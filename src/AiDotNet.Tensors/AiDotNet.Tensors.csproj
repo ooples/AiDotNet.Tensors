@@ -59,27 +59,11 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
-  <!-- Intel oneDNN for optimized CPU convolution (Windows x64 only, .NET Core+) -->
-  <!-- Using vcomp variant which uses Visual C++ OpenMP (fewer dependency issues) -->
-  <ItemGroup Condition="'$(TargetFramework)' != 'net471' AND $([MSBuild]::IsOSPlatform('Windows'))">
-    <PackageReference Include="onednn.cpu_vcomp.redist.win-x64" Version="2023.2.0.49513" GeneratePathProperty="true" />
-  </ItemGroup>
-
-  <!-- Copy oneDNN native DLL to output during build (Windows x64 only, .NET Core+) -->
-  <ItemGroup Condition="'$(TargetFramework)' != 'net471' AND $([MSBuild]::IsOSPlatform('Windows'))">
-    <None Include="$(Pkgonednn_cpu_vcomp_redist_win-x64)\runtimes\native\dnnl.dll"
-          Condition="'$(Pkgonednn_cpu_vcomp_redist_win-x64)' != ''"
-          Link="dnnl.dll"
-          CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <!-- Include oneDNN native DLL in NuGet package using runtimes convention -->
-  <!-- The runtimes/win-x64/native folder enables automatic copy for Windows x64 consumers -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <None Include="$(NuGetPackageRoot)onednn.cpu_vcomp.redist.win-x64\2023.2.0.49513\runtimes\native\dnnl.dll"
-          Pack="true"
-          PackagePath="runtimes\win-x64\native" />
-  </ItemGroup>
+  <!--
+    Intel oneDNN support for optimized CPU convolution, ReLU, sigmoid, and element-wise operations.
+    The native dnnl.dll is provided by the separate AiDotNet.Native.OneDNN package.
+    Install AiDotNet.Native.OneDNN to enable oneDNN acceleration (Windows x64 only, .NET Core+).
+  -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
@@ -88,6 +72,7 @@
 
   <!--
     Native library acceleration packages are OPTIONAL.
+    Install AiDotNet.Native.OneDNN for CPU deep learning acceleration (convolution, ReLU, etc).
     Install AiDotNet.Native.OpenBLAS for CPU BLAS acceleration.
     Install AiDotNet.Native.CLBlast for OpenCL GPU acceleration.
     The core package works without them using managed fallbacks.
