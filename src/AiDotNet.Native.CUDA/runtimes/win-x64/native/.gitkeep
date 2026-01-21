@@ -1,0 +1,9 @@
+# This directory should contain CUDA native libraries.
+#
+# Required DLLs (from NVIDIA CUDA Toolkit):
+# - cublas64_12.dll (cuBLAS)
+# - cublasLt64_12.dll (cuBLASLt)
+# - cudnn64_8.dll (cuDNN - optional)
+#
+# These files are NOT distributed with this package due to NVIDIA licensing.
+# Download CUDA Toolkit from: https://developer.nvidia.com/cuda-downloads

@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>AiDotNet.Native.CUDA</PackageId>
+    <Version>12.4.0</Version>
+    <Authors>AiDotNet Contributors</Authors>
+    <Company>AiDotNet</Company>
+    <Description>Native CUDA binaries for NVIDIA GPU-accelerated operations. This package provides CUDA libraries required by AiDotNet.Tensors for NVIDIA GPU acceleration.</Description>
+    <PackageTags>cuda;nvidia;gpu;blas;native;cublas;cudnn</PackageTags>
+    <PackageLicenseExpression>NVIDIA-EULA</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- This is a native-only package, no managed code -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+
+    <!-- Include native libraries in package -->
+    <ContentTargetFolders>content</ContentTargetFolders>
+  </PropertyGroup>
+
+  <!--
+    IMPORTANT: CUDA native libraries are NOT included in this package by default.
+    Users must download CUDA Toolkit from NVIDIA and copy the required DLLs.
+
+    Required DLLs (from CUDA Toolkit installation):
+    - cublas64_12.dll (cuBLAS)
+    - cublasLt64_12.dll (cuBLASLt)
+    - cudnn64_8.dll (cuDNN - optional, for neural networks)
+
+    Copy these to: runtimes/win-x64/native/
+
+    Alternatively, ensure CUDA Toolkit is installed and these libraries are in PATH.
+  -->
+
+  <!-- Windows x64 native libraries (if provided) -->
+  <ItemGroup Condition="Exists('runtimes\win-x64\native\cublas64_12.dll')">
+    <None Include="runtimes\win-x64\native\cublas64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <None Include="runtimes\win-x64\native\cublasLt64_12.dll" Pack="true" PackagePath="runtimes\win-x64\native" Condition="Exists('runtimes\win-x64\native\cublasLt64_12.dll')" />
+    <None Include="runtimes\win-x64\native\cudnn64_8.dll" Pack="true" PackagePath="runtimes\win-x64\native" Condition="Exists('runtimes\win-x64\native\cudnn64_8.dll')" />
+  </ItemGroup>
+
+  <!-- Linux x64 native libraries (if provided) -->
+  <ItemGroup Condition="Exists('runtimes\linux-x64\native\libcublas.so.12')">
+    <None Include="runtimes\linux-x64\native\libcublas.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" />
+    <None Include="runtimes\linux-x64\native\libcublasLt.so.12" Pack="true" PackagePath="runtimes\linux-x64\native" Condition="Exists('runtimes\linux-x64\native\libcublasLt.so.12')" />
+    <None Include="runtimes\linux-x64\native\libcudnn.so.8" Pack="true" PackagePath="runtimes\linux-x64\native" Condition="Exists('runtimes\linux-x64\native\libcudnn.so.8')" />
+  </ItemGroup>
+
+  <!-- Ensure the native libraries are copied to output -->
+  <ItemGroup>
+    <None Include="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- Build targets to copy native library -->
+  <ItemGroup>
+    <None Include="build\AiDotNet.Native.CUDA.targets" Pack="true" PackagePath="build" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    This targets file copies CUDA native libraries to the output directory
+    when a project references AiDotNet.Native.CUDA.
+  -->
+
+  <PropertyGroup>
+    <AiDotNetNativeCudaPackagePath>$(MSBuildThisFileDirectory)..</AiDotNetNativeCudaPackagePath>
+  </PropertyGroup>
+
+  <!-- Windows x64 -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(Platform)' == 'x64' And $([MSBuild]::IsOSPlatform('Windows')))">
+    <None Include="$(AiDotNetNativeCudaPackagePath)\runtimes\win-x64\native\*.dll"
+          Condition="Exists('$(AiDotNetNativeCudaPackagePath)\runtimes\win-x64\native\')">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+  <!-- Linux x64 -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('Linux')))">
+    <None Include="$(AiDotNetNativeCudaPackagePath)\runtimes\linux-x64\native\*.so*"
+          Condition="Exists('$(AiDotNetNativeCudaPackagePath)\runtimes\linux-x64\native\')">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+</Project>

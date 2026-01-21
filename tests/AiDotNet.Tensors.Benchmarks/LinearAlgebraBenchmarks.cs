@@ -1,7 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
 using AiDotNet.Tensors.LinearAlgebra;
-using AiDotNet.Extensions;
 using AiDotNet.Tensors.Helpers;
 using MathNet.Numerics.LinearAlgebra;
 using MathNet.Numerics.LinearAlgebra.Double;
@@ -395,24 +394,6 @@ public class LinearAlgebraBenchmarks
     public void MatrixTransposeInPlaceAiDotNet()
     {
         _aiMatrix1.TransposeInPlace();
-    }
-
-    #endregion
-
-    #region Frobenius Norm
-
-    [Benchmark(Description = "Frobenius Norm - AiDotNet")]
-    [BenchmarkCategory("FrobNorm")]
-    public double FrobeniusNormAiDotNet()
-    {
-        return _aiMatrix1.FrobeniusNorm();
-    }
-
-    [Benchmark(Description = "Frobenius Norm - MathNet")]
-    [BenchmarkCategory("FrobNorm")]
-    public double FrobeniusNormMathNet()
-    {
-        return _mnMatrix1.FrobeniusNorm();
     }
 
     #endregion
