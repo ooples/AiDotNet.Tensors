@@ -35,7 +35,7 @@
 
   <!-- Ensure the native library is copied to output -->
   <ItemGroup>
-    <None Include="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+    <None Update="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <!-- License file -->

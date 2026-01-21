@@ -2,8 +2,8 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
 
   <!-- Copy oneDNN native library to output directory based on runtime -->
-  <!-- Use simpler Windows detection for reliability -->
-  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+  <!-- Include Windows DLL only when building for Windows RID or when no explicit RID and running on Windows -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' == 'Windows_NT')">
     <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\dnnl.dll">
       <Link>dnnl.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
