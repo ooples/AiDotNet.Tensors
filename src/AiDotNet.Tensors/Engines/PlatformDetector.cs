@@ -73,6 +73,13 @@ namespace AiDotNet.Tensors.Engines
             caps.HasCudaSupport = DetectCudaSupport();
             caps.HasOpenCLSupport = DetectOpenCLSupport();
 
+            // Check for native library availability
+            var nativeStatus = NativeLibraryDetector.Status;
+            caps.HasOpenBlas = nativeStatus.HasOpenBlas;
+            caps.HasMkl = nativeStatus.HasMkl;
+            caps.HasClBlast = nativeStatus.HasClBlast;
+            caps.HasHipSupport = nativeStatus.HasHip;
+
             return caps;
         }
 
@@ -205,6 +212,13 @@ namespace AiDotNet.Tensors.Engines
             desc.AppendLine("GPU Support:");
             desc.AppendLine($"  CUDA: {caps.HasCudaSupport}");
             desc.AppendLine($"  OpenCL: {caps.HasOpenCLSupport}");
+            desc.AppendLine($"  HIP/ROCm: {caps.HasHipSupport}");
+
+            desc.AppendLine();
+            desc.AppendLine("Native Acceleration Libraries:");
+            desc.AppendLine($"  OpenBLAS: {(caps.HasOpenBlas ? "Available" : "Not found - install AiDotNet.Native.OpenBLAS")}");
+            desc.AppendLine($"  Intel MKL: {(caps.HasMkl ? "Available" : "Not found")}");
+            desc.AppendLine($"  CLBlast: {(caps.HasClBlast ? "Available" : "Not found - install AiDotNet.Native.CLBlast")}");
 
             return desc.ToString();
         }
@@ -254,6 +268,17 @@ namespace AiDotNet.Tensors.Engines
         // GPU capabilities
         public bool HasCudaSupport { get; set; }
         public bool HasOpenCLSupport { get; set; }
+        public bool HasHipSupport { get; set; }
+
+        // Native library availability (optional acceleration packages)
+        public bool HasOpenBlas { get; set; }
+        public bool HasMkl { get; set; }
+        public bool HasClBlast { get; set; }
+
+        /// <summary>
+        /// Gets whether any CPU BLAS acceleration is available (OpenBLAS or MKL).
+        /// </summary>
+        public bool HasCpuBlas => HasOpenBlas || HasMkl;
 
         /// <summary>
         /// Returns the best available SIMD instruction set
