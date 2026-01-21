@@ -25,6 +25,9 @@ dotnet add package AiDotNet.Native.OpenBLAS
 
 # Optional: CLBlast for OpenCL GPU acceleration (AMD/Intel/NVIDIA)
 dotnet add package AiDotNet.Native.CLBlast
+
+# Optional: CUDA for NVIDIA GPU acceleration (requires NVIDIA GPU)
+dotnet add package AiDotNet.Native.CUDA
 ```
 
 ## Quick Start
@@ -67,10 +70,21 @@ The library automatically detects and uses the best available SIMD instructions:
 using AiDotNet.Tensors.Engines;
 
 var caps = PlatformDetector.Capabilities;
+
+// SIMD capabilities
 Console.WriteLine($"AVX2: {caps.HasAVX2}");
 Console.WriteLine($"AVX-512: {caps.HasAVX512F}");
+
+// GPU support
 Console.WriteLine($"CUDA: {caps.HasCudaSupport}");
 Console.WriteLine($"OpenCL: {caps.HasOpenCLSupport}");
+
+// Native library availability
+Console.WriteLine($"OpenBLAS: {caps.HasOpenBlas}");
+Console.WriteLine($"CLBlast: {caps.HasClBlast}");
+
+// Or get a full status summary
+Console.WriteLine(NativeLibraryDetector.GetStatusSummary());
 ```
 
 ## Optional Acceleration Packages
@@ -94,6 +108,38 @@ dotnet add package AiDotNet.Native.CLBlast
 ```
 
 **Performance**: 10x+ faster for large matrix operations on GPU.
+
+### AiDotNet.Native.CUDA
+
+Provides GPU acceleration via NVIDIA CUDA (NVIDIA GPUs only):
+
+```bash
+dotnet add package AiDotNet.Native.CUDA
+```
+
+**Performance**: 30,000+ GFLOPS for matrix operations on modern NVIDIA GPUs.
+
+**Requirements**:
+- NVIDIA GPU (GeForce, Quadro, or Tesla)
+- NVIDIA display driver 525.60+ (includes CUDA driver)
+
+**Usage with helpful error messages**:
+
+```csharp
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+
+// Recommended: throws beginner-friendly exception if CUDA unavailable
+using var cuda = CudaBackend.CreateOrThrow();
+
+// Or check availability first
+if (CudaBackend.IsCudaAvailable)
+{
+    using var backend = new CudaBackend();
+    // Use CUDA acceleration
+}
+```
+
+If CUDA is not available, you'll get detailed troubleshooting steps explaining exactly what's missing and how to fix it.
 
 ## Requirements
 
