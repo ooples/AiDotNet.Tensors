@@ -32,6 +32,7 @@ jobs:
       run: dotnet build --configuration Release --no-restore
 
     - name: Test with Coverage
+      shell: pwsh
       run: |
         dotnet test --configuration Release --no-build --verbosity normal --framework net10.0 `
           --collect:"XPlat Code Coverage" `
@@ -40,9 +41,11 @@ jobs:
           DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*"
 
     - name: Install ReportGenerator
+      shell: pwsh
       run: dotnet tool install --global dotnet-reportgenerator-globaltool
 
     - name: Generate Coverage Report
+      shell: pwsh
       run: |
         reportgenerator `
           -reports:"./coverage/**/coverage.cobertura.xml" `
