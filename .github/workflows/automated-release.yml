@@ -302,6 +302,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+          # Pack OneDNN native package
+          if (Test-Path "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj") {
+            Write-Host "Packing AiDotNet.Native.OneDNN..."
+            dotnet pack src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
           # Note: CUDA package is not packed in CI because native binaries (770MB) are not in git
           # CUDA package must be built and published locally with binaries present
 
