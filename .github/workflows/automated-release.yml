@@ -1,0 +1,401 @@
+name: Automated Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # Don't cancel release in progress
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  version-and-build:
+    name: Version and Build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      package_version: ${{ steps.version.outputs.version }}
+      changelog: ${{ steps.version.outputs.changelog }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Determine version from conventional commits
+        id: version
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Automated Semantic Versioning from Conventional Commits ==="
+
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+
+          CURRENT_VERSION=${LATEST_TAG#v}
+          echo "Current version: $CURRENT_VERSION"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          PATCH=${PATCH%%-*}
+
+          echo "Parsed version: $MAJOR.$MINOR.$PATCH"
+
+          if git rev-parse "$LATEST_TAG" >/dev/null 2>&1; then
+            COMMITS=$(git log "$LATEST_TAG..HEAD" --oneline --no-merges)
+          else
+            COMMITS=$(git log --oneline --no-merges)
+          fi
+
+          echo "=== Commits since last tag ==="
+          echo "$COMMITS"
+          echo "==========================="
+
+          BUMP_TYPE="none"
+
+          # Check for breaking changes (conventional format)
+          if echo "$COMMITS" | grep -iE "(BREAKING CHANGE:|BREAKING:|^[a-f0-9]+ [a-z]+(\([^)]*\))?!:)" > /dev/null; then
+            BUMP_TYPE="major"
+            echo "Found BREAKING CHANGE - will bump MAJOR version"
+          fi
+
+          # Check for features (conventional format: feat:)
+          if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ feat(\(.*\))?:" > /dev/null; then
+            BUMP_TYPE="minor"
+            echo "Found feat: commits - will bump MINOR version"
+          fi
+
+          # Check for fixes/refactor/perf/docs (conventional format with colon)
+          if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ (fix|refactor|perf|docs)(\(.*\))?:" > /dev/null; then
+            BUMP_TYPE="minor"
+            echo "Found fix:/refactor:/perf:/docs: commits - will bump MINOR version"
+          fi
+
+          # FALLBACK: Check for common non-conventional patterns (without colon)
+          if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ (add|implement|create|new) " > /dev/null; then
+            BUMP_TYPE="minor"
+            echo "Found Add/Implement/Create commits - will bump MINOR version"
+          fi
+
+          if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ (fix|update|improve|enhance|resolve|patch|correct|repair) " > /dev/null; then
+            BUMP_TYPE="minor"
+            echo "Found Fix/Update/Improve commits - will bump MINOR version"
+          fi
+
+          case $BUMP_TYPE in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              echo "Bumping MAJOR: $CURRENT_VERSION -> $MAJOR.$MINOR.$PATCH"
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              echo "Bumping MINOR: $CURRENT_VERSION -> $MAJOR.$MINOR.$PATCH"
+              ;;
+            none)
+              echo "No conventional commits found, no version bump"
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+              echo "changelog=No release needed - no conventional commits found" >> $GITHUB_OUTPUT
+              exit 0
+              ;;
+          esac
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "New version: $NEW_VERSION"
+
+          echo "=== Generating Changelog ==="
+          CHANGELOG="## Changes in v$NEW_VERSION"$'\n\n'
+
+          BREAKING=$(echo "$COMMITS" | grep -iE "BREAKING CHANGE:|BREAKING:" || true)
+          if [ -n "$BREAKING" ]; then
+            CHANGELOG+="### Breaking Changes"$'\n'
+            while IFS= read -r line; do
+              CHANGELOG+="- ${line#* }"$'\n'
+            done < <(echo "$BREAKING")
+            CHANGELOG+=$'\n'
+          fi
+
+          FEATURES=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ feat(\(.*\))?:" || true)
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG+="### Features"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ feat(\(.*\))?: //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$FEATURES")
+            CHANGELOG+=$'\n'
+          fi
+
+          FIXES=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ fix(\(.*\))?:" || true)
+          if [ -n "$FIXES" ]; then
+            CHANGELOG+="### Bug Fixes"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ fix(\(.*\))?: //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$FIXES")
+            CHANGELOG+=$'\n'
+          fi
+
+          PERF=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ perf(\(.*\))?:" || true)
+          if [ -n "$PERF" ]; then
+            CHANGELOG+="### Performance Improvements"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ perf(\(.*\))?: //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$PERF")
+            CHANGELOG+=$'\n'
+          fi
+
+          REFACTOR=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ refactor(\(.*\))?:" || true)
+          if [ -n "$REFACTOR" ]; then
+            CHANGELOG+="### Code Refactoring"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ refactor(\(.*\))?: //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$REFACTOR")
+            CHANGELOG+=$'\n'
+          fi
+
+          DOCS=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ docs(\(.*\))?:" || true)
+          if [ -n "$DOCS" ]; then
+            CHANGELOG+="### Documentation"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ docs(\(.*\))?: //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$DOCS")
+            CHANGELOG+=$'\n'
+          fi
+
+          # FALLBACK: Non-conventional commits
+          NEW_FEATURES=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ (add|implement|create|new) " | grep -viE "^[a-f0-9]+ (feat|fix|refactor|perf|docs)(\(.*\))?:" || true)
+          if [ -n "$NEW_FEATURES" ]; then
+            CHANGELOG+="### New Features"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$NEW_FEATURES")
+            CHANGELOG+=$'\n'
+          fi
+
+          OTHER_FIXES=$(echo "$COMMITS" | grep -iE "^[a-f0-9]+ (fix|update|improve|enhance|resolve|patch|correct|repair) " | grep -viE "^[a-f0-9]+ (feat|fix|refactor|perf|docs)(\(.*\))?:" || true)
+          if [ -n "$OTHER_FIXES" ]; then
+            CHANGELOG+="### Bug Fixes & Improvements"$'\n'
+            while IFS= read -r line; do
+              MSG=$(echo "$line" | sed -E 's/^[a-f0-9]+ //')
+              CHANGELOG+="- $MSG"$'\n'
+            done < <(echo "$OTHER_FIXES")
+            CHANGELOG+=$'\n'
+          fi
+
+          echo "$CHANGELOG"
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "should_release=true" >> $GITHUB_OUTPUT
+
+          echo "$CHANGELOG" > /tmp/changelog.txt
+          {
+            echo 'changelog<<EOF'
+            cat /tmp/changelog.txt
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Restore dependencies
+        if: steps.version.outputs.should_release == 'true'
+        run: dotnet restore
+
+      - name: Build
+        if: steps.version.outputs.should_release == 'true'
+        run: dotnet build -c Release --no-restore
+
+  pack:
+    name: Pack NuGet
+    runs-on: windows-latest
+    needs: version-and-build
+    timeout-minutes: 20
+    if: needs.version-and-build.outputs.should_release == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore and Build
+        run: |
+          dotnet restore
+          dotnet build -c Release --no-restore
+
+      - name: Pack NuGet packages
+        shell: bash
+        run: |
+          VERSION="${{ needs.version-and-build.outputs.package_version }}"
+          echo "Packing version $VERSION"
+
+          mkdir -p out
+
+          # Pack main package
+          if [ -f "src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" ]; then
+            echo "Packing AiDotNet.Tensors..."
+            dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+          fi
+
+          # Pack OpenBLAS native package
+          if [ -f "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj" ]; then
+            echo "Packing AiDotNet.Native.OpenBLAS..."
+            dotnet pack src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+          fi
+
+          # Pack CLBlast native package
+          if [ -f "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj" ]; then
+            echo "Packing AiDotNet.Native.CLBlast..."
+            dotnet pack src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+          fi
+
+          # Note: CUDA package is not packed in CI because native binaries (770MB) are not in git
+          # CUDA package must be built and published locally with binaries present
+
+          echo "=== Packages created ==="
+          ls -la out/
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages-${{ github.sha }}
+          path: out/*.nupkg
+          if-no-files-found: error
+
+  publish-nuget:
+    name: Publish to NuGet
+    runs-on: ubuntu-latest
+    needs: [version-and-build, pack]
+    timeout-minutes: 10
+    if: needs.version-and-build.outputs.should_release == 'true'
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-packages-${{ github.sha }}
+          path: out/
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Push to NuGet
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pkgs=(out/*.nupkg)
+
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "Error: No .nupkg files found in out/ directory"
+            exit 1
+          fi
+
+          for pkg in "${pkgs[@]}"; do
+            echo "Publishing $pkg to NuGet..."
+            dotnet nuget push "$pkg" \
+              --api-key ${{ secrets.NUGET_API_KEY }} \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+
+            if [ $? -eq 0 ]; then
+              echo "Successfully published $pkg"
+            else
+              echo "Warning: Failed to publish $pkg (may already exist)"
+            fi
+          done
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [version-and-build, publish-nuget]
+    timeout-minutes: 10
+    if: needs.version-and-build.outputs.should_release == 'true'
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nuget-packages-${{ github.sha }}
+          path: out/
+
+      - name: List artifacts
+        run: ls -lah out/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version-and-build.outputs.package_version }}
+          name: Release v${{ needs.version-and-build.outputs.package_version }}
+          body: |
+            ${{ needs.version-and-build.outputs.changelog }}
+
+            ## Packages
+
+            - **AiDotNet.Tensors** - Core tensor operations with SIMD acceleration
+            - **AiDotNet.Native.OpenBLAS** - CPU-accelerated BLAS operations
+            - **AiDotNet.Native.CLBlast** - GPU-accelerated OpenCL BLAS operations
+
+            > Note: AiDotNet.Native.CUDA must be built locally due to large binary size (770MB).
+
+            ## Installation
+
+            ```bash
+            dotnet add package AiDotNet.Tensors
+            ```
+          files: out/*.nupkg
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
