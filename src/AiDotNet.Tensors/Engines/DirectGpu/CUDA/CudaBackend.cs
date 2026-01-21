@@ -65,6 +65,52 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public static bool IsCudaAvailable => CudaNativeBindings.IsAvailable && NvrtcNativeBindings.IsAvailable;
 
+    /// <summary>
+    /// Ensures CUDA is available, throwing a detailed beginner-friendly exception if not.
+    /// Call this method before attempting to use CUDA features to get helpful error messages.
+    /// </summary>
+    /// <param name="feature">Optional description of the feature requiring CUDA.</param>
+    /// <exception cref="Exceptions.CudaNotFoundException">
+    /// Thrown with detailed troubleshooting steps when CUDA is not available.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// // Check CUDA availability before use
+    /// CudaBackend.EnsureAvailable("matrix multiplication");
+    ///
+    /// // Now safe to create the backend
+    /// using var cuda = new CudaBackend();
+    /// </code>
+    /// </example>
+    public static void EnsureAvailable(string feature = "NVIDIA GPU acceleration")
+    {
+        if (!IsCudaAvailable)
+        {
+            throw new Exceptions.CudaNotFoundException(feature);
+        }
+    }
+
+    /// <summary>
+    /// Creates a CudaBackend, throwing a detailed beginner-friendly exception if CUDA is not available.
+    /// This is the recommended way to create a CudaBackend for beginners.
+    /// </summary>
+    /// <param name="deviceIndex">The CUDA device index (default: 0 for the first GPU).</param>
+    /// <returns>A new CudaBackend instance.</returns>
+    /// <exception cref="Exceptions.CudaNotFoundException">
+    /// Thrown with detailed troubleshooting steps when CUDA is not available.
+    /// </exception>
+    public static CudaBackend CreateOrThrow(int deviceIndex = 0)
+    {
+        EnsureAvailable();
+        var backend = new CudaBackend(deviceIndex);
+        if (!backend.IsAvailable)
+        {
+            throw new Exceptions.CudaNotFoundException(Exceptions.CudaUnavailableReason.NoDevices,
+                "CUDA backend initialization");
+        }
+        return backend;
+    }
+
     public CudaBackend() : this(0)
     {
     }
