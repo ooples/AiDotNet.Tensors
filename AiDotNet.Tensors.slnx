@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj" />
     <Project Path="src/AiDotNet.Native.CUDA/AiDotNet.Native.CUDA.csproj" />
+    <Project Path="src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj" />
     <Project Path="src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj" />
     <Project Path="src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" />
   </Folder>
