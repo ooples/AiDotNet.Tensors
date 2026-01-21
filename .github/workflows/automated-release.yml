@@ -274,36 +274,39 @@ jobs:
           dotnet build -c Release --no-restore
 
       - name: Pack NuGet packages
-        shell: bash
+        shell: pwsh
         run: |
-          VERSION="${{ needs.version-and-build.outputs.package_version }}"
-          echo "Packing version $VERSION"
+          $VERSION = "${{ needs.version-and-build.outputs.package_version }}"
+          Write-Host "Packing version $VERSION"
 
-          mkdir -p out
+          New-Item -ItemType Directory -Force -Path out | Out-Null
 
           # Pack main package
-          if [ -f "src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" ]; then
-            echo "Packing AiDotNet.Tensors..."
+          if (Test-Path "src/AiDotNet.Tensors/AiDotNet.Tensors.csproj") {
+            Write-Host "Packing AiDotNet.Tensors..."
             dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
-          fi
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
           # Pack OpenBLAS native package
-          if [ -f "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj" ]; then
-            echo "Packing AiDotNet.Native.OpenBLAS..."
+          if (Test-Path "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj") {
+            Write-Host "Packing AiDotNet.Native.OpenBLAS..."
             dotnet pack src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
-          fi
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
           # Pack CLBlast native package
-          if [ -f "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj" ]; then
-            echo "Packing AiDotNet.Native.CLBlast..."
+          if (Test-Path "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj") {
+            Write-Host "Packing AiDotNet.Native.CLBlast..."
             dotnet pack src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
-          fi
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
           # Note: CUDA package is not packed in CI because native binaries (770MB) are not in git
           # CUDA package must be built and published locally with binaries present
 
-          echo "=== Packages created ==="
-          ls -la out/
+          Write-Host "=== Packages created ==="
+          Get-ChildItem out/
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
