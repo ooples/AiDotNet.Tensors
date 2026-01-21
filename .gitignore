@@ -1,0 +1,60 @@
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.cache
+
+# Rider
+.idea/
+
+# NuGet
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Build
+[Oo]ut/
+publish/
+PublishScripts/
+
+# Test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.trx
+TestResults/
+coverage*/
+*.coverage
+*.coveragexml
+
+# BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+~$*

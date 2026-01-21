@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj" />
+    <Project Path="src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj" />
+    <Project Path="src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj" />
+    <Project Path="tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj" />
+  </Folder>
+</Solution>
