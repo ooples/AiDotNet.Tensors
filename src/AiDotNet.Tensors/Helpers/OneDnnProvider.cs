@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -32,6 +33,11 @@ internal static class OneDnnProvider
     private const int MaxCacheSize = 32; // Limit cache size to avoid memory bloat
     private const int MaxEltwiseCacheSize = 16; // Limit eltwise cache size
     private const int MaxBinaryCacheSize = 16; // Limit binary cache size
+
+    // Reader-writer locks to prevent use-after-free during cache eviction
+    // These ensure that eviction doesn't happen while cached objects are in use
+    private static readonly ReaderWriterLockSlim _eltwiseCacheLock = new(LockRecursionPolicy.NoRecursion);
+    private static readonly ReaderWriterLockSlim _binaryCacheLock = new(LockRecursionPolicy.NoRecursion);
 
     // Windows API for DLL search path manipulation
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
@@ -726,6 +732,7 @@ internal static class OneDnnProvider
 
     /// <summary>
     /// Performs in-place eltwise operation using cached oneDNN primitives.
+    /// Uses a reader-writer lock to prevent use-after-free during cache eviction.
     /// </summary>
     private static unsafe bool TryEltwiseInPlace(float* data, int length, int algorithm)
     {
@@ -733,39 +740,71 @@ internal static class OneDnnProvider
             return false;
 
         var key = new EltwiseKey(algorithm, length);
+        CachedEltwise? cached = null;
 
-        // Try to get cached primitive or create new one
-        if (!_eltwiseCache.TryGetValue(key, out var cached))
+        // Acquire read lock to prevent eviction while we're using the cached object
+        _eltwiseCacheLock.EnterReadLock();
+        try
         {
-            cached = CreateEltwisePrimitive(algorithm, length);
-            if (cached == null)
-                return false;
-
-            // Add to cache first, then evict if over limit (avoids race condition)
-            // Using GetOrAdd to handle concurrent creation of same key
-            var existingOrNew = _eltwiseCache.GetOrAdd(key, cached);
-            if (!ReferenceEquals(existingOrNew, cached))
+            // Try to get cached primitive
+            if (_eltwiseCache.TryGetValue(key, out cached))
             {
-                // Another thread added the same key first, dispose our duplicate
-                cached.Dispose();
-                cached = existingOrNew;
+                // Cache hit - execute under read lock
+                return ExecuteEltwiseOperation(cached, data);
             }
+        }
+        finally
+        {
+            _eltwiseCacheLock.ExitReadLock();
+        }
 
-            // Evict after adding to prevent exceeding cache size
-            while (_eltwiseCache.Count > MaxEltwiseCacheSize)
+        // Cache miss - need to create a new primitive under write lock
+        _eltwiseCacheLock.EnterWriteLock();
+        try
+        {
+            // Double-check after acquiring write lock (another thread may have added it)
+            if (!_eltwiseCache.TryGetValue(key, out cached))
             {
-                // Remove any entry to make room
-                foreach (var k in _eltwiseCache.Keys)
+                cached = CreateEltwisePrimitive(algorithm, length);
+                if (cached == null)
+                    return false;
+
+                _eltwiseCache[key] = cached;
+
+                // Perform eviction under write lock (safe - no readers can be using evicted entries)
+                if (_eltwiseCache.Count > MaxEltwiseCacheSize)
                 {
-                    if (_eltwiseCache.TryRemove(k, out var removed))
+                    foreach (var k in _eltwiseCache.Keys)
                     {
-                        removed.Dispose();
-                        break;
+                        if (!k.Equals(key) && _eltwiseCache.TryRemove(k, out var removed))
+                        {
+                            removed.Dispose();
+                            break;
+                        }
                     }
                 }
             }
-        }
 
+            // Execute the operation while still holding write lock
+            // This eliminates the race window between lock release and re-acquisition
+            return ExecuteEltwiseOperation(cached, data);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            _eltwiseCacheLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Executes the eltwise operation on the given data using the cached primitive.
+    /// Must be called while holding either a read or write lock on _eltwiseCacheLock.
+    /// </summary>
+    private static unsafe bool ExecuteEltwiseOperation(CachedEltwise cached, float* data)
+    {
         try
         {
             // Update memory handle to point to user data
@@ -869,6 +908,7 @@ internal static class OneDnnProvider
 
     /// <summary>
     /// Performs binary operation using cached oneDNN primitives.
+    /// Uses a reader-writer lock to prevent use-after-free during cache eviction.
     /// </summary>
     private static unsafe bool TryBinary(float* src0, float* src1, float* dst, int length, int algorithm)
     {
@@ -876,37 +916,72 @@ internal static class OneDnnProvider
             return false;
 
         var key = new BinaryKey(algorithm, length);
-        if (!_binaryCache.TryGetValue(key, out var cached))
+        CachedBinary? cached = null;
+
+        // Acquire read lock to prevent eviction while we're using the cached object
+        _binaryCacheLock.EnterReadLock();
+        try
         {
-            cached = CreateBinaryPrimitive(algorithm, length);
-            if (cached == null)
-                return false;
-
-            // Add to cache first, then evict if over limit (avoids race condition)
-            // Using GetOrAdd to handle concurrent creation of same key
-            var existingOrNew = _binaryCache.GetOrAdd(key, cached);
-            if (!ReferenceEquals(existingOrNew, cached))
+            // Try to get cached primitive
+            if (_binaryCache.TryGetValue(key, out cached))
             {
-                // Another thread added the same key first, dispose our duplicate
-                cached.Dispose();
-                cached = existingOrNew;
+                // Cache hit - execute under read lock
+                return ExecuteBinaryOperation(cached, src0, src1, dst);
             }
+        }
+        finally
+        {
+            _binaryCacheLock.ExitReadLock();
+        }
 
-            // Evict after adding to prevent exceeding cache size
-            while (_binaryCache.Count > MaxBinaryCacheSize)
+        // Cache miss - need to create a new primitive under write lock
+        _binaryCacheLock.EnterWriteLock();
+        try
+        {
+            // Double-check after acquiring write lock (another thread may have added it)
+            if (!_binaryCache.TryGetValue(key, out cached))
             {
-                // Remove any entry to make room
-                foreach (var k in _binaryCache.Keys)
+                cached = CreateBinaryPrimitive(algorithm, length);
+                if (cached == null)
+                    return false;
+
+                _binaryCache[key] = cached;
+
+                // Perform eviction under write lock (safe - no readers can be using evicted entries)
+                if (_binaryCache.Count > MaxBinaryCacheSize)
                 {
-                    if (_binaryCache.TryRemove(k, out var removed))
+                    foreach (var k in _binaryCache.Keys)
                     {
-                        removed.Dispose();
-                        break;
+                        // Don't evict the entry we just added
+                        if (!k.Equals(key) && _binaryCache.TryRemove(k, out var removed))
+                        {
+                            removed.Dispose();
+                            break;
+                        }
                     }
                 }
             }
-        }
 
+            // Execute the operation while still holding write lock
+            // This eliminates the race window between lock release and re-acquisition
+            return ExecuteBinaryOperation(cached, src0, src1, dst);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            _binaryCacheLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Executes the binary operation on the given data using the cached primitive.
+    /// Must be called while holding either a read or write lock on _binaryCacheLock.
+    /// </summary>
+    private static unsafe bool ExecuteBinaryOperation(CachedBinary cached, float* src0, float* src1, float* dst)
+    {
         try
         {
             // Update memory handles
