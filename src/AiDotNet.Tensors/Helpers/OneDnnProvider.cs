@@ -741,58 +741,72 @@ internal static class OneDnnProvider
 
         var key = new EltwiseKey(algorithm, length);
         CachedEltwise? cached = null;
-        bool needsEviction = false;
 
         // Acquire read lock to prevent eviction while we're using the cached object
         _eltwiseCacheLock.EnterReadLock();
         try
         {
-            // Try to get cached primitive or create new one
+            // Try to get cached primitive
+            if (_eltwiseCache.TryGetValue(key, out cached))
+            {
+                // Cache hit - execute under read lock
+                return ExecuteEltwiseOperation(cached, data);
+            }
+        }
+        finally
+        {
+            _eltwiseCacheLock.ExitReadLock();
+        }
+
+        // Cache miss - need to create a new primitive under write lock
+        _eltwiseCacheLock.EnterWriteLock();
+        try
+        {
+            // Double-check after acquiring write lock (another thread may have added it)
             if (!_eltwiseCache.TryGetValue(key, out cached))
             {
-                // Need to create a new primitive - upgrade to write lock
-                _eltwiseCacheLock.ExitReadLock();
-                _eltwiseCacheLock.EnterWriteLock();
-                try
+                cached = CreateEltwisePrimitive(algorithm, length);
+                if (cached == null)
+                    return false;
+
+                _eltwiseCache[key] = cached;
+
+                // Perform eviction under write lock (safe - no readers can be using evicted entries)
+                if (_eltwiseCache.Count > MaxEltwiseCacheSize)
                 {
-                    // Double-check after acquiring write lock
-                    if (!_eltwiseCache.TryGetValue(key, out cached))
+                    foreach (var k in _eltwiseCache.Keys)
                     {
-                        cached = CreateEltwisePrimitive(algorithm, length);
-                        if (cached == null)
-                            return false;
-
-                        _eltwiseCache[key] = cached;
-                        needsEviction = _eltwiseCache.Count > MaxEltwiseCacheSize;
-                    }
-
-                    // Perform eviction under write lock (safe - no readers)
-                    if (needsEviction)
-                    {
-                        foreach (var k in _eltwiseCache.Keys)
+                        if (!k.Equals(key) && _eltwiseCache.TryRemove(k, out var removed))
                         {
-                            if (!k.Equals(key) && _eltwiseCache.TryRemove(k, out var removed))
-                            {
-                                removed.Dispose();
-                                break;
-                            }
+                            removed.Dispose();
+                            break;
                         }
                     }
                 }
-                finally
-                {
-                    _eltwiseCacheLock.ExitWriteLock();
-                }
-
-                // Re-acquire read lock for the operation
-                _eltwiseCacheLock.EnterReadLock();
-
-                // Get the cached object again (should exist now)
-                if (!_eltwiseCache.TryGetValue(key, out cached) || cached == null)
-                    return false;
             }
 
-            // Now execute the operation under read lock
+            // Execute the operation while still holding write lock
+            // This eliminates the race window between lock release and re-acquisition
+            return ExecuteEltwiseOperation(cached, data);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            _eltwiseCacheLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Executes the eltwise operation on the given data using the cached primitive.
+    /// Must be called while holding either a read or write lock on _eltwiseCacheLock.
+    /// </summary>
+    private static unsafe bool ExecuteEltwiseOperation(CachedEltwise cached, float* data)
+    {
+        try
+        {
             // Update memory handle to point to user data
             int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)data);
             if (status != DnnlSuccess)
@@ -815,11 +829,6 @@ internal static class OneDnnProvider
         catch
         {
             return false;
-        }
-        finally
-        {
-            if (_eltwiseCacheLock.IsReadLockHeld)
-                _eltwiseCacheLock.ExitReadLock();
         }
     }
 
@@ -908,59 +917,73 @@ internal static class OneDnnProvider
 
         var key = new BinaryKey(algorithm, length);
         CachedBinary? cached = null;
-        bool needsEviction = false;
 
         // Acquire read lock to prevent eviction while we're using the cached object
         _binaryCacheLock.EnterReadLock();
         try
         {
             // Try to get cached primitive
+            if (_binaryCache.TryGetValue(key, out cached))
+            {
+                // Cache hit - execute under read lock
+                return ExecuteBinaryOperation(cached, src0, src1, dst);
+            }
+        }
+        finally
+        {
+            _binaryCacheLock.ExitReadLock();
+        }
+
+        // Cache miss - need to create a new primitive under write lock
+        _binaryCacheLock.EnterWriteLock();
+        try
+        {
+            // Double-check after acquiring write lock (another thread may have added it)
             if (!_binaryCache.TryGetValue(key, out cached))
             {
-                // Need to create a new primitive - upgrade to write lock
-                _binaryCacheLock.ExitReadLock();
-                _binaryCacheLock.EnterWriteLock();
-                try
+                cached = CreateBinaryPrimitive(algorithm, length);
+                if (cached == null)
+                    return false;
+
+                _binaryCache[key] = cached;
+
+                // Perform eviction under write lock (safe - no readers can be using evicted entries)
+                if (_binaryCache.Count > MaxBinaryCacheSize)
                 {
-                    // Double-check after acquiring write lock
-                    if (!_binaryCache.TryGetValue(key, out cached))
+                    foreach (var k in _binaryCache.Keys)
                     {
-                        cached = CreateBinaryPrimitive(algorithm, length);
-                        if (cached == null)
-                            return false;
-
-                        _binaryCache[key] = cached;
-                        needsEviction = _binaryCache.Count > MaxBinaryCacheSize;
-                    }
-
-                    // Perform eviction under write lock (safe - no readers)
-                    if (needsEviction)
-                    {
-                        foreach (var k in _binaryCache.Keys)
+                        // Don't evict the entry we just added
+                        if (!k.Equals(key) && _binaryCache.TryRemove(k, out var removed))
                         {
-                            // Don't evict the entry we just added or the one we're about to use
-                            if (!k.Equals(key) && _binaryCache.TryRemove(k, out var removed))
-                            {
-                                removed.Dispose();
-                                break;
-                            }
+                            removed.Dispose();
+                            break;
                         }
                     }
                 }
-                finally
-                {
-                    _binaryCacheLock.ExitWriteLock();
-                }
-
-                // Re-acquire read lock for the operation
-                _binaryCacheLock.EnterReadLock();
-
-                // Get the cached object again (should exist now)
-                if (!_binaryCache.TryGetValue(key, out cached) || cached == null)
-                    return false;
             }
 
-            // Now execute the operation under read lock
+            // Execute the operation while still holding write lock
+            // This eliminates the race window between lock release and re-acquisition
+            return ExecuteBinaryOperation(cached, src0, src1, dst);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            _binaryCacheLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Executes the binary operation on the given data using the cached primitive.
+    /// Must be called while holding either a read or write lock on _binaryCacheLock.
+    /// </summary>
+    private static unsafe bool ExecuteBinaryOperation(CachedBinary cached, float* src0, float* src1, float* dst)
+    {
+        try
+        {
             // Update memory handles
             int status = dnnl_memory_set_data_handle(cached.Src0Mem, (IntPtr)src0);
             if (status != DnnlSuccess)
@@ -993,11 +1016,6 @@ internal static class OneDnnProvider
         catch
         {
             return false;
-        }
-        finally
-        {
-            if (_binaryCacheLock.IsReadLockHeld)
-                _binaryCacheLock.ExitReadLock();
         }
     }
 
