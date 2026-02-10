@@ -237,13 +237,15 @@ public sealed partial class MetalBackend
     /// </summary>
     public void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         ThrowIfDisposed();
 
         var queryData = DownloadBuffer(query);
         var keyData = DownloadBuffer(key);
         var valueData = DownloadBuffer(value);
+        float[]? biasData = attentionBias is not null ? DownloadBuffer(attentionBias) : null;
 
         var outputData = new float[batch * numHeads * seqQ * headDim];
         var statsData = new float[batch * numHeads * seqQ];
@@ -255,6 +257,9 @@ public sealed partial class MetalBackend
                 int qOffset = (b * numHeads + h) * seqQ * headDim;
                 int kOffset = (b * numHeads + h) * seqK * headDim;
                 int statsOffset = (b * numHeads + h) * seqQ;
+                int biasHeadOffset = biasData is not null
+                    ? b * biasBatchStride + h * seqQ * seqK
+                    : 0;
 
                 for (int i = 0; i < seqQ; i++)
                 {
@@ -276,6 +281,13 @@ public sealed partial class MetalBackend
                                 sum += queryData[qOffset + i * headDim + d] * keyData[kOffset + j * headDim + d];
                             }
                             scores[j] = sum * scale;
+
+                            // Add attention bias (ALiBi / relative position bias)
+                            if (biasData is not null)
+                            {
+                                scores[j] += biasData[biasHeadOffset + i * seqK + j];
+                            }
+
                             maxScore = MathF.Max(maxScore, scores[j]);
                         }
                     }
@@ -326,7 +338,8 @@ public sealed partial class MetalBackend
     public void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         ThrowIfDisposed();
 
@@ -335,6 +348,7 @@ public sealed partial class MetalBackend
         var keyData = DownloadBuffer(key);
         var valueData = DownloadBuffer(value);
         var statsData = DownloadBuffer(softmaxStats);
+        float[]? biasData = attentionBias is not null ? DownloadBuffer(attentionBias) : null;
 
         var gradQueryData = new float[batch * numHeads * seqQ * headDim];
         var gradKeyData = new float[batch * numHeads * seqK * headDim];
@@ -347,6 +361,9 @@ public sealed partial class MetalBackend
                 int qOffset = (b * numHeads + h) * seqQ * headDim;
                 int kOffset = (b * numHeads + h) * seqK * headDim;
                 int statsOffset = (b * numHeads + h) * seqQ;
+                int biasHeadOffset = biasData is not null
+                    ? b * biasBatchStride + h * seqQ * seqK
+                    : 0;
 
                 for (int i = 0; i < seqQ; i++)
                 {
@@ -367,7 +384,14 @@ public sealed partial class MetalBackend
                             {
                                 score += queryData[qOffset + i * headDim + d] * keyData[kOffset + j * headDim + d];
                             }
-                            weights[j] = MathF.Exp(score * scale - lse);
+
+                            float biasedScore = score * scale;
+                            if (biasData is not null)
+                            {
+                                biasedScore += biasData[biasHeadOffset + i * seqK + j];
+                            }
+
+                            weights[j] = MathF.Exp(biasedScore - lse);
                         }
                     }
 
