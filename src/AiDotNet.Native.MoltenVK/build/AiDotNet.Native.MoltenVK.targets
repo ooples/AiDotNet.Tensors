@@ -24,7 +24,7 @@
        which would incorrectly select x64 on Apple Silicon).
   -->
   <PropertyGroup Condition="'$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">
-    <_MoltenVKIsArm64>$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant())</_MoltenVKIsArm64>
+    <_MoltenVKIsArm64>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</_MoltenVKIsArm64>
   </PropertyGroup>
 
   <!-- macOS x64 (Intel) -->
