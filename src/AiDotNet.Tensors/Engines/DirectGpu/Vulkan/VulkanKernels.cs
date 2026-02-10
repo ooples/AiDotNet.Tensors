@@ -38,6 +38,11 @@ public static class VulkanKernels
     /// <returns>The number of workgroups.</returns>
     public static uint CalculateWorkgroupCount(int elementCount)
     {
+        if (elementCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(elementCount), elementCount, "Element count must be positive.");
+        }
+
         return (uint)((elementCount + WorkgroupSize - 1) / WorkgroupSize);
     }
 
@@ -614,6 +619,9 @@ public static class VulkanKernels
     /// Push constants: { uint M; uint N; uint K; }
     /// </summary>
     /// <remarks>
+    /// <para><b>WARNING:</b> This SPIR-V only computes c[row,col] = a[row,0] * b[0,col] (k=0 case).
+    /// A correct implementation requires an OpLoopMerge construct to iterate over all K values.
+    /// The GLSL source below shows the intended tiled implementation.</para>
     /// GLSL Source:
     /// <code>
     /// #version 450
@@ -781,6 +789,10 @@ public static class VulkanKernels
     /// Push constants: { uint size; }
     /// </summary>
     /// <remarks>
+    /// <para><b>WARNING:</b> This SPIR-V only computes element-wise products c[idx] = a[idx] * b[idx]
+    /// without performing the parallel reduction (shared memory + barrier + atomicAdd).
+    /// A correct implementation needs OpControlBarrier, shared memory variables, and a reduction loop.
+    /// The GLSL source below shows the intended shared-memory reduction implementation.</para>
     /// GLSL Source:
     /// <code>
     /// #version 450
@@ -877,6 +889,12 @@ public static class VulkanKernels
     /// Vector L2 norm: result = sqrt(sum(A^2))
     /// Push constants: { uint size; }
     /// </summary>
+    /// <remarks>
+    /// <para><b>WARNING:</b> This SPIR-V only computes element-wise squares c[idx] = a[idx]^2
+    /// without performing the parallel reduction (sum) or final sqrt.
+    /// A correct implementation needs shared memory reduction, barrier synchronization,
+    /// and an ExtInst sqrt call on the final result.</para>
+    /// </remarks>
     public static readonly uint[] VectorNorm = new uint[]
     {
         0x07230203, 0x00010000, 0x00080001, 0x00000050, 0x00000000,
@@ -1020,6 +1038,10 @@ public static class VulkanKernels
     /// Push constants: { uint size; float epsilon; }
     /// Buffers: A=input, B=gamma, C=beta, D=mean, E=var, F=output
     /// </summary>
+    /// <remarks>
+    /// <para><b>WARNING:</b> This is an identity stub (copies input to output).
+    /// A correct implementation needs 6 buffer bindings and the normalization arithmetic.</para>
+    /// </remarks>
     public static readonly uint[] BatchNorm = new uint[]
     {
         0x07230203, 0x00010000, 0x00080001, 0x00000060, 0x00000000,
@@ -1089,6 +1111,10 @@ public static class VulkanKernels
     /// 2D Convolution: C = conv2d(A, kernel)
     /// Push constants: { uint inputH; uint inputW; uint kernelH; uint kernelW; uint strideH; uint strideW; }
     /// </summary>
+    /// <remarks>
+    /// <para><b>WARNING:</b> This is an identity stub (copies input to output).
+    /// A correct implementation needs nested loops over kernel dimensions with accumulation.</para>
+    /// </remarks>
     public static readonly uint[] Conv2D = new uint[]
     {
         0x07230203, 0x00010000, 0x00080001, 0x00000070, 0x00000000,
@@ -1157,6 +1183,10 @@ public static class VulkanKernels
     /// Max Pooling 2D: C = maxpool2d(A, poolSize, stride)
     /// Push constants: { uint inputH; uint inputW; uint poolH; uint poolW; uint strideH; uint strideW; }
     /// </summary>
+    /// <remarks>
+    /// <para><b>WARNING:</b> This is an identity stub (copies input to output).
+    /// A correct implementation needs nested loops over pool window with max comparison.</para>
+    /// </remarks>
     public static readonly uint[] MaxPool2D = new uint[]
     {
         0x07230203, 0x00010000, 0x00080001, 0x00000060, 0x00000000,
@@ -1223,6 +1253,10 @@ public static class VulkanKernels
     /// Average Pooling 2D: C = avgpool2d(A, poolSize, stride)
     /// Push constants: { uint inputH; uint inputW; uint poolH; uint poolW; uint strideH; uint strideW; }
     /// </summary>
+    /// <remarks>
+    /// <para><b>WARNING:</b> This is an identity stub (copies input to output).
+    /// A correct implementation needs nested loops over pool window with sum and division.</para>
+    /// </remarks>
     public static readonly uint[] AvgPool2D = new uint[]
     {
         0x07230203, 0x00010000, 0x00080001, 0x00000060, 0x00000000,

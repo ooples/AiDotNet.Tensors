@@ -788,16 +788,14 @@ public sealed partial class MetalBackend
             float label = l[b];
             if (label == 0)
             {
+                // Similar pairs: minimize distance
                 totalLoss += dist * dist;
             }
             else
             {
-                totalLoss += MathF.Max(0, margin - dist);
-                float marginDist = margin - dist;
-                if (marginDist > 0)
-                {
-                    totalLoss += marginDist * marginDist;
-                }
+                // Dissimilar pairs: squared hinge loss
+                float marginDist = MathF.Max(0, margin - dist);
+                totalLoss += marginDist * marginDist;
             }
         }
         return totalLoss / batchSize;

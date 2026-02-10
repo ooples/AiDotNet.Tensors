@@ -38,7 +38,7 @@ public sealed unsafe class VulkanBackend : IDisposable
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);
 
     private readonly VulkanDevice _device;
-    private readonly ConcurrentDictionary<VulkanKernelType, VulkanComputePipeline> _pipelineCache;
+    private readonly ConcurrentDictionary<(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize), VulkanComputePipeline> _pipelineCache;
     private readonly ConcurrentDictionary<VulkanKernelType, VulkanShaderModule> _shaderCache;
     private VulkanBufferTransfer? _transfer;
     private IntPtr _commandBuffer;
@@ -78,7 +78,7 @@ public sealed unsafe class VulkanBackend : IDisposable
     private VulkanBackend()
     {
         _device = VulkanDevice.Instance;
-        _pipelineCache = new ConcurrentDictionary<VulkanKernelType, VulkanComputePipeline>();
+        _pipelineCache = new ConcurrentDictionary<(VulkanKernelType, int, uint), VulkanComputePipeline>();
         _shaderCache = new ConcurrentDictionary<VulkanKernelType, VulkanShaderModule>();
     }
 
@@ -136,7 +136,8 @@ public sealed unsafe class VulkanBackend : IDisposable
     /// </summary>
     private VulkanComputePipeline? GetOrCreatePipeline(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize = 0)
     {
-        if (_pipelineCache.TryGetValue(kernelType, out var cached))
+        var cacheKey = (kernelType, bindingCount, pushConstantSize);
+        if (_pipelineCache.TryGetValue(cacheKey, out var cached))
         {
             return cached;
         }
@@ -150,7 +151,7 @@ public sealed unsafe class VulkanBackend : IDisposable
         var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
         if (pipeline != null)
         {
-            _pipelineCache.TryAdd(kernelType, pipeline);
+            _pipelineCache.TryAdd(cacheKey, pipeline);
         }
 
         return pipeline;

@@ -10,10 +10,16 @@ public sealed partial class MetalBackend
     /// <summary>
     /// 2D matrix transpose.
     /// </summary>
+    /// <remarks>
+    /// TODO: Replace CPU fallback with a Metal compute kernel to avoid GPU-CPU-GPU round-trip.
+    /// A proper implementation would use a Metal shader with threadgroup memory for coalesced reads/writes.
+    /// </remarks>
     public void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
     {
         ThrowIfDisposed();
 
+        // CPU fallback: download, transpose, upload
+        // This incurs a GPU->CPU->GPU round-trip penalty.
         var aData = DownloadBuffer(A);
         var bData = new float[rows * cols];
 

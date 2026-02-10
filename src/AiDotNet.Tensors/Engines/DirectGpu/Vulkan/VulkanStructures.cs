@@ -301,6 +301,8 @@ public struct VkMemoryHeap
 {
     public ulong size;
     public uint flags;
+    // Padding for 16-byte alignment as per Vulkan spec
+    private uint _padding;
 }
 
 /// <summary>

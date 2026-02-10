@@ -74,9 +74,14 @@ public sealed unsafe class VulkanBuffer : IDisposable
     /// <param name="hostVisible">Whether to use host-visible memory.</param>
     private VulkanBuffer(VulkanDevice device, int elementCount, uint usage, bool hostVisible)
     {
+        if (elementCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(elementCount), elementCount, "Element count must be positive.");
+        }
+
         _device = device;
         _elementCount = elementCount;
-        _size = (ulong)(elementCount * sizeof(float));
+        _size = (ulong)elementCount * sizeof(float);
         _usage = usage;
         _isHostVisible = hostVisible;
     }
@@ -521,7 +526,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         // Add memory barrier to ensure compute writes are visible
         var preBarrier = new VkBufferMemoryBarrier
         {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO + 32,
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             pNext = null,
             srcAccessMask = VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
             dstAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_READ_BIT,

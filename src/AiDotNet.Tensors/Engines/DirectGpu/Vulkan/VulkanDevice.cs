@@ -529,8 +529,17 @@ public sealed unsafe class VulkanDevice : IDisposable
             pSignalSemaphores = null
         };
 
-        VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, _fence);
-        VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
+        var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, _fence);
+        if (submitResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
+        }
+
+        var waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
+        if (waitResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            throw new InvalidOperationException($"vkWaitForFences failed with error code {waitResult}");
+        }
     }
 
     private void Cleanup()

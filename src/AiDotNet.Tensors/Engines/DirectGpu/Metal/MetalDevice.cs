@@ -221,15 +221,13 @@ public sealed class MetalDevice : IDisposable
     /// </summary>
     private MTLSize GetMaxThreadsPerThreadgroup()
     {
-        // On Apple Silicon, typical max is 1024 total threads
-        // Common configurations: 1024x1x1, 32x32x1, 16x16x4, etc.
-        // We query the actual value from the device
+        // On Apple Silicon, typical max is 1024 total threads.
+        // The product of all dimensions must not exceed the device's maximum.
+        // M1/M2/M3/M4 support up to 1024 total threads per threadgroup.
+        // Using (1024, 1, 1) as a safe conservative default that works on all Metal devices.
+        // Callers should reshape dimensions based on their specific dispatch needs.
 
-        // Note: maxThreadsPerThreadgroup returns an MTLSize struct
-        // For simplicity, we use typical Apple Silicon values
-        // M1/M2/M3 support up to 1024 threads per threadgroup
-
-        return new MTLSize(1024, 1024, 64);
+        return new MTLSize(1024, 1, 1);
     }
 
     /// <summary>
@@ -367,7 +365,7 @@ public sealed class MetalDevice : IDisposable
         try
         {
             IntPtr errorPtr = IntPtr.Zero;
-            var library = SendMessage(_device, Selectors.NewLibraryWithSource, sourceNS, IntPtr.Zero, errorPtr);
+            var library = MetalNativeBindings.SendMessageWithError(_device, Selectors.NewLibraryWithSource, sourceNS, IntPtr.Zero, ref errorPtr);
 
             if (library == IntPtr.Zero && errorPtr != IntPtr.Zero)
             {
@@ -399,7 +397,7 @@ public sealed class MetalDevice : IDisposable
         }
 
         IntPtr errorPtr = IntPtr.Zero;
-        var pipelineState = SendMessage(_device, Selectors.NewComputePipelineStateWithFunction, function, errorPtr);
+        var pipelineState = MetalNativeBindings.SendMessageWithError(_device, Selectors.NewComputePipelineStateWithFunction, function, ref errorPtr);
 
         if (pipelineState == IntPtr.Zero && errorPtr != IntPtr.Zero)
         {

@@ -127,20 +127,8 @@ public sealed class MetalCommandQueue : IDisposable
     {
         ThrowIfDisposed();
 
-        IntPtr buffer;
-        lock (_lock)
-        {
-            // Try to reuse a pooled buffer first
-            if (_commandBufferPool.Count > 0)
-            {
-                buffer = _commandBufferPool.Dequeue();
-                Interlocked.Increment(ref _activeBufferCount);
-                return buffer;
-            }
-        }
-
-        // Create a new command buffer
-        buffer = SendMessage(_commandQueue, Selectors.CommandBuffer);
+        // Metal command buffers cannot be reused after commit, so always create a new one.
+        var buffer = SendMessage(_commandQueue, Selectors.CommandBuffer);
         if (buffer != IntPtr.Zero)
         {
             Retain(buffer);
@@ -187,23 +175,9 @@ public sealed class MetalCommandQueue : IDisposable
 
         lock (_lock)
         {
-            // Check if the command buffer has completed
-            var status = (MTLCommandBufferStatus)SendMessageULongReturn(commandBuffer, Selectors.Status);
-
-            if (status == MTLCommandBufferStatus.Completed)
-            {
-                // Release completed buffers - they can't be reused
-                Release(commandBuffer);
-            }
-            else if (_commandBufferPool.Count < _maxPooledBuffers)
-            {
-                // Pool for reuse if not yet completed and pool isn't full
-                _commandBufferPool.Enqueue(commandBuffer);
-            }
-            else
-            {
-                Release(commandBuffer);
-            }
+            // Metal command buffers cannot be reused after commit.
+            // Always release them regardless of status.
+            Release(commandBuffer);
         }
     }
 
@@ -473,8 +447,12 @@ public sealed class MetalCommandQueue : IDisposable
         CopyBufferInternal(encoder, sourceBuffer, sourceOffset, destBuffer, destOffset, size);
     }
 
+    /// <summary>
+    /// P/Invoke for Metal blit encoder copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:
+    /// Maps to [encoder copyFromBuffer:source sourceOffset:srcOff toBuffer:dest destinationOffset:dstOff size:sz]
+    /// </summary>
     [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
-    private static extern void CopyBufferInternal(
+    private static extern void CopyBufferSend(
         IntPtr encoder,
         IntPtr selector,
         IntPtr sourceBuffer,
@@ -483,12 +461,13 @@ public sealed class MetalCommandQueue : IDisposable
         ulong destOffset,
         ulong size);
 
+    private static readonly IntPtr CopyFromBufferSelector =
+        MetalNativeBindings.RegisterSelector("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:");
+
     private static void CopyBufferInternal(IntPtr encoder, IntPtr sourceBuffer, ulong sourceOffset,
         IntPtr destBuffer, ulong destOffset, ulong size)
     {
-        // Note: This is simplified - real implementation needs proper selector passing
-        // The actual Metal API is:
-        // copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:
+        CopyBufferSend(encoder, CopyFromBufferSelector, sourceBuffer, sourceOffset, destBuffer, destOffset, size);
     }
 
     /// <summary>

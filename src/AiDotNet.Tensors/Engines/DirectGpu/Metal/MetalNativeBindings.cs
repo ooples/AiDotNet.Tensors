@@ -40,10 +40,17 @@ public static class MetalNativeBindings
             }
 
             // Check macOS version - Metal requires macOS 10.11+
+            // Note: On .NET 5+, Environment.OSVersion returns Darwin kernel version, not macOS marketing version.
+            // Use OperatingSystem.IsMacOSVersionAtLeast when available for correct detection.
             try
             {
+#if NET5_0_OR_GREATER
+                return OperatingSystem.IsMacOSVersionAtLeast(10, 11);
+#else
+                // Fallback for .NET Framework: Darwin 15.x maps to macOS 10.11 (El Capitan)
                 var version = Environment.OSVersion.Version;
-                return version.Major >= 10 && version.Minor >= 11;
+                return version.Major >= 15;
+#endif
             }
             catch
             {
@@ -96,6 +103,18 @@ public static class MetalNativeBindings
     /// </summary>
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     public static extern IntPtr SendMessage(IntPtr receiver, IntPtr selector, IntPtr arg1, IntPtr arg2, IntPtr arg3);
+
+    /// <summary>
+    /// Sends a message with an IntPtr, IntPtr, and ref IntPtr argument (for NSError** out-parameters).
+    /// </summary>
+    [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
+    public static extern IntPtr SendMessageWithError(IntPtr receiver, IntPtr selector, IntPtr arg1, IntPtr arg2, ref IntPtr errorOut);
+
+    /// <summary>
+    /// Sends a message with an IntPtr and ref IntPtr argument (for NSError** out-parameters).
+    /// </summary>
+    [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
+    public static extern IntPtr SendMessageWithError(IntPtr receiver, IntPtr selector, IntPtr arg1, ref IntPtr errorOut);
 
     /// <summary>
     /// Sends a message with an IntPtr and ulong argument.

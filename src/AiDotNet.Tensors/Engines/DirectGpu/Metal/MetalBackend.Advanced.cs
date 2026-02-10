@@ -282,7 +282,7 @@ public sealed partial class MetalBackend
         ThrowIfDisposed();
 
         var gradOutData = DownloadBuffer(gradOutput);
-        var gradBiasesData = new float[outputFeatures * inputFeatures];
+        var gradBiasesData = new float[outputFeatures];
 
         for (int o = 0; o < outputFeatures; o++)
         {
@@ -291,11 +291,8 @@ public sealed partial class MetalBackend
             {
                 sum += gradOutData[b * outputFeatures + o];
             }
-            // Sum over batch for each output feature
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                gradBiasesData[o * inputFeatures + i] = sum / inputFeatures;
-            }
+            // Bias gradient is the sum over batch for each output feature
+            gradBiasesData[o] = sum;
         }
 
         UploadToBuffer(gradBiases, gradBiasesData);

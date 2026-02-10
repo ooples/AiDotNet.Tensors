@@ -638,8 +638,8 @@ public sealed partial class MetalBackend
                                     int idx = b * channels * inHeight * inWidth +
                                              c * inHeight * inWidth + ih * inWidth + iw;
                                     sum += inp[idx];
+                                    count++;
                                 }
-                                count++;
                             }
                         }
 
