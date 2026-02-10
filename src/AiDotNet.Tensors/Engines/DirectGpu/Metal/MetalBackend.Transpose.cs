@@ -8,55 +8,52 @@ public sealed partial class MetalBackend
     #region Transpose and Reshape
 
     /// <summary>
-    /// 2D matrix transpose.
+    /// 2D matrix transpose using Metal compute kernel.
     /// </summary>
-    /// <remarks>
-    /// TODO: Replace CPU fallback with a Metal compute kernel to avoid GPU-CPU-GPU round-trip.
-    /// A proper implementation would use a Metal shader with threadgroup memory for coalesced reads/writes.
-    /// </remarks>
     public void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
     {
         ThrowIfDisposed();
 
-        // CPU fallback: download, transpose, upload
-        // This incurs a GPU->CPU->GPU round-trip penalty.
-        var aData = DownloadBuffer(A);
-        var bData = new float[rows * cols];
-
-        for (int i = 0; i < rows; i++)
+        if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer)
         {
-            for (int j = 0; j < cols; j++)
-            {
-                bData[j * rows + i] = aData[i * cols + j];
-            }
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        UploadToBuffer(B, bData);
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "transpose");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(cols, rows);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBytes((uint)rows, 2);
+        encoder.SetBytes((uint)cols, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>
-    /// Batched matrix transpose.
+    /// Batched matrix transpose using Metal compute kernel.
     /// </summary>
     public void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
     {
         ThrowIfDisposed();
 
-        var aData = DownloadBuffer(A);
-        var bData = new float[batch * rows * cols];
-
-        for (int b = 0; b < batch; b++)
+        if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer)
         {
-            int offset = b * rows * cols;
-            for (int i = 0; i < rows; i++)
-            {
-                for (int j = 0; j < cols; j++)
-                {
-                    bData[offset + j * rows + i] = aData[offset + i * cols + j];
-                }
-            }
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        UploadToBuffer(B, bData);
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, "batched_transpose");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate3DDispatch(cols, rows, batch);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBytes((uint)batch, 2);
+        encoder.SetBytes((uint)rows, 3);
+        encoder.SetBytes((uint)cols, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     /// <summary>

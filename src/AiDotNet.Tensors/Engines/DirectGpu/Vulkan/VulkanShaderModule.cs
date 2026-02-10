@@ -114,7 +114,7 @@ public sealed unsafe class VulkanShaderModule : IDisposable
         }
 
         // SPIR-V spec requires codeSize to be a multiple of 4
-        // Copy byte[] into uint[] to guarantee 4-byte alignment required by Vulkan for pCode
+        // Copy byte[] into uint[] so pCode points to 32-bit words and codeSize can be rounded up to a 4-byte multiple as required by Vulkan
         int uint32Count = (spirvCode.Length + 3) / 4;
         var alignedCode = new uint[uint32Count];
         Buffer.BlockCopy(spirvCode, 0, alignedCode, 0, spirvCode.Length);

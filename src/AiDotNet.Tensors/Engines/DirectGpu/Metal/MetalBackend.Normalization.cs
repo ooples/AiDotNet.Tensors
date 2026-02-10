@@ -584,26 +584,26 @@ public sealed partial class MetalBackend
         {
             if (dropoutRate >= 1.0f)
             {
-                // dropoutRate of 1.0 means drop everything — output all zeros
-                UploadToBuffer(output, outputData);
-                UploadToBuffer(mask, maskData);
-                return;
+                // dropoutRate of 1.0 (or higher) means drop everything — leave arrays as zeros
+                // The common upload at the end of the method will write these zeros to the buffers.
             }
-
-            var rng = new Random((int)(seed & 0x7FFFFFFF));
-            float scale = 1.0f / (1.0f - dropoutRate);
-
-            for (int i = 0; i < size; i++)
+            else
             {
-                if (rng.NextDouble() >= dropoutRate)
+                var rng = new Random((int)(seed & 0x7FFFFFFF));
+                float scale = 1.0f / (1.0f - dropoutRate);
+
+                for (int i = 0; i < size; i++)
                 {
-                    maskData[i] = scale;
-                    outputData[i] = inputData[i] * scale;
-                }
-                else
-                {
-                    maskData[i] = 0;
-                    outputData[i] = 0;
+                    if (rng.NextDouble() >= dropoutRate)
+                    {
+                        maskData[i] = scale;
+                        outputData[i] = inputData[i] * scale;
+                    }
+                    else
+                    {
+                        maskData[i] = 0;
+                        outputData[i] = 0;
+                    }
                 }
             }
         }
