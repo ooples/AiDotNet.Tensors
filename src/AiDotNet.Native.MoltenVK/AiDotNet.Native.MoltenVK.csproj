@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>AiDotNet.Native.MoltenVK</PackageId>
+    <Version>1.2.11</Version>
+    <Authors>AiDotNet Contributors</Authors>
+    <Company>AiDotNet</Company>
+    <Description>Native MoltenVK binaries for Vulkan GPU acceleration on macOS and iOS. MoltenVK is a Vulkan-to-Metal translation layer that enables the AiDotNet.Tensors Vulkan backend to run on Apple platforms. Install this package to use Vulkan compute shaders on macOS (Intel and Apple Silicon).</Description>
+    <PackageTags>moltenvk;vulkan;metal;macos;apple-silicon;gpu;native</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- This is a native-only package, no managed code -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+
+    <!-- Include native libraries in package -->
+    <ContentTargetFolders>content</ContentTargetFolders>
+  </PropertyGroup>
+
+  <!-- macOS x64 (Intel) native libraries -->
+  <ItemGroup>
+    <None Include="runtimes\osx-x64\native\libvulkan.1.dylib" Pack="true" PackagePath="runtimes\osx-x64\native" Condition="Exists('runtimes\osx-x64\native\libvulkan.1.dylib')" />
+    <None Include="runtimes\osx-x64\native\libMoltenVK.dylib" Pack="true" PackagePath="runtimes\osx-x64\native" Condition="Exists('runtimes\osx-x64\native\libMoltenVK.dylib')" />
+    <None Include="runtimes\osx-x64\native\MoltenVK_icd.json" Pack="true" PackagePath="runtimes\osx-x64\native" Condition="Exists('runtimes\osx-x64\native\MoltenVK_icd.json')" />
+  </ItemGroup>
+
+  <!-- macOS arm64 (Apple Silicon) native libraries -->
+  <ItemGroup>
+    <None Include="runtimes\osx-arm64\native\libvulkan.1.dylib" Pack="true" PackagePath="runtimes\osx-arm64\native" Condition="Exists('runtimes\osx-arm64\native\libvulkan.1.dylib')" />
+    <None Include="runtimes\osx-arm64\native\libMoltenVK.dylib" Pack="true" PackagePath="runtimes\osx-arm64\native" Condition="Exists('runtimes\osx-arm64\native\libMoltenVK.dylib')" />
+    <None Include="runtimes\osx-arm64\native\MoltenVK_icd.json" Pack="true" PackagePath="runtimes\osx-arm64\native" Condition="Exists('runtimes\osx-arm64\native\MoltenVK_icd.json')" />
+  </ItemGroup>
+
+  <!-- Ensure native libraries are copied to output -->
+  <ItemGroup>
+    <None Update="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- License file -->
+  <ItemGroup>
+    <None Include="LICENSE.MoltenVK.txt" Pack="true" PackagePath="\" Condition="Exists('LICENSE.MoltenVK.txt')" />
+  </ItemGroup>
+
+  <!-- Build targets to copy native libraries -->
+  <ItemGroup>
+    <None Include="build\AiDotNet.Native.MoltenVK.targets" Pack="true" PackagePath="build" />
+  </ItemGroup>
+
+</Project>

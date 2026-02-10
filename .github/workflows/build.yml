@@ -126,7 +126,23 @@ jobs:
       run: dotnet build --configuration Release --no-restore
 
     - name: Pack
-      run: dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-build --output ./artifacts
+      shell: pwsh
+      run: |
+        dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-build --output ./artifacts
+
+        # Pack native packages
+        $nativeProjects = @(
+          "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj",
+          "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj",
+          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj",
+          "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
+        )
+        foreach ($proj in $nativeProjects) {
+          if (Test-Path $proj) {
+            Write-Host "Packing $proj..."
+            dotnet pack $proj --configuration Release --no-build --output ./artifacts
+          }
+        }
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

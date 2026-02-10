@@ -309,6 +309,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+          # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
+          if (Test-Path "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj") {
+            Write-Host "Packing AiDotNet.Native.MoltenVK..."
+            dotnet pack src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
           # Note: CUDA package is not packed in CI because native binaries (770MB) are not in git
           # CUDA package must be built and published locally with binaries present
 
@@ -394,6 +401,8 @@ jobs:
             - **AiDotNet.Tensors** - Core tensor operations with SIMD acceleration
             - **AiDotNet.Native.OpenBLAS** - CPU-accelerated BLAS operations
             - **AiDotNet.Native.CLBlast** - GPU-accelerated OpenCL BLAS operations
+            - **AiDotNet.Native.OneDNN** - Intel oneDNN CPU deep learning acceleration
+            - **AiDotNet.Native.MoltenVK** - Vulkan on macOS via Metal translation layer
 
             > Note: AiDotNet.Native.CUDA must be built locally due to large binary size (770MB).
 
