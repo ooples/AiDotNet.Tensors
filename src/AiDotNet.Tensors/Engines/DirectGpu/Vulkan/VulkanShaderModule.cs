@@ -264,6 +264,23 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
 
     private bool CreateDescriptorSetLayout()
     {
+        if (_bindingCount == 0)
+        {
+            var emptyCreateInfo = new VkDescriptorSetLayoutCreateInfo
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                pNext = null,
+                flags = 0,
+                bindingCount = 0,
+                pBindings = null
+            };
+
+            var emptyResult = VulkanNativeBindings.vkCreateDescriptorSetLayout(
+                _device.Device, &emptyCreateInfo, IntPtr.Zero, out _descriptorSetLayout);
+
+            return emptyResult == VulkanNativeBindings.VK_SUCCESS && _descriptorSetLayout != IntPtr.Zero;
+        }
+
         var bindings = stackalloc VkDescriptorSetLayoutBinding[_bindingCount];
 
         for (int i = 0; i < _bindingCount; i++)

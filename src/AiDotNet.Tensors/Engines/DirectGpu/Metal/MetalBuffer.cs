@@ -385,11 +385,11 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         }
 
         // Call [MTLBuffer didModifyRange:NSMakeRange(offset, count)]
-        // NSRange is passed as two ulong values (location, length) on ARM64
-        ulong rangeLocation = (ulong)(offset * sizeof(float));
-        ulong rangeLength = (ulong)(count * sizeof(float));
-        MetalNativeBindings.SendMessageULong2(
-            _buffer, MetalNativeBindings.Selectors.DidModifyRange, rangeLocation, rangeLength);
+        var range = new MetalNativeBindings.NSRange(
+            (ulong)(offset * sizeof(float)),
+            (ulong)(count * sizeof(float)));
+        MetalNativeBindings.SendMessageNSRange(
+            _buffer, MetalNativeBindings.Selectors.DidModifyRange, range);
     }
 
     private void ThrowIfDisposed()

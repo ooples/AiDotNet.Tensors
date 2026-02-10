@@ -66,8 +66,29 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
 
-        var inputData = DownloadBuffer(input);
         int ndim = shape.Length;
+
+        // Validate permutation array
+        if (permutation.Length != ndim)
+        {
+            throw new ArgumentException($"Permutation length ({permutation.Length}) must match shape dimensions ({ndim}).", nameof(permutation));
+        }
+
+        var seen = new bool[ndim];
+        for (int i = 0; i < ndim; i++)
+        {
+            if (permutation[i] < 0 || permutation[i] >= ndim)
+            {
+                throw new ArgumentOutOfRangeException(nameof(permutation), $"Permutation index {permutation[i]} at position {i} is out of range [0, {ndim}).");
+            }
+            if (seen[permutation[i]])
+            {
+                throw new ArgumentException($"Duplicate index {permutation[i]} in permutation array.", nameof(permutation));
+            }
+            seen[permutation[i]] = true;
+        }
+
+        var inputData = DownloadBuffer(input);
 
         // Compute output shape and strides
         var outputShape = new int[ndim];
@@ -140,7 +161,16 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var data = DownloadBuffer(source);
-        UploadToBuffer(destination, data);
+        if (data.Length > size)
+        {
+            var slice = new float[size];
+            Array.Copy(data, slice, size);
+            UploadToBuffer(destination, slice);
+        }
+        else
+        {
+            UploadToBuffer(destination, data);
+        }
     }
 
     /// <summary>
@@ -531,8 +561,19 @@ public sealed partial class MetalBackend
         ThrowIfDisposed();
 
         var inputFloatData = DownloadBuffer(input);
-        var inputBytes = new byte[size * 2];
-        Buffer.BlockCopy(inputFloatData, 0, inputBytes, 0, size * 2);
+
+        // Input buffer must have at least (size + 1) / 2 floats to hold size FP16 values
+        int requiredFloats = (size + 1) / 2;
+        if (inputFloatData.Length < requiredFloats)
+        {
+            throw new ArgumentException(
+                $"Input buffer too small: has {inputFloatData.Length} floats but needs at least {requiredFloats} to hold {size} FP16 values.",
+                nameof(input));
+        }
+
+        int bytesToCopy = size * 2;
+        var inputBytes = new byte[bytesToCopy];
+        Buffer.BlockCopy(inputFloatData, 0, inputBytes, 0, bytesToCopy);
 
         var outputData = new float[size];
 

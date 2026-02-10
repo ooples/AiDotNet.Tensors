@@ -759,7 +759,8 @@ public sealed partial class MetalBackend
                     }
                 }
                 result[b * channels + c] = maxVal;
-                idxResult[b * channels + c] = maxIdx;
+                // Store index as int-to-float bitcast to avoid float precision loss for large indices
+                unsafe { int tmp = maxIdx; idxResult[b * channels + c] = *(float*)&tmp; }
             }
         }
 
@@ -816,7 +817,9 @@ public sealed partial class MetalBackend
         {
             for (int c = 0; c < channels; c++)
             {
-                int maxIdx = (int)idx[b * channels + c];
+                // Decode index from int-to-float bitcast stored in forward pass
+                int maxIdx;
+                unsafe { float tmp = idx[b * channels + c]; maxIdx = *(int*)&tmp; }
                 result[b * channels * spatialSize + c * spatialSize + maxIdx] = go[b * channels + c];
             }
         }
@@ -882,11 +885,7 @@ public sealed partial class MetalBackend
         int strideD, int strideH, int strideW)
     {
         ThrowIfDisposed();
-        var result = new float[batch * channels * outDepth * outHeight * outWidth];
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("MaxPool3D is not yet implemented in the Metal backend. Use MaxPool2D or implement a CPU fallback.");
     }
 
     /// <summary>
@@ -898,11 +897,7 @@ public sealed partial class MetalBackend
         int outDepth, int outHeight, int outWidth)
     {
         ThrowIfDisposed();
-        var result = new float[batch * channels * inDepth * inHeight * inWidth];
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("MaxPool3DBackward is not yet implemented in the Metal backend. Use MaxPool2DBackward or implement a CPU fallback.");
     }
 
     #endregion

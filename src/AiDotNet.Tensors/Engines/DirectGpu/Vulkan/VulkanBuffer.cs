@@ -255,6 +255,11 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         int copyCount = Math.Min(data.Length, _elementCount);
+        if (copyCount == 0)
+        {
+            return;
+        }
+
         ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
@@ -290,6 +295,11 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         int copyCount = Math.Min(data.Length, _elementCount);
+        if (copyCount == 0)
+        {
+            return;
+        }
+
         ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
@@ -321,7 +331,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
     /// <param name="data">The data to write.</param>
     public void WriteRawData<T>(ReadOnlySpan<T> data) where T : unmanaged
     {
-        if (!_isHostVisible || _disposed)
+        if (!_isHostVisible || _disposed || data.Length == 0)
         {
             return;
         }

@@ -241,11 +241,12 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
         }
 
-        // Update descriptor set
-        pipeline.UpdateDescriptorSet(bufferA, bufferB, bufferC);
-
-        // Record and execute command buffer
-        RecordAndExecuteCompute(pipeline, size);
+        // Lock around descriptor set update + dispatch to prevent concurrent mutation
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(bufferA, bufferB, bufferC);
+            RecordAndExecuteComputeUnlocked(pipeline, size);
+        }
 
         // Download results
         _transfer.CopyFromDevice(bufferC, stagingC);
@@ -299,11 +300,12 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
         }
 
-        // Update descriptor set
-        pipeline.UpdateDescriptorSet(bufferA, bufferB);
-
-        // Record and execute command buffer
-        RecordAndExecuteCompute(pipeline, size);
+        // Lock around descriptor set update + dispatch to prevent concurrent mutation
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(bufferA, bufferB);
+            RecordAndExecuteComputeUnlocked(pipeline, size);
+        }
 
         // Download results
         _transfer.CopyFromDevice(bufferB, stagingB);
@@ -357,11 +359,12 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException("Failed to create scalar multiply pipeline.");
         }
 
-        // Update descriptor set
-        pipeline.UpdateDescriptorSet(bufferA, bufferB);
-
-        // Record and execute command buffer with push constants
-        RecordAndExecuteComputeWithScalar(pipeline, size, scalar);
+        // Lock around descriptor set update + dispatch to prevent concurrent mutation
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(bufferA, bufferB);
+            RecordAndExecuteComputeWithScalarUnlocked(pipeline, size, scalar);
+        }
 
         // Download results
         _transfer.CopyFromDevice(bufferB, stagingB);
@@ -424,10 +427,11 @@ public sealed unsafe class VulkanBackend : IDisposable
         ExecuteUnaryOp(input, result, VulkanKernelType.Tanh);
     }
 
-    private void RecordAndExecuteCompute(VulkanComputePipeline pipeline, int elementCount)
+    /// <summary>
+    /// Records and executes a compute dispatch. Caller MUST hold _computeLock.
+    /// </summary>
+    private void RecordAndExecuteComputeUnlocked(VulkanComputePipeline pipeline, int elementCount)
     {
-        lock (_computeLock)
-        {
         // Reset command buffer
         VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
 
@@ -476,13 +480,13 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Submit and wait
         _device.SubmitAndWait(_commandBuffer);
-        }
     }
 
-    private void RecordAndExecuteComputeWithScalar(VulkanComputePipeline pipeline, int elementCount, float scalar)
+    /// <summary>
+    /// Records and executes a compute dispatch with scalar push constant. Caller MUST hold _computeLock.
+    /// </summary>
+    private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar)
     {
-        lock (_computeLock)
-        {
         // Reset command buffer
         VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
 
@@ -538,7 +542,6 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Submit and wait
         _device.SubmitAndWait(_commandBuffer);
-        }
     }
 
     /// <summary>

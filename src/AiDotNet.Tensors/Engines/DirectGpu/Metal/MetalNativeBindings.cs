@@ -135,6 +135,12 @@ public static class MetalNativeBindings
     public static extern IntPtr SendMessageULong2(IntPtr receiver, IntPtr selector, ulong arg1, ulong arg2);
 
     /// <summary>
+    /// Sends a message with an NSRange struct parameter (e.g., didModifyRange:).
+    /// </summary>
+    [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
+    public static extern void SendMessageNSRange(IntPtr receiver, IntPtr selector, NSRange range);
+
+    /// <summary>
     /// Sends a message that returns a ulong.
     /// </summary>
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
@@ -267,6 +273,22 @@ public static class MetalNativeBindings
     }
 
     /// <summary>
+    /// Foundation NSRange structure (location, length).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NSRange
+    {
+        public ulong Location;
+        public ulong Length;
+
+        public NSRange(ulong location, ulong length)
+        {
+            Location = location;
+            Length = length;
+        }
+    }
+
+    /// <summary>
     /// Metal origin structure (x, y, z).
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
@@ -378,7 +400,7 @@ public static class MetalNativeBindings
     public static class Selectors
     {
         // Device selectors
-        public static readonly IntPtr CreateSystemDefaultDevice = RegisterSelector("MTLCreateSystemDefaultDevice");
+        // Note: MTLCreateSystemDefaultDevice is a C function, not a selector — called via DllImport directly
         public static readonly IntPtr Name = RegisterSelector("name");
         public static readonly IntPtr MaxThreadsPerThreadgroup = RegisterSelector("maxThreadsPerThreadgroup");
         public static readonly IntPtr MaxThreadgroupMemoryLength = RegisterSelector("maxThreadgroupMemoryLength");
