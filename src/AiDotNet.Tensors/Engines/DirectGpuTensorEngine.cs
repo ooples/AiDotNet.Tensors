@@ -4006,16 +4006,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
-        using OwnedBuffer? biasBufferHandle = attentionBias is not null
+        using var biasBufferHandle = attentionBias is not null
             ? GetOrAllocateBiasBuffer(backend, attentionBias, batch, heads, seqQ, seqK, out biasBatchStride)
-            : null;
+            : default(OwnedBuffer);
 
         try
         {
             // Execute GPU FlashAttention with optional bias
             backend.FlashAttentionV2(queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer, outputBuffer.Buffer, statsBuffer.Buffer,
                 batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal,
-                biasBufferHandle?.Buffer, biasBatchStride);
+                biasBufferHandle.Buffer, biasBatchStride);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] outputFloat = new float[batch * heads * seqQ * headDim];
@@ -4082,9 +4082,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
         // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
-        using OwnedBuffer? biasBufferHandle = attentionBias is not null
+        using var biasBufferHandle = attentionBias is not null
             ? GetOrAllocateBiasBuffer(backend, attentionBias, batch, heads, seqQ, seqK, out biasBatchStride)
-            : null;
+            : default(OwnedBuffer);
 
         try
         {
@@ -4092,7 +4092,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
             backend.FlashAttentionBackward(gradOutBuffer.Buffer, queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer,
                 outputBuffer.Buffer, statsBuffer.Buffer, gradQBuffer.Buffer, gradKBuffer.Buffer, gradVBuffer.Buffer,
                 batch, heads, seqQ, seqK, headDim, (float)scale, isCausal,
-                biasBufferHandle?.Buffer, biasBatchStride);
+                biasBufferHandle.Buffer, biasBatchStride);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] gradQFloat = new float[batch * heads * seqQ * headDim];
