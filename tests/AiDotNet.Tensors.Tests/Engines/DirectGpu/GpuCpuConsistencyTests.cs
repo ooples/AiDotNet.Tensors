@@ -39,10 +39,7 @@ public class GpuCpuConsistencyTests
 
     private void SkipIfNoGpu()
     {
-        if (!_isVulkanAvailable)
-        {
-            throw new SkipException("GPU not available on this system");
-        }
+        Skip.If(!_isVulkanAvailable, "GPU not available on this system");
     }
 
     private static bool AreClose(float expected, float actual, float tolerance = Tolerance)
@@ -64,7 +61,7 @@ public class GpuCpuConsistencyTests
 
     #region Addition Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Add_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -92,7 +89,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_ExtremeValues_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -129,7 +126,7 @@ public class GpuCpuConsistencyTests
 
     #region Subtraction Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -154,7 +151,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_CancellationPrecision_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -181,7 +178,7 @@ public class GpuCpuConsistencyTests
 
     #region Multiplication Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -206,7 +203,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_OverflowCases_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -232,7 +229,7 @@ public class GpuCpuConsistencyTests
 
     #region Division Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Divide_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -258,7 +255,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_SpecialCases_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -295,7 +292,7 @@ public class GpuCpuConsistencyTests
 
     #region Scalar Multiply Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -320,7 +317,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_SpecialScalars_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -349,7 +346,7 @@ public class GpuCpuConsistencyTests
 
     #region ReLU Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -373,7 +370,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_NearZero_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -405,7 +402,7 @@ public class GpuCpuConsistencyTests
 
     #region Sigmoid Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -429,7 +426,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_ExtremeValues_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -455,7 +452,7 @@ public class GpuCpuConsistencyTests
 
     #region Tanh Consistency Tests
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_RandomData_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -479,7 +476,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_ExtremeValues_MatchesCpu()
     {
         SkipIfNoGpu();
@@ -504,7 +501,7 @@ public class GpuCpuConsistencyTests
 
     #region Data Transfer Integrity Tests
 
-    [Fact]
+    [SkippableFact]
     public void DataTransfer_PreservesExactBitPattern()
     {
         SkipIfNoGpu();
@@ -542,7 +539,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void DataTransfer_LargeArray_PreservesAllValues()
     {
         SkipIfNoGpu();
@@ -571,7 +568,7 @@ public class GpuCpuConsistencyTests
 
     #region Determinism Tests
 
-    [Fact]
+    [SkippableFact]
     public void Operations_AreDeterministic()
     {
         SkipIfNoGpu();
@@ -602,7 +599,7 @@ public class GpuCpuConsistencyTests
 
     #region Associativity/Commutativity Tests
 
-    [Fact]
+    [SkippableFact]
     public void Add_IsCommutative()
     {
         SkipIfNoGpu();
@@ -622,7 +619,7 @@ public class GpuCpuConsistencyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_IsCommutative()
     {
         SkipIfNoGpu();

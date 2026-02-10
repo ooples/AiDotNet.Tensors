@@ -46,15 +46,12 @@ public class VulkanBackendTests : IDisposable
 
     private void SkipIfNoVulkan()
     {
-        if (!_isVulkanAvailable)
-        {
-            throw new SkipException("Vulkan not available on this system");
-        }
+        Skip.If(!_isVulkanAvailable, "Vulkan not available on this system");
     }
 
     #region Initialization Tests
 
-    [Fact]
+    [SkippableFact]
     public void Initialize_CanBeCalledMultipleTimes_DoesNotCrash()
     {
         SkipIfNoVulkan();
@@ -67,7 +64,7 @@ public class VulkanBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void IsAvailable_ReturnsConsistentValue()
     {
         SkipIfNoVulkan();
@@ -82,7 +79,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(results, r => Assert.True(r));
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeviceName_IsNotNullOrEmpty()
     {
         SkipIfNoVulkan();
@@ -91,7 +88,7 @@ public class VulkanBackendTests : IDisposable
         Assert.False(string.IsNullOrEmpty(_backend!.DeviceName));
     }
 
-    [Fact]
+    [SkippableFact]
     public void VendorName_IsNotNullOrEmpty()
     {
         SkipIfNoVulkan();
@@ -103,7 +100,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Vector Addition Tests
 
-    [Fact]
+    [SkippableFact]
     public void Add_SingleElement_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -118,7 +115,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(8.0f, result[0], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_TwoElements_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -133,7 +130,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(6.0f, result[1], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_ExactlyWorkgroupSize_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -152,7 +149,7 @@ public class VulkanBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_OneMoreThanWorkgroupSize_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -171,7 +168,7 @@ public class VulkanBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_OneLessThanWorkgroupSize_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -190,7 +187,7 @@ public class VulkanBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_MultipleWorkgroups_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -209,7 +206,7 @@ public class VulkanBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_NonPowerOfTwo_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -225,7 +222,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(4.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_LargeArray_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -241,7 +238,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(3.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_ZeroValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -255,7 +252,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(0.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_NegativeValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -271,7 +268,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(-9.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_MixedSigns_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -287,7 +284,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(0.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_VerySmallValues_MaintainsPrecision()
     {
         SkipIfNoVulkan();
@@ -304,7 +301,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(2e-9f, result[2], 10);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Add_VeryLargeValues_DoesNotOverflow()
     {
         SkipIfNoVulkan();
@@ -324,7 +321,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Vector Subtraction Tests
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_BasicValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -340,7 +337,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(23.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_ResultNegative_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -356,7 +353,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(-27.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_SameValues_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -374,7 +371,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Vector Multiplication Tests
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_BasicValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -390,7 +387,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(28.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_ByZero_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -404,7 +401,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(0.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_ByOne_ReturnsSame()
     {
         SkipIfNoVulkan();
@@ -420,7 +417,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(3.5f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_NegativeValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -440,7 +437,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Vector Division Tests
 
-    [Fact]
+    [SkippableFact]
     public void Divide_BasicValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -456,7 +453,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(6.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_ByOne_ReturnsSame()
     {
         SkipIfNoVulkan();
@@ -472,7 +469,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(3.5f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_ByZero_ReturnsInfinity()
     {
         SkipIfNoVulkan();
@@ -488,7 +485,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(float.IsNegativeInfinity(result[1]) || float.IsNaN(result[1]));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_ZeroByZero_ReturnsNaN()
     {
         SkipIfNoVulkan();
@@ -502,7 +499,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(float.IsNaN(result[0]));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_FractionalResults_MaintainsPrecision()
     {
         SkipIfNoVulkan();
@@ -522,7 +519,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Scalar Multiplication Tests
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_ByZero_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -535,7 +532,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(0.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_ByOne_ReturnsSame()
     {
         SkipIfNoVulkan();
@@ -550,7 +547,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(3.5f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_ByNegative_NegatesValues()
     {
         SkipIfNoVulkan();
@@ -565,7 +562,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(-3.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_ByFraction_ScalesDown()
     {
         SkipIfNoVulkan();
@@ -580,7 +577,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(15.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ScalarMultiply_LargeArray_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -598,7 +595,7 @@ public class VulkanBackendTests : IDisposable
 
     #region ReLU Activation Tests
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_PositiveValues_ReturnsSame()
     {
         SkipIfNoVulkan();
@@ -613,7 +610,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(3.0f, result[2], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_NegativeValues_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -626,7 +623,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(0.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_Zero_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -639,7 +636,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.Equal(0.0f, r, 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_MixedValues_ComputesCorrectly()
     {
         SkipIfNoVulkan();
@@ -656,7 +653,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(1.5f, result[4], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_VerySmallNegative_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -674,7 +671,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Sigmoid Activation Tests
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_Zero_ReturnsHalf()
     {
         SkipIfNoVulkan();
@@ -687,7 +684,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(0.5f, result[0], 4);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_LargePositive_ReturnsNearOne()
     {
         SkipIfNoVulkan();
@@ -702,7 +699,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(result[2] > 0.9999f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_LargeNegative_ReturnsNearZero()
     {
         SkipIfNoVulkan();
@@ -717,7 +714,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(result[2] < 0.0001f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_OutputRange_BetweenZeroAndOne()
     {
         SkipIfNoVulkan();
@@ -734,7 +731,7 @@ public class VulkanBackendTests : IDisposable
         });
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_Symmetric_AroundHalf()
     {
         SkipIfNoVulkan();
@@ -758,7 +755,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Tanh Activation Tests
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_Zero_ReturnsZero()
     {
         SkipIfNoVulkan();
@@ -771,7 +768,7 @@ public class VulkanBackendTests : IDisposable
         Assert.Equal(0.0f, result[0], 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_LargePositive_ReturnsNearOne()
     {
         SkipIfNoVulkan();
@@ -785,7 +782,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(result[1] > 0.9999f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_LargeNegative_ReturnsNearNegativeOne()
     {
         SkipIfNoVulkan();
@@ -799,7 +796,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(result[1] < -0.9999f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_OutputRange_BetweenNegativeOneAndOne()
     {
         SkipIfNoVulkan();
@@ -816,7 +813,7 @@ public class VulkanBackendTests : IDisposable
         });
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_OddFunction_Symmetric()
     {
         SkipIfNoVulkan();
@@ -840,7 +837,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Memory Management Tests
 
-    [Fact]
+    [SkippableFact]
     public void RepeatedOperations_DoNotLeakMemory()
     {
         SkipIfNoVulkan();
@@ -861,7 +858,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(true);
     }
 
-    [Fact]
+    [SkippableFact]
     public void DifferentSizedOperations_HandleCorrectly()
     {
         SkipIfNoVulkan();
@@ -885,7 +882,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Thread Safety Tests
 
-    [Fact]
+    [SkippableFact]
     public void ConcurrentOperations_ProduceCorrectResults()
     {
         SkipIfNoVulkan();
@@ -913,7 +910,7 @@ public class VulkanBackendTests : IDisposable
 
     #region Edge Case Tests
 
-    [Fact]
+    [SkippableFact]
     public void SpecialFloatValues_HandleCorrectly()
     {
         SkipIfNoVulkan();
@@ -930,7 +927,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(float.IsNegativeInfinity(result[2]));
     }
 
-    [Fact]
+    [SkippableFact]
     public void DenormalizedNumbers_HandleCorrectly()
     {
         SkipIfNoVulkan();
@@ -947,7 +944,7 @@ public class VulkanBackendTests : IDisposable
         Assert.All(result, r => Assert.True(r == 0.0f || r == 2 * denormal));
     }
 
-    [Fact]
+    [SkippableFact]
     public void MaxFloatValues_HandleCorrectly()
     {
         SkipIfNoVulkan();
@@ -962,7 +959,7 @@ public class VulkanBackendTests : IDisposable
         Assert.True(float.IsPositiveInfinity(result[0]));
     }
 
-    [Fact]
+    [SkippableFact]
     public void MinFloatValues_HandleCorrectly()
     {
         SkipIfNoVulkan();
@@ -980,10 +977,3 @@ public class VulkanBackendTests : IDisposable
     #endregion
 }
 
-/// <summary>
-/// Exception used to skip tests when Vulkan is not available.
-/// </summary>
-public class SkipException : Exception
-{
-    public SkipException(string message) : base(message) { }
-}

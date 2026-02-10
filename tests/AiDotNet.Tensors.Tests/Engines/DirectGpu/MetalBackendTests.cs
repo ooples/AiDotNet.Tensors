@@ -59,10 +59,7 @@ public class MetalBackendTests : IDisposable
 
     private void SkipIfNoMetal()
     {
-        if (!_isAvailable)
-        {
-            throw new MetalSkipException("Metal backend not available on this platform");
-        }
+        Skip.If(!_isAvailable, "Metal backend not available on this platform");
     }
 
     public void Dispose()
@@ -72,7 +69,7 @@ public class MetalBackendTests : IDisposable
 
     #region Initialization Tests
 
-    [Fact]
+    [SkippableFact]
     public void MetalBackend_OnMacOS_IsAvailableOrSkipped()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
@@ -86,7 +83,7 @@ public class MetalBackendTests : IDisposable
         Assert.True(_isAvailable || true, "Metal may or may not be available depending on hardware");
     }
 
-    [Fact]
+    [SkippableFact]
     public void MetalBackend_DeviceName_IsNotEmpty()
     {
         SkipIfNoMetal();
@@ -94,7 +91,7 @@ public class MetalBackendTests : IDisposable
         _output.WriteLine($"Device name: {_backend.DeviceName}");
     }
 
-    [Fact]
+    [SkippableFact]
     public void MetalBackend_ComputeUnits_IsPositive()
     {
         SkipIfNoMetal();
@@ -106,7 +103,7 @@ public class MetalBackendTests : IDisposable
 
     #region Buffer Management Tests
 
-    [Fact]
+    [SkippableFact]
     public void AllocateBuffer_WithData_StoresCorrectly()
     {
         SkipIfNoMetal();
@@ -121,21 +118,21 @@ public class MetalBackendTests : IDisposable
         Assert.Equal(data, result);
     }
 
-    [Fact]
+    [SkippableFact]
     public void AllocateBuffer_EmptySize_Throws()
     {
         SkipIfNoMetal();
         Assert.Throws<ArgumentOutOfRangeException>(() => _backend!.AllocateBuffer(0));
     }
 
-    [Fact]
+    [SkippableFact]
     public void AllocateBuffer_NegativeSize_Throws()
     {
         SkipIfNoMetal();
         Assert.Throws<ArgumentOutOfRangeException>(() => _backend!.AllocateBuffer(-1));
     }
 
-    [Fact]
+    [SkippableFact]
     public void AllocateBuffer_LargeSize_Works()
     {
         SkipIfNoMetal();
@@ -150,7 +147,7 @@ public class MetalBackendTests : IDisposable
 
     #region Element-wise Operation Tests
 
-    [Fact]
+    [SkippableFact]
     public void Add_BasicOperation_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -172,7 +169,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Subtract_BasicOperation_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -194,7 +191,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Multiply_BasicOperation_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -216,7 +213,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Divide_BasicOperation_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -238,7 +235,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Scale_BasicOperation_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -263,7 +260,7 @@ public class MetalBackendTests : IDisposable
 
     #region Activation Function Tests
 
-    [Fact]
+    [SkippableFact]
     public void ReLU_PositiveAndNegativeValues_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -283,7 +280,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_VariousValues_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -309,7 +306,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tanh_VariousValues_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -335,7 +332,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void GELU_VariousValues_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -361,7 +358,7 @@ public class MetalBackendTests : IDisposable
 
     #region Reduction Tests
 
-    [Fact]
+    [SkippableFact]
     public void Sum_BasicArray_ReturnsCorrectSum()
     {
         SkipIfNoMetal();
@@ -375,7 +372,7 @@ public class MetalBackendTests : IDisposable
         Assert.Equal(expected, result, precision: 3);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sum_LargeArray_ReturnsCorrectSum()
     {
         SkipIfNoMetal();
@@ -390,7 +387,7 @@ public class MetalBackendTests : IDisposable
         Assert.Equal(expected, result, precision: 0);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Max_BasicArray_ReturnsMaximum()
     {
         SkipIfNoMetal();
@@ -404,7 +401,7 @@ public class MetalBackendTests : IDisposable
         Assert.Equal(expected, result, precision: 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Min_BasicArray_ReturnsMinimum()
     {
         SkipIfNoMetal();
@@ -422,7 +419,7 @@ public class MetalBackendTests : IDisposable
 
     #region GEMM Tests
 
-    [Fact]
+    [SkippableFact]
     public void Gemm_SmallMatrices_ReturnsCorrectResult()
     {
         SkipIfNoMetal();
@@ -446,7 +443,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Gemm_IdentityMatrix_ReturnsOriginal()
     {
         SkipIfNoMetal();
@@ -480,7 +477,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Gemm_LargerMatrices_CompletesSuccessfully()
     {
         SkipIfNoMetal();
@@ -511,7 +508,7 @@ public class MetalBackendTests : IDisposable
 
     #region Edge Case Tests
 
-    [Fact]
+    [SkippableFact]
     public void Operations_WithZeroValues_HandleCorrectly()
     {
         SkipIfNoMetal();
@@ -534,7 +531,7 @@ public class MetalBackendTests : IDisposable
         Assert.All(result, v => Assert.Equal(0.0f, v, precision: 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Operations_WithNegativeValues_HandleCorrectly()
     {
         SkipIfNoMetal();
@@ -551,7 +548,7 @@ public class MetalBackendTests : IDisposable
         Assert.All(result, v => Assert.Equal(0.0f, v, precision: 5));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Operations_WorkgroupBoundary_HandlesCorrectly()
     {
         SkipIfNoMetal();
@@ -575,7 +572,7 @@ public class MetalBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_ExtremeValues_DoesNotOverflow()
     {
         SkipIfNoMetal();
@@ -602,7 +599,7 @@ public class MetalBackendTests : IDisposable
 
 #else
     // .NET Framework stub - Metal is not supported
-    [Fact]
+    [SkippableFact]
     public void MetalBackend_NotSupportedOnNetFramework()
     {
         Assert.True(true, "Metal is only supported on .NET 7+ on macOS");
@@ -615,10 +612,3 @@ public class MetalBackendTests : IDisposable
 #endif
 }
 
-/// <summary>
-/// Exception used to skip tests when Metal backend is not available.
-/// </summary>
-public class MetalSkipException : Exception
-{
-    public MetalSkipException(string message) : base(message) { }
-}

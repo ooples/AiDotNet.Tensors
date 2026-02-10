@@ -33,17 +33,23 @@ public class WebGpuBackendTests : IDisposable
     public WebGpuBackendTests(ITestOutputHelper output)
     {
         _output = output;
+        _isAvailable = false;
+
+        // WebGPU requires browser/WASM environment - skip on desktop platforms
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Create("BROWSER")))
+        {
+            _output.WriteLine("WebGPU is only available in browser/WASM environment");
+            return;
+        }
 
         try
         {
             _backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-            // WebGPU requires async initialization
-            _isAvailable = false; // Will be set in InitializeAsync
+            // WebGPU requires async initialization - will be set in InitializeAsync
         }
         catch (Exception ex)
         {
             _output.WriteLine($"WebGPU initialization failed: {ex.Message}");
-            _isAvailable = false;
         }
     }
 
@@ -51,11 +57,19 @@ public class WebGpuBackendTests : IDisposable
     {
         if (_backend is not null && !_isAvailable)
         {
-            _isAvailable = await _backend.InitializeAsync();
-            if (_isAvailable)
+            try
             {
-                _output.WriteLine($"WebGPU backend: {_backend.DeviceName}");
-                _output.WriteLine($"Max workgroup size: {_backend.MaxWorkgroupSize}");
+                _isAvailable = await _backend.InitializeAsync();
+                if (_isAvailable)
+                {
+                    _output.WriteLine($"WebGPU backend: {_backend.DeviceName}");
+                    _output.WriteLine($"Max workgroup size: {_backend.MaxWorkgroupSize}");
+                }
+            }
+            catch (PlatformNotSupportedException)
+            {
+                _output.WriteLine("WebGPU JS interop not supported on this platform");
+                _isAvailable = false;
             }
         }
     }
@@ -63,10 +77,7 @@ public class WebGpuBackendTests : IDisposable
     private async Task SkipIfNoWebGpuAsync()
     {
         await EnsureInitializedAsync();
-        if (!_isAvailable)
-        {
-            throw new WebGpuSkipException("WebGPU backend not available (requires browser environment)");
-        }
+        Skip.If(!_isAvailable, "WebGPU backend not available (requires browser environment)");
     }
 
     public void Dispose()
@@ -76,7 +87,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Initialization Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task WebGpuBackend_Initialization_WorksOrSkips()
     {
         if (_backend is null)
@@ -94,7 +105,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Element-wise Operation Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Add_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -116,7 +127,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Sub_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -138,7 +149,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Mul_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -160,7 +171,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Div_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -182,7 +193,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Maximum_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -204,7 +215,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Minimum_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -230,7 +241,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Scalar Operation Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Scale_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -251,7 +262,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task AddScalar_BasicOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -272,7 +283,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Power_SquareOperation_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -297,7 +308,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Unary Operation Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Sqrt_PositiveValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -317,7 +328,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Exp_BasicValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -337,7 +348,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Log_PositiveValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -357,7 +368,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Abs_MixedValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -377,7 +388,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Neg_MixedValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -401,7 +412,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Activation Function Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task ReLU_MixedValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -421,7 +432,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task LeakyReLU_MixedValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -442,7 +453,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Sigmoid_VariousValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -466,7 +477,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Tanh_VariousValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -490,7 +501,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task GELU_VariousValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -512,7 +523,7 @@ public class WebGpuBackendTests : IDisposable
         Assert.True(result[4] > 0);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Swish_VariousValues_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -538,7 +549,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Reduction Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Sum_BasicArray_ReturnsCorrectSum()
     {
         await SkipIfNoWebGpuAsync();
@@ -552,7 +563,7 @@ public class WebGpuBackendTests : IDisposable
         Assert.Equal(expected, result, precision: 3);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Max_BasicArray_ReturnsMaximum()
     {
         await SkipIfNoWebGpuAsync();
@@ -566,7 +577,7 @@ public class WebGpuBackendTests : IDisposable
         Assert.Equal(expected, result, precision: 5);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Min_BasicArray_ReturnsMinimum()
     {
         await SkipIfNoWebGpuAsync();
@@ -584,7 +595,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Matrix Operation Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Gemm_SmallMatrices_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -608,7 +619,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Transpose_BasicMatrix_ReturnsCorrectResult()
     {
         await SkipIfNoWebGpuAsync();
@@ -634,7 +645,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Softmax and Normalization Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Softmax_BasicInput_SumsToOne()
     {
         await SkipIfNoWebGpuAsync();
@@ -662,7 +673,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Softmax_BatchedInput_EachBatchSumsToOne()
     {
         await SkipIfNoWebGpuAsync();
@@ -698,7 +709,7 @@ public class WebGpuBackendTests : IDisposable
 
     #region Edge Case Tests
 
-    [Fact]
+    [SkippableFact]
     public async Task Operations_WorkgroupBoundary_HandlesCorrectly()
     {
         await SkipIfNoWebGpuAsync();
@@ -722,7 +733,7 @@ public class WebGpuBackendTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Sigmoid_ExtremeValues_DoesNotOverflow()
     {
         await SkipIfNoWebGpuAsync();
@@ -748,7 +759,7 @@ public class WebGpuBackendTests : IDisposable
 
 #else
     // .NET Framework stub - WebGPU is not supported
-    [Fact]
+    [SkippableFact]
     public void WebGpuBackend_NotSupportedOnNetFramework()
     {
         Assert.True(true, "WebGPU is only supported on .NET 7+");
@@ -761,10 +772,3 @@ public class WebGpuBackendTests : IDisposable
 #endif
 }
 
-/// <summary>
-/// Exception used to skip tests when WebGPU backend is not available.
-/// </summary>
-public class WebGpuSkipException : Exception
-{
-    public WebGpuSkipException(string message) : base(message) { }
-}
