@@ -129,19 +129,31 @@ jobs:
       shell: pwsh
       run: |
         dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-build --output ./artifacts
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-        # Pack native packages
+        # Pack native packages (skip MoltenVK if binaries are not present)
         $nativeProjects = @(
           "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj",
           "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj",
-          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj",
-          "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
+          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj"
         )
         foreach ($proj in $nativeProjects) {
           if (Test-Path $proj) {
             Write-Host "Packing $proj..."
             dotnet pack $proj --configuration Release --no-build --output ./artifacts
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+        }
+
+        # MoltenVK: only pack if native binaries are present (not just the csproj)
+        $moltenVKProj = "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
+        $moltenVKBinary = "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/libMoltenVK.dylib"
+        if ((Test-Path $moltenVKProj) -and (Test-Path $moltenVKBinary)) {
+          Write-Host "Packing AiDotNet.Native.MoltenVK..."
+          dotnet pack $moltenVKProj --configuration Release --no-build --output ./artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        } else {
+          Write-Host "Skipping AiDotNet.Native.MoltenVK - native binaries not present"
         }
 
     - name: Upload artifacts

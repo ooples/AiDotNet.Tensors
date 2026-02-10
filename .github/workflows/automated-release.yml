@@ -310,10 +310,15 @@ jobs:
           }
 
           # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
-          if (Test-Path "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj") {
+          # Only pack if native binaries are present to avoid publishing an empty package
+          $moltenVKProj = "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
+          $moltenVKBinary = "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/libMoltenVK.dylib"
+          if ((Test-Path $moltenVKProj) -and (Test-Path $moltenVKBinary)) {
             Write-Host "Packing AiDotNet.Native.MoltenVK..."
-            dotnet pack src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
+            dotnet pack $moltenVKProj -c Release -o out --no-build /p:PackageVersion=$VERSION
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Skipping AiDotNet.Native.MoltenVK - native binaries not present"
           }
 
           # Note: CUDA package is not packed in CI because native binaries (770MB) are not in git

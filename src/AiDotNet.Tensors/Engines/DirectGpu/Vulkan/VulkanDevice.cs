@@ -2,6 +2,7 @@
 // Vulkan device initialization and management for GPU compute.
 
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -156,6 +157,14 @@ public sealed unsafe class VulkanDevice : IDisposable
 
         try
         {
+            // On macOS, set VK_ICD_FILENAMES so the Vulkan loader can discover MoltenVK.
+            // The MoltenVK_icd.json file is copied to the output directory by the
+            // AiDotNet.Native.MoltenVK NuGet package build targets.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                SetMoltenVKIcdPath();
+            }
+
             if (!CreateInstance())
             {
                 return false;
@@ -192,6 +201,29 @@ public sealed unsafe class VulkanDevice : IDisposable
         {
             Cleanup();
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Sets VK_ICD_FILENAMES to point to MoltenVK_icd.json in the application output directory,
+    /// enabling the Vulkan loader to discover MoltenVK as an installable client driver on macOS.
+    /// Only sets the variable if MoltenVK_icd.json exists and VK_ICD_FILENAMES is not already set.
+    /// </summary>
+    private static void SetMoltenVKIcdPath()
+    {
+        // Don't override if the user has already configured ICD discovery
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VK_ICD_FILENAMES")))
+        {
+            return;
+        }
+
+        // Look for MoltenVK_icd.json next to the executing assembly (output directory)
+        string baseDir = AppContext.BaseDirectory;
+        string icdPath = Path.Combine(baseDir, "MoltenVK_icd.json");
+
+        if (File.Exists(icdPath))
+        {
+            Environment.SetEnvironmentVariable("VK_ICD_FILENAMES", icdPath);
         }
     }
 

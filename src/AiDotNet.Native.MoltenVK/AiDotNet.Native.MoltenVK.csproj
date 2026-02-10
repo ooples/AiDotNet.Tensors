@@ -6,7 +6,7 @@
     <Version>1.4.1</Version>
     <Authors>AiDotNet Contributors</Authors>
     <Company>AiDotNet</Company>
-    <Description>Native MoltenVK binaries for Vulkan GPU acceleration on macOS and iOS. MoltenVK is a Vulkan-to-Metal translation layer that enables the AiDotNet.Tensors Vulkan backend to run on Apple platforms. Install this package to use Vulkan compute shaders on macOS (Intel and Apple Silicon).</Description>
+    <Description>Native MoltenVK binaries for Vulkan GPU acceleration on macOS. MoltenVK is a Vulkan-to-Metal translation layer that enables the AiDotNet.Tensors Vulkan backend to run on macOS. Install this package to use Vulkan compute shaders on macOS (Intel and Apple Silicon).</Description>
     <PackageTags>moltenvk;vulkan;metal;macos;apple-silicon;gpu;native</PackageTags>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
