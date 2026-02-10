@@ -6421,7 +6421,7 @@ KERNEL VARIANTS (A/B testing):
             else
                 k.SetArg(arg++, IntPtr.Zero);
             k.SetArg(arg++, attentionBias is not null ? 1 : 0);
-            k.SetArg(arg++, biasBatchStride);
+            k.SetArg(arg, biasBatchStride);
 
             // Each work item handles one query position
             int localX = Math.Min(64, seqQ);
@@ -6460,7 +6460,7 @@ KERNEL VARIANTS (A/B testing):
             else
                 k.SetArg(arg++, IntPtr.Zero);
             k.SetArg(arg++, attentionBias is not null ? 1 : 0);
-            k.SetArg(arg++, biasBatchStride);
+            k.SetArg(arg, biasBatchStride);
 
             // Process in blocks
             int localX = Math.Min(64, seqQ);

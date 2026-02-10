@@ -155,7 +155,7 @@ public class FlashAttentionBiasTests
     }
 
     [Fact]
-    public void FlashAttentionBackward_WithBias_MatchesRecomputation()
+    public void FlashAttentionBackward_WithBias_ProducesNonZeroGradientsWithCorrectShape()
     {
         var query = CreateRandomTensor([Batch, Heads, SeqQ, HeadDim], 42);
         var key = CreateRandomTensor([Batch, Heads, SeqK, HeadDim], 43);
@@ -168,7 +168,7 @@ public class FlashAttentionBiasTests
 
         // Backward with bias — should use bias for recomputation
         var gradOutput = CreateRandomTensor([Batch, Heads, SeqQ, HeadDim], 55);
-        var result = _engine.FlashAttentionBackward(
+        _ = _engine.FlashAttentionBackward(
             gradOutput, query, key, value, output, stats,
             scale, false, out var gradQ, out var gradK, out var gradV, bias);
 

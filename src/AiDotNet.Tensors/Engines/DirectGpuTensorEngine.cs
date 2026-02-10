@@ -471,6 +471,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
     }
 
     /// <summary>
+    /// Validates attention bias shape/rank and uploads to GPU.
+    /// Matches CpuEngine validation: rank must be 3 [heads, seqQ, seqK] or 4 [batch, heads, seqQ, seqK].
+    /// </summary>
+    private OwnedBuffer GetOrAllocateBiasBuffer<T>(IDirectGpuBackend backend, Tensor<T> attentionBias,
+        int batch, int heads, int seqQ, int seqK, out int biasBatchStride)
+    {
+        var biasShape = attentionBias.Shape;
+
+        if (biasShape.Length == 4)
+        {
+            if (biasShape[0] != batch || biasShape[1] != heads || biasShape[2] != seqQ || biasShape[3] != seqK)
+            {
+                throw new ArgumentException(
+                    $"attentionBias shape must be [batch, heads, seqQ, seqK] = [{batch}, {heads}, {seqQ}, {seqK}] " +
+                    $"for rank-4 bias, but was [{string.Join(", ", biasShape)}].",
+                    nameof(attentionBias));
+            }
+
+            biasBatchStride = heads * seqQ * seqK;
+        }
+        else if (biasShape.Length == 3)
+        {
+            if (biasShape[0] != heads || biasShape[1] != seqQ || biasShape[2] != seqK)
+            {
+                throw new ArgumentException(
+                    $"attentionBias shape must be [heads, seqQ, seqK] = [{heads}, {seqQ}, {seqK}] " +
+                    $"for rank-3 bias, but was [{string.Join(", ", biasShape)}].",
+                    nameof(attentionBias));
+            }
+
+            biasBatchStride = 0;
+        }
+        else
+        {
+            throw new ArgumentException(
+                "attentionBias must have rank 3 ([heads, seqQ, seqK]) or rank 4 ([batch, heads, seqQ, seqK]).",
+                nameof(attentionBias));
+        }
+
+        return GetOrAllocateBuffer(backend, attentionBias.ToArray());
+    }
+
+    /// <summary>
     /// Caches the result buffer for potential reuse by the next layer.
     /// The result data array serves as the cache key.
     /// Thread-safe: uses lock to coordinate with cache lookups.
@@ -3926,7 +3969,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
     /// GPU-accelerated FlashAttention - memory-efficient O(N) attention algorithm.
     /// Uses cached GPU buffers for registered persistent tensors (e.g., KV cache) to avoid
     /// redundant CPU→GPU transfers on every forward pass.
-    /// Falls back to CPU implementation when GPU is unavailable.
+    /// Supports optional attention bias (ALiBi) — the bias is uploaded to GPU and passed to the kernel.
+    /// Falls back to CPU implementation when GPU is unavailable or on any GPU error.
     /// </summary>
     public new Tensor<T> FlashAttention<T>(
         Tensor<T> query,
@@ -3960,17 +4004,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         using var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
 
-        // Upload attention bias to GPU if provided
-        OwnedBuffer? biasBufferHandle = null;
+        // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
-        if (attentionBias is not null)
-        {
-            biasBufferHandle = GetOrAllocateBuffer(backend, attentionBias.ToArray());
-            // 4D bias [batch, heads, seqQ, seqK] vs 3D [heads, seqQ, seqK] (batch-broadcast)
-            biasBatchStride = attentionBias.Shape.Length == 4
-                ? heads * seqQ * seqK
-                : 0;
-        }
+        using OwnedBuffer? biasBufferHandle = attentionBias is not null
+            ? GetOrAllocateBiasBuffer(backend, attentionBias, batch, heads, seqQ, seqK, out biasBatchStride)
+            : null;
 
         try
         {
@@ -3996,10 +4034,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         {
             // Fall back to CPU on any GPU error
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
-        }
-        finally
-        {
-            biasBufferHandle?.Dispose();
         }
     }
 
@@ -4046,16 +4080,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
 
-        // Upload attention bias to GPU if provided
-        OwnedBuffer? biasBufferHandle = null;
+        // Upload attention bias to GPU if provided, with shape validation
         int biasBatchStride = 0;
-        if (attentionBias is not null)
-        {
-            biasBufferHandle = GetOrAllocateBuffer(backend, attentionBias.ToArray());
-            biasBatchStride = attentionBias.Shape.Length == 4
-                ? heads * seqQ * seqK
-                : 0;
-        }
+        using OwnedBuffer? biasBufferHandle = attentionBias is not null
+            ? GetOrAllocateBiasBuffer(backend, attentionBias, batch, heads, seqQ, seqK, out biasBatchStride)
+            : null;
 
         try
         {
@@ -4084,10 +4113,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         {
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
                 out gradQuery, out gradKey, out gradValue, attentionBias);
-        }
-        finally
-        {
-            biasBufferHandle?.Dispose();
         }
     }
 
