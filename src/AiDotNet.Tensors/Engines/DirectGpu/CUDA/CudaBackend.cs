@@ -4024,15 +4024,18 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
         var kernel = _kernelCache["flash_attention_v2"];
         uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);
         int causalFlag = isCausal ? 1 : 0;
+        int hasBias = attentionBias is not null ? 1 : 0;
+        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
 
-        void** args = stackalloc void*[12];
+        void** args = stackalloc void*[15];
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
         IntPtr vPtr = value.Handle;
@@ -4050,6 +4053,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[9] = &headDim;
         args[10] = &scale;
         args[11] = &causalFlag;
+        args[12] = &biasPtr;
+        args[13] = &hasBias;
+        args[14] = &biasBatchStride;
 
         LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args);
     }
@@ -4057,15 +4063,18 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         using var _ = PushContext();
         var kernel = _kernelCache["flash_attention_backward"];
         uint gridX = (uint)((seqQ + 63) / 64);
         uint gridY = (uint)(batch * numHeads);
         int causalFlag = isCausal ? 1 : 0;
+        int hasBias = attentionBias is not null ? 1 : 0;
+        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
 
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[19];
         IntPtr goPtr = gradOutput.Handle;
         IntPtr qPtr = query.Handle;
         IntPtr kPtr = key.Handle;
@@ -4090,14 +4099,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[12] = &seqK;
         args[13] = &headDim;
         args[14] = &scale;
+        args[15] = &causalFlag;
+        args[16] = &biasPtr;
+        args[17] = &hasBias;
+        args[18] = &biasBatchStride;
 
-        // Note: args[15] would be causalFlag but signature in kernel expects 15 args
-        // Need to adjust - let me fix kernel arg count
-        void** args2 = stackalloc void*[16];
-        for (int i = 0; i < 15; i++) args2[i] = args[i];
-        args2[15] = &causalFlag;
-
-        LaunchKernel2D(kernel, gridX, gridY, 1, 64, 1, args2);
+        LaunchKernel2D(kernel, gridX, gridY, 1, 64, 1, args);
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,

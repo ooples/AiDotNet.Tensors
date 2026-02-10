@@ -6395,7 +6395,8 @@ KERNEL VARIANTS (A/B testing):
 
         public void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer softmaxStats,
-            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+            IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
         {
             // FlashAttention V2 with online softmax and log-sum-exp statistics
             // Uses tiled computation for O(N) memory complexity
@@ -6414,6 +6415,14 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, scale);
             k.SetArg(arg++, isCausal ? 1 : 0);
 
+            // Attention bias parameters
+            if (attentionBias is not null)
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+            else
+                k.SetArg(arg++, IntPtr.Zero);
+            k.SetArg(arg++, attentionBias is not null ? 1 : 0);
+            k.SetArg(arg, biasBatchStride);
+
             // Each work item handles one query position
             int localX = Math.Min(64, seqQ);
             k.Execute2D(seqQ, batch * numHeads, localX, 1);
@@ -6422,7 +6431,8 @@ KERNEL VARIANTS (A/B testing):
         public void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
             IGpuBuffer output, IGpuBuffer softmaxStats,
             IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+            int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+            IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
         {
             // FlashAttention backward with recomputation for memory efficiency
             var k = _kernelCache["flash_attention_backward"];
@@ -6443,6 +6453,14 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, headDim);
             k.SetArg(arg++, scale);
             k.SetArg(arg++, isCausal ? 1 : 0);
+
+            // Attention bias parameters
+            if (attentionBias is not null)
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)attentionBias).Buffer.Handle);
+            else
+                k.SetArg(arg++, IntPtr.Zero);
+            k.SetArg(arg++, attentionBias is not null ? 1 : 0);
+            k.SetArg(arg, biasBatchStride);
 
             // Process in blocks
             int localX = Math.Min(64, seqQ);

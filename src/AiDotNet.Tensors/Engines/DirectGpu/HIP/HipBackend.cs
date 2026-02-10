@@ -5132,13 +5132,16 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         if (!_kernelCache.TryGetValue("flash_attention_v2", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: flash_attention_v2");
 
         int causalFlag = isCausal ? 1 : 0;
-        var handles = new GCHandle[12];
+        int hasBias = attentionBias is not null ? 1 : 0;
+        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
+        var handles = new GCHandle[15];
         try
         {
             handles[0] = GCHandle.Alloc(query.Handle, GCHandleType.Pinned);
@@ -5153,9 +5156,12 @@ public sealed class HipBackend : IAsyncGpuBackend
             handles[9] = GCHandle.Alloc(headDim, GCHandleType.Pinned);
             handles[10] = GCHandle.Alloc(scale, GCHandleType.Pinned);
             handles[11] = GCHandle.Alloc(causalFlag, GCHandleType.Pinned);
+            handles[12] = GCHandle.Alloc(biasPtr, GCHandleType.Pinned);
+            handles[13] = GCHandle.Alloc(hasBias, GCHandleType.Pinned);
+            handles[14] = GCHandle.Alloc(biasBatchStride, GCHandleType.Pinned);
 
-            var args = new IntPtr[12];
-            for (int i = 0; i < 12; i++) args[i] = handles[i].AddrOfPinnedObject();
+            var args = new IntPtr[15];
+            for (int i = 0; i < 15; i++) args[i] = handles[i].AddrOfPinnedObject();
 
             uint gridX = (uint)((seqQ + 31) / 32);
             uint gridY = (uint)(batch * numHeads);
@@ -5171,13 +5177,16 @@ public sealed class HipBackend : IAsyncGpuBackend
     public unsafe void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
 
         int causalFlag = isCausal ? 1 : 0;
-        var handles = new GCHandle[16];
+        int hasBias = attentionBias is not null ? 1 : 0;
+        IntPtr biasPtr = attentionBias is not null ? attentionBias.Handle : IntPtr.Zero;
+        var handles = new GCHandle[19];
         try
         {
             handles[0] = GCHandle.Alloc(gradOutput.Handle, GCHandleType.Pinned);
@@ -5196,9 +5205,12 @@ public sealed class HipBackend : IAsyncGpuBackend
             handles[13] = GCHandle.Alloc(headDim, GCHandleType.Pinned);
             handles[14] = GCHandle.Alloc(scale, GCHandleType.Pinned);
             handles[15] = GCHandle.Alloc(causalFlag, GCHandleType.Pinned);
+            handles[16] = GCHandle.Alloc(biasPtr, GCHandleType.Pinned);
+            handles[17] = GCHandle.Alloc(hasBias, GCHandleType.Pinned);
+            handles[18] = GCHandle.Alloc(biasBatchStride, GCHandleType.Pinned);
 
-            var args = new IntPtr[16];
-            for (int i = 0; i < 16; i++) args[i] = handles[i].AddrOfPinnedObject();
+            var args = new IntPtr[19];
+            for (int i = 0; i < 19; i++) args[i] = handles[i].AddrOfPinnedObject();
 
             uint gridX = (uint)((seqQ + 63) / 64);
             uint gridY = (uint)(batch * numHeads);

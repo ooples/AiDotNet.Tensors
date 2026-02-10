@@ -136,18 +136,21 @@ __kernel void scaled_dot_product_attention(
 #define FLASH_BLOCK_SIZE 64
 
 __kernel void flash_attention_v2(
-    __global const float* query,      // [batch * heads * seqQ * headDim]
-    __global const float* key,        // [batch * heads * seqK * headDim]
-    __global const float* value,      // [batch * heads * seqK * headDim]
-    __global float* output,           // [batch * heads * seqQ * headDim]
-    __global float* softmaxStats,     // [batch * heads * seqQ] (log-sum-exp)
+    __global const float* query,          // [batch * heads * seqQ * headDim]
+    __global const float* key,            // [batch * heads * seqK * headDim]
+    __global const float* value,          // [batch * heads * seqK * headDim]
+    __global float* output,               // [batch * heads * seqQ * headDim]
+    __global float* softmaxStats,         // [batch * heads * seqQ] (log-sum-exp)
     const int batch,
     const int numHeads,
     const int seqQ,
     const int seqK,
     const int headDim,
     const float scale,
-    const int isCausal)
+    const int isCausal,
+    __global const float* attentionBias,  // optional bias (pass dummy buffer if unused)
+    const int hasBias,
+    const int biasBatchStride)
 {
     const int bh = get_global_id(1);  // batch * head index
     const int qi = get_global_id(0);  // query position
@@ -160,6 +163,14 @@ __kernel void flash_attention_v2(
     const int vOffset = bh * seqK * headDim;
     const int oOffset = bh * seqQ * headDim + qi * headDim;
     const int sOffset = bh * seqQ + qi;
+
+    // Bias offset base
+    int biasBase = 0;
+    if (hasBias) {
+        const int b = bh / numHeads;
+        const int h = bh % numHeads;
+        biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
+    }
 
     // Initialize accumulators for online softmax
     float rowMax = NEGATIVE_INFINITY;
@@ -188,6 +199,7 @@ __kernel void flash_attention_v2(
                 score += query[qOffset + d] * key[kOffset + ki * headDim + d];
             }
             score *= scale;
+            if (hasBias) score += attentionBias[biasBase + ki];
             blockMax = fmax(blockMax, score);
         }
 
@@ -212,6 +224,7 @@ __kernel void flash_attention_v2(
                 score += query[qOffset + d] * key[kOffset + ki * headDim + d];
             }
             score *= scale;
+            if (hasBias) score += attentionBias[biasBase + ki];
 
             float expScore = exp(score - newMax);
             newSum += expScore;
@@ -238,22 +251,25 @@ __kernel void flash_attention_v2(
 
 // FlashAttention backward pass with recomputation
 __kernel void flash_attention_backward(
-    __global const float* gradOutput,   // [batch * heads * seqQ * headDim]
-    __global const float* query,        // [batch * heads * seqQ * headDim]
-    __global const float* key,          // [batch * heads * seqK * headDim]
-    __global const float* value,        // [batch * heads * seqK * headDim]
-    __global const float* output,       // [batch * heads * seqQ * headDim]
-    __global const float* softmaxStats, // [batch * heads * seqQ]
-    __global float* gradQuery,          // [batch * heads * seqQ * headDim]
-    __global float* gradKey,            // [batch * heads * seqK * headDim]
-    __global float* gradValue,          // [batch * heads * seqK * headDim]
+    __global const float* gradOutput,     // [batch * heads * seqQ * headDim]
+    __global const float* query,          // [batch * heads * seqQ * headDim]
+    __global const float* key,            // [batch * heads * seqK * headDim]
+    __global const float* value,          // [batch * heads * seqK * headDim]
+    __global const float* output,         // [batch * heads * seqQ * headDim]
+    __global const float* softmaxStats,   // [batch * heads * seqQ]
+    __global float* gradQuery,            // [batch * heads * seqQ * headDim]
+    __global float* gradKey,              // [batch * heads * seqK * headDim]
+    __global float* gradValue,            // [batch * heads * seqK * headDim]
     const int batch,
     const int numHeads,
     const int seqQ,
     const int seqK,
     const int headDim,
     const float scale,
-    const int isCausal)
+    const int isCausal,
+    __global const float* attentionBias,
+    const int hasBias,
+    const int biasBatchStride)
 {
     const int bh = get_global_id(1);
     const int qi = get_global_id(0);
@@ -267,6 +283,13 @@ __kernel void flash_attention_backward(
     const int gOffset = bh * seqQ * headDim + qi * headDim;
     const int sOffset = bh * seqQ + qi;
 
+    int biasBase = 0;
+    if (hasBias) {
+        const int b = bh / numHeads;
+        const int h = bh % numHeads;
+        biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
+    }
+
     float logsumexp = softmaxStats[sOffset];
 
     // Compute dO @ O (for softmax backward)
@@ -279,12 +302,13 @@ __kernel void flash_attention_backward(
     for (int ki = 0; ki < seqK; ki++) {
         if (isCausal && ki > qi) continue;
 
-        // Recompute attention score
+        // Recompute attention score (must match forward pass exactly)
         float score = 0.0f;
         for (int d = 0; d < headDim; d++) {
             score += query[qOffset + d] * key[kOffset + ki * headDim + d];
         }
         score *= scale;
+        if (hasBias) score += attentionBias[biasBase + ki];
 
         // Recompute attention weight
         float attnWeight = exp(score - logsumexp);

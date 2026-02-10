@@ -10343,7 +10343,8 @@ public class CpuEngine : IEngine
         Tensor<T> value,
         double? scale,
         bool isCausal,
-        out Tensor<T> softmaxStats)
+        out Tensor<T> softmaxStats,
+        Tensor<T>? attentionBias = null)
     {
         if (query == null) throw new ArgumentNullException(nameof(query));
         if (key == null) throw new ArgumentNullException(nameof(key));
@@ -10356,6 +10357,40 @@ public class CpuEngine : IEngine
         int seqQ = query.Shape[2];
         int headDim = query.Shape[3];
         int seqK = key.Shape[2];
+
+        // Extract and validate bias data if provided
+        T[]? biasData = null;
+        bool hasBias = false;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            int biasRank = attentionBias.Shape.Length;
+            if (biasRank == 4)
+            {
+                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
+                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                    throw new ArgumentException(
+                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = false;
+            }
+            else if (biasRank == 3)
+            {
+                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                    throw new ArgumentException(
+                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = true;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
+                    nameof(attentionBias));
+            }
+            biasData = attentionBias.ToVector().ToArray();
+            hasBias = true;
+        }
 
         // Compute scale if not provided
         double scaleValue = scale ?? 1.0 / Math.Sqrt(headDim);
@@ -10436,6 +10471,16 @@ public class CpuEngine : IEngine
                                     keyData[kOffset + ki * headDim + d]));
                             }
                             score = numOps.Multiply(score, scaleFactor);
+
+                            // Add attention bias if provided (applied after QK^T * scale, before softmax)
+                            if (hasBias && biasData is not null)
+                            {
+                                int biasIdx = biasBroadcastBatch
+                                    ? (h * seqQ * seqK + qi * seqK + ki)
+                                    : (b * heads * seqQ * seqK + h * seqQ * seqK + qi * seqK + ki);
+                                score = numOps.Add(score, biasData[biasIdx]);
+                            }
+
                             blockScores[ki - kvBlockStart] = score;
 
                             if (numOps.ToDouble(score) > numOps.ToDouble(blockMaxScore))
@@ -10510,7 +10555,8 @@ public class CpuEngine : IEngine
         bool isCausal,
         out Tensor<T> gradQuery,
         out Tensor<T> gradKey,
-        out Tensor<T> gradValue)
+        out Tensor<T> gradValue,
+        Tensor<T>? attentionBias = null)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (query == null) throw new ArgumentNullException(nameof(query));
@@ -10542,6 +10588,40 @@ public class CpuEngine : IEngine
         var gradQData = new T[batch * heads * seqQ * headDim];
         var gradKData = new T[batch * heads * seqK * headDim];
         var gradVData = new T[batch * heads * seqK * headDim];
+
+        // Extract and validate bias data if provided (same validation as forward pass)
+        T[]? biasData = null;
+        bool hasBias = false;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            int biasRank = attentionBias.Shape.Length;
+            if (biasRank == 4)
+            {
+                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
+                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                    throw new ArgumentException(
+                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = false;
+            }
+            else if (biasRank == 3)
+            {
+                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                    throw new ArgumentException(
+                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = true;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
+                    nameof(attentionBias));
+            }
+            biasData = attentionBias.ToVector().ToArray();
+            hasBias = true;
+        }
 
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 
@@ -10586,6 +10666,15 @@ public class CpuEngine : IEngine
                                     keyData[kOffset + ki * headDim + d]));
                             }
                             score = numOps.Multiply(score, scaleFactor);
+
+                            // Add attention bias if provided (must match forward pass)
+                            if (hasBias && biasData is not null)
+                            {
+                                int biasIdx = biasBroadcastBatch
+                                    ? (h * seqQ * seqK + qi * seqK + ki)
+                                    : (b * heads * seqQ * seqK + h * seqQ * seqK + qi * seqK + ki);
+                                score = numOps.Add(score, biasData[biasIdx]);
+                            }
 
                             // Recompute attention weight: exp(score - logsumexp)
                             T attnWeight = numOps.Exp(numOps.Subtract(score, logsumexp));
