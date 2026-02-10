@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    This targets file copies MoltenVK native libraries to the output directory
+    when a project references AiDotNet.Native.MoltenVK.
+    MoltenVK provides Vulkan-to-Metal translation on macOS.
+
+    VK_ICD_FILENAMES: The Vulkan loader uses this environment variable to discover
+    MoltenVK as an ICD driver. The VulkanDevice.Initialize() method in the main library
+    sets this automatically at runtime to point to the MoltenVK_icd.json in the output
+    directory, so consumers do not need to configure it manually.
+  -->
+
+  <PropertyGroup>
+    <AiDotNetNativeMoltenVKPackagePath>$(MSBuildThisFileDirectory)..</AiDotNetNativeMoltenVKPackagePath>
+  </PropertyGroup>
+
+  <!--
+    Architecture detection strategy:
+    1. If RuntimeIdentifier is explicitly set (e.g., dotnet publish -r osx-arm64), use it directly.
+    2. Otherwise, use NETCoreSdkRuntimeIdentifier which reflects the host machine's actual
+       architecture, avoiding the PlatformTarget pitfall (PlatformTarget defaults to AnyCPU
+       which would incorrectly select x64 on Apple Silicon).
+  -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">
+    <_MoltenVKIsArm64>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</_MoltenVKIsArm64>
+  </PropertyGroup>
+
+  <!-- macOS x64 (Intel) -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'osx-x64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX')) And '$(_MoltenVKIsArm64)' != 'arm64')">
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\libvulkan.1.dylib"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\libvulkan.1.dylib')">
+      <Link>libvulkan.1.dylib</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\libMoltenVK.dylib"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\libMoltenVK.dylib')">
+      <Link>libMoltenVK.dylib</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\MoltenVK_icd.json"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-x64\native\MoltenVK_icd.json')">
+      <Link>MoltenVK_icd.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+  <!-- macOS arm64 (Apple Silicon) -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'osx-arm64' Or ('$(RuntimeIdentifier)' == '' And $([MSBuild]::IsOSPlatform('OSX')) And '$(_MoltenVKIsArm64)' == 'arm64')">
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\libvulkan.1.dylib"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\libvulkan.1.dylib')">
+      <Link>libvulkan.1.dylib</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\libMoltenVK.dylib"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\libMoltenVK.dylib')">
+      <Link>libMoltenVK.dylib</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\MoltenVK_icd.json"
+             Condition="Exists('$(AiDotNetNativeMoltenVKPackagePath)\runtimes\osx-arm64\native\MoltenVK_icd.json')">
+      <Link>MoltenVK_icd.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+</Project>

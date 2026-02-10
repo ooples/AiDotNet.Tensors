@@ -126,7 +126,43 @@ jobs:
       run: dotnet build --configuration Release --no-restore
 
     - name: Pack
-      run: dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-build --output ./artifacts
+      shell: pwsh
+      run: |
+        dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-build --output ./artifacts
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        # Pack native packages (skip MoltenVK if binaries are not present)
+        $nativeProjects = @(
+          "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj",
+          "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj",
+          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj"
+        )
+        foreach ($proj in $nativeProjects) {
+          if (Test-Path $proj) {
+            Write-Host "Packing $proj..."
+            dotnet pack $proj --configuration Release --no-build --output ./artifacts
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+        }
+
+        # MoltenVK: only pack if all required native binaries are present for both architectures
+        $moltenVKProj = "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
+        $moltenVKFiles = @(
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/libMoltenVK.dylib",
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/libvulkan.1.dylib",
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/MoltenVK_icd.json",
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-x64/native/libMoltenVK.dylib",
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-x64/native/libvulkan.1.dylib",
+          "src/AiDotNet.Native.MoltenVK/runtimes/osx-x64/native/MoltenVK_icd.json"
+        )
+        $allPresent = (Test-Path $moltenVKProj) -and ($moltenVKFiles | ForEach-Object { Test-Path $_ }) -notcontains $false
+        if ($allPresent) {
+          Write-Host "Packing AiDotNet.Native.MoltenVK..."
+          dotnet pack $moltenVKProj --configuration Release --no-build --output ./artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        } else {
+          Write-Host "Skipping AiDotNet.Native.MoltenVK - not all native binaries present"
+        }
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
