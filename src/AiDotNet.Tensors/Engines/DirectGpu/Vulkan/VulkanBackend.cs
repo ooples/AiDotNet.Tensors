@@ -42,6 +42,7 @@ public sealed unsafe class VulkanBackend : IDisposable
     private readonly ConcurrentDictionary<VulkanKernelType, VulkanShaderModule> _shaderCache;
     private VulkanBufferTransfer? _transfer;
     private IntPtr _commandBuffer;
+    private readonly object _computeLock = new object();
     private bool _initialized;
     private bool _disposed;
 
@@ -127,7 +128,12 @@ public sealed unsafe class VulkanBackend : IDisposable
         };
 
         IntPtr cmdBuffer;
-        VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
+        int result = VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
+        if (result != VulkanNativeBindings.VK_SUCCESS || cmdBuffer == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"Failed to allocate Vulkan command buffer: {result}");
+        }
+
         _commandBuffer = cmdBuffer;
     }
 
@@ -402,6 +408,8 @@ public sealed unsafe class VulkanBackend : IDisposable
 
     private void RecordAndExecuteCompute(VulkanComputePipeline pipeline, int elementCount)
     {
+        lock (_computeLock)
+        {
         // Reset command buffer
         VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
 
@@ -450,10 +458,13 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Submit and wait
         _device.SubmitAndWait(_commandBuffer);
+        }
     }
 
     private void RecordAndExecuteComputeWithScalar(VulkanComputePipeline pipeline, int elementCount, float scalar)
     {
+        lock (_computeLock)
+        {
         // Reset command buffer
         VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
 
@@ -509,6 +520,7 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Submit and wait
         _device.SubmitAndWait(_commandBuffer);
+        }
     }
 
     /// <summary>

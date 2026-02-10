@@ -138,9 +138,14 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// <returns>True if initialization succeeded.</returns>
     public bool Initialize()
     {
-        if (_initialized)
+        if (_initialized && !_disposed)
         {
             return true;
+        }
+
+        if (_disposed)
+        {
+            return false;
         }
 
         if (!VulkanNativeBindings.IsPlatformSupported)

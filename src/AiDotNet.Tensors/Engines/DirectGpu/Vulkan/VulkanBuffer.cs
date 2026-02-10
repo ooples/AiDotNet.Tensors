@@ -255,7 +255,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         int copyCount = Math.Min(data.Length, _elementCount);
-        ulong copySize = (ulong)(copyCount * sizeof(float));
+        ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
             _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
@@ -290,7 +290,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         int copyCount = Math.Min(data.Length, _elementCount);
-        ulong copySize = (ulong)(copyCount * sizeof(float));
+        ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
             _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
@@ -428,7 +428,12 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         IntPtr cmdBuffer;
-        VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
+        int result = VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
+        if (result != VulkanNativeBindings.VK_SUCCESS || cmdBuffer == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"Failed to allocate Vulkan transfer command buffer: {result}");
+        }
+
         _commandBuffer = cmdBuffer;
     }
 
@@ -476,7 +481,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             pNext = null,
             srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
-            dstAccessMask = VkAccessFlags.VK_ACCESS_SHADER_READ_BIT,
+            dstAccessMask = VkAccessFlags.VK_ACCESS_SHADER_READ_BIT | VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
             srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             buffer = device.Handle,

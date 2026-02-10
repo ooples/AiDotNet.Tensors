@@ -113,7 +113,12 @@ public sealed unsafe class VulkanShaderModule : IDisposable
             return;
         }
 
-        fixed (byte* pCode = spirvCode)
+        // Copy byte[] into uint[] to guarantee 4-byte alignment required by Vulkan for pCode
+        int uint32Count = (spirvCode.Length + 3) / 4;
+        var alignedCode = new uint[uint32Count];
+        Buffer.BlockCopy(spirvCode, 0, alignedCode, 0, spirvCode.Length);
+
+        fixed (uint* pCode = alignedCode)
         {
             var createInfo = new VkShaderModuleCreateInfo
             {
@@ -121,7 +126,7 @@ public sealed unsafe class VulkanShaderModule : IDisposable
                 pNext = null,
                 flags = 0,
                 codeSize = (nuint)spirvCode.Length,
-                pCode = (uint*)pCode
+                pCode = pCode
             };
 
             var result = VulkanNativeBindings.vkCreateShaderModule(
@@ -186,6 +191,7 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
     private IntPtr _descriptorSet;
     private readonly int _bindingCount;
     private readonly uint _pushConstantSize;
+    private readonly object _dispatchLock = new object();
     private bool _disposed;
 
     /// <summary>
@@ -404,31 +410,34 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
             return;
         }
 
-        int count = Math.Min(buffers.Length, _bindingCount);
-        var bufferInfos = stackalloc VkDescriptorBufferInfo[count];
-        var writes = stackalloc VkWriteDescriptorSet[count];
-
-        for (int i = 0; i < count; i++)
+        lock (_dispatchLock)
         {
-            bufferInfos[i] = buffers[i].GetDescriptorInfo();
+            int count = Math.Min(buffers.Length, _bindingCount);
+            var bufferInfos = stackalloc VkDescriptorBufferInfo[count];
+            var writes = stackalloc VkWriteDescriptorSet[count];
 
-            writes[i] = new VkWriteDescriptorSet
+            for (int i = 0; i < count; i++)
             {
-                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                pNext = null,
-                dstSet = _descriptorSet,
-                dstBinding = (uint)i,
-                dstArrayElement = 0,
-                descriptorCount = 1,
-                descriptorType = VulkanNativeBindings.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                pImageInfo = null,
-                pBufferInfo = &bufferInfos[i],
-                pTexelBufferView = null
-            };
-        }
+                bufferInfos[i] = buffers[i].GetDescriptorInfo();
 
-        VulkanNativeBindings.vkUpdateDescriptorSets(
-            _device.Device, (uint)count, writes, 0, IntPtr.Zero);
+                writes[i] = new VkWriteDescriptorSet
+                {
+                    sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    pNext = null,
+                    dstSet = _descriptorSet,
+                    dstBinding = (uint)i,
+                    dstArrayElement = 0,
+                    descriptorCount = 1,
+                    descriptorType = VulkanNativeBindings.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    pImageInfo = null,
+                    pBufferInfo = &bufferInfos[i],
+                    pTexelBufferView = null
+                };
+            }
+
+            VulkanNativeBindings.vkUpdateDescriptorSets(
+                _device.Device, (uint)count, writes, 0, IntPtr.Zero);
+        }
     }
 
     /// <summary>
