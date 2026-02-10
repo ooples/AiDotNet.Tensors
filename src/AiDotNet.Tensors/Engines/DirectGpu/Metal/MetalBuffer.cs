@@ -295,6 +295,14 @@ public sealed class MetalGpuBuffer : IGpuBuffer
 
         var destPtr = IntPtr.Add(contents, offsetInBytes);
         Buffer.MemoryCopy(source.ToPointer(), destPtr.ToPointer(), SizeInBytes - offsetInBytes, sizeInBytes);
+
+        // For managed storage mode, notify Metal that the range was modified
+        if ((StorageMode & MTLResourceOptions.StorageModeManaged) == MTLResourceOptions.StorageModeManaged)
+        {
+            int offsetElements = offsetInBytes / sizeof(float);
+            int countElements = (sizeInBytes + sizeof(float) - 1) / sizeof(float);
+            NotifyModified(offsetElements, countElements);
+        }
     }
 
     /// <summary>

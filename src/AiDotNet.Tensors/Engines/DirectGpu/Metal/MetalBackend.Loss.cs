@@ -13,6 +13,8 @@ public sealed partial class MetalBackend
     public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
     {
         ThrowIfDisposed();
+        if (batchSize <= 0) return 0f;
+
         // CPU fallback
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
@@ -47,6 +49,7 @@ public sealed partial class MetalBackend
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -76,10 +79,7 @@ public sealed partial class MetalBackend
             grad[i] = ((p - targs[i]) / (p * (1 - p))) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -88,6 +88,7 @@ public sealed partial class MetalBackend
     public float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -116,6 +117,7 @@ public sealed partial class MetalBackend
     public float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -158,10 +160,7 @@ public sealed partial class MetalBackend
             }
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -188,6 +187,7 @@ public sealed partial class MetalBackend
     public float FocalLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float alpha, float gamma)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -224,10 +224,7 @@ public sealed partial class MetalBackend
             grad[i] = alphaT * factor * (gamma * pt * MathF.Log(pt) + pt - 1) * (2 * t - 1) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -236,6 +233,7 @@ public sealed partial class MetalBackend
     public float MaeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -262,10 +260,7 @@ public sealed partial class MetalBackend
             grad[i] = MathF.Sign(preds[i] - targs[i]) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -274,6 +269,7 @@ public sealed partial class MetalBackend
     public float LogCoshLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -302,10 +298,7 @@ public sealed partial class MetalBackend
             grad[i] = MathF.Tanh(diff) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -314,6 +307,7 @@ public sealed partial class MetalBackend
     public float QuantileLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float quantile)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -342,10 +336,7 @@ public sealed partial class MetalBackend
             grad[i] = (diff >= 0 ? -quantile : (1 - quantile)) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -354,6 +345,7 @@ public sealed partial class MetalBackend
     public float HingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -380,10 +372,7 @@ public sealed partial class MetalBackend
             grad[i] = (1 - targs[i] * preds[i] > 0) ? -targs[i] / size : 0;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -392,6 +381,7 @@ public sealed partial class MetalBackend
     public float SquaredHingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -420,10 +410,7 @@ public sealed partial class MetalBackend
             grad[i] = margin > 0 ? -2 * margin * targs[i] / size : 0;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -432,6 +419,7 @@ public sealed partial class MetalBackend
     public float PoissonLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -460,10 +448,7 @@ public sealed partial class MetalBackend
             grad[i] = (1 - targs[i] / p) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -472,6 +457,7 @@ public sealed partial class MetalBackend
     public float ExponentialLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -498,10 +484,7 @@ public sealed partial class MetalBackend
             grad[i] = -targs[i] * MathF.Exp(-targs[i] * preds[i]) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -510,6 +493,7 @@ public sealed partial class MetalBackend
     public float ModifiedHuberLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -557,10 +541,7 @@ public sealed partial class MetalBackend
             }
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -569,6 +550,7 @@ public sealed partial class MetalBackend
     public float CategoricalCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -597,10 +579,7 @@ public sealed partial class MetalBackend
             grad[i] = -targs[i] / p / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -609,6 +588,7 @@ public sealed partial class MetalBackend
     public float CharbonnierLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float epsilon)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -637,10 +617,7 @@ public sealed partial class MetalBackend
             grad[i] = diff / MathF.Sqrt(diff * diff + epsilon * epsilon) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -649,6 +626,7 @@ public sealed partial class MetalBackend
     public float ElasticNetLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float l1Weight, float l2Weight)
     {
         ThrowIfDisposed();
+        if (size <= 0) return 0f;
         var preds = DownloadBuffer(predictions);
         var targs = DownloadBuffer(targets);
 
@@ -677,10 +655,7 @@ public sealed partial class MetalBackend
             grad[i] = (l1Weight * MathF.Sign(diff) + 2 * l2Weight * diff) / size;
         }
 
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(grad);
-        }
+        UploadToBuffer(gradInput, grad);
     }
 
     /// <summary>
@@ -689,6 +664,7 @@ public sealed partial class MetalBackend
     public float TripletLoss(IGpuBuffer anchor, IGpuBuffer positive, IGpuBuffer negative, int batchSize, int embeddingDim, float margin)
     {
         ThrowIfDisposed();
+        if (batchSize <= 0) return 0f;
         var a = DownloadBuffer(anchor);
         var p = DownloadBuffer(positive);
         var n = DownloadBuffer(negative);
@@ -769,6 +745,7 @@ public sealed partial class MetalBackend
     public float ContrastiveLoss(IGpuBuffer output1, IGpuBuffer output2, IGpuBuffer labels, int batchSize, int embeddingDim, float margin)
     {
         ThrowIfDisposed();
+        if (batchSize <= 0) return 0f;
         var o1 = DownloadBuffer(output1);
         var o2 = DownloadBuffer(output2);
         var l = DownloadBuffer(labels);

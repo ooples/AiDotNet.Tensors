@@ -226,8 +226,14 @@ public sealed partial class MetalBackend
 
         // Project to Poincare ball
         var tempOutput = AllocateBuffer(outputData);
-        PoincareProject(tempOutput, output, batchSize, outputFeatures, curvature, epsilon);
-        ((MetalGpuBuffer)tempOutput).Dispose();
+        try
+        {
+            PoincareProject(tempOutput, output, batchSize, outputFeatures, curvature, epsilon);
+        }
+        finally
+        {
+            ((MetalGpuBuffer)tempOutput).Dispose();
+        }
     }
 
     /// <summary>
@@ -443,20 +449,44 @@ public sealed partial class MetalBackend
         var weightsData = DownloadBuffer(weights);
         var gradInputData = new float[batchSize * inputFeatures * 8];
 
+        // Full octonion backward: d(prod)/d(a) is an 8x8 Jacobian matrix determined by w.
+        // For forward: prod[c] = sum over all a[j] and w[k] terms from the octonion multiplication table.
+        // The gradient for a[j] = sum_c gradOut[c] * (d prod[c] / d a[j])
         for (int b = 0; b < batchSize; b++)
         {
             for (int i = 0; i < inputFeatures; i++)
             {
-                for (int c = 0; c < 8; c++)
+                int inputOffset = (b * inputFeatures + i) * 8;
+                var ga = new float[8];
+
+                for (int o = 0; o < outputFeatures; o++)
                 {
-                    float sum = 0;
-                    for (int o = 0; o < outputFeatures; o++)
-                    {
-                        // Simplified gradient computation
-                        sum += gradOutData[(b * outputFeatures + o) * 8 + c] * weightsData[(o * inputFeatures + i) * 8 + c];
-                    }
-                    gradInputData[(b * inputFeatures + i) * 8 + c] = sum;
+                    int weightOffset = (o * inputFeatures + i) * 8;
+                    int gradOutOffset = (b * outputFeatures + o) * 8;
+
+                    float w0 = weightsData[weightOffset], w1 = weightsData[weightOffset + 1];
+                    float w2 = weightsData[weightOffset + 2], w3 = weightsData[weightOffset + 3];
+                    float w4 = weightsData[weightOffset + 4], w5 = weightsData[weightOffset + 5];
+                    float w6 = weightsData[weightOffset + 6], w7 = weightsData[weightOffset + 7];
+
+                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
+                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
+                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
+                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
+
+                    // Transpose of the Jacobian d(prod)/d(a), derived from the octonion multiplication table
+                    ga[0] += g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4 + g5 * w5 + g6 * w6 + g7 * w7;
+                    ga[1] += g0 * (-w1) + g1 * w0 + g2 * (-w3) + g3 * w2 + g4 * (-w5) + g5 * w4 + g6 * w7 + g7 * (-w6);
+                    ga[2] += g0 * (-w2) + g1 * w3 + g2 * w0 + g3 * (-w1) + g4 * (-w6) + g5 * (-w7) + g6 * w4 + g7 * w5;
+                    ga[3] += g0 * (-w3) + g1 * (-w2) + g2 * w1 + g3 * w0 + g4 * (-w7) + g5 * w6 + g6 * (-w5) + g7 * w4;
+                    ga[4] += g0 * (-w4) + g1 * w5 + g2 * w6 + g3 * w7 + g4 * w0 + g5 * (-w1) + g6 * (-w2) + g7 * (-w3);
+                    ga[5] += g0 * (-w5) + g1 * (-w4) + g2 * w7 + g3 * (-w6) + g4 * w1 + g5 * w0 + g6 * w3 + g7 * (-w2);
+                    ga[6] += g0 * (-w6) + g1 * (-w7) + g2 * (-w4) + g3 * w5 + g4 * w2 + g5 * (-w3) + g6 * w0 + g7 * w1;
+                    ga[7] += g0 * (-w7) + g1 * w6 + g2 * (-w5) + g3 * (-w4) + g4 * w3 + g5 * w2 + g6 * (-w1) + g7 * w0;
                 }
+
+                for (int c = 0; c < 8; c++)
+                    gradInputData[inputOffset + c] = ga[c];
             }
         }
 
@@ -475,19 +505,42 @@ public sealed partial class MetalBackend
         var inputData = DownloadBuffer(input);
         var gradWeightsData = new float[outputFeatures * inputFeatures * 8];
 
+        // Full octonion backward for weights: d(prod)/d(w) Jacobian derived from the multiplication table.
         for (int o = 0; o < outputFeatures; o++)
         {
             for (int i = 0; i < inputFeatures; i++)
             {
-                for (int c = 0; c < 8; c++)
+                int weightOffset = (o * inputFeatures + i) * 8;
+                var gw = new float[8];
+
+                for (int b = 0; b < batchSize; b++)
                 {
-                    float sum = 0;
-                    for (int b = 0; b < batchSize; b++)
-                    {
-                        sum += gradOutData[(b * outputFeatures + o) * 8 + c] * inputData[(b * inputFeatures + i) * 8 + c];
-                    }
-                    gradWeightsData[(o * inputFeatures + i) * 8 + c] = sum;
+                    int inputOffset = (b * inputFeatures + i) * 8;
+                    int gradOutOffset = (b * outputFeatures + o) * 8;
+
+                    float a0 = inputData[inputOffset], a1 = inputData[inputOffset + 1];
+                    float a2 = inputData[inputOffset + 2], a3 = inputData[inputOffset + 3];
+                    float a4 = inputData[inputOffset + 4], a5 = inputData[inputOffset + 5];
+                    float a6 = inputData[inputOffset + 6], a7 = inputData[inputOffset + 7];
+
+                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
+                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
+                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
+                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
+
+                    // Transpose of Jacobian d(prod)/d(w), from the octonion multiplication table
+                    gw[0] += g0 * a0 + g1 * a1 + g2 * a2 + g3 * a3 + g4 * a4 + g5 * a5 + g6 * a6 + g7 * a7;
+                    gw[1] += g0 * (-a1) + g1 * a0 + g2 * a3 + g3 * (-a2) + g4 * a5 + g5 * (-a4) + g6 * (-a7) + g7 * a6;
+                    gw[2] += g0 * (-a2) + g1 * (-a3) + g2 * a0 + g3 * a1 + g4 * a6 + g5 * a7 + g6 * (-a4) + g7 * (-a5);
+                    gw[3] += g0 * (-a3) + g1 * a2 + g2 * (-a1) + g3 * a0 + g4 * a7 + g5 * (-a6) + g6 * a5 + g7 * (-a4);
+                    gw[4] += g0 * (-a4) + g1 * (-a5) + g2 * (-a6) + g3 * (-a7) + g4 * a0 + g5 * a1 + g6 * a2 + g7 * a3;
+                    gw[5] += g0 * (-a5) + g1 * a4 + g2 * (-a7) + g3 * a6 + g4 * (-a1) + g5 * a0 + g6 * (-a3) + g7 * a2;
+                    gw[6] += g0 * (-a6) + g1 * a7 + g2 * a4 + g3 * (-a5) + g4 * (-a2) + g5 * a3 + g6 * a0 + g7 * (-a1);
+                    gw[7] += g0 * (-a7) + g1 * (-a6) + g2 * a5 + g3 * a4 + g4 * (-a3) + g5 * (-a2) + g6 * a1 + g7 * a0;
                 }
+
+                for (int c = 0; c < 8; c++)
+                    gradWeightsData[weightOffset + c] = gw[c];
             }
         }
 

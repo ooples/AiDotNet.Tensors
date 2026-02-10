@@ -492,7 +492,8 @@ public sealed partial class MetalBackend
                         result[outIdx] = maxVal;
                         if (idxResult is not null)
                         {
-                            idxResult[outIdx] = maxIdx;
+                            // Store index as int-to-float bitcast to avoid float precision loss for large indices
+                            unsafe { int tmp = maxIdx; idxResult[outIdx] = *(float*)&tmp; }
                         }
                     }
                 }
@@ -533,7 +534,9 @@ public sealed partial class MetalBackend
                     {
                         int outIdx = b * channels * outHeight * outWidth +
                                     c * outHeight * outWidth + oh * outWidth + ow;
-                        int maxIdx = (int)idx[outIdx];
+                        // Decode index from int-to-float bitcast stored in forward pass
+                        int maxIdx;
+                        unsafe { float tmp = idx[outIdx]; maxIdx = *(int*)&tmp; }
                         int giIdx = b * channels * inHeight * inWidth +
                                    c * inHeight * inWidth + maxIdx;
                         result[giIdx] += go[outIdx];

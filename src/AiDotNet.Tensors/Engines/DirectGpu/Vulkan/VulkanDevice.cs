@@ -39,6 +39,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     private bool _initialized;
     private bool _disposed;
 
+    private readonly object _submitLock = new();
     private string _deviceName = string.Empty;
     private string _vendorName = string.Empty;
     private VkPhysicalDeviceLimits _limits;
@@ -194,10 +195,16 @@ public sealed unsafe class VulkanDevice : IDisposable
         }
     }
 
+    // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR — required for MoltenVK on macOS
+    private const uint VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x00000001;
+
     private bool CreateInstance()
     {
         var appNameBytes = Encoding.UTF8.GetBytes("AiDotNet.Tensors\0");
         var engineNameBytes = Encoding.UTF8.GetBytes("DirectGpu\0");
+
+        // MoltenVK on macOS requires the portability enumeration extension
+        bool isMacOS = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
 
         fixed (byte* pAppName = appNameBytes)
         fixed (byte* pEngineName = engineNameBytes)
@@ -213,20 +220,61 @@ public sealed unsafe class VulkanDevice : IDisposable
                 apiVersion = (uint)VulkanNativeBindings.VK_API_VERSION_1_0
             };
 
-            var createInfo = new VkInstanceCreateInfo
-            {
-                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-                pNext = null,
-                flags = 0,
-                pApplicationInfo = &appInfo,
-                enabledLayerCount = 0,
-                ppEnabledLayerNames = null,
-                enabledExtensionCount = 0,
-                ppEnabledExtensionNames = null
-            };
+            uint instanceFlags = 0;
+            uint extensionCount = 0;
+            byte** ppExtensions = null;
 
-            var result = VulkanNativeBindings.vkCreateInstance(&createInfo, IntPtr.Zero, out _instance_vk);
-            return result == VulkanNativeBindings.VK_SUCCESS;
+            // For MoltenVK, enable portability enumeration
+            var portabilityExtName = Encoding.UTF8.GetBytes("VK_KHR_portability_enumeration\0");
+            fixed (byte* pPortabilityExt = portabilityExtName)
+            {
+                byte*[] extensions = [pPortabilityExt];
+                if (isMacOS)
+                {
+                    instanceFlags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+                    extensionCount = 1;
+                    fixed (byte** pExtensions = extensions)
+                    {
+                        ppExtensions = pExtensions;
+
+                        var createInfo = new VkInstanceCreateInfo
+                        {
+                            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                            pNext = null,
+                            flags = instanceFlags,
+                            pApplicationInfo = &appInfo,
+                            enabledLayerCount = 0,
+                            ppEnabledLayerNames = null,
+                            enabledExtensionCount = extensionCount,
+                            ppEnabledExtensionNames = ppExtensions
+                        };
+
+                        var result = VulkanNativeBindings.vkCreateInstance(&createInfo, IntPtr.Zero, out _instance_vk);
+                        if (result == VulkanNativeBindings.VK_SUCCESS)
+                        {
+                            return true;
+                        }
+
+                        // Fall through to try without portability extension
+                    }
+                }
+
+                // Non-macOS or macOS fallback without portability extension
+                var fallbackCreateInfo = new VkInstanceCreateInfo
+                {
+                    sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                    pNext = null,
+                    flags = 0,
+                    pApplicationInfo = &appInfo,
+                    enabledLayerCount = 0,
+                    ppEnabledLayerNames = null,
+                    enabledExtensionCount = 0,
+                    ppEnabledExtensionNames = null
+                };
+
+                var fallbackResult = VulkanNativeBindings.vkCreateInstance(&fallbackCreateInfo, IntPtr.Zero, out _instance_vk);
+                return fallbackResult == VulkanNativeBindings.VK_SUCCESS;
+            }
         }
     }
 
@@ -517,33 +565,37 @@ public sealed unsafe class VulkanDevice : IDisposable
             return;
         }
 
-        // Reset fence
-        var fencePtr = _fence;
-        VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
-
-        var submitInfo = new VkSubmitInfo
+        // Vulkan spec requires external synchronization for vkQueueSubmit
+        lock (_submitLock)
         {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            pNext = null,
-            waitSemaphoreCount = 0,
-            pWaitSemaphores = null,
-            pWaitDstStageMask = null,
-            commandBufferCount = 1,
-            pCommandBuffers = &commandBuffer,
-            signalSemaphoreCount = 0,
-            pSignalSemaphores = null
-        };
+            // Reset fence
+            var fencePtr = _fence;
+            VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
 
-        var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, _fence);
-        if (submitResult != VulkanNativeBindings.VK_SUCCESS)
-        {
-            throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
-        }
+            var submitInfo = new VkSubmitInfo
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                pNext = null,
+                waitSemaphoreCount = 0,
+                pWaitSemaphores = null,
+                pWaitDstStageMask = null,
+                commandBufferCount = 1,
+                pCommandBuffers = &commandBuffer,
+                signalSemaphoreCount = 0,
+                pSignalSemaphores = null
+            };
 
-        var waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
-        if (waitResult != VulkanNativeBindings.VK_SUCCESS)
-        {
-            throw new InvalidOperationException($"vkWaitForFences failed with error code {waitResult}");
+            var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, _fence);
+            if (submitResult != VulkanNativeBindings.VK_SUCCESS)
+            {
+                throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
+            }
+
+            var waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
+            if (waitResult != VulkanNativeBindings.VK_SUCCESS)
+            {
+                throw new InvalidOperationException($"vkWaitForFences failed with error code {waitResult}");
+            }
         }
     }
 

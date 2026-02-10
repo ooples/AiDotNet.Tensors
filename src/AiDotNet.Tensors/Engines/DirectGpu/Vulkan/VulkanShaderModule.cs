@@ -113,10 +113,14 @@ public sealed unsafe class VulkanShaderModule : IDisposable
             return;
         }
 
+        // SPIR-V spec requires codeSize to be a multiple of 4
         // Copy byte[] into uint[] to guarantee 4-byte alignment required by Vulkan for pCode
         int uint32Count = (spirvCode.Length + 3) / 4;
         var alignedCode = new uint[uint32Count];
         Buffer.BlockCopy(spirvCode, 0, alignedCode, 0, spirvCode.Length);
+
+        // codeSize must be a multiple of 4 per Vulkan spec (VUID-VkShaderModuleCreateInfo-codeSize-01085)
+        nuint alignedCodeSize = (nuint)(uint32Count * 4);
 
         fixed (uint* pCode = alignedCode)
         {
@@ -125,7 +129,7 @@ public sealed unsafe class VulkanShaderModule : IDisposable
                 sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                 pNext = null,
                 flags = 0,
-                codeSize = (nuint)spirvCode.Length,
+                codeSize = alignedCodeSize,
                 pCode = pCode
             };
 
@@ -410,9 +414,17 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
             return;
         }
 
+        if (buffers.Length != _bindingCount)
+        {
+            throw new ArgumentException(
+                $"Buffer count mismatch: expected {_bindingCount} buffers for pipeline bindings, got {buffers.Length}. " +
+                "All bindings must be provided to avoid undefined behavior.",
+                nameof(buffers));
+        }
+
         lock (_dispatchLock)
         {
-            int count = Math.Min(buffers.Length, _bindingCount);
+            int count = buffers.Length;
             var bufferInfos = stackalloc VkDescriptorBufferInfo[count];
             var writes = stackalloc VkWriteDescriptorSet[count];
 

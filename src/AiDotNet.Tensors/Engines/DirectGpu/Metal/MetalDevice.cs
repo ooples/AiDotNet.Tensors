@@ -302,7 +302,13 @@ public sealed class MetalDevice : IDisposable
             throw new ArgumentException("Buffer size must be greater than zero.", nameof(sizeInBytes));
         }
 
-        return SendMessageULong2(_device, Selectors.NewBufferWithLength, sizeInBytes, (ulong)options);
+        IntPtr buffer = SendMessageULong2(_device, Selectors.NewBufferWithLength, sizeInBytes, (ulong)options);
+        if (buffer == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"Metal failed to create buffer with {sizeInBytes} bytes");
+        }
+
+        return buffer;
     }
 
     /// <summary>

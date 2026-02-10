@@ -326,7 +326,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
             return;
         }
 
-        ulong copySize = (ulong)(data.Length * sizeof(T));
+        ulong copySize = (ulong)data.Length * (ulong)sizeof(T);
         if (copySize > _size)
         {
             copySize = _size;
@@ -558,6 +558,26 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
 
         VulkanNativeBindings.vkCmdCopyBuffer(
             _commandBuffer, device.Handle, staging.Handle, 1, &copyRegion);
+
+        // Add post-transfer barrier to ensure copy completes before host read
+        var postBarrier = new VkBufferMemoryBarrier
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            pNext = null,
+            srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
+            dstAccessMask = VkAccessFlags.VK_ACCESS_HOST_READ_BIT,
+            srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+            buffer = staging.Handle,
+            offset = 0,
+            size = VulkanNativeBindings.VK_WHOLE_SIZE
+        };
+
+        VulkanNativeBindings.vkCmdPipelineBarrier(
+            _commandBuffer,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VkPipelineStageFlags.VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, IntPtr.Zero, 1, &postBarrier, 0, IntPtr.Zero);
 
         VulkanNativeBindings.vkEndCommandBuffer(_commandBuffer);
 

@@ -202,7 +202,13 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException("Vulkan backend not initialized.");
         }
 
-        int size = Math.Min(a.Length, Math.Min(b.Length, result.Length));
+        if (a.Length != b.Length || a.Length != result.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer size mismatch: a.Length={a.Length}, b.Length={b.Length}, result.Length={result.Length}. All must be equal.");
+        }
+
+        int size = a.Length;
         if (size == 0)
         {
             return;
@@ -259,7 +265,13 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException("Vulkan backend not initialized.");
         }
 
-        int size = Math.Min(input.Length, result.Length);
+        if (input.Length != result.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer size mismatch: input.Length={input.Length}, result.Length={result.Length}. Both must be equal.");
+        }
+
+        int size = input.Length;
         if (size == 0)
         {
             return;
@@ -311,7 +323,13 @@ public sealed unsafe class VulkanBackend : IDisposable
             throw new InvalidOperationException("Vulkan backend not initialized.");
         }
 
-        int size = Math.Min(input.Length, result.Length);
+        if (input.Length != result.Length)
+        {
+            throw new ArgumentException(
+                $"Buffer size mismatch: input.Length={input.Length}, result.Length={result.Length}. Both must be equal.");
+        }
+
+        int size = input.Length;
         if (size == 0)
         {
             return;

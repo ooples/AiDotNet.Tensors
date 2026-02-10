@@ -426,10 +426,12 @@ public sealed partial class MetalBackend
         for (int i = 0; i < sourceSize; i++)
         {
             int idx = idxData[i];
-            if (idx >= 0 && idx < destSize)
+            if (idx < 0 || idx >= destSize)
             {
-                destData[idx] += srcData[i];
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {destSize})");
             }
+
+            destData[idx] += srcData[i];
         }
 
         UploadToBuffer(destination, destData);
