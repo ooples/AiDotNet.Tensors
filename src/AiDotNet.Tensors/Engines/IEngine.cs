@@ -3540,6 +3540,9 @@ public interface IEngine
     /// <param name="scale">Optional scale factor. If null, uses 1/sqrt(head_dim).</param>
     /// <param name="isCausal">If true, applies causal masking (lower triangular).</param>
     /// <param name="softmaxStats">Output: log-sum-exp statistics for backward pass [batch, heads, seq_q].</param>
+    /// <param name="attentionBias">Optional additive attention bias with shape [batch, heads, seq_q, seq_kv] or [heads, seq_q, seq_kv].
+    /// Added to attention scores after QK^T * scale and before softmax. Used for ALiBi, relative position biases, etc.
+    /// When null, no bias is applied (backward compatible).</param>
     /// <returns>The attention output with shape [batch, heads, seq_q, head_dim].</returns>
     /// <remarks>
     /// <para><b>FlashAttention Algorithm (Dao et al., 2022):</b></para>
@@ -3574,7 +3577,8 @@ public interface IEngine
         Tensor<T> value,
         double? scale,
         bool isCausal,
-        out Tensor<T> softmaxStats);
+        out Tensor<T> softmaxStats,
+        Tensor<T>? attentionBias = null);
 
     /// <summary>
     /// Computes the backward pass for FlashAttention.
@@ -3591,6 +3595,8 @@ public interface IEngine
     /// <param name="gradQuery">Output: gradient with respect to query.</param>
     /// <param name="gradKey">Output: gradient with respect to key.</param>
     /// <param name="gradValue">Output: gradient with respect to value.</param>
+    /// <param name="attentionBias">Optional additive attention bias used in the forward pass.
+    /// Must match the same bias passed to FlashAttention. When null, no bias gradient is computed.</param>
     /// <returns>The gradient with respect to the output (same as gradOutput for chaining).</returns>
     /// <remarks>
     /// <para>
@@ -3609,7 +3615,8 @@ public interface IEngine
         bool isCausal,
         out Tensor<T> gradQuery,
         out Tensor<T> gradKey,
-        out Tensor<T> gradValue);
+        out Tensor<T> gradValue,
+        Tensor<T>? attentionBias = null);
 
     /// <summary>
     /// Computes Grouped Query Attention (GQA) for efficient inference.

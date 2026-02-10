@@ -1225,17 +1225,23 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="headDim">Dimension per head.</param>
     /// <param name="scale">Scaling factor (typically 1/sqrt(headDim)).</param>
     /// <param name="isCausal">If true, applies causal masking.</param>
+    /// <param name="attentionBias">Optional additive attention bias buffer [batch * heads * seqQ * seqK] or [heads * seqQ * seqK] for ALiBi/relative position bias. Added after QK^T * scale, before softmax.</param>
+    /// <param name="biasBatchStride">Batch stride for bias indexing. Set to numHeads * seqQ * seqK for 4D bias, or 0 for 3D (batch-broadcast).</param>
     void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0);
 
     /// <summary>
     /// Backward pass for FlashAttention using recomputation for memory efficiency.
     /// </summary>
+    /// <param name="attentionBias">Optional additive attention bias buffer, must match what was used in the forward pass.</param>
+    /// <param name="biasBatchStride">Batch stride for bias indexing, must match the forward pass.</param>
     void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0);
 
     /// <summary>
     /// Grouped Query Attention - multiple query heads share same KV heads.

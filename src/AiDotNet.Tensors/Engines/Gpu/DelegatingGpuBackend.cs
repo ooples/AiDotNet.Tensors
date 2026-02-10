@@ -774,16 +774,18 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void FlashAttentionV2(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
-        => Inner.FlashAttentionV2(query, key, value, output, softmaxStats, batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
+        => Inner.FlashAttentionV2(query, key, value, output, softmaxStats, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, biasBatchStride);
 
     /// <inheritdoc/>
     public virtual void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
-        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
+        int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
+        IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
         => Inner.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats,
-            gradQuery, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal);
+            gradQuery, gradKey, gradValue, batch, numHeads, seqQ, seqK, headDim, scale, isCausal, attentionBias, biasBatchStride);
 
     /// <inheritdoc/>
     public virtual void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,

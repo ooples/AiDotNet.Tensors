@@ -3934,14 +3934,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         Tensor<T> value,
         double? scale,
         bool isCausal,
-        out Tensor<T> softmaxStats)
+        out Tensor<T> softmaxStats,
+        Tensor<T>? attentionBias = null)
     {
         if (!TryGetBackend(out var backend))
-            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats);
+            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
         // Validate tensor shapes [batch, heads, seq, head_dim]
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
-            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats);
+            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
         int batch = query.Shape[0];
         int heads = query.Shape[1];
@@ -3959,11 +3960,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         using var outputBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ * headDim);
         using var statsBuffer = AllocateOutputBuffer(backend, batch * heads * seqQ);
 
+        // Upload attention bias to GPU if provided
+        OwnedBuffer? biasBufferHandle = null;
+        int biasBatchStride = 0;
+        if (attentionBias is not null)
+        {
+            biasBufferHandle = GetOrAllocateBuffer(backend, attentionBias.ToArray());
+            // 4D bias [batch, heads, seqQ, seqK] vs 3D [heads, seqQ, seqK] (batch-broadcast)
+            biasBatchStride = attentionBias.Shape.Length == 4
+                ? heads * seqQ * seqK
+                : 0;
+        }
+
         try
         {
-            // Execute GPU FlashAttention
+            // Execute GPU FlashAttention with optional bias
             backend.FlashAttentionV2(queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer, outputBuffer.Buffer, statsBuffer.Buffer,
-                batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal);
+                batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal,
+                biasBufferHandle?.Buffer, biasBatchStride);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] outputFloat = new float[batch * heads * seqQ * headDim];
@@ -3981,7 +3995,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         catch
         {
             // Fall back to CPU on any GPU error
-            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats);
+            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
+        }
+        finally
+        {
+            biasBufferHandle?.Dispose();
         }
     }
 
@@ -4000,15 +4018,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         bool isCausal,
         out Tensor<T> gradQuery,
         out Tensor<T> gradKey,
-        out Tensor<T> gradValue)
+        out Tensor<T> gradValue,
+        Tensor<T>? attentionBias = null)
     {
         if (!TryGetBackend(out var backend))
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
-                out gradQuery, out gradKey, out gradValue);
+                out gradQuery, out gradKey, out gradValue, attentionBias);
 
         if (query.Rank != 4)
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
-                out gradQuery, out gradKey, out gradValue);
+                out gradQuery, out gradKey, out gradValue, attentionBias);
 
         int batch = query.Shape[0];
         int heads = query.Shape[1];
@@ -4027,12 +4046,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         using var gradKBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
         using var gradVBuffer = AllocateOutputBuffer(backend, batch * heads * seqK * headDim);
 
+        // Upload attention bias to GPU if provided
+        OwnedBuffer? biasBufferHandle = null;
+        int biasBatchStride = 0;
+        if (attentionBias is not null)
+        {
+            biasBufferHandle = GetOrAllocateBuffer(backend, attentionBias.ToArray());
+            biasBatchStride = attentionBias.Shape.Length == 4
+                ? heads * seqQ * seqK
+                : 0;
+        }
+
         try
         {
-            // Execute GPU backward
+            // Execute GPU backward with optional bias
             backend.FlashAttentionBackward(gradOutBuffer.Buffer, queryBuffer.Buffer, keyBuffer.Buffer, valueBuffer.Buffer,
                 outputBuffer.Buffer, statsBuffer.Buffer, gradQBuffer.Buffer, gradKBuffer.Buffer, gradVBuffer.Buffer,
-                batch, heads, seqQ, seqK, headDim, (float)scale, isCausal);
+                batch, heads, seqQ, seqK, headDim, (float)scale, isCausal,
+                biasBufferHandle?.Buffer, biasBatchStride);
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
             float[] gradQFloat = new float[batch * heads * seqQ * headDim];
@@ -4052,7 +4083,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         catch
         {
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
-                out gradQuery, out gradKey, out gradValue);
+                out gradQuery, out gradKey, out gradValue, attentionBias);
+        }
+        finally
+        {
+            biasBufferHandle?.Dispose();
         }
     }
 
