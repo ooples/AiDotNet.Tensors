@@ -42,7 +42,9 @@ public enum GpuBackendPreference
     /// Auto-detect best backend for the GPU vendor.
     /// NVIDIA: CUDA (primary), OpenCL (fallback)
     /// AMD: HIP/ROCm (if available), OpenCL (fallback)
-    /// Intel: OpenCL
+    /// Intel: OpenCL or Vulkan
+    /// Apple: Metal
+    /// Browser: WebGPU
     /// </summary>
     Auto = 0,
 
@@ -52,12 +54,30 @@ public enum GpuBackendPreference
     CUDA = 1,
 
     /// <summary>
-    /// Force OpenCL backend (all vendors).
+    /// Force OpenCL backend (all vendors except Apple).
     /// </summary>
     OpenCL = 2,
 
     /// <summary>
     /// Force HIP/ROCm backend (AMD only).
     /// </summary>
-    HIP = 3
+    HIP = 3,
+
+    /// <summary>
+    /// Force Metal backend (Apple Silicon only).
+    /// Uses Metal Performance Shaders (MPS) for optimized operations.
+    /// </summary>
+    Metal = 4,
+
+    /// <summary>
+    /// Force WebGPU backend (browser environment only).
+    /// Requires WebGPU-enabled browser (Chrome 113+, Edge, Firefox).
+    /// </summary>
+    WebGPU = 5,
+
+    /// <summary>
+    /// Force Vulkan backend (cross-platform).
+    /// Best for Android, also works on Linux, Windows, and macOS via MoltenVK.
+    /// </summary>
+    Vulkan = 6
 }
