@@ -316,12 +316,23 @@ public sealed class MetalDevice : IDisposable
     {
         ThrowIfDisposed();
 
+        if (data == IntPtr.Zero)
+        {
+            throw new ArgumentException("Data pointer must not be null.", nameof(data));
+        }
+
         if (sizeInBytes == 0)
         {
             throw new ArgumentException("Buffer size must be greater than zero.", nameof(sizeInBytes));
         }
 
-        return SendMessagePtr(_device, Selectors.NewBufferWithBytes, data, sizeInBytes, (ulong)options);
+        IntPtr buffer = SendMessagePtr(_device, Selectors.NewBufferWithBytes, data, sizeInBytes, (ulong)options);
+        if (buffer == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"Metal failed to create buffer with {sizeInBytes} bytes");
+        }
+
+        return buffer;
     }
 
     /// <summary>

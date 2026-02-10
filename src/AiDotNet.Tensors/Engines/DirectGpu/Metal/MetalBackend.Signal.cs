@@ -30,12 +30,20 @@ public sealed partial class MetalBackend
 
     private static void CooleyTukeyFFT(float[] inReal, float[] inImag, float[] outReal, float[] outImag, int n, bool inverse)
     {
+        // Validate n is a power of two
+        if (n <= 0 || (n & (n - 1)) != 0)
+        {
+            throw new ArgumentException($"FFT size must be a positive power of two, got {n}", nameof(n));
+        }
+
         // Copy input to output for in-place computation
         Array.Copy(inReal, outReal, n);
         Array.Copy(inImag, outImag, n);
 
-        // Bit-reversal permutation
-        int bits = (int)MathHelper.Log2((float)n);
+        // Compute bits using integer arithmetic to avoid float rounding errors
+        int bits = 0;
+        int temp = n;
+        while (temp > 1) { temp >>= 1; bits++; }
         for (int i = 0; i < n; i++)
         {
             int j = BitReverse(i, bits);

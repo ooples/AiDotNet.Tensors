@@ -392,7 +392,7 @@ public sealed class MetalCommandQueue : IDisposable
         }
 
         // Use the dispatch selector with MTLSize structs
-        SendMessageDispatch(encoder, Selectors.DispatchThreadgroups, IntPtr.Zero, threadgroups, threadsPerThreadgroup);
+        SendMessageDispatch(encoder, Selectors.DispatchThreadgroups, threadgroups, threadsPerThreadgroup);
     }
 
     /// <summary>
@@ -408,7 +408,7 @@ public sealed class MetalCommandQueue : IDisposable
             return;
         }
 
-        SendMessageDispatch(encoder, Selectors.DispatchThreads, IntPtr.Zero, threads, threadsPerThreadgroup);
+        SendMessageDispatch(encoder, Selectors.DispatchThreads, threads, threadsPerThreadgroup);
     }
 
     /// <summary>

@@ -198,16 +198,7 @@ public sealed partial class MetalBackend
         int dilationD, int dilationH, int dilationW)
     {
         ThrowIfDisposed();
-        // CPU fallback - simplified implementation
-        var inp = DownloadBuffer(input);
-        var kern = DownloadBuffer(kernel);
-        var result = new float[batch * outChannels * outDepth * outHeight * outWidth];
-
-        // Simplified: would need full implementation for production
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("Conv3D is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -273,12 +264,7 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
-        // CPU fallback - simplified
-        var result = new float[batch * outChannels * outHeight * outWidth];
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("ConvTranspose2D is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -292,11 +278,7 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
-        var result = new float[batch * inChannels * inHeight * inWidth];
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("ConvTranspose2DBackwardInput is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -310,11 +292,7 @@ public sealed partial class MetalBackend
         int outputPadH, int outputPadW)
     {
         ThrowIfDisposed();
-        var result = new float[inChannels * outChannels * kernelH * kernelW];
-        if (gradKernel is MetalGpuBuffer gkBuffer)
-        {
-            gkBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("ConvTranspose2DBackwardKernel is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -327,11 +305,7 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
-        var result = new float[batch * outChannels * outHeight * outWidth];
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("LocallyConnectedConv2D is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -344,11 +318,7 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
-        var result = new float[batch * inChannels * inHeight * inWidth];
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("LocallyConnectedConv2DBackwardInput is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -361,11 +331,7 @@ public sealed partial class MetalBackend
         int strideH, int strideW)
     {
         ThrowIfDisposed();
-        var result = new float[outHeight * outWidth * outChannels * inChannels * kernelH * kernelW];
-        if (gradWeights is MetalGpuBuffer gwBuffer)
-        {
-            gwBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("LocallyConnectedConv2DBackwardWeights is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -410,11 +376,7 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        var result = new float[batch * outChannels * outHeight * outWidth];
-        if (output is MetalGpuBuffer outBuffer)
-        {
-            outBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("DeformableConv2D is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -429,11 +391,7 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        var result = new float[batch * inChannels * inHeight * inWidth];
-        if (gradInput is MetalGpuBuffer giBuffer)
-        {
-            giBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("DeformableConv2DBackwardInput is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -448,11 +406,7 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        var result = new float[outChannels * (inChannels / groups) * kernelH * kernelW];
-        if (gradWeights is MetalGpuBuffer gwBuffer)
-        {
-            gwBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("DeformableConv2DBackwardWeights is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -467,11 +421,7 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        var result = new float[batch * 2 * kernelH * kernelW * deformGroups * outHeight * outWidth];
-        if (gradOffsets is MetalGpuBuffer goBuffer)
-        {
-            goBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("DeformableConv2DBackwardOffset is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     /// <summary>
@@ -486,11 +436,7 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        var result = new float[batch * kernelH * kernelW * deformGroups * outHeight * outWidth];
-        if (gradMask is MetalGpuBuffer gmBuffer)
-        {
-            gmBuffer.CopyFrom(result);
-        }
+        throw new NotSupportedException("DeformableConv2DBackwardMask is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
     }
 
     #endregion
@@ -682,7 +628,23 @@ public sealed partial class MetalBackend
                     {
                         int outIdx = b * channels * outHeight * outWidth +
                                     c * outHeight * outWidth + oh * outWidth + ow;
-                        float grad = go[outIdx] / (kernelH * kernelW);
+
+                        // Compute divisor: full kernel size if countIncludePad, else valid elements only
+                        int divisor;
+                        if (countIncludePad)
+                        {
+                            divisor = kernelH * kernelW;
+                        }
+                        else
+                        {
+                            int hStart = Math.Max(oh * strideH - padH, 0);
+                            int hEnd = Math.Min(oh * strideH - padH + kernelH, inHeight);
+                            int wStart = Math.Max(ow * strideW - padW, 0);
+                            int wEnd = Math.Min(ow * strideW - padW + kernelW, inWidth);
+                            divisor = (hEnd - hStart) * (wEnd - wStart);
+                        }
+
+                        float grad = go[outIdx] / divisor;
 
                         for (int kh = 0; kh < kernelH; kh++)
                         {

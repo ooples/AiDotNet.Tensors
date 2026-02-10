@@ -839,8 +839,10 @@ public sealed partial class MetalBackend
                 }
                 else if (margin - dist > 0)
                 {
-                    g1[idx] = -diff / dist / batchSize;
-                    g2[idx] = diff / dist / batchSize;
+                    // Gradient of 0.5 * (margin - dist)^2: d/dx = -(margin - dist) * (diff / dist)
+                    float marginScale = 2 * (margin - dist);
+                    g1[idx] = -marginScale * diff / dist / batchSize;
+                    g2[idx] = marginScale * diff / dist / batchSize;
                 }
             }
         }

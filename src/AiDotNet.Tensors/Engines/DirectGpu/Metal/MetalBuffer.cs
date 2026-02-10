@@ -376,12 +376,12 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             return;
         }
 
-        // Create NSRange struct and call didModifyRange:
-        // This is only needed for StorageModeManaged on macOS
-        // On Apple Silicon with StorageModeShared, this is a no-op
-
-        // For now, we skip this as Apple Silicon primarily uses shared storage
-        // which doesn't require explicit synchronization
+        // Call [MTLBuffer didModifyRange:NSMakeRange(offset, count)]
+        // NSRange is passed as two ulong values (location, length) on ARM64
+        ulong rangeLocation = (ulong)(offset * sizeof(float));
+        ulong rangeLength = (ulong)(count * sizeof(float));
+        MetalNativeBindings.SendMessageULong2(
+            _buffer, MetalNativeBindings.Selectors.DidModifyRange, rangeLocation, rangeLength);
     }
 
     private void ThrowIfDisposed()

@@ -7,12 +7,22 @@ public sealed partial class MetalBackend
 {
     #region Hyperbolic Geometry Operations (Poincare Ball Model)
 
+    private static void ValidateCurvature(float curvature)
+    {
+        if (curvature <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(curvature), curvature,
+                "Curvature must be positive for hyperbolic operations");
+        }
+    }
+
     /// <summary>
     /// Project points to Poincare ball.
     /// </summary>
     public void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
         ThrowIfDisposed();
+        ValidateCurvature(curvature);
 
         var inputData = DownloadBuffer(input);
         var outputData = new float[batchSize * dim];
@@ -44,6 +54,7 @@ public sealed partial class MetalBackend
     public void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         ThrowIfDisposed();
+        ValidateCurvature(curvature);
 
         var xData = DownloadBuffer(x);
         var yData = DownloadBuffer(y);
@@ -81,6 +92,7 @@ public sealed partial class MetalBackend
     public void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         ThrowIfDisposed();
+        ValidateCurvature(curvature);
 
         var baseData = DownloadBuffer(basePoint);
         var tangentData = DownloadBuffer(tangentVec);
@@ -141,6 +153,7 @@ public sealed partial class MetalBackend
     public void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         ThrowIfDisposed();
+        ValidateCurvature(curvature);
 
         var xData = DownloadBuffer(x);
         var yData = DownloadBuffer(y);

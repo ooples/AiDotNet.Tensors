@@ -186,12 +186,12 @@ public static class MetalNativeBindings
 
     /// <summary>
     /// Sends a message for dispatch with grid/threadgroup sizes.
+    /// Maps to dispatchThreadgroups:threadsPerThreadgroup: which takes two MTLSize arguments.
     /// </summary>
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     public static extern void SendMessageDispatch(
         IntPtr receiver,
         IntPtr selector,
-        IntPtr pipelineState,
         MTLSize gridSize,
         MTLSize threadgroupSize);
 

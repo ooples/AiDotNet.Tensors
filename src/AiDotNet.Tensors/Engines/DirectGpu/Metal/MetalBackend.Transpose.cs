@@ -100,10 +100,13 @@ public sealed partial class MetalBackend
 
         var outputData = new float[totalSize];
 
+        // Preallocate coordinate arrays outside loop to avoid per-element GC pressure
+        var outCoords = new int[ndim];
+        var inCoords = new int[ndim];
+
         for (int outIdx = 0; outIdx < totalSize; outIdx++)
         {
             // Convert output index to coordinates
-            var outCoords = new int[ndim];
             int remaining = outIdx;
             for (int d = 0; d < ndim; d++)
             {
@@ -112,7 +115,6 @@ public sealed partial class MetalBackend
             }
 
             // Convert to input coordinates using inverse permutation
-            var inCoords = new int[ndim];
             for (int d = 0; d < ndim; d++)
             {
                 inCoords[permutation[d]] = outCoords[d];
@@ -445,9 +447,15 @@ public sealed partial class MetalBackend
         var idxData = DownloadIntBuffer(indices, numIndices);
         var gradSrcData = new float[numIndices * featureSize];
 
+        int maxGradIdx = gradDestData.Length / featureSize;
         for (int i = 0; i < numIndices; i++)
         {
             int idx = idxData[i];
+            if (idx < 0 || idx >= maxGradIdx)
+            {
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {maxGradIdx})");
+            }
+
             for (int f = 0; f < featureSize; f++)
             {
                 gradSrcData[i * featureSize + f] = gradDestData[idx * featureSize + f];
@@ -468,9 +476,15 @@ public sealed partial class MetalBackend
         var idxData = DownloadIntBuffer(indices, numIndices);
         var outData = new float[numIndices * featureSize];
 
+        int maxSrcIdx = srcData.Length / featureSize;
         for (int i = 0; i < numIndices; i++)
         {
             int idx = idxData[i];
+            if (idx < 0 || idx >= maxSrcIdx)
+            {
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Index {idx} at position {i} is out of range [0, {maxSrcIdx})");
+            }
+
             for (int f = 0; f < featureSize; f++)
             {
                 outData[i * featureSize + f] = srcData[idx * featureSize + f];

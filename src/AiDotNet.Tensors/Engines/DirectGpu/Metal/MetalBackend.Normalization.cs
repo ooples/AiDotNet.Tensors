@@ -582,6 +582,14 @@ public sealed partial class MetalBackend
 
         if (training && dropoutRate > 0)
         {
+            if (dropoutRate >= 1.0f)
+            {
+                // dropoutRate of 1.0 means drop everything — output all zeros
+                UploadToBuffer(output, outputData);
+                UploadToBuffer(mask, maskData);
+                return;
+            }
+
             var rng = new Random((int)(seed & 0x7FFFFFFF));
             float scale = 1.0f / (1.0f - dropoutRate);
 
