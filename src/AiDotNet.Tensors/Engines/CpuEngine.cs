@@ -10358,11 +10358,39 @@ public class CpuEngine : IEngine
         int headDim = query.Shape[3];
         int seqK = key.Shape[2];
 
-        // Extract bias data if provided
-        T[]? biasData = attentionBias?.ToVector().ToArray();
-        bool hasBias = biasData is not null;
-        // Bias can be [batch, heads, seqQ, seqK] or [heads, seqQ, seqK]
-        bool biasBroadcastBatch = hasBias && attentionBias?.Shape.Length == 3;
+        // Extract and validate bias data if provided
+        T[]? biasData = null;
+        bool hasBias = false;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            int biasRank = attentionBias.Shape.Length;
+            if (biasRank == 4)
+            {
+                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
+                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                    throw new ArgumentException(
+                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = false;
+            }
+            else if (biasRank == 3)
+            {
+                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                    throw new ArgumentException(
+                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = true;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
+                    nameof(attentionBias));
+            }
+            biasData = attentionBias.ToVector().ToArray();
+            hasBias = true;
+        }
 
         // Compute scale if not provided
         double scaleValue = scale ?? 1.0 / Math.Sqrt(headDim);
@@ -10561,10 +10589,39 @@ public class CpuEngine : IEngine
         var gradKData = new T[batch * heads * seqK * headDim];
         var gradVData = new T[batch * heads * seqK * headDim];
 
-        // Extract bias data if provided (same as forward pass)
-        T[]? biasData = attentionBias?.ToVector().ToArray();
-        bool hasBias = biasData is not null;
-        bool biasBroadcastBatch = hasBias && attentionBias?.Shape.Length == 3;
+        // Extract and validate bias data if provided (same validation as forward pass)
+        T[]? biasData = null;
+        bool hasBias = false;
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            int biasRank = attentionBias.Shape.Length;
+            if (biasRank == 4)
+            {
+                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
+                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                    throw new ArgumentException(
+                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = false;
+            }
+            else if (biasRank == 3)
+            {
+                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                    throw new ArgumentException(
+                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = true;
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
+                    nameof(attentionBias));
+            }
+            biasData = attentionBias.ToVector().ToArray();
+            hasBias = true;
+        }
 
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 

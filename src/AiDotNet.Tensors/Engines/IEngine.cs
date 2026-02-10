@@ -3596,7 +3596,8 @@ public interface IEngine
     /// <param name="gradKey">Output: gradient with respect to key.</param>
     /// <param name="gradValue">Output: gradient with respect to value.</param>
     /// <param name="attentionBias">Optional additive attention bias used in the forward pass.
-    /// Must match the same bias passed to FlashAttention. When null, no bias gradient is computed.</param>
+    /// Must match the same bias passed to FlashAttention. The bias is used to reproduce the forward
+    /// attention scores during recomputation; no gradient is produced for the bias tensor itself.</param>
     /// <returns>The gradient with respect to the output (same as gradOutput for chaining).</returns>
     /// <remarks>
     /// <para>

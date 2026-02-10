@@ -1234,8 +1234,9 @@ public interface IDirectGpuBackend : IDisposable
 
     /// <summary>
     /// Backward pass for FlashAttention using recomputation for memory efficiency.
+    /// Bias parameters are passed through to the GPU kernel for score recomputation during backward.
     /// </summary>
-    /// <param name="attentionBias">Optional additive attention bias buffer, must match what was used in the forward pass.</param>
+    /// <param name="attentionBias">Optional additive attention bias buffer, must match what was used in the forward pass. Used for score recomputation; no bias gradient is produced.</param>
     /// <param name="biasBatchStride">Batch stride for bias indexing, must match the forward pass.</param>
     void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer softmaxStats,
