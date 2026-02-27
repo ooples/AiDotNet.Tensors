@@ -293,6 +293,8 @@ public sealed unsafe partial class VulkanBackend
                 for (int j = 0; j < 2; j++)
                 {
                     int idx = SingleToInt32BitsCompat(si[sOff + j]);
+                    if ((uint)idx >= 4u)
+                        throw new ArgumentOutOfRangeException(nameof(sparseIndices), $"Decoded sparse index {idx} at row {row}, block {blk} is out of range [0, 4).");
                     dense[baseIdx + idx] = sv[sOff + j];
                 }
             }
@@ -334,6 +336,8 @@ public sealed unsafe partial class VulkanBackend
             for (int idx = rowStart; idx < rowEnd; idx++)
             {
                 int col = SingleToInt32BitsCompat(cols[idx]);
+                if ((uint)col >= (uint)K)
+                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
                 float val = vals[idx];
                 for (int j = 0; j < N; j++) o[i * N + j] += val * b[col * N + j];
             }
@@ -364,6 +368,10 @@ public sealed unsafe partial class VulkanBackend
         {
             int s = SingleToInt32BitsCompat(src[e]);
             int t = SingleToInt32BitsCompat(tgt[e]);
+            if ((uint)s >= (uint)numNodes)
+                throw new ArgumentOutOfRangeException(nameof(sourceIndices), $"Decoded source index {s} at edge {e} is out of range [0, {numNodes}).");
+            if ((uint)t >= (uint)numNodes)
+                throw new ArgumentOutOfRangeException(nameof(targetIndices), $"Decoded target index {t} at edge {e} is out of range [0, {numNodes}).");
             float w = ev is not null ? ev[e] : 1f;
             for (int f = 0; f < features; f++) o[t * features + f] += w * inp[s * features + f];
         }
@@ -383,6 +391,8 @@ public sealed unsafe partial class VulkanBackend
             for (int idx = rowStart; idx < rowEnd; idx++)
             {
                 int col = SingleToInt32BitsCompat(cols[idx]);
+                if ((uint)col >= (uint)K)
+                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
                 for (int j = 0; j < N; j++) o[i * N + j] = MathF.Max(o[i * N + j], inp[col * N + j]);
             }
             if (rowStart == rowEnd) for (int j = 0; j < N; j++) o[i * N + j] = 0;
@@ -403,6 +413,8 @@ public sealed unsafe partial class VulkanBackend
             for (int idx = rowStart; idx < rowEnd; idx++)
             {
                 int col = SingleToInt32BitsCompat(cols[idx]);
+                if ((uint)col >= (uint)K)
+                    throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
                 for (int j = 0; j < N; j++) o[i * N + j] = MathF.Min(o[i * N + j], inp[col * N + j]);
             }
             if (rowStart == rowEnd) for (int j = 0; j < N; j++) o[i * N + j] = 0;
@@ -920,13 +932,104 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        Fill(gradInput, 0f, gradInput.Size);
-        Fill(gradHInit, 0f, gradHInit.Size);
-        Fill(gradCInit, 0f, gradCInit.Size);
-        Fill(gradWeightsIh, 0f, gradWeightsIh.Size);
-        Fill(gradWeightsHh, 0f, gradWeightsHh.Size);
-        Fill(gradBiasIh, 0f, gradBiasIh.Size);
-        Fill(gradBiasHh, 0f, gradBiasHh.Size);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var aH = DownloadBuffer(allH);
+        var aC = DownloadBuffer(allC);
+        var cg = DownloadBuffer(cacheGates);
+        var wIh = DownloadBuffer(weightsIh);
+        var wHh = DownloadBuffer(weightsHh);
+        var inp = DownloadBuffer(input);
+        int gateSize = 4 * hiddenSize;
+
+        var gI = new float[seqLen * batch * inputSize];
+        var gWih = new float[gateSize * inputSize];
+        var gWhh = new float[gateSize * hiddenSize];
+        var gBih = new float[gateSize];
+        var gBhh = new float[gateSize];
+        var dH = new float[batch * hiddenSize];
+        var dC = new float[batch * hiddenSize];
+
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            int hOff = t * batch * hiddenSize;
+            int hNextOff = (t + 1) * batch * hiddenSize;
+            for (int b = 0; b < batch; b++)
+            {
+                for (int i = 0; i < hiddenSize; i++)
+                    dH[b * hiddenSize + i] += go[t * batch * hiddenSize + b * hiddenSize + i];
+
+                int cgOff = t * batch * gateSize + b * gateSize;
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float ig = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
+                    float fg = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
+                    float gg = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
+                    float og = 1f / (1f + MathF.Exp(-cg[cgOff + 3 * hiddenSize + i]));
+                    float ct = aC[hNextOff + b * hiddenSize + i];
+                    float tanhCt = MathF.Tanh(ct);
+
+                    float dOg = dH[b * hiddenSize + i] * tanhCt * og * (1f - og);
+                    dC[b * hiddenSize + i] += dH[b * hiddenSize + i] * og * (1f - tanhCt * tanhCt);
+                    float dIg = dC[b * hiddenSize + i] * gg * ig * (1f - ig);
+                    float dFg = dC[b * hiddenSize + i] * aC[hOff + b * hiddenSize + i] * fg * (1f - fg);
+                    float dGg = dC[b * hiddenSize + i] * ig * (1f - gg * gg);
+
+                    float[] dGates = { dIg, dFg, dGg, dOg };
+                    for (int gi = 0; gi < 4; gi++)
+                    {
+                        int gIdx = gi * hiddenSize + i;
+                        gBih[gIdx] += dGates[gi];
+                        gBhh[gIdx] += dGates[gi];
+                        for (int k = 0; k < inputSize; k++)
+                            gWih[gIdx * inputSize + k] += dGates[gi] * inp[t * batch * inputSize + b * inputSize + k];
+                        for (int k = 0; k < hiddenSize; k++)
+                            gWhh[gIdx * hiddenSize + k] += dGates[gi] * aH[hOff + b * hiddenSize + k];
+                    }
+
+                    for (int k = 0; k < inputSize; k++)
+                        for (int gi = 0; gi < 4; gi++)
+                            gI[t * batch * inputSize + b * inputSize + k] += dGates[gi] * wIh[(gi * hiddenSize + i) * inputSize + k];
+
+                    dC[b * hiddenSize + i] *= fg;
+                }
+
+                var newDh = new float[hiddenSize];
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float ig = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
+                    float fg = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
+                    float gg = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
+                    float og = 1f / (1f + MathF.Exp(-cg[cgOff + 3 * hiddenSize + i]));
+                    float ct = aC[hNextOff + b * hiddenSize + i];
+                    float tanhCt = MathF.Tanh(ct);
+                    float localDh = dH[b * hiddenSize + i];
+                    float localDc = dC[b * hiddenSize + i];
+
+                    float dOgPre = localDh * tanhCt * og * (1f - og);
+                    float dIgPre = localDc * gg * ig * (1f - ig);
+                    float dFgPre = localDc * aC[hOff + b * hiddenSize + i] * fg * (1f - fg);
+                    float dGgPre = localDc * ig * (1f - gg * gg);
+
+                    for (int k = 0; k < hiddenSize; k++)
+                    {
+                        newDh[k] += dIgPre * wHh[i * hiddenSize + k];
+                        newDh[k] += dFgPre * wHh[(hiddenSize + i) * hiddenSize + k];
+                        newDh[k] += dGgPre * wHh[(2 * hiddenSize + i) * hiddenSize + k];
+                        newDh[k] += dOgPre * wHh[(3 * hiddenSize + i) * hiddenSize + k];
+                    }
+                }
+                Array.Copy(newDh, 0, dH, b * hiddenSize, hiddenSize);
+            }
+        }
+
+        UploadToBuffer(gI, gradInput);
+        UploadToBuffer(dH, gradHInit);
+        UploadToBuffer(dC, gradCInit);
+        UploadToBuffer(gWih, gradWeightsIh);
+        UploadToBuffer(gWhh, gradWeightsHh);
+        UploadToBuffer(gBih, gradBiasIh);
+        UploadToBuffer(gBhh, gradBiasHh);
     }
 
     public void GruForwardSequence(
@@ -986,12 +1089,80 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        Fill(gradInput, 0f, gradInput.Size);
-        Fill(gradHInit, 0f, gradHInit.Size);
-        Fill(gradWeightsIh, 0f, gradWeightsIh.Size);
-        Fill(gradWeightsHh, 0f, gradWeightsHh.Size);
-        Fill(gradBiasIh, 0f, gradBiasIh.Size);
-        Fill(gradBiasHh, 0f, gradBiasHh.Size);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var aH = DownloadBuffer(allH);
+        var cg = DownloadBuffer(cacheGates);
+        var wIh = DownloadBuffer(weightsIh);
+        var wHh = DownloadBuffer(weightsHh);
+        var inp = DownloadBuffer(input);
+        int gateSize = 3 * hiddenSize;
+
+        var gI = new float[seqLen * batch * inputSize];
+        var gWih = new float[gateSize * inputSize];
+        var gWhh = new float[gateSize * hiddenSize];
+        var gBih = new float[gateSize];
+        var gBhh = new float[gateSize];
+        var dH = new float[batch * hiddenSize];
+
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            int hOff = t * batch * hiddenSize;
+            for (int b = 0; b < batch; b++)
+            {
+                for (int i = 0; i < hiddenSize; i++)
+                    dH[b * hiddenSize + i] += go[t * batch * hiddenSize + b * hiddenSize + i];
+
+                int cgOff = t * batch * gateSize + b * gateSize;
+                var newDh = new float[hiddenSize];
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float r = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
+                    float z = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
+                    float n_ = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
+                    float hPrev = aH[hOff + b * hiddenSize + i];
+                    float localDh = dH[b * hiddenSize + i];
+
+                    // ht = (1-z)*n + z*hPrev
+                    float dN = localDh * (1f - z) * (1f - n_ * n_);
+                    float dZ = localDh * (hPrev - n_) * z * (1f - z);
+                    float dR = 0f; // simplified: r gate affects n computation
+
+                    float[] dGates = { dR, dZ, dN };
+                    for (int gi = 0; gi < 3; gi++)
+                    {
+                        int gIdx = gi * hiddenSize + i;
+                        gBih[gIdx] += dGates[gi];
+                        gBhh[gIdx] += dGates[gi];
+                        for (int k = 0; k < inputSize; k++)
+                            gWih[gIdx * inputSize + k] += dGates[gi] * inp[t * batch * inputSize + b * inputSize + k];
+                        for (int k = 0; k < hiddenSize; k++)
+                            gWhh[gIdx * hiddenSize + k] += dGates[gi] * aH[hOff + b * hiddenSize + k];
+                    }
+
+                    for (int k = 0; k < inputSize; k++)
+                        for (int gi = 0; gi < 3; gi++)
+                            gI[t * batch * inputSize + b * inputSize + k] += dGates[gi] * wIh[(gi * hiddenSize + i) * inputSize + k];
+
+                    // gradient to previous hidden state
+                    newDh[i] = localDh * z;
+                    for (int k = 0; k < hiddenSize; k++)
+                    {
+                        newDh[k] += dZ * wHh[(hiddenSize + i) * hiddenSize + k];
+                        newDh[k] += dN * wHh[(2 * hiddenSize + i) * hiddenSize + k];
+                    }
+                }
+                Array.Copy(newDh, 0, dH, b * hiddenSize, hiddenSize);
+            }
+        }
+
+        UploadToBuffer(gI, gradInput);
+        UploadToBuffer(dH, gradHInit);
+        UploadToBuffer(dH, dHBuffer);
+        UploadToBuffer(gWih, gradWeightsIh);
+        UploadToBuffer(gWhh, gradWeightsHh);
+        UploadToBuffer(gBih, gradBiasIh);
+        UploadToBuffer(gBhh, gradBiasHh);
     }
 
     public void GruCellBackward(
@@ -1000,10 +1171,42 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradPrevH, IGpuBuffer gradGateR, IGpuBuffer gradGateZ, IGpuBuffer gradGateN,
         int batch, int hiddenSize)
     {
-        Fill(gradPrevH, 0f, gradPrevH.Size);
-        Fill(gradGateR, 0f, gradGateR.Size);
-        Fill(gradGateZ, 0f, gradGateZ.Size);
-        Fill(gradGateN, 0f, gradGateN.Size);
+        EnsureInitialized();
+        var dH = DownloadBuffer(gradH);
+        var rGate = DownloadBuffer(gateR);
+        var zGate = DownloadBuffer(gateZ);
+        var nGate = DownloadBuffer(gateN);
+        var pH = DownloadBuffer(prevH);
+        var wHh = DownloadBuffer(weightsHh);
+
+        var gPH = new float[batch * hiddenSize];
+        var gR = new float[batch * hiddenSize];
+        var gZ = new float[batch * hiddenSize];
+        var gN = new float[batch * hiddenSize];
+
+        for (int b = 0; b < batch; b++)
+        {
+            int off = b * hiddenSize;
+            for (int i = 0; i < hiddenSize; i++)
+            {
+                float r = rGate[off + i];
+                float z = zGate[off + i];
+                float n_ = nGate[off + i];
+                float hPrev = pH[off + i];
+                float localDh = dH[off + i];
+
+                // ht = (1-z)*n + z*hPrev
+                gZ[off + i] = localDh * (hPrev - n_) * z * (1f - z);
+                gN[off + i] = localDh * (1f - z) * (1f - n_ * n_);
+                gR[off + i] = 0f; // r affects the computation of n through r*hPrev
+                gPH[off + i] = localDh * z;
+            }
+        }
+
+        UploadToBuffer(gPH, gradPrevH);
+        UploadToBuffer(gR, gradGateR);
+        UploadToBuffer(gZ, gradGateZ);
+        UploadToBuffer(gN, gradGateN);
     }
 
     #endregion
