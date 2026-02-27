@@ -9739,6 +9739,142 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     #endregion
 
+    #region Tensor-Level Activation GPU Dispatch
+
+    Tensor<T> IEngine.TensorSigmoid<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSigmoid(tensor);
+    }
+
+    Tensor<T> IEngine.TensorReLU<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorReLU(tensor);
+    }
+
+    Tensor<T> IEngine.TensorGELU<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorGELU(tensor);
+    }
+
+    Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSiLU(tensor);
+    }
+
+    Tensor<T> IEngine.TensorTanh<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorTanh(tensor);
+    }
+
+    Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.TensorLeakyReLU(tensor, alpha);
+
+        float alphaFloat = ToFloatScalar(alpha);
+        using var bufferA = GetOrAllocateBuffer(backend, tensor.ToArray());
+        using var bufferB = AllocateOutputBuffer(backend, tensor.Length);
+        backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
+        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        return new Tensor<T>(result, tensor.Shape);
+    }
+
+    Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMish(tensor);
+    }
+
+    Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
+    {
+        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
+        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorHardSwish(tensor);
+    }
+
+    #endregion
+
+    #region Tensor-Level Composite GPU Dispatch
+
+    Tensor<T> IEngine.TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
+    {
+        // GPU fused lerp: a + t * (b - a)
+        // Uses three GPU ops but avoids CPU fallback for each step
+        if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
+            return base.TensorLerp(a, b, t);
+
+        float tFloat = ToFloatScalar(t);
+        int size = a.Length;
+
+        using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
+        using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
+        using var bufferDiff = AllocateOutputBuffer(backend, size);
+        using var bufferScaled = AllocateOutputBuffer(backend, size);
+        using var bufferResult = AllocateOutputBuffer(backend, size);
+
+        // diff = b - a
+        backend.Subtract(bufferB.Buffer, bufferA.Buffer, bufferDiff.Buffer, size);
+        // scaled = t * diff
+        backend.Scale(bufferDiff.Buffer, bufferScaled.Buffer, tFloat, size);
+        // result = a + scaled
+        backend.Add(bufferA.Buffer, bufferScaled.Buffer, bufferResult.Buffer, size);
+
+        float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
+        return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+    }
+
+    Tensor<T> IEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
+    {
+        // GPU fused: scaleA * a + scaleB * b
+        if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
+            return base.TensorAddScaled(a, b, scaleA, scaleB);
+
+        float scaleAFloat = ToFloatScalar(scaleA);
+        float scaleBFloat = ToFloatScalar(scaleB);
+        int size = a.Length;
+
+        using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
+        using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
+        using var bufferScaledA = AllocateOutputBuffer(backend, size);
+        using var bufferScaledB = AllocateOutputBuffer(backend, size);
+        using var bufferResult = AllocateOutputBuffer(backend, size);
+
+        // scaledA = scaleA * a
+        backend.Scale(bufferA.Buffer, bufferScaledA.Buffer, scaleAFloat, size);
+        // scaledB = scaleB * b
+        backend.Scale(bufferB.Buffer, bufferScaledB.Buffer, scaleBFloat, size);
+        // result = scaledA + scaledB
+        backend.Add(bufferScaledA.Buffer, bufferScaledB.Buffer, bufferResult.Buffer, size);
+
+        float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
+        return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+    }
+
+    Tensor<T> IEngine.TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    {
+        // GPU dispatch already handled by the existing MaxPool2D method override
+        return MaxPool2D(input, poolSize, stride, padding);
+    }
+
+    Tensor<T> IEngine.TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    {
+        // GPU dispatch already handled by the existing AvgPool2D method override
+        return AvgPool2D(input, poolSize, stride, padding);
+    }
+
+    Tensor<T> IEngine.TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
+    {
+        // GPU dispatch handled by FusedConv2D which already has GPU acceleration
+        return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
+    }
+
+    #endregion
+
     public void Dispose()
     {
         // Clear activation cache to free GPU memory from cached activations
