@@ -727,6 +727,109 @@ extern ""C"" __global__ void residual_batchnorm_relu(
     float result = g * normalized + b + residual[idx];
     output[idx] = fmaxf(0.0f, result);
 }
+
+// ===========================================================================
+// FUSED TENSOR-LEVEL COMPOSITE KERNELS
+// ===========================================================================
+
+// Fused linear interpolation: output = a + t * (b - a) = (1-t)*a + t*b
+// Uses fmaf for precision: fmaf(t, b[idx] - a[idx], a[idx])
+extern ""C"" __global__ void lerp_fused(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ output,
+    float t,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    output[idx] = fmaf(t, b[idx] - a[idx], a[idx]);
+}
+
+// Fused scaled addition: output = scaleA * a + scaleB * b
+// Uses fmaf for precision: fmaf(scaleA, a, scaleB * b)
+extern ""C"" __global__ void add_scaled(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ output,
+    float scaleA,
+    float scaleB,
+    int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    output[idx] = fmaf(scaleA, a[idx], scaleB * b[idx]);
+}
+
+// ===========================================================================
+// REDUCTION KERNELS
+// ===========================================================================
+
+// Parallel mean reduction using shared memory
+extern ""C"" __global__ void reduce_mean_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int size)
+{
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load and accumulate with grid-stride loop
+    float sum = 0.0f;
+    for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
+        sum += input[i];
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(output, sdata[0]);
+    }
+}
+
+// Compute variance given a known mean, using parallel reduction
+extern ""C"" __global__ void reduce_variance_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    float mean,
+    int size)
+{
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load and accumulate squared differences
+    float sum = 0.0f;
+    for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
+        float diff = input[i] - mean;
+        sum += diff * diff;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(output, sdata[0]);
+    }
+}
 ";
     }
 
@@ -754,7 +857,12 @@ extern ""C"" __global__ void residual_batchnorm_relu(
             "batchnorm_gelu",
             "batchnorm_sigmoid",
             "batchnorm_tanh",
-            "residual_batchnorm_relu"
+            "residual_batchnorm_relu",
+            // Fused Tensor-Level Composite kernels
+            "lerp_fused",
+            "add_scaled",
+            "reduce_mean_kernel",
+            "reduce_variance_kernel"
         };
     }
 }

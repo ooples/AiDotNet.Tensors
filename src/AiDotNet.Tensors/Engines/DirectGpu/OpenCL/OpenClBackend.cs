@@ -7903,6 +7903,81 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(size, Math.Min(256, size));
         }
 
+        public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+        {
+            var k = _kernelCache["lerp_fused"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, t);
+            k.SetArg(arg++, size);
+
+            k.Execute1D(size, Math.Min(256, size));
+        }
+
+        public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+        {
+            var k = _kernelCache["add_scaled"];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, scaleA);
+            k.SetArg(arg++, scaleB);
+            k.SetArg(arg++, size);
+
+            k.Execute1D(size, Math.Min(256, size));
+        }
+
+        public float StdDev(IGpuBuffer input, int size)
+        {
+            if (size <= 1) return 0.0f;
+
+            // Step 1: Compute mean using GPU reduction
+            float mean = Sum(input, size) / size;
+
+            // Step 2: Compute variance using reduce_variance_local kernel
+            if (_kernelCache.TryGetValue("reduce_variance_local", out var varKernel))
+            {
+                var bufferA = ((DirectOpenClGpuBuffer)input).Buffer;
+                int localSize = CalculateOptimalWorkGroupSize1D(size);
+                localSize = ClampLocalSizeForKernel(varKernel, localSize, sizeof(float));
+                int groupCount = (size + localSize - 1) / localSize;
+
+                using var partialBuffer = AllocateBuffer(groupCount);
+                var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
+
+                varKernel.SetArg(0, bufferA.Handle);
+                varKernel.SetArg(1, partial.Handle);
+                varKernel.SetArg(2, mean);
+                varKernel.SetArg(3, size);
+
+                varKernel.Execute1D(size, localSize);
+
+                if (_context != null)
+                    _context.Finish();
+
+                var partials = DownloadBuffer(partialBuffer);
+                float varianceSum = 0.0f;
+                for (int i = 0; i < partials.Length; i++)
+                    varianceSum += partials[i];
+
+                return MathF.Sqrt(varianceSum / size);
+            }
+
+            // Fallback: download and compute on CPU
+            float[] data = DownloadBuffer(input);
+            float varSum = 0.0f;
+            for (int i = 0; i < size; i++)
+            {
+                float diff = data[i] - mean;
+                varSum += diff * diff;
+            }
+
+            return MathF.Sqrt(varSum / size);
+        }
+
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
         {
             var k = _kernelCache["scatter_add"];

@@ -9803,8 +9803,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     Tensor<T> IEngine.TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
     {
-        // GPU fused lerp: a + t * (b - a)
-        // Uses three GPU ops but avoids CPU fallback for each step
+        // Single fused GPU kernel: output[i] = a[i] + t * (b[i] - a[i])
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
             return base.TensorLerp(a, b, t);
 
@@ -9813,16 +9812,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
         using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
         using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
-        using var bufferDiff = AllocateOutputBuffer(backend, size);
-        using var bufferScaled = AllocateOutputBuffer(backend, size);
         using var bufferResult = AllocateOutputBuffer(backend, size);
 
-        // diff = b - a
-        backend.Subtract(bufferB.Buffer, bufferA.Buffer, bufferDiff.Buffer, size);
-        // scaled = t * diff
-        backend.Scale(bufferDiff.Buffer, bufferScaled.Buffer, tFloat, size);
-        // result = a + scaled
-        backend.Add(bufferA.Buffer, bufferScaled.Buffer, bufferResult.Buffer, size);
+        backend.Lerp(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, tFloat, size);
 
         float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
         return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
@@ -9830,7 +9822,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     Tensor<T> IEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
     {
-        // GPU fused: scaleA * a + scaleB * b
+        // Single fused GPU kernel: output[i] = scaleA * a[i] + scaleB * b[i]
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
             return base.TensorAddScaled(a, b, scaleA, scaleB);
 
@@ -9840,16 +9832,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
         using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
         using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
-        using var bufferScaledA = AllocateOutputBuffer(backend, size);
-        using var bufferScaledB = AllocateOutputBuffer(backend, size);
         using var bufferResult = AllocateOutputBuffer(backend, size);
 
-        // scaledA = scaleA * a
-        backend.Scale(bufferA.Buffer, bufferScaledA.Buffer, scaleAFloat, size);
-        // scaledB = scaleB * b
-        backend.Scale(bufferB.Buffer, bufferScaledB.Buffer, scaleBFloat, size);
-        // result = scaledA + scaledB
-        backend.Add(bufferScaledA.Buffer, bufferScaledB.Buffer, bufferResult.Buffer, size);
+        backend.AddScaled(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, scaleAFloat, scaleBFloat, size);
 
         float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
         return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);

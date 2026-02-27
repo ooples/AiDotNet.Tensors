@@ -1557,6 +1557,38 @@ public interface IDirectGpuBackend : IDisposable
     void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size);
     void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize);
 
+    /// <summary>
+    /// Fused linear interpolation: output[i] = (1 - t) * a[i] + t * b[i].
+    /// Single kernel launch, zero intermediate allocations.
+    /// </summary>
+    /// <param name="a">Start values buffer.</param>
+    /// <param name="b">End values buffer.</param>
+    /// <param name="output">Output buffer.</param>
+    /// <param name="t">Interpolation factor (0 = a, 1 = b).</param>
+    /// <param name="size">Number of elements.</param>
+    void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size);
+
+    /// <summary>
+    /// Fused scaled addition: output[i] = scaleA * a[i] + scaleB * b[i].
+    /// Single kernel launch for diffusion noise mixing (alpha * signal + sigma * noise).
+    /// </summary>
+    /// <param name="a">First input buffer.</param>
+    /// <param name="b">Second input buffer.</param>
+    /// <param name="output">Output buffer.</param>
+    /// <param name="scaleA">Scale factor for first buffer.</param>
+    /// <param name="scaleB">Scale factor for second buffer.</param>
+    /// <param name="size">Number of elements.</param>
+    void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size);
+
+    /// <summary>
+    /// Computes standard deviation across elements: sqrt(variance).
+    /// Uses numerically stable Welford's algorithm for GPU reduction.
+    /// </summary>
+    /// <param name="input">Input buffer.</param>
+    /// <param name="size">Number of elements.</param>
+    /// <returns>Standard deviation of the buffer elements.</returns>
+    float StdDev(IGpuBuffer input, int size);
+
     #endregion
 
     #region Mixed Precision
