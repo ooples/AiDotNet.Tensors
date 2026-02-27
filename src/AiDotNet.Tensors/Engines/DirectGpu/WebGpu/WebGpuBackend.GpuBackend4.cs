@@ -75,36 +75,54 @@ public sealed partial class WebGpuBackend
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var v = DownloadBufferData(velocity);
-        float pNorm = 0, gNorm = 0;
-        for (int i = 0; i < size; i++) { pNorm += p[i] * p[i]; gNorm += g[i] * g[i]; }
-        pNorm = MathF.Sqrt(pNorm); gNorm = MathF.Sqrt(gNorm);
+        // Two-pass: compute norms on GPU, then dispatch update with pre-computed local_lr
+        using var squared = (WebGpuBuffer)AllocateBuffer(size);
+        // Compute param norm
+        SquareAsync(param, squared, size).GetAwaiter().GetResult();
+        float pNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
+        float pNorm = MathF.Sqrt(pNormSq);
+        // Compute gradient norm
+        SquareAsync(gradient, squared, size).GetAwaiter().GetResult();
+        float gNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
+        float gNorm = MathF.Sqrt(gNormSq);
         float localLr = pNorm > 0 && gNorm > 0 ? trustCoeff * pNorm / (gNorm + weightDecay * pNorm) : 1f;
-        for (int i = 0; i < size; i++) { v[i] = momentum * v[i] + localLr * (g[i] + weightDecay * p[i]); p[i] -= learningRate * v[i]; }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        // LarsLambFtrlSource lars_update: extra = pre-computed local_lr, beta1 = momentum
+        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
+        // Replace the last uniform (extra) with localLr
+        uniforms[7] = localLr;
+        Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lars_update",
+            param, gradient, velocity, dummyState2, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
+        // Two-pass: first compute param_norm via GPU, then compute update_norm via Adam-like step, then dispatch
+        // For LAMB we need param_norm and update_norm. Compute param_norm on GPU:
+        using var squared = (WebGpuBuffer)AllocateBuffer(size);
+        SquareAsync(param, squared, size).GetAwaiter().GetResult();
+        float pNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
+        float pNorm = MathF.Sqrt(pNormSq);
+        // To compute update_norm, we need the Adam update vector. Do this on CPU for the norm computation only:
         var mData = DownloadBufferData(m); var vData = DownloadBufferData(v);
+        var gData = DownloadBufferData(gradient); var pData = DownloadBufferData(param);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        var update = new float[size];
+        float uNormSq = 0;
         for (int i = 0; i < size; i++)
         {
-            mData[i] = beta1 * mData[i] + (1 - beta1) * g[i];
-            vData[i] = beta2 * vData[i] + (1 - beta2) * g[i] * g[i];
-            update[i] = (mData[i] / bc1) / (MathF.Sqrt(vData[i] / bc2) + epsilon) + weightDecay * p[i];
+            float mHat = (beta1 * mData[i] + (1 - beta1) * gData[i]) / bc1;
+            float vHat = (beta2 * vData[i] + (1 - beta2) * gData[i] * gData[i]) / bc2;
+            float ui = mHat / (MathF.Sqrt(vHat) + epsilon) + weightDecay * pData[i];
+            uNormSq += ui * ui;
         }
-        float pNorm = 0, uNorm = 0;
-        for (int i = 0; i < size; i++) { pNorm += p[i] * p[i]; uNorm += update[i] * update[i]; }
-        pNorm = MathF.Sqrt(pNorm); uNorm = MathF.Sqrt(uNorm);
+        float uNorm = MathF.Sqrt(uNormSq);
         float ratio = uNorm > 0 ? pNorm / uNorm : 1f;
-        for (int i = 0; i < size; i++) p[i] -= learningRate * ratio * update[i];
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(vData, v);
+        // LarsLambFtrlSource lamb_update: extra = pre-computed ratio
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        uniforms[7] = ratio;
+        Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lamb_update",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
@@ -156,18 +174,11 @@ public sealed partial class WebGpuBackend
     public void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
         float learningRate, float l1Reg, float l2Reg, float beta, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var zData = DownloadBufferData(z); var nData = DownloadBufferData(n);
-        for (int i = 0; i < size; i++)
-        {
-            float sigma = (MathF.Sqrt(nData[i] + g[i] * g[i]) - MathF.Sqrt(nData[i])) / learningRate;
-            zData[i] += g[i] - sigma * p[i];
-            nData[i] += g[i] * g[i];
-            if (MathF.Abs(zData[i]) <= l1Reg) p[i] = 0;
-            else p[i] = -(zData[i] - MathF.Sign(zData[i]) * l1Reg) / (l2Reg + (beta + MathF.Sqrt(nData[i])) / learningRate);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(zData, z); UploadToBuffer(nData, n);
+        // LarsLambFtrlSource ftrl_update: state1=z, state2=n, beta1=l1_reg, beta2=l2_reg, extra=beta_param
+        var uniforms = MakeOptimizerUniforms(size, learningRate, l1Reg, l2Reg, 0, 0, 0);
+        uniforms[7] = beta; // extra = beta parameter
+        Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "ftrl_update",
+            param, gradient, z, n, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size) => Copy(input, output, size);
@@ -179,17 +190,25 @@ public sealed partial class WebGpuBackend
 
     public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input); var c = DownloadBufferData(centers); var eps = DownloadBufferData(epsilons);
-        var o = new float[batchSize * numCenters];
-        for (int b = 0; b < batchSize; b++)
-            for (int nc = 0; nc < numCenters; nc++)
-            {
-                float dist = 0;
-                for (int d = 0; d < inputDim; d++) { float diff = inp[b * inputDim + d] - c[nc * inputDim + d]; dist += diff * diff; }
-                o[b * numCenters + nc] = MathF.Exp(-eps[nc] * dist);
-            }
-        UploadToBuffer(o, output);
+        // SpecializedLayerSource rbf_forward: binding(0)=input, binding(1)=centers+epsilons combined, binding(2)=output
+        // Epsilons are stored after centers at offset numCenters*inputDim in the centers buffer
+        var centersData = DownloadBufferData(centers);
+        var epsData = DownloadBufferData(epsilons);
+        var combined = new float[numCenters * inputDim + numCenters];
+        Array.Copy(centersData, 0, combined, 0, numCenters * inputDim);
+        Array.Copy(epsData, 0, combined, numCenters * inputDim, numCenters);
+        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(combined.Length);
+        UploadToBuffer(combined, combinedBuf);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(numCenters),
+            BitConverter.Int32BitsToSingle(inputDim),
+            0
+        };
+        int total = batchSize * numCenters;
+        Dispatch3BufferAsync("SpecializedLayer", WebGpuKernels.SpecializedLayerSource, "rbf_forward",
+            input, combinedBuf, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
@@ -234,35 +253,33 @@ public sealed partial class WebGpuBackend
 
     public void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input); var o = new float[batchSize * dim];
-        float maxNorm = (1f - epsilon) / MathF.Sqrt(curvature);
-        for (int b = 0; b < batchSize; b++)
+        // HyperbolicSource poincare_project: binding(0)=input_a, binding(1)=input_b(unused), binding(2)=output
+        using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = new float[]
         {
-            int off = b * dim; float norm = 0;
-            for (int d = 0; d < dim; d++) norm += inp[off + d] * inp[off + d];
-            norm = MathF.Sqrt(norm);
-            float scale = norm > maxNorm ? maxNorm / norm : 1f;
-            for (int d = 0; d < dim; d++) o[off + d] = inp[off + d] * scale;
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(dim),
+            curvature,
+            epsilon
+        };
+        int total = batchSize * dim;
+        Dispatch3BufferAsync("Hyperbolic", WebGpuKernels.HyperbolicSource, "poincare_project",
+            input, dummyB, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
-        EnsureInitialized();
-        var xd = DownloadBufferData(x); var yd = DownloadBufferData(y); var o = new float[batchSize * dim];
-        for (int b = 0; b < batchSize; b++)
+        // HyperbolicSource mobius_add: binding(0)=x, binding(1)=y, binding(2)=output
+        var uniforms = new float[]
         {
-            int off = b * dim;
-            float xSq = 0, ySq = 0, xy = 0;
-            for (int d = 0; d < dim; d++) { xSq += xd[off + d] * xd[off + d]; ySq += yd[off + d] * yd[off + d]; xy += xd[off + d] * yd[off + d]; }
-            float denom = 1f + 2f * curvature * xy + curvature * curvature * xSq * ySq;
-            if (MathF.Abs(denom) < 1e-10f) denom = 1e-10f;
-            for (int d = 0; d < dim; d++)
-                o[off + d] = ((1f + 2f * curvature * xy + curvature * ySq) * xd[off + d] + (1f - curvature * xSq) * yd[off + d]) / denom;
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(dim),
+            curvature,
+            0
+        };
+        int total = batchSize * dim;
+        Dispatch3BufferAsync("Hyperbolic", WebGpuKernels.HyperbolicSource, "mobius_add",
+            x, y, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
@@ -291,16 +308,16 @@ public sealed partial class WebGpuBackend
 
     public void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
-        EnsureInitialized();
-        var xd = DownloadBufferData(x); var yd = DownloadBufferData(y); var o = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
+        // HyperbolicSource poincare_distance: binding(0)=x, binding(1)=y, binding(2)=output (one per batch)
+        var uniforms = new float[]
         {
-            int off = b * dim; float diffSq = 0, xSq = 0, ySq = 0;
-            for (int d = 0; d < dim; d++) { float diff = xd[off + d] - yd[off + d]; diffSq += diff * diff; xSq += xd[off + d] * xd[off + d]; ySq += yd[off + d] * yd[off + d]; }
-            float arg = 1f + 2f * curvature * diffSq / ((1f - curvature * xSq) * (1f - curvature * ySq));
-            o[b] = (float)(Math.Acosh(Math.Max(1.0, arg)) / Math.Sqrt(curvature));
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(dim),
+            curvature,
+            0
+        };
+        Dispatch3BufferAsync("Hyperbolic", WebGpuKernels.HyperbolicSource, "poincare_distance",
+            x, y, output, uniforms, batchSize).GetAwaiter().GetResult();
     }
 
     public void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
@@ -332,25 +349,10 @@ public sealed partial class WebGpuBackend
 
     public void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
-        EnsureInitialized();
-        var ad = DownloadBufferData(a); var bd = DownloadBufferData(b); var o = new float[count * 8];
-        for (int i = 0; i < count; i++)
-        {
-            int off = i * 8;
-            float a0 = ad[off], a1 = ad[off + 1], a2 = ad[off + 2], a3 = ad[off + 3];
-            float a4 = ad[off + 4], a5 = ad[off + 5], a6 = ad[off + 6], a7 = ad[off + 7];
-            float b0 = bd[off], b1 = bd[off + 1], b2 = bd[off + 2], b3 = bd[off + 3];
-            float b4 = bd[off + 4], b5 = bd[off + 5], b6 = bd[off + 6], b7 = bd[off + 7];
-            o[off]     = a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7;
-            o[off + 1] = a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6;
-            o[off + 2] = a0*b2 - a1*b3 + a2*b0 + a3*b1 + a4*b6 + a5*b7 - a6*b4 - a7*b5;
-            o[off + 3] = a0*b3 + a1*b2 - a2*b1 + a3*b0 + a4*b7 - a5*b6 + a6*b5 - a7*b4;
-            o[off + 4] = a0*b4 - a1*b5 - a2*b6 - a3*b7 + a4*b0 + a5*b1 + a6*b2 + a7*b3;
-            o[off + 5] = a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2;
-            o[off + 6] = a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1;
-            o[off + 7] = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0;
-        }
-        UploadToBuffer(o, output);
+        // OctonionSource: binding(0)=A, binding(1)=B, binding(2)=C, uniform: count
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(count) };
+        Dispatch3BufferAsync("Octonion", WebGpuKernels.OctonionSource, "octonion_multiply",
+            a, b, output, uniforms, count).GetAwaiter().GetResult();
     }
 
     public void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count) => Add(a, b, output, count * 8);
@@ -379,25 +381,23 @@ public sealed partial class WebGpuBackend
 
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
-        EnsureInitialized();
-        var re = DownloadBufferData(realPart); var im = DownloadBufferData(imagPart);
-        var o = new float[batchSize * stateSize];
-        for (int b = 0; b < batchSize; b++)
-            for (int s = 0; s < stateSize; s++) { int idx = b * stateSize + s; o[idx] = re[idx] * re[idx] + im[idx] * im[idx]; }
-        UploadToBuffer(o, probabilities);
+        // QuantumSource quantum_measurement: C[i] = A[i]^2 + B[i]^2
+        var uniforms = MakeUniformInts2(batchSize, stateSize);
+        int total = batchSize * stateSize;
+        Dispatch3BufferAsync("Quantum", WebGpuKernels.QuantumSource, "quantum_measurement",
+            realPart, imagPart, probabilities, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(probabilities);
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0;
-            for (int s = 0; s < stateSize; s++) sum += p[b * stateSize + s];
-            if (sum > 0) for (int s = 0; s < stateSize; s++) p[b * stateSize + s] /= sum;
-        }
-        UploadToBuffer(p, probabilities);
+        // QuantumSource normalize_probabilities: reads A, writes C = A/sum(A) per batch
+        // The kernel reads from A and writes to C, so we copy probs to a temp and dispatch
+        using var tempInput = (WebGpuBuffer)AllocateBuffer(batchSize * stateSize);
+        Copy(probabilities, tempInput, batchSize * stateSize);
+        using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeUniformInts2(batchSize, stateSize);
+        Dispatch3BufferAsync("Quantum", WebGpuKernels.QuantumSource, "normalize_probabilities",
+            tempInput, dummyB, probabilities, uniforms, batchSize).GetAwaiter().GetResult();
     }
 
     public void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
@@ -420,30 +420,34 @@ public sealed partial class WebGpuBackend
     public void QuantumRotation(IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag,
         IGpuBuffer angles, int numQubits, int batchSize)
     {
-        EnsureInitialized();
-        var re = DownloadBufferData(stateReal); var im = DownloadBufferData(stateImag); var ang = DownloadBufferData(angles);
-        var or_ = new float[batchSize * numQubits]; var oi = new float[batchSize * numQubits];
-        for (int b = 0; b < batchSize; b++)
-            for (int q = 0; q < numQubits; q++)
-            {
-                int idx = b * numQubits + q; float c = MathF.Cos(ang[idx]), s = MathF.Sin(ang[idx]);
-                or_[idx] = c * re[idx] - s * im[idx]; oi[idx] = s * re[idx] + c * im[idx];
-            }
-        UploadToBuffer(or_, outReal); UploadToBuffer(oi, outImag);
+        // ComplexOpsSource quantum_rotation: appends angles to stateReal buffer (A[idx + total] = angle)
+        // Pack stateReal + angles into a combined buffer
+        int total = batchSize * numQubits;
+        var reData = DownloadBufferData(stateReal);
+        var angData = DownloadBufferData(angles);
+        var combined = new float[total + total];
+        Array.Copy(reData, 0, combined, 0, total);
+        Array.Copy(angData, 0, combined, total, total);
+        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(combined.Length);
+        UploadToBuffer(combined, combinedBuf);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(total),
+            BitConverter.Int32BitsToSingle(numQubits),
+            BitConverter.Int32BitsToSingle(batchSize),
+            0
+        };
+        Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "quantum_rotation",
+            combinedBuf, stateImag, outReal, outImag, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var o = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0;
-            for (int s = 0; s < stateSize; s++) sum += inp[b * stateSize + s] * inp[b * stateSize + s];
-            o[b] = sum;
-        }
-        UploadToBuffer(o, output);
+        // QuantumSource measurement_forward: C[b] = sum(A[base+s]^2) per batch
+        using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeUniformInts2(batchSize, stateSize);
+        Dispatch3BufferAsync("Quantum", WebGpuKernels.QuantumSource, "measurement_forward",
+            input, dummyB, output, uniforms, batchSize).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -452,23 +456,17 @@ public sealed partial class WebGpuBackend
 
     public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
-        EnsureInitialized();
-        var re = DownloadBufferData(inputReal); var im = DownloadBufferData(inputImag);
-        var or_ = new float[n]; var oi = new float[n];
-        float sign = inverse ? 1f : -1f;
-        for (int k = 0; k < n; k++)
+        // FFTSource fft_1d: batched DFT kernel, batch_size=1 for single FFT
+        var uniforms = new float[]
         {
-            float sumR = 0, sumI = 0;
-            for (int j = 0; j < n; j++)
-            {
-                float angle = sign * 2f * MathF.PI * k * j / n;
-                float c = MathF.Cos(angle), s = MathF.Sin(angle);
-                sumR += re[j] * c - im[j] * s; sumI += re[j] * s + im[j] * c;
-            }
-            if (inverse) { or_[k] = sumR / n; oi[k] = sumI / n; }
-            else { or_[k] = sumR; oi[k] = sumI; }
-        }
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+            BitConverter.Int32BitsToSingle(n),
+            BitConverter.Int32BitsToSingle(1), // batch_size=1
+            BitConverter.Int32BitsToSingle(inverse ? 1 : 0),
+            0
+        };
+        Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
+            inputReal, inputImag, outputReal, outputImag, uniforms, n).GetAwaiter().GetResult();
+        // For inverse FFT, the kernel already handles 1/N normalization
     }
 
     public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
@@ -488,27 +486,17 @@ public sealed partial class WebGpuBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int n, bool inverse)
     {
-        EnsureInitialized();
-        var re = DownloadBufferData(inputReal); var im = DownloadBufferData(inputImag);
-        var or_ = new float[batch * n]; var oi = new float[batch * n];
-        float sign = inverse ? 1f : -1f;
-        for (int b = 0; b < batch; b++)
+        // FFTSource fft_1d: batched DFT kernel
+        var uniforms = new float[]
         {
-            int off = b * n;
-            for (int k = 0; k < n; k++)
-            {
-                float sumR = 0, sumI = 0;
-                for (int j = 0; j < n; j++)
-                {
-                    float angle = sign * 2f * MathF.PI * k * j / n;
-                    float c = MathF.Cos(angle), s = MathF.Sin(angle);
-                    sumR += re[off + j] * c - im[off + j] * s; sumI += re[off + j] * s + im[off + j] * c;
-                }
-                if (inverse) { or_[off + k] = sumR / n; oi[off + k] = sumI / n; }
-                else { or_[off + k] = sumR; oi[off + k] = sumI; }
-            }
-        }
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+            BitConverter.Int32BitsToSingle(n),
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inverse ? 1 : 0),
+            0
+        };
+        int total = batch * n;
+        Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
+            inputReal, inputImag, outputReal, outputImag, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
@@ -541,28 +529,39 @@ public sealed partial class WebGpuBackend
         UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
     }
 
-    public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n) => CpuBinary(input, window, output, n, (a, b) => a * b);
+    public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
+    {
+        // ComplexOpsSource apply_window: C = A * B (element-wise multiply)
+        using var dummyD = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(n), 0, 0, 0 };
+        Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "apply_window",
+            input, window, output, dummyD, uniforms, n).GetAwaiter().GetResult();
+    }
 
     public void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
     {
-        var r = DownloadBufferData(real); var im = DownloadBufferData(imag); var o = new float[n];
-        for (int i = 0; i < n; i++) o[i] = MathF.Sqrt(r[i] * r[i] + im[i] * im[i]);
-        UploadToBuffer(o, magnitude);
+        // ComplexOpsSource complex_magnitude: C = sqrt(A^2 + B^2)
+        using var dummyD = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(n), 0, 0, 0 };
+        Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "complex_magnitude",
+            real, imag, magnitude, dummyD, uniforms, n).GetAwaiter().GetResult();
     }
 
     public void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
     {
-        var r = DownloadBufferData(real); var im = DownloadBufferData(imag); var o = new float[n];
-        for (int i = 0; i < n; i++) o[i] = MathF.Atan2(im[i], r[i]);
-        UploadToBuffer(o, phase);
+        // ComplexOpsSource complex_phase: C = atan2(B, A)
+        using var dummyD = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(n), 0, 0, 0 };
+        Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "complex_phase",
+            real, imag, phase, dummyD, uniforms, n).GetAwaiter().GetResult();
     }
 
     public void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
     {
-        var m = DownloadBufferData(magnitude); var p = DownloadBufferData(phase);
-        var or_ = new float[n]; var oi = new float[n];
-        for (int i = 0; i < n; i++) { or_[i] = m[i] * MathF.Cos(p[i]); oi[i] = m[i] * MathF.Sin(p[i]); }
-        UploadToBuffer(or_, real); UploadToBuffer(oi, imag);
+        // ComplexOpsSource polar_to_complex: C=mag*cos(phase), D=mag*sin(phase)
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(n), 0, 0, 0 };
+        Dispatch4BufferAsync("ComplexOps", WebGpuKernels.ComplexOpsSource, "polar_to_complex",
+            magnitude, phase, real, imag, uniforms, n).GetAwaiter().GetResult();
     }
 
     public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec,
