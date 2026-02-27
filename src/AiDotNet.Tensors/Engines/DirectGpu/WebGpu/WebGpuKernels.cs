@@ -5559,6 +5559,192 @@ fn batch_norm_ema(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
+
+    /// <summary>
+    /// Locally connected convolution 2D - per-position weights (unshared convolution).
+    /// Weight layout: [outH, outW, outC, inC, kH, kW]
+    /// </summary>
+    public const string LocallyConnectedConv2DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+struct LCParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+}
+@group(0) @binding(3) var<uniform> params: LCParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn locally_connected_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_x = gid.x;
+    let out_y = gid.y;
+    let out_c = gid.z % params.out_channels;
+    let batch = gid.z / params.out_channels;
+
+    if (out_x >= params.out_width || out_y >= params.out_height || batch >= params.batch_size) {
+        return;
+    }
+
+    var acc: f32 = 0.0;
+    let kernel_size = params.in_channels * params.kernel_height * params.kernel_width;
+    let w_base = ((out_y * params.out_width + out_x) * params.out_channels + out_c) * kernel_size;
+
+    for (var ic: u32 = 0u; ic < params.in_channels; ic = ic + 1u) {
+        for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+            for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+                let in_y = i32(out_y * params.stride_h + ky);
+                let in_x = i32(out_x * params.stride_w + kx);
+                if (in_y >= 0 && in_y < i32(params.in_height) && in_x >= 0 && in_x < i32(params.in_width)) {
+                    let in_idx = batch * params.in_channels * params.in_height * params.in_width
+                               + ic * params.in_height * params.in_width
+                               + u32(in_y) * params.in_width + u32(in_x);
+                    let w_idx = w_base + ic * params.kernel_height * params.kernel_width
+                              + ky * params.kernel_width + kx;
+                    acc = acc + input[in_idx] * weights[w_idx];
+                }
+            }
+        }
+    }
+
+    let out_idx = batch * params.out_channels * params.out_height * params.out_width
+                + out_c * params.out_height * params.out_width
+                + out_y * params.out_width + out_x;
+    output[out_idx] = acc;
+}
+";
+
+    /// <summary>
+    /// Locally connected conv2d backward input.
+    /// </summary>
+    public const string LocallyConnectedConv2DBackwardInputSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
+
+struct LCParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+}
+@group(0) @binding(3) var<uniform> params: LCParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn lc_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let in_x = gid.x;
+    let in_y = gid.y;
+    let ic = gid.z % params.in_channels;
+    let batch = gid.z / params.in_channels;
+
+    if (in_x >= params.in_width || in_y >= params.in_height || batch >= params.batch_size) {
+        return;
+    }
+
+    var acc: f32 = 0.0;
+    let kernel_size = params.in_channels * params.kernel_height * params.kernel_width;
+    for (var oc: u32 = 0u; oc < params.out_channels; oc = oc + 1u) {
+        for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+            for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+                let out_y_check = i32(in_y) - i32(ky);
+                let out_x_check = i32(in_x) - i32(kx);
+                if (out_y_check >= 0 && out_x_check >= 0 &&
+                    out_y_check % i32(params.stride_h) == 0 && out_x_check % i32(params.stride_w) == 0) {
+                    let out_y = u32(out_y_check) / params.stride_h;
+                    let out_x = u32(out_x_check) / params.stride_w;
+                    if (out_y < params.out_height && out_x < params.out_width) {
+                        let go_idx = batch * params.out_channels * params.out_height * params.out_width
+                                   + oc * params.out_height * params.out_width
+                                   + out_y * params.out_width + out_x;
+                        let w_base = ((out_y * params.out_width + out_x) * params.out_channels + oc) * kernel_size;
+                        let w_idx = w_base + ic * params.kernel_height * params.kernel_width
+                                  + ky * params.kernel_width + kx;
+                        acc = acc + grad_output[go_idx] * weights[w_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    let gi_idx = batch * params.in_channels * params.in_height * params.in_width
+               + ic * params.in_height * params.in_width
+               + in_y * params.in_width + in_x;
+    grad_input[gi_idx] = acc;
+}
+";
+
+    /// <summary>
+    /// Locally connected conv2d backward weights.
+    /// </summary>
+    public const string LocallyConnectedConv2DBackwardWeightsSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_weights: array<f32>;
+
+struct LCParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+}
+@group(0) @binding(3) var<uniform> params: LCParams;
+
+@compute @workgroup_size(256)
+fn lc_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let kernel_size = params.in_channels * params.kernel_height * params.kernel_width;
+    let total = params.out_height * params.out_width * params.out_channels * kernel_size;
+    if (idx >= total) { return; }
+
+    let kw = idx % params.kernel_width;
+    let kh = (idx / params.kernel_width) % params.kernel_height;
+    let ic = (idx / (params.kernel_width * params.kernel_height)) % params.in_channels;
+    let oc = (idx / kernel_size) % params.out_channels;
+    let spatial_idx = idx / (params.out_channels * kernel_size);
+    let out_y = spatial_idx / params.out_width;
+    let out_x = spatial_idx % params.out_width;
+
+    var acc: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        let in_y = i32(out_y * params.stride_h + kh);
+        let in_x = i32(out_x * params.stride_w + kw);
+        if (in_y >= 0 && in_y < i32(params.in_height) && in_x >= 0 && in_x < i32(params.in_width)) {
+            let in_idx = n * params.in_channels * params.in_height * params.in_width
+                       + ic * params.in_height * params.in_width
+                       + u32(in_y) * params.in_width + u32(in_x);
+            let go_idx = n * params.out_channels * params.out_height * params.out_width
+                       + oc * params.out_height * params.out_width
+                       + out_y * params.out_width + out_x;
+            acc = acc + input[in_idx] * grad_output[go_idx];
+        }
+    }
+    grad_weights[idx] = acc;
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -5590,7 +5776,9 @@ fn batch_norm_ema(@builtin(global_invocation_id) gid: vec3<u32>) {
                PoincareExpMapSource + HomeostasisClampSource + ThresholdStepSource +
                PhiloxRngSource + StridedSliceSource + Copy2DStridedSource +
                InterleaveSource + BatchNormStatsSource + LambNormSource +
-               OneHotSource + BatchNormEmaSource;
+               OneHotSource + BatchNormEmaSource +
+               LocallyConnectedConv2DSource + LocallyConnectedConv2DBackwardInputSource +
+               LocallyConnectedConv2DBackwardWeightsSource;
     }
 }
 #endif

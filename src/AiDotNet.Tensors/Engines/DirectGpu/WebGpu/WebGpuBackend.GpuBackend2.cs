@@ -134,8 +134,26 @@ public sealed partial class WebGpuBackend
         int kernelH, int kernelW,
         int strideH, int strideW)
     {
-        Conv2D(input, weights, output, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, 0, 0, 1, 1);
+        // Locally connected conv uses per-position weights: weight layout [outH, outW, outC, inC, kH, kW]
+        var uniforms = MakeLCUniforms(batch, inChannels, outChannels,
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW);
+        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
+        Dispatch3Buffer3DAsync("LocallyConnectedConv2D", WebGpuKernels.LocallyConnectedConv2DSource,
+            "locally_connected_conv2d", input, weights, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
+        if (bias is not null)
+        {
+            // Add bias per output channel
+            int spatial = outHeight * outWidth;
+            var biasUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(outChannels),
+                BitConverter.Int32BitsToSingle(spatial),
+                0
+            };
+            Dispatch2BufferAsync("BiasGrad", WebGpuKernels.BiasGradSource, "bias_grad",
+                output, bias, biasUniforms, outChannels).GetAwaiter().GetResult();
+        }
     }
 
     public void LocallyConnectedConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
@@ -144,8 +162,12 @@ public sealed partial class WebGpuBackend
         int kernelH, int kernelW,
         int strideH, int strideW)
     {
-        Conv2DBackwardInput(gradOutput, weights, gradInput, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, 0, 0, 1, 1);
+        var uniforms = MakeLCUniforms(batch, inChannels, outChannels,
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW);
+        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
+        Dispatch3Buffer3DAsync("LocallyConnectedConv2DBackwardInput",
+            WebGpuKernels.LocallyConnectedConv2DBackwardInputSource, "lc_backward_input",
+            gradOutput, weights, gradInput, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
 
     public void LocallyConnectedConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
@@ -154,8 +176,12 @@ public sealed partial class WebGpuBackend
         int kernelH, int kernelW,
         int strideH, int strideW)
     {
-        Conv2DBackwardKernel(input, gradOutput, gradWeights, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, 0, 0, 1, 1);
+        int totalWeightElements = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
+        var uniforms = MakeLCUniforms(batch, inChannels, outChannels,
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW);
+        Dispatch3BufferAsync("LocallyConnectedConv2DBackwardWeights",
+            WebGpuKernels.LocallyConnectedConv2DBackwardWeightsSource, "lc_backward_weights",
+            input, gradOutput, gradWeights, uniforms, totalWeightElements).GetAwaiter().GetResult();
     }
 
     public void LocallyConnectedConv2DBackwardBias(IGpuBuffer gradOutput, IGpuBuffer gradBias,
@@ -816,6 +842,26 @@ public sealed partial class WebGpuBackend
             gradOutput, indices, gradEmbedding, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
+    private static float[] MakeLCUniforms(int batch, int inChannels, int outChannels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inChannels),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            0 // padding
+        };
+    }
     #endregion
 }
 #endif
