@@ -18011,10 +18011,20 @@ public class CpuEngine : IEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
-        // result = scaleA * a + scaleB * b
-        var scaledA = TensorMultiplyScalar(a, scaleA);
-        var scaledB = TensorMultiplyScalar(b, scaleB);
-        return TensorAdd(scaledA, scaledB);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(a.Shape);
+
+        // Single pass: result[i] = scaleA * a[i] + scaleB * b[i]
+        // Avoids 2 intermediate tensor allocations from the original 3-pass approach
+        for (int i = 0; i < a.Length; i++)
+        {
+            var val = numOps.Add(
+                numOps.Multiply(a.GetFlat(i), scaleA),
+                numOps.Multiply(b.GetFlat(i), scaleB));
+            result.SetFlat(i, val);
+        }
+
+        return result;
     }
 
     /// <inheritdoc/>

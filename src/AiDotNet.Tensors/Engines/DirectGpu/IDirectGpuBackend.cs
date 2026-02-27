@@ -1582,7 +1582,8 @@ public interface IDirectGpuBackend : IDisposable
 
     /// <summary>
     /// Computes standard deviation across elements: sqrt(variance).
-    /// Uses numerically stable Welford's algorithm for GPU reduction.
+    /// Uses a two-pass approach: first computes the mean via GPU reduction,
+    /// then computes variance as the mean of squared deviations.
     /// </summary>
     /// <param name="input">Input buffer.</param>
     /// <param name="size">Number of elements.</param>
