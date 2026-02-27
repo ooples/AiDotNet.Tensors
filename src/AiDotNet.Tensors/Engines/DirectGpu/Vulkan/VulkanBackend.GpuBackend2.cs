@@ -1068,6 +1068,23 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(g, grid);
     }
 
+    /// <summary>
+    /// Applies padding mode to a pixel coordinate for grid sampling.
+    /// paddingMode: 0=zeros (returns -1 for out-of-bounds), 1=border (clamp), 2=reflection.
+    /// </summary>
+    private static int ApplyGridPadding(int coord, int size, int paddingMode)
+    {
+        if (coord >= 0 && coord < size) return coord;
+        if (paddingMode == 0) return -1; // zeros: signal out-of-bounds
+        if (paddingMode == 1) return Math.Max(0, Math.Min(size - 1, coord)); // border: clamp
+        // reflection: reflect at boundaries
+        if (size <= 1) return 0;
+        int period = 2 * (size - 1);
+        int c = coord % period;
+        if (c < 0) c += period;
+        return c < size ? c : period - c;
+    }
+
     public void GridSample(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode, bool alignCorners)
@@ -1091,8 +1108,9 @@ public sealed unsafe partial class VulkanBackend
                         for (int jy = 0; jy <= 1; jy++)
                             for (int jx = 0; jx <= 1; jx++)
                             {
-                                int py = iy0 + jy, px = ix0 + jx;
-                                if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
+                                int py = ApplyGridPadding(iy0 + jy, inHeight, paddingMode);
+                                int px = ApplyGridPadding(ix0 + jx, inWidth, paddingMode);
+                                if (py >= 0 && px >= 0)
                                     val += (jy == 0 ? 1 - dy : dy) * (jx == 0 ? 1 - dx : dx)
                                         * inp[((b * channels + c) * inHeight + py) * inWidth + px];
                             }
@@ -1139,11 +1157,12 @@ public sealed unsafe partial class VulkanBackend
                         for (int jy = 0; jy <= 1; jy++)
                             for (int jx = 0; jx <= 1; jx++)
                             {
-                                int py = iy0 + jy, px = ix0 + jx;
+                                int py = ApplyGridPadding(iy0 + jy, inHeight, paddingMode);
+                                int px = ApplyGridPadding(ix0 + jx, inWidth, paddingMode);
                                 float wy = jy == 0 ? 1f - dy : dy;
                                 float wx = jx == 0 ? 1f - dx : dx;
 
-                                if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
+                                if (py >= 0 && px >= 0)
                                 {
                                     // gradInput: scatter gradient weighted by bilinear weight
                                     gi[((b * channels + c) * inHeight + py) * inWidth + px] += gradVal * wy * wx;
