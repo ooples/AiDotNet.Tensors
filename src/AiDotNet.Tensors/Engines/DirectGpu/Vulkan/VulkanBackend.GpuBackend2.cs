@@ -1198,10 +1198,13 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var idx = DownloadBuffer(indices);
         var table = DownloadBuffer(embeddingTable);
+        int vocabSize = table.Length / embeddingDim;
         var outp = new float[numIndices * embeddingDim];
         for (int i = 0; i < numIndices; i++)
         {
             int wordIdx = SingleToInt32BitsCompat(idx[i]);
+            if ((uint)wordIdx >= (uint)vocabSize)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Embedding index {wordIdx} at position {i} is out of range [0, {vocabSize}).");
             Array.Copy(table, wordIdx * embeddingDim, outp, i * embeddingDim, embeddingDim);
         }
         UploadToBuffer(outp, output);
@@ -1216,6 +1219,8 @@ public sealed unsafe partial class VulkanBackend
         for (int i = 0; i < numIndices; i++)
         {
             int wordIdx = SingleToInt32BitsCompat(idx[i]);
+            if ((uint)wordIdx >= (uint)vocabSize)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Embedding index {wordIdx} at position {i} is out of range [0, {vocabSize}).");
             for (int d = 0; d < embeddingDim; d++)
                 ge[wordIdx * embeddingDim + d] += go[i * embeddingDim + d];
         }
