@@ -350,6 +350,31 @@ public sealed unsafe partial class VulkanBackend
         UploadToBuffer(gb, gradBias);
     }
 
+    /// <summary>
+    /// Bilinearly samples input at fractional position (fy, fx) for given batch and channel.
+    /// Returns 0 for out-of-bounds positions (zero-padding).
+    /// </summary>
+    private static float BilinearSample(float[] inp, int b, int c, float fy, float fx,
+        int channels, int height, int width)
+    {
+        int iy0 = (int)MathF.Floor(fy);
+        int ix0 = (int)MathF.Floor(fx);
+        float dy = fy - iy0;
+        float dx = fx - ix0;
+        float val = 0f;
+        for (int jy = 0; jy <= 1; jy++)
+            for (int jx = 0; jx <= 1; jx++)
+            {
+                int py = iy0 + jy, px = ix0 + jx;
+                if (py >= 0 && py < height && px >= 0 && px < width)
+                {
+                    float w = (jy == 0 ? 1f - dy : dy) * (jx == 0 ? 1f - dx : dx);
+                    val += w * inp[((b * channels + c) * height + py) * width + px];
+                }
+            }
+        return val;
+    }
+
     public void DeformableConv2D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
@@ -357,9 +382,59 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        // Fallback to standard Conv2D (ignoring offsets/mask for correctness baseline)
-        Conv2D(input, weights, output, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        EnsureInitialized();
+        var inp = DownloadBuffer(input);
+        var ker = DownloadBuffer(weights);
+        var off = DownloadBuffer(offsets);
+        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
+        var outp = new float[batch * outChannels * outHeight * outWidth];
+
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
+
+        for (int b = 0; b < batch; b++)
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int g = oc / outChannelsPerGroup;
+                for (int oh = 0; oh < outHeight; oh++)
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        float sum = 0f;
+                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                        {
+                            int actualIc = g * inChannelsPerGroup + ic;
+                            int dg = actualIc / inChannelsPerDeformGroup;
+
+                            for (int kh = 0; kh < kernelH; kh++)
+                                for (int kw = 0; kw < kernelW; kw++)
+                                {
+                                    // Offset layout: [batch, deformGroups * kernelH * kernelW * 2, outH, outW]
+                                    int offsetIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
+                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
+                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
+
+                                    float fy = oh * strideH - padH + kh * dilationH + offY;
+                                    float fx = ow * strideW - padW + kw * dilationW + offX;
+
+                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
+
+                                    // Apply mask if provided
+                                    if (msk is not null)
+                                    {
+                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
+                                        float m = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
+                                        val *= m;
+                                    }
+
+                                    sum += val * ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
+                                }
+                        }
+                        outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+                    }
+            }
+        UploadToBuffer(outp, output);
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
@@ -369,8 +444,70 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        Conv2DBackwardInput(gradOutput, weights, gradInput, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var ker = DownloadBuffer(weights);
+        var off = DownloadBuffer(offsets);
+        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
+        var gi = new float[batch * inChannels * inHeight * inWidth];
+
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
+
+        for (int b = 0; b < batch; b++)
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int g = oc / outChannelsPerGroup;
+                for (int oh = 0; oh < outHeight; oh++)
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                        {
+                            int actualIc = g * inChannelsPerGroup + ic;
+                            int dg = actualIc / inChannelsPerDeformGroup;
+
+                            for (int kh = 0; kh < kernelH; kh++)
+                                for (int kw = 0; kw < kernelW; kw++)
+                                {
+                                    int offsetIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
+                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
+                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
+
+                                    float fy = oh * strideH - padH + kh * dilationH + offY;
+                                    float fx = ow * strideW - padW + kw * dilationW + offX;
+
+                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
+                                    float maskVal = 1f;
+                                    if (msk is not null)
+                                    {
+                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
+                                        maskVal = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
+                                    }
+
+                                    // Scatter gradient to the 4 bilinear interpolation neighbors
+                                    int iy0 = (int)MathF.Floor(fy);
+                                    int ix0 = (int)MathF.Floor(fx);
+                                    float dy = fy - iy0;
+                                    float dx = fx - ix0;
+                                    for (int jy = 0; jy <= 1; jy++)
+                                        for (int jx = 0; jx <= 1; jx++)
+                                        {
+                                            int py = iy0 + jy, px = ix0 + jx;
+                                            if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
+                                            {
+                                                float bw = (jy == 0 ? 1f - dy : dy) * (jx == 0 ? 1f - dx : dx);
+                                                gi[((b * inChannels + actualIc) * inHeight + py) * inWidth + px]
+                                                    += grad * w * maskVal * bw;
+                                            }
+                                        }
+                                }
+                        }
+                    }
+            }
+        UploadToBuffer(gi, gradInput);
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -380,8 +517,54 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        Conv2DBackwardKernel(input, gradOutput, gradWeights, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var off = DownloadBuffer(offsets);
+        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
+        var gw = new float[outChannels * (inChannels / groups) * kernelH * kernelW];
+
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
+
+        for (int b = 0; b < batch; b++)
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int g = oc / outChannelsPerGroup;
+                for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                {
+                    int actualIc = g * inChannelsPerGroup + ic;
+                    int dg = actualIc / inChannelsPerDeformGroup;
+
+                    for (int kh = 0; kh < kernelH; kh++)
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            float sum = 0f;
+                            for (int oh = 0; oh < outHeight; oh++)
+                                for (int ow = 0; ow < outWidth; ow++)
+                                {
+                                    int offsetIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
+                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
+                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
+
+                                    float fy = oh * strideH - padH + kh * dilationH + offY;
+                                    float fx = ow * strideW - padW + kw * dilationW + offX;
+
+                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
+                                    if (msk is not null)
+                                    {
+                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
+                                        val *= msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
+                                    }
+                                    sum += go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] * val;
+                                }
+                            gw[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw] += sum;
+                        }
+                }
+            }
+        UploadToBuffer(gw, gradWeights);
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -391,7 +574,82 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        Fill(gradOffsets, 0f, gradOffsets.Size);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var ker = DownloadBuffer(weights);
+        var off = DownloadBuffer(offsets);
+        float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
+        var gOff = new float[batch * deformGroups * kernelH * kernelW * 2 * outHeight * outWidth];
+
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
+
+        for (int b = 0; b < batch; b++)
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int g = oc / outChannelsPerGroup;
+                for (int oh = 0; oh < outHeight; oh++)
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                        {
+                            int actualIc = g * inChannelsPerGroup + ic;
+                            int dg = actualIc / inChannelsPerDeformGroup;
+
+                            for (int kh = 0; kh < kernelH; kh++)
+                                for (int kw = 0; kw < kernelW; kw++)
+                                {
+                                    int offsetIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
+                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
+                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
+
+                                    float fy = oh * strideH - padH + kh * dilationH + offY;
+                                    float fx = ow * strideW - padW + kw * dilationW + offX;
+
+                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
+                                    float maskVal = 1f;
+                                    if (msk is not null)
+                                    {
+                                        int maskBase = ((b * deformGroups + dg) * kernelH * kernelW) * outHeight * outWidth;
+                                        maskVal = msk[maskBase + offsetIdx * outHeight * outWidth + oh * outWidth + ow];
+                                    }
+
+                                    // Compute gradient of bilinear interpolation w.r.t. offset (fy, fx)
+                                    int iy0 = (int)MathF.Floor(fy);
+                                    int ix0 = (int)MathF.Floor(fx);
+                                    float dy = fy - iy0;
+                                    float dx = fx - ix0;
+
+                                    // dval/dfy and dval/dfx via bilinear weight derivatives
+                                    float dvalDfy = 0f, dvalDfx = 0f;
+                                    for (int jy = 0; jy <= 1; jy++)
+                                        for (int jx = 0; jx <= 1; jx++)
+                                        {
+                                            int py = iy0 + jy, px = ix0 + jx;
+                                            if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
+                                            {
+                                                float pixel = inp[((b * inChannels + actualIc) * inHeight + py) * inWidth + px];
+                                                float dwDfy = (jy == 0 ? -1f : 1f) * (jx == 0 ? 1f - dx : dx);
+                                                float dwDfx = (jy == 0 ? 1f - dy : dy) * (jx == 0 ? -1f : 1f);
+                                                dvalDfy += dwDfy * pixel;
+                                                dvalDfx += dwDfx * pixel;
+                                            }
+                                        }
+
+                                    float gradScale = grad * w * maskVal;
+                                    int gOffIdxY = offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow;
+                                    int gOffIdxX = offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow;
+                                    gOff[gOffIdxY] += gradScale * dvalDfy;
+                                    gOff[gOffIdxX] += gradScale * dvalDfx;
+                                }
+                        }
+                    }
+            }
+        UploadToBuffer(gOff, gradOffsets);
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -401,7 +659,53 @@ public sealed unsafe partial class VulkanBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups)
     {
-        Fill(gradMask, 0f, gradMask.Size);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var ker = DownloadBuffer(weights);
+        var off = DownloadBuffer(offsets);
+        var gMask = new float[batch * deformGroups * kernelH * kernelW * outHeight * outWidth];
+
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int inChannelsPerDeformGroup = inChannels / deformGroups;
+
+        for (int b = 0; b < batch; b++)
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int g = oc / outChannelsPerGroup;
+                for (int oh = 0; oh < outHeight; oh++)
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        float grad = go[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                        {
+                            int actualIc = g * inChannelsPerGroup + ic;
+                            int dg = actualIc / inChannelsPerDeformGroup;
+
+                            for (int kh = 0; kh < kernelH; kh++)
+                                for (int kw = 0; kw < kernelW; kw++)
+                                {
+                                    int offsetIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * kernelH * kernelW * 2) * outHeight * outWidth;
+                                    float offY = off[offBase + (offsetIdx * 2) * outHeight * outWidth + oh * outWidth + ow];
+                                    float offX = off[offBase + (offsetIdx * 2 + 1) * outHeight * outWidth + oh * outWidth + ow];
+
+                                    float fy = oh * strideH - padH + kh * dilationH + offY;
+                                    float fx = ow * strideW - padW + kw * dilationW + offX;
+
+                                    float val = BilinearSample(inp, b, actualIc, fy, fx, inChannels, inHeight, inWidth);
+                                    float w = ker[((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw];
+
+                                    // gradMask = sum over output channels of (gradOutput * weight * sampledValue)
+                                    int maskIdx = ((b * deformGroups + dg) * kernelH * kernelW + offsetIdx) * outHeight * outWidth
+                                        + oh * outWidth + ow;
+                                    gMask[maskIdx] += grad * w * val;
+                                }
+                        }
+                    }
+            }
+        UploadToBuffer(gMask, gradMask);
     }
 
     #endregion
