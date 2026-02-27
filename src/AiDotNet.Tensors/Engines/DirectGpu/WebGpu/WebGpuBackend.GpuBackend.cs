@@ -579,6 +579,13 @@ public sealed partial class WebGpuBackend
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         int ndim = shape.Length;
+        if (ndim > 4)
+        {
+            throw new ArgumentException(
+                $"Permute supports up to 4 dimensions, but got {ndim}. " +
+                "The GPU kernel uses fixed 4-element stride arrays.",
+                nameof(shape));
+        }
         int total = 1;
         for (int i = 0; i < ndim; i++) total *= shape[i];
         // Compute output shape and strides
