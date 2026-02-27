@@ -166,12 +166,16 @@ public sealed unsafe partial class VulkanBackend
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         EnsureInitialized();
-        return VulkanGpuBuffer.Create(data, _transfer!);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        return VulkanGpuBuffer.Create(data, _transfer);
     }
 
     public IGpuBuffer AllocateBuffer(int size)
     {
         EnsureInitialized();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         return VulkanGpuBuffer.Create(size);
     }
 
@@ -179,7 +183,9 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         var vb = AsVulkan(buffer);
-        _transfer!.CopyFromDevice(vb.Storage, vb.Staging);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         var result = new float[vb.Size];
         vb.Staging.ReadData(result);
         return result;
@@ -188,8 +194,12 @@ public sealed unsafe partial class VulkanBackend
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         EnsureInitialized();
+        if (destination.Length < buffer.Size)
+            throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         var vb = AsVulkan(buffer);
-        _transfer!.CopyFromDevice(vb.Storage, vb.Staging);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         vb.Staging.ReadData(destination);
     }
 
@@ -223,7 +233,9 @@ public sealed unsafe partial class VulkanBackend
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
             floatData[i] = Int32BitsToSingleCompat(data[i]);
-        return VulkanGpuBuffer.Create(floatData, _transfer!);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        return VulkanGpuBuffer.Create(floatData, _transfer);
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)
@@ -748,7 +760,17 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         var s = DownloadBuffer(source);
-        var d = DownloadBuffer(destination);
+        // Only download destination if the strided copy does not cover all columns,
+        // since we need to preserve existing data in non-written columns.
+        float[] d;
+        if (destColOffset == 0 && srcCols >= destTotalCols)
+        {
+            d = new float[destination.Size];
+        }
+        else
+        {
+            d = DownloadBuffer(destination);
+        }
         for (int r = 0; r < numRows; r++)
             Array.Copy(s, r * srcCols, d, r * destTotalCols + destColOffset, srcCols);
         UploadToBuffer(d, destination);
@@ -806,10 +828,22 @@ public sealed unsafe partial class VulkanBackend
 
     #region Random Number Generation
 
+    /// <summary>
+    /// Creates a deterministic Random from a 64-bit seed by combining both halves
+    /// into a single 32-bit seed via XOR, preserving entropy from the full 64-bit value.
+    /// </summary>
+    private static Random CreateSeededRandom(ulong seed)
+    {
+        // Split the 64-bit seed into two 32-bit halves and XOR them together
+        // to preserve entropy from both halves instead of truncating to 31 bits.
+        int combinedSeed = (int)(seed & 0xFFFFFFFF) ^ (int)(seed >> 32);
+        return new Random(combinedSeed);
+    }
+
     public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
         EnsureInitialized();
-        var rng = new Random((int)(seed & 0x7FFFFFFF));
+        var rng = CreateSeededRandom(seed);
         var data = new float[size];
         float range = max - min;
         for (int i = 0; i < size; i++)
@@ -820,7 +854,7 @@ public sealed unsafe partial class VulkanBackend
     public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         EnsureInitialized();
-        var rng = new Random((int)(seed & 0x7FFFFFFF));
+        var rng = CreateSeededRandom(seed);
         var data = new float[size];
         for (int i = 0; i < size; i += 2)
         {
