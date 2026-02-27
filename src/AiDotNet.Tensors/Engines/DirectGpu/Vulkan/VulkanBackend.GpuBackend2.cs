@@ -794,8 +794,8 @@ public sealed unsafe partial class VulkanBackend
                                 { sum += inp[((b * channels + c) * inHeight + ih) * inWidth + iw]; count++; }
                                 else if (countIncludePad) count++;
                             }
-                        if (!countIncludePad && count == 0) count = 1;
-                        else if (countIncludePad) count = kernelH * kernelW;
+                        if (countIncludePad) count = kernelH * kernelW;
+                        else if (count == 0) count = 1;
                         outp[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum / count;
                     }
         UploadToBuffer(outp, output);

@@ -10,15 +10,15 @@ public sealed unsafe partial class VulkanBackend
 {
     #region Internal Helpers
 
-    // .NET Framework 4.7.1 compatibility helpers
+    // Bit conversion helpers using safe BitConverter methods
     private static int SingleToInt32BitsCompat(float value)
     {
-        return *(int*)&value;
+        return BitConverter.SingleToInt32Bits(value);
     }
 
     private static float Int32BitsToSingleCompat(int value)
     {
-        return *(float*)&value;
+        return BitConverter.Int32BitsToSingle(value);
     }
 
     private static float AsinhCompat(float x)
@@ -72,8 +72,10 @@ public sealed unsafe partial class VulkanBackend
     private void UploadToBuffer(float[] data, IGpuBuffer buffer)
     {
         var vb = AsVulkan(buffer);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
         vb.Staging.WriteData(data);
-        _transfer!.CopyToDevice(vb.Staging, vb.Storage);
+        _transfer.CopyToDevice(vb.Staging, vb.Storage);
     }
 
     private void GpuBinaryOp(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, VulkanKernelType kernelType)
@@ -114,6 +116,12 @@ public sealed unsafe partial class VulkanBackend
     private void CpuUnary(IGpuBuffer A, IGpuBuffer B, int size, Func<float, float> op)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({A.Size}).");
+        if (size > B.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({B.Size}).");
         var a = DownloadBuffer(A);
         var b = new float[size];
         for (int i = 0; i < size; i++) b[i] = op(a[i]);
@@ -123,6 +131,14 @@ public sealed unsafe partial class VulkanBackend
     private void CpuBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, Func<float, float, float> op)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds first input buffer length ({A.Size}).");
+        if (size > B.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds second input buffer length ({B.Size}).");
+        if (size > C.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({C.Size}).");
         var a = DownloadBuffer(A);
         var b = DownloadBuffer(B);
         var c = new float[size];
@@ -133,6 +149,10 @@ public sealed unsafe partial class VulkanBackend
     private float CpuReduce(IGpuBuffer A, int size, float seed, Func<float, float, float> accumulate)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer length ({A.Size}).");
         var a = DownloadBuffer(A);
         float result = seed;
         for (int i = 0; i < size; i++) result = accumulate(result, a[i]);
@@ -177,7 +197,16 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         var src = DownloadBuffer(source);
-        var dst = DownloadBuffer(destination);
+        // Only download destination when partial copy needs to preserve existing data
+        float[] dst;
+        if (destOffset == 0 && size >= destination.Size)
+        {
+            dst = new float[destination.Size];
+        }
+        else
+        {
+            dst = DownloadBuffer(destination);
+        }
         Array.Copy(src, srcOffset, dst, destOffset, size);
         UploadToBuffer(dst, destination);
     }
@@ -213,7 +242,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var a = DownloadBuffer(A);
         var b = DownloadBuffer(B);
-        var c = DownloadBuffer(C);
+        // Skip downloading C when beta is 0 since existing values are not needed
+        var c = beta != 0.0f ? DownloadBuffer(C) : new float[M * N];
         for (int i = 0; i < M; i++)
         {
             for (int j = 0; j < N; j++)
@@ -221,7 +251,7 @@ public sealed unsafe partial class VulkanBackend
                 float sum = 0;
                 for (int k = 0; k < K; k++)
                     sum += a[i * K + k] * b[k * N + j];
-                c[i * N + j] = alpha * sum + beta * c[i * N + j];
+                c[i * N + j] = beta != 0.0f ? alpha * sum + beta * c[i * N + j] : alpha * sum;
             }
         }
         UploadToBuffer(c, C);
@@ -239,7 +269,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var a = DownloadBuffer(A);
         var b = DownloadBuffer(B);
-        var c = DownloadBuffer(C);
+        // Skip downloading C when beta is 0 since existing values are not needed
+        var c = beta != 0.0f ? DownloadBuffer(C) : new float[batchCount * M * N];
         int aStride = M * K, bStride = K * N, cStride = M * N;
         for (int batch = 0; batch < batchCount; batch++)
         {
@@ -250,7 +281,7 @@ public sealed unsafe partial class VulkanBackend
                     float sum = 0;
                     for (int k = 0; k < K; k++)
                         sum += a[aOff + i * K + k] * b[bOff + k * N + j];
-                    c[cOff + i * N + j] = alpha * sum + beta * c[cOff + i * N + j];
+                    c[cOff + i * N + j] = beta != 0.0f ? alpha * sum + beta * c[cOff + i * N + j] : alpha * sum;
                 }
         }
         UploadToBuffer(c, C);

@@ -18000,9 +18000,8 @@ public class CpuEngine : IEngine
 
         // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
         // Using a + t*(b-a) is more numerically stable and requires fewer ops
-        var diff = TensorSubtract(a, b);  // a - b
-        var negDiff = TensorNegate(diff);  // b - a
-        var scaled = TensorMultiplyScalar(negDiff, t);  // t * (b - a)
+        var diff = TensorSubtract(b, a);  // b - a
+        var scaled = TensorMultiplyScalar(diff, t);  // t * (b - a)
         return TensorAdd(a, scaled);  // a + t * (b - a)
     }
 
