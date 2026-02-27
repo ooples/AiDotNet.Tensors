@@ -214,37 +214,53 @@ public sealed partial class WebGpuBackend
     public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
-        EnsureInitialized();
-        var w = DownloadBufferData(weights);
-        var preT = DownloadBufferData(preTrace); var postT = DownloadBufferData(postTrace);
-        var preS = DownloadBufferData(preSpike); var postS = DownloadBufferData(postSpike);
-        for (int i = 0; i < numPre; i++)
-            for (int j = 0; j < numPost; j++)
+        // NeuromorphicSource stdp_update: binding(0)=weights, binding(1)=preSpike, binding(2)=postSpike, binding(3)=preTrace
+        // Uniform: num_pre, num_post, a_plus=ltpRate, a_minus=ltdRate, lr=1.0 (already scaled), pad, pad, pad
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(numPre),
+            BitConverter.Int32BitsToSingle(numPost),
+            ltpRate,
+            ltdRate,
+            1f,
+            0, 0, 0
+        };
+        int total = numPre * numPost;
+        Dispatch4BufferAsync("Neuromorphic", WebGpuKernels.NeuromorphicSource, "stdp_update",
+            weights, preSpike, postSpike, preTrace, uniforms, total).GetAwaiter().GetResult();
+        // Apply homeostasis and clamping via CPU post-processing
+        if (homeostasisRate != 0f || minWeight != float.MinValue || maxWeight != float.MaxValue)
+        {
+            var w = DownloadBufferData(weights);
+            for (int i = 0; i < total; i++)
             {
-                int idx = i * numPost + j;
-                // LTP: pre-spike paired with post-trace
-                if (preS[i] > 0.5f) w[idx] += ltpRate * postT[j];
-                // LTD: post-spike paired with pre-trace
-                if (postS[j] > 0.5f) w[idx] -= ltdRate * preT[i];
-                // Homeostasis
-                w[idx] += homeostasisRate * (0.5f - w[idx]);
-                // Clamp
-                w[idx] = MathF.Max(minWeight, MathF.Min(maxWeight, w[idx]));
+                w[i] += homeostasisRate * (0.5f - w[i]);
+                w[i] = MathF.Max(minWeight, MathF.Min(maxWeight, w[i]));
             }
-        UploadToBuffer(w, weights);
+            UploadToBuffer(w, weights);
+        }
     }
 
     public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
+        // Two-step: First compute spikes from input (1 if input > threshold, else 0) via GPU
+        // Then update traces via GPU: traces = decay * traces + spikes
+        // Step 1: Compute spikes using NotEqualScalar-like approach (need threshold comparison)
+        // Since we need ">", not "!=", use a custom approach - threshold compare into spikes
         EnsureInitialized();
-        var t = DownloadBufferData(traces); var s = DownloadBufferData(spikes); var inp = DownloadBufferData(input);
-        for (int i = 0; i < size; i++)
+        var inp = DownloadBufferData(input);
+        var s = new float[size];
+        for (int i = 0; i < size; i++) s[i] = inp[i] > threshold ? 1f : 0f;
+        UploadToBuffer(s, spikes);
+        // Step 2: Update traces on GPU: traces = decay * traces + spikes
+        // TraceUpdateSource: binding(0)=traces(rw), binding(1)=spikes(read), uniform: size, decay
+        var uniforms = new float[]
         {
-            t[i] = decay * t[i];
-            if (inp[i] > threshold) { s[i] = 1f; t[i] += 1f; }
-            else s[i] = 0f;
-        }
-        UploadToBuffer(t, traces); UploadToBuffer(s, spikes);
+            BitConverter.Int32BitsToSingle(size),
+            decay
+        };
+        Dispatch2BufferAsync("TraceUpdate", WebGpuKernels.TraceUpdateSource, "update_traces",
+            traces, spikes, uniforms, size).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -502,31 +518,24 @@ public sealed partial class WebGpuBackend
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
         int height, int width, bool inverse)
     {
-        EnsureInitialized();
-        var tempR = new float[height * width]; var tempI = new float[height * width];
-        var re = DownloadBufferData(inputReal); var im = DownloadBufferData(inputImag);
-        float sign = inverse ? 1f : -1f;
-        for (int r = 0; r < height; r++)
-        {
-            for (int k = 0; k < width; k++)
-            {
-                float sr = 0, si = 0;
-                for (int j = 0; j < width; j++) { float a = sign * 2f * MathF.PI * k * j / width; float c = MathF.Cos(a), s = MathF.Sin(a); sr += re[r * width + j] * c - im[r * width + j] * s; si += re[r * width + j] * s + im[r * width + j] * c; }
-                tempR[r * width + k] = sr; tempI[r * width + k] = si;
-            }
-        }
-        var or_ = new float[height * width]; var oi = new float[height * width];
-        for (int c = 0; c < width; c++)
-        {
-            for (int k = 0; k < height; k++)
-            {
-                float sr = 0, si = 0;
-                for (int j = 0; j < height; j++) { float a = sign * 2f * MathF.PI * k * j / height; float co = MathF.Cos(a), s = MathF.Sin(a); sr += tempR[j * width + c] * co - tempI[j * width + c] * s; si += tempR[j * width + c] * s + tempI[j * width + c] * co; }
-                if (inverse) { or_[k * width + c] = sr / (height * width); oi[k * width + c] = si / (height * width); }
-                else { or_[k * width + c] = sr; oi[k * width + c] = si; }
-            }
-        }
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+        // 2D FFT = row-wise 1D FFT (batch=height, n=width) then column-wise 1D FFT (batch=width, n=height)
+        // Pass 1: Row-wise FFT - data is already in row-major order, so batch=height works directly
+        using var tempR = (WebGpuBuffer)AllocateBuffer(height * width);
+        using var tempI = (WebGpuBuffer)AllocateBuffer(height * width);
+        BatchedFFT(inputReal, inputImag, tempR, tempI, height, width, inverse);
+        // Pass 2: Column-wise FFT - need to transpose, FFT, then transpose back
+        using var transR = (WebGpuBuffer)AllocateBuffer(height * width);
+        using var transI = (WebGpuBuffer)AllocateBuffer(height * width);
+        // Transpose from (height x width) to (width x height)
+        BatchedTranspose(tempR, transR, 1, height, width);
+        BatchedTranspose(tempI, transI, 1, height, width);
+        // FFT columns: now batch=width, n=height
+        using var fftR = (WebGpuBuffer)AllocateBuffer(height * width);
+        using var fftI = (WebGpuBuffer)AllocateBuffer(height * width);
+        BatchedFFT(transR, transI, fftR, fftI, width, height, inverse);
+        // Transpose back from (width x height) to (height x width)
+        BatchedTranspose(fftR, outputReal, 1, width, height);
+        BatchedTranspose(fftI, outputImag, 1, width, height);
     }
 
     public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
@@ -567,17 +576,13 @@ public sealed partial class WebGpuBackend
     public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec,
         int numFrames, int numFreqs, int nMels)
     {
-        EnsureInitialized();
-        var spec = DownloadBufferData(powerSpec); var fb = DownloadBufferData(filterbank);
-        var o = new float[numFrames * nMels];
-        for (int b = 0; b < numFrames; b++)
-            for (int m = 0; m < nMels; m++)
-            {
-                float sum = 0;
-                for (int f = 0; f < numFreqs; f++) sum += spec[b * numFreqs + f] * fb[m * numFreqs + f];
-                o[b * nMels + m] = sum;
-            }
-        UploadToBuffer(o, melSpec);
+        // melSpec[b,m] = sum_f(powerSpec[b,f] * filterbank[m,f])
+        // This is powerSpec (numFrames x numFreqs) * filterbank^T (numFreqs x nMels)
+        // = Gemm(powerSpec, filterbank^T, melSpec, M=numFrames, N=nMels, K=numFreqs)
+        // filterbank is (nMels x numFreqs), so transpose it
+        using var filterbankT = (WebGpuBuffer)AllocateBuffer(numFreqs * nMels);
+        BatchedTranspose(filterbank, filterbankT, 1, nMels, numFreqs);
+        Gemm(powerSpec, filterbankT, melSpec, numFrames, nMels, numFreqs);
     }
 
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
