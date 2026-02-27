@@ -14,48 +14,22 @@ public sealed partial class WebGpuBackend
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
         int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
-        EnsureInitialized();
-        var q = DownloadBufferData(query); var k = DownloadBufferData(key); var v = DownloadBufferData(value);
-        float[]? m = mask is not null ? DownloadBufferData(mask) : null;
-        var o = new float[batch * numHeads * seqLen * headDim];
-        float[]? aw = attentionWeights is not null ? new float[batch * numHeads * seqLen * seqLen] : null;
-        for (int b = 0; b < batch; b++)
-            for (int h = 0; h < numHeads; h++)
-            {
-                int off = (b * numHeads + h) * seqLen;
-                var scores = new float[seqLen * seqLen];
-                for (int i = 0; i < seqLen; i++)
-                    for (int j = 0; j < seqLen; j++)
-                    {
-                        float dot = 0;
-                        for (int d = 0; d < headDim; d++) dot += q[(off + i) * headDim + d] * k[(off + j) * headDim + d];
-                        scores[i * seqLen + j] = dot * scale;
-                        if (isCausal && j > i) scores[i * seqLen + j] = -1e9f;
-                        if (m is not null && m[i * seqLen + j] == 0) scores[i * seqLen + j] = -1e9f;
-                    }
-                for (int i = 0; i < seqLen; i++)
-                {
-                    float max = float.MinValue;
-                    for (int j = 0; j < seqLen; j++) max = MathF.Max(max, scores[i * seqLen + j]);
-                    float sum = 0;
-                    for (int j = 0; j < seqLen; j++) { scores[i * seqLen + j] = MathF.Exp(scores[i * seqLen + j] - max); sum += scores[i * seqLen + j]; }
-                    if (sum > 0) for (int j = 0; j < seqLen; j++) scores[i * seqLen + j] /= sum;
-                }
-                if (aw is not null)
-                {
-                    int awOff = (b * numHeads + h) * seqLen * seqLen;
-                    Array.Copy(scores, 0, aw, awOff, seqLen * seqLen);
-                }
-                for (int i = 0; i < seqLen; i++)
-                    for (int d = 0; d < headDim; d++)
-                    {
-                        float sum = 0;
-                        for (int j = 0; j < seqLen; j++) sum += scores[i * seqLen + j] * v[(off + j) * headDim + d];
-                        o[(off + i) * headDim + d] = sum;
-                    }
-            }
-        UploadToBuffer(o, output);
-        if (attentionWeights is not null && aw is not null) UploadToBuffer(aw, attentionWeights);
+        // AttentionSource: binding(0)=query, binding(1)=key, binding(2)=value, binding(3)=output, binding(4)=uniform
+        // Uniform: batch_heads, seq_len, head_dim, pad
+        int batchHeads = batch * numHeads;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchHeads),
+            BitConverter.Int32BitsToSingle(seqLen),
+            BitConverter.Int32BitsToSingle(headDim),
+            0
+        };
+        int totalElements = batchHeads * seqLen * headDim;
+        Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
+            query, key, value, output, uniforms, totalElements).GetAwaiter().GetResult();
+        // attentionWeights not produced by this kernel; fill with zeros if requested
+        if (attentionWeights is not null)
+            Fill(attentionWeights, 0f, batchHeads * seqLen * seqLen);
     }
 
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -270,19 +244,23 @@ public sealed partial class WebGpuBackend
 
     public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
     {
+        // Convert integer-encoded targets to one-hot for GPU kernel
         EnsureInitialized();
-        var p = DownloadBufferData(predictions); var t = DownloadBufferData(targets);
-        var o = new float[batchSize * numClasses];
+        var t = DownloadBufferData(targets);
+        var oneHot = new float[batchSize * numClasses];
         for (int b = 0; b < batchSize; b++)
         {
             int target = BitConverter.SingleToInt32Bits(t[b]);
-            float maxVal = float.MinValue;
-            for (int c = 0; c < numClasses; c++) maxVal = MathF.Max(maxVal, p[b * numClasses + c]);
-            float sum = 0;
-            for (int c = 0; c < numClasses; c++) sum += MathF.Exp(p[b * numClasses + c] - maxVal);
-            for (int c = 0; c < numClasses; c++) o[b * numClasses + c] = (MathF.Exp(p[b * numClasses + c] - maxVal) / sum - (c == target ? 1f : 0f)) / batchSize;
+            if (target >= 0 && target < numClasses)
+                oneHot[b * numClasses + target] = 1f;
         }
-        UploadToBuffer(o, gradInput);
+        using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(batchSize * numClasses);
+        UploadToBuffer(oneHot, oneHotBuf);
+        // CrossEntropySource cross_entropy_backward: softmax(predictions) - targets (one-hot)
+        var uniforms = MakeUniformInts2(batchSize, numClasses);
+        int total = batchSize * numClasses;
+        Dispatch3BufferAsync("CrossEntropy", WebGpuKernels.CrossEntropySource, "cross_entropy_backward",
+            predictions, oneHotBuf, gradInput, uniforms, total).GetAwaiter().GetResult();
     }
 
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
@@ -528,41 +506,40 @@ public sealed partial class WebGpuBackend
 
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
-        EnsureInitialized();
-        var src = DownloadBufferData(source); var idx = DownloadBufferData(indices);
-        var dst = DownloadBufferData(destination);
-        for (int i = 0; i < sourceSize; i++)
+        // ScatterGatherExtSource scatter_add: gather pattern - for each dest element, scan source for matching indices
+        // binding(0)=source, binding(1)=indices, binding(2)=destination
+        // Uniform: num_indices=sourceSize, inner_size=1 (flat), dest_outer=destSize, pad
+        var uniforms = new float[]
         {
-            int dstIdx = BitConverter.SingleToInt32Bits(idx[i]);
-            if (dstIdx >= 0 && dstIdx < destSize) dst[dstIdx] += src[i];
-        }
-        UploadToBuffer(dst, destination);
+            BitConverter.Int32BitsToSingle(sourceSize),
+            BitConverter.Int32BitsToSingle(1),
+            BitConverter.Int32BitsToSingle(destSize),
+            0
+        };
+        Dispatch3BufferAsync("ScatterGatherExt", WebGpuKernels.ScatterGatherExtSource, "scatter_add",
+            source, indices, destination, uniforms, destSize).GetAwaiter().GetResult();
     }
 
     public void ScatterAddBackward(IGpuBuffer gradDestination, IGpuBuffer indices, IGpuBuffer gradSource, int numIndices, int featureSize)
     {
-        EnsureInitialized();
-        var gd = DownloadBufferData(gradDestination); var idx = DownloadBufferData(indices);
-        var gs = new float[numIndices * featureSize];
-        for (int i = 0; i < numIndices; i++)
-        {
-            int srcIdx = BitConverter.SingleToInt32Bits(idx[i]);
-            for (int f = 0; f < featureSize; f++) gs[i * featureSize + f] = gd[srcIdx * featureSize + f];
-        }
-        UploadToBuffer(gs, gradSource);
+        // ScatterAddBackward is equivalent to Gather
+        Gather(gradDestination, indices, gradSource, numIndices, featureSize);
     }
 
     public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
-        EnsureInitialized();
-        var src = DownloadBufferData(source); var idx = DownloadBufferData(indices);
-        var o = new float[numIndices * featureSize];
-        for (int i = 0; i < numIndices; i++)
+        // ScatterGatherExtSource gather_op: binding(0)=source, binding(1)=indices, binding(2)=output(destination)
+        // Uniform: num_indices, inner_size=featureSize, dest_outer(unused), pad
+        var uniforms = new float[]
         {
-            int srcIdx = BitConverter.SingleToInt32Bits(idx[i]);
-            for (int f = 0; f < featureSize; f++) o[i * featureSize + f] = src[srcIdx * featureSize + f];
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(numIndices),
+            BitConverter.Int32BitsToSingle(featureSize),
+            0,
+            0
+        };
+        int totalElements = numIndices * featureSize;
+        Dispatch3BufferAsync("ScatterGatherExt", WebGpuKernels.ScatterGatherExtSource, "gather_op",
+            source, indices, output, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -589,14 +566,32 @@ public sealed partial class WebGpuBackend
 
     public void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        EnsureInitialized();
-        var cond = DownloadBufferData(condition); var a = DownloadBufferData(A); var b = DownloadBufferData(B);
-        var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = cond[i] != 0 ? a[i] : b[i];
-        UploadToBuffer(o, C);
+        // ConditionalSource where_op: A=condition, B=trueVals, C gets falseVals first then selected
+        // First copy B (false values) to C, then the kernel writes: C[i] = select(C[i], B[i], A[i]>0.5)
+        // Wait - the kernel has bindings: A=condition at binding(0), B=trueVals at binding(1), C at binding(2)
+        // So we need to copy the false values (B param) into C first, then dispatch with condition and trueVals (A param)
+        Copy(B, C, size);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            0 // scalar not used for where_op
+        };
+        Dispatch3BufferAsync("Conditional", WebGpuKernels.ConditionalSource, "where_op",
+            condition, A, C, uniforms, size).GetAwaiter().GetResult();
     }
 
-    public void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size) => CpuUnary(A, C, size, v => MathF.Abs(v - scalar) > 1e-6f ? 1f : 0f);
+    public void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size)
+    {
+        // ConditionalSource not_equal_scalar: A at binding(0), C at binding(2)
+        using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            scalar
+        };
+        Dispatch3BufferAsync("Conditional", WebGpuKernels.ConditionalSource, "not_equal_scalar",
+            A, dummyB, C, uniforms, size).GetAwaiter().GetResult();
+    }
 
     #endregion
 
@@ -610,19 +605,12 @@ public sealed partial class WebGpuBackend
 
     public void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A);
-        var m = new float[outerSize]; var v = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float sum = 0;
-            for (int j = 0; j < reduceSize; j++) sum += inp[i * reduceSize + j];
-            m[i] = sum / reduceSize;
-            float var_ = 0;
-            for (int j = 0; j < reduceSize; j++) { float d = inp[i * reduceSize + j] - m[i]; var_ += d * d; }
-            v[i] = var_ / reduceSize;
-        }
-        UploadToBuffer(m, mean); UploadToBuffer(v, variance);
+        // First compute mean using existing GPU kernel
+        MeanAxis(A, mean, outerSize, reduceSize);
+        // Then compute variance using VarAxisSource
+        var uniforms = MakeUniformInts2(outerSize, reduceSize);
+        Dispatch2BufferAsync("VarAxis", WebGpuKernels.VarAxisSource, "var_axis",
+            A, variance, uniforms, outerSize).GetAwaiter().GetResult();
     }
 
     public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
