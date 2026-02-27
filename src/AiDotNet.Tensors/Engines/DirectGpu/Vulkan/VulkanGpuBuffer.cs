@@ -19,6 +19,13 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     public int Size { get; }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Returns the actual byte size of the underlying Vulkan buffer.
+    /// For standard float buffers, this is Size * 4.
+    /// For FP16 buffers created via ConvertToFp16, the element count remains
+    /// the same but each element is 2 bytes instead of 4; callers should
+    /// account for this at a higher level.
+    /// </remarks>
     public long SizeInBytes => (long)Size * sizeof(float);
 
     /// <inheritdoc/>

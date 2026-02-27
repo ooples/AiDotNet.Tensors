@@ -238,9 +238,19 @@ public sealed unsafe partial class VulkanBackend
         return VulkanGpuBuffer.Create(floatData, _transfer);
     }
 
+    /// <summary>
+    /// Allocates a GPU buffer for raw byte data.
+    /// </summary>
+    /// <remarks>
+    /// Vulkan storage buffers are float-typed, so byte data is packed into float elements.
+    /// The buffer's Size property reflects the float element count, not the original byte count.
+    /// Callers must track the original byte count separately for correct data interpretation.
+    /// </remarks>
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
         int floatCount = (size + sizeof(float) - 1) / sizeof(float);
         return VulkanGpuBuffer.Create(floatCount);
     }

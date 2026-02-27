@@ -130,6 +130,27 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// </summary>
     public uint MaxStorageBufferRange => _limits.maxStorageBufferRange;
 
+    /// <summary>
+    /// Gets the total device-local memory in bytes by summing all device-local heaps.
+    /// </summary>
+    public long TotalDeviceLocalMemoryBytes
+    {
+        get
+        {
+            long total = 0;
+            for (int i = 0; i < _memoryProperties.memoryHeapCount; i++)
+            {
+                var heap = _memoryProperties.GetMemoryHeap(i);
+                // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1
+                if ((heap.flags & 0x1) != 0)
+                {
+                    total += (long)heap.size;
+                }
+            }
+            return total;
+        }
+    }
+
     private VulkanDevice()
     {
     }

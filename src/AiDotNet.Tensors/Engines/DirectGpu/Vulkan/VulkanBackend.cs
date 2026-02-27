@@ -79,9 +79,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     public int ComputeUnits => (int)_device.Limits.maxComputeWorkGroupInvocations;
 
     /// <summary>
-    /// Gets the total global memory in bytes.
+    /// Gets the total device-local (global) memory in bytes.
+    /// Sums all device-local memory heaps instead of using MaxStorageBufferRange.
     /// </summary>
-    public long GlobalMemoryBytes => _device.MaxStorageBufferRange;
+    public long GlobalMemoryBytes => _device.TotalDeviceLocalMemoryBytes;
 
     /// <summary>
     /// Gets the local (shared) memory per workgroup in bytes.
