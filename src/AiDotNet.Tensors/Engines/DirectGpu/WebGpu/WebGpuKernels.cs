@@ -4065,6 +4065,470 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Fused GEMM + Bias + Activation kernel with proper separate bias buffer.
+    /// </summary>
+    public const string FusedGemmBiasSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+struct FusedParams {
+    M: u32,
+    N: u32,
+    K: u32,
+    activation: u32,
+}
+@group(0) @binding(4) var<uniform> params: FusedParams;
+
+@compute @workgroup_size(256)
+fn gemm_bias_act(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) { return; }
+    let row = idx / params.N;
+    let col = idx % params.N;
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k = k + 1u) {
+        acc = acc + A[row * params.K + k] * B[k * params.N + col];
+    }
+    var val = acc + bias[col];
+    if (params.activation == 1u) {
+        val = max(0.0, val);
+    } else if (params.activation == 2u) {
+        val = 0.5 * val * (1.0 + tanh(0.7978845608 * (val + 0.044715 * val * val * val)));
+    } else if (params.activation == 3u) {
+        val = 1.0 / (1.0 + exp(-val));
+    } else if (params.activation == 4u) {
+        val = tanh(val);
+    }
+    output[idx] = val;
+}
+";
+
+    /// <summary>
+    /// Tile/repeat operations for batch and axis tiling.
+    /// </summary>
+    public const string TileSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct TileParams {
+    inner_size: u32,
+    repeats: u32,
+    outer_size: u32,
+    axis_size: u32,
+}
+@group(0) @binding(2) var<uniform> params: TileParams;
+
+@compute @workgroup_size(256)
+fn tile_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.repeats * params.inner_size;
+    if (idx >= total) { return; }
+    output[idx] = input[idx % params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn tile_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let expanded_axis = params.axis_size * params.repeats;
+    let total = params.outer_size * expanded_axis * params.inner_size;
+    if (idx >= total) { return; }
+    let inner = idx % params.inner_size;
+    let mid_idx = (idx / params.inner_size) % expanded_axis;
+    let outer = idx / (expanded_axis * params.inner_size);
+    let axis = mid_idx / params.repeats;
+    let src_idx = (outer * params.axis_size + axis) * params.inner_size + inner;
+    output[idx] = input[src_idx];
+}
+";
+
+    /// <summary>
+    /// Power-to-dB and dB-to-power conversion kernels.
+    /// </summary>
+    public const string PowerDbSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> B: array<f32>;
+
+struct DbParams {
+    size: u32,
+    ref_value: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+@group(0) @binding(2) var<uniform> params: DbParams;
+
+@compute @workgroup_size(256)
+fn power_to_db(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    B[idx] = 10.0 * log(max(A[idx], params.ref_value)) / log(10.0);
+}
+
+@compute @workgroup_size(256)
+fn db_to_power(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    B[idx] = pow(10.0, A[idx] / 10.0);
+}
+";
+
+    /// <summary>
+    /// Capsule squash operation (2-buffer: input, output).
+    /// </summary>
+    public const string CapsuleSquashSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct SquashParams {
+    num_capsules: u32,
+    capsule_dim: u32,
+    epsilon: f32,
+    _pad: u32,
+}
+@group(0) @binding(2) var<uniform> params: SquashParams;
+
+@compute @workgroup_size(256)
+fn squash(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.num_capsules) { return; }
+    let off = c * params.capsule_dim;
+    var sq: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
+        sq = sq + input[off + d] * input[off + d];
+    }
+    let scale = sq / ((1.0 + sq) * sqrt(sq + params.epsilon));
+    for (var d: u32 = 0u; d < params.capsule_dim; d = d + 1u) {
+        output[off + d] = input[off + d] * scale;
+    }
+}
+";
+
+    /// <summary>
+    /// Capsule predictions, weighted sum, and agreement (3-buffer: A, B, C).
+    /// </summary>
+    public const string CapsuleOpsSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+
+struct CapsParams {
+    batch_size: u32,
+    input_capsules: u32,
+    output_capsules: u32,
+    input_dim: u32,
+    output_dim: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+@group(0) @binding(3) var<uniform> params: CapsParams;
+
+@compute @workgroup_size(256)
+fn capsule_predictions(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.input_capsules * params.output_capsules * params.output_dim;
+    if (idx >= total) { return; }
+    let od = idx % params.output_dim;
+    let j = (idx / params.output_dim) % params.output_capsules;
+    let i = (idx / (params.output_dim * params.output_capsules)) % params.input_capsules;
+    let b = idx / (params.output_dim * params.output_capsules * params.input_capsules);
+    var sum_val: f32 = 0.0;
+    for (var id: u32 = 0u; id < params.input_dim; id = id + 1u) {
+        sum_val = sum_val + A[(b * params.input_capsules + i) * params.input_dim + id]
+                          * B[((i * params.output_capsules + j) * params.input_dim + id) * params.output_dim + od];
+    }
+    C[idx] = sum_val;
+}
+
+@compute @workgroup_size(256)
+fn capsule_weighted_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.output_capsules * params.output_dim;
+    if (idx >= total) { return; }
+    let d = idx % params.output_dim;
+    let j = (idx / params.output_dim) % params.output_capsules;
+    let b = idx / (params.output_dim * params.output_capsules);
+    var sum_val: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.input_capsules; i = i + 1u) {
+        sum_val = sum_val + A[b * params.input_capsules * params.output_capsules + i * params.output_capsules + j]
+                          * B[((b * params.input_capsules + i) * params.output_capsules + j) * params.output_dim + d];
+    }
+    C[idx] = sum_val;
+}
+
+@compute @workgroup_size(256)
+fn capsule_agreement(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.input_capsules * params.output_capsules;
+    if (idx >= total) { return; }
+    let j = idx % params.output_capsules;
+    let i = (idx / params.output_capsules) % params.input_capsules;
+    let b = idx / (params.output_capsules * params.input_capsules);
+    var dot_val: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.output_dim; d = d + 1u) {
+        dot_val = dot_val + A[((b * params.input_capsules + i) * params.output_capsules + j) * params.output_dim + d]
+                          * B[(b * params.output_capsules + j) * params.output_dim + d];
+    }
+    C[idx] = C[idx] + dot_val;
+}
+";
+
+    /// <summary>
+    /// Copy with offset support.
+    /// </summary>
+    public const string CopyOpsSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct CopyParams {
+    length: u32,
+    src_offset: u32,
+    dst_offset: u32,
+    _pad: u32,
+}
+@group(0) @binding(2) var<uniform> params: CopyParams;
+
+@compute @workgroup_size(256)
+fn copy_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.length) { return; }
+    output[idx] = input[idx];
+}
+
+@compute @workgroup_size(256)
+fn copy_offset(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.length) { return; }
+    output[params.dst_offset + idx] = input[params.src_offset + idx];
+}
+";
+
+    /// <summary>
+    /// 2:4 structured sparsity enforcement and decompression.
+    /// </summary>
+    public const string Sparse2x4Source = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read_write> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+
+struct Sparse2x4Params {
+    M: u32,
+    K: u32,
+    sparse_K: u32,
+    _pad: u32,
+}
+@group(0) @binding(3) var<uniform> params: Sparse2x4Params;
+
+@compute @workgroup_size(256)
+fn enforce_2x4_sparsity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let blocks_per_row = params.K / 4u;
+    let total_blocks = params.M * blocks_per_row;
+    if (idx >= total_blocks) { return; }
+    let row = idx / blocks_per_row;
+    let blk = idx % blocks_per_row;
+    let base_idx = row * params.K + blk * 4u;
+    var vals: array<f32, 4>;
+    var abs_v: array<f32, 4>;
+    var idxs: array<u32, 4> = array<u32, 4>(0u, 1u, 2u, 3u);
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        vals[i] = A[base_idx + i];
+        abs_v[i] = abs(vals[i]);
+    }
+    for (var pass: u32 = 0u; pass < 3u; pass = pass + 1u) {
+        for (var j: u32 = 0u; j < 3u - pass; j = j + 1u) {
+            if (abs_v[j] < abs_v[j + 1u]) {
+                let tv = abs_v[j]; abs_v[j] = abs_v[j + 1u]; abs_v[j + 1u] = tv;
+                let ti = idxs[j]; idxs[j] = idxs[j + 1u]; idxs[j + 1u] = ti;
+            }
+        }
+    }
+    let s_off = row * params.sparse_K + blk * 2u;
+    B[s_off] = vals[idxs[0]];
+    B[s_off + 1u] = vals[idxs[1]];
+    C[s_off] = bitcast<f32>(idxs[0]);
+    C[s_off + 1u] = bitcast<f32>(idxs[1]);
+}
+
+@compute @workgroup_size(256)
+fn decompress_2x4_sparse(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let blocks_per_row = params.K / 4u;
+    let total_blocks = params.M * blocks_per_row;
+    if (idx >= total_blocks) { return; }
+    let row = idx / blocks_per_row;
+    let blk = idx % blocks_per_row;
+    let s_off = row * params.sparse_K + blk * 2u;
+    let base_idx = row * params.K + blk * 4u;
+    C[base_idx] = 0.0; C[base_idx + 1u] = 0.0;
+    C[base_idx + 2u] = 0.0; C[base_idx + 3u] = 0.0;
+    let col0 = bitcast<u32>(B[s_off]);
+    let col1 = bitcast<u32>(B[s_off + 1u]);
+    C[base_idx + col0] = A[s_off];
+    C[base_idx + col1] = A[s_off + 1u];
+}
+";
+
+    /// <summary>
+    /// CSR sparse matrix-matrix multiply (5 buffers).
+    /// </summary>
+    public const string CsrSpMMSource = @"
+@group(0) @binding(0) var<storage, read> csr_values: array<f32>;
+@group(0) @binding(1) var<storage, read> csr_col_indices: array<f32>;
+@group(0) @binding(2) var<storage, read> csr_row_ptrs: array<f32>;
+@group(0) @binding(3) var<storage, read> dense_B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+struct CsrParams {
+    M: u32,
+    K: u32,
+    N: u32,
+    nnz: u32,
+}
+@group(0) @binding(5) var<uniform> params: CsrParams;
+
+@compute @workgroup_size(256)
+fn csr_spmm(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) { return; }
+    let row = idx / params.N;
+    let j = idx % params.N;
+    let start = bitcast<u32>(bitcast<i32>(csr_row_ptrs[row]));
+    let end = bitcast<u32>(bitcast<i32>(csr_row_ptrs[row + 1u]));
+    var sum_val: f32 = 0.0;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let col = bitcast<u32>(bitcast<i32>(csr_col_indices[i]));
+        sum_val = sum_val + csr_values[i] * dense_B[col * params.N + j];
+    }
+    output[idx] = sum_val;
+}
+";
+
+    /// <summary>
+    /// CSR segmented reduction operations (4 buffers: col_indices, row_ptrs, input, output).
+    /// </summary>
+    public const string CsrSegmentedSource = @"
+@group(0) @binding(0) var<storage, read> col_indices: array<f32>;
+@group(0) @binding(1) var<storage, read> row_ptrs: array<f32>;
+@group(0) @binding(2) var<storage, read> input: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+struct SegParams {
+    M: u32,
+    K: u32,
+    N: u32,
+    epsilon: f32,
+}
+@group(0) @binding(4) var<uniform> params: SegParams;
+
+@compute @workgroup_size(256)
+fn csr_segmented_max(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) { return; }
+    let row = idx / params.N;
+    let j = idx % params.N;
+    let start = bitcast<u32>(bitcast<i32>(row_ptrs[row]));
+    let end = bitcast<u32>(bitcast<i32>(row_ptrs[row + 1u]));
+    if (start >= end) { output[idx] = 0.0; return; }
+    var max_val: f32 = -3.402823e+38;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let col = bitcast<u32>(bitcast<i32>(col_indices[i]));
+        max_val = max(max_val, input[col * params.N + j]);
+    }
+    output[idx] = max_val;
+}
+
+@compute @workgroup_size(256)
+fn csr_segmented_min(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) { return; }
+    let row = idx / params.N;
+    let j = idx % params.N;
+    let start = bitcast<u32>(bitcast<i32>(row_ptrs[row]));
+    let end = bitcast<u32>(bitcast<i32>(row_ptrs[row + 1u]));
+    if (start >= end) { output[idx] = 0.0; return; }
+    var min_val: f32 = 3.402823e+38;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let col = bitcast<u32>(bitcast<i32>(col_indices[i]));
+        min_val = min(min_val, input[col * params.N + j]);
+    }
+    output[idx] = min_val;
+}
+
+@compute @workgroup_size(256)
+fn csr_segmented_stddev(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.M * params.N;
+    if (idx >= total) { return; }
+    let row = idx / params.N;
+    let j = idx % params.N;
+    let start = bitcast<u32>(bitcast<i32>(row_ptrs[row]));
+    let end = bitcast<u32>(bitcast<i32>(row_ptrs[row + 1u]));
+    let count = end - start;
+    if (count == 0u) { output[idx] = 0.0; return; }
+    var mean_val: f32 = 0.0;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let col = bitcast<u32>(bitcast<i32>(col_indices[i]));
+        mean_val = mean_val + input[col * params.N + j];
+    }
+    mean_val = mean_val / f32(count);
+    var var_val: f32 = 0.0;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let col = bitcast<u32>(bitcast<i32>(col_indices[i]));
+        let d = input[col * params.N + j] - mean_val;
+        var_val = var_val + d * d;
+    }
+    output[idx] = sqrt(var_val / f32(count) + params.epsilon);
+}
+";
+
+    /// <summary>
+    /// Graph scatter-add edges (5 buffers: input, src_idx, tgt_idx, edge_vals, output).
+    /// </summary>
+    public const string ScatterEdgesSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> src_idx: array<f32>;
+@group(0) @binding(2) var<storage, read> tgt_idx: array<f32>;
+@group(0) @binding(3) var<storage, read> edge_vals: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+struct EdgeParams {
+    num_nodes: u32,
+    num_edges: u32,
+    features: u32,
+    has_edge_values: u32,
+}
+@group(0) @binding(5) var<uniform> params: EdgeParams;
+
+@compute @workgroup_size(256)
+fn scatter_add_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.num_nodes * params.features;
+    if (idx >= total) { return; }
+    let t = idx / params.features;
+    let f = idx % params.features;
+    var acc: f32 = 0.0;
+    for (var e: u32 = 0u; e < params.num_edges; e = e + 1u) {
+        let tgt = bitcast<u32>(bitcast<i32>(tgt_idx[e]));
+        if (tgt == t) {
+            let src = bitcast<u32>(bitcast<i32>(src_idx[e]));
+            var w: f32 = 1.0;
+            if (params.has_edge_values > 0u) {
+                w = edge_vals[e];
+            }
+            acc = acc + input[src * params.features + f] * w;
+        }
+    }
+    output[idx] = output[idx] + acc;
+}
+";
+
+    /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
     public static string GetCombinedSource()
@@ -4088,7 +4552,10 @@ fn permute_op(@builtin(global_invocation_id) gid: vec3<u32>) {
                AttentionSource + SpatialTransformerSource + FFTSource + ComplexOpsSource +
                SpecializedLayerSource + HyperbolicSource + OctonionSource + QuantumSource +
                NeuromorphicSource + TraceUpdateSource + BatchedGemmSource +
-               RnnCellSource + SparseOpsSource + PermuteSource;
+               RnnCellSource + SparseOpsSource + PermuteSource +
+               FusedGemmBiasSource + TileSource + PowerDbSource +
+               CapsuleSquashSource + CapsuleOpsSource + CopyOpsSource +
+               Sparse2x4Source + CsrSpMMSource + CsrSegmentedSource + ScatterEdgesSource;
     }
 }
 #endif

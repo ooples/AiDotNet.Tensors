@@ -83,18 +83,26 @@ public sealed partial class WebGpuBackend
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        EnsureInitialized();
-        var data = DownloadBufferData(source);
-        UploadToBuffer(data, destination);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            0, 0, 0
+        };
+        Dispatch2BufferAsync("CopyOps", WebGpuKernels.CopyOpsSource, "copy_simple",
+            source, destination, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        EnsureInitialized();
-        var src = DownloadBufferData(source);
-        var dst = DownloadBufferData(destination);
-        Array.Copy(src, sourceOffset, dst, destinationOffset, length);
-        UploadToBuffer(dst, destination);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(length),
+            BitConverter.Int32BitsToSingle(sourceOffset),
+            BitConverter.Int32BitsToSingle(destinationOffset),
+            0
+        };
+        Dispatch2BufferAsync("CopyOps", WebGpuKernels.CopyOpsSource, "copy_offset",
+            source, destination, uniforms, length).GetAwaiter().GetResult();
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)
@@ -137,57 +145,56 @@ public sealed partial class WebGpuBackend
 
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1f, float beta = 0f)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A); var b = DownloadBufferData(B); var c = DownloadBufferData(C);
-        int aStride = M * K, bStride = K * N, cStride = M * N;
-        for (int batch = 0; batch < batchCount; batch++)
+        // BatchedGemmSource: binding(0)=A, binding(1)=B, binding(2)=C, uniform: batch_size, M, N, K, alpha, beta, pad, pad
+        var uniforms = new float[]
         {
-            int aOff = batch * aStride, bOff = batch * bStride, cOff = batch * cStride;
-            for (int i = 0; i < M; i++)
-                for (int j = 0; j < N; j++)
-                {
-                    float sum = 0;
-                    for (int k = 0; k < K; k++) sum += a[aOff + i * K + k] * b[bOff + k * N + j];
-                    c[cOff + i * N + j] = alpha * sum + beta * c[cOff + i * N + j];
-                }
-        }
-        UploadToBuffer(c, C);
+            BitConverter.Int32BitsToSingle(batchCount),
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(K),
+            alpha,
+            beta,
+            0, 0
+        };
+        int totalElements = batchCount * M * N;
+        Dispatch3BufferAsync("BatchedGemm", WebGpuKernels.BatchedGemmSource, "batched_gemm",
+            A, B, C, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     #endregion
 
     #region Fused GEMM Operations
 
-    private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, Func<float, float>? activation = null)
+    // activation: 0=none, 1=relu, 2=gelu, 3=sigmoid, 4=tanh
+    private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, int activationType = 0)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A); var b = DownloadBufferData(B); var bi = DownloadBufferData(bias);
-        var c = new float[M * N];
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++)
-            {
-                float sum = 0;
-                for (int k = 0; k < K; k++) sum += a[i * K + k] * b[k * N + j];
-                sum += bi[j];
-                c[i * N + j] = activation is not null ? activation(sum) : sum;
-            }
-        return AllocateBuffer(c);
+        var output = AllocateBuffer(M * N);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(activationType)
+        };
+        Dispatch4BufferAsync("FusedGemmBias", WebGpuKernels.FusedGemmBiasSource, "gemm_bias_act",
+            A, B, bias, output, uniforms, M * N).GetAwaiter().GetResult();
+        return output;
     }
 
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => MathF.Max(0, v));
+        => GemmBiasActivation(A, B, bias, M, N, K, 1);
 
     public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => 0.5f * v * (1f + MathF.Tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+        => GemmBiasActivation(A, B, bias, M, N, K, 2);
 
     public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, v => 1f / (1f + MathF.Exp(-v)));
+        => GemmBiasActivation(A, B, bias, M, N, K, 3);
 
     public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K, MathF.Tanh);
+        => GemmBiasActivation(A, B, bias, M, N, K, 4);
 
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
-        => GemmBiasActivation(A, B, bias, M, N, K);
+        => GemmBiasActivation(A, B, bias, M, N, K, 0);
 
     #endregion
 
@@ -252,18 +259,14 @@ public sealed partial class WebGpuBackend
 
     public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var o = new float[numCapsules * capsuleDim];
-        for (int c = 0; c < numCapsules; c++)
+        var uniforms = new float[]
         {
-            int off = c * capsuleDim;
-            float sq = 0;
-            for (int d = 0; d < capsuleDim; d++) sq += inp[off + d] * inp[off + d];
-            float scale = sq / ((1f + sq) * MathF.Sqrt(sq + epsilon));
-            for (int d = 0; d < capsuleDim; d++) o[off + d] = inp[off + d] * scale;
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(numCapsules),
+            BitConverter.Int32BitsToSingle(capsuleDim),
+            epsilon, 0
+        };
+        Dispatch2BufferAsync("CapsuleSquash", WebGpuKernels.CapsuleSquashSource, "squash",
+            input, output, uniforms, numCapsules).GetAwaiter().GetResult();
     }
 
     public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
@@ -274,20 +277,18 @@ public sealed partial class WebGpuBackend
     public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input); var w = DownloadBufferData(weights);
-        var o = new float[batchSize * inputCapsules * outputCapsules * outputDim];
-        for (int b = 0; b < batchSize; b++)
-            for (int i = 0; i < inputCapsules; i++)
-                for (int j = 0; j < outputCapsules; j++)
-                    for (int od = 0; od < outputDim; od++)
-                    {
-                        float sum = 0;
-                        for (int id = 0; id < inputDim; id++)
-                            sum += inp[(b * inputCapsules + i) * inputDim + id] * w[((i * outputCapsules + j) * inputDim + id) * outputDim + od];
-                        o[((b * inputCapsules + i) * outputCapsules + j) * outputDim + od] = sum;
-                    }
-        UploadToBuffer(o, output);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inputCapsules),
+            BitConverter.Int32BitsToSingle(outputCapsules),
+            BitConverter.Int32BitsToSingle(inputDim),
+            BitConverter.Int32BitsToSingle(outputDim),
+            0, 0, 0
+        };
+        int total = batchSize * inputCapsules * outputCapsules * outputDim;
+        Dispatch3BufferAsync("CapsuleOps", WebGpuKernels.CapsuleOpsSource, "capsule_predictions",
+            input, weights, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
@@ -297,60 +298,62 @@ public sealed partial class WebGpuBackend
     public void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        EnsureInitialized();
-        var cc = DownloadBufferData(coupling); var pred = DownloadBufferData(predictions);
-        var o = new float[batchSize * outputCapsules * capsuleDim];
-        for (int b = 0; b < batchSize; b++)
-            for (int j = 0; j < outputCapsules; j++)
-                for (int d = 0; d < capsuleDim; d++)
-                {
-                    float sum = 0;
-                    for (int i = 0; i < inputCapsules; i++)
-                        sum += cc[b * inputCapsules * outputCapsules + i * outputCapsules + j]
-                             * pred[((b * inputCapsules + i) * outputCapsules + j) * capsuleDim + d];
-                    o[(b * outputCapsules + j) * capsuleDim + d] = sum;
-                }
-        UploadToBuffer(o, output);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inputCapsules),
+            BitConverter.Int32BitsToSingle(outputCapsules),
+            0, // inputDim unused
+            BitConverter.Int32BitsToSingle(capsuleDim),
+            0, 0, 0
+        };
+        int total = batchSize * outputCapsules * capsuleDim;
+        Dispatch3BufferAsync("CapsuleOps", WebGpuKernels.CapsuleOpsSource, "capsule_weighted_sum",
+            coupling, predictions, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        EnsureInitialized();
-        var pred = DownloadBufferData(predictions); var cur = DownloadBufferData(output); var lo = DownloadBufferData(agreement);
-        for (int b = 0; b < batchSize; b++)
-            for (int i = 0; i < inputCapsules; i++)
-                for (int j = 0; j < outputCapsules; j++)
-                {
-                    float dot = 0;
-                    for (int d = 0; d < capsuleDim; d++)
-                        dot += pred[((b * inputCapsules + i) * outputCapsules + j) * capsuleDim + d]
-                             * cur[(b * outputCapsules + j) * capsuleDim + d];
-                    lo[b * inputCapsules * outputCapsules + i * outputCapsules + j] += dot;
-                }
-        UploadToBuffer(lo, agreement);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inputCapsules),
+            BitConverter.Int32BitsToSingle(outputCapsules),
+            0, // inputDim unused
+            BitConverter.Int32BitsToSingle(capsuleDim),
+            0, 0, 0
+        };
+        int total = batchSize * inputCapsules * outputCapsules;
+        Dispatch3BufferAsync("CapsuleOps", WebGpuKernels.CapsuleOpsSource, "capsule_agreement",
+            predictions, output, agreement, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var o = new float[repeats * innerSize];
-        for (int t = 0; t < repeats; t++)
-            Array.Copy(inp, 0, o, t * innerSize, innerSize);
-        UploadToBuffer(o, output);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(innerSize),
+            BitConverter.Int32BitsToSingle(repeats),
+            0, 0
+        };
+        int total = repeats * innerSize;
+        Dispatch2BufferAsync("Tile", WebGpuKernels.TileSource, "tile_batch",
+            input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var o = new float[outerSize * axisSize * repeats * innerSize];
-        for (int i = 0; i < outerSize; i++)
-            for (int a = 0; a < axisSize; a++)
-                for (int r = 0; r < repeats; r++)
-                    Array.Copy(inp, (i * axisSize + a) * innerSize, o, ((i * axisSize * repeats + a * repeats + r)) * innerSize, innerSize);
-        UploadToBuffer(o, output);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(innerSize),
+            BitConverter.Int32BitsToSingle(repeats),
+            BitConverter.Int32BitsToSingle(outerSize),
+            BitConverter.Int32BitsToSingle(axisSize)
+        };
+        int total = outerSize * axisSize * repeats * innerSize;
+        Dispatch2BufferAsync("Tile", WebGpuKernels.TileSource, "tile_axis",
+            input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -411,45 +414,33 @@ public sealed partial class WebGpuBackend
 
     public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
     {
-        EnsureInitialized();
-        var dense = DownloadBufferData(denseInput);
         int sparseK = K / 2;
-        var vals = new float[M * sparseK]; var idxs = new float[M * sparseK];
-        for (int row = 0; row < M; row++)
-            for (int blk = 0; blk < K / 4; blk++)
-            {
-                int baseIdx = row * K + blk * 4;
-                var pairs = new (float val, int idx)[4];
-                for (int i = 0; i < 4; i++) pairs[i] = (MathF.Abs(dense[baseIdx + i]), i);
-                Array.Sort(pairs, (a, b) => b.val.CompareTo(a.val));
-                int sOff = row * sparseK + blk * 2;
-                for (int i = 0; i < 2; i++)
-                {
-                    vals[sOff + i] = dense[baseIdx + pairs[i].idx];
-                    idxs[sOff + i] = BitConverter.Int32BitsToSingle(pairs[i].idx);
-                }
-            }
-        UploadToBuffer(vals, sparseValues); UploadToBuffer(idxs, sparseIndices);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(sparseK),
+            0
+        };
+        int totalBlocks = M * (K / 4);
+        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "enforce_2x4_sparsity",
+            denseInput, sparseValues, sparseIndices, uniforms, totalBlocks).GetAwaiter().GetResult();
     }
 
     public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
-        EnsureInitialized();
-        var vals = DownloadBufferData(sparseValues); var idxs = DownloadBufferData(sparseIndices);
         int sparseK = K / 2;
-        var dense = new float[M * K];
-        for (int row = 0; row < M; row++)
-            for (int blk = 0; blk < K / 4; blk++)
-            {
-                int sOff = row * sparseK + blk * 2;
-                int baseIdx = row * K + blk * 4;
-                for (int i = 0; i < 2; i++)
-                {
-                    int col = BitConverter.SingleToInt32Bits(idxs[sOff + i]);
-                    dense[baseIdx + col] = vals[sOff + i];
-                }
-            }
-        UploadToBuffer(dense, denseOutput);
+        Fill(denseOutput, 0f, M * K);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(sparseK),
+            0
+        };
+        int totalBlocks = M * (K / 4);
+        Dispatch3BufferAsync("Sparse2x4", WebGpuKernels.Sparse2x4Source, "decompress_2x4_sparse",
+            sparseValues, sparseIndices, denseOutput, uniforms, totalBlocks).GetAwaiter().GetResult();
     }
 
     public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C,
@@ -472,122 +463,98 @@ public sealed partial class WebGpuBackend
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer denseB, IGpuBuffer output, int M, int K, int N, int nnz)
     {
-        EnsureInitialized();
-        var vals = DownloadBufferData(csrValues); var cols = DownloadBufferData(csrColIndices);
-        var ptrs = DownloadBufferData(csrRowPointers); var b = DownloadBufferData(denseB);
-        var o = new float[M * N];
-        for (int row = 0; row < M; row++)
+        var uniforms = new float[]
         {
-            int start = BitConverter.SingleToInt32Bits(ptrs[row]);
-            int end = BitConverter.SingleToInt32Bits(ptrs[row + 1]);
-            for (int idx = start; idx < end; idx++)
-            {
-                int col = BitConverter.SingleToInt32Bits(cols[idx]);
-                float val = vals[idx];
-                for (int j = 0; j < N; j++) o[row * N + j] += val * b[col * N + j];
-            }
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(N),
+            BitConverter.Int32BitsToSingle(nnz)
+        };
+        int total = M * N;
+        Dispatch5BufferAsync("CsrSpMM", WebGpuKernels.CsrSpMMSource, "csr_spmm",
+            csrValues, csrColIndices, csrRowPointers, denseB, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void CsrSpMMBias(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer denseB, IGpuBuffer bias, IGpuBuffer output, int M, int K, int N, int nnz)
     {
         CsrSpMM(csrValues, csrColIndices, csrRowPointers, denseB, output, M, K, N, nnz);
-        var o = DownloadBufferData(output); var bi = DownloadBufferData(bias);
-        for (int row = 0; row < M; row++)
-            for (int j = 0; j < N; j++) o[row * N + j] += bi[j];
-        UploadToBuffer(o, output);
+        BiasAdd(output, bias, output, M, N);
     }
 
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices,
         IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input); var src = DownloadBufferData(sourceIndices); var tgt = DownloadBufferData(targetIndices);
-        float[]? ev = edgeValues is not null ? DownloadBufferData(edgeValues) : null;
-        var o = new float[numNodes * features];
-        Array.Copy(inp, o, Math.Min(inp.Length, o.Length));
-        for (int e = 0; e < numEdges; e++)
+        // Copy input to output first (base values)
+        Copy(input, output, numNodes * features);
+        // Create dummy edge values buffer if null
+        IGpuBuffer evBuf;
+        WebGpuBuffer? ownedDummy = null;
+        if (edgeValues is not null)
         {
-            int s = BitConverter.SingleToInt32Bits(src[e]);
-            int t = BitConverter.SingleToInt32Bits(tgt[e]);
-            float w = ev is not null ? ev[e] : 1f;
-            for (int f = 0; f < features; f++) o[t * features + f] += inp[s * features + f] * w;
+            evBuf = edgeValues;
         }
-        UploadToBuffer(o, output);
+        else
+        {
+            ownedDummy = (WebGpuBuffer)AllocateBuffer(1);
+            evBuf = ownedDummy;
+        }
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(numNodes),
+            BitConverter.Int32BitsToSingle(numEdges),
+            BitConverter.Int32BitsToSingle(features),
+            BitConverter.Int32BitsToSingle(edgeValues is not null ? 1 : 0)
+        };
+        int total = numNodes * features;
+        Dispatch5BufferAsync("ScatterEdges", WebGpuKernels.ScatterEdgesSource, "scatter_add_edges",
+            input, sourceIndices, targetIndices, evBuf, output, uniforms, total).GetAwaiter().GetResult();
+        ownedDummy?.Dispose();
     }
 
     public void CsrSegmentedMax(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
-        EnsureInitialized();
-        var cols = DownloadBufferData(csrColIndices); var ptrs = DownloadBufferData(csrRowPointers);
-        var inp = DownloadBufferData(input);
-        var o = new float[M * N];
-        Array.Fill(o, float.MinValue);
-        for (int row = 0; row < M; row++)
+        var uniforms = new float[]
         {
-            int start = BitConverter.SingleToInt32Bits(ptrs[row]);
-            int end = BitConverter.SingleToInt32Bits(ptrs[row + 1]);
-            for (int idx = start; idx < end; idx++)
-            {
-                int col = BitConverter.SingleToInt32Bits(cols[idx]);
-                for (int j = 0; j < N; j++) o[row * N + j] = MathF.Max(o[row * N + j], inp[col * N + j]);
-            }
-            if (start == end)
-                for (int j = 0; j < N; j++) o[row * N + j] = 0;
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(N),
+            0
+        };
+        int total = M * N;
+        Dispatch4BufferAsync("CsrSegmented", WebGpuKernels.CsrSegmentedSource, "csr_segmented_max",
+            csrColIndices, csrRowPointers, input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void CsrSegmentedMin(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N)
     {
-        EnsureInitialized();
-        var cols = DownloadBufferData(csrColIndices); var ptrs = DownloadBufferData(csrRowPointers);
-        var inp = DownloadBufferData(input);
-        var o = new float[M * N];
-        Array.Fill(o, float.MaxValue);
-        for (int row = 0; row < M; row++)
+        var uniforms = new float[]
         {
-            int start = BitConverter.SingleToInt32Bits(ptrs[row]);
-            int end = BitConverter.SingleToInt32Bits(ptrs[row + 1]);
-            for (int idx = start; idx < end; idx++)
-            {
-                int col = BitConverter.SingleToInt32Bits(cols[idx]);
-                for (int j = 0; j < N; j++) o[row * N + j] = MathF.Min(o[row * N + j], inp[col * N + j]);
-            }
-            if (start == end)
-                for (int j = 0; j < N; j++) o[row * N + j] = 0;
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(N),
+            0
+        };
+        int total = M * N;
+        Dispatch4BufferAsync("CsrSegmented", WebGpuKernels.CsrSegmentedSource, "csr_segmented_min",
+            csrColIndices, csrRowPointers, input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void CsrSegmentedStdDev(IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
         IGpuBuffer input, IGpuBuffer output, int M, int K, int N, float epsilon = 1e-8f)
     {
-        EnsureInitialized();
-        var cols = DownloadBufferData(csrColIndices); var ptrs = DownloadBufferData(csrRowPointers);
-        var inp = DownloadBufferData(input);
-        var o = new float[M * N];
-        for (int row = 0; row < M; row++)
+        var uniforms = new float[]
         {
-            int start = BitConverter.SingleToInt32Bits(ptrs[row]);
-            int end = BitConverter.SingleToInt32Bits(ptrs[row + 1]);
-            int count = end - start;
-            if (count == 0) continue;
-            for (int j = 0; j < N; j++)
-            {
-                float mean = 0;
-                for (int idx = start; idx < end; idx++) mean += inp[BitConverter.SingleToInt32Bits(cols[idx]) * N + j];
-                mean /= count;
-                float var_ = 0;
-                for (int idx = start; idx < end; idx++) { float d = inp[BitConverter.SingleToInt32Bits(cols[idx]) * N + j] - mean; var_ += d * d; }
-                o[row * N + j] = MathF.Sqrt(var_ / count + epsilon);
-            }
-        }
-        UploadToBuffer(o, output);
+            BitConverter.Int32BitsToSingle(M),
+            BitConverter.Int32BitsToSingle(K),
+            BitConverter.Int32BitsToSingle(N),
+            epsilon
+        };
+        int total = M * N;
+        Dispatch4BufferAsync("CsrSegmented", WebGpuKernels.CsrSegmentedSource, "csr_segmented_stddev",
+            csrColIndices, csrRowPointers, input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -636,26 +603,50 @@ public sealed partial class WebGpuBackend
 
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        int ndim = shape.Length; int total = 1;
+        int ndim = shape.Length;
+        int total = 1;
         for (int i = 0; i < ndim; i++) total *= shape[i];
+        // Compute output shape and strides
         var newShape = new int[ndim];
         for (int i = 0; i < ndim; i++) newShape[i] = shape[permutation[i]];
-        var o = new float[total];
-        var srcStrides = new int[ndim]; var dstStrides = new int[ndim];
-        srcStrides[ndim - 1] = 1; dstStrides[ndim - 1] = 1;
-        for (int i = ndim - 2; i >= 0; i--) { srcStrides[i] = srcStrides[i + 1] * shape[i + 1]; dstStrides[i] = dstStrides[i + 1] * newShape[i + 1]; }
-        var indices = new int[ndim];
-        for (int flat = 0; flat < total; flat++)
+        var outStrides = new int[4]; // max 4 dims
+        var inStrides = new int[4];
+        var perm = new int[4];
+        var shapeArr = new int[4];
+        // Initialize with identity (for unused dims)
+        for (int i = 0; i < 4; i++) { outStrides[i] = 1; inStrides[i] = 1; perm[i] = i; shapeArr[i] = 1; }
+        // Compute strides
+        if (ndim > 0)
         {
-            int rem = flat;
-            for (int d = 0; d < ndim; d++) { indices[d] = rem / srcStrides[d]; rem %= srcStrides[d]; }
-            int dstFlat = 0;
-            for (int d = 0; d < ndim; d++) dstFlat += indices[permutation[d]] * dstStrides[d];
-            o[dstFlat] = inp[flat];
+            var srcStr = new int[ndim]; var dstStr = new int[ndim];
+            srcStr[ndim - 1] = 1; dstStr[ndim - 1] = 1;
+            for (int i = ndim - 2; i >= 0; i--)
+            {
+                srcStr[i] = srcStr[i + 1] * shape[i + 1];
+                dstStr[i] = dstStr[i + 1] * newShape[i + 1];
+            }
+            for (int i = 0; i < ndim && i < 4; i++)
+            {
+                outStrides[i] = dstStr[i];
+                inStrides[i] = srcStr[i];
+                perm[i] = permutation[i];
+                shapeArr[i] = newShape[i];
+            }
         }
-        UploadToBuffer(o, output);
+        // Pack uniform: total, ndim, pad, pad, shape(4), out_strides(4), in_strides(4), perm(4)
+        var uniforms = new float[20];
+        uniforms[0] = BitConverter.Int32BitsToSingle(total);
+        uniforms[1] = BitConverter.Int32BitsToSingle(ndim);
+        uniforms[2] = 0; uniforms[3] = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            uniforms[4 + i] = BitConverter.Int32BitsToSingle(shapeArr[i]);
+            uniforms[8 + i] = BitConverter.Int32BitsToSingle(outStrides[i]);
+            uniforms[12 + i] = BitConverter.Int32BitsToSingle(inStrides[i]);
+            uniforms[16 + i] = BitConverter.Int32BitsToSingle(perm[i]);
+        }
+        Dispatch2BufferAsync("Permute", WebGpuKernels.PermuteSource, "permute_op",
+            input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
