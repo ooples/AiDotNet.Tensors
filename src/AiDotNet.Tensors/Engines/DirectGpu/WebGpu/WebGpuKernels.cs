@@ -6077,6 +6077,439 @@ fn batch_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    /// <summary>
+    /// AvgPool2D with countIncludePad support. When count_include_pad != 0,
+    /// divides by kernelH*kernelW instead of only valid (non-padded) positions.
+    /// Also handles backward pass with the same parameter.
+    /// Uses PoolParams + 4 extra u32 fields (count_include_pad + 3 padding).
+    /// </summary>
+    public const string AvgPoolCountPadSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct AvgPoolParams {
+    batch_size: u32,
+    channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    count_include_pad: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+@group(0) @binding(2) var<uniform> params: AvgPoolParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn avg_pool2d_count_pad(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_x = gid.x;
+    let out_y = gid.y;
+    let c = gid.z % params.channels;
+    let batch = gid.z / params.channels;
+    if (out_x >= params.out_width || out_y >= params.out_height || batch >= params.batch_size) { return; }
+    var sum: f32 = 0.0;
+    var valid_count: f32 = 0.0;
+    for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+        for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+            let in_y = i32(out_y * params.stride_h + ky) - i32(params.pad_h);
+            let in_x = i32(out_x * params.stride_w + kx) - i32(params.pad_w);
+            if (in_y >= 0 && in_y < i32(params.in_height) && in_x >= 0 && in_x < i32(params.in_width)) {
+                let in_idx = batch * params.channels * params.in_height * params.in_width
+                           + c * params.in_height * params.in_width
+                           + u32(in_y) * params.in_width + u32(in_x);
+                sum = sum + input[in_idx];
+                valid_count = valid_count + 1.0;
+            }
+        }
+    }
+    let divisor = select(max(valid_count, 1.0), f32(params.kernel_height * params.kernel_width), params.count_include_pad != 0u);
+    let out_idx = batch * params.channels * params.out_height * params.out_width
+                + c * params.out_height * params.out_width
+                + out_y * params.out_width + out_x;
+    output[out_idx] = sum / divisor;
+}
+";
+
+    /// <summary>
+    /// AvgPool2D backward with countIncludePad support.
+    /// binding(0)=grad_output, binding(1)=dummy_input (unused), binding(2)=grad_input
+    /// </summary>
+    public const string AvgPoolCountPadBackwardSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> dummy_input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
+
+struct AvgPoolParams {
+    batch_size: u32,
+    channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    count_include_pad: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+@group(0) @binding(3) var<uniform> params: AvgPoolParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn avg_pool2d_backward_count_pad(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let in_x = gid.x;
+    let in_y = gid.y;
+    let c = gid.z % params.channels;
+    let batch = gid.z / params.channels;
+    if (in_x >= params.in_width || in_y >= params.in_height || batch >= params.batch_size) { return; }
+    var acc: f32 = 0.0;
+    for (var oh: u32 = 0u; oh < params.out_height; oh = oh + 1u) {
+        for (var ow: u32 = 0u; ow < params.out_width; ow = ow + 1u) {
+            let in_y_start_i = i32(oh * params.stride_h) - i32(params.pad_h);
+            let in_x_start_i = i32(ow * params.stride_w) - i32(params.pad_w);
+            let in_y_end_i = in_y_start_i + i32(params.kernel_height);
+            let in_x_end_i = in_x_start_i + i32(params.kernel_width);
+            if (i32(in_y) >= in_y_start_i && i32(in_y) < in_y_end_i &&
+                i32(in_x) >= in_x_start_i && i32(in_x) < in_x_end_i) {
+                var divisor: f32;
+                if (params.count_include_pad != 0u) {
+                    divisor = f32(params.kernel_height * params.kernel_width);
+                } else {
+                    // Count valid (non-padded) positions in this window
+                    let y_lo = max(in_y_start_i, 0);
+                    let y_hi = min(in_y_end_i, i32(params.in_height));
+                    let x_lo = max(in_x_start_i, 0);
+                    let x_hi = min(in_x_end_i, i32(params.in_width));
+                    divisor = f32((y_hi - y_lo) * (x_hi - x_lo));
+                }
+                let go_idx = batch * params.channels * params.out_height * params.out_width
+                           + c * params.out_height * params.out_width
+                           + oh * params.out_width + ow;
+                acc = acc + grad_output[go_idx] / max(divisor, 1.0);
+            }
+        }
+    }
+    let gi_idx = batch * params.channels * params.in_height * params.in_width
+               + c * params.in_height * params.in_width
+               + in_y * params.in_width + in_x;
+    grad_input[gi_idx] = acc;
+}
+";
+
+    /// <summary>
+    /// MaxPool3D with indices tracking for backward pass.
+    /// binding(0)=input, binding(1)=output, binding(2)=indices_out
+    /// </summary>
+    public const string Pool3DWithIndicesSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> indices_out: array<f32>;
+
+struct Pool3DParams {
+    batch: u32, channels: u32,
+    in_d: u32, in_h: u32, in_w: u32,
+    out_d: u32, out_h: u32, out_w: u32,
+    k_d: u32, k_h: u32, k_w: u32,
+    s_d: u32, s_h: u32, s_w: u32,
+    _pad1: u32, _pad2: u32,
+}
+@group(0) @binding(3) var<uniform> params: Pool3DParams;
+
+@compute @workgroup_size(256)
+fn max_pool3d_with_indices(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let out_spatial = params.out_d * params.out_h * params.out_w;
+    let total = params.batch * params.channels * out_spatial;
+    if (idx >= total) { return; }
+    let ow = idx % params.out_w;
+    let oh = (idx / params.out_w) % params.out_h;
+    let od = (idx / (params.out_w * params.out_h)) % params.out_d;
+    let nc = idx / out_spatial;
+    let in_spatial = params.in_d * params.in_h * params.in_w;
+    var max_val: f32 = -3.402823e+38;
+    var max_pos: u32 = 0u;
+    for (var kd: u32 = 0u; kd < params.k_d; kd = kd + 1u) {
+        let id = od * params.s_d + kd;
+        if (id >= params.in_d) { continue; }
+        for (var kh: u32 = 0u; kh < params.k_h; kh = kh + 1u) {
+            let ih = oh * params.s_h + kh;
+            if (ih >= params.in_h) { continue; }
+            for (var kw: u32 = 0u; kw < params.k_w; kw = kw + 1u) {
+                let iw = ow * params.s_w + kw;
+                if (iw >= params.in_w) { continue; }
+                let flat_pos = id * params.in_h * params.in_w + ih * params.in_w + iw;
+                let val = input[nc * in_spatial + flat_pos];
+                if (val > max_val) {
+                    max_val = val;
+                    max_pos = flat_pos;
+                }
+            }
+        }
+    }
+    output[idx] = select(0.0, max_val, max_val > -3.402823e+38);
+    indices_out[idx] = bitcast<f32>(i32(max_pos));
+}
+";
+
+    /// <summary>
+    /// GridSample with alignCorners and paddingMode support.
+    /// paddingMode: 0=zeros, 1=border (clamp), 2=reflection.
+    /// alignCorners: 0=false maps [-1,1] to [-0.5, size-0.5], 1=true maps [-1,1] to [0, size-1].
+    /// </summary>
+    public const string GridSampleExtSource = @"
+@group(0) @binding(0) var<storage, read> input_a: array<f32>;
+@group(0) @binding(1) var<storage, read> input_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+struct GridSampleParams {
+    batch_size: u32,
+    channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_spatial: u32,
+    padding_mode: u32,
+    align_corners: u32,
+    _pad: u32,
+}
+@group(0) @binding(3) var<uniform> params: GridSampleParams;
+
+fn grid_to_pixel(coord: f32, size: u32, align_corners: u32) -> f32 {
+    if (align_corners != 0u) {
+        return (coord + 1.0) * 0.5 * f32(size - 1u);
+    } else {
+        return ((coord + 1.0) * f32(size) - 1.0) * 0.5;
+    }
+}
+
+fn reflect_coord(x: f32, lo: f32, hi: f32) -> f32 {
+    // Reflect x into [lo, hi]
+    let span = hi - lo;
+    if (span <= 0.0) { return lo; }
+    var v = x - lo;
+    // Normalize to positive
+    if (v < 0.0) { v = -v; }
+    // Fold into range
+    let periods = floor(v / span);
+    v = v - periods * span;
+    // If odd period, reflect
+    if (u32(periods) % 2u == 1u) {
+        v = span - v;
+    }
+    return v + lo;
+}
+
+fn apply_padding(px: f32, size: u32, padding_mode: u32, align_corners: u32) -> f32 {
+    if (padding_mode == 1u) {
+        // Border: clamp to valid range
+        if (align_corners != 0u) {
+            return clamp(px, 0.0, f32(size - 1u));
+        } else {
+            return clamp(px, 0.0, f32(size - 1u));
+        }
+    } else if (padding_mode == 2u) {
+        // Reflection
+        if (align_corners != 0u) {
+            return reflect_coord(px, 0.0, f32(size - 1u));
+        } else {
+            return reflect_coord(px, -0.5, f32(size) - 0.5);
+        }
+    }
+    // padding_mode == 0: zeros (no coord modification, bounds check at sample time)
+    return px;
+}
+
+fn sample_with_padding(base_idx: u32, y: i32, x: i32, h: u32, w: u32, padding_mode: u32) -> f32 {
+    if (y >= 0 && y < i32(h) && x >= 0 && x < i32(w)) {
+        return input_a[base_idx + u32(y) * w + u32(x)];
+    }
+    if (padding_mode == 0u) {
+        return 0.0;  // Zero padding
+    }
+    // For border/reflection, coords should already be clamped/reflected
+    let cy = clamp(y, 0, i32(h) - 1);
+    let cx = clamp(x, 0, i32(w) - 1);
+    return input_a[base_idx + u32(cy) * w + u32(cx)];
+}
+
+@compute @workgroup_size(256)
+fn grid_sample_ext(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.channels * params.out_spatial;
+    if (idx >= total) { return; }
+    let spatial = idx % params.out_spatial;
+    let c = (idx / params.out_spatial) % params.channels;
+    let n = idx / (params.out_spatial * params.channels);
+    let g_idx = (n * params.out_spatial + spatial) * 2u;
+    let gx = input_b[g_idx];
+    let gy = input_b[g_idx + 1u];
+    var px = grid_to_pixel(gx, params.in_width, params.align_corners);
+    var py = grid_to_pixel(gy, params.in_height, params.align_corners);
+    px = apply_padding(px, params.in_width, params.padding_mode, params.align_corners);
+    py = apply_padding(py, params.in_height, params.padding_mode, params.align_corners);
+    let x0 = i32(floor(px));
+    let y0 = i32(floor(py));
+    let fx = px - f32(x0);
+    let fy = py - f32(y0);
+    let in_base = (n * params.channels + c) * params.in_height * params.in_width;
+    let v00 = sample_with_padding(in_base, y0, x0, params.in_height, params.in_width, params.padding_mode);
+    let v01 = sample_with_padding(in_base, y0, x0 + 1, params.in_height, params.in_width, params.padding_mode);
+    let v10 = sample_with_padding(in_base, y0 + 1, x0, params.in_height, params.in_width, params.padding_mode);
+    let v11 = sample_with_padding(in_base, y0 + 1, x0 + 1, params.in_height, params.in_width, params.padding_mode);
+    output[idx] = (1.0 - fy) * ((1.0 - fx) * v00 + fx * v01) + fy * ((1.0 - fx) * v10 + fx * v11);
+}
+";
+
+    /// <summary>
+    /// LayerNorm backward that computes gradGamma and gradBeta in addition to gradInput.
+    /// binding(0)=grad_output, binding(1)=input, binding(2)=gamma, binding(3)=grad_input,
+    /// binding(4)=grad_gamma, binding(5)=grad_beta
+    /// </summary>
+    public const string LayerNormBackwardFullSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> input_data: array<f32>;
+@group(0) @binding(2) var<storage, read> gamma: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_gamma: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_beta: array<f32>;
+
+struct LNParams {
+    batch_size: u32,
+    feature_size: u32,
+    epsilon: f32,
+    _pad: f32,
+}
+@group(0) @binding(6) var<uniform> params: LNParams;
+
+// Pass 1: Compute gradGamma and gradBeta by summing over the batch dimension.
+// Each thread handles one feature index.
+@compute @workgroup_size(256)
+fn layer_norm_backward_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let f = gid.x;
+    if (f >= params.feature_size) { return; }
+    var sum_grad_beta: f32 = 0.0;
+    var sum_grad_gamma: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        let base = n * params.feature_size;
+        // Compute mean and variance for this batch element
+        var mean: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+            mean = mean + input_data[base + i];
+        }
+        mean = mean / f32(params.feature_size);
+        var variance: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+            let d = input_data[base + i] - mean;
+            variance = variance + d * d;
+        }
+        variance = variance / f32(params.feature_size);
+        let inv_std = 1.0 / sqrt(variance + params.epsilon);
+        let x_hat = (input_data[base + f] - mean) * inv_std;
+        sum_grad_beta = sum_grad_beta + grad_output[base + f];
+        sum_grad_gamma = sum_grad_gamma + grad_output[base + f] * x_hat;
+    }
+    grad_beta[f] = sum_grad_beta;
+    grad_gamma[f] = sum_grad_gamma;
+}
+
+// Pass 2: Compute gradInput per element using the full chain rule.
+// Each thread handles one element in the (batch, feature) grid.
+@compute @workgroup_size(256)
+fn layer_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.feature_size;
+    if (idx >= total) { return; }
+    let n = idx / params.feature_size;
+    let f = idx % params.feature_size;
+    let base = n * params.feature_size;
+    let N = f32(params.feature_size);
+    // Compute mean and variance
+    var mean: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        mean = mean + input_data[base + i];
+    }
+    mean = mean / N;
+    var variance: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        let d = input_data[base + i] - mean;
+        variance = variance + d * d;
+    }
+    variance = variance / N;
+    let inv_std = 1.0 / sqrt(variance + params.epsilon);
+    // Compute sum of gamma * gradOutput and sum of gamma * gradOutput * x_hat for this sample
+    var sum_dg: f32 = 0.0;
+    var sum_dg_xhat: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        let go = grad_output[base + i];
+        let x_hat_i = (input_data[base + i] - mean) * inv_std;
+        sum_dg = sum_dg + gamma[i] * go;
+        sum_dg_xhat = sum_dg_xhat + gamma[i] * go * x_hat_i;
+    }
+    let x_hat = (input_data[idx] - mean) * inv_std;
+    grad_input[idx] = inv_std * (gamma[f] * grad_output[idx] - (sum_dg + x_hat * sum_dg_xhat) / N);
+}
+";
+
+    /// <summary>
+    /// Adaptive average pool 2D with proper per-position bin boundaries.
+    /// Uses floor/ceil formula: startH = floor(oh * inH / outH), endH = ceil((oh+1) * inH / outH).
+    /// </summary>
+    public const string AdaptiveAvgPool2DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct AdaptivePoolParams {
+    batch_size: u32,
+    channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(2) var<uniform> params: AdaptivePoolParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn adaptive_avg_pool2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_x = gid.x;
+    let out_y = gid.y;
+    let c = gid.z % params.channels;
+    let batch = gid.z / params.channels;
+    if (out_x >= params.out_width || out_y >= params.out_height || batch >= params.batch_size) { return; }
+    // Compute bin boundaries using floor/ceil for proper adaptive pooling
+    let start_h = u32(floor(f32(out_y * params.in_height) / f32(params.out_height)));
+    let end_h = u32(ceil(f32((out_y + 1u) * params.in_height) / f32(params.out_height)));
+    let start_w = u32(floor(f32(out_x * params.in_width) / f32(params.out_width)));
+    let end_w = u32(ceil(f32((out_x + 1u) * params.in_width) / f32(params.out_width)));
+    var sum: f32 = 0.0;
+    var count: f32 = 0.0;
+    for (var ih: u32 = start_h; ih < end_h; ih = ih + 1u) {
+        for (var iw: u32 = start_w; iw < end_w; iw = iw + 1u) {
+            let in_idx = batch * params.channels * params.in_height * params.in_width
+                       + c * params.in_height * params.in_width
+                       + ih * params.in_width + iw;
+            sum = sum + input[in_idx];
+            count = count + 1.0;
+        }
+    }
+    let out_idx = batch * params.channels * params.out_height * params.out_width
+                + c * params.out_height * params.out_width
+                + out_y * params.out_width + out_x;
+    output[out_idx] = sum / max(count, 1.0);
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -6113,7 +6546,10 @@ fn batch_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
                LocallyConnectedConv2DBackwardWeightsSource +
                DeformableConv2DSource +
                ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource +
-               BatchNormBackwardStatsSource + BatchNormBackwardDataSource;
+               BatchNormBackwardStatsSource + BatchNormBackwardDataSource +
+               AvgPoolCountPadSource + AvgPoolCountPadBackwardSource +
+               Pool3DWithIndicesSource + GridSampleExtSource +
+               LayerNormBackwardFullSource + AdaptiveAvgPool2DSource;
     }
 }
 #endif

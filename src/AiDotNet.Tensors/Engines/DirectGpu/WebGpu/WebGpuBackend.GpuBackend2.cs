@@ -100,10 +100,13 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        // ConvTranspose2DSource uses ConvParams (same layout as MakeConvUniforms)
+        // Apply output padding to resolve transposed convolution output size ambiguity.
+        // outH_final = outH + outputPadH, outW_final = outW + outputPadW
+        int finalOutH = outHeight + outputPadH;
+        int finalOutW = outWidth + outputPadW;
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
-        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
+            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
+        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(finalOutW, finalOutH, batch * outChannels);
         Dispatch3Buffer3DAsync("ConvTranspose2D", WebGpuKernels.ConvTranspose2DSource, "conv_transpose2d",
             input, kernel, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
@@ -115,9 +118,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        // ConvTranspose2D backward w.r.t. input: regular Conv2D of gradOutput with kernel
+        // Use adjusted output dimensions including output padding for backward pass
+        int finalOutH = outHeight + outputPadH;
+        int finalOutW = outWidth + outputPadW;
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
         Dispatch3Buffer3DAsync("ConvTranspose2DBackwardInput",
             WebGpuKernels.ConvTranspose2DBackwardInputSource, "conv_transpose2d_backward_input",
@@ -132,9 +137,11 @@ public sealed partial class WebGpuBackend
         int outputPadH, int outputPadW)
     {
         // dL/dW[ic,oc,ky,kx] = sum over batch, input positions of input * gradOutput
+        int finalOutH = outHeight + outputPadH;
+        int finalOutW = outWidth + outputPadW;
         int totalKernelElements = inChannels * outChannels * kernelH * kernelW;
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, finalOutH, finalOutW, kernelH, kernelW, strideH, strideW, padH, padW);
         Dispatch3BufferAsync("ConvTranspose2DBackwardKernel",
             WebGpuKernels.ConvTranspose2DBackwardKernelSource, "conv_transpose2d_backward_kernel",
             input, gradOutput, gradKernel, uniforms, totalKernelElements).GetAwaiter().GetResult();
@@ -352,11 +359,12 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         bool countIncludePad)
     {
-        // GPU kernel counts only valid (non-padded) elements, equivalent to countIncludePad=false
-        var uniforms = MakePoolUniforms(batch, channels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW);
+        // Use AvgPoolCountPadSource which respects countIncludePad:
+        // When true, divides by kernelH*kernelW; when false, divides by valid (non-padded) count.
+        var uniforms = MakeAvgPoolUniforms(batch, channels, inHeight, inWidth, outHeight, outWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * channels);
-        Dispatch2Buffer3DAsync("Pooling", WebGpuKernels.PoolingSource, "avg_pool2d",
+        Dispatch2Buffer3DAsync("AvgPoolCountPad", WebGpuKernels.AvgPoolCountPadSource, "avg_pool2d_count_pad",
             input, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
 
@@ -367,13 +375,14 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         bool countIncludePad)
     {
-        // PoolBackwardSource declares 3 bindings; avg_pool2d_backward only reads binding(0) and writes binding(2)
-        // Pass a dummy buffer for unused binding(1) (input)
+        // Use AvgPoolCountPadBackwardSource which respects countIncludePad.
+        // Binding(1) is a dummy (unused by the kernel but required by the 3-buffer dispatch layout).
         using var dummyInput = (WebGpuBuffer)AllocateBuffer(1);
-        var uniforms = MakePoolUniforms(batch, channels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW);
+        var uniforms = MakeAvgPoolUniforms(batch, channels, inHeight, inWidth, outHeight, outWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, countIncludePad);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * channels);
-        Dispatch3Buffer3DAsync("PoolBackward", WebGpuKernels.PoolBackwardSource, "avg_pool2d_backward",
+        Dispatch3Buffer3DAsync("AvgPoolCountPadBackward", WebGpuKernels.AvgPoolCountPadBackwardSource,
+            "avg_pool2d_backward_count_pad",
             gradOutput, dummyInput, gradInput, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
 
@@ -461,17 +470,22 @@ public sealed partial class WebGpuBackend
     public void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
-        // Adaptive pooling uses floor-division to compute kernel/stride:
-        // strideH = inHeight / outHeight, kernelH = inHeight - (outHeight - 1) * strideH
-        // This gives exact coverage when inHeight is divisible by outHeight
-        int strideH = inHeight / outHeight;
-        int strideW = inWidth / outWidth;
-        int kernelH = inHeight - (outHeight - 1) * strideH;
-        int kernelW = inWidth - (outWidth - 1) * strideW;
-        var uniforms = MakePoolUniforms(batch, channels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, 0, 0);
+        // Use dedicated adaptive pool kernel with per-position bin boundaries:
+        // startH = floor(oh * inH / outH), endH = ceil((oh+1) * inH / outH)
+        // This handles non-divisible sizes correctly (matching PyTorch behavior).
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            0, 0 // padding to 8 floats (32 bytes)
+        };
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * channels);
-        Dispatch2Buffer3DAsync("Pooling", WebGpuKernels.PoolingSource, "avg_pool2d",
+        Dispatch2Buffer3DAsync("AdaptiveAvgPool2D", WebGpuKernels.AdaptiveAvgPool2DSource,
+            "adaptive_avg_pool2d",
             input, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
 
@@ -490,8 +504,19 @@ public sealed partial class WebGpuBackend
                        strideD, strideH, strideW, 0, 0 };
         for (int i = 0; i < 16; i++) uniforms[i] = BitConverter.Int32BitsToSingle(vals[i]);
         int total = batch * channels * outDepth * outHeight * outWidth;
-        Dispatch2BufferAsync("Pool3D", WebGpuKernels.Pool3DSource, "max_pool3d",
-            input, output, uniforms, total).GetAwaiter().GetResult();
+        if (indices is not null)
+        {
+            // Pool3DWithIndicesSource: binding(0)=input, binding(1)=output, binding(2)=indices_out
+            // Tracks the flat spatial index of the max element per output position
+            Dispatch3BufferAsync("Pool3DWithIndices", WebGpuKernels.Pool3DWithIndicesSource,
+                "max_pool3d_with_indices",
+                input, output, indices, uniforms, total).GetAwaiter().GetResult();
+        }
+        else
+        {
+            Dispatch2BufferAsync("Pool3D", WebGpuKernels.Pool3DSource, "max_pool3d",
+                input, output, uniforms, total).GetAwaiter().GetResult();
+        }
     }
 
     public void MaxPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -573,8 +598,9 @@ public sealed partial class WebGpuBackend
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        // SpatialTransformerSource grid_sample: binding(0)=input(image), binding(1)=grid, binding(2)=output
-        // Uniform: batch_size, param1=channels, param2=inHeight, param3=inWidth, param4=outHeight*outWidth
+        // GridSampleExtSource: fully supports alignCorners and paddingMode.
+        // paddingMode: 0=zeros, 1=border (clamp), 2=reflection.
+        // alignCorners: true maps [-1,1] to [0, size-1]; false maps [-1,1] to [-0.5, size-0.5].
         int outSpatial = outHeight * outWidth;
         var uniforms = new float[]
         {
@@ -583,10 +609,12 @@ public sealed partial class WebGpuBackend
             BitConverter.Int32BitsToSingle(inHeight),
             BitConverter.Int32BitsToSingle(inWidth),
             BitConverter.Int32BitsToSingle(outSpatial),
-            0, 0, 0
+            BitConverter.Int32BitsToSingle(paddingMode),
+            BitConverter.Int32BitsToSingle(alignCorners ? 1 : 0),
+            0 // padding
         };
         int total = batch * channels * outSpatial;
-        Dispatch3BufferAsync("SpatialTransformer", WebGpuKernels.SpatialTransformerSource, "grid_sample",
+        Dispatch3BufferAsync("GridSampleExt", WebGpuKernels.GridSampleExtSource, "grid_sample_ext",
             input, grid, output, uniforms, total).GetAwaiter().GetResult();
     }
 
@@ -732,8 +760,11 @@ public sealed partial class WebGpuBackend
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
-        // NormBackwardSource layer_norm_backward: binding(0)=grad_output, binding(1)=saved_data(input), binding(2)=grad_input
-        // Uniform: outer_size=batchSize, feature_size=normalizedSize, epsilon, pad
+        // LayerNormBackwardFullSource: two-pass approach.
+        // Pass 1: Compute gradGamma and gradBeta by summing over batch dimension.
+        //   gradBeta[f] = sum_n(gradOutput[n,f])
+        //   gradGamma[f] = sum_n(gradOutput[n,f] * x_hat[n,f])
+        // Pass 2: Compute gradInput per element using the full chain rule with gamma.
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
@@ -741,12 +772,17 @@ public sealed partial class WebGpuBackend
             epsilon,
             0
         };
+        // Pass 1: gradGamma/gradBeta stats (dispatches per feature)
+        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource,
+            "layer_norm_backward_stats",
+            gradOutput, input, gamma, gradInput, gradGamma, gradBeta,
+            uniforms, normalizedSize).GetAwaiter().GetResult();
+        // Pass 2: gradInput (dispatches per element)
         int totalElements = batchSize * normalizedSize;
-        Dispatch3BufferAsync("NormBackward", WebGpuKernels.NormBackwardSource, "layer_norm_backward",
-            gradOutput, input, gradInput, uniforms, totalElements).GetAwaiter().GetResult();
-        // gradGamma and gradBeta are not computed by this simplified kernel; zero them
-        Fill(gradGamma, 0f, normalizedSize);
-        Fill(gradBeta, 0f, normalizedSize);
+        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource,
+            "layer_norm_backward_data",
+            gradOutput, input, gamma, gradInput, gradGamma, gradBeta,
+            uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -946,6 +982,33 @@ public sealed partial class WebGpuBackend
             BitConverter.Int32BitsToSingle(strideH),
             BitConverter.Int32BitsToSingle(strideW),
             0 // padding
+        };
+    }
+
+    /// <summary>
+    /// Packs AvgPoolParams uniform (12 pool fields + count_include_pad + 3 padding = 16 u32 = 64 bytes).
+    /// </summary>
+    private static float[] MakeAvgPoolUniforms(int batch, int channels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        bool countIncludePad)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW),
+            BitConverter.Int32BitsToSingle(countIncludePad ? 1 : 0),
+            0, 0, 0 // padding to 16 floats (64 bytes)
         };
     }
     #endregion
