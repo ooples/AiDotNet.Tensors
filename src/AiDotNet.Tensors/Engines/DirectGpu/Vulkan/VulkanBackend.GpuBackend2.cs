@@ -803,8 +803,64 @@ public sealed unsafe partial class VulkanBackend
         int paddingMode, bool alignCorners)
     {
         EnsureInitialized();
-        Fill(gradInput, 0f, gradInput.Size);
-        Fill(gradGrid, 0f, gradGrid.Size);
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var gr = DownloadBuffer(grid);
+        var gi = new float[batch * channels * inHeight * inWidth];
+        var gg = new float[batch * outHeight * outWidth * 2];
+
+        for (int b = 0; b < batch; b++)
+            for (int oh = 0; oh < outHeight; oh++)
+                for (int ow = 0; ow < outWidth; ow++)
+                {
+                    int gOff = (b * outHeight * outWidth + oh * outWidth + ow) * 2;
+                    float gx = gr[gOff], gy = gr[gOff + 1];
+
+                    // Unnormalize grid coordinates to input pixel space
+                    float ix = alignCorners ? (gx + 1f) * 0.5f * (inWidth - 1) : (gx + 1f) * 0.5f * inWidth - 0.5f;
+                    float iy = alignCorners ? (gy + 1f) * 0.5f * (inHeight - 1) : (gy + 1f) * 0.5f * inHeight - 0.5f;
+
+                    // Derivatives of unnormalization: d(ix)/d(gx) and d(iy)/d(gy)
+                    float dixDgx = alignCorners ? 0.5f * (inWidth - 1) : 0.5f * inWidth;
+                    float diyDgy = alignCorners ? 0.5f * (inHeight - 1) : 0.5f * inHeight;
+
+                    int ix0 = (int)MathF.Floor(ix), iy0 = (int)MathF.Floor(iy);
+                    float dx = ix - ix0, dy = iy - iy0;
+
+                    for (int c = 0; c < channels; c++)
+                    {
+                        float gradVal = go[((b * channels + c) * outHeight + oh) * outWidth + ow];
+                        float gradGx = 0f, gradGy = 0f;
+
+                        for (int jy = 0; jy <= 1; jy++)
+                            for (int jx = 0; jx <= 1; jx++)
+                            {
+                                int py = iy0 + jy, px = ix0 + jx;
+                                float wy = jy == 0 ? 1f - dy : dy;
+                                float wx = jx == 0 ? 1f - dx : dx;
+
+                                if (py >= 0 && py < inHeight && px >= 0 && px < inWidth)
+                                {
+                                    // gradInput: scatter gradient weighted by bilinear weight
+                                    gi[((b * channels + c) * inHeight + py) * inWidth + px] += gradVal * wy * wx;
+
+                                    // gradGrid: derivative of bilinear weight w.r.t. grid coordinates
+                                    float pixel = inp[((b * channels + c) * inHeight + py) * inWidth + px];
+                                    float dwyDiy = jy == 0 ? -1f : 1f;
+                                    float dwxDix = jx == 0 ? -1f : 1f;
+                                    gradGy += gradVal * pixel * dwyDiy * wx;
+                                    gradGx += gradVal * pixel * wy * dwxDix;
+                                }
+                            }
+
+                        // Chain rule: d/d(grid) = d/d(unnormalized) * d(unnormalized)/d(grid)
+                        gg[gOff] += gradGx * dixDgx;
+                        gg[gOff + 1] += gradGy * diyDgy;
+                    }
+                }
+
+        UploadToBuffer(gi, gradInput);
+        UploadToBuffer(gg, gradGrid);
     }
 
     #endregion
