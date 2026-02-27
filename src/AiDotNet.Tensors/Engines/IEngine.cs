@@ -6613,6 +6613,7 @@ public interface IEngine
     /// <summary>
     /// Applies element-wise SiLU (Sigmoid Linear Unit) activation: x * sigmoid(x).
     /// Also known as Swish. Default activation in modern diffusion models.
+    /// Alias for <see cref="Swish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6634,7 +6635,7 @@ public interface IEngine
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
-    /// <param name="alpha">Negative slope coefficient. Default is 0.01.</param>
+    /// <param name="alpha">Negative slope coefficient (commonly 0.01).</param>
     /// <returns>Tensor with Leaky ReLU applied element-wise.</returns>
     Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha);
 
