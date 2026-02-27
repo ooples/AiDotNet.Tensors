@@ -35,6 +35,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
@@ -52,6 +54,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
@@ -127,6 +131,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
@@ -164,6 +170,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v); var vmArr = DownloadBuffer(vMax);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
@@ -182,6 +190,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var uArr = DownloadBuffer(u);
         float bc1 = 1f - MathF.Pow(beta1, step);
@@ -212,6 +222,8 @@ public sealed unsafe partial class VulkanBackend
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         EnsureInitialized();
+        if (step <= 0)
+            throw new ArgumentOutOfRangeException(nameof(step), step, "Step must be > 0 for bias-corrected optimizers to avoid division by zero.");
         var p = DownloadBuffer(param); var g = DownloadBuffer(gradient);
         var mArr = DownloadBuffer(m); var vArr = DownloadBuffer(v);
         float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
@@ -244,10 +256,113 @@ public sealed unsafe partial class VulkanBackend
     }
 
     public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
-        => Copy(input, output, size);
+    {
+        EnsureInitialized();
+        var inputData = DownloadBuffer(input);
+        var outputBytes = new byte[size * 2];
+
+        for (int i = 0; i < size; i++)
+        {
+            ushort fp16 = FloatToHalfCompat(inputData[i]);
+            outputBytes[i * 2] = (byte)(fp16 & 0xFF);
+            outputBytes[i * 2 + 1] = (byte)((fp16 >> 8) & 0xFF);
+        }
+
+        var floatData = new float[(size + 1) / 2];
+        Buffer.BlockCopy(outputBytes, 0, floatData, 0, size * 2);
+        UploadToBuffer(floatData, output);
+    }
 
     public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
-        => Copy(input, output, size);
+    {
+        EnsureInitialized();
+        var inputFloatData = DownloadBuffer(input);
+
+        int requiredFloats = (size + 1) / 2;
+        if (inputFloatData.Length < requiredFloats)
+        {
+            throw new ArgumentException(
+                $"Input buffer too small: has {inputFloatData.Length} floats but needs at least {requiredFloats} to hold {size} FP16 values.",
+                nameof(input));
+        }
+
+        int bytesToCopy = size * 2;
+        var inputBytes = new byte[bytesToCopy];
+        Buffer.BlockCopy(inputFloatData, 0, inputBytes, 0, bytesToCopy);
+
+        var outputData = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            ushort fp16 = (ushort)(inputBytes[i * 2] | (inputBytes[i * 2 + 1] << 8));
+            outputData[i] = HalfToFloatCompat(fp16);
+        }
+
+        UploadToBuffer(outputData, output);
+    }
+
+    private static ushort FloatToHalfCompat(float value)
+    {
+        int bits = SingleToInt32BitsCompat(value);
+        int sign = (bits >> 16) & 0x8000;
+        int exp = ((bits >> 23) & 0xFF) - 112;
+        int mantissa = bits & 0x7FFFFF;
+
+        if (exp <= 0)
+        {
+            if (exp < -10)
+            {
+                return (ushort)sign;
+            }
+            mantissa |= 0x800000;
+            int shift = 14 - exp;
+            mantissa >>= shift;
+            return (ushort)(sign | mantissa);
+        }
+        else if (exp >= 31)
+        {
+            if ((bits & 0x7FFFFFFF) > 0x7F800000)
+            {
+                return 0x7FFF; // NaN
+            }
+            return (ushort)(sign | 0x7C00); // Infinity
+        }
+
+        return (ushort)(sign | (exp << 10) | (mantissa >> 13));
+    }
+
+    private static float HalfToFloatCompat(ushort value)
+    {
+        int sign = (value & 0x8000) << 16;
+        int exp = (value >> 10) & 0x1F;
+        int mantissa = value & 0x3FF;
+
+        if (exp == 0)
+        {
+            if (mantissa == 0)
+            {
+                return Int32BitsToSingleCompat(sign);
+            }
+            while ((mantissa & 0x400) == 0)
+            {
+                mantissa <<= 1;
+                exp--;
+            }
+            exp++;
+            mantissa &= 0x3FF;
+        }
+        else if (exp == 31)
+        {
+            if (mantissa == 0)
+            {
+                return Int32BitsToSingleCompat(sign | 0x7F800000);
+            }
+            return Int32BitsToSingleCompat(sign | 0x7FC00000);
+        }
+
+        exp += 112;
+        int bits = sign | (exp << 23) | (mantissa << 13);
+        return Int32BitsToSingleCompat(bits);
+    }
 
     #endregion
 
@@ -259,8 +374,10 @@ public sealed unsafe partial class VulkanBackend
         var dense = DownloadBuffer(denseInput);
         int sparseK = K / 2;
         var sv = new float[M * sparseK];
-        var si = new float[M * sparseK];
+        var sparseIndicesData = new byte[M * K / 4];
+
         for (int row = 0; row < M; row++)
+        {
             for (int blk = 0; blk < K / 4; blk++)
             {
                 int baseIdx = row * K + blk * 4;
@@ -268,36 +385,46 @@ public sealed unsafe partial class VulkanBackend
                 for (int j = 0; j < 4; j++) vals[j] = (MathF.Abs(dense[baseIdx + j]), j);
                 Array.Sort(vals, (a, b) => b.v.CompareTo(a.v));
                 int sOff = row * sparseK + blk * 2;
-                for (int j = 0; j < 2; j++)
-                {
-                    sv[sOff + j] = dense[baseIdx + vals[j].idx];
-                    si[sOff + j] = Int32BitsToSingleCompat(vals[j].idx);
-                }
+                sv[sOff] = dense[baseIdx + vals[0].idx];
+                sv[sOff + 1] = dense[baseIdx + vals[1].idx];
+
+                // Pack indices into byte (2 bits per index), matching IDirectGpuBackend contract
+                byte packedIndices = (byte)((vals[0].idx & 0x3) | ((vals[1].idx & 0x3) << 2));
+                sparseIndicesData[row * K / 4 + blk] = packedIndices;
             }
+        }
+
         UploadToBuffer(sv, sparseValues);
-        UploadToBuffer(si, sparseIndices);
+        var floatIndices = new float[(M * K / 4 + 3) / 4];
+        Buffer.BlockCopy(sparseIndicesData, 0, floatIndices, 0, sparseIndicesData.Length);
+        UploadToBuffer(floatIndices, sparseIndices);
     }
 
     public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
         EnsureInitialized();
         var sv = DownloadBuffer(sparseValues);
-        var si = DownloadBuffer(sparseIndices);
+        var floatIndices = DownloadBuffer(sparseIndices);
+        var sparseIndicesData = new byte[M * K / 4];
+        Buffer.BlockCopy(floatIndices, 0, sparseIndicesData, 0, sparseIndicesData.Length);
+
         var dense = new float[M * K];
         int sparseK = K / 2;
         for (int row = 0; row < M; row++)
+        {
             for (int blk = 0; blk < K / 4; blk++)
             {
-                int sOff = row * sparseK + blk * 2;
+                int sparseValueOffset = row * sparseK + blk * 2;
+                byte packedIndices = sparseIndicesData[row * K / 4 + blk];
+
+                int idx0 = packedIndices & 0x3;
+                int idx1 = (packedIndices >> 2) & 0x3;
+
                 int baseIdx = row * K + blk * 4;
-                for (int j = 0; j < 2; j++)
-                {
-                    int idx = SingleToInt32BitsCompat(si[sOff + j]);
-                    if ((uint)idx >= 4u)
-                        throw new ArgumentOutOfRangeException(nameof(sparseIndices), $"Decoded sparse index {idx} at row {row}, block {blk} is out of range [0, 4).");
-                    dense[baseIdx + idx] = sv[sOff + j];
-                }
+                dense[baseIdx + idx0] = sv[sparseValueOffset];
+                dense[baseIdx + idx1] = sv[sparseValueOffset + 1];
             }
+        }
         UploadToBuffer(dense, denseOutput);
     }
 
@@ -436,10 +563,23 @@ public sealed unsafe partial class VulkanBackend
             for (int j = 0; j < N; j++)
             {
                 float mean = 0;
-                for (int idx = rowStart; idx < rowEnd; idx++) mean += inp[SingleToInt32BitsCompat(cols[idx]) * N + j];
+                for (int idx = rowStart; idx < rowEnd; idx++)
+                {
+                    int col = SingleToInt32BitsCompat(cols[idx]);
+                    if ((uint)col >= (uint)K)
+                        throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
+                    mean += inp[col * N + j];
+                }
                 mean /= count;
                 float var_ = 0;
-                for (int idx = rowStart; idx < rowEnd; idx++) { float d = inp[SingleToInt32BitsCompat(cols[idx]) * N + j] - mean; var_ += d * d; }
+                for (int idx = rowStart; idx < rowEnd; idx++)
+                {
+                    int col = SingleToInt32BitsCompat(cols[idx]);
+                    if ((uint)col >= (uint)K)
+                        throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
+                    float d = inp[col * N + j] - mean;
+                    var_ += d * d;
+                }
                 o[i * N + j] = MathF.Sqrt(var_ / count + epsilon);
             }
         }
@@ -501,6 +641,8 @@ public sealed unsafe partial class VulkanBackend
     public void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
         EnsureInitialized();
+        if (curvature <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare ball model.");
         var inp = DownloadBuffer(input); var o = new float[batchSize * dim];
         float maxNorm = 1f / MathF.Sqrt(curvature) - epsilon;
         for (int b = 0; b < batchSize; b++)
@@ -517,6 +659,8 @@ public sealed unsafe partial class VulkanBackend
     public void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         EnsureInitialized();
+        if (curvature <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Mobius addition.");
         var xd = DownloadBuffer(x); var yd = DownloadBuffer(y); var o = new float[batchSize * dim];
         for (int b = 0; b < batchSize; b++)
         {
@@ -535,6 +679,8 @@ public sealed unsafe partial class VulkanBackend
     public void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         EnsureInitialized();
+        if (curvature <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare exponential map.");
         var bp = DownloadBuffer(basePoint); var tv = DownloadBuffer(tangentVec); var o = new float[batchSize * dim];
         for (int b = 0; b < batchSize; b++)
         {
@@ -560,13 +706,21 @@ public sealed unsafe partial class VulkanBackend
     public void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         EnsureInitialized();
+        if (curvature <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare distance.");
         var xd = DownloadBuffer(x); var yd = DownloadBuffer(y); var o = new float[batchSize];
         for (int b = 0; b < batchSize; b++)
         {
             int off = b * dim;
             float diffSq = 0, xSq = 0, ySq = 0;
             for (int d = 0; d < dim; d++) { float diff = xd[off + d] - yd[off + d]; diffSq += diff * diff; xSq += xd[off + d] * xd[off + d]; ySq += yd[off + d] * yd[off + d]; }
-            float arg = 1f + 2f * curvature * diffSq / ((1f - curvature * xSq) * (1f - curvature * ySq));
+            float denomX = 1f - curvature * xSq;
+            float denomY = 1f - curvature * ySq;
+            // Clamp denominators to avoid division by zero when points are near the ball boundary
+            if (MathF.Abs(denomX) < 1e-10f) denomX = 1e-10f;
+            if (MathF.Abs(denomY) < 1e-10f) denomY = 1e-10f;
+            float arg = 1f + 2f * curvature * diffSq / (denomX * denomY);
+            // Clamp arg >= 1.0 for numerical safety (acosh domain requirement)
             o[b] = (float)(AcoshDoubleCompat(Math.Max(1.0, arg)) / Math.Sqrt(curvature));
         }
         UploadToBuffer(o, output);
