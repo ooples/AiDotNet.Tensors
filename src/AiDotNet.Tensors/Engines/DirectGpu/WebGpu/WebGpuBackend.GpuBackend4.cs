@@ -12,105 +12,64 @@ public sealed partial class WebGpuBackend
 
     public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient, float learningRate, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        for (int i = 0; i < size; i++)
-        {
-            if (weightDecay != 0) p[i] -= learningRate * weightDecay * p[i];
-            p[i] -= learningRate * g[i];
-        }
-        UploadToBuffer(p, param);
+        using var dummyM = (WebGpuBuffer)AllocateBuffer(1);
+        using var dummyV = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, 0, 0, 0, weightDecay, 0);
+        Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "sgd",
+            param, gradient, dummyM, dummyV, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void SgdMomentumUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var v = DownloadBufferData(velocity);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            v[i] = momentum * v[i] + grad;
-            p[i] -= learningRate * v[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        using var dummyV = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
+        Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "sgd_momentum",
+            param, gradient, velocity, dummyV, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var mData = DownloadBufferData(m); var vData = DownloadBufferData(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-            p[i] -= learningRate * (mData[i] / bc1) / (MathF.Sqrt(vData[i] / bc2) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(vData, v);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "adam",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdamWUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var mData = DownloadBufferData(m); var vData = DownloadBufferData(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            p[i] -= learningRate * weightDecay * p[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * g[i];
-            vData[i] = beta2 * vData[i] + (1 - beta2) * g[i] * g[i];
-            p[i] -= learningRate * (mData[i] / bc1) / (MathF.Sqrt(vData[i] / bc2) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(vData, v);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "adamw",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var c = DownloadBufferData(squaredAvg);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            c[i] = rho * c[i] + (1 - rho) * grad * grad;
-            p[i] -= learningRate * grad / (MathF.Sqrt(c[i]) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(c, squaredAvg);
+        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
+        // beta1=rho for rmsprop kernel
+        var uniforms = MakeOptimizerUniforms(size, learningRate, rho, 0, epsilon, weightDecay, 0);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "rmsprop",
+            param, gradient, squaredAvg, dummyState2, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdagradUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumulatedGrad,
         float learningRate, float epsilon, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var a = DownloadBufferData(accumulatedGrad);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            a[i] += grad * grad;
-            p[i] -= learningRate * grad / (MathF.Sqrt(a[i]) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(a, accumulatedGrad);
+        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, 0, 0, epsilon, weightDecay, 0);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "adagrad",
+            param, gradient, accumulatedGrad, dummyState2, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void NagUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var v = DownloadBufferData(velocity);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            float vPrev = v[i];
-            v[i] = momentum * v[i] - learningRate * grad;
-            p[i] += -momentum * vPrev + (1 + momentum) * v[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(v, velocity);
+        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
+        var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "nag",
+            param, gradient, velocity, dummyState2, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
@@ -151,85 +110,47 @@ public sealed partial class WebGpuBackend
     public void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var ag = DownloadBufferData(accumGrad); var au = DownloadBufferData(accumUpdate);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            ag[i] = rho * ag[i] + (1 - rho) * grad * grad;
-            float update = MathF.Sqrt(au[i] + epsilon) / MathF.Sqrt(ag[i] + epsilon) * grad;
-            au[i] = rho * au[i] + (1 - rho) * update * update;
-            p[i] -= update;
-        }
-        UploadToBuffer(p, param); UploadToBuffer(ag, accumGrad); UploadToBuffer(au, accumUpdate);
+        // state1=accumGrad, state2=accumUpdate, beta1=rho
+        var uniforms = MakeOptimizerUniforms(size, 0, rho, 0, epsilon, weightDecay, 0);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "adadelta",
+            param, gradient, accumGrad, accumUpdate, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AmsgradUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v, IGpuBuffer vMax,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var mData = DownloadBufferData(m); var vData = DownloadBufferData(v); var vm = DownloadBufferData(vMax);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-            vm[i] = MathF.Max(vm[i], vData[i]);
-            p[i] -= learningRate * (mData[i] / bc1) / (MathF.Sqrt(vm[i] / bc2) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(vData, v); UploadToBuffer(vm, vMax);
+        // 5-buffer kernel: param, gradient, m, v, v_max each as separate storage buffers
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch5BufferAsync("Amsgrad5BufferOptimizer", WebGpuKernels.Amsgrad5BufferOptimizerSource, "amsgrad5",
+            param, gradient, m, v, vMax, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdamaxUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer u,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var mData = DownloadBufferData(m); var uData = DownloadBufferData(u);
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            uData[i] = MathF.Max(beta2 * uData[i], MathF.Abs(grad));
-            p[i] -= learningRate / bc1 * mData[i] / (uData[i] + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(uData, u);
+        // state1=m, state2=u
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "adamax",
+            param, gradient, m, u, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void LionUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m,
         float learningRate, float beta1, float beta2, float weightDecay, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient); var mData = DownloadBufferData(m);
-        for (int i = 0; i < size; i++)
-        {
-            float update = MathF.Sign(beta1 * mData[i] + (1 - beta1) * g[i]);
-            p[i] -= learningRate * (update + weightDecay * p[i]);
-            mData[i] = beta2 * mData[i] + (1 - beta2) * g[i];
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m);
+        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
+        // Lion kernel uses state1=m, does not use state2
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, 0, weightDecay, 0);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "lion",
+            param, gradient, m, dummyState2, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void NadamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(param); var g = DownloadBufferData(gradient);
-        var mData = DownloadBufferData(m); var vData = DownloadBufferData(v);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        for (int i = 0; i < size; i++)
-        {
-            float grad = g[i] + weightDecay * p[i];
-            mData[i] = beta1 * mData[i] + (1 - beta1) * grad;
-            vData[i] = beta2 * vData[i] + (1 - beta2) * grad * grad;
-            float mHat = mData[i] / bc1, vHat = vData[i] / bc2;
-            p[i] -= learningRate * (beta1 * mHat + (1 - beta1) * grad / bc1) / (MathF.Sqrt(vHat) + epsilon);
-        }
-        UploadToBuffer(p, param); UploadToBuffer(mData, m); UploadToBuffer(vData, v);
+        // state1=m, state2=v
+        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
+        Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "nadam",
+            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void FtrlUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer z, IGpuBuffer n,
