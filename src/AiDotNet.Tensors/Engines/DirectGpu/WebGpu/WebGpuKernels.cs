@@ -5097,8 +5097,10 @@ fn topk_select(@builtin(global_invocation_id) gid: vec3<u32>) {
     public const string ComplexMatVecSource = @"
 @group(0) @binding(0) var<storage, read> mat_real: array<f32>;
 @group(0) @binding(1) var<storage, read> mat_imag: array<f32>;
-@group(0) @binding(2) var<storage, read> vec_data: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out_data: array<f32>;
+@group(0) @binding(2) var<storage, read> vec_real: array<f32>;
+@group(0) @binding(3) var<storage, read> vec_imag: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out_real: array<f32>;
+@group(0) @binding(5) var<storage, read_write> out_imag: array<f32>;
 
 struct CMVParams {
     batch_size: u32,
@@ -5106,7 +5108,7 @@ struct CMVParams {
     _pad1: u32,
     _pad2: u32,
 }
-@group(0) @binding(4) var<uniform> params: CMVParams;
+@group(0) @binding(6) var<uniform> params: CMVParams;
 
 @compute @workgroup_size(256)
 fn complex_mat_vec(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -5119,13 +5121,14 @@ fn complex_mat_vec(@builtin(global_invocation_id) gid: vec3<u32>) {
     var im: f32 = 0.0;
     for (var c: u32 = 0u; c < params.dim; c = c + 1u) {
         let m_idx = r * params.dim + c;
-        let vr = vec_data[b * params.dim * 2u + c];
-        let vi = vec_data[b * params.dim * 2u + params.dim + c];
+        let v_idx = b * params.dim + c;
+        let vr = vec_real[v_idx];
+        let vi = vec_imag[v_idx];
         re = re + mat_real[m_idx] * vr - mat_imag[m_idx] * vi;
         im = im + mat_real[m_idx] * vi + mat_imag[m_idx] * vr;
     }
-    out_data[b * params.dim * 2u + r] = re;
-    out_data[b * params.dim * 2u + params.dim + r] = im;
+    out_real[b * params.dim + r] = re;
+    out_imag[b * params.dim + r] = im;
 }
 ";
 
@@ -5509,6 +5512,43 @@ fn one_hot_encode(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// BatchNorm EMA update kernel: updates running mean/var in-place on GPU and computes saveInvVar.
+    /// running_mean = (1-momentum)*running_mean + momentum*batch_mean
+    /// running_var  = (1-momentum)*running_var  + momentum*batch_var
+    /// save_inv_var = 1/sqrt(batch_var + epsilon)
+    /// Also copies batch_mean to save_mean.
+    /// </summary>
+    public const string BatchNormEmaSource = @"
+@group(0) @binding(0) var<storage, read> batch_mean: array<f32>;
+@group(0) @binding(1) var<storage, read> batch_var: array<f32>;
+@group(0) @binding(2) var<storage, read_write> running_mean: array<f32>;
+@group(0) @binding(3) var<storage, read_write> running_var: array<f32>;
+@group(0) @binding(4) var<storage, read_write> save_mean: array<f32>;
+@group(0) @binding(5) var<storage, read_write> save_inv_var: array<f32>;
+
+struct EmaParams {
+    channels: u32,
+    _pad1: u32,
+    momentum: f32,
+    epsilon: f32,
+}
+@group(0) @binding(6) var<uniform> params: EmaParams;
+
+@compute @workgroup_size(256)
+fn batch_norm_ema(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.channels) { return; }
+    let bm = batch_mean[idx];
+    let bv = batch_var[idx];
+    let mom = params.momentum;
+    running_mean[idx] = (1.0 - mom) * running_mean[idx] + mom * bm;
+    running_var[idx]  = (1.0 - mom) * running_var[idx]  + mom * bv;
+    save_mean[idx] = bm;
+    save_inv_var[idx] = 1.0 / sqrt(bv + params.epsilon);
+}
+";
+
+    /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
     public static string GetCombinedSource()
@@ -5542,7 +5582,7 @@ fn one_hot_encode(@builtin(global_invocation_id) gid: vec3<u32>) {
                PoincareExpMapSource + HomeostasisClampSource + ThresholdStepSource +
                PhiloxRngSource + StridedSliceSource + Copy2DStridedSource +
                InterleaveSource + BatchNormStatsSource + LambNormSource +
-               OneHotSource;
+               OneHotSource + BatchNormEmaSource;
     }
 }
 #endif

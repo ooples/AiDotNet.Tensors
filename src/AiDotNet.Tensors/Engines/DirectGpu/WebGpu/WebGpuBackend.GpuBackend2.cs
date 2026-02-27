@@ -582,25 +582,17 @@ public sealed partial class WebGpuBackend
         using var gpuVar = (WebGpuBuffer)AllocateBuffer(channels);
         Dispatch3BufferAsync("BatchNormStats", WebGpuKernels.BatchNormStatsSource, "batch_norm_stats",
             input, gpuMean, gpuVar, statsUniforms, channels).GetAwaiter().GetResult();
-        // Update running stats via GPU: runningMean = (1-momentum)*runningMean + momentum*gpuMean
-        // runningVar = (1-momentum)*runningVar + momentum*gpuVar
-        // Use Scale+Fma approach: Scale(running, running, 1-momentum) then Fma(gpuMean, momentum_buf, running, running)
-        // Simpler: download only the small channel-sized buffers for the running stats update
-        var sm = DownloadBufferData(gpuMean);
-        var sv = DownloadBufferData(gpuVar);
-        var rm = DownloadBufferData(runningMean);
-        var rv = DownloadBufferData(runningVar);
-        var siv = new float[channels];
-        for (int c = 0; c < channels; c++)
+        // Update running stats entirely on GPU: EMA + saveInvVar computation
+        var emaUniforms = new float[]
         {
-            rm[c] = (1 - momentum) * rm[c] + momentum * sm[c];
-            rv[c] = (1 - momentum) * rv[c] + momentum * sv[c];
-            siv[c] = 1f / MathF.Sqrt(sv[c] + epsilon);
-        }
-        UploadToBuffer(sm, saveMean);
-        UploadToBuffer(siv, saveInvVar);
-        UploadToBuffer(rm, runningMean);
-        UploadToBuffer(rv, runningVar);
+            BitConverter.Int32BitsToSingle(channels),
+            0, // pad
+            momentum,
+            epsilon
+        };
+        Dispatch6BufferAsync("BatchNormEma", WebGpuKernels.BatchNormEmaSource, "batch_norm_ema",
+            gpuMean, gpuVar, runningMean, runningVar, saveMean, saveInvVar,
+            emaUniforms, channels).GetAwaiter().GetResult();
     }
 
     public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,

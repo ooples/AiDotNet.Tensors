@@ -777,6 +777,26 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
+    internal async Task Dispatch6BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, IGpuBuffer e, IGpuBuffer f,
+        float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var eBuffer = (WebGpuBuffer)e;
+        var fBuffer = (WebGpuBuffer)f;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer, eBuffer, fBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     internal async Task Dispatch3Buffer2DAsync(string moduleName, string source, string kernelName,
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workgroupsX, int workgroupsY)
     {

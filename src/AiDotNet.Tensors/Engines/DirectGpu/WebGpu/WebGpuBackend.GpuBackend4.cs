@@ -407,31 +407,16 @@ public sealed partial class WebGpuBackend
     public void ComplexMatVec(IGpuBuffer matReal, IGpuBuffer matImag, IGpuBuffer vecReal, IGpuBuffer vecImag,
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
-        // ComplexMatVecSource complex_mat_vec: uses interleaved vec and output buffers
-        // GPU interleave vecReal + vecImag per batch using StridedSlice
-        int vecLen = batchSize * dim;
-        using var vecBuf = (WebGpuBuffer)AllocateBuffer(vecLen * 2);
-        // Copy vecReal blocks: vecBuf[b*dim*2 + 0..dim-1] = vecReal[b*dim..b*dim+dim-1]
-        for (int b = 0; b < batchSize; b++)
-        {
-            Copy(vecReal, b * dim, vecBuf, b * dim * 2, dim);
-            Copy(vecImag, b * dim, vecBuf, b * dim * 2 + dim, dim);
-        }
-        using var outBuf = (WebGpuBuffer)AllocateBuffer(vecLen * 2);
+        // ComplexMatVecSource reads separate real/imag buffers directly — no interleave needed
+        int total = batchSize * dim;
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
             BitConverter.Int32BitsToSingle(dim),
             0, 0
         };
-        Dispatch4BufferAsync("ComplexMatVec", WebGpuKernels.ComplexMatVecSource, "complex_mat_vec",
-            matReal, matImag, vecBuf, outBuf, uniforms, vecLen).GetAwaiter().GetResult();
-        // GPU deinterleave output per batch
-        for (int b = 0; b < batchSize; b++)
-        {
-            Copy(outBuf, b * dim * 2, outReal, b * dim, dim);
-            Copy(outBuf, b * dim * 2 + dim, outImag, b * dim, dim);
-        }
+        Dispatch6BufferAsync("ComplexMatVec", WebGpuKernels.ComplexMatVecSource, "complex_mat_vec",
+            matReal, matImag, vecReal, vecImag, outReal, outImag, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void QuantumRotation(IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag,
