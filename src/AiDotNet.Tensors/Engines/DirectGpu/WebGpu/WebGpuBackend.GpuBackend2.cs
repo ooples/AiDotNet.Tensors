@@ -208,8 +208,35 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Conv2D(input, weights, output, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        // Deformable conv uses offsets to compute sampling positions with bilinear interpolation
+        int hasMask = mask is not null ? 1 : 0;
+        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
+        IGpuBuffer maskBuf = mask is not null ? mask : dummyMask;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inChannels),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW),
+            BitConverter.Int32BitsToSingle(dilationH),
+            BitConverter.Int32BitsToSingle(dilationW),
+            BitConverter.Int32BitsToSingle(deformGroups),
+            BitConverter.Int32BitsToSingle(hasMask),
+            0, 0, 0 // padding to 20 floats (80 bytes)
+        };
+        int total = batch * outChannels * outHeight * outWidth;
+        Dispatch5BufferAsync("DeformableConv2D", WebGpuKernels.DeformableConv2DSource,
+            "deformable_conv2d", input, weights, offsets, maskBuf, output,
+            uniforms, total).GetAwaiter().GetResult();
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,

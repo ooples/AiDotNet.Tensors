@@ -5745,6 +5745,108 @@ fn lc_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+
+    /// <summary>
+    /// Deformable convolution 2D with offset-based sampling and bilinear interpolation.
+    /// offsets layout: [batch, deformGroups, 2, kH, kW, outH, outW] (2 = dy, dx)
+    /// mask layout:    [batch, deformGroups, kH, kW, outH, outW] (optional modulation)
+    /// </summary>
+    public const string DeformableConv2DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> offsets: array<f32>;
+@group(0) @binding(3) var<storage, read> mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+struct DeformConvParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+    deform_groups: u32,
+    has_mask: u32,
+}
+@group(0) @binding(5) var<uniform> params: DeformConvParams;
+
+fn bilinear_sample(n: u32, c: u32, y: f32, x: f32) -> f32 {
+    let h = i32(params.in_height);
+    let w = i32(params.in_width);
+    let y0 = i32(floor(y));
+    let x0 = i32(floor(x));
+    let y1 = y0 + 1;
+    let x1 = x0 + 1;
+    let ly = y - f32(y0);
+    let lx = x - f32(x0);
+    let hy = 1.0 - ly;
+    let hx = 1.0 - lx;
+    var val: f32 = 0.0;
+    let base = n * params.in_channels * params.in_height * params.in_width
+             + c * params.in_height * params.in_width;
+    if (y0 >= 0 && y0 < h && x0 >= 0 && x0 < w) { val = val + hy * hx * input[base + u32(y0) * params.in_width + u32(x0)]; }
+    if (y0 >= 0 && y0 < h && x1 >= 0 && x1 < w) { val = val + hy * lx * input[base + u32(y0) * params.in_width + u32(x1)]; }
+    if (y1 >= 0 && y1 < h && x0 >= 0 && x0 < w) { val = val + ly * hx * input[base + u32(y1) * params.in_width + u32(x0)]; }
+    if (y1 >= 0 && y1 < h && x1 >= 0 && x1 < w) { val = val + ly * lx * input[base + u32(y1) * params.in_width + u32(x1)]; }
+    return val;
+}
+
+@compute @workgroup_size(256)
+fn deformable_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.out_channels * params.out_height * params.out_width;
+    if (idx >= total) { return; }
+
+    let ow = idx % params.out_width;
+    let oh = (idx / params.out_width) % params.out_height;
+    let oc = (idx / (params.out_width * params.out_height)) % params.out_channels;
+    let n = idx / (params.out_width * params.out_height * params.out_channels);
+
+    let channels_per_group = params.in_channels / params.deform_groups;
+    var acc: f32 = 0.0;
+
+    for (var ic: u32 = 0u; ic < params.in_channels; ic = ic + 1u) {
+        let dg = ic / channels_per_group;
+        for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+            for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+                let offset_base = (n * params.deform_groups + dg) * 2u * params.kernel_height * params.kernel_width * params.out_height * params.out_width;
+                let offset_spatial = (ky * params.kernel_width + kx) * params.out_height * params.out_width + oh * params.out_width + ow;
+                let offset_y = offsets[offset_base + offset_spatial];
+                let offset_x = offsets[offset_base + params.kernel_height * params.kernel_width * params.out_height * params.out_width + offset_spatial];
+
+                let base_y = f32(oh * params.stride_h) - f32(params.pad_h) + f32(ky * params.dilation_h);
+                let base_x = f32(ow * params.stride_w) - f32(params.pad_w) + f32(kx * params.dilation_w);
+                let sample_y = base_y + offset_y;
+                let sample_x = base_x + offset_x;
+
+                var val = bilinear_sample(n, ic, sample_y, sample_x);
+
+                if (params.has_mask > 0u) {
+                    let mask_base = (n * params.deform_groups + dg) * params.kernel_height * params.kernel_width * params.out_height * params.out_width;
+                    let mask_val = mask[mask_base + (ky * params.kernel_width + kx) * params.out_height * params.out_width + oh * params.out_width + ow];
+                    val = val * mask_val;
+                }
+
+                let w_idx = oc * params.in_channels * params.kernel_height * params.kernel_width
+                          + ic * params.kernel_height * params.kernel_width
+                          + ky * params.kernel_width + kx;
+                acc = acc + val * weights[w_idx];
+            }
+        }
+    }
+    output[idx] = acc;
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -5778,7 +5880,8 @@ fn lc_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
                InterleaveSource + BatchNormStatsSource + LambNormSource +
                OneHotSource + BatchNormEmaSource +
                LocallyConnectedConv2DSource + LocallyConnectedConv2DBackwardInputSource +
-               LocallyConnectedConv2DBackwardWeightsSource;
+               LocallyConnectedConv2DBackwardWeightsSource +
+               DeformableConv2DSource;
     }
 }
 #endif
