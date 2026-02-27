@@ -28,6 +28,8 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     {
         Storage = storage ?? throw new ArgumentNullException(nameof(storage));
         Staging = staging ?? throw new ArgumentNullException(nameof(staging));
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         Size = size;
     }
 
@@ -36,6 +38,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     /// </summary>
     internal static VulkanGpuBuffer Create(int size)
     {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+
         var storage = VulkanBuffer.CreateStorageBuffer(size);
         var staging = VulkanBuffer.CreateStagingBuffer(size);
         if (storage is null || staging is null)
@@ -51,14 +56,28 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     /// <summary>
     /// Creates a new VulkanGpuBuffer and uploads initial data.
     /// </summary>
+    /// <remarks>
+    /// The upload is performed synchronously via a staging buffer copy.
+    /// For large data sets, consider pre-allocating and uploading in batches.
+    /// If upload fails, the buffer is disposed to prevent resource leaks.
+    /// </remarks>
     internal static VulkanGpuBuffer Create(float[] data, VulkanBufferTransfer transfer)
     {
         if (data is null) throw new ArgumentNullException(nameof(data));
+        if (data.Length == 0) throw new ArgumentException("Data array must not be empty.", nameof(data));
         if (transfer is null) throw new ArgumentNullException(nameof(transfer));
 
         var buffer = Create(data.Length);
-        buffer.Staging.WriteData(data);
-        transfer.CopyToDevice(buffer.Staging, buffer.Storage);
+        try
+        {
+            buffer.Staging.WriteData(data);
+            transfer.CopyToDevice(buffer.Staging, buffer.Storage);
+        }
+        catch
+        {
+            buffer.Dispose();
+            throw;
+        }
         return buffer;
     }
 
