@@ -689,6 +689,13 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
     private static float[] MakeUniformInts2(int a, int b) =>
         new float[] { BitConverter.Int32BitsToSingle(a), BitConverter.Int32BitsToSingle(b), 0, 0 };
 
+    internal static float[] MakeOptimizerUniforms(int size, float lr, float beta1, float beta2,
+        float epsilon, float weightDecay, float t, float extra = 0) =>
+        new float[]
+        {
+            BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay, t, extra
+        };
+
     internal async Task Dispatch1BufferAsync(string moduleName, string source, string kernelName,
         IGpuBuffer a, float[] uniformParams, int workSize)
     {
@@ -783,6 +790,110 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch2Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, float[] uniformParams, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch3Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch4Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, float[] uniformParams,
+        int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    /// <summary>
+    /// Packs ConvParams uniform (13 u32 fields, padded to 16 floats).
+    /// </summary>
+    internal static float[] MakeConvUniforms(int batch, int inChannels, int outChannels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inChannels),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW),
+            0, 0, 0 // padding to 16 floats (64 bytes)
+        };
+    }
+
+    /// <summary>
+    /// Packs PoolParams uniform (12 u32 fields = 48 bytes).
+    /// </summary>
+    internal static float[] MakePoolUniforms(int batch, int channels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW)
+        };
+    }
+
+    /// <summary>
+    /// Calculates workgroup counts for conv/pool 3D dispatch with @workgroup_size(8,8,1).
+    /// </summary>
+    internal static (int wgX, int wgY, int wgZ) CalcWorkgroups8x8(int width, int height, int depthSlices)
+    {
+        return ((width + 7) / 8, (height + 7) / 8, depthSlices);
     }
 
     #endregion
