@@ -421,7 +421,7 @@ public sealed partial class WebGpuBackend
         int M, int N, int K, float alpha = 1f, float beta = 0f)
     {
         EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
+        using var denseA = AllocateBuffer(M * K);
         Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
         Gemm(denseA, B, C, M, N, K, alpha, beta);
     }
@@ -429,9 +429,10 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         EnsureInitialized();
-        var denseA = AllocateBuffer(M * K);
+        using var denseA = AllocateBuffer(M * K);
         Decompress2x4Sparse(sparseAValues, sparseAIndices, denseA, M, K);
-        return GemmBiasRelu(denseA, B, bias, M, N, K);
+        var result = GemmBiasRelu(denseA, B, bias, M, N, K);
+        return result;
     }
 
     public void CsrSpMM(IGpuBuffer csrValues, IGpuBuffer csrColIndices, IGpuBuffer csrRowPointers,
