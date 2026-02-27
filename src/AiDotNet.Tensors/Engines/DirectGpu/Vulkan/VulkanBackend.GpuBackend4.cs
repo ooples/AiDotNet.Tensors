@@ -586,19 +586,72 @@ public sealed unsafe partial class VulkanBackend
     public void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        Fill(gradInput, 0f, gradInput.Size);
+        EnsureInitialized();
+        var gradOutData = DownloadBuffer(gradOutput);
+        var weightsData = DownloadBuffer(weights);
+        var gradInputData = new float[batchSize * inputFeatures];
+
+        // gradInput = gradOutput * weights^T (standard linear backward through Euclidean approximation)
+        for (int b = 0; b < batchSize; b++)
+        {
+            for (int i = 0; i < inputFeatures; i++)
+            {
+                float sum = 0;
+                for (int o = 0; o < outputFeatures; o++)
+                {
+                    sum += gradOutData[b * outputFeatures + o] * weightsData[o * inputFeatures + i];
+                }
+                gradInputData[b * inputFeatures + i] = sum;
+            }
+        }
+
+        UploadToBuffer(gradInputData, gradInput);
     }
 
     public void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        Fill(gradWeights, 0f, gradWeights.Size);
+        EnsureInitialized();
+        var gradOutData = DownloadBuffer(gradOutput);
+        var inputData = DownloadBuffer(input);
+        var gradWeightsData = new float[outputFeatures * inputFeatures];
+
+        // gradWeights = gradOutput^T * input (standard linear backward)
+        for (int o = 0; o < outputFeatures; o++)
+        {
+            for (int i = 0; i < inputFeatures; i++)
+            {
+                float sum = 0;
+                for (int b = 0; b < batchSize; b++)
+                {
+                    sum += gradOutData[b * outputFeatures + o] * inputData[b * inputFeatures + i];
+                }
+                gradWeightsData[o * inputFeatures + i] = sum;
+            }
+        }
+
+        UploadToBuffer(gradWeightsData, gradWeights);
     }
 
     public void HyperbolicLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradBiases,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
-        Fill(gradBiases, 0f, gradBiases.Size);
+        EnsureInitialized();
+        var gradOutData = DownloadBuffer(gradOutput);
+        var gradBiasesData = new float[outputFeatures];
+
+        // gradBiases = sum over batch of gradOutput
+        for (int o = 0; o < outputFeatures; o++)
+        {
+            float sum = 0;
+            for (int b = 0; b < batchSize; b++)
+            {
+                sum += gradOutData[b * outputFeatures + o];
+            }
+            gradBiasesData[o] = sum;
+        }
+
+        UploadToBuffer(gradBiasesData, gradBiases);
     }
 
     #endregion
@@ -641,13 +694,101 @@ public sealed unsafe partial class VulkanBackend
     public void OctonionLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        Fill(gradInput, 0f, gradInput.Size);
+        EnsureInitialized();
+        var gradOutData = DownloadBuffer(gradOutput);
+        var weightsData = DownloadBuffer(weights);
+        var gradInputData = new float[batchSize * inputFeatures * 8];
+
+        // Full octonion backward: d(prod)/d(a) via the octonion multiplication table Jacobian
+        for (int b = 0; b < batchSize; b++)
+        {
+            for (int i = 0; i < inputFeatures; i++)
+            {
+                int inputOffset = (b * inputFeatures + i) * 8;
+                var ga = new float[8];
+
+                for (int o = 0; o < outputFeatures; o++)
+                {
+                    int weightOffset = (o * inputFeatures + i) * 8;
+                    int gradOutOffset = (b * outputFeatures + o) * 8;
+
+                    float w0 = weightsData[weightOffset], w1 = weightsData[weightOffset + 1];
+                    float w2 = weightsData[weightOffset + 2], w3 = weightsData[weightOffset + 3];
+                    float w4 = weightsData[weightOffset + 4], w5 = weightsData[weightOffset + 5];
+                    float w6 = weightsData[weightOffset + 6], w7 = weightsData[weightOffset + 7];
+
+                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
+                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
+                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
+                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
+
+                    // Transpose of the Jacobian d(prod)/d(a), from the octonion multiplication table
+                    ga[0] += g0*w0 + g1*w1 + g2*w2 + g3*w3 + g4*w4 + g5*w5 + g6*w6 + g7*w7;
+                    ga[1] += g0*(-w1) + g1*w0 + g2*(-w3) + g3*w2 + g4*(-w5) + g5*w4 + g6*w7 + g7*(-w6);
+                    ga[2] += g0*(-w2) + g1*w3 + g2*w0 + g3*(-w1) + g4*(-w6) + g5*(-w7) + g6*w4 + g7*w5;
+                    ga[3] += g0*(-w3) + g1*(-w2) + g2*w1 + g3*w0 + g4*(-w7) + g5*w6 + g6*(-w5) + g7*w4;
+                    ga[4] += g0*(-w4) + g1*w5 + g2*w6 + g3*w7 + g4*w0 + g5*(-w1) + g6*(-w2) + g7*(-w3);
+                    ga[5] += g0*(-w5) + g1*(-w4) + g2*w7 + g3*(-w6) + g4*w1 + g5*w0 + g6*w3 + g7*(-w2);
+                    ga[6] += g0*(-w6) + g1*(-w7) + g2*(-w4) + g3*w5 + g4*w2 + g5*(-w3) + g6*w0 + g7*w1;
+                    ga[7] += g0*(-w7) + g1*w6 + g2*(-w5) + g3*(-w4) + g4*w3 + g5*w2 + g6*(-w1) + g7*w0;
+                }
+
+                for (int c = 0; c < 8; c++)
+                    gradInputData[inputOffset + c] = ga[c];
+            }
+        }
+
+        UploadToBuffer(gradInputData, gradInput);
     }
 
     public void OctonionLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        Fill(gradWeights, 0f, gradWeights.Size);
+        EnsureInitialized();
+        var gradOutData = DownloadBuffer(gradOutput);
+        var inputData = DownloadBuffer(input);
+        var gradWeightsData = new float[outputFeatures * inputFeatures * 8];
+
+        // Full octonion backward for weights: d(prod)/d(w) Jacobian from multiplication table
+        for (int o = 0; o < outputFeatures; o++)
+        {
+            for (int i = 0; i < inputFeatures; i++)
+            {
+                int weightOffset = (o * inputFeatures + i) * 8;
+                var gw = new float[8];
+
+                for (int b = 0; b < batchSize; b++)
+                {
+                    int inputOffset = (b * inputFeatures + i) * 8;
+                    int gradOutOffset = (b * outputFeatures + o) * 8;
+
+                    float a0 = inputData[inputOffset], a1 = inputData[inputOffset + 1];
+                    float a2 = inputData[inputOffset + 2], a3 = inputData[inputOffset + 3];
+                    float a4 = inputData[inputOffset + 4], a5 = inputData[inputOffset + 5];
+                    float a6 = inputData[inputOffset + 6], a7 = inputData[inputOffset + 7];
+
+                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
+                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
+                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
+                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
+
+                    // Transpose of Jacobian d(prod)/d(w), from the octonion multiplication table
+                    gw[0] += g0*a0 + g1*a1 + g2*a2 + g3*a3 + g4*a4 + g5*a5 + g6*a6 + g7*a7;
+                    gw[1] += g0*(-a1) + g1*a0 + g2*a3 + g3*(-a2) + g4*a5 + g5*(-a4) + g6*(-a7) + g7*a6;
+                    gw[2] += g0*(-a2) + g1*(-a3) + g2*a0 + g3*a1 + g4*a6 + g5*a7 + g6*(-a4) + g7*(-a5);
+                    gw[3] += g0*(-a3) + g1*a2 + g2*(-a1) + g3*a0 + g4*a7 + g5*(-a6) + g6*a5 + g7*(-a4);
+                    gw[4] += g0*(-a4) + g1*(-a5) + g2*(-a6) + g3*(-a7) + g4*a0 + g5*a1 + g6*a2 + g7*a3;
+                    gw[5] += g0*(-a5) + g1*a4 + g2*(-a7) + g3*a6 + g4*(-a1) + g5*a0 + g6*(-a3) + g7*a2;
+                    gw[6] += g0*(-a6) + g1*a7 + g2*a4 + g3*(-a5) + g4*(-a2) + g5*a3 + g6*a0 + g7*(-a1);
+                    gw[7] += g0*(-a7) + g1*(-a6) + g2*a5 + g3*a4 + g4*(-a3) + g5*(-a2) + g6*a1 + g7*a0;
+                }
+
+                for (int c = 0; c < 8; c++)
+                    gradWeightsData[weightOffset + c] = gw[c];
+            }
+        }
+
+        UploadToBuffer(gradWeightsData, gradWeights);
     }
 
     public void OctonionLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer gradBiases, int batchSize, int outputFeatures)
@@ -762,6 +903,80 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var ir = DownloadBuffer(inputReal); var ii = DownloadBuffer(inputImag);
         var or_ = new float[n]; var oi = new float[n];
+
+        if (n > 0 && (n & (n - 1)) == 0)
+        {
+            // Cooley-Tukey radix-2 FFT for power-of-2 sizes: O(n log n)
+            CooleyTukeyFFT(ir, ii, or_, oi, n, inverse);
+        }
+        else
+        {
+            // Fallback to naive DFT for non-power-of-2 sizes: O(n^2)
+            NaiveDFT(ir, ii, or_, oi, n, inverse);
+        }
+
+        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
+    }
+
+    private static void CooleyTukeyFFT(float[] inR, float[] inI, float[] outR, float[] outI, int n, bool inverse)
+    {
+        // Bit-reversal permutation
+        Array.Copy(inR, outR, n);
+        Array.Copy(inI, outI, n);
+
+        int logN = 0;
+        for (int tmp = n; tmp > 1; tmp >>= 1) logN++;
+
+        for (int i = 0; i < n; i++)
+        {
+            int rev = 0;
+            for (int bit = 0; bit < logN; bit++)
+                if ((i & (1 << bit)) != 0)
+                    rev |= 1 << (logN - 1 - bit);
+            if (rev > i)
+            {
+                (outR[i], outR[rev]) = (outR[rev], outR[i]);
+                (outI[i], outI[rev]) = (outI[rev], outI[i]);
+            }
+        }
+
+        // Butterfly stages
+        float sign = inverse ? 1f : -1f;
+        for (int size = 2; size <= n; size <<= 1)
+        {
+            int halfSize = size / 2;
+            float wAngle = sign * 2f * MathF.PI / size;
+            float wR = MathF.Cos(wAngle);
+            float wI = MathF.Sin(wAngle);
+
+            for (int start = 0; start < n; start += size)
+            {
+                float twR = 1f, twI = 0f;
+                for (int j = 0; j < halfSize; j++)
+                {
+                    int even = start + j;
+                    int odd = start + j + halfSize;
+                    float tR = twR * outR[odd] - twI * outI[odd];
+                    float tI = twR * outI[odd] + twI * outR[odd];
+                    outR[odd] = outR[even] - tR;
+                    outI[odd] = outI[even] - tI;
+                    outR[even] += tR;
+                    outI[even] += tI;
+                    float newTwR = twR * wR - twI * wI;
+                    twI = twR * wI + twI * wR;
+                    twR = newTwR;
+                }
+            }
+        }
+
+        if (inverse)
+        {
+            for (int i = 0; i < n; i++) { outR[i] /= n; outI[i] /= n; }
+        }
+    }
+
+    private static void NaiveDFT(float[] inR, float[] inI, float[] outR, float[] outI, int n, bool inverse)
+    {
         float sign = inverse ? 1f : -1f;
         for (int k = 0; k < n; k++)
         {
@@ -769,13 +984,12 @@ public sealed unsafe partial class VulkanBackend
             for (int j = 0; j < n; j++)
             {
                 float angle = sign * 2f * MathF.PI * k * j / n;
-                sumR += ir[j] * MathF.Cos(angle) - ii[j] * MathF.Sin(angle);
-                sumI += ir[j] * MathF.Sin(angle) + ii[j] * MathF.Cos(angle);
+                sumR += inR[j] * MathF.Cos(angle) - inI[j] * MathF.Sin(angle);
+                sumI += inR[j] * MathF.Sin(angle) + inI[j] * MathF.Cos(angle);
             }
             if (inverse) { sumR /= n; sumI /= n; }
-            or_[k] = sumR; oi[k] = sumI;
+            outR[k] = sumR; outI[k] = sumI;
         }
-        UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
     }
 
     public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
@@ -798,29 +1012,75 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var ir = DownloadBuffer(inputReal); var ii = DownloadBuffer(inputImag);
         var or_ = new float[batch * n]; var oi = new float[batch * n];
-        float sign = inverse ? 1f : -1f;
+        bool isPow2 = n > 0 && (n & (n - 1)) == 0;
+
         for (int b = 0; b < batch; b++)
         {
             int off = b * n;
-            for (int k = 0; k < n; k++)
-            {
-                float sumR = 0, sumI = 0;
-                for (int j = 0; j < n; j++)
-                {
-                    float angle = sign * 2f * MathF.PI * k * j / n;
-                    sumR += ir[off + j] * MathF.Cos(angle) - ii[off + j] * MathF.Sin(angle);
-                    sumI += ir[off + j] * MathF.Sin(angle) + ii[off + j] * MathF.Cos(angle);
-                }
-                if (inverse) { sumR /= n; sumI /= n; }
-                or_[off + k] = sumR; oi[off + k] = sumI;
-            }
+            var rowR = new float[n]; var rowI = new float[n];
+            var resR = new float[n]; var resI = new float[n];
+            Array.Copy(ir, off, rowR, 0, n);
+            Array.Copy(ii, off, rowI, 0, n);
+
+            if (isPow2)
+                CooleyTukeyFFT(rowR, rowI, resR, resI, n, inverse);
+            else
+                NaiveDFT(rowR, rowI, resR, resI, n, inverse);
+
+            Array.Copy(resR, 0, or_, off, n);
+            Array.Copy(resI, 0, oi, off, n);
         }
         UploadToBuffer(or_, outputReal); UploadToBuffer(oi, outputImag);
     }
 
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
+        EnsureInitialized();
+
+        // Step 1: FFT along rows (treating height rows of width elements)
         BatchedFFT(inputReal, inputImag, outputReal, outputImag, height, width, inverse);
+
+        // Step 2: FFT along columns (transpose, FFT rows, transpose back)
+        var rowR = DownloadBuffer(outputReal); var rowI = DownloadBuffer(outputImag);
+
+        // Transpose: height x width -> width x height
+        var trR = new float[width * height]; var trI = new float[width * height];
+        for (int r = 0; r < height; r++)
+            for (int c = 0; c < width; c++)
+            {
+                trR[c * height + r] = rowR[r * width + c];
+                trI[c * height + r] = rowI[r * width + c];
+            }
+
+        // FFT along transposed rows (= original columns)
+        bool isPow2 = height > 0 && (height & (height - 1)) == 0;
+        var colR = new float[width * height]; var colI = new float[width * height];
+        for (int c = 0; c < width; c++)
+        {
+            var inR = new float[height]; var inI = new float[height];
+            var outR = new float[height]; var outI = new float[height];
+            Array.Copy(trR, c * height, inR, 0, height);
+            Array.Copy(trI, c * height, inI, 0, height);
+
+            if (isPow2)
+                CooleyTukeyFFT(inR, inI, outR, outI, height, inverse);
+            else
+                NaiveDFT(inR, inI, outR, outI, height, inverse);
+
+            Array.Copy(outR, 0, colR, c * height, height);
+            Array.Copy(outI, 0, colI, c * height, height);
+        }
+
+        // Transpose back: width x height -> height x width
+        var finalR = new float[height * width]; var finalI = new float[height * width];
+        for (int r = 0; r < height; r++)
+            for (int c = 0; c < width; c++)
+            {
+                finalR[r * width + c] = colR[c * height + r];
+                finalI[r * width + c] = colI[c * height + r];
+            }
+
+        UploadToBuffer(finalR, outputReal); UploadToBuffer(finalI, outputImag);
     }
 
     public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
@@ -1055,20 +1315,42 @@ public sealed unsafe partial class VulkanBackend
             int hNextOff = (t + 1) * batch * hiddenSize;
             for (int b = 0; b < batch; b++)
             {
+                // Step 1: Compute r (reset) and z (update) gates
                 var gates = new float[gateSize];
-                for (int g = 0; g < gateSize; g++)
+                for (int g = 0; g < 2 * hiddenSize; g++)
                 {
                     float sum = bIh[g] + bHh[g];
                     for (int k = 0; k < inputSize; k++) sum += inp[t * batch * inputSize + b * inputSize + k] * wIh[g * inputSize + k];
                     for (int k = 0; k < hiddenSize; k++) sum += aH[hOff + b * hiddenSize + k] * wHh[g * hiddenSize + k];
                     gates[g] = sum;
                 }
-                Array.Copy(gates, 0, cg, t * batch * gateSize + b * gateSize, gateSize);
+
+                // Apply sigmoid to r and z gates
                 for (int i = 0; i < hiddenSize; i++)
                 {
-                    float r = 1f / (1f + MathF.Exp(-gates[i]));
-                    float z = 1f / (1f + MathF.Exp(-gates[hiddenSize + i]));
-                    float n_ = MathF.Tanh(gates[2 * hiddenSize + i]);
+                    gates[i] = 1f / (1f + MathF.Exp(-gates[i]));                 // r gate
+                    gates[hiddenSize + i] = 1f / (1f + MathF.Exp(-gates[hiddenSize + i])); // z gate
+                }
+
+                // Step 2: Compute candidate n using reset-gated hidden state (r * hPrev)
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float sum = bIh[2 * hiddenSize + i] + bHh[2 * hiddenSize + i];
+                    for (int k = 0; k < inputSize; k++) sum += inp[t * batch * inputSize + b * inputSize + k] * wIh[(2 * hiddenSize + i) * inputSize + k];
+                    // Apply reset gate: use r * hPrev instead of raw hPrev
+                    for (int k = 0; k < hiddenSize; k++) sum += gates[k] * aH[hOff + b * hiddenSize + k] * wHh[(2 * hiddenSize + i) * hiddenSize + k];
+                    gates[2 * hiddenSize + i] = MathF.Tanh(sum);
+                }
+
+                // Cache all gates for backward pass
+                Array.Copy(gates, 0, cg, t * batch * gateSize + b * gateSize, gateSize);
+
+                // Step 3: Compute new hidden state: ht = (1-z)*n + z*hPrev
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float r = gates[i];
+                    float z = gates[hiddenSize + i];
+                    float n_ = gates[2 * hiddenSize + i];
                     float ht = (1f - z) * n_ + z * aH[hOff + b * hiddenSize + i];
                     aH[hNextOff + b * hiddenSize + i] = ht;
                     outp[t * batch * hiddenSize + b * hiddenSize + i] = ht;
