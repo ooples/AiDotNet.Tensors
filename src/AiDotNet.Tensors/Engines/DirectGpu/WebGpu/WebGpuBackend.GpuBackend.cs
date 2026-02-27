@@ -620,14 +620,18 @@ public sealed partial class WebGpuBackend
 
     public void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A);
-        var o = new float[batch * rows * cols];
-        int stride = rows * cols;
-        for (int b = 0; b < batch; b++)
-            for (int r = 0; r < rows; r++)
-                for (int c = 0; c < cols; c++) o[b * stride + c * rows + r] = inp[b * stride + r * cols + c];
-        UploadToBuffer(o, B);
+        // BatchedTransposeSource: binding(0)=input, binding(1)=output, binding(2)=uniform
+        // Uniform: batch_size, rows, cols, pad
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(rows),
+            BitConverter.Int32BitsToSingle(cols),
+            0
+        };
+        int totalElements = batch * rows * cols;
+        Dispatch2BufferAsync("BatchedTranspose", WebGpuKernels.BatchedTransposeSource, "batched_transpose",
+            A, B, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
@@ -656,38 +660,69 @@ public sealed partial class WebGpuBackend
 
     public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
     {
-        EnsureInitialized();
-        var src = DownloadBufferData(source);
-        var dst = DownloadBufferData(destination);
-        for (int r = 0; r < numRows; r++)
-            for (int c = 0; c < srcCols; c++) dst[r * destTotalCols + destColOffset + c] = src[r * srcCols + c];
-        UploadToBuffer(dst, destination);
+        // For the general case with destColOffset, we need offset support.
+        // The kernel copy_2d_strided uses: batch_size=srcStride(srcCols), rows=numRows, cols=srcCols, _pad=dstStride(destTotalCols)
+        // But it doesn't handle destColOffset, so use CPU for offset cases
+        if (destColOffset != 0)
+        {
+            EnsureInitialized();
+            var src = DownloadBufferData(source);
+            var dst = DownloadBufferData(destination);
+            for (int r = 0; r < numRows; r++)
+                for (int c = 0; c < srcCols; c++) dst[r * destTotalCols + destColOffset + c] = src[r * srcCols + c];
+            UploadToBuffer(dst, destination);
+            return;
+        }
+        // No offset: use GPU kernel
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(srcCols),       // batch_size repurposed as src_stride
+            BitConverter.Int32BitsToSingle(numRows),
+            BitConverter.Int32BitsToSingle(srcCols),
+            BitConverter.Int32BitsToSingle(destTotalCols)  // _pad repurposed as dst_stride
+        };
+        int totalElements = numRows * srcCols;
+        Dispatch2BufferAsync("BatchedTranspose", WebGpuKernels.BatchedTransposeSource, "copy_2d_strided",
+            source, destination, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        int outH = height * scaleFactor, outW = width * scaleFactor;
-        var o = new float[batchChannels * outH * outW];
-        for (int bc = 0; bc < batchChannels; bc++)
-            for (int oh = 0; oh < outH; oh++)
-                for (int ow = 0; ow < outW; ow++)
-                    o[(bc * outH + oh) * outW + ow] = inp[(bc * height + oh / scaleFactor) * width + ow / scaleFactor];
-        UploadToBuffer(o, output);
+        // UpsampleSource nearest_upsample2d: binding(0)=input, binding(1)=output, binding(2)=uniform
+        // Uniform: batch_channels, in_height, in_width, scale_h, scale_w, pad, pad, pad
+        int outH = height * scaleFactor;
+        int outW = width * scaleFactor;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchChannels),
+            BitConverter.Int32BitsToSingle(height),
+            BitConverter.Int32BitsToSingle(width),
+            BitConverter.Int32BitsToSingle(scaleFactor),
+            BitConverter.Int32BitsToSingle(scaleFactor),
+            0, 0, 0
+        };
+        int totalElements = batchChannels * outH * outW;
+        Dispatch2BufferAsync("Upsample", WebGpuKernels.UpsampleSource, "nearest_upsample2d",
+            input, output, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
-        EnsureInitialized();
-        var grad = DownloadBufferData(gradOutput);
-        int outH = height * scaleFactor, outW = width * scaleFactor;
-        var gi = new float[batchChannels * height * width];
-        for (int bc = 0; bc < batchChannels; bc++)
-            for (int oh = 0; oh < outH; oh++)
-                for (int ow = 0; ow < outW; ow++)
-                    gi[(bc * height + oh / scaleFactor) * width + ow / scaleFactor] += grad[(bc * outH + oh) * outW + ow];
-        UploadToBuffer(gi, gradInput);
+        // UpsampleSource nearest_upsample2d_backward: binding(0)=gradOutput(input), binding(1)=gradInput(output)
+        // Accumulates from upsampled space back to original space
+        Fill(gradInput, 0f, batchChannels * height * width);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchChannels),
+            BitConverter.Int32BitsToSingle(height),
+            BitConverter.Int32BitsToSingle(width),
+            BitConverter.Int32BitsToSingle(scaleFactor),
+            BitConverter.Int32BitsToSingle(scaleFactor),
+            0, 0, 0
+        };
+        int totalElements = batchChannels * height * width;
+        Dispatch2BufferAsync("Upsample", WebGpuKernels.UpsampleSource, "nearest_upsample2d_backward",
+            gradOutput, gradInput, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
