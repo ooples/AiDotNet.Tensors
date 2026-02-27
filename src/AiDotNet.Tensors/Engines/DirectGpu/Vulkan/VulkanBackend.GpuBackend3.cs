@@ -65,13 +65,95 @@ public sealed unsafe partial class VulkanBackend
         if (attentionWeights is not null && aw is not null) UploadToBuffer(aw, attentionWeights);
     }
 
+    private void AttentionBackwardCore(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
+        IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
+        int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
+    {
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var q = DownloadBuffer(query);
+        var k = DownloadBuffer(key);
+        var v = DownloadBuffer(value);
+        var aw = DownloadBuffer(attentionWeights);
+        int totalHeads = batch * numHeads;
+        var gq = new float[totalHeads * seqLen * headDim];
+        var gk = new float[totalHeads * seqLen * headDim];
+        var gv = new float[totalHeads * seqLen * headDim];
+
+        for (int h = 0; h < totalHeads; h++)
+        {
+            int qOff = h * seqLen * headDim;
+            int awOff = h * seqLen * seqLen;
+
+            // gradV = attn_weights^T * gradOutput
+            for (int j = 0; j < seqLen; j++)
+                for (int d = 0; d < headDim; d++)
+                {
+                    float sum = 0;
+                    for (int i = 0; i < seqLen; i++)
+                        sum += aw[awOff + i * seqLen + j] * go[qOff + i * headDim + d];
+                    gv[qOff + j * headDim + d] = sum;
+                }
+
+            // gradAttn = gradOutput * V^T
+            var gradAttn = new float[seqLen * seqLen];
+            for (int i = 0; i < seqLen; i++)
+                for (int j = 0; j < seqLen; j++)
+                {
+                    float sum = 0;
+                    for (int d = 0; d < headDim; d++)
+                        sum += go[qOff + i * headDim + d] * v[qOff + j * headDim + d];
+                    gradAttn[i * seqLen + j] = sum;
+                }
+
+            // softmax backward
+            var gradScores = new float[seqLen * seqLen];
+            for (int i = 0; i < seqLen; i++)
+            {
+                float dot = 0;
+                for (int j = 0; j < seqLen; j++)
+                    dot += gradAttn[i * seqLen + j] * aw[awOff + i * seqLen + j];
+                for (int j = 0; j < seqLen; j++)
+                {
+                    if (isCausal && j > i)
+                        gradScores[i * seqLen + j] = 0;
+                    else
+                        gradScores[i * seqLen + j] = aw[awOff + i * seqLen + j] * (gradAttn[i * seqLen + j] - dot);
+                }
+            }
+
+            // gradQ = gradScores * K * scale
+            for (int i = 0; i < seqLen; i++)
+                for (int d = 0; d < headDim; d++)
+                {
+                    float sum = 0;
+                    for (int j = 0; j < seqLen; j++)
+                        sum += gradScores[i * seqLen + j] * k[qOff + j * headDim + d];
+                    gq[qOff + i * headDim + d] = sum * scale;
+                }
+
+            // gradK = gradScores^T * Q * scale
+            for (int j = 0; j < seqLen; j++)
+                for (int d = 0; d < headDim; d++)
+                {
+                    float sum = 0;
+                    for (int i = 0; i < seqLen; i++)
+                        sum += gradScores[i * seqLen + j] * q[qOff + i * headDim + d];
+                    gk[qOff + j * headDim + d] = sum * scale;
+                }
+        }
+
+        UploadToBuffer(gq, gradQuery);
+        UploadToBuffer(gk, gradKey);
+        UploadToBuffer(gv, gradValue);
+    }
+
     public void ScaledDotProductAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
-        Fill(gradQuery, 0f, gradQuery.Size);
-        Fill(gradKey, 0f, gradKey.Size);
-        Fill(gradValue, 0f, gradValue.Size);
+        AttentionBackwardCore(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+            batch, numHeads, seqLen, headDim, scale, isCausal);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -93,9 +175,11 @@ public sealed unsafe partial class VulkanBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        Fill(gradQuery, 0f, gradQuery.Size);
-        Fill(gradKey, 0f, gradKey.Size);
-        Fill(gradValue, 0f, gradValue.Size);
+        var awBuffer = AllocateBuffer(batch * numHeads * seqQ * seqQ);
+        ScaledDotProductAttention(query, key, value, output, awBuffer, attentionBias, batch, numHeads, seqQ, headDim, scale, isCausal);
+        AttentionBackwardCore(gradOutput, query, key, value, awBuffer, gradQuery, gradKey, gradValue,
+            batch, numHeads, seqQ, headDim, scale, isCausal);
+        awBuffer.Dispose();
     }
 
     public void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -108,9 +192,8 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
-        Fill(gradQuery, 0f, gradQuery.Size);
-        Fill(gradKey, 0f, gradKey.Size);
-        Fill(gradValue, 0f, gradValue.Size);
+        AttentionBackwardCore(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
+            batch, numQHeads, seqQ, headDim, scale, false);
     }
 
     #endregion
@@ -375,9 +458,42 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradAnchor, IGpuBuffer gradPositive, IGpuBuffer gradNegative,
         int batchSize, int embeddingDim, float margin)
     {
-        Fill(gradAnchor, 0f, gradAnchor.Size);
-        Fill(gradPositive, 0f, gradPositive.Size);
-        Fill(gradNegative, 0f, gradNegative.Size);
+        EnsureInitialized();
+        var a = DownloadBuffer(anchor);
+        var p = DownloadBuffer(positive);
+        var n = DownloadBuffer(negative);
+        var ga = new float[batchSize * embeddingDim];
+        var gp = new float[batchSize * embeddingDim];
+        var gn = new float[batchSize * embeddingDim];
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * embeddingDim;
+            float dp = 0, dn = 0;
+            for (int d = 0; d < embeddingDim; d++)
+            {
+                float diffP = a[off + d] - p[off + d]; dp += diffP * diffP;
+                float diffN = a[off + d] - n[off + d]; dn += diffN * diffN;
+            }
+            float distP = MathF.Sqrt(dp + 1e-8f);
+            float distN = MathF.Sqrt(dn + 1e-8f);
+
+            if (distP - distN + margin > 0)
+            {
+                for (int d = 0; d < embeddingDim; d++)
+                {
+                    float diffP = a[off + d] - p[off + d];
+                    float diffN = a[off + d] - n[off + d];
+                    ga[off + d] += (diffP / distP - diffN / distN) / batchSize;
+                    gp[off + d] += (-diffP / distP) / batchSize;
+                    gn[off + d] += (diffN / distN) / batchSize;
+                }
+            }
+        }
+
+        UploadToBuffer(ga, gradAnchor);
+        UploadToBuffer(gp, gradPositive);
+        UploadToBuffer(gn, gradNegative);
     }
 
     public float FocalLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float alpha, float gamma)
@@ -485,8 +601,39 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradOutput1, IGpuBuffer gradOutput2,
         int batchSize, int embeddingDim, float margin)
     {
-        Fill(gradOutput1, 0f, gradOutput1.Size);
-        Fill(gradOutput2, 0f, gradOutput2.Size);
+        EnsureInitialized();
+        var o1 = DownloadBuffer(output1);
+        var o2 = DownloadBuffer(output2);
+        var lab = DownloadBuffer(labels);
+        var g1 = new float[batchSize * embeddingDim];
+        var g2 = new float[batchSize * embeddingDim];
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * embeddingDim;
+            float distSq = 0;
+            for (int d = 0; d < embeddingDim; d++)
+            {
+                float diff = o1[off + d] - o2[off + d];
+                distSq += diff * diff;
+            }
+            float dist = MathF.Sqrt(distSq + 1e-8f);
+            float y = lab[b];
+
+            for (int d = 0; d < embeddingDim; d++)
+            {
+                float diff = o1[off + d] - o2[off + d];
+                float gradSimilar = y * diff;
+                float gradDissimilar = 0f;
+                if (margin - dist > 0)
+                    gradDissimilar = -(1f - y) * (margin - dist) * diff / dist;
+                g1[off + d] = (gradSimilar + gradDissimilar) / batchSize;
+                g2[off + d] = -(gradSimilar + gradDissimilar) / batchSize;
+            }
+        }
+
+        UploadToBuffer(g1, gradOutput1);
+        UploadToBuffer(g2, gradOutput2);
     }
 
     #endregion
@@ -549,9 +696,12 @@ public sealed unsafe partial class VulkanBackend
         var gd = DownloadBuffer(gradDestination);
         var idx = DownloadBuffer(indices);
         var gs = new float[numIndices * featureSize];
+        int scatterNumRows = gd.Length / featureSize;
         for (int i = 0; i < numIndices; i++)
         {
             int srcIdx = SingleToInt32BitsCompat(idx[i]);
+            if ((uint)srcIdx >= (uint)scatterNumRows)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded index {srcIdx} at position {i} is out of range [0, {scatterNumRows}).");
             for (int f = 0; f < featureSize; f++)
                 gs[i * featureSize + f] = gd[srcIdx * featureSize + f];
         }
@@ -564,9 +714,12 @@ public sealed unsafe partial class VulkanBackend
         var src = DownloadBuffer(source);
         var idx = DownloadBuffer(indices);
         var outp = new float[numIndices * featureSize];
+        int gatherNumRows = src.Length / featureSize;
         for (int i = 0; i < numIndices; i++)
         {
             int srcIdx = SingleToInt32BitsCompat(idx[i]);
+            if ((uint)srcIdx >= (uint)gatherNumRows)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded index {srcIdx} at position {i} is out of range [0, {gatherNumRows}).");
             Array.Copy(src, srcIdx * featureSize, outp, i * featureSize, featureSize);
         }
         UploadToBuffer(outp, output);
