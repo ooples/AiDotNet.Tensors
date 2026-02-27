@@ -195,23 +195,22 @@ public sealed partial class WebGpuBackend
 
     public void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A); var bi = DownloadBufferData(bias);
-        var o = new float[M * N];
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++) o[i * N + j] = inp[i * N + j] + bi[j];
-        UploadToBuffer(o, C);
+        Dispatch3BufferAsync("BiasAdd", WebGpuKernels.BiasAddSource, "bias_add",
+            A, bias, C, MakeUniformInts2(M, N), M * N).GetAwaiter().GetResult();
     }
 
     public void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
-        EnsureInitialized();
-        var o = DownloadBufferData(output); var bi = DownloadBufferData(bias);
-        for (int n = 0; n < batch; n++)
-            for (int c = 0; c < channels; c++)
-                for (int s = 0; s < spatialSize; s++)
-                    o[(n * channels + c) * spatialSize + s] += bi[c];
-        UploadToBuffer(o, output);
+        int total = batch * channels * spatialSize;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(spatialSize),
+            0
+        };
+        Dispatch2BufferAsync("Conv2DBiasAdd", WebGpuKernels.Conv2DBiasAddSource, "conv2d_bias_add",
+            output, bias, uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -222,24 +221,29 @@ public sealed partial class WebGpuBackend
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => SubAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Multiply(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MulAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Divide(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => DivAsync(A, B, C, size).GetAwaiter().GetResult();
-    public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => CpuBinary(A, B, C, size, MathF.Min);
-    public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => CpuBinary(A, B, C, size, MathF.Max);
+    public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MinimumAsync(A, B, C, size).GetAwaiter().GetResult();
+    public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MaximumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => ScaleAsync(A, B, scalar, size).GetAwaiter().GetResult();
-    public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => CpuUnary(A, B, size, v => MathF.Pow(v, exponent));
-    public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Abs);
-    public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Exp);
-    public void Exp2(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Pow(2f, v));
-    public void Exp10(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Pow(10f, v));
-    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Exp(v) - 1f);
-    public void Log(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Log);
-    public void Log2(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Log2);
-    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Log(1f + v));
-    public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Sqrt);
-    public void Sign(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Sign(v));
+    public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();
+    public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => AbsAsync(A, B, size).GetAwaiter().GetResult();
+    public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => ExpAsync(A, B, size).GetAwaiter().GetResult();
+    public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "expm1_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Log(IGpuBuffer A, IGpuBuffer B, int size) => LogAsync(A, B, size).GetAwaiter().GetResult();
+    public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log1p_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size) => SqrtAsync(A, B, size).GetAwaiter().GetResult();
+    public void Sign(IGpuBuffer A, IGpuBuffer B, int size) => SignAsync(A, B, size).GetAwaiter().GetResult();
     public void Relu(IGpuBuffer A, IGpuBuffer B, int size) => ReLUAsync(A, B, size).GetAwaiter().GetResult();
     public void Sigmoid(IGpuBuffer A, IGpuBuffer B, int size) => SigmoidAsync(A, B, size).GetAwaiter().GetResult();
     public void Tanh(IGpuBuffer A, IGpuBuffer B, int size) => TanhAsync(A, B, size).GetAwaiter().GetResult();
-    public void Gelu(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => 0.5f * v * (1f + MathF.Tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+    public void Gelu(IGpuBuffer A, IGpuBuffer B, int size) => GeLUAsync(A, B, size).GetAwaiter().GetResult();
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features) => SoftmaxAsync(A, B, batchSize, features).GetAwaiter().GetResult();
 
     #endregion
@@ -353,35 +357,53 @@ public sealed partial class WebGpuBackend
 
     #region Trigonometric Operations
 
-    public void Sin(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Sin);
-    public void Cos(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Cos);
-    public void Tan(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Tan);
-    public void Asin(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Asin);
-    public void Acos(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Acos);
-    public void Atan(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Atan);
+    public void Sin(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "sin_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Cos(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "cos_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Tan(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "tan_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Asin(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "asin_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Acos(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "acos_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Atan(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "atan_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
 
     #endregion
 
     #region Hyperbolic Operations
 
-    public void Sinh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Sinh);
-    public void Cosh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Cosh);
-    public void Asinh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Asinh);
-    public void Acosh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Acosh);
-    public void Atanh(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Atanh);
+    public void Sinh(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "sinh_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Cosh(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("Trig", WebGpuKernels.TrigSource, "cosh_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Asinh(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("InverseHyperbolic", WebGpuKernels.InverseHyperbolicSource, "asinh_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Acosh(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("InverseHyperbolic", WebGpuKernels.InverseHyperbolicSource, "acosh_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Atanh(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("InverseHyperbolic", WebGpuKernels.InverseHyperbolicSource, "atanh_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
 
     #endregion
 
     #region Additional Unary Operations
 
-    public void Reciprocal(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => 1f / v);
-    public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Cbrt);
-    public void Log10(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Log10);
-    public void Negate(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => -v);
-    public void Floor(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Floor);
-    public void Ceiling(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Ceiling);
-    public void Round(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Round);
-    public void Truncate(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, MathF.Truncate);
+    public void Reciprocal(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchUnaryOpAsync("reciprocal_op", A, B, size).GetAwaiter().GetResult();
+    public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "cbrt_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Log10(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
+    public void Negate(IGpuBuffer A, IGpuBuffer B, int size) => NegAsync(A, B, size).GetAwaiter().GetResult();
+    public void Floor(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchUnaryOpAsync("floor_op", A, B, size).GetAwaiter().GetResult();
+    public void Ceiling(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchUnaryOpAsync("ceil_op", A, B, size).GetAwaiter().GetResult();
+    public void Round(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchUnaryOpAsync("round_op", A, B, size).GetAwaiter().GetResult();
+    public void Truncate(IGpuBuffer A, IGpuBuffer B, int size)
+        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "trunc_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
 
     #endregion
 
@@ -572,20 +594,13 @@ public sealed partial class WebGpuBackend
 
     #region Reduction Operations
 
-    public float Sum(IGpuBuffer A, int size) => CpuReduce(A, size, 0f, (acc, v) => acc + v);
-    public float Max(IGpuBuffer A, int size) => CpuReduce(A, size, float.MinValue, MathF.Max);
+    public float Sum(IGpuBuffer A, int size) => SumAsync(A, size).GetAwaiter().GetResult();
+    public float Max(IGpuBuffer A, int size) => MaxAsync(A, size).GetAwaiter().GetResult();
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A); var o = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float sum = 0;
-            for (int j = 0; j < reduceSize; j++) sum += inp[i * reduceSize + j];
-            o[i] = sum;
-        }
-        UploadToBuffer(o, B);
+        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "sum_axis",
+            A, B, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -677,10 +692,8 @@ public sealed partial class WebGpuBackend
 
     public void Fill(IGpuBuffer buffer, float value, int size)
     {
-        EnsureInitialized();
-        var data = new float[size];
-        Array.Fill(data, value);
-        UploadToBuffer(data, buffer);
+        Dispatch1BufferAsync("Fill", WebGpuKernels.FillSource, "fill_value",
+            buffer, MakeUniform2(size, value), size).GetAwaiter().GetResult();
     }
 
     #endregion
