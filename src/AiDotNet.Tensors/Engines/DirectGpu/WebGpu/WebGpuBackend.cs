@@ -863,7 +863,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
     /// </summary>
     internal static float[] MakeConvUniforms(int batch, int inChannels, int outChannels,
         int inHeight, int inWidth, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        int dilationH = 1, int dilationW = 1)
     {
         return new float[]
         {
@@ -880,7 +881,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
             BitConverter.Int32BitsToSingle(strideW),
             BitConverter.Int32BitsToSingle(padH),
             BitConverter.Int32BitsToSingle(padW),
-            0, 0, 0 // padding to 16 floats (64 bytes)
+            BitConverter.Int32BitsToSingle(dilationH),
+            BitConverter.Int32BitsToSingle(dilationW),
+            0 // padding to 16 floats (64 bytes)
         };
     }
 

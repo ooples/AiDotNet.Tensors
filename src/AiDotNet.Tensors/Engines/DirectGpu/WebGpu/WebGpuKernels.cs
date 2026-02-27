@@ -1112,6 +1112,8 @@ struct ConvParams {
     stride_w: u32,
     pad_h: u32,
     pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
 }
 @group(0) @binding(3) var<uniform> params: ConvParams;
 
@@ -1131,8 +1133,8 @@ fn conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var ic: u32 = 0u; ic < params.in_channels; ic = ic + 1u) {
         for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
             for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
-                let in_y = i32(out_y * params.stride_h + ky) - i32(params.pad_h);
-                let in_x = i32(out_x * params.stride_w + kx) - i32(params.pad_w);
+                let in_y = i32(out_y * params.stride_h + ky * params.dilation_h) - i32(params.pad_h);
+                let in_x = i32(out_x * params.stride_w + kx * params.dilation_w) - i32(params.pad_w);
 
                 if (in_y >= 0 && in_y < i32(params.in_height) && in_x >= 0 && in_x < i32(params.in_width)) {
                     let in_idx = batch * params.in_channels * params.in_height * params.in_width
@@ -2419,6 +2421,8 @@ struct ConvParams {
     stride_w: u32,
     pad_h: u32,
     pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
 }
 @group(0) @binding(3) var<uniform> params: ConvParams;
 
@@ -2437,8 +2441,8 @@ fn conv2d_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var oc: u32 = 0u; oc < params.out_channels; oc = oc + 1u) {
         for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
             for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
-                let out_y_check = i32(in_y) + i32(params.pad_h) - i32(ky);
-                let out_x_check = i32(in_x) + i32(params.pad_w) - i32(kx);
+                let out_y_check = i32(in_y) + i32(params.pad_h) - i32(ky * params.dilation_h);
+                let out_x_check = i32(in_x) + i32(params.pad_w) - i32(kx * params.dilation_w);
                 if (out_y_check >= 0 && out_x_check >= 0 &&
                     out_y_check % i32(params.stride_h) == 0 && out_x_check % i32(params.stride_w) == 0) {
                     let out_y = u32(out_y_check) / params.stride_h;
@@ -2486,6 +2490,8 @@ struct ConvParams {
     stride_w: u32,
     pad_h: u32,
     pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
 }
 @group(0) @binding(3) var<uniform> params: ConvParams;
 
@@ -2504,8 +2510,8 @@ fn conv2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
         for (var oh: u32 = 0u; oh < params.out_height; oh = oh + 1u) {
             for (var ow: u32 = 0u; ow < params.out_width; ow = ow + 1u) {
-                let ih = i32(oh * params.stride_h + kh) - i32(params.pad_h);
-                let iw = i32(ow * params.stride_w + kw) - i32(params.pad_w);
+                let ih = i32(oh * params.stride_h + kh * params.dilation_h) - i32(params.pad_h);
+                let iw = i32(ow * params.stride_w + kw * params.dilation_w) - i32(params.pad_w);
                 if (ih >= 0 && ih < i32(params.in_height) && iw >= 0 && iw < i32(params.in_width)) {
                     let in_idx = n * params.in_channels * params.in_height * params.in_width
                                + ic * params.in_height * params.in_width
@@ -2697,6 +2703,8 @@ struct ConvParams {
     stride_w: u32,
     pad_h: u32,
     pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
 }
 @group(0) @binding(3) var<uniform> params: ConvParams;
 

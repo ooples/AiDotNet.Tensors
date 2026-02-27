@@ -17,9 +17,9 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        // GPU kernel uses stride-based padding (dilation folded into stride for simple cases)
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+            dilationH, dilationW);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
         Dispatch3Buffer3DAsync("Convolution", WebGpuKernels.ConvolutionSource, "conv2d",
             input, kernel, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
@@ -33,7 +33,8 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW)
     {
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+            dilationH, dilationW);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
         Dispatch3Buffer3DAsync("Conv2DBackward", WebGpuKernels.Conv2DBackwardSource, "conv2d_backward_input",
             gradOutput, kernel, gradInput, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
@@ -49,7 +50,8 @@ public sealed partial class WebGpuBackend
         // 1D dispatch: each thread computes one kernel weight gradient
         int totalKernelElements = outChannels * inChannels * kernelH * kernelW;
         var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+            dilationH, dilationW);
         Dispatch3BufferAsync("Conv2DBackwardKernel", WebGpuKernels.Conv2DBackwardKernelSource, "conv2d_backward_kernel",
             input, gradOutput, gradKernel, uniforms, totalKernelElements).GetAwaiter().GetResult();
     }
