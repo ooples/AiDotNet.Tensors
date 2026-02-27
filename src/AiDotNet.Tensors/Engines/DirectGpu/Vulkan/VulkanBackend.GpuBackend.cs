@@ -667,6 +667,36 @@ public sealed unsafe partial class VulkanBackend
 
     #endregion
 
+    #region Fused Operations
+
+    public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+        => CpuBinary(a, b, output, size, (va, vb) => va + t * (vb - va));
+
+    public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+        => CpuBinary(a, b, output, size, (va, vb) => scaleA * va + scaleB * vb);
+
+    public float StdDev(IGpuBuffer input, int size)
+    {
+        EnsureInitialized();
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        var data = DownloadBuffer(input);
+        // Welford's algorithm for numerically stable variance computation
+        double mean = 0;
+        double m2 = 0;
+        for (int i = 0; i < size; i++)
+        {
+            double delta = data[i] - mean;
+            mean += delta / (i + 1);
+            double delta2 = data[i] - mean;
+            m2 += delta * delta2;
+        }
+        double variance = m2 / size;
+        return (float)Math.Sqrt(variance);
+    }
+
+    #endregion
+
     #region Synchronization
 
     public void Synchronize()
