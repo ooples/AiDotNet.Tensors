@@ -4,7 +4,9 @@
 
 using System;
 using System.Linq;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -636,6 +638,154 @@ public class GpuCpuConsistencyTests
         for (int i = 0; i < 5; i++)
         {
             Assert.Equal(result1[i], result2[i]);
+        }
+    }
+
+    #endregion
+
+    #region TensorLerp GPU vs CPU Consistency Tests
+
+    [SkippableFact]
+    public void TensorLerp_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+
+        var random = new Random(42);
+        const int size = 1000;
+
+        var aData = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 200 - 100)).ToArray();
+        var bData = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 200 - 100)).ToArray();
+
+        var a = new Tensor<float>(new[] { size });
+        var b = new Tensor<float>(new[] { size });
+        for (int i = 0; i < size; i++)
+        {
+            a.SetFlat(i, aData[i]);
+            b.SetFlat(i, bData[i]);
+        }
+
+        float t = 0.3f;
+
+        // CPU reference
+        var cpuEngine = new CpuEngine();
+        var cpuResult = ((IEngine)cpuEngine).TensorLerp(a, b, t);
+
+        // GPU via DirectGpuTensorEngine (falls back to CPU if no GPU)
+        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuResult = ((IEngine)gpuEngine).TensorLerp(a, b, t);
+
+        // Compare
+        Assert.Equal(cpuResult.Shape, gpuResult.Shape);
+        for (int i = 0; i < size; i++)
+        {
+            Assert.True(AreClose(cpuResult.GetFlat(i), gpuResult.GetFlat(i)),
+                $"TensorLerp mismatch at index {i}: CPU={cpuResult.GetFlat(i)}, GPU={gpuResult.GetFlat(i)}");
+        }
+    }
+
+    [SkippableFact]
+    public void TensorLerp_BoundaryInterpolation_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+
+        var a = new Tensor<float>(new[] { 4 });
+        var b = new Tensor<float>(new[] { 4 });
+        a.SetFlat(0, 1f); a.SetFlat(1, 2f); a.SetFlat(2, 3f); a.SetFlat(3, 4f);
+        b.SetFlat(0, 10f); b.SetFlat(1, 20f); b.SetFlat(2, 30f); b.SetFlat(3, 40f);
+
+        var cpuEngine = new CpuEngine();
+        using var gpuEngine = new DirectGpuTensorEngine();
+
+        // t=0 should return a, t=1 should return b
+        var cpuAt0 = ((IEngine)cpuEngine).TensorLerp(a, b, 0f);
+        var gpuAt0 = ((IEngine)gpuEngine).TensorLerp(a, b, 0f);
+
+        var cpuAt1 = ((IEngine)cpuEngine).TensorLerp(a, b, 1f);
+        var gpuAt1 = ((IEngine)gpuEngine).TensorLerp(a, b, 1f);
+
+        for (int i = 0; i < 4; i++)
+        {
+            Assert.True(AreClose(cpuAt0.GetFlat(i), gpuAt0.GetFlat(i)),
+                $"TensorLerp(t=0) mismatch at {i}: CPU={cpuAt0.GetFlat(i)}, GPU={gpuAt0.GetFlat(i)}");
+            Assert.True(AreClose(cpuAt1.GetFlat(i), gpuAt1.GetFlat(i)),
+                $"TensorLerp(t=1) mismatch at {i}: CPU={cpuAt1.GetFlat(i)}, GPU={gpuAt1.GetFlat(i)}");
+        }
+    }
+
+    #endregion
+
+    #region TensorAddScaled GPU vs CPU Consistency Tests
+
+    [SkippableFact]
+    public void TensorAddScaled_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+
+        var random = new Random(42);
+        const int size = 1000;
+
+        var aData = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 200 - 100)).ToArray();
+        var bData = Enumerable.Range(0, size).Select(_ => (float)(random.NextDouble() * 200 - 100)).ToArray();
+
+        var a = new Tensor<float>(new[] { size });
+        var b = new Tensor<float>(new[] { size });
+        for (int i = 0; i < size; i++)
+        {
+            a.SetFlat(i, aData[i]);
+            b.SetFlat(i, bData[i]);
+        }
+
+        float scaleA = 0.7f;
+        float scaleB = 0.3f;
+
+        // CPU reference
+        var cpuEngine = new CpuEngine();
+        var cpuResult = ((IEngine)cpuEngine).TensorAddScaled(a, b, scaleA, scaleB);
+
+        // GPU via DirectGpuTensorEngine
+        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuResult = ((IEngine)gpuEngine).TensorAddScaled(a, b, scaleA, scaleB);
+
+        // Compare
+        Assert.Equal(cpuResult.Shape, gpuResult.Shape);
+        for (int i = 0; i < size; i++)
+        {
+            Assert.True(AreClose(cpuResult.GetFlat(i), gpuResult.GetFlat(i)),
+                $"TensorAddScaled mismatch at index {i}: CPU={cpuResult.GetFlat(i)}, GPU={gpuResult.GetFlat(i)}");
+        }
+    }
+
+    [SkippableFact]
+    public void TensorAddScaled_DiffusionNoiseMixing_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+
+        // Simulate diffusion noise mixing: alpha * signal + sigma * noise
+        var random = new Random(123);
+        const int size = 512;
+
+        var signal = new Tensor<float>(new[] { size });
+        var noise = new Tensor<float>(new[] { size });
+        for (int i = 0; i < size; i++)
+        {
+            signal.SetFlat(i, (float)(random.NextDouble() * 2 - 1));
+            noise.SetFlat(i, (float)(random.NextDouble() * 2 - 1));
+        }
+
+        float alpha = 0.95f;  // signal weight
+        float sigma = 0.05f;  // noise weight
+
+        var cpuEngine = new CpuEngine();
+        using var gpuEngine = new DirectGpuTensorEngine();
+
+        var cpuResult = ((IEngine)cpuEngine).TensorAddScaled(signal, noise, alpha, sigma);
+        var gpuResult = ((IEngine)gpuEngine).TensorAddScaled(signal, noise, alpha, sigma);
+
+        Assert.Equal(cpuResult.Shape, gpuResult.Shape);
+        for (int i = 0; i < size; i++)
+        {
+            Assert.True(AreClose(cpuResult.GetFlat(i), gpuResult.GetFlat(i)),
+                $"Diffusion mixing mismatch at {i}: CPU={cpuResult.GetFlat(i)}, GPU={gpuResult.GetFlat(i)}");
         }
     }
 
