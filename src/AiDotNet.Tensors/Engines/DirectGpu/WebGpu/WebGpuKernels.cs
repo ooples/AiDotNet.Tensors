@@ -5989,41 +5989,34 @@ fn conv_transpose2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<u32
 
 
     /// <summary>
-    /// BatchNorm backward pass - computes gradInput, gradGamma, gradBeta.
-    /// Inputs: gradOutput[batch*channels*spatial], input[batch*channels*spatial],
-    ///         gamma[channels], saveMean[channels], saveInvVar[channels]
-    /// Outputs: gradInput[batch*channels*spatial], gradGamma[channels], gradBeta[channels]
-    /// Each workgroup processes one channel.
+    /// BatchNorm backward pass 1: compute gradGamma and gradBeta per channel.
+    /// Bindings: gradOutput(0), input(1), saveMean(2), saveInvVar(3), gradGamma(4=write), gradBeta(5=write)
+    /// Dispatched per channel (workSize = channels).
     /// </summary>
-    public const string BatchNormBackwardSource = @"
+    public const string BatchNormBackwardStatsSource = @"
 @group(0) @binding(0) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(1) var<storage, read> input: array<f32>;
-@group(0) @binding(2) var<storage, read> gamma: array<f32>;
-@group(0) @binding(3) var<storage, read> save_mean: array<f32>;
-@group(0) @binding(4) var<storage, read> save_inv_var: array<f32>;
-@group(0) @binding(5) var<storage, read_write> grad_input: array<f32>;
-@group(0) @binding(6) var<storage, read_write> grad_gamma: array<f32>;
-@group(0) @binding(7) var<storage, read_write> grad_beta: array<f32>;
+@group(0) @binding(2) var<storage, read> save_mean: array<f32>;
+@group(0) @binding(3) var<storage, read> save_inv_var: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_gamma: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_beta: array<f32>;
 
-struct BNBackwardParams {
+struct BNBackwardStatsParams {
     batch_size: u32,
     channels: u32,
     spatial_size: u32,
-    epsilon: f32,
+    _pad: u32,
 }
-@group(0) @binding(8) var<uniform> params: BNBackwardParams;
+@group(0) @binding(6) var<uniform> params: BNBackwardStatsParams;
 
 @compute @workgroup_size(256)
-fn batch_norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn batch_norm_backward_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= params.channels) { return; }
 
-    let N = f32(params.batch_size * params.spatial_size);
     let mean_c = save_mean[c];
     let inv_var_c = save_inv_var[c];
-    let gamma_c = gamma[c];
 
-    // Pass 1: Compute gradBeta = sum(gradOutput) and gradGamma = sum(gradOutput * normalized)
     var sum_grad: f32 = 0.0;
     var sum_grad_xhat: f32 = 0.0;
     for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
@@ -6037,18 +6030,50 @@ fn batch_norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     grad_beta[c] = sum_grad;
     grad_gamma[c] = sum_grad_xhat;
+}
+";
 
-    // Pass 2: Compute gradInput
-    // gradInput = gamma * invVar * (gradOutput - (gradBeta + x_hat * gradGamma) / N)
+    /// <summary>
+    /// BatchNorm backward pass 2: compute gradInput using precomputed gradGamma and gradBeta.
+    /// Uses a packed stats buffer: [gamma, mean, invVar, sumGrad, sumGradXhat] per channel (5 floats per channel).
+    /// Bindings: gradOutput(0), input(1), packedStats(2), gradInput(3=write)
+    /// Dispatched per element (workSize = batch * channels * spatialSize).
+    /// </summary>
+    public const string BatchNormBackwardDataSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> packed_stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
+
+struct BNBackwardDataParams {
+    batch_size: u32,
+    channels: u32,
+    spatial_size: u32,
+    _pad: u32,
+}
+@group(0) @binding(4) var<uniform> params: BNBackwardDataParams;
+
+@compute @workgroup_size(256)
+fn batch_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.channels * params.spatial_size;
+    if (idx >= total) { return; }
+
+    let c = (idx / params.spatial_size) % params.channels;
+
+    // packed_stats layout: [gamma, mean, invVar, sumGrad, sumGradXhat] per channel (5 floats per channel)
+    let stats_base = c * 5u;
+    let gamma_c = packed_stats[stats_base];
+    let mean_c = packed_stats[stats_base + 1u];
+    let inv_var_c = packed_stats[stats_base + 2u];
+    let sum_grad = packed_stats[stats_base + 3u];
+    let sum_grad_xhat = packed_stats[stats_base + 4u];
+
+    let N = f32(params.batch_size * params.spatial_size);
+    let go = grad_output[idx];
+    let x_hat = (input[idx] - mean_c) * inv_var_c;
     let scale = gamma_c * inv_var_c;
-    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
-        for (var s: u32 = 0u; s < params.spatial_size; s = s + 1u) {
-            let idx = n * params.channels * params.spatial_size + c * params.spatial_size + s;
-            let go = grad_output[idx];
-            let x_hat = (input[idx] - mean_c) * inv_var_c;
-            grad_input[idx] = scale * (go - (sum_grad + x_hat * sum_grad_xhat) / N);
-        }
-    }
+    grad_input[idx] = scale * (go - (sum_grad + x_hat * sum_grad_xhat) / N);
 }
 ";
 
@@ -6088,7 +6113,7 @@ fn batch_norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
                LocallyConnectedConv2DBackwardWeightsSource +
                DeformableConv2DSource +
                ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource +
-               BatchNormBackwardSource;
+               BatchNormBackwardStatsSource + BatchNormBackwardDataSource;
     }
 }
 #endif

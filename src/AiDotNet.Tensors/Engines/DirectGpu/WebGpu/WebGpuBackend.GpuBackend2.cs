@@ -666,9 +666,56 @@ public sealed partial class WebGpuBackend
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
     {
-        Fill(gradInput, 0f, batch * channels * spatialSize);
-        Fill(gradGamma, 0f, channels);
-        Fill(gradBeta, 0f, channels);
+        EnsureInitialized();
+
+        // Pass 1: Compute gradGamma and gradBeta per channel
+        // Bindings: gradOutput(0), input(1), saveMean(2), saveInvVar(3), gradGamma(4=rw), gradBeta(5=rw) + uniform
+        var statsUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(spatialSize),
+            0 // _pad
+        };
+        Dispatch6BufferAsync("BatchNormBackwardStats", WebGpuKernels.BatchNormBackwardStatsSource,
+            "batch_norm_backward_stats",
+            gradOutput, input, saveMean, saveInvVar, gradGamma, gradBeta,
+            statsUniforms, channels).GetAwaiter().GetResult();
+
+        // Pass 2: Compute gradInput per element using packed per-channel stats
+        // Pack [gamma, mean, invVar, sumGrad, sumGradXhat] per channel (5 floats per channel)
+        var gammaData = DownloadBufferData(gamma);
+        var meanData = DownloadBufferData(saveMean);
+        var invVarData = DownloadBufferData(saveInvVar);
+        var sumGradData = DownloadBufferData(gradGamma);     // gradGamma holds sum_grad_xhat after Pass 1
+        var sumGradBetaData = DownloadBufferData(gradBeta);  // gradBeta holds sum_grad after Pass 1
+
+        var packedData = new float[channels * 5];
+        for (int c = 0; c < channels; c++)
+        {
+            int baseIdx = c * 5;
+            packedData[baseIdx] = gammaData[c];
+            packedData[baseIdx + 1] = meanData[c];
+            packedData[baseIdx + 2] = invVarData[c];
+            packedData[baseIdx + 3] = sumGradBetaData[c];  // sum_grad (gradBeta from pass 1)
+            packedData[baseIdx + 4] = sumGradData[c];       // sum_grad_xhat (gradGamma from pass 1)
+        }
+
+        using var packedStats = (WebGpuBuffer)AllocateBuffer(packedData);
+
+        // Bindings: gradOutput(0), input(1), packedStats(2), gradInput(3=rw) + uniform
+        var dataUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(spatialSize),
+            0 // _pad
+        };
+        int totalElements = batch * channels * spatialSize;
+        Dispatch4BufferAsync("BatchNormBackwardData", WebGpuKernels.BatchNormBackwardDataSource,
+            "batch_norm_backward_data",
+            gradOutput, input, packedStats, gradInput,
+            dataUniforms, totalElements).GetAwaiter().GetResult();
     }
 
     public void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
