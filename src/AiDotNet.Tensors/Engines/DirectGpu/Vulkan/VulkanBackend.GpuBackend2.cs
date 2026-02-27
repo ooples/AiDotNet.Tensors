@@ -180,6 +180,9 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var inp = DownloadBuffer(input);
         var ker = DownloadBuffer(kernel);
+        // Output padding restricts valid output range (adds extra rows/columns to one side)
+        int effectiveOutH = outHeight - outputPadH;
+        int effectiveOutW = outWidth - outputPadW;
         var outp = new float[batch * outChannels * outHeight * outWidth];
         for (int b = 0; b < batch; b++)
             for (int ic = 0; ic < inChannels; ic++)
@@ -193,7 +196,7 @@ public sealed unsafe partial class VulkanBackend
                                 {
                                     int oh = ih * strideH - padH + kh;
                                     int ow = iw * strideW - padW + kw;
-                                    if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth)
+                                    if (oh >= 0 && oh < effectiveOutH && ow >= 0 && ow < effectiveOutW)
                                         outp[((b * outChannels + oc) * outHeight + oh) * outWidth + ow]
                                             += val * ker[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
                                 }
@@ -389,6 +392,14 @@ public sealed unsafe partial class VulkanBackend
         float[]? msk = mask is not null ? DownloadBuffer(mask) : null;
         var outp = new float[batch * outChannels * outHeight * outWidth];
 
+        if (groups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(groups), "groups must be positive.");
+        if (deformGroups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(deformGroups), "deformGroups must be positive.");
+        if (inChannels % groups != 0)
+            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by groups ({groups}).");
+        if (inChannels % deformGroups != 0)
+            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by deformGroups ({deformGroups}).");
         int inChannelsPerGroup = inChannels / groups;
         int outChannelsPerGroup = outChannels / groups;
         int inChannelsPerDeformGroup = inChannels / deformGroups;
@@ -1372,6 +1383,10 @@ public sealed unsafe partial class VulkanBackend
         var inp = DownloadBuffer(input);
         var g = DownloadBuffer(gamma);
         var b = DownloadBuffer(beta);
+        if (numGroups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGroups), "numGroups must be positive.");
+        if (channels % numGroups != 0)
+            throw new ArgumentException($"channels ({channels}) must be divisible by numGroups ({numGroups}).");
         int channelsPerGroup = channels / numGroups;
         int groupSize = channelsPerGroup * spatialSize;
         var outp = new float[batch * channels * spatialSize];
@@ -1419,7 +1434,47 @@ public sealed unsafe partial class VulkanBackend
         IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
     {
-        BatchNormBackward(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta, batch, channels, spatialSize, epsilon);
+        EnsureInitialized();
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var g = DownloadBuffer(gamma);
+        var sm = DownloadBuffer(saveMean);
+        var siv = DownloadBuffer(saveInvVar);
+        var gi = new float[batch * channels * spatialSize];
+        var gg = new float[channels];
+        var gb = new float[channels];
+
+        // InstanceNorm: statistics are per (batch, channel) pair, N = spatialSize
+        int N = spatialSize;
+        for (int bi = 0; bi < batch; bi++)
+            for (int c = 0; c < channels; c++)
+            {
+                // saveMean/saveInvVar layout: [batch * channels] (from GroupNorm with numGroups=channels)
+                float mean = sm[bi * channels + c];
+                float invVar = siv[bi * channels + c];
+                float sumGrad = 0, sumGradXhat = 0;
+
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = (bi * channels + c) * spatialSize + s;
+                    float xhat = (inp[idx] - mean) * invVar;
+                    gg[c] += go[idx] * xhat;
+                    gb[c] += go[idx];
+                    sumGrad += go[idx];
+                    sumGradXhat += go[idx] * xhat;
+                }
+
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    int idx = (bi * channels + c) * spatialSize + s;
+                    float xhat = (inp[idx] - mean) * invVar;
+                    gi[idx] = g[c] * invVar / N * (N * go[idx] - sumGrad - xhat * sumGradXhat);
+                }
+            }
+
+        UploadToBuffer(gi, gradInput);
+        UploadToBuffer(gg, gradGamma);
+        UploadToBuffer(gb, gradBeta);
     }
 
     public void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -1490,7 +1545,9 @@ public sealed unsafe partial class VulkanBackend
 
         if (training)
         {
-            var rng = new Random((int)(seed & 0x7FFFFFFF));
+            if (dropoutRate < 0f || dropoutRate >= 1f)
+                throw new ArgumentOutOfRangeException(nameof(dropoutRate), $"dropoutRate must be in [0, 1), got {dropoutRate}.");
+            var rng = new Random(unchecked((int)seed) ^ unchecked((int)(seed >> 32)));
             float scale = 1f / (1f - dropoutRate);
             for (int i = 0; i < size; i++)
             {

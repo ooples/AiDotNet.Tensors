@@ -35,7 +35,12 @@ public sealed unsafe partial class VulkanBackend
                     for (int d = 0; d < headDim; d++)
                         dot += q[qOff + i * headDim + d] * k[kOff + j * headDim + d];
                     scores[i * seqLen + j] = dot * scale;
-                    if (m is not null) scores[i * seqLen + j] += m[i * seqLen + j];
+                    if (m is not null)
+                    {
+                        // Support per-head masks: layout [batch*numHeads, seqLen, seqLen] or [seqLen, seqLen]
+                        int maskOffset = m.Length >= totalHeads * seqLen * seqLen ? h * seqLen * seqLen : 0;
+                        scores[i * seqLen + j] += m[maskOffset + i * seqLen + j];
+                    }
                 }
 
             for (int i = 0; i < seqLen; i++)
@@ -165,7 +170,9 @@ public sealed unsafe partial class VulkanBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        ScaledDotProductAttention(query, key, value, output, null, attentionBias, batch, numHeads, seqQ, headDim, scale, isCausal);
+        // Note: seqK may differ from seqQ in cross-attention; this fallback uses seqQ for square attention.
+        int effectiveSeqLen = seqQ;
+        ScaledDotProductAttention(query, key, value, output, null, attentionBias, batch, numHeads, effectiveSeqLen, headDim, scale, isCausal);
         Fill(softmaxStats, 0f, softmaxStats.Size);
     }
 
@@ -185,13 +192,18 @@ public sealed unsafe partial class VulkanBackend
     public void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer output, IGpuBuffer? attentionWeights,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
-        => ScaledDotProductAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, seqQ, headDim, scale, isCausal);
+    {
+        // GQA: numKVHeads < numQHeads, each KV head is shared by numQHeads/numKVHeads query heads.
+        // Fallback treats it as standard MHA with numQHeads.
+        ScaledDotProductAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, seqQ, headDim, scale, isCausal);
+    }
 
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
         IGpuBuffer attentionWeights,
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
+        // GQA backward: using numQHeads for fallback path.
         AttentionBackwardCore(gradOutput, query, key, value, attentionWeights, gradQuery, gradKey, gradValue,
             batch, numQHeads, seqQ, headDim, scale, false);
     }
@@ -343,6 +355,7 @@ public sealed unsafe partial class VulkanBackend
     private float CpuLossReduce(IGpuBuffer predictions, IGpuBuffer targets, int size, Func<float, float, float> lossPerElement)
     {
         EnsureInitialized();
+        if (size == 0) return 0f;
         var p = DownloadBuffer(predictions);
         var t = DownloadBuffer(targets);
         float sum = 0;
@@ -353,6 +366,7 @@ public sealed unsafe partial class VulkanBackend
     private void CpuLossBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, Func<float, float, float> gradPerElement)
     {
         EnsureInitialized();
+        if (size == 0) return;
         var p = DownloadBuffer(predictions);
         var t = DownloadBuffer(targets);
         var gi = new float[size];
@@ -401,6 +415,8 @@ public sealed unsafe partial class VulkanBackend
             for (int c = 0; c < numClasses; c++) logSumExp += MathF.Exp(p[off + c] - max);
             logSumExp = max + MathF.Log(logSumExp);
             int target = SingleToInt32BitsCompat(t[b]);
+            if ((uint)target >= (uint)numClasses)
+                throw new ArgumentOutOfRangeException(nameof(targets), $"Target class index {target} at batch {b} is out of range [0, {numClasses}).");
             loss -= p[off + target] - logSumExp;
         }
         return loss / batchSize;
@@ -421,6 +437,8 @@ public sealed unsafe partial class VulkanBackend
             for (int c = 0; c < numClasses; c++) { gi[off + c] = MathF.Exp(p[off + c] - max); sum += gi[off + c]; }
             for (int c = 0; c < numClasses; c++) gi[off + c] /= sum;
             int target = SingleToInt32BitsCompat(t[b]);
+            if ((uint)target >= (uint)numClasses)
+                throw new ArgumentOutOfRangeException(nameof(targets), $"Target class index {target} at batch {b} is out of range [0, {numClasses}).");
             gi[off + target] -= 1f;
             for (int c = 0; c < numClasses; c++) gi[off + c] /= batchSize;
         }
@@ -499,17 +517,26 @@ public sealed unsafe partial class VulkanBackend
     public float FocalLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float alpha, float gamma)
         => CpuLossReduce(predictions, targets, size, (p, t) =>
         {
-            float cp = MathF.Max(1e-7f, MathF.Min(1f - 1e-7f, p));
+            const float eps = 1e-7f;
+            float cp = MathF.Max(eps, MathF.Min(1f - eps, p));
             float pt = t > 0.5f ? cp : 1f - cp;
+            pt = MathF.Max(eps, MathF.Min(1f - eps, pt));
             return -alpha * MathF.Pow(1f - pt, gamma) * MathF.Log(pt);
         });
 
     public void FocalBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float alpha, float gamma)
         => CpuLossBackward(predictions, targets, gradInput, size, (p, t) =>
         {
-            float cp = MathF.Max(1e-7f, MathF.Min(1f - 1e-7f, p));
-            float pt = t > 0.5f ? cp : 1f - cp;
-            return -alpha * MathF.Pow(1f - pt, gamma) * (gamma * MathF.Log(pt) * (t > 0.5f ? -1f : 1f) + (t > 0.5f ? 1f / cp : -1f / (1f - cp)));
+            const float eps = 1e-7f;
+            float cp = MathF.Max(eps, MathF.Min(1f - eps, p));
+            bool isPositive = t > 0.5f;
+            float pt = isPositive ? cp : 1f - cp;
+            pt = MathF.Max(eps, MathF.Min(1f - eps, pt));
+            float oneMinusPt = 1f - pt;
+            float logPt = MathF.Log(pt);
+            float sign = isPositive ? -1f : 1f;
+            float common = gamma * logPt + 1f / pt;
+            return -alpha * sign * MathF.Pow(oneMinusPt, gamma) * common;
         });
 
     public float LogCoshLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
@@ -757,6 +784,8 @@ public sealed unsafe partial class VulkanBackend
     public void MeanAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         EnsureInitialized();
+        if (reduceSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(reduceSize), "reduceSize must be positive.");
         var a = DownloadBuffer(A);
         var b = new float[outerSize];
         for (int i = 0; i < outerSize; i++)
@@ -771,6 +800,8 @@ public sealed unsafe partial class VulkanBackend
     public void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
         EnsureInitialized();
+        if (reduceSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(reduceSize), "reduceSize must be positive.");
         var a = DownloadBuffer(A);
         var m = DownloadBuffer(mean);
         var v = new float[outerSize];
