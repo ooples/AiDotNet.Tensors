@@ -3791,7 +3791,7 @@ fn measurement_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(0) var<storage, read_write> weights: array<f32>;
 @group(0) @binding(1) var<storage, read> pre_spikes: array<f32>;
 @group(0) @binding(2) var<storage, read> post_spikes: array<f32>;
-@group(0) @binding(3) var<storage, read> pre_traces: array<f32>;
+@group(0) @binding(3) var<storage, read> traces: array<f32>;
 
 struct StdpParams {
     num_pre: u32,
@@ -3812,9 +3812,14 @@ fn stdp_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= total) { return; }
     let i = idx / params.num_post;
     let j = idx % params.num_post;
+    // traces layout: [pre_traces(num_pre), post_traces(num_post)]
+    let pre_trace = traces[i];
+    let post_trace = traces[params.num_pre + j];
     var dw: f32 = 0.0;
-    if (post_spikes[j] > 0.5) { dw = dw + params.a_plus * pre_traces[i]; }
-    if (pre_spikes[i] > 0.5) { dw = dw - params.a_minus * pre_traces[j]; }
+    // LTP: when post-neuron fires, potentiate based on pre-synaptic trace
+    if (post_spikes[j] > 0.5) { dw = dw + params.a_plus * pre_trace; }
+    // LTD: when pre-neuron fires, depress based on post-synaptic trace
+    if (pre_spikes[i] > 0.5) { dw = dw - params.a_minus * post_trace; }
     weights[idx] = weights[idx] + params.lr * dw;
 }
 ";
@@ -4162,8 +4167,8 @@ fn tile_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct DbParams {
     size: u32,
     ref_value: f32,
-    _pad1: f32,
-    _pad2: f32,
+    min_db: f32,
+    _pad: f32,
 }
 @group(0) @binding(2) var<uniform> params: DbParams;
 
@@ -4171,14 +4176,20 @@ struct DbParams {
 fn power_to_db(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.size) { return; }
-    B[idx] = 10.0 * log(max(A[idx], params.ref_value)) / log(10.0);
+    // Convert power to dB: 10 * log10(power / ref_value), clamped to min_db
+    let ref_val = max(params.ref_value, 1e-10);
+    let ratio = max(A[idx], 1e-10) / ref_val;
+    let db_val = 10.0 * log(ratio) / log(10.0);
+    B[idx] = max(db_val, params.min_db);
 }
 
 @compute @workgroup_size(256)
 fn db_to_power(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.size) { return; }
-    B[idx] = pow(10.0, A[idx] / 10.0);
+    // Convert dB to power: ref_value * 10^(dB / 10)
+    let ref_val = max(params.ref_value, 1e-10);
+    B[idx] = ref_val * pow(10.0, A[idx] / 10.0);
 }
 ";
 

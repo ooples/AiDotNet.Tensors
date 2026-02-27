@@ -12,20 +12,18 @@ public sealed partial class WebGpuBackend
 
     public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient, float learningRate, float weightDecay, int size)
     {
-        using var dummyM = (WebGpuBuffer)AllocateBuffer(1);
-        using var dummyV = (WebGpuBuffer)AllocateBuffer(1);
+        var dummy = SharedDummyBuffer;
         var uniforms = MakeOptimizerUniforms(size, learningRate, 0, 0, 0, weightDecay, 0);
         Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "sgd",
-            param, gradient, dummyM, dummyV, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, dummy, dummy, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void SgdMomentumUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
-        using var dummyV = (WebGpuBuffer)AllocateBuffer(1);
         var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
         Dispatch4BufferAsync("Optimizer", WebGpuKernels.OptimizerSource, "sgd_momentum",
-            param, gradient, velocity, dummyV, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, velocity, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
@@ -47,29 +45,26 @@ public sealed partial class WebGpuBackend
     public void RmspropUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer squaredAvg,
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
-        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
         // beta1=rho for rmsprop kernel
         var uniforms = MakeOptimizerUniforms(size, learningRate, rho, 0, epsilon, weightDecay, 0);
         Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "rmsprop",
-            param, gradient, squaredAvg, dummyState2, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, squaredAvg, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void AdagradUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumulatedGrad,
         float learningRate, float epsilon, float weightDecay, int size)
     {
-        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
         var uniforms = MakeOptimizerUniforms(size, learningRate, 0, 0, epsilon, weightDecay, 0);
         Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "adagrad",
-            param, gradient, accumulatedGrad, dummyState2, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, accumulatedGrad, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void NagUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
         float learningRate, float momentum, float weightDecay, int size)
     {
-        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
         var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
         Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "nag",
-            param, gradient, velocity, dummyState2, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, velocity, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
@@ -87,12 +82,11 @@ public sealed partial class WebGpuBackend
         float gNorm = MathF.Sqrt(gNormSq);
         float localLr = pNorm > 0 && gNorm > 0 ? trustCoeff * pNorm / (gNorm + weightDecay * pNorm) : 1f;
         // LarsLambFtrlSource lars_update: extra = pre-computed local_lr, beta1 = momentum
-        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
         var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
         // Replace the last uniform (extra) with localLr
         uniforms[7] = localLr;
         Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lars_update",
-            param, gradient, velocity, dummyState2, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, velocity, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
@@ -156,11 +150,10 @@ public sealed partial class WebGpuBackend
     public void LionUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m,
         float learningRate, float beta1, float beta2, float weightDecay, int size)
     {
-        using var dummyState2 = (WebGpuBuffer)AllocateBuffer(1);
         // Lion kernel uses state1=m, does not use state2
         var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, 0, weightDecay, 0);
         Dispatch4BufferAsync("AdditionalOptimizer", WebGpuKernels.AdditionalOptimizerSource, "lion",
-            param, gradient, m, dummyState2, uniforms, size).GetAwaiter().GetResult();
+            param, gradient, m, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void NadamUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
@@ -182,8 +175,33 @@ public sealed partial class WebGpuBackend
             param, gradient, z, n, uniforms, size).GetAwaiter().GetResult();
     }
 
-    public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size) => Copy(input, output, size);
-    public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size) => Copy(input, output, size);
+    public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        // FP32 -> FP16 emulation: truncate mantissa to 10 bits via GPU kernel.
+        // WebGPU buffers are always f32, so we emulate FP16 by reducing precision
+        // (zeroing the bottom 13 mantissa bits). This matches IEEE 754 half-precision
+        // rounding behavior (round-toward-zero) and handles overflow/underflow.
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            BitConverter.Int32BitsToSingle(0) // direction=0: to_fp16
+        };
+        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
+            input, output, uniforms, size).GetAwaiter().GetResult();
+    }
+
+    public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
+    {
+        // FP16 -> FP32: data is already stored as f32 with FP16-truncated precision.
+        // Simply copy the values through (they are valid f32 representations of FP16 values).
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            BitConverter.Int32BitsToSingle(1) // direction=1: from_fp16
+        };
+        Dispatch2BufferAsync("Fp16Convert", WebGpuKernels.Fp16ConvertSource, "fp16_convert",
+            input, output, uniforms, size).GetAwaiter().GetResult();
+    }
 
     #endregion
 
@@ -213,7 +231,19 @@ public sealed partial class WebGpuBackend
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
         // NeuromorphicSource stdp_update: binding(0)=weights, binding(1)=preSpike, binding(2)=postSpike, binding(3)=preTrace
-        // Uniform: num_pre, num_post, a_plus=ltpRate, a_minus=ltdRate, lr=1.0 (already scaled), pad, pad, pad
+        // The STDP rule uses both pre-synaptic and post-synaptic traces:
+        //   dw += a_plus * pre_trace[i]   when post_spike[j] fires (LTP)
+        //   dw -= a_minus * post_trace[j] when pre_spike[i] fires (LTD)
+        // The kernel currently reads pre_traces at binding(3). We pack both trace buffers
+        // into the preTrace binding by interleaving or using postTrace via the kernel.
+        // Since the kernel indexes pre_traces[j] for LTD (using post-neuron index on pre_traces),
+        // we need to replace that with post_traces[j]. Pack postTrace into the kernel's pre_traces
+        // binding at offset numPre so the kernel can read post_traces[j] = pre_traces[numPre + j].
+        // Actually, the simpler fix: update the kernel to use a 5-buffer dispatch.
+        // For now, combine preTrace and postTrace into a single buffer.
+        using var combinedTraces = (WebGpuBuffer)AllocateBuffer(numPre + numPost);
+        Copy(preTrace, 0, combinedTraces, 0, numPre);
+        Copy(postTrace, 0, combinedTraces, numPre, numPost);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(numPre),
@@ -225,7 +255,7 @@ public sealed partial class WebGpuBackend
         };
         int total = numPre * numPost;
         Dispatch4BufferAsync("Neuromorphic", WebGpuKernels.NeuromorphicSource, "stdp_update",
-            weights, preSpike, postSpike, preTrace, uniforms, total).GetAwaiter().GetResult();
+            weights, preSpike, postSpike, combinedTraces, uniforms, total).GetAwaiter().GetResult();
         // Apply homeostasis and clamping via GPU dispatch
         if (homeostasisRate != 0f || minWeight != float.MinValue || maxWeight != float.MaxValue)
         {
@@ -327,25 +357,45 @@ public sealed partial class WebGpuBackend
     public void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
-        var matResult = AllocateBuffer(batchSize * outputFeatures);
+        using var matResult = (WebGpuBuffer)AllocateBuffer(batchSize * outputFeatures);
         Gemm(input, weights, matResult, batchSize, outputFeatures, inputFeatures);
-        var biasResult = AllocateBuffer(batchSize * outputFeatures);
+        using var biasResult = (WebGpuBuffer)AllocateBuffer(batchSize * outputFeatures);
         BiasAdd(matResult, biases, biasResult, batchSize, outputFeatures);
         PoincareProject(biasResult, output, batchSize, outputFeatures, curvature, epsilon);
-        matResult.Dispose(); biasResult.Dispose();
     }
 
     public void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
-        int batchSize, int inputFeatures, int outputFeatures, float curvature) =>
-        Fill(gradInput, 0f, batchSize * inputFeatures);
+        int batchSize, int inputFeatures, int outputFeatures, float curvature)
+    {
+        // Hyperbolic linear backward for input: gradInput = gradOutput * weights^T
+        // This is the Euclidean gradient; the Riemannian correction from Poincare projection
+        // is left to the optimizer's Riemannian gradient step.
+        using var weightsT = (WebGpuBuffer)AllocateBuffer(outputFeatures * inputFeatures);
+        BatchedTranspose(weights, weightsT, 1, inputFeatures, outputFeatures);
+        Gemm(gradOutput, weightsT, gradInput, batchSize, inputFeatures, outputFeatures);
+    }
 
     public void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
-        int batchSize, int inputFeatures, int outputFeatures, float curvature) =>
-        Fill(gradWeights, 0f, inputFeatures * outputFeatures);
+        int batchSize, int inputFeatures, int outputFeatures, float curvature)
+    {
+        // gradWeights = input^T * gradOutput
+        using var inputT = (WebGpuBuffer)AllocateBuffer(inputFeatures * batchSize);
+        BatchedTranspose(input, inputT, 1, batchSize, inputFeatures);
+        Gemm(inputT, gradOutput, gradWeights, inputFeatures, outputFeatures, batchSize);
+    }
 
     public void HyperbolicLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradBiases,
-        int batchSize, int inputFeatures, int outputFeatures, float curvature) =>
+        int batchSize, int inputFeatures, int outputFeatures, float curvature)
+    {
+        // gradBiases = sum of gradOutput along batch dimension
         Fill(gradBiases, 0f, outputFeatures);
+        for (int b = 0; b < batchSize; b++)
+        {
+            using var slice = (WebGpuBuffer)AllocateBuffer(outputFeatures);
+            Copy(gradOutput, b * outputFeatures, slice, 0, outputFeatures);
+            Add(gradBiases, slice, gradBiases, outputFeatures);
+        }
+    }
 
     #endregion
 
@@ -369,15 +419,48 @@ public sealed partial class WebGpuBackend
     }
 
     public void OctonionLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
-        int batchSize, int inputFeatures, int outputFeatures) =>
-        Fill(gradInput, 0f, batchSize * inputFeatures);
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        // gradInput = gradOutput * weights^T
+        // gradOutput: (batchSize x outputFeatures), weights: (inputFeatures x outputFeatures)
+        // gradInput: (batchSize x inputFeatures) = gradOutput * weights^T
+        using var weightsT = (WebGpuBuffer)AllocateBuffer(outputFeatures * inputFeatures);
+        BatchedTranspose(weights, weightsT, 1, inputFeatures, outputFeatures);
+        Gemm(gradOutput, weightsT, gradInput, batchSize, inputFeatures, outputFeatures);
+    }
 
     public void OctonionLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
-        int batchSize, int inputFeatures, int outputFeatures) =>
-        Fill(gradWeights, 0f, inputFeatures * outputFeatures);
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        // gradWeights = input^T * gradOutput
+        // input: (batchSize x inputFeatures), gradOutput: (batchSize x outputFeatures)
+        // gradWeights: (inputFeatures x outputFeatures) = input^T * gradOutput
+        using var inputT = (WebGpuBuffer)AllocateBuffer(inputFeatures * batchSize);
+        BatchedTranspose(input, inputT, 1, batchSize, inputFeatures);
+        Gemm(inputT, gradOutput, gradWeights, inputFeatures, outputFeatures, batchSize);
+    }
 
-    public void OctonionLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer gradBiases, int batchSize, int outputFeatures) =>
+    public void OctonionLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer gradBiases, int batchSize, int outputFeatures)
+    {
+        // gradBiases = sum of gradOutput along batch dimension
+        // gradBiases[j] = sum_b(gradOutput[b, j])
+        // Use MeanAxis * batchSize or just reduce along axis 0
+        MeanAxis(gradOutput, gradBiases, outputFeatures, batchSize);
+        // MeanAxis divides by batchSize; we want the sum, so scale by batchSize
+        // Actually, for bias gradient, the mean is fine for averaged gradients.
+        // Standard practice: gradBiases = sum over batch, then typically divided by batch later.
+        // We compute the sum directly by treating gradOutput as (outputFeatures x batchSize) and summing.
+        // Use a different approach: reduce along the batch dimension
         Fill(gradBiases, 0f, outputFeatures);
+        // Sum rows: for each output feature, sum over all batch elements
+        for (int b = 0; b < batchSize; b++)
+        {
+            // gradBiases += gradOutput[b, :]
+            using var slice = (WebGpuBuffer)AllocateBuffer(outputFeatures);
+            Copy(gradOutput, b * outputFeatures, slice, 0, outputFeatures);
+            Add(gradBiases, slice, gradBiases, outputFeatures);
+        }
+    }
 
     #endregion
 
@@ -469,16 +552,15 @@ public sealed partial class WebGpuBackend
 
     public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
     {
-        var zeros = AllocateBuffer(n); Fill(zeros, 0f, n);
+        using var zeros = (WebGpuBuffer)AllocateBuffer(n);
+        Fill(zeros, 0f, n);
         FFT(input, zeros, outputReal, outputImag, n, false);
-        zeros.Dispose();
     }
 
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
-        var tempImag = AllocateBuffer(n);
+        using var tempImag = (WebGpuBuffer)AllocateBuffer(n);
         FFT(inputReal, inputImag, output, tempImag, n, true);
-        tempImag.Dispose();
     }
 
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
@@ -569,11 +651,11 @@ public sealed partial class WebGpuBackend
 
     public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
     {
-        // PowerDbSource power_to_db: binding(0)=A(power), binding(1)=B(db), uniform: size, ref_value
+        // PowerDbSource power_to_db: binding(0)=A(power), binding(1)=B(db), uniform: size, ref_value, min_db
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(n),
-            refValue, 0, 0
+            refValue, minDb, 0
         };
         Dispatch2BufferAsync("PowerDb", WebGpuKernels.PowerDbSource, "power_to_db",
             power, db, uniforms, n).GetAwaiter().GetResult();
@@ -685,13 +767,235 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
+        // LSTM Backpropagation Through Time (BPTT)
+        // Initialize gradient accumulators to zero
+        int hs = hiddenSize;
+        int cellTotal = batch * hs;
         Fill(gradInput, 0f, batch * seqLen * inputSize);
-        Fill(gradHInit, 0f, batch * hiddenSize);
-        Fill(gradCInit, 0f, batch * hiddenSize);
-        Fill(gradWeightsIh, 0f, 4 * hiddenSize * inputSize);
-        Fill(gradWeightsHh, 0f, 4 * hiddenSize * hiddenSize);
-        Fill(gradBiasIh, 0f, 4 * hiddenSize);
-        Fill(gradBiasHh, 0f, 4 * hiddenSize);
+        Fill(gradWeightsIh, 0f, 4 * hs * inputSize);
+        Fill(gradWeightsHh, 0f, 4 * hs * hs);
+        Fill(gradBiasIh, 0f, 4 * hs);
+        Fill(gradBiasHh, 0f, 4 * hs);
+
+        // Running gradient of hidden state and cell state
+        using var gradH = (WebGpuBuffer)AllocateBuffer(cellTotal);
+        using var gradC = (WebGpuBuffer)AllocateBuffer(cellTotal);
+        Fill(gradH, 0f, cellTotal);
+        Fill(gradC, 0f, cellTotal);
+
+        // Download weights for CPU-side gradient accumulation
+        var wihData = DownloadBufferData(weightsIh);
+        var whhData = DownloadBufferData(weightsHh);
+
+        // Iterate backwards through time
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            // Add gradient from output at this timestep to gradH
+            // gradOutput[b, t, :] -> gradH[b, :]
+            using var gradOutSlice = (WebGpuBuffer)AllocateBuffer(cellTotal);
+            var sliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(hs),
+                BitConverter.Int32BitsToSingle(seqLen * hs),
+                BitConverter.Int32BitsToSingle(hs),
+                BitConverter.Int32BitsToSingle(t * hs),
+                BitConverter.Int32BitsToSingle(0),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                gradOutput, gradOutSlice, sliceUniforms, cellTotal).GetAwaiter().GetResult();
+            Add(gradH, gradOutSlice, gradH, cellTotal);
+
+            // Get h_prev and c_prev for this timestep
+            // c_prev = t > 0 ? allC[(t-1)*batch*hs : t*batch*hs] : cInit
+            using var cPrev = (WebGpuBuffer)AllocateBuffer(cellTotal);
+            if (t > 0)
+                Copy(allC, (t - 1) * cellTotal, cPrev, 0, cellTotal);
+            else
+                Copy(cInit, cPrev, cellTotal);
+
+            // Download current states for CPU computation of gate gradients
+            var hData = DownloadBufferData(gradH);
+            var cData = DownloadBufferData(gradC);
+            var cPrevData = DownloadBufferData(cPrev);
+
+            // Get current cell state
+            var allCData = DownloadBufferData(allC);
+
+            // Recompute gates for this timestep from allH, allC, input
+            // h_prev for this timestep
+            using var hPrev = (WebGpuBuffer)AllocateBuffer(cellTotal);
+            if (t > 0)
+                Copy(allH, (t - 1) * cellTotal, hPrev, 0, cellTotal);
+            else
+                Copy(hInit, hPrev, cellTotal);
+
+            var hPrevData = DownloadBufferData(hPrev);
+
+            // Get input slice for this timestep
+            using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
+            var inSliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(t * inputSize),
+                BitConverter.Int32BitsToSingle(0),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                input, inputSlice, inSliceUniforms, batch * inputSize).GetAwaiter().GetResult();
+            var inputData = DownloadBufferData(inputSlice);
+
+            // Recompute gates and compute gradients on CPU
+            var gradGates = new float[batch * 4 * hs]; // [di, df, dg, do] per element
+            var newGradC = new float[cellTotal];
+            var newGradH = new float[cellTotal];
+            var gradInputT = new float[batch * inputSize];
+
+            for (int b = 0; b < batch; b++)
+            {
+                for (int h = 0; h < hs; h++)
+                {
+                    int idx = b * hs + h;
+                    // Recompute gates
+                    float[] gates = new float[4];
+                    for (int gate = 0; gate < 4; gate++)
+                    {
+                        float val = 0;
+                        int wihOff = (gate * hs + h) * inputSize;
+                        for (int j = 0; j < inputSize; j++)
+                            val += wihData[wihOff + j] * inputData[b * inputSize + j];
+                        int whhOff = (gate * hs + h) * hs;
+                        for (int j = 0; j < hs; j++)
+                            val += whhData[whhOff + j] * hPrevData[b * hs + j];
+                        gates[gate] = val;
+                    }
+                    float iGate = 1f / (1f + MathF.Exp(-gates[0]));
+                    float fGate = 1f / (1f + MathF.Exp(-gates[1]));
+                    float gGate = MathF.Tanh(gates[2]);
+                    float oGate = 1f / (1f + MathF.Exp(-gates[3]));
+                    float cNew = allCData[t * cellTotal + idx];
+                    float tanhC = MathF.Tanh(cNew);
+
+                    float dh = hData[idx];
+                    float dcNext = cData[idx];
+
+                    // dc = dh * o * (1 - tanh(c)^2) + dc_next
+                    float dc = dh * oGate * (1 - tanhC * tanhC) + dcNext;
+
+                    // Gate gradients
+                    float di = dc * gGate * iGate * (1 - iGate);
+                    float df = dc * cPrevData[idx] * fGate * (1 - fGate);
+                    float dg = dc * iGate * (1 - gGate * gGate);
+                    float dOGate = dh * tanhC * oGate * (1 - oGate);
+
+                    gradGates[b * 4 * hs + 0 * hs + h] = di;
+                    gradGates[b * 4 * hs + 1 * hs + h] = df;
+                    gradGates[b * 4 * hs + 2 * hs + h] = dg;
+                    gradGates[b * 4 * hs + 3 * hs + h] = dOGate;
+
+                    // Gradient for c_prev
+                    newGradC[idx] = dc * fGate;
+
+                    // Gradient for h_prev (through W_hh)
+                    // Will be accumulated below
+                }
+            }
+
+            // Compute gradInput for this timestep: gradInput_t = gradGates * W_ih^T
+            for (int b = 0; b < batch; b++)
+            {
+                for (int j = 0; j < inputSize; j++)
+                {
+                    float sum = 0;
+                    for (int gate = 0; gate < 4; gate++)
+                    {
+                        for (int h = 0; h < hs; h++)
+                        {
+                            int wihOff = (gate * hs + h) * inputSize + j;
+                            sum += gradGates[b * 4 * hs + gate * hs + h] * wihData[wihOff];
+                        }
+                    }
+                    gradInputT[b * inputSize + j] = sum;
+                }
+            }
+
+            // Upload gradInput for this timestep
+            using var gradInputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
+            UploadToBuffer(gradInputT, gradInputSlice);
+            // Scatter to gradInput[b, t, :]
+            var scatterUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),
+                BitConverter.Int32BitsToSingle(0),
+                BitConverter.Int32BitsToSingle(t * inputSize),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                gradInputSlice, gradInput, scatterUniforms, batch * inputSize).GetAwaiter().GetResult();
+
+            // Compute gradH_prev = gradGates * W_hh^T
+            for (int b = 0; b < batch; b++)
+            {
+                for (int j = 0; j < hs; j++)
+                {
+                    float sum = 0;
+                    for (int gate = 0; gate < 4; gate++)
+                    {
+                        for (int h = 0; h < hs; h++)
+                        {
+                            int whhOff = (gate * hs + h) * hs + j;
+                            sum += gradGates[b * 4 * hs + gate * hs + h] * whhData[whhOff];
+                        }
+                    }
+                    newGradH[b * hs + j] = sum;
+                }
+            }
+
+            // Accumulate weight gradients: gradW_ih += gradGates^T * input_t, gradW_hh += gradGates^T * h_prev
+            var gWihData = DownloadBufferData(gradWeightsIh);
+            var gWhhData = DownloadBufferData(gradWeightsHh);
+            var gBiasData = DownloadBufferData(gradBiasIh);
+
+            for (int b = 0; b < batch; b++)
+            {
+                for (int gate = 0; gate < 4; gate++)
+                {
+                    for (int h = 0; h < hs; h++)
+                    {
+                        float dGate = gradGates[b * 4 * hs + gate * hs + h];
+                        // W_ih gradient
+                        for (int j = 0; j < inputSize; j++)
+                            gWihData[(gate * hs + h) * inputSize + j] += dGate * inputData[b * inputSize + j];
+                        // W_hh gradient
+                        for (int j = 0; j < hs; j++)
+                            gWhhData[(gate * hs + h) * hs + j] += dGate * hPrevData[b * hs + j];
+                        // Bias gradient
+                        gBiasData[gate * hs + h] += dGate;
+                    }
+                }
+            }
+
+            UploadToBuffer(gWihData, gradWeightsIh);
+            UploadToBuffer(gWhhData, gradWeightsHh);
+            UploadToBuffer(gBiasData, gradBiasIh);
+
+            // Update running gradients
+            UploadToBuffer(newGradH, gradH);
+            UploadToBuffer(newGradC, gradC);
+        }
+
+        // Copy final gradients
+        Copy(gradH, gradHInit, cellTotal);
+        Copy(gradC, gradCInit, cellTotal);
+        // gradBiasHh = gradBiasIh (same bias gradient accumulation)
+        Copy(gradBiasIh, gradBiasHh, 4 * hs);
     }
 
     public void GruForwardSequence(
@@ -779,13 +1083,198 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
+        // GRU Backpropagation Through Time (BPTT)
+        int hs = hiddenSize;
+        int cellTotal = batch * hs;
         Fill(gradInput, 0f, batch * seqLen * inputSize);
-        Fill(gradHInit, 0f, batch * hiddenSize);
-        Fill(dHBuffer, 0f, batch * hiddenSize);
-        Fill(gradWeightsIh, 0f, 3 * hiddenSize * inputSize);
-        Fill(gradWeightsHh, 0f, 3 * hiddenSize * hiddenSize);
-        Fill(gradBiasIh, 0f, 3 * hiddenSize);
-        Fill(gradBiasHh, 0f, 3 * hiddenSize);
+        Fill(gradWeightsIh, 0f, 3 * hs * inputSize);
+        Fill(gradWeightsHh, 0f, 3 * hs * hs);
+        Fill(gradBiasIh, 0f, 3 * hs);
+        Fill(gradBiasHh, 0f, 3 * hs);
+
+        using var gradH = (WebGpuBuffer)AllocateBuffer(cellTotal);
+        Fill(gradH, 0f, cellTotal);
+
+        var wihData = DownloadBufferData(weightsIh);
+        var whhData = DownloadBufferData(weightsHh);
+
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            // Add gradient from output at this timestep
+            using var gradOutSlice = (WebGpuBuffer)AllocateBuffer(cellTotal);
+            var sliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(hs),
+                BitConverter.Int32BitsToSingle(seqLen * hs),
+                BitConverter.Int32BitsToSingle(hs),
+                BitConverter.Int32BitsToSingle(t * hs),
+                BitConverter.Int32BitsToSingle(0),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                gradOutput, gradOutSlice, sliceUniforms, cellTotal).GetAwaiter().GetResult();
+            Add(gradH, gradOutSlice, gradH, cellTotal);
+
+            // Get h_prev
+            using var hPrev = (WebGpuBuffer)AllocateBuffer(cellTotal);
+            if (t > 0)
+                Copy(allH, (t - 1) * cellTotal, hPrev, 0, cellTotal);
+            else
+                Copy(dHBuffer, hPrev, cellTotal); // dHBuffer holds hInit initially
+
+            var hPrevData = DownloadBufferData(hPrev);
+            var dhData = DownloadBufferData(gradH);
+
+            // Get input slice
+            using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
+            var inSliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(t * inputSize),
+                BitConverter.Int32BitsToSingle(0),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                input, inputSlice, inSliceUniforms, batch * inputSize).GetAwaiter().GetResult();
+            var inputData = DownloadBufferData(inputSlice);
+
+            // Recompute GRU gates and compute gradients on CPU
+            var gradGates = new float[batch * 3 * hs]; // [dr, dz, dn]
+            var newGradH = new float[cellTotal];
+            var gradInputT = new float[batch * inputSize];
+
+            for (int b = 0; b < batch; b++)
+            {
+                for (int h = 0; h < hs; h++)
+                {
+                    int idx = b * hs + h;
+                    // Recompute gates
+                    float[] gates = new float[3];
+                    for (int gate = 0; gate < 3; gate++)
+                    {
+                        float val = 0;
+                        int wihOff = (gate * hs + h) * inputSize;
+                        for (int j = 0; j < inputSize; j++)
+                            val += wihData[wihOff + j] * inputData[b * inputSize + j];
+                        int whhOff = (gate * hs + h) * hs;
+                        for (int j = 0; j < hs; j++)
+                            val += whhData[whhOff + j] * hPrevData[b * hs + j];
+                        gates[gate] = val;
+                    }
+                    float rGate = 1f / (1f + MathF.Exp(-gates[0]));
+                    float zGate = 1f / (1f + MathF.Exp(-gates[1]));
+
+                    // Recompute n_gate with reset
+                    float nVal = 0;
+                    int wihNOff = (2 * hs + h) * inputSize;
+                    for (int j = 0; j < inputSize; j++)
+                        nVal += wihData[wihNOff + j] * inputData[b * inputSize + j];
+                    float nHid = 0;
+                    int whhNOff = (2 * hs + h) * hs;
+                    for (int j = 0; j < hs; j++)
+                        nHid += whhData[whhNOff + j] * hPrevData[b * hs + j];
+                    float nGate = MathF.Tanh(nVal + rGate * nHid);
+
+                    float dh = dhData[idx];
+                    // h_new = (1-z)*n + z*h_prev
+                    float dn = dh * (1 - zGate) * (1 - nGate * nGate);
+                    float dz = dh * (hPrevData[idx] - nGate) * zGate * (1 - zGate);
+                    float dr = dn * nHid * rGate * (1 - rGate);
+
+                    gradGates[b * 3 * hs + 0 * hs + h] = dr;
+                    gradGates[b * 3 * hs + 1 * hs + h] = dz;
+                    gradGates[b * 3 * hs + 2 * hs + h] = dn;
+
+                    // Gradient for h_prev: dh_prev += dh * z
+                    newGradH[idx] = dh * zGate;
+                }
+            }
+
+            // Compute gradInput for this timestep
+            for (int b = 0; b < batch; b++)
+            {
+                for (int j = 0; j < inputSize; j++)
+                {
+                    float sum = 0;
+                    for (int gate = 0; gate < 3; gate++)
+                    {
+                        for (int h = 0; h < hs; h++)
+                        {
+                            int wihOff = (gate * hs + h) * inputSize + j;
+                            sum += gradGates[b * 3 * hs + gate * hs + h] * wihData[wihOff];
+                        }
+                    }
+                    gradInputT[b * inputSize + j] = sum;
+                }
+            }
+
+            using var gradInputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
+            UploadToBuffer(gradInputT, gradInputSlice);
+            var scatterUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),
+                BitConverter.Int32BitsToSingle(0),
+                BitConverter.Int32BitsToSingle(t * inputSize),
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                gradInputSlice, gradInput, scatterUniforms, batch * inputSize).GetAwaiter().GetResult();
+
+            // Accumulate weight gradients
+            var gWihData = DownloadBufferData(gradWeightsIh);
+            var gWhhData = DownloadBufferData(gradWeightsHh);
+            var gBiasData = DownloadBufferData(gradBiasIh);
+
+            for (int b = 0; b < batch; b++)
+            {
+                for (int gate = 0; gate < 3; gate++)
+                {
+                    for (int h = 0; h < hs; h++)
+                    {
+                        float dGate = gradGates[b * 3 * hs + gate * hs + h];
+                        for (int j = 0; j < inputSize; j++)
+                            gWihData[(gate * hs + h) * inputSize + j] += dGate * inputData[b * inputSize + j];
+                        for (int j = 0; j < hs; j++)
+                            gWhhData[(gate * hs + h) * hs + j] += dGate * hPrevData[b * hs + j];
+                        gBiasData[gate * hs + h] += dGate;
+                    }
+                }
+            }
+
+            UploadToBuffer(gWihData, gradWeightsIh);
+            UploadToBuffer(gWhhData, gradWeightsHh);
+            UploadToBuffer(gBiasData, gradBiasIh);
+
+            // Compute gradH_prev through W_hh
+            for (int b = 0; b < batch; b++)
+            {
+                for (int j = 0; j < hs; j++)
+                {
+                    float sum = 0;
+                    for (int gate = 0; gate < 3; gate++)
+                    {
+                        for (int h = 0; h < hs; h++)
+                        {
+                            int whhOff = (gate * hs + h) * hs + j;
+                            sum += gradGates[b * 3 * hs + gate * hs + h] * whhData[whhOff];
+                        }
+                    }
+                    newGradH[b * hs + j] += sum;
+                }
+            }
+
+            UploadToBuffer(newGradH, gradH);
+        }
+
+        Copy(gradH, gradHInit, cellTotal);
+        Copy(gradBiasIh, gradBiasHh, 3 * hs);
     }
 
     public void GruCellBackward(
@@ -794,10 +1283,73 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradPrevH, IGpuBuffer gradGateR, IGpuBuffer gradGateZ, IGpuBuffer gradGateN,
         int batch, int hiddenSize)
     {
-        Fill(gradPrevH, 0f, batch * hiddenSize);
-        Fill(gradGateR, 0f, batch * hiddenSize);
-        Fill(gradGateZ, 0f, batch * hiddenSize);
-        Fill(gradGateN, 0f, batch * hiddenSize);
+        // GRU cell backward: compute gate gradients from dH
+        int cellTotal = batch * hiddenSize;
+        var dhData = DownloadBufferData(gradH);
+        var rData = DownloadBufferData(gateR);
+        var zData = DownloadBufferData(gateZ);
+        var nData = DownloadBufferData(gateN);
+        var hPrevData = DownloadBufferData(prevH);
+        var whhData = DownloadBufferData(weightsHh);
+
+        var gradRData = new float[cellTotal];
+        var gradZData = new float[cellTotal];
+        var gradNData = new float[cellTotal];
+        var gradPrevHData = new float[cellTotal];
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int h = 0; h < hiddenSize; h++)
+            {
+                int idx = b * hiddenSize + h;
+                float dh = dhData[idx];
+                float r = rData[idx];
+                float z = zData[idx];
+                float n = nData[idx];
+
+                // h_new = (1 - z) * n + z * h_prev
+                float dn = dh * (1 - z) * (1 - n * n);
+                float dz = dh * (hPrevData[idx] - n) * z * (1 - z);
+
+                // Compute hidden contribution for reset gate gradient
+                float nHid = 0;
+                int whhNOff = (2 * hiddenSize + h) * hiddenSize;
+                for (int j = 0; j < hiddenSize; j++)
+                    nHid += whhData[whhNOff + j] * hPrevData[b * hiddenSize + j];
+                float dr = dn * nHid * r * (1 - r);
+
+                gradRData[idx] = dr;
+                gradZData[idx] = dz;
+                gradNData[idx] = dn;
+                gradPrevHData[idx] = dh * z;
+            }
+        }
+
+        // Accumulate gradPrevH through W_hh
+        for (int b = 0; b < batch; b++)
+        {
+            for (int j = 0; j < hiddenSize; j++)
+            {
+                float sum = 0;
+                for (int gate = 0; gate < 3; gate++)
+                {
+                    for (int h = 0; h < hiddenSize; h++)
+                    {
+                        int whhOff = (gate * hiddenSize + h) * hiddenSize + j;
+                        float dGate = gate == 0 ? gradRData[b * hiddenSize + h]
+                                    : gate == 1 ? gradZData[b * hiddenSize + h]
+                                    : gradNData[b * hiddenSize + h];
+                        sum += dGate * whhData[whhOff];
+                    }
+                }
+                gradPrevHData[b * hiddenSize + j] += sum;
+            }
+        }
+
+        UploadToBuffer(gradRData, gradGateR);
+        UploadToBuffer(gradZData, gradGateZ);
+        UploadToBuffer(gradNData, gradGateN);
+        UploadToBuffer(gradPrevHData, gradPrevH);
     }
 
     #endregion

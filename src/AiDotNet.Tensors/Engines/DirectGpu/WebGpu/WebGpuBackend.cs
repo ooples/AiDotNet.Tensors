@@ -40,6 +40,24 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
     private bool _initialized;
     private bool _disposed;
 
+    // Shared dummy buffer for optimizer kernels that require unused buffer slots.
+    // Avoids per-call allocation overhead for SGD, NAG, Lion, etc.
+    private WebGpuBuffer? _sharedDummyBuffer;
+
+    /// <summary>
+    /// Gets a shared single-element dummy buffer for kernel dispatch padding.
+    /// Lazily allocated on first use.
+    /// </summary>
+    private WebGpuBuffer SharedDummyBuffer
+    {
+        get
+        {
+            if (_sharedDummyBuffer is null || !_sharedDummyBuffer.IsValid)
+                _sharedDummyBuffer = (WebGpuBuffer)AllocateBuffer(1);
+            return _sharedDummyBuffer;
+        }
+    }
+
     /// <inheritdoc/>
     public bool IsAvailable => _initialized && !_disposed;
 
@@ -64,7 +82,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
     public long GlobalMemoryBytes => _device.MaxBufferSize;
 
     /// <inheritdoc/>
-    public long LocalMemoryBytes => _device.MaxWorkgroupSize * 4L;
+    /// <summary>
+    /// Gets the local (workgroup) memory in bytes.
+    /// WebGPU reports MaxStorageBufferBindingSize for shared memory limits.
+    /// We use a reasonable default of 16KB for workgroup shared memory.
+    /// </summary>
+    public long LocalMemoryBytes => 16384L;
 
     /// <summary>
     /// Gets the maximum buffer size in bytes.
