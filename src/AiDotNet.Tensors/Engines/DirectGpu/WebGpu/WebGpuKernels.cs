@@ -4529,6 +4529,248 @@ fn scatter_add_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// 3D convolution kernel.
+    /// </summary>
+    public const string Conv3DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> kernel: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+struct Conv3DParams {
+    batch: u32, in_ch: u32, in_d: u32, in_h: u32, in_w: u32,
+    out_ch: u32, out_d: u32, out_h: u32, out_w: u32,
+    k_d: u32, k_h: u32, k_w: u32,
+    s_d: u32, s_h: u32, s_w: u32,
+    p_d: u32, p_h: u32, p_w: u32,
+    dil_d: u32, dil_h: u32,
+    dil_w: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+}
+@group(0) @binding(3) var<uniform> params: Conv3DParams;
+
+@compute @workgroup_size(256)
+fn conv3d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let out_spatial = params.out_d * params.out_h * params.out_w;
+    let total = params.batch * params.out_ch * out_spatial;
+    if (idx >= total) { return; }
+    let ow = idx % params.out_w;
+    let oh = (idx / params.out_w) % params.out_h;
+    let od = (idx / (params.out_w * params.out_h)) % params.out_d;
+    let oc = (idx / out_spatial) % params.out_ch;
+    let n = idx / (out_spatial * params.out_ch);
+    var sum_val: f32 = 0.0;
+    for (var ic: u32 = 0u; ic < params.in_ch; ic = ic + 1u) {
+        for (var kd: u32 = 0u; kd < params.k_d; kd = kd + 1u) {
+            let id_s = i32(od * params.s_d + kd * params.dil_d) - i32(params.p_d);
+            if (id_s < 0 || u32(id_s) >= params.in_d) { continue; }
+            let id = u32(id_s);
+            for (var kh: u32 = 0u; kh < params.k_h; kh = kh + 1u) {
+                let ih_s = i32(oh * params.s_h + kh * params.dil_h) - i32(params.p_h);
+                if (ih_s < 0 || u32(ih_s) >= params.in_h) { continue; }
+                let ih = u32(ih_s);
+                for (var kw: u32 = 0u; kw < params.k_w; kw = kw + 1u) {
+                    let iw_s = i32(ow * params.s_w + kw * params.dil_w) - i32(params.p_w);
+                    if (iw_s < 0 || u32(iw_s) >= params.in_w) { continue; }
+                    let iw = u32(iw_s);
+                    let in_idx = (((n * params.in_ch + ic) * params.in_d + id) * params.in_h + ih) * params.in_w + iw;
+                    let k_idx = (((oc * params.in_ch + ic) * params.k_d + kd) * params.k_h + kh) * params.k_w + kw;
+                    sum_val = sum_val + input[in_idx] * kernel[k_idx];
+                }
+            }
+        }
+    }
+    output[idx] = sum_val;
+}
+";
+
+    /// <summary>
+    /// 3D max pooling kernel.
+    /// </summary>
+    public const string Pool3DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Pool3DParams {
+    batch: u32, channels: u32,
+    in_d: u32, in_h: u32, in_w: u32,
+    out_d: u32, out_h: u32, out_w: u32,
+    k_d: u32, k_h: u32, k_w: u32,
+    s_d: u32, s_h: u32, s_w: u32,
+    _pad1: u32, _pad2: u32,
+}
+@group(0) @binding(2) var<uniform> params: Pool3DParams;
+
+@compute @workgroup_size(256)
+fn max_pool3d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let out_spatial = params.out_d * params.out_h * params.out_w;
+    let total = params.batch * params.channels * out_spatial;
+    if (idx >= total) { return; }
+    let ow = idx % params.out_w;
+    let oh = (idx / params.out_w) % params.out_h;
+    let od = (idx / (params.out_w * params.out_h)) % params.out_d;
+    let nc = idx / out_spatial;
+    var max_val: f32 = -3.402823e+38;
+    for (var kd: u32 = 0u; kd < params.k_d; kd = kd + 1u) {
+        let id = od * params.s_d + kd;
+        if (id >= params.in_d) { continue; }
+        for (var kh: u32 = 0u; kh < params.k_h; kh = kh + 1u) {
+            let ih = oh * params.s_h + kh;
+            if (ih >= params.in_h) { continue; }
+            for (var kw: u32 = 0u; kw < params.k_w; kw = kw + 1u) {
+                let iw = ow * params.s_w + kw;
+                if (iw >= params.in_w) { continue; }
+                max_val = max(max_val, input[(nc * params.in_d + id) * params.in_h * params.in_w + ih * params.in_w + iw]);
+            }
+        }
+    }
+    output[idx] = select(0.0, max_val, max_val > -3.402823e+38);
+}
+";
+
+    /// <summary>
+    /// 3D nearest neighbor upsample and backward.
+    /// </summary>
+    public const string Upsample3DSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Up3DParams {
+    batch_channels: u32,
+    in_d: u32, in_h: u32, in_w: u32,
+    scale_d: u32, scale_h: u32, scale_w: u32,
+    _pad: u32,
+}
+@group(0) @binding(2) var<uniform> params: Up3DParams;
+
+@compute @workgroup_size(256)
+fn nearest_upsample3d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let out_d = params.in_d * params.scale_d;
+    let out_h = params.in_h * params.scale_h;
+    let out_w = params.in_w * params.scale_w;
+    let out_spatial = out_d * out_h * out_w;
+    let total = params.batch_channels * out_spatial;
+    if (idx >= total) { return; }
+    let ow = idx % out_w;
+    let oh = (idx / out_w) % out_h;
+    let od = (idx / (out_w * out_h)) % out_d;
+    let nc = idx / out_spatial;
+    let id = od / params.scale_d;
+    let ih = oh / params.scale_h;
+    let iw = ow / params.scale_w;
+    output[idx] = input[(nc * params.in_d + id) * params.in_h * params.in_w + ih * params.in_w + iw];
+}
+
+@compute @workgroup_size(256)
+fn nearest_upsample3d_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let in_spatial = params.in_d * params.in_h * params.in_w;
+    let total = params.batch_channels * in_spatial;
+    if (idx >= total) { return; }
+    let iw = idx % params.in_w;
+    let ih = (idx / params.in_w) % params.in_h;
+    let id = (idx / (params.in_w * params.in_h)) % params.in_d;
+    let nc = idx / in_spatial;
+    let out_d = params.in_d * params.scale_d;
+    let out_h = params.in_h * params.scale_h;
+    let out_w = params.in_w * params.scale_w;
+    var sum_val: f32 = 0.0;
+    for (var sd: u32 = 0u; sd < params.scale_d; sd = sd + 1u) {
+        for (var sh: u32 = 0u; sh < params.scale_h; sh = sh + 1u) {
+            for (var sw: u32 = 0u; sw < params.scale_w; sw = sw + 1u) {
+                let od = id * params.scale_d + sd;
+                let oh = ih * params.scale_h + sh;
+                let ow = iw * params.scale_w + sw;
+                sum_val = sum_val + input[(nc * out_d + od) * out_h * out_w + oh * out_w + ow];
+            }
+        }
+    }
+    output[idx] = sum_val;
+}
+";
+
+    /// <summary>
+    /// Bias gradient: sum over batch and spatial per channel (2 buffers: gradOutput, gradBias).
+    /// </summary>
+    public const string BiasGradSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read_write> grad_bias: array<f32>;
+
+struct BiasGradParams {
+    batch: u32,
+    channels: u32,
+    spatial: u32,
+    _pad: u32,
+}
+@group(0) @binding(2) var<uniform> params: BiasGradParams;
+
+@compute @workgroup_size(256)
+fn bias_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.channels) { return; }
+    var sum_val: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            sum_val = sum_val + grad_output[(n * params.channels + c) * params.spatial + s];
+        }
+    }
+    grad_bias[c] = sum_val;
+}
+";
+
+    /// <summary>
+    /// Batch normalization training mode with running stats update.
+    /// </summary>
+    public const string BatchNormTrainingSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> gamma: array<f32>;
+@group(0) @binding(2) var<storage, read> beta: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+struct BNTrainParams {
+    batch: u32,
+    channels: u32,
+    spatial: u32,
+    epsilon: f32,
+    momentum: f32,
+    training: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(4) var<uniform> params: BNTrainParams;
+
+@compute @workgroup_size(256)
+fn batch_norm_train(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.channels) { return; }
+    let count = params.batch * params.spatial;
+    var mean_val: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            mean_val = mean_val + input[(n * params.channels + c) * params.spatial + s];
+        }
+    }
+    mean_val = mean_val / f32(count);
+    var var_val: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            let d = input[(n * params.channels + c) * params.spatial + s] - mean_val;
+            var_val = var_val + d * d;
+        }
+    }
+    var_val = var_val / f32(count);
+    let inv_std = 1.0 / sqrt(var_val + params.epsilon);
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            let i = (n * params.channels + c) * params.spatial + s;
+            output[i] = gamma[c] * (input[i] - mean_val) * inv_std + beta[c];
+        }
+    }
+}
+";
+
+    /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
     public static string GetCombinedSource()
@@ -4555,7 +4797,9 @@ fn scatter_add_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
                RnnCellSource + SparseOpsSource + PermuteSource +
                FusedGemmBiasSource + TileSource + PowerDbSource +
                CapsuleSquashSource + CapsuleOpsSource + CopyOpsSource +
-               Sparse2x4Source + CsrSpMMSource + CsrSegmentedSource + ScatterEdgesSource;
+               Sparse2x4Source + CsrSpMMSource + CsrSegmentedSource + ScatterEdgesSource +
+               Conv3DSource + Pool3DSource + Upsample3DSource + BiasGradSource +
+               BatchNormTrainingSource;
     }
 }
 #endif

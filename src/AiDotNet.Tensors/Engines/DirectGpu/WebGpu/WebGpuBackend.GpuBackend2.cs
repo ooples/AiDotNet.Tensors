@@ -62,31 +62,18 @@ public sealed partial class WebGpuBackend
         int padD, int padH, int padW,
         int dilationD, int dilationH, int dilationW)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input); var k = DownloadBufferData(kernel);
-        var o = new float[batch * outChannels * outDepth * outHeight * outWidth];
-        for (int n = 0; n < batch; n++)
-            for (int oc = 0; oc < outChannels; oc++)
-                for (int od = 0; od < outDepth; od++)
-                    for (int oh = 0; oh < outHeight; oh++)
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            float sum = 0;
-                            for (int ic = 0; ic < inChannels; ic++)
-                                for (int kd = 0; kd < kernelD; kd++)
-                                    for (int kh = 0; kh < kernelH; kh++)
-                                        for (int kw = 0; kw < kernelW; kw++)
-                                        {
-                                            int id = od * strideD - padD + kd * dilationD;
-                                            int ih = oh * strideH - padH + kh * dilationH;
-                                            int iw = ow * strideW - padW + kw * dilationW;
-                                            if (id >= 0 && id < inDepth && ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
-                                                sum += inp[(((n * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw]
-                                                     * k[(((oc * inChannels + ic) * kernelD + kd) * kernelH + kh) * kernelW + kw];
-                                        }
-                            o[(((n * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
-                        }
-        UploadToBuffer(o, output);
+        // Conv3DParams: 24 u32 fields packed as floats
+        var uniforms = new float[24];
+        int[] vals = { batch, inChannels, inDepth, inHeight, inWidth,
+                       outChannels, outDepth, outHeight, outWidth,
+                       kernelD, kernelH, kernelW,
+                       strideD, strideH, strideW,
+                       padD, padH, padW,
+                       dilationD, dilationH, dilationW, 0, 0, 0 };
+        for (int i = 0; i < 24; i++) uniforms[i] = BitConverter.Int32BitsToSingle(vals[i]);
+        int total = batch * outChannels * outDepth * outHeight * outWidth;
+        Dispatch3BufferAsync("Conv3D", WebGpuKernels.Conv3DSource, "conv3d",
+            input, kernel, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -172,17 +159,17 @@ public sealed partial class WebGpuBackend
     public void LocallyConnectedConv2DBackwardBias(IGpuBuffer gradOutput, IGpuBuffer gradBias,
         int batch, int outChannels, int outHeight, int outWidth)
     {
-        // Sum over batch and spatial dimensions per channel using StatisticsSource "sum_axis"
-        // outer_size = outChannels, reduce_size = batch * spatial
-        // This works if data is laid out as [channel][batch*spatial], but actual layout is [batch][channel][spatial]
-        // So we keep CPU for correct reduction across non-contiguous slices
-        EnsureInitialized();
-        var go = DownloadBufferData(gradOutput); var gb = new float[outChannels];
+        // BiasGradSource: per-channel sum over batch and spatial dimensions
         int spatial = outHeight * outWidth;
-        for (int n = 0; n < batch; n++)
-            for (int c = 0; c < outChannels; c++)
-                for (int s = 0; s < spatial; s++) gb[c] += go[(n * outChannels + c) * spatial + s];
-        UploadToBuffer(gb, gradBias);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(spatial),
+            0
+        };
+        Dispatch2BufferAsync("BiasGrad", WebGpuKernels.BiasGradSource, "bias_grad",
+            gradOutput, gradBias, uniforms, outChannels).GetAwaiter().GetResult();
     }
 
     public void DeformableConv2D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer output,
@@ -423,27 +410,16 @@ public sealed partial class WebGpuBackend
         int kernelD, int kernelH, int kernelW,
         int strideD, int strideH, int strideW)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var o = new float[batch * channels * outDepth * outHeight * outWidth];
-        for (int n = 0; n < batch; n++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outDepth; od++)
-                    for (int oh = 0; oh < outHeight; oh++)
-                        for (int ow = 0; ow < outWidth; ow++)
-                        {
-                            float maxVal = float.MinValue;
-                            for (int kd = 0; kd < kernelD; kd++)
-                                for (int kh = 0; kh < kernelH; kh++)
-                                    for (int kw = 0; kw < kernelW; kw++)
-                                    {
-                                        int id = od * strideD + kd; int ih = oh * strideH + kh; int iw = ow * strideW + kw;
-                                        if (id < inDepth && ih < inHeight && iw < inWidth)
-                                            maxVal = MathF.Max(maxVal, inp[(((n * channels + c) * inDepth + id) * inHeight + ih) * inWidth + iw]);
-                                    }
-                            o[(((n * channels + c) * outDepth + od) * outHeight + oh) * outWidth + ow] = maxVal == float.MinValue ? 0 : maxVal;
-                        }
-        UploadToBuffer(o, output);
+        // Pool3DParams: 16 u32 fields packed as floats
+        var uniforms = new float[16];
+        int[] vals = { batch, channels, inDepth, inHeight, inWidth,
+                       outDepth, outHeight, outWidth,
+                       kernelD, kernelH, kernelW,
+                       strideD, strideH, strideW, 0, 0 };
+        for (int i = 0; i < 16; i++) uniforms[i] = BitConverter.Int32BitsToSingle(vals[i]);
+        int total = batch * channels * outDepth * outHeight * outWidth;
+        Dispatch2BufferAsync("Pool3D", WebGpuKernels.Pool3DSource, "max_pool3d",
+            input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void MaxPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -459,18 +435,22 @@ public sealed partial class WebGpuBackend
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
+        int batchChannels = batch * channels;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchChannels),
+            BitConverter.Int32BitsToSingle(inDepth),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(scaleD),
+            BitConverter.Int32BitsToSingle(scaleH),
+            BitConverter.Int32BitsToSingle(scaleW),
+            0
+        };
         int outD = inDepth * scaleD, outH = inHeight * scaleH, outW = inWidth * scaleW;
-        var o = new float[batch * channels * outD * outH * outW];
-        for (int n = 0; n < batch; n++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outD; od++)
-                    for (int oh = 0; oh < outH; oh++)
-                        for (int ow = 0; ow < outW; ow++)
-                            o[(((n * channels + c) * outD + od) * outH + oh) * outW + ow] =
-                                inp[(((n * channels + c) * inDepth + od / scaleD) * inHeight + oh / scaleH) * inWidth + ow / scaleW];
-        UploadToBuffer(o, output);
+        int total = batchChannels * outD * outH * outW;
+        Dispatch2BufferAsync("Upsample3D", WebGpuKernels.Upsample3DSource, "nearest_upsample3d",
+            input, output, uniforms, total).GetAwaiter().GetResult();
     }
 
     public void NearestNeighborUpsample3DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput,
@@ -478,18 +458,22 @@ public sealed partial class WebGpuBackend
         int inDepth, int inHeight, int inWidth,
         int scaleD, int scaleH, int scaleW)
     {
-        EnsureInitialized();
-        var grad = DownloadBufferData(gradOutput);
-        int outD = inDepth * scaleD, outH = inHeight * scaleH, outW = inWidth * scaleW;
-        var gi = new float[batch * channels * inDepth * inHeight * inWidth];
-        for (int n = 0; n < batch; n++)
-            for (int c = 0; c < channels; c++)
-                for (int od = 0; od < outD; od++)
-                    for (int oh = 0; oh < outH; oh++)
-                        for (int ow = 0; ow < outW; ow++)
-                            gi[(((n * channels + c) * inDepth + od / scaleD) * inHeight + oh / scaleH) * inWidth + ow / scaleW]
-                                += grad[(((n * channels + c) * outD + od) * outH + oh) * outW + ow];
-        UploadToBuffer(gi, gradInput);
+        int batchChannels = batch * channels;
+        Fill(gradInput, 0f, batchChannels * inDepth * inHeight * inWidth);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchChannels),
+            BitConverter.Int32BitsToSingle(inDepth),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(scaleD),
+            BitConverter.Int32BitsToSingle(scaleH),
+            BitConverter.Int32BitsToSingle(scaleW),
+            0
+        };
+        int total = batchChannels * inDepth * inHeight * inWidth;
+        Dispatch2BufferAsync("Upsample3D", WebGpuKernels.Upsample3DSource, "nearest_upsample3d_backward",
+            gradOutput, gradInput, uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -551,35 +535,59 @@ public sealed partial class WebGpuBackend
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
+        if (!training)
+        {
+            // Inference: use existing BatchNormSource kernel (uses running stats)
+            var uniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(channels),
+                BitConverter.Int32BitsToSingle(spatialSize),
+                epsilon
+            };
+            Dispatch4Buffer3DAsync("BatchNorm", WebGpuKernels.BatchNormSource, "batch_norm",
+                input, gamma, beta, output, uniforms, batch * channels, 1, 1).GetAwaiter().GetResult();
+            Fill(saveMean, 0f, channels);
+            Fill(saveInvVar, 0f, channels);
+            return;
+        }
+        // Training mode: use BatchNormTrainingSource to compute mean/var and normalize on GPU
+        var trainUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(spatialSize),
+            epsilon,
+            momentum,
+            BitConverter.Int32BitsToSingle(1), // training flag
+            0, 0
+        };
+        // Dispatch per channel - each thread computes stats for one channel
+        Dispatch4BufferAsync("BatchNormTraining", WebGpuKernels.BatchNormTrainingSource, "batch_norm_train",
+            input, gamma, beta, output, trainUniforms, channels).GetAwaiter().GetResult();
+        // Update running stats and save mean/invvar on CPU (only channels elements, not perf-critical)
         EnsureInitialized();
-        var inp = DownloadBufferData(input); var g = DownloadBufferData(gamma); var b = DownloadBufferData(beta);
+        var inp = DownloadBufferData(input);
         var rm = DownloadBufferData(runningMean); var rv = DownloadBufferData(runningVar);
         var sm = new float[channels]; var siv = new float[channels];
-        var o = new float[batch * channels * spatialSize];
+        int count = batch * spatialSize;
         for (int c = 0; c < channels; c++)
         {
-            float mean, var_;
-            if (training)
-            {
-                mean = 0; var_ = 0;
-                for (int n = 0; n < batch; n++)
-                    for (int s = 0; s < spatialSize; s++) mean += inp[(n * channels + c) * spatialSize + s];
-                mean /= (batch * spatialSize);
-                for (int n = 0; n < batch; n++)
-                    for (int s = 0; s < spatialSize; s++) { float d = inp[(n * channels + c) * spatialSize + s] - mean; var_ += d * d; }
-                var_ /= (batch * spatialSize);
-                rm[c] = (1 - momentum) * rm[c] + momentum * mean;
-                rv[c] = (1 - momentum) * rv[c] + momentum * var_;
-            }
-            else { mean = rm[c]; var_ = rv[c]; }
-            float invStd = 1f / MathF.Sqrt(var_ + epsilon);
-            sm[c] = mean; siv[c] = invStd;
+            float mean = 0;
             for (int n = 0; n < batch; n++)
-                for (int s = 0; s < spatialSize; s++)
-                    o[(n * channels + c) * spatialSize + s] = g[c] * (inp[(n * channels + c) * spatialSize + s] - mean) * invStd + b[c];
+                for (int s = 0; s < spatialSize; s++) mean += inp[(n * channels + c) * spatialSize + s];
+            mean /= count;
+            float var_ = 0;
+            for (int n = 0; n < batch; n++)
+                for (int s = 0; s < spatialSize; s++) { float d = inp[(n * channels + c) * spatialSize + s] - mean; var_ += d * d; }
+            var_ /= count;
+            rm[c] = (1 - momentum) * rm[c] + momentum * mean;
+            rv[c] = (1 - momentum) * rv[c] + momentum * var_;
+            sm[c] = mean;
+            siv[c] = 1f / MathF.Sqrt(var_ + epsilon);
         }
-        UploadToBuffer(o, output); UploadToBuffer(sm, saveMean); UploadToBuffer(siv, saveInvVar);
-        if (training) { UploadToBuffer(rm, runningMean); UploadToBuffer(rv, runningVar); }
+        UploadToBuffer(sm, saveMean); UploadToBuffer(siv, saveInvVar);
+        UploadToBuffer(rm, runningMean); UploadToBuffer(rv, runningVar);
     }
 
     public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
