@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDisposable
+public sealed partial class WebGpuBackend : IDirectGpuBackend
 {
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;
@@ -40,20 +40,31 @@ public sealed partial class WebGpuBackend : IDisposable
     private bool _initialized;
     private bool _disposed;
 
-    /// <summary>
-    /// Gets whether WebGPU is available and initialized.
-    /// </summary>
+    /// <inheritdoc/>
     public bool IsAvailable => _initialized && !_disposed;
+
+    /// <inheritdoc/>
+    public string BackendName => "WebGPU";
 
     /// <summary>
     /// Gets the backend type identifier.
     /// </summary>
     public string BackendType => "WebGPU";
 
-    /// <summary>
-    /// Gets the device name.
-    /// </summary>
+    /// <inheritdoc/>
     public string DeviceName => _device.AdapterInfo;
+
+    /// <inheritdoc/>
+    public string DeviceVendor => _device.AdapterInfo ?? "Unknown";
+
+    /// <inheritdoc/>
+    public int ComputeUnits => 1;
+
+    /// <inheritdoc/>
+    public long GlobalMemoryBytes => _device.MaxBufferSize;
+
+    /// <inheritdoc/>
+    public long LocalMemoryBytes => _device.MaxWorkgroupSize * 4L;
 
     /// <summary>
     /// Gets the maximum buffer size in bytes.
@@ -691,57 +702,7 @@ public sealed partial class WebGpuBackend : IDisposable
 
     #endregion
 
-    #region Synchronous Wrappers
-
-    /// <summary>
-    /// Element-wise addition (synchronous).
-    /// </summary>
-    public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        AddAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise subtraction (synchronous).
-    /// </summary>
-    public void Sub(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        SubAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise multiplication (synchronous).
-    /// </summary>
-    public void Mul(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        MulAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise division (synchronous).
-    /// </summary>
-    public void Div(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        DivAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Matrix multiplication (synchronous).
-    /// </summary>
-    public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
-    {
-        GemmAsync(A, B, C, M, N, K, alpha, beta).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Sum reduction (synchronous).
-    /// </summary>
-    public float Sum(IGpuBuffer A, int size)
-    {
-        return SumAsync(A, size).GetAwaiter().GetResult();
-    }
-
-    #endregion
+    // Synchronous wrappers are defined in WebGpuBackend.GpuBackend.cs as part of IDirectGpuBackend implementation
 
     /// <summary>
     /// Disposes the WebGPU backend and releases resources.
