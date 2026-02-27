@@ -4771,6 +4771,461 @@ fn batch_norm_train(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Per-element loss computation (3 buffers: predictions, targets, output).
+    /// Used with GPU reduction for forward loss scalar computation.
+    /// </summary>
+    public const string LossElementSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+
+struct LEParams {
+    size: u32,
+    param1: f32,
+    param2: f32,
+    param3: f32,
+}
+@group(0) @binding(3) var<uniform> params: LEParams;
+
+@compute @workgroup_size(256)
+fn mse_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let d = A[idx] - B[idx];
+    C[idx] = d * d;
+}
+
+@compute @workgroup_size(256)
+fn bce_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let p = clamp(A[idx], 1e-7, 1.0 - 1e-7);
+    let t = B[idx];
+    C[idx] = -(t * log(p) + (1.0 - t) * log(1.0 - p));
+}
+
+@compute @workgroup_size(256)
+fn mae_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    C[idx] = abs(A[idx] - B[idx]);
+}
+
+@compute @workgroup_size(256)
+fn smooth_l1_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let d = abs(A[idx] - B[idx]);
+    let beta = params.param1;
+    C[idx] = select(d - 0.5 * beta, 0.5 * d * d / beta, d < beta);
+}
+
+@compute @workgroup_size(256)
+fn hinge_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    C[idx] = max(0.0, 1.0 - B[idx] * A[idx]);
+}
+
+@compute @workgroup_size(256)
+fn squared_hinge_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let h = max(0.0, 1.0 - B[idx] * A[idx]);
+    C[idx] = h * h;
+}
+
+@compute @workgroup_size(256)
+fn logcosh_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    C[idx] = log(cosh(A[idx] - B[idx]));
+}
+
+@compute @workgroup_size(256)
+fn poisson_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    C[idx] = exp(A[idx]) - B[idx] * A[idx];
+}
+
+@compute @workgroup_size(256)
+fn exponential_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    C[idx] = exp(-B[idx] * A[idx]);
+}
+
+@compute @workgroup_size(256)
+fn focal_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let p = clamp(A[idx], 1e-7, 1.0 - 1e-7);
+    let t = B[idx];
+    let pt = select(1.0 - p, p, t > 0.5);
+    C[idx] = -params.param1 * pow(1.0 - pt, params.param2) * log(pt);
+}
+
+@compute @workgroup_size(256)
+fn quantile_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let d = B[idx] - A[idx];
+    C[idx] = select((params.param1 - 1.0) * d, params.param1 * d, d >= 0.0);
+}
+
+@compute @workgroup_size(256)
+fn modified_huber_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let y = B[idx] * A[idx];
+    let h = max(0.0, 1.0 - y);
+    C[idx] = select(-4.0 * y, h * h, y >= -1.0);
+}
+
+@compute @workgroup_size(256)
+fn categorical_ce_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let p = clamp(A[idx], 1e-7, 1.0);
+    C[idx] = -B[idx] * log(p);
+}
+
+@compute @workgroup_size(256)
+fn charbonnier_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let d = A[idx] - B[idx];
+    let eps = params.param1;
+    C[idx] = sqrt(d * d + eps * eps);
+}
+
+@compute @workgroup_size(256)
+fn elastic_net_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let d = A[idx] - B[idx];
+    C[idx] = params.param1 * abs(d) + params.param2 * d * d;
+}
+";
+
+    /// <summary>
+    /// Cross-entropy forward: per-batch softmax + NLL (3 buffers: predictions, targets, output).
+    /// </summary>
+    public const string CrossEntropyForwardSource = @"
+@group(0) @binding(0) var<storage, read> predictions: array<f32>;
+@group(0) @binding(1) var<storage, read> targets: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+struct CEFwdParams {
+    batch_size: u32,
+    num_classes: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(3) var<uniform> params: CEFwdParams;
+
+@compute @workgroup_size(256)
+fn cross_entropy_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.batch_size) { return; }
+    let target = bitcast<u32>(bitcast<i32>(targets[b]));
+    let base = b * params.num_classes;
+    var max_val: f32 = -3.402823e+38;
+    for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
+        max_val = max(max_val, predictions[base + c]);
+    }
+    var sum_exp: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
+        sum_exp = sum_exp + exp(predictions[base + c] - max_val);
+    }
+    output[b] = -(predictions[base + target] - max_val - log(sum_exp));
+}
+";
+
+    /// <summary>
+    /// Triplet and contrastive loss (4 buffers: A, B, C/labels, output).
+    /// </summary>
+    public const string TripletContrastiveSource = @"
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read> C: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+struct TCParams {
+    batch_size: u32,
+    embedding_dim: u32,
+    margin: f32,
+    _pad: u32,
+}
+@group(0) @binding(4) var<uniform> params: TCParams;
+
+@compute @workgroup_size(256)
+fn triplet_loss_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.batch_size) { return; }
+    var dp: f32 = 0.0;
+    var dn: f32 = 0.0;
+    for (var f: u32 = 0u; f < params.embedding_dim; f = f + 1u) {
+        let da_p = A[b * params.embedding_dim + f] - B[b * params.embedding_dim + f];
+        dp = dp + da_p * da_p;
+        let da_n = A[b * params.embedding_dim + f] - C[b * params.embedding_dim + f];
+        dn = dn + da_n * da_n;
+    }
+    output[b] = max(0.0, sqrt(dp) - sqrt(dn) + params.margin);
+}
+
+@compute @workgroup_size(256)
+fn contrastive_loss_elem(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.batch_size) { return; }
+    var dist: f32 = 0.0;
+    for (var f: u32 = 0u; f < params.embedding_dim; f = f + 1u) {
+        let d = A[b * params.embedding_dim + f] - B[b * params.embedding_dim + f];
+        dist = dist + d * d;
+    }
+    dist = sqrt(dist);
+    let label = C[b];
+    let hinge = max(0.0, params.margin - dist);
+    output[b] = select(hinge * hinge, dist * dist, label > 0.5);
+}
+
+@compute @workgroup_size(256)
+fn triplet_loss_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.embedding_dim;
+    if (idx >= total) { return; }
+    let b = idx / params.embedding_dim;
+    let f = idx % params.embedding_dim;
+    let a_val = A[idx];
+    let p_val = B[idx];
+    let n_val = C[idx];
+    var dp: f32 = 0.0;
+    var dn: f32 = 0.0;
+    for (var ff: u32 = 0u; ff < params.embedding_dim; ff = ff + 1u) {
+        let da_p = A[b * params.embedding_dim + ff] - B[b * params.embedding_dim + ff];
+        dp = dp + da_p * da_p;
+        let da_n = A[b * params.embedding_dim + ff] - C[b * params.embedding_dim + ff];
+        dn = dn + da_n * da_n;
+    }
+    let loss = sqrt(dp) - sqrt(dn) + params.margin;
+    if (loss <= 0.0) { output[idx] = 0.0; return; }
+    let inv_dp = select(0.0, 1.0 / sqrt(dp), dp > 1e-10);
+    let inv_dn = select(0.0, 1.0 / sqrt(dn), dn > 1e-10);
+    output[idx] = ((a_val - p_val) * inv_dp - (a_val - n_val) * inv_dn) / f32(params.batch_size);
+}
+
+@compute @workgroup_size(256)
+fn contrastive_loss_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.embedding_dim;
+    if (idx >= total) { return; }
+    let b = idx / params.embedding_dim;
+    let f = idx % params.embedding_dim;
+    var dist: f32 = 0.0;
+    for (var ff: u32 = 0u; ff < params.embedding_dim; ff = ff + 1u) {
+        let d = A[b * params.embedding_dim + ff] - B[b * params.embedding_dim + ff];
+        dist = dist + d * d;
+    }
+    dist = sqrt(dist);
+    let label = C[b];
+    let diff = A[idx] - B[idx];
+    if (label > 0.5) {
+        output[idx] = 2.0 * diff / f32(params.batch_size);
+    } else {
+        let hinge = params.margin - dist;
+        if (hinge > 0.0 && dist > 1e-10) {
+            output[idx] = -2.0 * hinge * diff / (dist * f32(params.batch_size));
+        } else {
+            output[idx] = 0.0;
+        }
+    }
+}
+";
+
+    /// <summary>
+    /// Top-K selection kernel (3 buffers: input, values_out, indices_out).
+    /// </summary>
+    public const string TopKSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> indices: array<f32>;
+
+struct TopKParams {
+    outer_size: u32,
+    reduce_size: u32,
+    k: u32,
+    _pad: u32,
+}
+@group(0) @binding(3) var<uniform> params: TopKParams;
+
+@compute @workgroup_size(256)
+fn topk_select(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.outer_size) { return; }
+    let base = b * params.reduce_size;
+    let out_base = b * params.k;
+    // Selection sort for top-K (optimal for small K)
+    for (var j: u32 = 0u; j < params.k && j < params.reduce_size; j = j + 1u) {
+        var best_val: f32 = -3.402823e+38;
+        var best_idx: u32 = 0u;
+        for (var c: u32 = 0u; c < params.reduce_size; c = c + 1u) {
+            let v = input[base + c];
+            var already_selected = false;
+            for (var prev: u32 = 0u; prev < j; prev = prev + 1u) {
+                if (bitcast<u32>(bitcast<i32>(indices[out_base + prev])) == c) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            if (!already_selected && v > best_val) {
+                best_val = v;
+                best_idx = c;
+            }
+        }
+        values[out_base + j] = best_val;
+        indices[out_base + j] = bitcast<f32>(best_idx);
+    }
+}
+";
+
+    /// <summary>
+    /// Complex matrix-vector multiplication (4 buffers: matReal, matImag, vec, output).
+    /// vec contains interleaved [vecReal(dim), vecImag(dim)] per batch.
+    /// output contains interleaved [outReal(dim), outImag(dim)] per batch.
+    /// </summary>
+    public const string ComplexMatVecSource = @"
+@group(0) @binding(0) var<storage, read> mat_real: array<f32>;
+@group(0) @binding(1) var<storage, read> mat_imag: array<f32>;
+@group(0) @binding(2) var<storage, read> vec_data: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out_data: array<f32>;
+
+struct CMVParams {
+    batch_size: u32,
+    dim: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(4) var<uniform> params: CMVParams;
+
+@compute @workgroup_size(256)
+fn complex_mat_vec(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.dim;
+    if (idx >= total) { return; }
+    let b = idx / params.dim;
+    let r = idx % params.dim;
+    var re: f32 = 0.0;
+    var im: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.dim; c = c + 1u) {
+        let m_idx = r * params.dim + c;
+        let vr = vec_data[b * params.dim * 2u + c];
+        let vi = vec_data[b * params.dim * 2u + params.dim + c];
+        re = re + mat_real[m_idx] * vr - mat_imag[m_idx] * vi;
+        im = im + mat_real[m_idx] * vi + mat_imag[m_idx] * vr;
+    }
+    out_data[b * params.dim * 2u + r] = re;
+    out_data[b * params.dim * 2u + params.dim + r] = im;
+}
+";
+
+    /// <summary>
+    /// Poincare exponential map kernel.
+    /// </summary>
+    public const string PoincareExpMapSource = @"
+@group(0) @binding(0) var<storage, read> base_pt: array<f32>;
+@group(0) @binding(1) var<storage, read> tangent: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+struct PEMParams {
+    batch_size: u32,
+    dim: u32,
+    curvature: f32,
+    _pad: u32,
+}
+@group(0) @binding(3) var<uniform> params: PEMParams;
+
+@compute @workgroup_size(256)
+fn poincare_exp_map(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= params.batch_size) { return; }
+    let off = b * params.dim;
+    var bp_sq: f32 = 0.0;
+    var t_norm: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.dim; d = d + 1u) {
+        bp_sq = bp_sq + base_pt[off + d] * base_pt[off + d];
+        t_norm = t_norm + tangent[off + d] * tangent[off + d];
+    }
+    t_norm = sqrt(t_norm);
+    let conformal = 2.0 / (1.0 - params.curvature * bp_sq + 1e-10);
+    let th = tanh(conformal * t_norm / 2.0);
+    let scale = select(th / (t_norm * sqrt(params.curvature)), 0.0, t_norm <= 1e-10);
+    var s_sq: f32 = 0.0;
+    var bs: f32 = 0.0;
+    for (var d: u32 = 0u; d < params.dim; d = d + 1u) {
+        let sd = tangent[off + d] * scale;
+        s_sq = s_sq + sd * sd;
+        bs = bs + base_pt[off + d] * sd;
+    }
+    let den = max(1.0 + 2.0 * params.curvature * bs + params.curvature * params.curvature * bp_sq * s_sq, 1e-10);
+    for (var d: u32 = 0u; d < params.dim; d = d + 1u) {
+        let sd = tangent[off + d] * scale;
+        output[off + d] = ((1.0 + 2.0 * params.curvature * bs + params.curvature * s_sq) * base_pt[off + d]
+                          + (1.0 - params.curvature * bp_sq) * sd) / den;
+    }
+}
+";
+
+    /// <summary>
+    /// Homeostasis and weight clamping kernel for STDP post-processing (2 buffers: weights in/out).
+    /// </summary>
+    public const string HomeostasisClampSource = @"
+@group(0) @binding(0) var<storage, read_write> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> dummy: array<f32>;
+
+struct HCParams {
+    size: u32,
+    homeostasis_rate: f32,
+    min_weight: f32,
+    max_weight: f32,
+}
+@group(0) @binding(2) var<uniform> params: HCParams;
+
+@compute @workgroup_size(256)
+fn homeostasis_clamp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    var w = weights[idx];
+    w = w + params.homeostasis_rate * (0.5 - w);
+    w = max(params.min_weight, min(params.max_weight, w));
+    weights[idx] = w;
+}
+";
+
+    /// <summary>
+    /// Threshold step kernel: outputs 1.0 if input > threshold, else 0.0 (2 buffers: input, spikes_output).
+    /// </summary>
+    public const string ThresholdStepSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> spikes: array<f32>;
+
+struct ThreshParams {
+    size: u32,
+    threshold: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+@group(0) @binding(2) var<uniform> params: ThreshParams;
+
+@compute @workgroup_size(256)
+fn threshold_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    spikes[idx] = select(0.0, 1.0, input[idx] > params.threshold);
+}
+";
+
+    /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
     public static string GetCombinedSource()
@@ -4799,7 +5254,9 @@ fn batch_norm_train(@builtin(global_invocation_id) gid: vec3<u32>) {
                CapsuleSquashSource + CapsuleOpsSource + CopyOpsSource +
                Sparse2x4Source + CsrSpMMSource + CsrSegmentedSource + ScatterEdgesSource +
                Conv3DSource + Pool3DSource + Upsample3DSource + BiasGradSource +
-               BatchNormTrainingSource;
+               BatchNormTrainingSource + LossElementSource + CrossEntropyForwardSource +
+               TripletContrastiveSource + TopKSource + ComplexMatVecSource +
+               PoincareExpMapSource + HomeostasisClampSource + ThresholdStepSource;
     }
 }
 #endif

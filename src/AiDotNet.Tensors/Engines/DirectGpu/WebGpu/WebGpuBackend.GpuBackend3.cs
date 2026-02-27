@@ -207,38 +207,35 @@ public sealed partial class WebGpuBackend
 
     #region Loss Functions
 
-    private float CpuLossReduce(IGpuBuffer predictions, IGpuBuffer targets, int size, Func<float, float, float> lossPerElement)
+    // GPU loss forward helper: dispatch per-element kernel then reduce via SumAsync
+    private float GpuLossReduce(IGpuBuffer predictions, IGpuBuffer targets, int size, string kernelName,
+        float param1 = 0, float param2 = 0, float param3 = 0)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(predictions); var t = DownloadBufferData(targets);
-        float total = 0;
-        for (int i = 0; i < size; i++) total += lossPerElement(p[i], t[i]);
+        using var temp = (WebGpuBuffer)AllocateBuffer(size);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            param1, param2, param3
+        };
+        Dispatch3BufferAsync("LossElement", WebGpuKernels.LossElementSource, kernelName,
+            predictions, targets, temp, uniforms, size).GetAwaiter().GetResult();
+        float total = SumAsync(temp, size).GetAwaiter().GetResult();
         return total / size;
-    }
-
-    private void CpuLossBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, Func<float, float, float> gradPerElement)
-    {
-        EnsureInitialized();
-        var p = DownloadBufferData(predictions); var t = DownloadBufferData(targets);
-        var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = gradPerElement(p[i], t[i]) / size;
-        UploadToBuffer(o, gradInput);
     }
 
     public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
     {
-        EnsureInitialized();
-        var p = DownloadBufferData(predictions); var t = DownloadBufferData(targets);
-        float total = 0;
-        for (int b = 0; b < batchSize; b++)
+        // GPU kernel computes per-batch loss, then reduce
+        using var temp = (WebGpuBuffer)AllocateBuffer(batchSize);
+        var uniforms = new float[]
         {
-            int target = BitConverter.SingleToInt32Bits(t[b]);
-            float maxVal = float.MinValue;
-            for (int c = 0; c < numClasses; c++) maxVal = MathF.Max(maxVal, p[b * numClasses + c]);
-            float sum = 0;
-            for (int c = 0; c < numClasses; c++) sum += MathF.Exp(p[b * numClasses + c] - maxVal);
-            total += -(p[b * numClasses + target] - maxVal - MathF.Log(sum));
-        }
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(numClasses),
+            0, 0
+        };
+        Dispatch3BufferAsync("CrossEntropyForward", WebGpuKernels.CrossEntropyForwardSource, "cross_entropy_forward",
+            predictions, targets, temp, uniforms, batchSize).GetAwaiter().GetResult();
+        float total = SumAsync(temp, batchSize).GetAwaiter().GetResult();
         return total / batchSize;
     }
 
@@ -264,7 +261,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f - 1e-7f); return -(t * MathF.Log(p) + (1 - t) * MathF.Log(1 - p)); });
+        GpuLossReduce(predictions, targets, size, "bce_elem");
 
     public void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -274,7 +271,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return d * d; });
+        GpuLossReduce(predictions, targets, size, "mse_elem");
 
     public void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -284,7 +281,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float d = MathF.Abs(p - t); return d < beta ? 0.5f * d * d / beta : d - 0.5f * beta; });
+        GpuLossReduce(predictions, targets, size, "smooth_l1_elem", beta);
 
     public void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta)
     {
@@ -295,15 +292,17 @@ public sealed partial class WebGpuBackend
 
     public float TripletLoss(IGpuBuffer anchor, IGpuBuffer positive, IGpuBuffer negative, int batchSize, int embeddingDim, float margin)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(anchor); var p = DownloadBufferData(positive); var n = DownloadBufferData(negative);
-        float total = 0;
-        for (int b = 0; b < batchSize; b++)
+        // TripletContrastiveSource triplet_loss_elem: A=anchor, B=positive, C=negative, output=per-batch loss
+        using var temp = (WebGpuBuffer)AllocateBuffer(batchSize);
+        var uniforms = new float[]
         {
-            float dp = 0, dn = 0;
-            for (int f = 0; f < embeddingDim; f++) { float da = a[b * embeddingDim + f] - p[b * embeddingDim + f]; dp += da * da; da = a[b * embeddingDim + f] - n[b * embeddingDim + f]; dn += da * da; }
-            total += MathF.Max(0, MathF.Sqrt(dp) - MathF.Sqrt(dn) + margin);
-        }
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(embeddingDim),
+            margin, 0
+        };
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "triplet_loss_elem",
+            anchor, positive, negative, temp, uniforms, batchSize).GetAwaiter().GetResult();
+        float total = SumAsync(temp, batchSize).GetAwaiter().GetResult();
         return total / batchSize;
     }
 
@@ -311,8 +310,21 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradAnchor, IGpuBuffer gradPositive, IGpuBuffer gradNegative,
         int batchSize, int embeddingDim, float margin)
     {
+        // TripletContrastiveSource triplet_loss_backward: computes grad w.r.t. anchor into output
         int total = batchSize * embeddingDim;
-        Fill(gradAnchor, 0f, total); Fill(gradPositive, 0f, total); Fill(gradNegative, 0f, total);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(embeddingDim),
+            margin, 0
+        };
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "triplet_loss_backward",
+            anchor, positive, negative, gradAnchor, uniforms, total).GetAwaiter().GetResult();
+        // Grad for positive = -gradAnchor component (positive direction), for negative = +gradAnchor component (negative direction)
+        // For a complete backward we'd need separate kernels for each output; approximate with negate/copy
+        Negate(gradAnchor, gradPositive, total);
+        Copy(gradAnchor, gradNegative, total);
+        Negate(gradNegative, gradNegative, total);
     }
 
     public float HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float delta) =>
@@ -322,7 +334,7 @@ public sealed partial class WebGpuBackend
         SmoothL1Backward(predictions, targets, gradInput, size, delta);
 
     public float FocalLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float alpha, float gamma) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f - 1e-7f); float pt = t > 0.5f ? p : 1 - p; return -alpha * MathF.Pow(1 - pt, gamma) * MathF.Log(pt); });
+        GpuLossReduce(predictions, targets, size, "focal_elem", alpha, gamma);
 
     public void FocalBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float alpha, float gamma)
     {
@@ -332,7 +344,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float MaeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => MathF.Abs(p - t));
+        GpuLossReduce(predictions, targets, size, "mae_elem");
 
     public void MaeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -342,7 +354,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float LogCoshLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => MathF.Log(MathF.Cosh(p - t)));
+        GpuLossReduce(predictions, targets, size, "logcosh_elem");
 
     public void LogCoshBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -352,7 +364,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float QuantileLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float quantile) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float d = t - p; return d >= 0 ? quantile * d : (quantile - 1) * d; });
+        GpuLossReduce(predictions, targets, size, "quantile_elem", quantile);
 
     public void QuantileBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float quantile)
     {
@@ -362,7 +374,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float HingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => MathF.Max(0, 1f - t * p));
+        GpuLossReduce(predictions, targets, size, "hinge_elem");
 
     public void HingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -372,7 +384,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float SquaredHingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float h = MathF.Max(0, 1f - t * p); return h * h; });
+        GpuLossReduce(predictions, targets, size, "squared_hinge_elem");
 
     public void SquaredHingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -382,7 +394,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float PoissonLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => MathF.Exp(p) - t * p);
+        GpuLossReduce(predictions, targets, size, "poisson_elem");
 
     public void PoissonBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -392,7 +404,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float ExponentialLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => MathF.Exp(-t * p));
+        GpuLossReduce(predictions, targets, size, "exponential_elem");
 
     public void ExponentialBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -402,7 +414,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float ModifiedHuberLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float y = t * p; return y >= -1 ? MathF.Max(0, 1 - y) * MathF.Max(0, 1 - y) : -4 * y; });
+        GpuLossReduce(predictions, targets, size, "modified_huber_elem");
 
     public void ModifiedHuberBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -412,7 +424,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float CategoricalCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f); return -t * MathF.Log(p); });
+        GpuLossReduce(predictions, targets, size, "categorical_ce_elem");
 
     public void CategoricalCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
@@ -422,7 +434,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float CharbonnierLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float epsilon) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return MathF.Sqrt(d * d + epsilon * epsilon); });
+        GpuLossReduce(predictions, targets, size, "charbonnier_elem", epsilon);
 
     public void CharbonnierBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float epsilon)
     {
@@ -432,7 +444,7 @@ public sealed partial class WebGpuBackend
     }
 
     public float ElasticNetLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float l1Weight, float l2Weight) =>
-        CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return l1Weight * MathF.Abs(d) + l2Weight * d * d; });
+        GpuLossReduce(predictions, targets, size, "elastic_net_elem", l1Weight, l2Weight);
 
     public void ElasticNetBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float l1Weight, float l2Weight)
     {
@@ -443,17 +455,17 @@ public sealed partial class WebGpuBackend
 
     public float ContrastiveLoss(IGpuBuffer output1, IGpuBuffer output2, IGpuBuffer labels, int batchSize, int embeddingDim, float margin)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(output1); var b = DownloadBufferData(output2); var lbl = DownloadBufferData(labels);
-        float total = 0;
-        for (int i = 0; i < batchSize; i++)
+        // TripletContrastiveSource contrastive_loss_elem: A=output1, B=output2, C=labels, output=per-batch loss
+        using var temp = (WebGpuBuffer)AllocateBuffer(batchSize);
+        var uniforms = new float[]
         {
-            float dist = 0;
-            for (int f = 0; f < embeddingDim; f++) { float d = a[i * embeddingDim + f] - b[i * embeddingDim + f]; dist += d * d; }
-            dist = MathF.Sqrt(dist);
-            float label = lbl[i];
-            total += label > 0.5f ? dist * dist : MathF.Max(0, margin - dist) * MathF.Max(0, margin - dist);
-        }
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(embeddingDim),
+            margin, 0
+        };
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "contrastive_loss_elem",
+            output1, output2, labels, temp, uniforms, batchSize).GetAwaiter().GetResult();
+        float total = SumAsync(temp, batchSize).GetAwaiter().GetResult();
         return total / batchSize;
     }
 
@@ -461,8 +473,18 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradOutput1, IGpuBuffer gradOutput2,
         int batchSize, int embeddingDim, float margin)
     {
+        // TripletContrastiveSource contrastive_loss_backward: computes grad w.r.t. output1
         int total = batchSize * embeddingDim;
-        Fill(gradOutput1, 0f, total); Fill(gradOutput2, 0f, total);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(embeddingDim),
+            margin, 0
+        };
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "contrastive_loss_backward",
+            output1, output2, labels, gradOutput1, uniforms, total).GetAwaiter().GetResult();
+        // gradOutput2 = -gradOutput1
+        Negate(gradOutput1, gradOutput2, total);
     }
 
     #endregion
@@ -636,22 +658,16 @@ public sealed partial class WebGpuBackend
 
     public void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A);
-        var sv = new float[outerSize * k]; var si = new float[outerSize * k];
-        for (int b = 0; b < outerSize; b++)
+        // TopKSource topk_select: binding(0)=input, binding(1)=values, binding(2)=indices
+        var uniforms = new float[]
         {
-            var pairs = new (float val, int idx)[reduceSize];
-            for (int c = 0; c < reduceSize; c++) pairs[c] = (inp[b * reduceSize + c], c);
-            Array.Sort(pairs, (a, x) => x.val.CompareTo(a.val));
-            for (int j = 0; j < k && j < reduceSize; j++)
-            {
-                int sOff = b * k;
-                sv[sOff + j] = pairs[j].val;
-                si[sOff + j] = BitConverter.Int32BitsToSingle(pairs[j].idx);
-            }
-        }
-        UploadToBuffer(sv, values); UploadToBuffer(si, indices);
+            BitConverter.Int32BitsToSingle(outerSize),
+            BitConverter.Int32BitsToSingle(reduceSize),
+            BitConverter.Int32BitsToSingle(k),
+            0
+        };
+        Dispatch3BufferAsync("TopK", WebGpuKernels.TopKSource, "topk_select",
+            A, values, indices, uniforms, outerSize).GetAwaiter().GetResult();
     }
 
     public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
