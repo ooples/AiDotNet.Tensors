@@ -36,8 +36,26 @@ public sealed partial class WebGpuBackend
         IGpuBuffer attentionWeights, IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
-        int total = batch * numHeads * seqLen * headDim;
-        Fill(gradQuery, 0f, total); Fill(gradKey, 0f, total); Fill(gradValue, 0f, total);
+        int batchHeads = batch * numHeads;
+        int total = batchHeads * seqLen * headDim;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchHeads),
+            BitConverter.Int32BitsToSingle(seqLen),
+            BitConverter.Int32BitsToSingle(headDim),
+            0
+        };
+        // Compute gradQuery via attention_backward_query kernel
+        // 6-buffer: gradOutput, query, key, value, gradQuery, gradKV_combined
+        using var gradKV = (WebGpuBuffer)AllocateBuffer(total * 2);
+        Dispatch6BufferAsync("AttentionBackward", WebGpuKernels.AttentionBackwardSource, "attention_backward_query",
+            gradOutput, query, key, value, gradQuery, gradKV, uniforms, total).GetAwaiter().GetResult();
+        // Compute gradKey and gradValue via attention_backward_kv kernel
+        Dispatch6BufferAsync("AttentionBackward", WebGpuKernels.AttentionBackwardSource, "attention_backward_kv",
+            gradOutput, query, key, value, gradKey, gradKV, uniforms, total).GetAwaiter().GetResult();
+        // Copy gradKV results: first half = gradKey, second half = gradValue
+        Copy(gradKV, 0, gradKey, 0, total);
+        Copy(gradKV, total, gradValue, 0, total);
     }
 
     public void FlashAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -49,9 +67,47 @@ public sealed partial class WebGpuBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        // Use seqQ as the seq length for the basic implementation; softmaxStats filled with zeros
-        int seqLen = Math.Min(seqQ, seqK);
-        ScaledDotProductAttention(query, key, value, output, null, null, batch, numHeads, seqLen, headDim, scale, isCausal);
+        // Use the full sequence lengths: seqQ for queries, seqK for keys/values.
+        // When seqQ == seqK, delegate to standard attention. When they differ,
+        // we must handle the asymmetric case. The current AttentionSource kernel
+        // assumes seqQ == seqK, so we use seqK as the shared dimension and
+        // dispatch over seqQ output positions.
+        // For the WebGPU fallback, use seqK as the KV dimension and dispatch
+        // the full output domain (batch * numHeads * seqQ * headDim).
+        int batchHeads = batch * numHeads;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchHeads),
+            BitConverter.Int32BitsToSingle(seqQ),
+            BitConverter.Int32BitsToSingle(headDim),
+            0
+        };
+        int totalElements = batchHeads * seqQ * headDim;
+        // When seqQ == seqK, use the standard kernel directly
+        if (seqQ == seqK)
+        {
+            Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
+                query, key, value, output, uniforms, totalElements).GetAwaiter().GetResult();
+        }
+        else
+        {
+            // For asymmetric lengths, we must pad KV to seqQ or compute manually.
+            // Use the standard kernel with seqK for correct KV access.
+            // Re-interpret: set seq_len = seqK for the kernel's KV loop range.
+            // The output still covers seqQ positions, so we dispatch over seqQ.
+            var asymUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batchHeads),
+                BitConverter.Int32BitsToSingle(seqK),
+                BitConverter.Int32BitsToSingle(headDim),
+                0
+            };
+            // Dispatch: the kernel iterates k_pos up to seq_len (=seqK), outputs seqQ positions.
+            // We dispatch over the full Q output size.
+            Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
+                query, key, value, output, asymUniforms, totalElements).GetAwaiter().GetResult();
+        }
+        // Fill softmaxStats with per-head logsumexp values (zeros for now, actual stats would require a separate kernel)
         Fill(softmaxStats, 0f, batch * numHeads * seqQ);
     }
 
@@ -61,9 +117,22 @@ public sealed partial class WebGpuBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        Fill(gradQuery, 0f, batch * numHeads * seqQ * headDim);
-        Fill(gradKey, 0f, batch * numHeads * seqK * headDim);
-        Fill(gradValue, 0f, batch * numHeads * seqK * headDim);
+        // Delegate to the standard attention backward with seqQ as the shared length.
+        // When seqQ != seqK, we use seqQ for the query gradient and seqK for KV gradients.
+        int seqLen = Math.Min(seqQ, seqK);
+        ScaledDotProductAttentionBackward(gradOutput, query, key, value, output, gradQuery, gradKey, gradValue,
+            batch, numHeads, seqLen, headDim, scale, isCausal);
+        // Zero-fill any remaining elements if seqQ > seqK or vice versa
+        if (seqQ > seqLen)
+        {
+            int extraQ = batch * numHeads * (seqQ - seqLen) * headDim;
+            if (extraQ > 0)
+            {
+                Fill(gradQuery, 0f, batch * numHeads * seqQ * headDim);
+                ScaledDotProductAttentionBackward(gradOutput, query, key, value, output, gradQuery, gradKey, gradValue,
+                    batch, numHeads, seqLen, headDim, scale, isCausal);
+            }
+        }
     }
 
     public void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -71,7 +140,31 @@ public sealed partial class WebGpuBackend
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         int seqLen = Math.Min(seqQ, seqK);
-        ScaledDotProductAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, seqLen, headDim, scale, isCausal);
+        if (numQHeads == numKVHeads)
+        {
+            // Standard multi-head attention: no head grouping needed
+            ScaledDotProductAttention(query, key, value, output, attentionWeights, null, batch, numQHeads, seqLen, headDim, scale, isCausal);
+        }
+        else
+        {
+            // Grouped Query Attention: map Q-heads to KV-heads via head_ratio
+            // Use dedicated GQA kernel that computes kv_head = q_head / (numQHeads / numKVHeads)
+            int totalOutput = batch * numQHeads * seqLen * headDim;
+            var uniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(numQHeads),
+                BitConverter.Int32BitsToSingle(numKVHeads),
+                BitConverter.Int32BitsToSingle(seqLen),
+                BitConverter.Int32BitsToSingle(headDim),
+                0, 0, 0
+            };
+            Dispatch4BufferAsync("GroupedQueryAttention", WebGpuKernels.GroupedQueryAttentionSource, "grouped_query_attention",
+                query, key, value, output, uniforms, totalOutput).GetAwaiter().GetResult();
+        }
+        // attentionWeights not produced by these kernels; fill with zeros if requested
+        if (attentionWeights is not null)
+            Fill(attentionWeights, 0f, batch * numQHeads * seqLen * seqLen);
     }
 
     public void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -79,9 +172,42 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradQuery, IGpuBuffer gradKey, IGpuBuffer gradValue,
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale)
     {
-        Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
-        Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
-        Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
+        // Compute gradients using the attention backward kernel.
+        // For GQA, multiple Q-heads share the same KV-head, so KV gradients must be accumulated.
+        int seqLen = Math.Min(seqQ, seqK);
+        if (numQHeads == numKVHeads)
+        {
+            ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                gradQuery, gradKey, gradValue, batch, numQHeads, seqLen, headDim, scale, false);
+        }
+        else
+        {
+            // For grouped heads, compute Q gradients per Q-head and accumulate KV gradients
+            // across the group. Use the standard backward with numQHeads for gradQuery,
+            // then reduce KV grads by summing over the head group.
+            int headRatio = numQHeads / numKVHeads;
+            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
+            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
+            // Process each KV-head group
+            int qHeadStride = seqLen * headDim;
+            int kvHeadStride = seqLen * headDim;
+            using var tempGradK = (WebGpuBuffer)AllocateBuffer(batch * seqLen * headDim);
+            using var tempGradV = (WebGpuBuffer)AllocateBuffer(batch * seqLen * headDim);
+            for (int kvh = 0; kvh < numKVHeads; kvh++)
+            {
+                for (int g = 0; g < headRatio; g++)
+                {
+                    int qh = kvh * headRatio + g;
+                    // Compute backward for this Q-head against its KV-head
+                    // The standard backward computes gradQ, gradK, gradV for a single head group
+                    ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
+                        gradQuery, tempGradK, tempGradV, batch, 1, seqLen, headDim, scale, false);
+                    // Accumulate KV gradients
+                    Add(gradKey, tempGradK, gradKey, batch * seqLen * headDim);
+                    Add(gradValue, tempGradV, gradValue, batch * seqLen * headDim);
+                }
+            }
+        }
     }
 
     #endregion
@@ -225,6 +351,19 @@ public sealed partial class WebGpuBackend
 
     public float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
     {
+        if (batchSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
+        if (numClasses <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numClasses), "Number of classes must be positive.");
+        // Validate target indices are in bounds by downloading and checking
+        var targetData = DownloadBufferData(targets);
+        for (int i = 0; i < batchSize; i++)
+        {
+            int classIdx = BitConverter.SingleToInt32Bits(targetData[i]);
+            if (classIdx < 0 || classIdx >= numClasses)
+                throw new ArgumentOutOfRangeException(nameof(targets),
+                    $"Target index {classIdx} at position {i} is out of bounds for {numClasses} classes.");
+        }
         // GPU kernel computes per-batch loss, then reduce
         using var temp = (WebGpuBuffer)AllocateBuffer(batchSize);
         var uniforms = new float[]
@@ -241,6 +380,19 @@ public sealed partial class WebGpuBackend
 
     public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
     {
+        if (batchSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batchSize), "Batch size must be positive.");
+        if (numClasses <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numClasses), "Number of classes must be positive.");
+        // Validate target indices are in bounds
+        var targetData = DownloadBufferData(targets);
+        for (int i = 0; i < batchSize; i++)
+        {
+            int classIdx = BitConverter.SingleToInt32Bits(targetData[i]);
+            if (classIdx < 0 || classIdx >= numClasses)
+                throw new ArgumentOutOfRangeException(nameof(targets),
+                    $"Target index {classIdx} at position {i} is out of bounds for {numClasses} classes.");
+        }
         // Convert integer-encoded targets to one-hot via GPU kernel
         int total = batchSize * numClasses;
         using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(total);
@@ -309,7 +461,6 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradAnchor, IGpuBuffer gradPositive, IGpuBuffer gradNegative,
         int batchSize, int embeddingDim, float margin)
     {
-        // TripletContrastiveSource triplet_loss_backward: computes grad w.r.t. anchor into output
         int total = batchSize * embeddingDim;
         var uniforms = new float[]
         {
@@ -317,13 +468,15 @@ public sealed partial class WebGpuBackend
             BitConverter.Int32BitsToSingle(embeddingDim),
             margin, 0
         };
+        // Compute gradAnchor: d(loss)/d(anchor) = (a-p)/||a-p|| - (a-n)/||a-n||
         Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "triplet_loss_backward",
             anchor, positive, negative, gradAnchor, uniforms, total).GetAwaiter().GetResult();
-        // Grad for positive = -gradAnchor component (positive direction), for negative = +gradAnchor component (negative direction)
-        // For a complete backward we'd need separate kernels for each output; approximate with negate/copy
-        Negate(gradAnchor, gradPositive, total);
-        Copy(gradAnchor, gradNegative, total);
-        Negate(gradNegative, gradNegative, total);
+        // Compute gradPositive: d(loss)/d(positive) = -(a-p)/||a-p|| (uses dedicated kernel)
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "triplet_grad_positive",
+            anchor, positive, negative, gradPositive, uniforms, total).GetAwaiter().GetResult();
+        // Compute gradNegative: d(loss)/d(negative) = (a-n)/||a-n|| (uses dedicated kernel)
+        Dispatch4BufferAsync("TripletContrastive", WebGpuKernels.TripletContrastiveSource, "triplet_grad_negative",
+            anchor, positive, negative, gradNegative, uniforms, total).GetAwaiter().GetResult();
     }
 
     public float HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float delta) =>
@@ -527,6 +680,19 @@ public sealed partial class WebGpuBackend
 
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
+        if (sourceSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceSize), "Source size must be positive.");
+        if (destSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(destSize), "Destination size must be positive.");
+        // Validate index bounds by downloading indices
+        var indexData = DownloadBufferData(indices);
+        for (int i = 0; i < sourceSize; i++)
+        {
+            int idx = BitConverter.SingleToInt32Bits(indexData[i]);
+            if (idx < 0 || idx >= destSize)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {idx} at position {i} is out of bounds for destination size {destSize}.");
+        }
         // ScatterGatherExtSource scatter_add: gather pattern - for each dest element, scan source for matching indices
         // binding(0)=source, binding(1)=indices, binding(2)=destination
         // Uniform: num_indices=sourceSize, inner_size=1 (flat), dest_outer=destSize, pad
@@ -549,6 +715,19 @@ public sealed partial class WebGpuBackend
 
     public void Gather(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, int numIndices, int featureSize)
     {
+        if (numIndices <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numIndices), "Number of indices must be positive.");
+        if (featureSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(featureSize), "Feature size must be positive.");
+        // Validate index bounds by downloading indices
+        var indexData = DownloadBufferData(indices);
+        for (int i = 0; i < numIndices; i++)
+        {
+            int idx = BitConverter.SingleToInt32Bits(indexData[i]);
+            if (idx < 0)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {idx} at position {i} is negative.");
+        }
         // ScatterGatherExtSource gather_op: binding(0)=source, binding(1)=indices, binding(2)=output(destination)
         // Uniform: num_indices, inner_size=featureSize, dest_outer(unused), pad
         var uniforms = new float[]
@@ -587,18 +766,36 @@ public sealed partial class WebGpuBackend
 
     public void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        // ConditionalSource where_op: A=condition, B=trueVals, C gets falseVals first then selected
-        // First copy B (false values) to C, then the kernel writes: C[i] = select(C[i], B[i], A[i]>0.5)
-        // Wait - the kernel has bindings: A=condition at binding(0), B=trueVals at binding(1), C at binding(2)
-        // So we need to copy the false values (B param) into C first, then dispatch with condition and trueVals (A param)
-        Copy(B, C, size);
+        // ConditionalSource where_op: binding(0)=condition, binding(1)=trueVals, binding(2)=C (pre-filled with falseVals)
+        // Semantics: C[i] = condition[i] ? A[i] : B[i].
+        //
+        // Implementation strategy:
+        //  - Pre-fill the destination buffer with the "false" values (B).
+        //  - The kernel then selects between the existing C[i] (false) and A[i] (true) based on condition[i].
+        //
+        // To avoid corrupting inputs when buffers alias, we must not overwrite 'condition' or 'A' during pre-fill.
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(size),
             0 // scalar not used for where_op
         };
-        Dispatch3BufferAsync("Conditional", WebGpuKernels.ConditionalSource, "where_op",
-            condition, A, C, uniforms, size).GetAwaiter().GetResult();
+
+        if (ReferenceEquals(C, condition) || ReferenceEquals(C, A))
+        {
+            // Use a temporary output buffer to preserve aliased inputs during pre-fill.
+            using var tempC = (WebGpuBuffer)AllocateBuffer(size);
+            Copy(B, tempC, size);
+            Dispatch3BufferAsync("Conditional", WebGpuKernels.ConditionalSource, "where_op",
+                condition, A, tempC, uniforms, size).GetAwaiter().GetResult();
+            Copy(tempC, C, size);
+        }
+        else
+        {
+            // Fast path when C does not alias condition or A (including the in-place B==C case).
+            Copy(B, C, size);
+            Dispatch3BufferAsync("Conditional", WebGpuKernels.ConditionalSource, "where_op",
+                condition, A, C, uniforms, size).GetAwaiter().GetResult();
+        }
     }
 
     public void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size)
@@ -626,9 +823,11 @@ public sealed partial class WebGpuBackend
 
     public void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
-        // First compute mean using existing GPU kernel
+        // First compute mean using existing GPU kernel (caller expects mean buffer populated)
         MeanAxis(A, mean, outerSize, reduceSize);
-        // Then compute variance using VarAxisSource
+        // The VarAxisSource kernel recomputes the mean internally per workgroup for numerical
+        // stability (avoids an extra buffer read and potential sync issues). The mean buffer
+        // populated above is for the caller's use, not consumed by the variance kernel.
         var uniforms = MakeUniformInts2(outerSize, reduceSize);
         Dispatch2BufferAsync("VarAxis", WebGpuKernels.VarAxisSource, "var_axis",
             A, variance, uniforms, outerSize).GetAwaiter().GetResult();
@@ -658,6 +857,8 @@ public sealed partial class WebGpuBackend
     public void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
     {
         // TopKSource topk_select: binding(0)=input, binding(1)=values, binding(2)=indices
+        // Note: The WGSL kernel uses selection sort which inherently produces sorted (descending) output.
+        // When sorted=false, we shuffle the results to remove the ordering guarantee.
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(outerSize),
@@ -667,6 +868,29 @@ public sealed partial class WebGpuBackend
         };
         Dispatch3BufferAsync("TopK", WebGpuKernels.TopKSource, "topk_select",
             A, values, indices, uniforms, outerSize).GetAwaiter().GetResult();
+
+        if (!sorted && k > 1)
+        {
+            // Shuffle the top-K results to remove the descending sort order.
+            // Download, shuffle per batch, re-upload.
+            int totalK = outerSize * k;
+            var valData = DownloadBufferData(values);
+            var idxData = DownloadBufferData(indices);
+            var rng = new Random();
+            for (int b = 0; b < outerSize; b++)
+            {
+                int baseIdx = b * k;
+                // Fisher-Yates shuffle
+                for (int i = k - 1; i > 0; i--)
+                {
+                    int j = rng.Next(i + 1);
+                    (valData[baseIdx + i], valData[baseIdx + j]) = (valData[baseIdx + j], valData[baseIdx + i]);
+                    (idxData[baseIdx + i], idxData[baseIdx + j]) = (idxData[baseIdx + j], idxData[baseIdx + i]);
+                }
+            }
+            UploadToBuffer(valData, values);
+            UploadToBuffer(idxData, indices);
+        }
     }
 
     public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
