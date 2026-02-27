@@ -5847,6 +5847,144 @@ fn deformable_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+
+    /// <summary>
+    /// ConvTranspose2D backward w.r.t. input (equivalent to Conv2D forward with kernel).
+    /// gradOutput has shape [batch, outChannels, outHeight, outWidth]
+    /// kernel has shape [inChannels, outChannels, kH, kW] (note: transposed conv kernel layout)
+    /// gradInput has shape [batch, inChannels, inHeight, inWidth]
+    /// </summary>
+    public const string ConvTranspose2DBackwardInputSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> kernel: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_input: array<f32>;
+
+struct ConvParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+}
+@group(0) @binding(3) var<uniform> params: ConvParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn conv_transpose2d_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let in_x = gid.x;
+    let in_y = gid.y;
+    let ic = gid.z % params.in_channels;
+    let batch = gid.z / params.in_channels;
+
+    if (in_x >= params.in_width || in_y >= params.in_height || batch >= params.batch_size) {
+        return;
+    }
+
+    // ConvTranspose2D backward w.r.t. input is a regular Conv2D of gradOutput with kernel
+    // gradInput[n,ic,iy,ix] = sum_oc,ky,kx gradOutput[n,oc, iy*s+ky-p, ix*s+kx-p] * kernel[ic,oc,ky,kx]
+    // But we need to account for stride: only positions where (out_pos - pad + ky) is divisible by stride contribute
+    var acc: f32 = 0.0;
+    for (var oc: u32 = 0u; oc < params.out_channels; oc = oc + 1u) {
+        for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+            for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+                // For transposed conv backward: gradInput is the input of the forward pass
+                // forward: output[oy] = sum input[iy] * kernel where oy = iy*stride - pad + ky
+                // backward: gradInput[iy] = sum gradOutput[oy] * kernel where oy = iy*stride - pad + ky
+                let out_y = i32(in_y * params.stride_h) - i32(params.pad_h) + i32(ky);
+                let out_x = i32(in_x * params.stride_w) - i32(params.pad_w) + i32(kx);
+                if (out_y >= 0 && out_y < i32(params.out_height) && out_x >= 0 && out_x < i32(params.out_width)) {
+                    let go_idx = batch * params.out_channels * params.out_height * params.out_width
+                               + oc * params.out_height * params.out_width
+                               + u32(out_y) * params.out_width + u32(out_x);
+                    // kernel layout for transposed conv: [inChannels, outChannels, kH, kW]
+                    let k_idx = ic * params.out_channels * params.kernel_height * params.kernel_width
+                              + oc * params.kernel_height * params.kernel_width
+                              + ky * params.kernel_width + kx;
+                    acc = acc + grad_output[go_idx] * kernel[k_idx];
+                }
+            }
+        }
+    }
+
+    let gi_idx = batch * params.in_channels * params.in_height * params.in_width
+               + ic * params.in_height * params.in_width
+               + in_y * params.in_width + in_x;
+    grad_input[gi_idx] = acc;
+}
+";
+
+    /// <summary>
+    /// ConvTranspose2D backward w.r.t. kernel weights.
+    /// dL/dW[ic,oc,ky,kx] = sum_n,oy,ox input[n,ic,iy] * gradOutput[n,oc,oy,ox]
+    ///   where oy = iy*stride - pad + ky
+    /// </summary>
+    public const string ConvTranspose2DBackwardKernelSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_kernel: array<f32>;
+
+struct ConvParams {
+    batch_size: u32,
+    in_channels: u32,
+    out_channels: u32,
+    in_height: u32,
+    in_width: u32,
+    out_height: u32,
+    out_width: u32,
+    kernel_height: u32,
+    kernel_width: u32,
+    stride_h: u32,
+    stride_w: u32,
+    pad_h: u32,
+    pad_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+}
+@group(0) @binding(3) var<uniform> params: ConvParams;
+
+@compute @workgroup_size(256)
+fn conv_transpose2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    // Kernel layout: [inChannels, outChannels, kH, kW]
+    let total = params.in_channels * params.out_channels * params.kernel_height * params.kernel_width;
+    if (idx >= total) { return; }
+
+    let kw = idx % params.kernel_width;
+    let kh = (idx / params.kernel_width) % params.kernel_height;
+    let oc = (idx / (params.kernel_width * params.kernel_height)) % params.out_channels;
+    let ic = idx / (params.kernel_width * params.kernel_height * params.out_channels);
+
+    var acc: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        for (var iy: u32 = 0u; iy < params.in_height; iy = iy + 1u) {
+            for (var ix: u32 = 0u; ix < params.in_width; ix = ix + 1u) {
+                let oy = i32(iy * params.stride_h) - i32(params.pad_h) + i32(kh);
+                let ox = i32(ix * params.stride_w) - i32(params.pad_w) + i32(kw);
+                if (oy >= 0 && oy < i32(params.out_height) && ox >= 0 && ox < i32(params.out_width)) {
+                    let in_idx = n * params.in_channels * params.in_height * params.in_width
+                               + ic * params.in_height * params.in_width
+                               + iy * params.in_width + ix;
+                    let go_idx = n * params.out_channels * params.out_height * params.out_width
+                               + oc * params.out_height * params.out_width
+                               + u32(oy) * params.out_width + u32(ox);
+                    acc = acc + input[in_idx] * grad_output[go_idx];
+                }
+            }
+        }
+    }
+    grad_kernel[idx] = acc;
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -5881,7 +6019,8 @@ fn deformable_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
                OneHotSource + BatchNormEmaSource +
                LocallyConnectedConv2DSource + LocallyConnectedConv2DBackwardInputSource +
                LocallyConnectedConv2DBackwardWeightsSource +
-               DeformableConv2DSource;
+               DeformableConv2DSource +
+               ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource;
     }
 }
 #endif

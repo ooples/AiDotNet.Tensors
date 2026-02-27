@@ -115,7 +115,13 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        Fill(gradInput, 0f, batch * inChannels * inHeight * inWidth);
+        // ConvTranspose2D backward w.r.t. input: regular Conv2D of gradOutput with kernel
+        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
+        Dispatch3Buffer3DAsync("ConvTranspose2DBackwardInput",
+            WebGpuKernels.ConvTranspose2DBackwardInputSource, "conv_transpose2d_backward_input",
+            gradOutput, kernel, gradInput, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
     }
 
     public void ConvTranspose2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -125,7 +131,13 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
-        Fill(gradKernel, 0f, inChannels * outChannels * kernelH * kernelW);
+        // dL/dW[ic,oc,ky,kx] = sum over batch, input positions of input * gradOutput
+        int totalKernelElements = inChannels * outChannels * kernelH * kernelW;
+        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
+            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
+        Dispatch3BufferAsync("ConvTranspose2DBackwardKernel",
+            WebGpuKernels.ConvTranspose2DBackwardKernelSource, "conv_transpose2d_backward_kernel",
+            input, gradOutput, gradKernel, uniforms, totalKernelElements).GetAwaiter().GetResult();
     }
 
     public void LocallyConnectedConv2D(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer? bias, IGpuBuffer output,
