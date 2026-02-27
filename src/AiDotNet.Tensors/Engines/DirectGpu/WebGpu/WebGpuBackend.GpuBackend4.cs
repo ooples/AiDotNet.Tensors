@@ -98,27 +98,28 @@ public sealed partial class WebGpuBackend
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
-        // Two-pass: first compute param_norm via GPU, then compute update_norm via Adam-like step, then dispatch
-        // For LAMB we need param_norm and update_norm. Compute param_norm on GPU:
-        using var squared = (WebGpuBuffer)AllocateBuffer(size);
-        SquareAsync(param, squared, size).GetAwaiter().GetResult();
-        float pNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
+        // Two-pass GPU: compute param_norm and update_norm entirely on GPU
+        // Step 1: param_norm via GPU square + sum
+        using var paramSq = (WebGpuBuffer)AllocateBuffer(size);
+        SquareAsync(param, paramSq, size).GetAwaiter().GetResult();
+        float pNormSq = SumAsync(paramSq, size).GetAwaiter().GetResult();
         float pNorm = MathF.Sqrt(pNormSq);
-        // To compute update_norm, we need the Adam update vector. Do this on CPU for the norm computation only:
-        var mData = DownloadBufferData(m); var vData = DownloadBufferData(v);
-        var gData = DownloadBufferData(gradient); var pData = DownloadBufferData(param);
-        float bc1 = 1f - MathF.Pow(beta1, step), bc2 = 1f - MathF.Pow(beta2, step);
-        float uNormSq = 0;
-        for (int i = 0; i < size; i++)
+        // Step 2: update_norm via GPU kernel that computes Adam update^2 per element, then sum
+        float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc2 = 1f - MathF.Pow(beta2, step);
+        using var updateSq = (WebGpuBuffer)AllocateBuffer(size);
+        var lambNormUniforms = new float[]
         {
-            float mHat = (beta1 * mData[i] + (1 - beta1) * gData[i]) / bc1;
-            float vHat = (beta2 * vData[i] + (1 - beta2) * gData[i] * gData[i]) / bc2;
-            float ui = mHat / (MathF.Sqrt(vHat) + epsilon) + weightDecay * pData[i];
-            uNormSq += ui * ui;
-        }
+            BitConverter.Int32BitsToSingle(size),
+            beta1, beta2, epsilon,
+            bc1, bc2, weightDecay, 0
+        };
+        Dispatch4BufferAsync("LambNorm", WebGpuKernels.LambNormSource, "lamb_update_sq",
+            m, v, gradient, updateSq, lambNormUniforms, size).GetAwaiter().GetResult();
+        float uNormSq = SumAsync(updateSq, size).GetAwaiter().GetResult();
         float uNorm = MathF.Sqrt(uNormSq);
         float ratio = uNorm > 0 ? pNorm / uNorm : 1f;
-        // LarsLambFtrlSource lamb_update: extra = pre-computed ratio
+        // Step 3: Apply LAMB update with pre-computed trust ratio
         var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
         uniforms[7] = ratio;
         Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lamb_update",
@@ -191,14 +192,11 @@ public sealed partial class WebGpuBackend
     public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
         // SpecializedLayerSource rbf_forward: binding(0)=input, binding(1)=centers+epsilons combined, binding(2)=output
-        // Epsilons are stored after centers at offset numCenters*inputDim in the centers buffer
-        var centersData = DownloadBufferData(centers);
-        var epsData = DownloadBufferData(epsilons);
-        var combined = new float[numCenters * inputDim + numCenters];
-        Array.Copy(centersData, 0, combined, 0, numCenters * inputDim);
-        Array.Copy(epsData, 0, combined, numCenters * inputDim, numCenters);
-        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(combined.Length);
-        UploadToBuffer(combined, combinedBuf);
+        // Pack centers and epsilons via GPU Copy with offsets
+        int centersLen = numCenters * inputDim;
+        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(centersLen + numCenters);
+        Copy(centers, 0, combinedBuf, 0, centersLen);
+        Copy(epsilons, 0, combinedBuf, centersLen, numCenters);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
@@ -410,53 +408,41 @@ public sealed partial class WebGpuBackend
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
         // ComplexMatVecSource complex_mat_vec: uses interleaved vec and output buffers
-        // Pack vecReal + vecImag into interleaved buffer: [vecReal(dim), vecImag(dim)] per batch
-        var vrData = DownloadBufferData(vecReal);
-        var viData = DownloadBufferData(vecImag);
-        var vecInterleaved = new float[batchSize * dim * 2];
+        // GPU interleave vecReal + vecImag per batch using StridedSlice
+        int vecLen = batchSize * dim;
+        using var vecBuf = (WebGpuBuffer)AllocateBuffer(vecLen * 2);
+        // Copy vecReal blocks: vecBuf[b*dim*2 + 0..dim-1] = vecReal[b*dim..b*dim+dim-1]
         for (int b = 0; b < batchSize; b++)
         {
-            Array.Copy(vrData, b * dim, vecInterleaved, b * dim * 2, dim);
-            Array.Copy(viData, b * dim, vecInterleaved, b * dim * 2 + dim, dim);
+            Copy(vecReal, b * dim, vecBuf, b * dim * 2, dim);
+            Copy(vecImag, b * dim, vecBuf, b * dim * 2 + dim, dim);
         }
-        using var vecBuf = (WebGpuBuffer)AllocateBuffer(vecInterleaved.Length);
-        UploadToBuffer(vecInterleaved, vecBuf);
-        using var outBuf = (WebGpuBuffer)AllocateBuffer(batchSize * dim * 2);
+        using var outBuf = (WebGpuBuffer)AllocateBuffer(vecLen * 2);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
             BitConverter.Int32BitsToSingle(dim),
             0, 0
         };
-        int total = batchSize * dim;
         Dispatch4BufferAsync("ComplexMatVec", WebGpuKernels.ComplexMatVecSource, "complex_mat_vec",
-            matReal, matImag, vecBuf, outBuf, uniforms, total).GetAwaiter().GetResult();
-        // Deinterleave output: [outReal(dim), outImag(dim)] per batch
-        var outData = DownloadBufferData(outBuf);
-        var orData = new float[batchSize * dim];
-        var oiData = new float[batchSize * dim];
+            matReal, matImag, vecBuf, outBuf, uniforms, vecLen).GetAwaiter().GetResult();
+        // GPU deinterleave output per batch
         for (int b = 0; b < batchSize; b++)
         {
-            Array.Copy(outData, b * dim * 2, orData, b * dim, dim);
-            Array.Copy(outData, b * dim * 2 + dim, oiData, b * dim, dim);
+            Copy(outBuf, b * dim * 2, outReal, b * dim, dim);
+            Copy(outBuf, b * dim * 2 + dim, outImag, b * dim, dim);
         }
-        UploadToBuffer(orData, outReal);
-        UploadToBuffer(oiData, outImag);
     }
 
     public void QuantumRotation(IGpuBuffer stateReal, IGpuBuffer stateImag, IGpuBuffer outReal, IGpuBuffer outImag,
         IGpuBuffer angles, int numQubits, int batchSize)
     {
         // ComplexOpsSource quantum_rotation: appends angles to stateReal buffer (A[idx + total] = angle)
-        // Pack stateReal + angles into a combined buffer
+        // Pack stateReal + angles into combined buffer via GPU Copy
         int total = batchSize * numQubits;
-        var reData = DownloadBufferData(stateReal);
-        var angData = DownloadBufferData(angles);
-        var combined = new float[total + total];
-        Array.Copy(reData, 0, combined, 0, total);
-        Array.Copy(angData, 0, combined, total, total);
-        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(combined.Length);
-        UploadToBuffer(combined, combinedBuf);
+        using var combinedBuf = (WebGpuBuffer)AllocateBuffer(total * 2);
+        Copy(stateReal, 0, combinedBuf, 0, total);
+        Copy(angles, 0, combinedBuf, total, total);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(total),
@@ -632,23 +618,17 @@ public sealed partial class WebGpuBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         // RnnCellSource lstm_cell: per-timestep GPU dispatch
-        // Pack weights into combined buffer: [W_ih (4*hs x in_s), W_hh (4*hs x hs), bias (4*hs)]
-        // bias = biasIh + biasHh (pre-add on CPU, only 4*hiddenSize elements)
-        var bihData = DownloadBufferData(biasIh);
-        var bhhData = DownloadBufferData(biasHh);
+        // Pack weights into combined buffer via GPU: [W_ih (4*hs x in_s), W_hh (4*hs x hs), bias (4*hs)]
         int biasLen = 4 * hiddenSize;
-        var combinedBias = new float[biasLen];
-        for (int i = 0; i < biasLen; i++) combinedBias[i] = bihData[i] + bhhData[i];
         int wihLen = 4 * hiddenSize * inputSize;
         int whhLen = 4 * hiddenSize * hiddenSize;
-        var wihData = DownloadBufferData(weightsIh);
-        var whhData = DownloadBufferData(weightsHh);
-        var packedWeights = new float[wihLen + whhLen + biasLen];
-        Array.Copy(wihData, 0, packedWeights, 0, wihLen);
-        Array.Copy(whhData, 0, packedWeights, wihLen, whhLen);
-        Array.Copy(combinedBias, 0, packedWeights, wihLen + whhLen, biasLen);
-        using var weightsBuf = (WebGpuBuffer)AllocateBuffer(packedWeights.Length);
-        UploadToBuffer(packedWeights, weightsBuf);
+        using var weightsBuf = (WebGpuBuffer)AllocateBuffer(wihLen + whhLen + biasLen);
+        Copy(weightsIh, 0, weightsBuf, 0, wihLen);
+        Copy(weightsHh, 0, weightsBuf, wihLen, whhLen);
+        // bias = biasIh + biasHh: add on GPU into the weights buffer at offset
+        using var biasCombined = (WebGpuBuffer)AllocateBuffer(biasLen);
+        Add(biasIh, biasHh, biasCombined, biasLen);
+        Copy(biasCombined, 0, weightsBuf, wihLen + whhLen, biasLen);
 
         // hBuf holds current hidden state, cBuf holds cell state (state buffer)
         using var hBuf = (WebGpuBuffer)AllocateBuffer(batch * hiddenSize);
@@ -668,16 +648,22 @@ public sealed partial class WebGpuBackend
         // Extract per-timestep input slices and dispatch
         for (int t = 0; t < seqLen; t++)
         {
-            // Extract input for timestep t: input[b, t, :] for all batches
+            // Extract input for timestep t via GPU strided slice: input[b, t, :] -> inputSlice[b, :]
             using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
-            var inputData = DownloadBufferData(input);
-            var sliceData = new float[batch * inputSize];
-            for (int b = 0; b < batch; b++)
-                Array.Copy(inputData, (b * seqLen + t) * inputSize, sliceData, b * inputSize, inputSize);
-            UploadToBuffer(sliceData, inputSlice);
+            var sliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),  // src_stride per batch
+                BitConverter.Int32BitsToSingle(inputSize),           // dst_stride per batch
+                BitConverter.Int32BitsToSingle(t * inputSize),       // src_offset (timestep t)
+                BitConverter.Int32BitsToSingle(0),                   // dst_offset
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                input, inputSlice, sliceUniforms, batch * inputSize).GetAwaiter().GetResult();
 
             // lstm_cell kernel: input=inputSlice, weights=packedWeights, state=cBuf, output=hBuf
-            // The kernel reads h_prev from output (hBuf), updates state (cBuf) in-place, writes h_new to output (hBuf)
             Dispatch4BufferAsync("RnnCell", WebGpuKernels.RnnCellSource, "lstm_cell",
                 inputSlice, weightsBuf, cBuf, hBuf, uniforms, cellTotal).GetAwaiter().GetResult();
 
@@ -685,12 +671,19 @@ public sealed partial class WebGpuBackend
             Copy(hBuf, 0, allH, t * batch * hiddenSize, batch * hiddenSize);
             Copy(cBuf, 0, allC, t * batch * hiddenSize, batch * hiddenSize);
 
-            // Copy h to output for this timestep: output[b, t, :] = h[b, :]
-            var hData = DownloadBufferData(hBuf);
-            var outputData = DownloadBufferData(output);
-            for (int b = 0; b < batch; b++)
-                Array.Copy(hData, b * hiddenSize, outputData, (b * seqLen + t) * hiddenSize, hiddenSize);
-            UploadToBuffer(outputData, output);
+            // Scatter h to output via GPU strided slice: hBuf[b, :] -> output[b, t, :]
+            var scatterUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(hiddenSize),
+                BitConverter.Int32BitsToSingle(hiddenSize),          // src_stride per batch
+                BitConverter.Int32BitsToSingle(seqLen * hiddenSize), // dst_stride per batch
+                BitConverter.Int32BitsToSingle(0),                   // src_offset
+                BitConverter.Int32BitsToSingle(t * hiddenSize),      // dst_offset (timestep t)
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                hBuf, output, scatterUniforms, batch * hiddenSize).GetAwaiter().GetResult();
         }
 
         Copy(hBuf, hFinal, batch * hiddenSize);
@@ -723,22 +716,17 @@ public sealed partial class WebGpuBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         // RnnCellSource gru_cell: per-timestep GPU dispatch
-        // Pack weights: [W_ih (3*hs x in_s), W_hh (3*hs x hs), bias (3*hs)]
-        var bihData = DownloadBufferData(biasIh);
-        var bhhData = DownloadBufferData(biasHh);
+        // Pack weights into combined buffer via GPU: [W_ih (3*hs x in_s), W_hh (3*hs x hs), bias (3*hs)]
         int biasLen = 3 * hiddenSize;
-        var combinedBias = new float[biasLen];
-        for (int i = 0; i < biasLen; i++) combinedBias[i] = bihData[i] + bhhData[i];
         int wihLen = 3 * hiddenSize * inputSize;
         int whhLen = 3 * hiddenSize * hiddenSize;
-        var wihData = DownloadBufferData(weightsIh);
-        var whhData = DownloadBufferData(weightsHh);
-        var packedWeights = new float[wihLen + whhLen + biasLen];
-        Array.Copy(wihData, 0, packedWeights, 0, wihLen);
-        Array.Copy(whhData, 0, packedWeights, wihLen, whhLen);
-        Array.Copy(combinedBias, 0, packedWeights, wihLen + whhLen, biasLen);
-        using var weightsBuf = (WebGpuBuffer)AllocateBuffer(packedWeights.Length);
-        UploadToBuffer(packedWeights, weightsBuf);
+        using var weightsBuf = (WebGpuBuffer)AllocateBuffer(wihLen + whhLen + biasLen);
+        Copy(weightsIh, 0, weightsBuf, 0, wihLen);
+        Copy(weightsHh, 0, weightsBuf, wihLen, whhLen);
+        // bias = biasIh + biasHh: add on GPU
+        using var biasCombined = (WebGpuBuffer)AllocateBuffer(biasLen);
+        Add(biasIh, biasHh, biasCombined, biasLen);
+        Copy(biasCombined, 0, weightsBuf, wihLen + whhLen, biasLen);
 
         // hBuf holds current hidden state
         using var hBuf = (WebGpuBuffer)AllocateBuffer(batch * hiddenSize);
@@ -757,28 +745,41 @@ public sealed partial class WebGpuBackend
 
         for (int t = 0; t < seqLen; t++)
         {
-            // Extract input for timestep t
+            // Extract input for timestep t via GPU strided slice: input[b, t, :] -> inputSlice[b, :]
             using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
-            var inputData = DownloadBufferData(input);
-            var sliceData = new float[batch * inputSize];
-            for (int b = 0; b < batch; b++)
-                Array.Copy(inputData, (b * seqLen + t) * inputSize, sliceData, b * inputSize, inputSize);
-            UploadToBuffer(sliceData, inputSlice);
+            var sliceUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(inputSize),
+                BitConverter.Int32BitsToSingle(seqLen * inputSize),  // src_stride per batch
+                BitConverter.Int32BitsToSingle(inputSize),           // dst_stride per batch
+                BitConverter.Int32BitsToSingle(t * inputSize),       // src_offset (timestep t)
+                BitConverter.Int32BitsToSingle(0),                   // dst_offset
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                input, inputSlice, sliceUniforms, batch * inputSize).GetAwaiter().GetResult();
 
             // gru_cell kernel: input=inputSlice, weights=packedWeights, state=dummyState, output=hBuf
-            // The kernel reads h_prev from output (hBuf), updates output (hBuf) in-place
             Dispatch4BufferAsync("RnnCell", WebGpuKernels.RnnCellSource, "gru_cell",
                 inputSlice, weightsBuf, dummyState, hBuf, uniforms, cellTotal).GetAwaiter().GetResult();
 
             // Copy h to allH for this timestep
             Copy(hBuf, 0, allH, t * batch * hiddenSize, batch * hiddenSize);
 
-            // Copy h to output: output[b, t, :] = h[b, :]
-            var hData = DownloadBufferData(hBuf);
-            var outputData = DownloadBufferData(output);
-            for (int b = 0; b < batch; b++)
-                Array.Copy(hData, b * hiddenSize, outputData, (b * seqLen + t) * hiddenSize, hiddenSize);
-            UploadToBuffer(outputData, output);
+            // Scatter h to output via GPU strided slice: hBuf[b, :] -> output[b, t, :]
+            var scatterUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(batch),
+                BitConverter.Int32BitsToSingle(hiddenSize),
+                BitConverter.Int32BitsToSingle(hiddenSize),          // src_stride per batch
+                BitConverter.Int32BitsToSingle(seqLen * hiddenSize), // dst_stride per batch
+                BitConverter.Int32BitsToSingle(0),                   // src_offset
+                BitConverter.Int32BitsToSingle(t * hiddenSize),      // dst_offset (timestep t)
+                0, 0
+            };
+            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
+                hBuf, output, scatterUniforms, batch * hiddenSize).GetAwaiter().GetResult();
         }
 
         Copy(hBuf, hFinal, batch * hiddenSize);

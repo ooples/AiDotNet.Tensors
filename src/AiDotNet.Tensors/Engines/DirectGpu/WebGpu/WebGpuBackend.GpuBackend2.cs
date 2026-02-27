@@ -332,24 +332,30 @@ public sealed partial class WebGpuBackend
     public void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer indices, int batch, int channels, int height, int width)
     {
         // GlobalPoolSource global_max_pool_with_indices: writes output[outer*2]=max_val, output[outer*2+1]=bitcast(max_idx)
-        // We use a temp buffer for interleaved result, then separate into output and indices
         int outerSize = batch * channels;
         int spatial = height * width;
         using var tempOutput = (WebGpuBuffer)AllocateBuffer(outerSize * 2);
         var uniforms = MakeUniformInts2(outerSize, spatial);
         Dispatch2BufferAsync("GlobalPool", WebGpuKernels.GlobalPoolSource, "global_max_pool_with_indices",
             input, tempOutput, uniforms, outerSize).GetAwaiter().GetResult();
-        // Unpack interleaved output
-        var tempData = DownloadBufferData(tempOutput);
-        var outData = new float[outerSize];
-        var idxData = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
+        // GPU deinterleave: extract values (even indices) and indices (odd indices)
+        using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
+        var deinterlUniforms1 = new float[]
         {
-            outData[i] = tempData[i * 2];
-            idxData[i] = tempData[i * 2 + 1];
-        }
-        UploadToBuffer(outData, output);
-        UploadToBuffer(idxData, indices);
+            BitConverter.Int32BitsToSingle(outerSize),
+            BitConverter.Int32BitsToSingle(1), // mode=1 deinterleave_a (values)
+            0, 0
+        };
+        Dispatch3BufferAsync("Interleave", WebGpuKernels.InterleaveSource, "interleave_op",
+            tempOutput, dummyB, output, deinterlUniforms1, outerSize).GetAwaiter().GetResult();
+        var deinterlUniforms2 = new float[]
+        {
+            BitConverter.Int32BitsToSingle(outerSize),
+            BitConverter.Int32BitsToSingle(2), // mode=2 deinterleave_b (indices)
+            0, 0
+        };
+        Dispatch3BufferAsync("Interleave", WebGpuKernels.InterleaveSource, "interleave_op",
+            tempOutput, dummyB, indices, deinterlUniforms2, outerSize).GetAwaiter().GetResult();
     }
 
     public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
@@ -367,19 +373,18 @@ public sealed partial class WebGpuBackend
     public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         // GlobalPoolSource global_max_pool_backward: reads combined buffer [outer*2+0]=grad, [outer*2+1]=idx
-        // We pack gradOutput and indices into interleaved buffer, then dispatch
         int outerSize = batch * channels;
         int spatial = height * width;
-        var go = DownloadBufferData(gradOutput);
-        var idx = DownloadBufferData(indices);
-        var combined = new float[outerSize * 2];
-        for (int i = 0; i < outerSize; i++)
-        {
-            combined[i * 2] = go[i];
-            combined[i * 2 + 1] = idx[i];
-        }
+        // GPU interleave: pack gradOutput and indices into combined buffer
         using var combinedBuf = (WebGpuBuffer)AllocateBuffer(outerSize * 2);
-        UploadToBuffer(combined, combinedBuf);
+        var interlUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(outerSize),
+            BitConverter.Int32BitsToSingle(0), // mode=0 interleave
+            0, 0
+        };
+        Dispatch3BufferAsync("Interleave", WebGpuKernels.InterleaveSource, "interleave_op",
+            gradOutput, indices, combinedBuf, interlUniforms, outerSize).GetAwaiter().GetResult();
         var uniforms = MakeUniformInts2(outerSize, spatial);
         int totalElements = outerSize * spatial;
         Dispatch2BufferAsync("GlobalPool", WebGpuKernels.GlobalPoolSource, "global_max_pool_backward",
@@ -565,29 +570,37 @@ public sealed partial class WebGpuBackend
         // Dispatch per channel - each thread computes stats for one channel
         Dispatch4BufferAsync("BatchNormTraining", WebGpuKernels.BatchNormTrainingSource, "batch_norm_train",
             input, gamma, beta, output, trainUniforms, channels).GetAwaiter().GetResult();
-        // Update running stats and save mean/invvar on CPU (only channels elements, not perf-critical)
-        EnsureInitialized();
-        var inp = DownloadBufferData(input);
-        var rm = DownloadBufferData(runningMean); var rv = DownloadBufferData(runningVar);
-        var sm = new float[channels]; var siv = new float[channels];
-        int count = batch * spatialSize;
+        // Compute per-channel mean and variance on GPU
+        var statsUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(spatialSize),
+            0
+        };
+        using var gpuMean = (WebGpuBuffer)AllocateBuffer(channels);
+        using var gpuVar = (WebGpuBuffer)AllocateBuffer(channels);
+        Dispatch3BufferAsync("BatchNormStats", WebGpuKernels.BatchNormStatsSource, "batch_norm_stats",
+            input, gpuMean, gpuVar, statsUniforms, channels).GetAwaiter().GetResult();
+        // Update running stats via GPU: runningMean = (1-momentum)*runningMean + momentum*gpuMean
+        // runningVar = (1-momentum)*runningVar + momentum*gpuVar
+        // Use Scale+Fma approach: Scale(running, running, 1-momentum) then Fma(gpuMean, momentum_buf, running, running)
+        // Simpler: download only the small channel-sized buffers for the running stats update
+        var sm = DownloadBufferData(gpuMean);
+        var sv = DownloadBufferData(gpuVar);
+        var rm = DownloadBufferData(runningMean);
+        var rv = DownloadBufferData(runningVar);
+        var siv = new float[channels];
         for (int c = 0; c < channels; c++)
         {
-            float mean = 0;
-            for (int n = 0; n < batch; n++)
-                for (int s = 0; s < spatialSize; s++) mean += inp[(n * channels + c) * spatialSize + s];
-            mean /= count;
-            float var_ = 0;
-            for (int n = 0; n < batch; n++)
-                for (int s = 0; s < spatialSize; s++) { float d = inp[(n * channels + c) * spatialSize + s] - mean; var_ += d * d; }
-            var_ /= count;
-            rm[c] = (1 - momentum) * rm[c] + momentum * mean;
-            rv[c] = (1 - momentum) * rv[c] + momentum * var_;
-            sm[c] = mean;
-            siv[c] = 1f / MathF.Sqrt(var_ + epsilon);
+            rm[c] = (1 - momentum) * rm[c] + momentum * sm[c];
+            rv[c] = (1 - momentum) * rv[c] + momentum * sv[c];
+            siv[c] = 1f / MathF.Sqrt(sv[c] + epsilon);
         }
-        UploadToBuffer(sm, saveMean); UploadToBuffer(siv, saveInvVar);
-        UploadToBuffer(rm, runningMean); UploadToBuffer(rv, runningVar);
+        UploadToBuffer(sm, saveMean);
+        UploadToBuffer(siv, saveInvVar);
+        UploadToBuffer(rm, runningMean);
+        UploadToBuffer(rv, runningVar);
     }
 
     public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -736,15 +749,23 @@ public sealed partial class WebGpuBackend
 
     public void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training)
     {
-        EnsureInitialized();
         if (training)
         {
-            // Generate mask on CPU (random generation not available on GPU), then apply on GPU
-            var m = new float[size];
-            var rand = seed != 0 ? new Random((int)(seed & 0x7FFFFFFF)) : new Random();
-            for (int i = 0; i < size; i++)
-                m[i] = (float)rand.NextDouble() >= dropoutRate ? 1f : 0f;
-            UploadToBuffer(m, mask);
+            // Generate bernoulli mask on GPU using Philox RNG
+            uint seedLo = (uint)(seed & 0xFFFFFFFF);
+            uint seedHi = (uint)((seed >> 32) & 0xFFFFFFFF);
+            if (seed == 0) { seedLo = (uint)Environment.TickCount; seedHi = (uint)(Environment.TickCount >> 16) ^ 0xCAFEBABE; }
+            float threshold = dropoutRate; // values >= dropoutRate become 1 (keep), < dropoutRate become 0 (drop)
+            var rngUniforms = new float[]
+            {
+                BitConverter.Int32BitsToSingle(size),
+                BitConverter.Int32BitsToSingle((int)seedLo),
+                BitConverter.Int32BitsToSingle((int)seedHi),
+                BitConverter.Int32BitsToSingle(2), // mode=2 bernoulli_mask
+                0, threshold, 0, 0
+            };
+            Dispatch1BufferAsync("PhiloxRng", WebGpuKernels.PhiloxRngSource, "gpu_random",
+                mask, rngUniforms, size).GetAwaiter().GetResult();
             // GPU kernel: output = input * mask * scale
             float scale = 1f / (1f - dropoutRate);
             var uniforms = MakeUniform2(size, scale);

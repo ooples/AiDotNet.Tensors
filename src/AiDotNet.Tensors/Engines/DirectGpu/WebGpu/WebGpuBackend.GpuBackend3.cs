@@ -241,21 +241,20 @@ public sealed partial class WebGpuBackend
 
     public void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
     {
-        // Convert integer-encoded targets to one-hot for GPU kernel
-        EnsureInitialized();
-        var t = DownloadBufferData(targets);
-        var oneHot = new float[batchSize * numClasses];
-        for (int b = 0; b < batchSize; b++)
+        // Convert integer-encoded targets to one-hot via GPU kernel
+        int total = batchSize * numClasses;
+        using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(total);
+        Fill(oneHotBuf, 0f, total);
+        var ohUniforms = new float[]
         {
-            int target = BitConverter.SingleToInt32Bits(t[b]);
-            if (target >= 0 && target < numClasses)
-                oneHot[b * numClasses + target] = 1f;
-        }
-        using var oneHotBuf = (WebGpuBuffer)AllocateBuffer(batchSize * numClasses);
-        UploadToBuffer(oneHot, oneHotBuf);
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(numClasses),
+            0, 0
+        };
+        Dispatch2BufferAsync("OneHot", WebGpuKernels.OneHotSource, "one_hot_encode",
+            targets, oneHotBuf, ohUniforms, total).GetAwaiter().GetResult();
         // CrossEntropySource cross_entropy_backward: softmax(predictions) - targets (one-hot)
         var uniforms = MakeUniformInts2(batchSize, numClasses);
-        int total = batchSize * numClasses;
         Dispatch3BufferAsync("CrossEntropy", WebGpuKernels.CrossEntropySource, "cross_entropy_backward",
             predictions, oneHotBuf, gradInput, uniforms, total).GetAwaiter().GetResult();
     }

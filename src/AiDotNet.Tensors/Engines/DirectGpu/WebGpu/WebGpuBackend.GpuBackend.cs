@@ -36,33 +36,7 @@ public sealed partial class WebGpuBackend
         return wb.Download();
     }
 
-    private void CpuUnary(IGpuBuffer A, IGpuBuffer B, int size, Func<float, float> op)
-    {
-        EnsureInitialized();
-        var a = DownloadBufferData(A);
-        var b = new float[size];
-        for (int i = 0; i < size; i++) b[i] = op(a[i]);
-        UploadToBuffer(b, B);
-    }
-
-    private void CpuBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, Func<float, float, float> op)
-    {
-        EnsureInitialized();
-        var a = DownloadBufferData(A);
-        var b = DownloadBufferData(B);
-        var c = new float[size];
-        for (int i = 0; i < size; i++) c[i] = op(a[i], b[i]);
-        UploadToBuffer(c, C);
-    }
-
-    private float CpuReduce(IGpuBuffer A, int size, float seed, Func<float, float, float> accumulate)
-    {
-        EnsureInitialized();
-        var a = DownloadBufferData(A);
-        float result = seed;
-        for (int i = 0; i < size; i++) result = accumulate(result, a[i]);
-        return result;
-    }
+    // All compute operations dispatched via GPU kernels - no CPU fallback helpers.
 
     #endregion
 
@@ -651,29 +625,16 @@ public sealed partial class WebGpuBackend
 
     public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
     {
-        // For the general case with destColOffset, we need offset support.
-        // The kernel copy_2d_strided uses: batch_size=srcStride(srcCols), rows=numRows, cols=srcCols, _pad=dstStride(destTotalCols)
-        // But it doesn't handle destColOffset, so use CPU for offset cases
-        if (destColOffset != 0)
-        {
-            EnsureInitialized();
-            var src = DownloadBufferData(source);
-            var dst = DownloadBufferData(destination);
-            for (int r = 0; r < numRows; r++)
-                for (int c = 0; c < srcCols; c++) dst[r * destTotalCols + destColOffset + c] = src[r * srcCols + c];
-            UploadToBuffer(dst, destination);
-            return;
-        }
-        // No offset: use GPU kernel
+        // Copy2DStridedSource copy_2d_strided_offset: handles all cases including non-zero offset
         var uniforms = new float[]
         {
-            BitConverter.Int32BitsToSingle(srcCols),       // batch_size repurposed as src_stride
             BitConverter.Int32BitsToSingle(numRows),
             BitConverter.Int32BitsToSingle(srcCols),
-            BitConverter.Int32BitsToSingle(destTotalCols)  // _pad repurposed as dst_stride
+            BitConverter.Int32BitsToSingle(destTotalCols),
+            BitConverter.Int32BitsToSingle(destColOffset)
         };
         int totalElements = numRows * srcCols;
-        Dispatch2BufferAsync("BatchedTranspose", WebGpuKernels.BatchedTransposeSource, "copy_2d_strided",
+        Dispatch2BufferAsync("Copy2DStrided", WebGpuKernels.Copy2DStridedSource, "copy_2d_strided_offset",
             source, destination, uniforms, totalElements).GetAwaiter().GetResult();
     }
 
@@ -728,28 +689,38 @@ public sealed partial class WebGpuBackend
 
     public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
-        EnsureInitialized();
-        var rand = seed != 0 ? new Random((int)(seed & 0x7FFFFFFF)) : new Random();
-        var data = new float[size];
-        float range = max - min;
-        for (int i = 0; i < size; i++) data[i] = (float)rand.NextDouble() * range + min;
-        UploadToBuffer(data, output);
+        // PhiloxRngSource gpu_random: mode=0 (uniform)
+        uint seedLo = (uint)(seed & 0xFFFFFFFF);
+        uint seedHi = (uint)((seed >> 32) & 0xFFFFFFFF);
+        if (seed == 0) { seedLo = (uint)Environment.TickCount; seedHi = (uint)(Environment.TickCount >> 16) ^ 0xDEADBEEF; }
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle((int)size),
+            BitConverter.Int32BitsToSingle((int)seedLo),
+            BitConverter.Int32BitsToSingle((int)seedHi),
+            BitConverter.Int32BitsToSingle(0), // mode=0 uniform
+            min, max, 0, 0
+        };
+        Dispatch1BufferAsync("PhiloxRng", WebGpuKernels.PhiloxRngSource, "gpu_random",
+            output, uniforms, size).GetAwaiter().GetResult();
     }
 
     public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
-        EnsureInitialized();
-        var rand = seed != 0 ? new Random((int)(seed & 0x7FFFFFFF)) : new Random();
-        var data = new float[size];
-        for (int i = 0; i < size; i += 2)
+        // PhiloxRngSource gpu_random: mode=1 (normal via Box-Muller)
+        uint seedLo = (uint)(seed & 0xFFFFFFFF);
+        uint seedHi = (uint)((seed >> 32) & 0xFFFFFFFF);
+        if (seed == 0) { seedLo = (uint)Environment.TickCount; seedHi = (uint)(Environment.TickCount >> 16) ^ 0xDEADBEEF; }
+        var uniforms = new float[]
         {
-            float u1 = 1f - (float)rand.NextDouble();
-            float u2 = (float)rand.NextDouble();
-            float mag = stdDev * MathF.Sqrt(-2f * MathF.Log(u1));
-            data[i] = mag * MathF.Cos(2f * MathF.PI * u2) + mean;
-            if (i + 1 < size) data[i + 1] = mag * MathF.Sin(2f * MathF.PI * u2) + mean;
-        }
-        UploadToBuffer(data, output);
+            BitConverter.Int32BitsToSingle((int)size),
+            BitConverter.Int32BitsToSingle((int)seedLo),
+            BitConverter.Int32BitsToSingle((int)seedHi),
+            BitConverter.Int32BitsToSingle(1), // mode=1 normal
+            0, 0, mean, stdDev
+        };
+        Dispatch1BufferAsync("PhiloxRng", WebGpuKernels.PhiloxRngSource, "gpu_random",
+            output, uniforms, size).GetAwaiter().GetResult();
     }
 
     #endregion

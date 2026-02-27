@@ -5226,6 +5226,289 @@ fn threshold_step(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Philox counter-based RNG kernel for GPU random number generation.
+    /// </summary>
+    public const string PhiloxRngSource = @"
+@group(0) @binding(0) var<storage, read_write> output: array<f32>;
+
+struct RngParams {
+    size: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    mode: u32,     // 0=uniform, 1=normal, 2=bernoulli_mask
+    min_val: f32,
+    max_val: f32,  // For bernoulli: 1-dropout_rate threshold
+    mean: f32,
+    std_dev: f32,
+}
+@group(0) @binding(1) var<uniform> params: RngParams;
+
+fn mulhi(a: u32, b: u32) -> u32 {
+    // 32x32->64 multiply high using 16-bit halves: (aH*bH)<<32 + (aH*bL + aL*bH)<<16 + aL*bL
+    let aL = a & 0xFFFFu;
+    let aH = a >> 16u;
+    let bL = b & 0xFFFFu;
+    let bH = b >> 16u;
+    let ll = aL * bL;
+    let lh = aL * bH;
+    let hl = aH * bL;
+    let hh = aH * bH;
+    let mid = (ll >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    return hh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
+}
+
+fn philox_round(ctr0: u32, ctr1: u32, key0: u32, key1: u32) -> vec4<u32> {
+    let M0: u32 = 0xD2511F53u;
+    let M1: u32 = 0xCD9E8D57u;
+    let lo0 = ctr0 * M0;
+    let hi0 = mulhi(ctr0, M0);
+    let lo1 = ctr1 * M1;
+    let hi1 = mulhi(ctr1, M1);
+    return vec4<u32>(hi1 ^ key0, lo1, hi0 ^ key1, lo0);
+}
+
+fn philox4x32(counter: vec4<u32>, key: vec2<u32>) -> vec4<u32> {
+    var c = counter;
+    var k = key;
+    for (var i: u32 = 0u; i < 10u; i = i + 1u) {
+        let r = philox_round(c.x, c.z, k.x, k.y);
+        c = r;
+        k.x = k.x + 0x9E3779B9u;
+        k.y = k.y + 0xBB67AE85u;
+    }
+    return c;
+}
+
+fn u32_to_f32_01(x: u32) -> f32 {
+    return f32(x >> 8u) / 16777216.0;
+}
+
+@compute @workgroup_size(256)
+fn gpu_random(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let block = idx / 4u;
+    let lane = idx % 4u;
+    let counter = vec4<u32>(block, 0u, 0u, 0u);
+    let key = vec2<u32>(params.seed_lo, params.seed_hi);
+    let rand = philox4x32(counter, key);
+    let u = u32_to_f32_01(rand[lane]);
+    if (params.mode == 0u) {
+        // Uniform: min + u * (max - min)
+        output[idx] = params.min_val + u * (params.max_val - params.min_val);
+    } else if (params.mode == 1u) {
+        // Normal via Box-Muller (use pairs)
+        let pair_idx = idx / 2u;
+        let pair_block = pair_idx / 2u;
+        let pair_lane = pair_idx % 2u;
+        let pc = vec4<u32>(pair_block, 1u, 0u, 0u);
+        let pr = philox4x32(pc, key);
+        let u1 = max(u32_to_f32_01(pr[pair_lane * 2u]), 1e-10);
+        let u2 = u32_to_f32_01(pr[pair_lane * 2u + 1u]);
+        let mag = params.std_dev * sqrt(-2.0 * log(u1));
+        if (idx % 2u == 0u) {
+            output[idx] = mag * cos(6.283185307 * u2) + params.mean;
+        } else {
+            output[idx] = mag * sin(6.283185307 * u2) + params.mean;
+        }
+    } else {
+        // Bernoulli mask: 1 if u >= threshold, else 0
+        output[idx] = select(0.0, 1.0, u >= params.max_val);
+    }
+}
+";
+
+    /// <summary>
+    /// Strided slice/scatter kernels for RNN timestep operations.
+    /// Extracts or inserts non-contiguous slices from/to batched sequence tensors.
+    /// </summary>
+    public const string StridedSliceSource = @"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+struct SliceParams {
+    batch: u32,
+    inner_size: u32,
+    src_stride: u32,  // stride between batches in source
+    dst_stride: u32,  // stride between batches in dest
+    src_offset: u32,  // offset within each batch in source
+    dst_offset: u32,  // offset within each batch in dest
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(2) var<uniform> params: SliceParams;
+
+@compute @workgroup_size(256)
+fn strided_slice(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch * params.inner_size;
+    if (idx >= total) { return; }
+    let b = idx / params.inner_size;
+    let i = idx % params.inner_size;
+    dst[b * params.dst_stride + params.dst_offset + i] = src[b * params.src_stride + params.src_offset + i];
+}
+";
+
+    /// <summary>
+    /// 2D strided copy with arbitrary column offset.
+    /// </summary>
+    public const string Copy2DStridedSource = @"
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+struct Copy2DParams {
+    num_rows: u32,
+    src_cols: u32,
+    dst_total_cols: u32,
+    dst_col_offset: u32,
+}
+@group(0) @binding(2) var<uniform> params: Copy2DParams;
+
+@compute @workgroup_size(256)
+fn copy_2d_strided_offset(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.num_rows * params.src_cols;
+    if (idx >= total) { return; }
+    let r = idx / params.src_cols;
+    let c = idx % params.src_cols;
+    dst[r * params.dst_total_cols + params.dst_col_offset + c] = src[r * params.src_cols + c];
+}
+";
+
+    /// <summary>
+    /// Interleave/deinterleave kernels for packing two arrays into alternating pairs.
+    /// </summary>
+    public const string InterleaveSource = @"
+@group(0) @binding(0) var<storage, read> a_data: array<f32>;
+@group(0) @binding(1) var<storage, read> b_data: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out_data: array<f32>;
+
+struct InterlParams {
+    count: u32,
+    mode: u32,  // 0=interleave(a,b->out), 1=deinterleave_a(src->out), 2=deinterleave_b(src->out)
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(3) var<uniform> params: InterlParams;
+
+@compute @workgroup_size(256)
+fn interleave_op(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.count) { return; }
+    if (params.mode == 0u) {
+        // Interleave: out[i*2] = a[i], out[i*2+1] = b[i]
+        out_data[idx * 2u] = a_data[idx];
+        out_data[idx * 2u + 1u] = b_data[idx];
+    } else if (params.mode == 1u) {
+        // Deinterleave A: out[i] = a_data[i*2] (a_data is the interleaved source)
+        out_data[idx] = a_data[idx * 2u];
+    } else {
+        // Deinterleave B: out[i] = a_data[i*2+1] (a_data is the interleaved source)
+        out_data[idx] = a_data[idx * 2u + 1u];
+    }
+}
+";
+
+    /// <summary>
+    /// BatchNorm statistics kernel: computes per-channel mean and variance on GPU.
+    /// </summary>
+    public const string BatchNormStatsSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_mean: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out_var: array<f32>;
+
+struct BNStatsParams {
+    batch: u32,
+    channels: u32,
+    spatial: u32,
+    _pad: u32,
+}
+@group(0) @binding(3) var<uniform> params: BNStatsParams;
+
+@compute @workgroup_size(256)
+fn batch_norm_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.channels) { return; }
+    let count = params.batch * params.spatial;
+    var sum_val: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            sum_val = sum_val + input[(n * params.channels + c) * params.spatial + s];
+        }
+    }
+    let mean_val = sum_val / f32(count);
+    out_mean[c] = mean_val;
+    var var_val: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial; s = s + 1u) {
+            let d = input[(n * params.channels + c) * params.spatial + s] - mean_val;
+            var_val = var_val + d * d;
+        }
+    }
+    out_var[c] = var_val / f32(count);
+}
+";
+
+    /// <summary>
+    /// LAMB update norm kernel: computes Adam update vector norm on GPU.
+    /// </summary>
+    public const string LambNormSource = @"
+@group(0) @binding(0) var<storage, read> m_buf: array<f32>;
+@group(0) @binding(1) var<storage, read> v_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> grad_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> update_sq: array<f32>;
+
+struct LambNormParams {
+    size: u32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    bc1: f32,
+    bc2: f32,
+    weight_decay: f32,
+    _pad: f32,
+}
+@group(0) @binding(4) var<uniform> params: LambNormParams;
+
+@compute @workgroup_size(256)
+fn lamb_update_sq(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let m_hat = (params.beta1 * m_buf[idx] + (1.0 - params.beta1) * grad_buf[idx]) / params.bc1;
+    let v_hat = (params.beta2 * v_buf[idx] + (1.0 - params.beta2) * grad_buf[idx] * grad_buf[idx]) / params.bc2;
+    let u = m_hat / (sqrt(v_hat) + params.epsilon);
+    update_sq[idx] = u * u;
+}
+";
+
+    /// <summary>
+    /// One-hot encoding kernel: converts integer-encoded labels to one-hot vectors.
+    /// </summary>
+    public const string OneHotSource = @"
+@group(0) @binding(0) var<storage, read> targets: array<f32>;
+@group(0) @binding(1) var<storage, read_write> one_hot: array<f32>;
+
+struct OneHotParams {
+    batch_size: u32,
+    num_classes: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+@group(0) @binding(2) var<uniform> params: OneHotParams;
+
+@compute @workgroup_size(256)
+fn one_hot_encode(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.num_classes;
+    if (idx >= total) { return; }
+    let b = idx / params.num_classes;
+    let c = idx % params.num_classes;
+    let target = bitcast<u32>(bitcast<i32>(targets[b]));
+    one_hot[idx] = select(0.0, 1.0, c == target);
+}
+";
+
+    /// <summary>
     /// Gets all kernel sources combined.
     /// </summary>
     public static string GetCombinedSource()
@@ -5256,7 +5539,10 @@ fn threshold_step(@builtin(global_invocation_id) gid: vec3<u32>) {
                Conv3DSource + Pool3DSource + Upsample3DSource + BiasGradSource +
                BatchNormTrainingSource + LossElementSource + CrossEntropyForwardSource +
                TripletContrastiveSource + TopKSource + ComplexMatVecSource +
-               PoincareExpMapSource + HomeostasisClampSource + ThresholdStepSource;
+               PoincareExpMapSource + HomeostasisClampSource + ThresholdStepSource +
+               PhiloxRngSource + StridedSliceSource + Copy2DStridedSource +
+               InterleaveSource + BatchNormStatsSource + LambNormSource +
+               OneHotSource;
     }
 }
 #endif
