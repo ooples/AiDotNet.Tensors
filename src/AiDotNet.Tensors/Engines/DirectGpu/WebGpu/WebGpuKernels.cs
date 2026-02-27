@@ -4523,8 +4523,10 @@ fn scatter_add_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc: f32 = 0.0;
     for (var e: u32 = 0u; e < params.num_edges; e = e + 1u) {
         let tgt = bitcast<u32>(bitcast<i32>(tgt_idx[e]));
+        if (tgt >= params.num_nodes) { continue; }
         if (tgt == t) {
             let src = bitcast<u32>(bitcast<i32>(src_idx[e]));
+            if (src >= params.num_nodes) { continue; }
             var w: f32 = 1.0;
             if (params.has_edge_values > 0u) {
                 w = edge_vals[e];
@@ -5985,6 +5987,71 @@ fn conv_transpose2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<u32
 }
 ";
 
+
+    /// <summary>
+    /// BatchNorm backward pass - computes gradInput, gradGamma, gradBeta.
+    /// Inputs: gradOutput[batch*channels*spatial], input[batch*channels*spatial],
+    ///         gamma[channels], saveMean[channels], saveInvVar[channels]
+    /// Outputs: gradInput[batch*channels*spatial], gradGamma[channels], gradBeta[channels]
+    /// Each workgroup processes one channel.
+    /// </summary>
+    public const string BatchNormBackwardSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> gamma: array<f32>;
+@group(0) @binding(3) var<storage, read> save_mean: array<f32>;
+@group(0) @binding(4) var<storage, read> save_inv_var: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_input: array<f32>;
+@group(0) @binding(6) var<storage, read_write> grad_gamma: array<f32>;
+@group(0) @binding(7) var<storage, read_write> grad_beta: array<f32>;
+
+struct BNBackwardParams {
+    batch_size: u32,
+    channels: u32,
+    spatial_size: u32,
+    epsilon: f32,
+}
+@group(0) @binding(8) var<uniform> params: BNBackwardParams;
+
+@compute @workgroup_size(256)
+fn batch_norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.channels) { return; }
+
+    let N = f32(params.batch_size * params.spatial_size);
+    let mean_c = save_mean[c];
+    let inv_var_c = save_inv_var[c];
+    let gamma_c = gamma[c];
+
+    // Pass 1: Compute gradBeta = sum(gradOutput) and gradGamma = sum(gradOutput * normalized)
+    var sum_grad: f32 = 0.0;
+    var sum_grad_xhat: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial_size; s = s + 1u) {
+            let idx = n * params.channels * params.spatial_size + c * params.spatial_size + s;
+            let go = grad_output[idx];
+            let x_hat = (input[idx] - mean_c) * inv_var_c;
+            sum_grad = sum_grad + go;
+            sum_grad_xhat = sum_grad_xhat + go * x_hat;
+        }
+    }
+    grad_beta[c] = sum_grad;
+    grad_gamma[c] = sum_grad_xhat;
+
+    // Pass 2: Compute gradInput
+    // gradInput = gamma * invVar * (gradOutput - (gradBeta + x_hat * gradGamma) / N)
+    let scale = gamma_c * inv_var_c;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        for (var s: u32 = 0u; s < params.spatial_size; s = s + 1u) {
+            let idx = n * params.channels * params.spatial_size + c * params.spatial_size + s;
+            let go = grad_output[idx];
+            let x_hat = (input[idx] - mean_c) * inv_var_c;
+            grad_input[idx] = scale * (go - (sum_grad + x_hat * sum_grad_xhat) / N);
+        }
+    }
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -6020,7 +6087,8 @@ fn conv_transpose2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<u32
                LocallyConnectedConv2DSource + LocallyConnectedConv2DBackwardInputSource +
                LocallyConnectedConv2DBackwardWeightsSource +
                DeformableConv2DSource +
-               ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource;
+               ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource +
+               BatchNormBackwardSource;
     }
 }
 #endif
