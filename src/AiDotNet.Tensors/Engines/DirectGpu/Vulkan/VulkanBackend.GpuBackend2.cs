@@ -753,8 +753,8 @@ public sealed unsafe partial class VulkanBackend
             for (int h = 0; h < outputHeight; h++)
                 for (int w = 0; w < outputWidth; w++)
                 {
-                    float ny = 2f * h / (outputHeight - 1) - 1f;
-                    float nx = 2f * w / (outputWidth - 1) - 1f;
+                    float ny = outputHeight > 1 ? 2f * h / (outputHeight - 1) - 1f : 0f;
+                    float nx = outputWidth > 1 ? 2f * w / (outputWidth - 1) - 1f : 0f;
                     int tOff = b * 6;
                     float x = t[tOff + 0] * nx + t[tOff + 1] * ny + t[tOff + 2];
                     float y = t[tOff + 3] * nx + t[tOff + 4] * ny + t[tOff + 5];
