@@ -7905,6 +7905,15 @@ KERNEL VARIANTS (A/B testing):
 
         public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
         {
+            if (size <= 0)
+                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+            if (a.Size < size)
+                throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+            if (b.Size < size)
+                throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+            if (output.Size < size)
+                throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
             var k = _kernelCache["lerp_fused"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7913,11 +7922,21 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, t);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int lerpLocalSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, lerpLocalSize);
         }
 
         public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
         {
+            if (size <= 0)
+                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+            if (a.Size < size)
+                throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+            if (b.Size < size)
+                throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+            if (output.Size < size)
+                throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
             var k = _kernelCache["add_scaled"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7927,11 +7946,16 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, scaleB);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int addScaledLocalSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, addScaledLocalSize);
         }
 
         public float StdDev(IGpuBuffer input, int size)
         {
+            if (size <= 0)
+                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+            if (input.Size < size)
+                throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
             if (size <= 1) return 0.0f;
 
             // Step 1: Compute mean using GPU reduction
@@ -7963,7 +7987,9 @@ KERNEL VARIANTS (A/B testing):
                 for (int i = 0; i < partials.Length; i++)
                     varianceSum += partials[i];
 
-                return MathF.Sqrt(varianceSum / size);
+                // Clamp variance to avoid NaN from floating-point round-off
+                float gpuVariance = Math.Max(0, varianceSum / size);
+                return MathF.Sqrt(gpuVariance);
             }
 
             // Fallback: download and compute on CPU
@@ -7975,7 +8001,9 @@ KERNEL VARIANTS (A/B testing):
                 varSum += diff * diff;
             }
 
-            return MathF.Sqrt(varSum / size);
+            // Clamp variance to avoid NaN from floating-point round-off
+            float cpuVariance = Math.Max(0, varSum / size);
+            return MathF.Sqrt(cpuVariance);
         }
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)

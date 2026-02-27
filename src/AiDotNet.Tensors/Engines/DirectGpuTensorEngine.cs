@@ -9776,13 +9776,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         if (!TryGetBackend(out var backend))
             return base.TensorLeakyReLU(tensor, alpha);
 
-        float alphaFloat = ToFloatScalar(alpha);
-        using var bufferA = GetOrAllocateBuffer(backend, tensor.ToArray());
-        using var bufferB = AllocateOutputBuffer(backend, tensor.Length);
-        backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        return new Tensor<T>(result, tensor.Shape);
+        try
+        {
+            float alphaFloat = ToFloatScalar(alpha);
+            using var bufferA = GetOrAllocateBuffer(backend, tensor.ToArray());
+            using var bufferB = AllocateOutputBuffer(backend, tensor.Length);
+            backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            return new Tensor<T>(result, tensor.Shape);
+        }
+        catch (Exception)
+        {
+            return base.TensorLeakyReLU(tensor, alpha);
+        }
     }
 
     Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
@@ -9807,17 +9814,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
             return base.TensorLerp(a, b, t);
 
-        float tFloat = ToFloatScalar(t);
-        int size = a.Length;
+        try
+        {
+            float tFloat = ToFloatScalar(t);
+            int size = a.Length;
 
-        using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
-        using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
-        using var bufferResult = AllocateOutputBuffer(backend, size);
+            using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
+            using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
+            using var bufferResult = AllocateOutputBuffer(backend, size);
 
-        backend.Lerp(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, tFloat, size);
+            backend.Lerp(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, tFloat, size);
 
-        float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
-        return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+            float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+        }
+        catch (Exception)
+        {
+            return base.TensorLerp(a, b, t);
+        }
     }
 
     Tensor<T> IEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
@@ -9826,18 +9840,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
             return base.TensorAddScaled(a, b, scaleA, scaleB);
 
-        float scaleAFloat = ToFloatScalar(scaleA);
-        float scaleBFloat = ToFloatScalar(scaleB);
-        int size = a.Length;
+        try
+        {
+            float scaleAFloat = ToFloatScalar(scaleA);
+            float scaleBFloat = ToFloatScalar(scaleB);
+            int size = a.Length;
 
-        using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
-        using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
-        using var bufferResult = AllocateOutputBuffer(backend, size);
+            using var bufferA = GetOrAllocateBuffer(backend, a.ToArray());
+            using var bufferB = GetOrAllocateBuffer(backend, b.ToArray());
+            using var bufferResult = AllocateOutputBuffer(backend, size);
 
-        backend.AddScaled(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, scaleAFloat, scaleBFloat, size);
+            backend.AddScaled(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, scaleAFloat, scaleBFloat, size);
 
-        float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
-        return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+            float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
+        }
+        catch (Exception)
+        {
+            return base.TensorAddScaled(a, b, scaleA, scaleB);
+        }
     }
 
     Tensor<T> IEngine.TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
