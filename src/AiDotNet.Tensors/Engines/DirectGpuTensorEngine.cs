@@ -9743,32 +9743,67 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     Tensor<T> IEngine.TensorSigmoid<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSigmoid(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSigmoid(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorSigmoid(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorReLU<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorReLU(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorReLU(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorReLU(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorGELU<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorGELU(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorGELU(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorGELU(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSiLU(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSiLU(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorSiLU(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorTanh<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorTanh(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorTanh(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorTanh(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
@@ -9794,14 +9829,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMish(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMish(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorMish(tensor);
+        }
     }
 
     Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorHardSwish(tensor);
+        try
+        {
+            var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
+            return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorHardSwish(tensor);
+        }
+        catch (Exception)
+        {
+            return base.TensorHardSwish(tensor);
+        }
     }
 
     #endregion
