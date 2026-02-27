@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe class VulkanBackend : IDisposable
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 {
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -57,6 +57,11 @@ public sealed unsafe class VulkanBackend : IDisposable
     public bool IsAvailable => _initialized && !_disposed;
 
     /// <summary>
+    /// Gets the backend name.
+    /// </summary>
+    public string BackendName => "Vulkan";
+
+    /// <summary>
     /// Gets the device name.
     /// </summary>
     public string DeviceName => _device.DeviceName;
@@ -65,6 +70,26 @@ public sealed unsafe class VulkanBackend : IDisposable
     /// Gets the vendor name.
     /// </summary>
     public string VendorName => _device.VendorName;
+
+    /// <summary>
+    /// Gets the device vendor.
+    /// </summary>
+    public string DeviceVendor => _device.VendorName;
+
+    /// <summary>
+    /// Gets the number of compute units (workgroup invocations).
+    /// </summary>
+    public int ComputeUnits => (int)_device.MaxWorkgroupSize;
+
+    /// <summary>
+    /// Gets the total global memory in bytes.
+    /// </summary>
+    public long GlobalMemoryBytes => _device.MaxStorageBufferRange;
+
+    /// <summary>
+    /// Gets the local (shared) memory per workgroup in bytes.
+    /// </summary>
+    public long LocalMemoryBytes => _device.MaxSharedMemorySize;
 
     /// <summary>
     /// Gets the maximum workgroup size.
