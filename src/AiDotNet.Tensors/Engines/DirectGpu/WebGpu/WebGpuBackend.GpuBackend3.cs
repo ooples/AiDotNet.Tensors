@@ -114,139 +114,119 @@ public sealed partial class WebGpuBackend
 
     #region Activation Gradients
 
-    public void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size) => CpuUnary(A, B, size, v => v >= 0 ? v : alpha * v);
+    public void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
+        => LeakyReLUAsync(A, B, size, alpha).GetAwaiter().GetResult();
 
     public void LeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] >= 0 ? 1f : alpha);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "leaky_relu_backward",
+            gradOutput, input, gradInput, MakeUniform3(size, alpha, 0), size).GetAwaiter().GetResult();
     }
 
-    public void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size) => CpuUnary(A, B, size, v => v >= 0 ? v : alpha * (MathF.Exp(v) - 1f));
+    public void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
+        => ELUAsync(A, B, size, alpha).GetAwaiter().GetResult();
 
     public void EluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer output, IGpuBuffer gradInput, float alpha, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] >= 0 ? 1f : alpha * MathF.Exp(inp[i]));
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "elu_backward",
+            gradOutput, input, gradInput, MakeUniform3(size, alpha, 0), size).GetAwaiter().GetResult();
     }
 
-    public void Swish(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => v / (1f + MathF.Exp(-v)));
+    public void Swish(IGpuBuffer A, IGpuBuffer B, int size) => SwishAsync(A, B, size).GetAwaiter().GetResult();
 
     public void SwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) { float s = 1f / (1f + MathF.Exp(-inp[i])); o[i] = g[i] * (s + inp[i] * s * (1f - s)); }
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "swish_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void Silu(IGpuBuffer A, IGpuBuffer B, int size) => Swish(A, B, size);
 
     public void SiluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size) => SwishBackward(gradOutput, input, gradInput, size);
 
-    public void Mish(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => v * MathF.Tanh(MathF.Log(1f + MathF.Exp(v))));
+    public void Mish(IGpuBuffer A, IGpuBuffer B, int size) => MishAsync(A, B, size).GetAwaiter().GetResult();
 
     public void MishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) { float sp = MathF.Log(1f + MathF.Exp(inp[i])); float th = MathF.Tanh(sp); float sig = 1f / (1f + MathF.Exp(-inp[i])); o[i] = g[i] * (th + inp[i] * sig * (1f - th * th)); }
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "mish_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
-    public void Softplus(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Log(1f + MathF.Exp(v)));
+    public void Softplus(IGpuBuffer A, IGpuBuffer B, int size) => SoftplusAsync(A, B, size).GetAwaiter().GetResult();
 
     public void SoftplusBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] / (1f + MathF.Exp(-inp[i]));
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "softplus_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
-    public void Hardswish(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => v <= -3 ? 0 : v >= 3 ? v : v * (v + 3f) / 6f);
+    public void Hardswish(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchActivationAsync("hardswish", A, B, size, 0).GetAwaiter().GetResult();
 
     public void HardswishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] <= -3 ? 0 : inp[i] >= 3 ? 1 : (2f * inp[i] + 3f) / 6f);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "hardswish_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
-        => CpuUnary(A, B, size, v => scale * (v >= 0 ? v : alpha * (MathF.Exp(v) - 1f)));
+        => DispatchActivationAsync("selu", A, B, size, alpha).GetAwaiter().GetResult();
 
     public void SeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, float scale, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * scale * (inp[i] >= 0 ? 1f : alpha * MathF.Exp(inp[i]));
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "selu_backward",
+            gradOutput, input, gradInput, MakeUniform3(size, alpha, scale), size).GetAwaiter().GetResult();
     }
 
-    public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size) => CpuUnary(A, B, size, v => MathF.Max(0, MathF.Min(1, (v + 3f) / 6f)));
+    public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchActivationAsync("hardsigmoid", A, B, size, 0).GetAwaiter().GetResult();
 
     public void HardsigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] > -3 && inp[i] < 3 ? 1f / 6f : 0);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "hardsigmoid_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
-    public void Hardtanh(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size) => CpuUnary(A, B, size, v => MathF.Max(minVal, MathF.Min(maxVal, v)));
+    public void Hardtanh(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size)
+    {
+        Dispatch2BufferAsync("Clamp", WebGpuKernels.ClampSource, "clamp_op",
+            A, B, MakeUniform3(size, minVal, maxVal), size).GetAwaiter().GetResult();
+    }
 
     public void HardtanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float minVal, float maxVal, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] >= minVal && inp[i] <= maxVal ? 1f : 0);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "hardtanh_backward",
+            gradOutput, input, gradInput, MakeUniform3(size, minVal, maxVal), size).GetAwaiter().GetResult();
     }
 
     public void ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (inp[i] > 0 ? 1f : 0);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "relu_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void SigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var outData = DownloadBufferData(output); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * outData[i] * (1f - outData[i]);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "sigmoid_backward",
+            gradOutput, output, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void TanhBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var outData = DownloadBufferData(output); var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = g[i] * (1f - outData[i] * outData[i]);
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "tanh_backward",
+            gradOutput, output, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        var g = DownloadBufferData(gradOutput); var inp = DownloadBufferData(input); var o = new float[size];
-        for (int i = 0; i < size; i++)
-        {
-            float x = inp[i];
-            float cdf = 0.5f * (1f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
-            float pdf = 0.3989422804f * MathF.Exp(-0.5f * x * x);
-            o[i] = g[i] * (cdf + x * pdf);
-        }
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "gelu_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
-        EnsureInitialized();
-        var g = DownloadBufferData(gradOutput); var outData = DownloadBufferData(output);
-        var o = new float[batchSize * features];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * features;
-            float dot = 0;
-            for (int f = 0; f < features; f++) dot += g[off + f] * outData[off + f];
-            for (int f = 0; f < features; f++) o[off + f] = outData[off + f] * (g[off + f] - dot);
-        }
-        UploadToBuffer(o, gradInput);
+        Dispatch3BufferAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward",
+            gradOutput, output, gradInput, MakeUniformInts2(batchSize, features), batchSize).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -308,20 +288,32 @@ public sealed partial class WebGpuBackend
     public float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f - 1e-7f); return -(t * MathF.Log(p) + (1 - t) * MathF.Log(1 - p)); });
 
-    public void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f - 1e-7f); return (p - t) / (p * (1 - p)); });
+    public void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "bce_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return d * d; });
 
-    public void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => 2f * (p - t));
+    public void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mse_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float d = MathF.Abs(p - t); return d < beta ? 0.5f * d * d / beta : d - 0.5f * beta; });
 
-    public void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { float d = p - t; return MathF.Abs(d) < beta ? d / beta : MathF.Sign(d); });
+    public void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "huber_backward",
+            predictions, targets, gradInput, MakeUniform4(size, invSize, beta, 0), size).GetAwaiter().GetResult();
+    }
 
     public float TripletLoss(IGpuBuffer anchor, IGpuBuffer positive, IGpuBuffer negative, int batchSize, int embeddingDim, float margin)
     {
@@ -354,80 +346,122 @@ public sealed partial class WebGpuBackend
     public float FocalLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float alpha, float gamma) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f - 1e-7f); float pt = t > 0.5f ? p : 1 - p; return -alpha * MathF.Pow(1 - pt, gamma) * MathF.Log(pt); });
 
-    public void FocalBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float alpha, float gamma) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) =>
-        {
-            p = Math.Clamp(p, 1e-7f, 1f - 1e-7f);
-            float pt = t > 0.5f ? p : 1 - p;
-            float sign = t > 0.5f ? 1f : -1f;
-            return sign * alpha * MathF.Pow(1 - pt, gamma) * (gamma * MathF.Log(pt) / (1 - pt + 1e-7f) - 1f / (pt + 1e-7f));
-        });
+    public void FocalBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float alpha, float gamma)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "focal_backward",
+            predictions, targets, gradInput, MakeUniform4(size, invSize, alpha, gamma), size).GetAwaiter().GetResult();
+    }
 
     public float MaeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => MathF.Abs(p - t));
 
-    public void MaeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => p > t ? 1f : p < t ? -1f : 0);
+    public void MaeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mae_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float LogCoshLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => MathF.Log(MathF.Cosh(p - t)));
 
-    public void LogCoshBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => MathF.Tanh(p - t));
+    public void LogCoshBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "logcosh_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float QuantileLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float quantile) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float d = t - p; return d >= 0 ? quantile * d : (quantile - 1) * d; });
 
-    public void QuantileBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float quantile) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => t - p >= 0 ? -quantile : 1 - quantile);
+    public void QuantileBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float quantile)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "quantile_backward",
+            predictions, targets, gradInput, MakeUniform4(size, invSize, quantile, 0), size).GetAwaiter().GetResult();
+    }
 
     public float HingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => MathF.Max(0, 1f - t * p));
 
-    public void HingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => t * p < 1f ? -t : 0);
+    public void HingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "hinge_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float SquaredHingeLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float h = MathF.Max(0, 1f - t * p); return h * h; });
 
-    public void SquaredHingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { float h = MathF.Max(0, 1f - t * p); return h > 0 ? -2f * h * t : 0; });
+    public void SquaredHingeBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "squared_hinge_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float PoissonLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => MathF.Exp(p) - t * p);
 
-    public void PoissonBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => MathF.Exp(p) - t);
+    public void PoissonBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "poisson_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float ExponentialLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => MathF.Exp(-t * p));
 
-    public void ExponentialBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => -t * MathF.Exp(-t * p));
+    public void ExponentialBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "exponential_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float ModifiedHuberLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float y = t * p; return y >= -1 ? MathF.Max(0, 1 - y) * MathF.Max(0, 1 - y) : -4 * y; });
 
-    public void ModifiedHuberBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { float y = t * p; return y >= -1 ? (y < 1 ? -2f * (1 - y) * t : 0) : -4f * t; });
+    public void ModifiedHuberBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "modified_huber_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float CategoricalCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f); return -t * MathF.Log(p); });
 
-    public void CategoricalCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { p = Math.Clamp(p, 1e-7f, 1f); return -t / p; });
+    public void CategoricalCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "categorical_ce_backward",
+            predictions, targets, gradInput, MakeUniform3(size, invSize, 0), size).GetAwaiter().GetResult();
+    }
 
     public float CharbonnierLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float epsilon) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return MathF.Sqrt(d * d + epsilon * epsilon); });
 
-    public void CharbonnierBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float epsilon) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { float d = p - t; return d / MathF.Sqrt(d * d + epsilon * epsilon); });
+    public void CharbonnierBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float epsilon)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "charbonnier_backward",
+            predictions, targets, gradInput, MakeUniform4(size, invSize, epsilon, 0), size).GetAwaiter().GetResult();
+    }
 
     public float ElasticNetLoss(IGpuBuffer predictions, IGpuBuffer targets, int size, float l1Weight, float l2Weight) =>
         CpuLossReduce(predictions, targets, size, (p, t) => { float d = p - t; return l1Weight * MathF.Abs(d) + l2Weight * d * d; });
 
-    public void ElasticNetBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float l1Weight, float l2Weight) =>
-        CpuLossBackward(predictions, targets, gradInput, size, (p, t) => { float d = p - t; return l1Weight * MathF.Sign(d) + 2f * l2Weight * d; });
+    public void ElasticNetBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float l1Weight, float l2Weight)
+    {
+        float invSize = 1f / size;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "elastic_net_backward",
+            predictions, targets, gradInput, MakeUniform4(size, invSize, l1Weight, l2Weight), size).GetAwaiter().GetResult();
+    }
 
     public float ContrastiveLoss(IGpuBuffer output1, IGpuBuffer output2, IGpuBuffer labels, int batchSize, int embeddingDim, float margin)
     {
@@ -457,39 +491,39 @@ public sealed partial class WebGpuBackend
 
     #region Gradient Clipping and Utility
 
-    public void Clamp(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size) => CpuUnary(A, B, size, v => MathF.Max(minVal, MathF.Min(maxVal, v)));
+    public void Clamp(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size)
+    {
+        Dispatch2BufferAsync("Clamp", WebGpuKernels.ClampSource, "clamp_op",
+            A, B, MakeUniform3(size, minVal, maxVal), size).GetAwaiter().GetResult();
+    }
 
     public float L2Norm(IGpuBuffer A, int size)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A);
-        float sum = 0;
-        for (int i = 0; i < size; i++) sum += a[i] * a[i];
-        return MathF.Sqrt(sum);
+        // Use GPU square + sum reduction
+        using var squared = (WebGpuBuffer)AllocateBuffer(size);
+        SquareAsync(A, squared, size).GetAwaiter().GetResult();
+        float sumSq = SumAsync(squared, size).GetAwaiter().GetResult();
+        return MathF.Sqrt(sumSq);
     }
 
-    public void ClipByValue(IGpuBuffer A, IGpuBuffer B, float clipValue, int size) => Clamp(A, B, -clipValue, clipValue, size);
+    public void ClipByValue(IGpuBuffer A, IGpuBuffer B, float clipValue, int size)
+    {
+        Dispatch2BufferAsync("GradientClip", WebGpuKernels.GradientClipSource, "clip_by_value",
+            A, B, MakeUniform2(size, clipValue), size).GetAwaiter().GetResult();
+    }
 
     public void ClipByNorm(IGpuBuffer A, IGpuBuffer B, float maxNorm, int size)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A);
-        float norm = 0;
-        for (int i = 0; i < size; i++) norm += a[i] * a[i];
-        norm = MathF.Sqrt(norm);
-        var o = new float[size];
-        if (norm > maxNorm) { float scale = maxNorm / norm; for (int i = 0; i < size; i++) o[i] = a[i] * scale; }
-        else Array.Copy(a, o, size);
-        UploadToBuffer(o, B);
+        float norm = L2Norm(A, size);
+        float scale = norm > maxNorm ? maxNorm / norm : 1f;
+        Dispatch2BufferAsync("GradientClip", WebGpuKernels.GradientClipSource, "clip_by_norm",
+            A, B, MakeUniform3(size, maxNorm, scale), size).GetAwaiter().GetResult();
     }
 
     public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A); var b = DownloadBufferData(B); var c = DownloadBufferData(C);
-        var o = new float[size];
-        for (int i = 0; i < size; i++) o[i] = a[i] * b[i] + c[i];
-        UploadToBuffer(o, D);
+        Dispatch4BufferAsync("Fma", WebGpuKernels.FmaSource, "fma_op",
+            A, B, C, D, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
@@ -535,9 +569,23 @@ public sealed partial class WebGpuBackend
 
     #region Comparison Operations
 
-    public void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => CpuBinary(A, B, C, size, (a, b) => a > b ? 1f : 0f);
-    public void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => CpuBinary(A, B, C, size, (a, b) => a < b ? 1f : 0f);
-    public void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => CpuBinary(A, B, C, size, (a, b) => MathF.Abs(a - b) < 1e-6f ? 1f : 0f);
+    public void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        Dispatch3BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "greater_than",
+            A, B, C, MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        Dispatch3BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "less_than",
+            A, B, C, MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        Dispatch3BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "equal_to",
+            A, B, C, MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
 
     public void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
@@ -556,10 +604,8 @@ public sealed partial class WebGpuBackend
 
     public void MeanAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
-        SumAxis(A, B, outerSize, reduceSize);
-        var o = DownloadBufferData(B);
-        for (int i = 0; i < outerSize; i++) o[i] /= reduceSize;
-        UploadToBuffer(o, B);
+        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "mean_axis",
+            A, B, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
     public void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
@@ -581,15 +627,8 @@ public sealed partial class WebGpuBackend
 
     public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A); var o = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float maxVal = float.MinValue; int maxJ = 0;
-            for (int j = 0; j < reduceSize; j++) { if (inp[i * reduceSize + j] > maxVal) { maxVal = inp[i * reduceSize + j]; maxJ = j; } }
-            o[i] = BitConverter.Int32BitsToSingle(maxJ);
-        }
-        UploadToBuffer(o, indices);
+        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "argmax_axis",
+            A, indices, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
     public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
@@ -597,28 +636,14 @@ public sealed partial class WebGpuBackend
 
     public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A); var o = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float minVal = float.MaxValue; int minJ = 0;
-            for (int j = 0; j < reduceSize; j++) { if (inp[i * reduceSize + j] < minVal) { minVal = inp[i * reduceSize + j]; minJ = j; } }
-            o[i] = BitConverter.Int32BitsToSingle(minJ);
-        }
-        UploadToBuffer(o, indices);
+        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "argmin_axis",
+            A, indices, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
     public void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
-        EnsureInitialized();
-        var inp = DownloadBufferData(A); var o = new float[outerSize];
-        for (int i = 0; i < outerSize; i++)
-        {
-            float maxVal = float.MinValue;
-            for (int j = 0; j < reduceSize; j++) maxVal = MathF.Max(maxVal, inp[i * reduceSize + j]);
-            o[i] = maxVal;
-        }
-        UploadToBuffer(o, B);
+        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "max_axis",
+            A, B, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
 
     public void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
@@ -643,22 +668,16 @@ public sealed partial class WebGpuBackend
 
     public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A); var b = DownloadBufferData(B);
-        var o = new float[outerSize * innerSize];
-        for (int i = 0; i < outerSize; i++)
-            for (int j = 0; j < innerSize; j++) o[i * innerSize + j] = a[i * innerSize + j] * b[j];
-        UploadToBuffer(o, C);
+        int total = outerSize * innerSize;
+        Dispatch3BufferAsync("Broadcast", WebGpuKernels.BroadcastSource, "broadcast_mul_last",
+            A, B, C, MakeUniformInts2(outerSize, innerSize), total).GetAwaiter().GetResult();
     }
 
     public void BroadcastMultiplyFirstAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
-        EnsureInitialized();
-        var a = DownloadBufferData(A); var b = DownloadBufferData(B);
-        var o = new float[outerSize * innerSize];
-        for (int i = 0; i < outerSize; i++)
-            for (int j = 0; j < innerSize; j++) o[i * innerSize + j] = a[i * innerSize + j] * b[i];
-        UploadToBuffer(o, C);
+        int total = outerSize * innerSize;
+        Dispatch3BufferAsync("Broadcast", WebGpuKernels.BroadcastSource, "broadcast_mul_first",
+            A, B, C, MakeUniformInts2(outerSize, innerSize), total).GetAwaiter().GetResult();
     }
 
     #endregion
