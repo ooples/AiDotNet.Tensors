@@ -7938,6 +7938,10 @@ KERNEL VARIANTS (A/B testing):
 
         public float StdDev(IGpuBuffer input, int size)
         {
+            if (size <= 0)
+                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+            if (input.Size < size)
+                throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
             if (size <= 1) return 0.0f;
 
             // Step 1: Compute mean using GPU reduction
@@ -7956,8 +7960,9 @@ KERNEL VARIANTS (A/B testing):
 
                 varKernel.SetArg(0, bufferA.Handle);
                 varKernel.SetArg(1, partial.Handle);
-                varKernel.SetArg(2, mean);
-                varKernel.SetArg(3, size);
+                varKernel.SetLocalArg(2, localSize * sizeof(float));
+                varKernel.SetArg(3, mean);
+                varKernel.SetArg(4, size);
 
                 varKernel.Execute1D(size, localSize);
 
@@ -7969,7 +7974,9 @@ KERNEL VARIANTS (A/B testing):
                 for (int i = 0; i < partials.Length; i++)
                     varianceSum += partials[i];
 
-                return MathF.Sqrt(varianceSum / size);
+                // Clamp variance to zero before sqrt to handle floating-point roundoff
+                float gpuVariance = Math.Max(0, varianceSum / size);
+                return MathF.Sqrt(gpuVariance);
             }
 
             // Fallback: download and compute on CPU
@@ -7981,7 +7988,9 @@ KERNEL VARIANTS (A/B testing):
                 varSum += diff * diff;
             }
 
-            return MathF.Sqrt(varSum / size);
+            // Clamp variance to zero before sqrt to handle floating-point roundoff
+            float variance = Math.Max(0, varSum / size);
+            return MathF.Sqrt(variance);
         }
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)

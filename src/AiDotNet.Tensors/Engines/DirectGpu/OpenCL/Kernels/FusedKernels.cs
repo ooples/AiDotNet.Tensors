@@ -704,15 +704,13 @@ __kernel void add_scaled(
 // REDUCTION KERNELS
 // ===========================================================================
 
-// Parallel sum reduction using local memory
-// Work group size must be exactly 256 to match shared memory allocation
-__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
-void reduce_sum_local(
+// Parallel sum reduction using dynamic local memory
+__kernel void reduce_sum_local(
     __global const float* input,
     __global float* partialSums,
+    __local float* sdata,
     const int size)
 {
-    __local float sdata[256];
     const int tid = get_local_id(0);
     const int gid = get_global_id(0);
 
@@ -736,15 +734,13 @@ void reduce_sum_local(
 }
 
 // Parallel variance reduction given a known mean
-// Work group size must be exactly 256 to match shared memory allocation
-__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
-void reduce_variance_local(
+__kernel void reduce_variance_local(
     __global const float* input,
     __global float* partialSums,
+    __local float* sdata,
     const float mean,
     const int size)
 {
-    __local float sdata[256];
     const int tid = get_local_id(0);
     const int gid = get_global_id(0);
 
