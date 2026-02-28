@@ -34,7 +34,7 @@ namespace AiDotNet.Tensors.Engines;
 /// - You're using custom numeric types
 /// </para>
 /// </remarks>
-public class CpuEngine : IEngine
+public class CpuEngine : ITensorLevelEngine
 {
     /// <inheritdoc/>
     public string Name => "CPU Engine";

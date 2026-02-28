@@ -74,7 +74,7 @@ internal sealed class ActivationCacheEntry : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -9741,37 +9741,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     #region Tensor-Level Activation GPU Dispatch
 
-    Tensor<T> IEngine.TensorSigmoid<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorSigmoid<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSigmoid(tensor);
     }
 
-    Tensor<T> IEngine.TensorReLU<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorReLU<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorReLU(tensor);
     }
 
-    Tensor<T> IEngine.TensorGELU<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorGELU<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorGELU(tensor);
     }
 
-    Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorSiLU<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorSiLU(tensor);
     }
 
-    Tensor<T> IEngine.TensorTanh<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorTanh<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorTanh(tensor);
     }
 
-    Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
+    Tensor<T> ITensorLevelEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (!TryGetBackend(out var backend))
             return base.TensorLeakyReLU(tensor, alpha);
@@ -9785,13 +9785,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         return new Tensor<T>(result, tensor.Shape);
     }
 
-    Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorMish<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMish(tensor);
     }
 
-    Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
+    Tensor<T> ITensorLevelEngine.TensorHardSwish<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.ToArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorHardSwish(tensor);
@@ -9801,7 +9801,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     #region Tensor-Level Composite GPU Dispatch
 
-    Tensor<T> IEngine.TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
+    Tensor<T> ITensorLevelEngine.TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
     {
         // Single fused GPU kernel: output[i] = a[i] + t * (b[i] - a[i])
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
@@ -9820,7 +9820,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
     }
 
-    Tensor<T> IEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
+    Tensor<T> ITensorLevelEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
     {
         // Single fused GPU kernel: output[i] = scaleA * a[i] + scaleB * b[i]
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
@@ -9840,19 +9840,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape);
     }
 
-    Tensor<T> IEngine.TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    Tensor<T> ITensorLevelEngine.TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
     {
         // GPU dispatch already handled by the existing MaxPool2D method override
         return MaxPool2D(input, poolSize, stride, padding);
     }
 
-    Tensor<T> IEngine.TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    Tensor<T> ITensorLevelEngine.TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
     {
         // GPU dispatch already handled by the existing AvgPool2D method override
         return AvgPool2D(input, poolSize, stride, padding);
     }
 
-    Tensor<T> IEngine.TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
+    Tensor<T> ITensorLevelEngine.TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
         // GPU dispatch handled by FusedConv2D which already has GPU acceleration
         return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
