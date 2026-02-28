@@ -890,6 +890,15 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, int groups, int deformGroups, int hasMask)
     {
+        if (groups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(groups), "groups must be positive.");
+        if (deformGroups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(deformGroups), "deformGroups must be positive.");
+        if (inChannels % groups != 0)
+            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by groups ({groups}).");
+        if (inChannels % deformGroups != 0)
+            throw new ArgumentException($"inChannels ({inChannels}) must be divisible by deformGroups ({deformGroups}).");
+
         return new float[]
         {
             BitConverter.Int32BitsToSingle(batch),
