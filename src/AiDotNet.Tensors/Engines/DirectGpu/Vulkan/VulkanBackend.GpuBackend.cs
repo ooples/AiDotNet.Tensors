@@ -74,7 +74,17 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
-        vb.Staging.WriteData(data);
+        // Pad data to buffer.Size to avoid writing stale staging contents for partial uploads
+        if (data.Length < vb.Size)
+        {
+            var padded = new float[vb.Size];
+            Array.Copy(data, 0, padded, 0, data.Length);
+            vb.Staging.WriteData(padded);
+        }
+        else
+        {
+            vb.Staging.WriteData(data);
+        }
         _transfer.CopyToDevice(vb.Staging, vb.Storage);
     }
 
@@ -136,6 +146,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size < 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
         if (size > A.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({A.Size}).");
         if (size > B.Size)
@@ -151,6 +162,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size < 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
         if (size > A.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds first input buffer length ({A.Size}).");
         if (size > B.Size)

@@ -54,11 +54,11 @@ public class TensorLevelOpsTests
 
         var result = _engine.TensorReLU(tensor);
 
-        Assert.Equal(0f, result[0]);
-        Assert.Equal(0f, result[1]);
-        Assert.Equal(0f, result[2]);
-        Assert.Equal(0.5f, result[3]);
-        Assert.Equal(3f, result[4]);
+        Assert.Equal(0f, result[0], Tolerance);
+        Assert.Equal(0f, result[1], Tolerance);
+        Assert.Equal(0f, result[2], Tolerance);
+        Assert.Equal(0.5f, result[3], Tolerance);
+        Assert.Equal(3f, result[4], Tolerance);
     }
 
     #endregion

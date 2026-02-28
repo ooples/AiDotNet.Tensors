@@ -170,9 +170,9 @@ public sealed unsafe partial class VulkanBackend
         int batch, int numHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal,
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
-        // Note: seqK may differ from seqQ in cross-attention; this fallback uses seqQ for square attention.
-        int effectiveSeqLen = seqQ;
-        ScaledDotProductAttention(query, key, value, output, null, attentionBias, batch, numHeads, effectiveSeqLen, headDim, scale, isCausal);
+        if (seqQ != seqK)
+            throw new NotSupportedException($"Cross-attention (seqQ={seqQ} != seqK={seqK}) is not yet supported by the Vulkan backend. Use CPU engine for cross-attention.");
+        ScaledDotProductAttention(query, key, value, output, null, attentionBias, batch, numHeads, seqQ, headDim, scale, isCausal);
         Fill(softmaxStats, 0f, softmaxStats.Size);
     }
 
