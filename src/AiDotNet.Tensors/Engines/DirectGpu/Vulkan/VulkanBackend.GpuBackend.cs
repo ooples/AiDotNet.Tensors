@@ -237,9 +237,11 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentOutOfRangeException(nameof(size), $"Destination offset ({destOffset}) + size ({size}) exceeds destination buffer length ({destination.Size}).");
 
         var src = DownloadBuffer(source);
-        // Only download destination when partial copy needs to preserve existing data
+        // Only download destination when partial copy needs to preserve existing data.
+        // Use strict equality to avoid allocating a too-small array when size > destination.Size
+        // (which is already prevented by the validation above, but defensive coding).
         float[] dst;
-        if (destOffset == 0 && size >= destination.Size)
+        if (destOffset == 0 && size == destination.Size)
         {
             dst = new float[destination.Size];
         }
@@ -857,8 +859,9 @@ public sealed unsafe partial class VulkanBackend
         var s = DownloadBuffer(source);
         // Only download destination if the strided copy does not cover all columns,
         // since we need to preserve existing data in non-written columns.
+        // Use strict equality to avoid out-of-bounds writes when srcCols > destTotalCols.
         float[] d;
-        if (destColOffset == 0 && srcCols >= destTotalCols)
+        if (destColOffset == 0 && srcCols == destTotalCols)
         {
             d = new float[destination.Size];
         }
@@ -866,8 +869,9 @@ public sealed unsafe partial class VulkanBackend
         {
             d = DownloadBuffer(destination);
         }
+        int colsToCopy = Math.Min(srcCols, destTotalCols - destColOffset);
         for (int r = 0; r < numRows; r++)
-            Array.Copy(s, r * srcCols, d, r * destTotalCols + destColOffset, srcCols);
+            Array.Copy(s, r * srcCols, d, r * destTotalCols + destColOffset, colsToCopy);
         UploadToBuffer(d, destination);
     }
 

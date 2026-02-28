@@ -17999,11 +17999,19 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
-        // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
-        // Using a + t*(b-a) is more numerically stable and requires fewer ops
-        var diff = TensorSubtract(b, a);  // b - a
-        var scaled = TensorMultiplyScalar(diff, t);  // t * (b - a)
-        return TensorAdd(a, scaled);  // a + t * (b - a)
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // Single-pass: result[i] = a[i] + t * (b[i] - a[i])
+        // Avoids intermediate tensor allocations for better memory efficiency
+        var aData = a.ToArray();
+        var bData = b.ToArray();
+        var result = new T[aData.Length];
+        for (int i = 0; i < result.Length; i++)
+        {
+            var diff = numOps.Subtract(bData[i], aData[i]);
+            result[i] = numOps.Add(aData[i], numOps.Multiply(t, diff));
+        }
+        return new Tensor<T>(a.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18012,10 +18020,18 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
-        // result = scaleA * a + scaleB * b
-        var scaledA = TensorMultiplyScalar(a, scaleA);
-        var scaledB = TensorMultiplyScalar(b, scaleB);
-        return TensorAdd(scaledA, scaledB);
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // Single-pass: result[i] = scaleA * a[i] + scaleB * b[i]
+        // Avoids intermediate tensor allocations for better memory efficiency
+        var aData = a.ToArray();
+        var bData = b.ToArray();
+        var result = new T[aData.Length];
+        for (int i = 0; i < result.Length; i++)
+        {
+            result[i] = numOps.Add(numOps.Multiply(scaleA, aData[i]), numOps.Multiply(scaleB, bData[i]));
+        }
+        return new Tensor<T>(a.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
