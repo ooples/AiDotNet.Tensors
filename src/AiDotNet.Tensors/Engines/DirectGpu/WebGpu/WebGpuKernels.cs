@@ -5929,6 +5929,451 @@ fn deformable_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
 
+    public const string DeformableConv2DBackwardInputSource = @"
+@group(0) @binding(0) var<storage, read> dbi_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> dbi_weights: array<f32>;
+@group(0) @binding(2) var<storage, read> dbi_offsets: array<f32>;
+@group(0) @binding(3) var<storage, read> dbi_mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dbi_grad_input: array<f32>;
+
+struct DBIParams {
+    batch_size: u32, in_channels: u32, out_channels: u32,
+    in_height: u32, in_width: u32, out_height: u32, out_width: u32,
+    kernel_height: u32, kernel_width: u32,
+    stride_h: u32, stride_w: u32, pad_h: u32, pad_w: u32,
+    dilation_h: u32, dilation_w: u32,
+    groups: u32, deform_groups: u32, has_mask: u32,
+    _pad0: u32, _pad1: u32,
+}
+@group(0) @binding(5) var<uniform> dbi_p: DBIParams;
+
+@compute @workgroup_size(256)
+fn deformable_conv2d_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = dbi_p.batch_size * dbi_p.in_channels * dbi_p.in_height * dbi_p.in_width;
+    if (idx >= total) { return; }
+
+    let n = idx / (dbi_p.in_channels * dbi_p.in_height * dbi_p.in_width);
+    let rem1 = idx % (dbi_p.in_channels * dbi_p.in_height * dbi_p.in_width);
+    let ic = rem1 / (dbi_p.in_height * dbi_p.in_width);
+    let rem2 = rem1 % (dbi_p.in_height * dbi_p.in_width);
+    let ih = rem2 / dbi_p.in_width;
+    let iw = rem2 % dbi_p.in_width;
+
+    let in_ch_per_g = dbi_p.in_channels / dbi_p.groups;
+    let out_ch_per_g = dbi_p.out_channels / dbi_p.groups;
+    let g = ic / in_ch_per_g;
+    let ks = dbi_p.kernel_height * dbi_p.kernel_width;
+    let ic_local = ic - g * in_ch_per_g;
+
+    var sum_grad: f32 = 0.0;
+    for (var oc: u32 = g * out_ch_per_g; oc < (g + 1u) * out_ch_per_g; oc = oc + 1u) {
+        let dg = oc / (dbi_p.out_channels / dbi_p.deform_groups);
+        for (var oh: u32 = 0u; oh < dbi_p.out_height; oh = oh + 1u) {
+            for (var ow: u32 = 0u; ow < dbi_p.out_width; ow = ow + 1u) {
+                let base_h = i32(oh * dbi_p.stride_h) - i32(dbi_p.pad_h);
+                let base_w = i32(ow * dbi_p.stride_w) - i32(dbi_p.pad_w);
+                for (var kh: u32 = 0u; kh < dbi_p.kernel_height; kh = kh + 1u) {
+                    for (var kw: u32 = 0u; kw < dbi_p.kernel_width; kw = kw + 1u) {
+                        let ki = kh * dbi_p.kernel_width + kw;
+                        let off_base = (n * dbi_p.deform_groups + dg) * 2u * ks * dbi_p.out_height * dbi_p.out_width;
+                        let off_sp = ki * dbi_p.out_height * dbi_p.out_width + oh * dbi_p.out_width + ow;
+                        let off_h = dbi_offsets[off_base + off_sp];
+                        let off_w = dbi_offsets[off_base + ks * dbi_p.out_height * dbi_p.out_width + off_sp];
+                        let h = f32(base_h) + f32(kh * dbi_p.dilation_h) + off_h;
+                        let w = f32(base_w) + f32(kw * dbi_p.dilation_w) + off_w;
+                        let h0 = i32(floor(h)); let w0 = i32(floor(w));
+                        let h1 = h0 + 1; let w1 = w0 + 1;
+                        let lh = h - f32(h0); let lw = w - f32(w0);
+                        let hh = 1.0 - lh; let hw = 1.0 - lw;
+                        var wc: f32 = 0.0;
+                        if (i32(ih) == h0 && i32(iw) == w0) { wc = hh * hw; }
+                        else if (i32(ih) == h0 && i32(iw) == w1) { wc = hh * lw; }
+                        else if (i32(ih) == h1 && i32(iw) == w0) { wc = lh * hw; }
+                        else if (i32(ih) == h1 && i32(iw) == w1) { wc = lh * lw; }
+                        else { continue; }
+                        let go_val = dbi_grad_output[((n * dbi_p.out_channels + oc) * dbi_p.out_height + oh) * dbi_p.out_width + ow];
+                        let w_idx = ((oc * in_ch_per_g + ic_local) * dbi_p.kernel_height + kh) * dbi_p.kernel_width + kw;
+                        var contrib = go_val * dbi_weights[w_idx] * wc;
+                        if (dbi_p.has_mask > 0u) {
+                            let m_base = (n * dbi_p.deform_groups + dg) * ks * dbi_p.out_height * dbi_p.out_width;
+                            contrib = contrib * dbi_mask[m_base + ki * dbi_p.out_height * dbi_p.out_width + oh * dbi_p.out_width + ow];
+                        }
+                        sum_grad = sum_grad + contrib;
+                    }
+                }
+            }
+        }
+    }
+    dbi_grad_input[idx] = sum_grad;
+}
+";
+
+    public const string DeformableConv2DBackwardWeightsSource = @"
+@group(0) @binding(0) var<storage, read> dbw_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> dbw_input: array<f32>;
+@group(0) @binding(2) var<storage, read> dbw_offsets: array<f32>;
+@group(0) @binding(3) var<storage, read> dbw_mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dbw_grad_weights: array<f32>;
+
+struct DBWParams {
+    batch_size: u32, in_channels: u32, out_channels: u32,
+    in_height: u32, in_width: u32, out_height: u32, out_width: u32,
+    kernel_height: u32, kernel_width: u32,
+    stride_h: u32, stride_w: u32, pad_h: u32, pad_w: u32,
+    dilation_h: u32, dilation_w: u32,
+    groups: u32, deform_groups: u32, has_mask: u32,
+    _pad0: u32, _pad1: u32,
+}
+@group(0) @binding(5) var<uniform> dbw_p: DBWParams;
+
+fn dbw_bilinear_sample(n: u32, c: u32, y: f32, x: f32) -> f32 {
+    let h = i32(dbw_p.in_height); let w = i32(dbw_p.in_width);
+    let y0 = i32(floor(y)); let x0 = i32(floor(x));
+    let y1 = y0 + 1; let x1 = x0 + 1;
+    let ly = y - f32(y0); let lx = x - f32(x0);
+    let hy = 1.0 - ly; let hx = 1.0 - lx;
+    var val: f32 = 0.0;
+    let base = n * dbw_p.in_channels * dbw_p.in_height * dbw_p.in_width + c * dbw_p.in_height * dbw_p.in_width;
+    if (y0 >= 0 && y0 < h && x0 >= 0 && x0 < w) { val += hy * hx * dbw_input[base + u32(y0) * dbw_p.in_width + u32(x0)]; }
+    if (y0 >= 0 && y0 < h && x1 >= 0 && x1 < w) { val += hy * lx * dbw_input[base + u32(y0) * dbw_p.in_width + u32(x1)]; }
+    if (y1 >= 0 && y1 < h && x0 >= 0 && x0 < w) { val += ly * hx * dbw_input[base + u32(y1) * dbw_p.in_width + u32(x0)]; }
+    if (y1 >= 0 && y1 < h && x1 >= 0 && x1 < w) { val += ly * lx * dbw_input[base + u32(y1) * dbw_p.in_width + u32(x1)]; }
+    return val;
+}
+
+@compute @workgroup_size(256)
+fn deformable_conv2d_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let in_ch_per_g = dbw_p.in_channels / dbw_p.groups;
+    let total_w = dbw_p.out_channels * in_ch_per_g * dbw_p.kernel_height * dbw_p.kernel_width;
+    if (idx >= total_w) { return; }
+
+    var tmp = idx;
+    let kw = tmp % dbw_p.kernel_width; tmp = tmp / dbw_p.kernel_width;
+    let kh = tmp % dbw_p.kernel_height; tmp = tmp / dbw_p.kernel_height;
+    let ic_local = tmp % in_ch_per_g; tmp = tmp / in_ch_per_g;
+    let oc = tmp;
+
+    let g = oc / (dbw_p.out_channels / dbw_p.groups);
+    let dg = oc / (dbw_p.out_channels / dbw_p.deform_groups);
+    let ic = g * in_ch_per_g + ic_local;
+    let ks = dbw_p.kernel_height * dbw_p.kernel_width;
+    let ki = kh * dbw_p.kernel_width + kw;
+
+    var sum_grad: f32 = 0.0;
+    for (var b: u32 = 0u; b < dbw_p.batch_size; b = b + 1u) {
+        for (var oh: u32 = 0u; oh < dbw_p.out_height; oh = oh + 1u) {
+            for (var ow: u32 = 0u; ow < dbw_p.out_width; ow = ow + 1u) {
+                let base_h = i32(oh * dbw_p.stride_h) - i32(dbw_p.pad_h);
+                let base_w = i32(ow * dbw_p.stride_w) - i32(dbw_p.pad_w);
+                let off_base = (b * dbw_p.deform_groups + dg) * 2u * ks * dbw_p.out_height * dbw_p.out_width;
+                let off_sp = ki * dbw_p.out_height * dbw_p.out_width + oh * dbw_p.out_width + ow;
+                let off_h = dbw_offsets[off_base + off_sp];
+                let off_w = dbw_offsets[off_base + ks * dbw_p.out_height * dbw_p.out_width + off_sp];
+                let h = f32(base_h) + f32(kh * dbw_p.dilation_h) + off_h;
+                let w = f32(base_w) + f32(kw * dbw_p.dilation_w) + off_w;
+                var input_val = dbw_bilinear_sample(b, ic, h, w);
+                if (dbw_p.has_mask > 0u) {
+                    let m_base = (b * dbw_p.deform_groups + dg) * ks * dbw_p.out_height * dbw_p.out_width;
+                    input_val = input_val * dbw_mask[m_base + ki * dbw_p.out_height * dbw_p.out_width + oh * dbw_p.out_width + ow];
+                }
+                let go_val = dbw_grad_output[((b * dbw_p.out_channels + oc) * dbw_p.out_height + oh) * dbw_p.out_width + ow];
+                sum_grad = sum_grad + go_val * input_val;
+            }
+        }
+    }
+    dbw_grad_weights[idx] = sum_grad;
+}
+";
+
+    public const string DeformableConv2DBackwardOffsetSource = @"
+@group(0) @binding(0) var<storage, read> dbo_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> dbo_input: array<f32>;
+@group(0) @binding(2) var<storage, read> dbo_weights: array<f32>;
+@group(0) @binding(3) var<storage, read> dbo_offsets: array<f32>;
+@group(0) @binding(4) var<storage, read> dbo_mask: array<f32>;
+@group(0) @binding(5) var<storage, read_write> dbo_grad_offsets: array<f32>;
+
+struct DBOParams {
+    batch_size: u32, in_channels: u32, out_channels: u32,
+    in_height: u32, in_width: u32, out_height: u32, out_width: u32,
+    kernel_height: u32, kernel_width: u32,
+    stride_h: u32, stride_w: u32, pad_h: u32, pad_w: u32,
+    dilation_h: u32, dilation_w: u32,
+    groups: u32, deform_groups: u32, has_mask: u32,
+    _pad0: u32, _pad1: u32,
+}
+@group(0) @binding(6) var<uniform> dbo_p: DBOParams;
+
+@compute @workgroup_size(256)
+fn deformable_conv2d_backward_offset(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let ks = dbo_p.kernel_height * dbo_p.kernel_width;
+    let total_off = dbo_p.batch_size * dbo_p.deform_groups * 2u * ks * dbo_p.out_height * dbo_p.out_width;
+    if (idx >= total_off) { return; }
+
+    var tmp = idx;
+    let ow = tmp % dbo_p.out_width; tmp = tmp / dbo_p.out_width;
+    let oh = tmp % dbo_p.out_height; tmp = tmp / dbo_p.out_height;
+    let off_comp = tmp % (2u * ks); tmp = tmp / (2u * ks);
+    let dg = tmp % dbo_p.deform_groups; tmp = tmp / dbo_p.deform_groups;
+    let n = tmp;
+
+    let is_y_offset = select(0u, 1u, off_comp >= ks);
+    let ki = off_comp % ks;
+    let kh = ki / dbo_p.kernel_width;
+    let kw = ki % dbo_p.kernel_width;
+
+    let off_base = (n * dbo_p.deform_groups + dg) * 2u * ks * dbo_p.out_height * dbo_p.out_width;
+    let off_sp = ki * dbo_p.out_height * dbo_p.out_width + oh * dbo_p.out_width + ow;
+    let off_h = dbo_offsets[off_base + off_sp];
+    let off_w = dbo_offsets[off_base + ks * dbo_p.out_height * dbo_p.out_width + off_sp];
+
+    let base_h = i32(oh * dbo_p.stride_h) - i32(dbo_p.pad_h);
+    let base_w = i32(ow * dbo_p.stride_w) - i32(dbo_p.pad_w);
+    let h = f32(base_h) + f32(kh * dbo_p.dilation_h) + off_h;
+    let w = f32(base_w) + f32(kw * dbo_p.dilation_w) + off_w;
+
+    let h0 = i32(floor(h)); let w0 = i32(floor(w));
+    let h1 = h0 + 1; let w1 = w0 + 1;
+    let lh = h - f32(h0); let lw = w - f32(w0);
+
+    var sum_grad: f32 = 0.0;
+    let in_ch_per_g = dbo_p.in_channels / dbo_p.groups;
+    let out_ch_per_dg = dbo_p.out_channels / dbo_p.deform_groups;
+
+    for (var oc_off: u32 = 0u; oc_off < out_ch_per_dg; oc_off = oc_off + 1u) {
+        let oc = dg * out_ch_per_dg + oc_off;
+        let g = oc / (dbo_p.out_channels / dbo_p.groups);
+        var go_val = dbo_grad_output[((n * dbo_p.out_channels + oc) * dbo_p.out_height + oh) * dbo_p.out_width + ow];
+        if (dbo_p.has_mask > 0u) {
+            let m_base = (n * dbo_p.deform_groups + dg) * ks * dbo_p.out_height * dbo_p.out_width;
+            go_val = go_val * dbo_mask[m_base + ki * dbo_p.out_height * dbo_p.out_width + oh * dbo_p.out_width + ow];
+        }
+        for (var ic: u32 = g * in_ch_per_g; ic < (g + 1u) * in_ch_per_g; ic = ic + 1u) {
+            let ic_local = ic - g * in_ch_per_g;
+            let w_idx = ((oc * in_ch_per_g + ic_local) * dbo_p.kernel_height + kh) * dbo_p.kernel_width + kw;
+            let wv = dbo_weights[w_idx];
+            var v1: f32 = 0.0; var v2: f32 = 0.0; var v3: f32 = 0.0; var v4: f32 = 0.0;
+            let ib = n * dbo_p.in_channels * dbo_p.in_height * dbo_p.in_width + ic * dbo_p.in_height * dbo_p.in_width;
+            if (h0 >= 0 && h0 < i32(dbo_p.in_height) && w0 >= 0 && w0 < i32(dbo_p.in_width)) { v1 = dbo_input[ib + u32(h0) * dbo_p.in_width + u32(w0)]; }
+            if (h0 >= 0 && h0 < i32(dbo_p.in_height) && w1 >= 0 && w1 < i32(dbo_p.in_width)) { v2 = dbo_input[ib + u32(h0) * dbo_p.in_width + u32(w1)]; }
+            if (h1 >= 0 && h1 < i32(dbo_p.in_height) && w0 >= 0 && w0 < i32(dbo_p.in_width)) { v3 = dbo_input[ib + u32(h1) * dbo_p.in_width + u32(w0)]; }
+            if (h1 >= 0 && h1 < i32(dbo_p.in_height) && w1 >= 0 && w1 < i32(dbo_p.in_width)) { v4 = dbo_input[ib + u32(h1) * dbo_p.in_width + u32(w1)]; }
+            if (is_y_offset == 0u) {
+                sum_grad = sum_grad + go_val * wv * ((1.0 - lw) * (v3 - v1) + lw * (v4 - v2));
+            } else {
+                sum_grad = sum_grad + go_val * wv * ((1.0 - lh) * (v2 - v1) + lh * (v4 - v3));
+            }
+        }
+    }
+    dbo_grad_offsets[idx] = sum_grad;
+}
+";
+
+    public const string DeformableConv2DBackwardMaskSource = @"
+@group(0) @binding(0) var<storage, read> dbm_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> dbm_input: array<f32>;
+@group(0) @binding(2) var<storage, read> dbm_weights: array<f32>;
+@group(0) @binding(3) var<storage, read> dbm_offsets: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dbm_grad_mask: array<f32>;
+
+struct DBMParams {
+    batch_size: u32, in_channels: u32, out_channels: u32,
+    in_height: u32, in_width: u32, out_height: u32, out_width: u32,
+    kernel_height: u32, kernel_width: u32,
+    stride_h: u32, stride_w: u32, pad_h: u32, pad_w: u32,
+    dilation_h: u32, dilation_w: u32,
+    groups: u32, deform_groups: u32, has_mask: u32,
+    _pad0: u32, _pad1: u32,
+}
+@group(0) @binding(5) var<uniform> dbm_p: DBMParams;
+
+fn dbm_bilinear_sample(n: u32, c: u32, y: f32, x: f32) -> f32 {
+    let h = i32(dbm_p.in_height); let w = i32(dbm_p.in_width);
+    let y0 = i32(floor(y)); let x0 = i32(floor(x));
+    let y1 = y0 + 1; let x1 = x0 + 1;
+    let ly = y - f32(y0); let lx = x - f32(x0);
+    let hy = 1.0 - ly; let hx = 1.0 - lx;
+    var val: f32 = 0.0;
+    let base = n * dbm_p.in_channels * dbm_p.in_height * dbm_p.in_width + c * dbm_p.in_height * dbm_p.in_width;
+    if (y0 >= 0 && y0 < h && x0 >= 0 && x0 < w) { val += hy * hx * dbm_input[base + u32(y0) * dbm_p.in_width + u32(x0)]; }
+    if (y0 >= 0 && y0 < h && x1 >= 0 && x1 < w) { val += hy * lx * dbm_input[base + u32(y0) * dbm_p.in_width + u32(x1)]; }
+    if (y1 >= 0 && y1 < h && x0 >= 0 && x0 < w) { val += ly * hx * dbm_input[base + u32(y1) * dbm_p.in_width + u32(x0)]; }
+    if (y1 >= 0 && y1 < h && x1 >= 0 && x1 < w) { val += ly * lx * dbm_input[base + u32(y1) * dbm_p.in_width + u32(x1)]; }
+    return val;
+}
+
+@compute @workgroup_size(256)
+fn deformable_conv2d_backward_mask(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let ks = dbm_p.kernel_height * dbm_p.kernel_width;
+    let total_mask = dbm_p.batch_size * dbm_p.deform_groups * ks * dbm_p.out_height * dbm_p.out_width;
+    if (idx >= total_mask) { return; }
+
+    var tmp = idx;
+    let ow = tmp % dbm_p.out_width; tmp = tmp / dbm_p.out_width;
+    let oh = tmp % dbm_p.out_height; tmp = tmp / dbm_p.out_height;
+    let ki = tmp % ks; tmp = tmp / ks;
+    let dg = tmp % dbm_p.deform_groups; tmp = tmp / dbm_p.deform_groups;
+    let n = tmp;
+
+    let kh = ki / dbm_p.kernel_width;
+    let kw = ki % dbm_p.kernel_width;
+
+    let off_base = (n * dbm_p.deform_groups + dg) * 2u * ks * dbm_p.out_height * dbm_p.out_width;
+    let off_sp = ki * dbm_p.out_height * dbm_p.out_width + oh * dbm_p.out_width + ow;
+    let off_h = dbm_offsets[off_base + off_sp];
+    let off_w = dbm_offsets[off_base + ks * dbm_p.out_height * dbm_p.out_width + off_sp];
+
+    let base_h = i32(oh * dbm_p.stride_h) - i32(dbm_p.pad_h);
+    let base_w = i32(ow * dbm_p.stride_w) - i32(dbm_p.pad_w);
+    let h = f32(base_h) + f32(kh * dbm_p.dilation_h) + off_h;
+    let w = f32(base_w) + f32(kw * dbm_p.dilation_w) + off_w;
+
+    var sum_grad: f32 = 0.0;
+    let in_ch_per_g = dbm_p.in_channels / dbm_p.groups;
+    let out_ch_per_dg = dbm_p.out_channels / dbm_p.deform_groups;
+
+    for (var oc_off: u32 = 0u; oc_off < out_ch_per_dg; oc_off = oc_off + 1u) {
+        let oc = dg * out_ch_per_dg + oc_off;
+        let g = oc / (dbm_p.out_channels / dbm_p.groups);
+        let go_val = dbm_grad_output[((n * dbm_p.out_channels + oc) * dbm_p.out_height + oh) * dbm_p.out_width + ow];
+        for (var ic: u32 = g * in_ch_per_g; ic < (g + 1u) * in_ch_per_g; ic = ic + 1u) {
+            let ic_local = ic - g * in_ch_per_g;
+            let w_idx = ((oc * in_ch_per_g + ic_local) * dbm_p.kernel_height + kh) * dbm_p.kernel_width + kw;
+            let wv = dbm_weights[w_idx];
+            let iv = dbm_bilinear_sample(n, ic, h, w);
+            sum_grad = sum_grad + go_val * wv * iv;
+        }
+    }
+    dbm_grad_mask[idx] = sum_grad;
+}
+";
+
+    public const string GridSampleBackwardSource = @"
+@group(0) @binding(0) var<storage, read> gsb_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> gsb_input: array<f32>;
+@group(0) @binding(2) var<storage, read> gsb_grid: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gsb_grad_input_atomic: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> gsb_grad_grid: array<f32>;
+
+struct GSBParams {
+    batch: u32, channels: u32, in_height: u32, in_width: u32,
+    out_height: u32, out_width: u32, padding_mode: u32, align_corners: u32,
+}
+@group(0) @binding(5) var<uniform> gsb_p: GSBParams;
+
+fn atomic_add_f32(addr: u32, val: f32) {
+    var old_val = atomicLoad(&gsb_grad_input_atomic[addr]);
+    loop {
+        let new_val = bitcast<u32>(bitcast<f32>(old_val) + val);
+        let result = atomicCompareExchangeWeak(&gsb_grad_input_atomic[addr], old_val, new_val);
+        if (result.exchanged) { break; }
+        old_val = result.old_value;
+    }
+}
+
+@compute @workgroup_size(256)
+fn grid_sample_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = gsb_p.batch * gsb_p.out_height * gsb_p.out_width;
+    if (idx >= total) { return; }
+
+    let ow = idx % gsb_p.out_width;
+    let oh = (idx / gsb_p.out_width) % gsb_p.out_height;
+    let n = idx / (gsb_p.out_width * gsb_p.out_height);
+
+    let grid_idx = ((n * gsb_p.out_height + oh) * gsb_p.out_width + ow) * 2u;
+    let gx = gsb_grid[grid_idx];
+    let gy = gsb_grid[grid_idx + 1u];
+
+    var ix: f32; var iy: f32;
+    var gm_x: f32; var gm_y: f32;
+    if (gsb_p.align_corners > 0u) {
+        ix = (gx + 1.0) * 0.5 * f32(gsb_p.in_width - 1u);
+        iy = (gy + 1.0) * 0.5 * f32(gsb_p.in_height - 1u);
+        gm_x = 0.5 * f32(gsb_p.in_width - 1u);
+        gm_y = 0.5 * f32(gsb_p.in_height - 1u);
+    } else {
+        ix = ((gx + 1.0) * f32(gsb_p.in_width) - 1.0) * 0.5;
+        iy = ((gy + 1.0) * f32(gsb_p.in_height) - 1.0) * 0.5;
+        gm_x = 0.5 * f32(gsb_p.in_width);
+        gm_y = 0.5 * f32(gsb_p.in_height);
+    }
+
+    let ix0 = i32(floor(ix)); let iy0 = i32(floor(iy));
+    let ix1 = ix0 + 1; let iy1 = iy0 + 1;
+    let wx1 = ix - f32(ix0); let wy1 = iy - f32(iy0);
+    let wx0 = 1.0 - wx1; let wy0 = 1.0 - wy1;
+
+    var grad_grid_x: f32 = 0.0;
+    var grad_grid_y: f32 = 0.0;
+
+    for (var c: u32 = 0u; c < gsb_p.channels; c = c + 1u) {
+        let out_idx = ((n * gsb_p.channels + c) * gsb_p.out_height + oh) * gsb_p.out_width + ow;
+        let go = gsb_grad_output[out_idx];
+        let in_base = (n * gsb_p.channels + c) * gsb_p.in_height * gsb_p.in_width;
+
+        var v00: f32 = 0.0; var v01: f32 = 0.0; var v10: f32 = 0.0; var v11: f32 = 0.0;
+        if (ix0 >= 0 && ix0 < i32(gsb_p.in_width) && iy0 >= 0 && iy0 < i32(gsb_p.in_height)) { v00 = gsb_input[in_base + u32(iy0) * gsb_p.in_width + u32(ix0)]; }
+        if (ix1 >= 0 && ix1 < i32(gsb_p.in_width) && iy0 >= 0 && iy0 < i32(gsb_p.in_height)) { v01 = gsb_input[in_base + u32(iy0) * gsb_p.in_width + u32(ix1)]; }
+        if (ix0 >= 0 && ix0 < i32(gsb_p.in_width) && iy1 >= 0 && iy1 < i32(gsb_p.in_height)) { v10 = gsb_input[in_base + u32(iy1) * gsb_p.in_width + u32(ix0)]; }
+        if (ix1 >= 0 && ix1 < i32(gsb_p.in_width) && iy1 >= 0 && iy1 < i32(gsb_p.in_height)) { v11 = gsb_input[in_base + u32(iy1) * gsb_p.in_width + u32(ix1)]; }
+
+        grad_grid_x += go * (wy0 * (v01 - v00) + wy1 * (v11 - v10)) * gm_x;
+        grad_grid_y += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gm_y;
+
+        if (ix0 >= 0 && ix0 < i32(gsb_p.in_width) && iy0 >= 0 && iy0 < i32(gsb_p.in_height)) {
+            atomic_add_f32(in_base + u32(iy0) * gsb_p.in_width + u32(ix0), go * wy0 * wx0);
+        }
+        if (ix1 >= 0 && ix1 < i32(gsb_p.in_width) && iy0 >= 0 && iy0 < i32(gsb_p.in_height)) {
+            atomic_add_f32(in_base + u32(iy0) * gsb_p.in_width + u32(ix1), go * wy0 * wx1);
+        }
+        if (ix0 >= 0 && ix0 < i32(gsb_p.in_width) && iy1 >= 0 && iy1 < i32(gsb_p.in_height)) {
+            atomic_add_f32(in_base + u32(iy1) * gsb_p.in_width + u32(ix0), go * wy1 * wx0);
+        }
+        if (ix1 >= 0 && ix1 < i32(gsb_p.in_width) && iy1 >= 0 && iy1 < i32(gsb_p.in_height)) {
+            atomic_add_f32(in_base + u32(iy1) * gsb_p.in_width + u32(ix1), go * wy1 * wx1);
+        }
+    }
+
+    gsb_grad_grid[grid_idx] = grad_grid_x;
+    gsb_grad_grid[grid_idx + 1u] = grad_grid_y;
+}
+";
+
+    public const string RmsNormGradGammaSource = @"
+@group(0) @binding(0) var<storage, read> rng_grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> rng_input: array<f32>;
+@group(0) @binding(2) var<storage, read> rng_save_rms: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rng_grad_gamma: array<f32>;
+
+struct RNGParams {
+    batch_size: u32,
+    normalized_size: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+@group(0) @binding(4) var<uniform> rng_p: RNGParams;
+
+@compute @workgroup_size(256)
+fn rmsnorm_grad_gamma(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= rng_p.normalized_size) { return; }
+
+    var d_gamma: f32 = 0.0;
+    for (var b: u32 = 0u; b < rng_p.batch_size; b = b + 1u) {
+        let idx = b * rng_p.normalized_size + i;
+        let rms = rng_save_rms[b];
+        let inv_rms = 1.0 / rms;
+        d_gamma = d_gamma + rng_grad_output[idx] * rng_input[idx] * inv_rms;
+    }
+    rng_grad_gamma[i] = d_gamma;
+}
+";
+
     /// <summary>
     /// ConvTranspose2D backward w.r.t. input (equivalent to Conv2D forward with kernel).
     /// gradOutput has shape [batch, outChannels, outHeight, outWidth]
@@ -7075,7 +7520,9 @@ fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
                OneHotSource + BatchNormEmaSource +
                LocallyConnectedConv2DSource + LocallyConnectedConv2DBackwardInputSource +
                LocallyConnectedConv2DBackwardWeightsSource +
-               DeformableConv2DSource +
+               DeformableConv2DSource + DeformableConv2DBackwardInputSource +
+               DeformableConv2DBackwardWeightsSource + DeformableConv2DBackwardOffsetSource +
+               DeformableConv2DBackwardMaskSource + GridSampleBackwardSource + RmsNormGradGammaSource +
                ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource +
                BatchNormBackwardStatsSource + PackBatchNormStatsSource + BatchNormBackwardDataSource +
                AvgPoolCountPadSource + AvgPoolCountPadBackwardSource +

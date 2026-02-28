@@ -885,6 +885,35 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     /// <summary>
     /// Packs ConvParams uniform (15 u32 fields, padded to 16 floats).
     /// </summary>
+    internal static float[] MakeDeformConvUniforms(int batch, int inChannels, int outChannels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, int groups, int deformGroups, int hasMask)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inChannels),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW),
+            BitConverter.Int32BitsToSingle(dilationH),
+            BitConverter.Int32BitsToSingle(dilationW),
+            BitConverter.Int32BitsToSingle(groups),
+            BitConverter.Int32BitsToSingle(deformGroups),
+            BitConverter.Int32BitsToSingle(hasMask),
+            0, 0 // padding to 20 floats (80 bytes)
+        };
+    }
+
     internal static float[] MakeConvUniforms(int batch, int inChannels, int outChannels,
         int inHeight, int inWidth, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
