@@ -705,7 +705,9 @@ __kernel void add_scaled(
 // ===========================================================================
 
 // Parallel sum reduction using local memory
-__kernel void reduce_sum_local(
+// Work group size must be exactly 256 to match shared memory allocation
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void reduce_sum_local(
     __global const float* input,
     __global float* partialSums,
     const int size)
@@ -734,7 +736,9 @@ __kernel void reduce_sum_local(
 }
 
 // Parallel variance reduction given a known mean
-__kernel void reduce_variance_local(
+// Work group size must be exactly 256 to match shared memory allocation
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void reduce_variance_local(
     __global const float* input,
     __global float* partialSums,
     const float mean,

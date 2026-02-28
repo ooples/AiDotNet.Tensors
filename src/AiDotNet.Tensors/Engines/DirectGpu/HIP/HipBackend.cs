@@ -7113,7 +7113,11 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe float StdDev(IGpuBuffer input, int size)
     {
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
         if (size <= 1) return 0.0f;
+        if (size > input.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
 
         const int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
@@ -7195,6 +7199,8 @@ public sealed class HipBackend : IAsyncGpuBackend
             variance = varSum / size;
         }
 
+        // Clamp variance to zero before sqrt to handle floating-point roundoff
+        if (variance < 0f) variance = 0f;
         return MathF.Sqrt(variance);
     }
 

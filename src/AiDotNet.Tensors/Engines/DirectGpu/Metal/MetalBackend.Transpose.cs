@@ -497,21 +497,27 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
 
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
         if (size <= 1) return 0.0f;
+        if (size > input.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
 
-        // Compute mean via GPU Sum reduction
-        float mean = Sum(input, size) / size;
-
-        // Compute variance: download, compute squared diffs, upload, reduce
+        // Welford's algorithm for numerically stable variance computation
         float[] data = DownloadBuffer(input);
-        float varSum = 0.0f;
+        double mean = 0;
+        double m2 = 0;
         for (int i = 0; i < size; i++)
         {
-            float diff = data[i] - mean;
-            varSum += diff * diff;
+            double delta = data[i] - mean;
+            mean += delta / (i + 1);
+            double delta2 = data[i] - mean;
+            m2 += delta * delta2;
         }
-
-        return MathF.Sqrt(varSum / size);
+        double variance = m2 / size;
+        // Clamp variance to zero before sqrt to handle floating-point roundoff
+        if (variance < 0) variance = 0;
+        return (float)Math.Sqrt(variance);
     }
 
     /// <summary>

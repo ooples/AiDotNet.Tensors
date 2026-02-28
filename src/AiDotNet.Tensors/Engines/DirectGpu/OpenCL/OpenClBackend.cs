@@ -7892,6 +7892,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
         {
+            if (size <= 0) return;
             var k = _kernelCache["fma"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -7900,11 +7901,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)D).Buffer.Handle);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
         {
+            if (size <= 0) return;
             var k = _kernelCache["lerp_fused"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7913,11 +7916,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, t);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
         {
+            if (size <= 0) return;
             var k = _kernelCache["add_scaled"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7927,7 +7932,8 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, scaleB);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public float StdDev(IGpuBuffer input, int size)
