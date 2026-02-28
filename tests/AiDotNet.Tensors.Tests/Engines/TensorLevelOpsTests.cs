@@ -215,8 +215,29 @@ public class TensorLevelOpsTests
         var result = _engine.TensorLayerNorm(input, gamma, beta, 1e-5);
 
         Assert.Equal(new[] { 2, 3 }, result.Shape);
+
         // After normalization with identity gamma and zero beta,
-        // each row should have mean ~0 and std ~1
+        // each row should have mean approximately 0 and std approximately 1
+        int rows = result.Shape[0];
+        int cols = result.Shape[1];
+        for (int r = 0; r < rows; r++)
+        {
+            float rowMean = 0f;
+            for (int c = 0; c < cols; c++)
+                rowMean += result[r, c];
+            rowMean /= cols;
+            Assert.Equal(0f, rowMean, 1e-4f);
+
+            float rowVar = 0f;
+            for (int c = 0; c < cols; c++)
+            {
+                float diff = result[r, c] - rowMean;
+                rowVar += diff * diff;
+            }
+            rowVar /= cols;
+            float rowStd = MathF.Sqrt(rowVar);
+            Assert.Equal(1f, rowStd, 0.01f);
+        }
     }
 
     #endregion
