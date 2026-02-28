@@ -6999,6 +6999,48 @@ fn gru_cell_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    public const string LerpFusedSource = @"
+@group(0) @binding(0) var<storage, read> lp_a: array<f32>;
+@group(0) @binding(1) var<storage, read> lp_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lp_out: array<f32>;
+
+struct LerpParams {
+    size: u32,
+    t: f32,
+}
+@group(0) @binding(3) var<uniform> lp_params: LerpParams;
+
+@compute @workgroup_size(256)
+fn lerp_fused(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lp_params.size) {
+        lp_out[idx] = lp_a[idx] + lp_params.t * (lp_b[idx] - lp_a[idx]);
+    }
+}
+";
+
+    public const string AddScaledSource = @"
+@group(0) @binding(0) var<storage, read> as_a: array<f32>;
+@group(0) @binding(1) var<storage, read> as_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> as_out: array<f32>;
+
+struct AddScaledParams {
+    size: u32,
+    _pad0: u32,
+    scaleA: f32,
+    scaleB: f32,
+}
+@group(0) @binding(3) var<uniform> as_params: AddScaledParams;
+
+@compute @workgroup_size(256)
+fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < as_params.size) {
+        as_out[idx] = as_params.scaleA * as_a[idx] + as_params.scaleB * as_b[idx];
+    }
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -7040,7 +7082,8 @@ fn gru_cell_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
                Pool3DWithIndicesSource + GridSampleExtSource +
                LayerNormBackwardFullSource + AdaptiveAvgPool2DSource +
                AttentionBackwardSource + GroupedQueryAttentionSource +
-               Fp16ConvertSource + LstmCellBackwardSource + GruCellBackwardSource;
+               Fp16ConvertSource + LstmCellBackwardSource + GruCellBackwardSource +
+               LerpFusedSource + AddScaledSource;
     }
 }
 #endif

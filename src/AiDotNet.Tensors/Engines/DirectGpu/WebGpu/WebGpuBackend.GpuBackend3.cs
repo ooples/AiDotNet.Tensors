@@ -960,6 +960,50 @@ public sealed partial class WebGpuBackend
             A, B, C, MakeUniformInts2(outerSize, innerSize), total).GetAwaiter().GetResult();
     }
 
+    public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+
+        Dispatch3BufferAsync("LerpFused", WebGpuKernels.LerpFusedSource, "lerp_fused",
+            a, b, output, MakeUniform2(size, t), size).GetAwaiter().GetResult();
+    }
+
+    public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(size),
+            BitConverter.Int32BitsToSingle(0),
+            scaleA,
+            scaleB
+        };
+        Dispatch3BufferAsync("AddScaled", WebGpuKernels.AddScaledSource, "add_scaled",
+            a, b, output, uniforms, size).GetAwaiter().GetResult();
+    }
+
+    public float StdDev(IGpuBuffer input, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
+        if (size <= 1) return 0.0f;
+
+        float mean = Sum(input, size) / size;
+
+        using var temp = AllocateBuffer(size);
+        AddScalarAsync(input, temp, -mean, size).GetAwaiter().GetResult();
+        Multiply(temp, temp, temp, size);
+        float varianceSum = Sum(temp, size);
+
+        float variance = Math.Max(0, varianceSum / size);
+        return MathF.Sqrt(variance);
+    }
+
     #endregion
 }
 #endif
