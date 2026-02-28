@@ -735,6 +735,12 @@ public sealed partial class WebGpuBackend
     {
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         // lerp(a, b, t) = a + t * (b - a)
         // CPU fallback: download, compute, upload
@@ -752,6 +758,12 @@ public sealed partial class WebGpuBackend
     {
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         // result = scaleA * a + scaleB * b
         // CPU fallback: download, compute, upload
@@ -769,6 +781,8 @@ public sealed partial class WebGpuBackend
     {
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
 
         // CPU fallback: download and compute

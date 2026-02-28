@@ -804,8 +804,27 @@ public sealed unsafe partial class VulkanBackend
     public void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
         EnsureInitialized();
-        var inp = DownloadBuffer(input);
+
+        if (shape.Length != permutation.Length)
+            throw new ArgumentException(
+                $"Shape rank ({shape.Length}) must match permutation length ({permutation.Length}).");
+
         int ndim = shape.Length;
+
+        // Validate permutation: must be a valid permutation of [0..ndim-1]
+        var seen = new bool[ndim];
+        for (int i = 0; i < ndim; i++)
+        {
+            if (permutation[i] < 0 || permutation[i] >= ndim)
+                throw new ArgumentOutOfRangeException(nameof(permutation),
+                    $"Permutation index {permutation[i]} at position {i} is out of range [0, {ndim}).");
+            if (seen[permutation[i]])
+                throw new ArgumentException(
+                    $"Duplicate index {permutation[i]} in permutation.", nameof(permutation));
+            seen[permutation[i]] = true;
+        }
+
+        var inp = DownloadBuffer(input);
         int totalSize = 1;
         for (int i = 0; i < ndim; i++) totalSize *= shape[i];
         var outp = new float[totalSize];
@@ -823,10 +842,11 @@ public sealed unsafe partial class VulkanBackend
             inStrides[i] = inStrides[i + 1] * shape[i + 1];
         }
 
+        // Pre-allocate coords array outside the loop to avoid per-element allocation
+        var coords = new int[ndim];
         for (int idx = 0; idx < totalSize; idx++)
         {
             int remaining = idx;
-            var coords = new int[ndim];
             for (int d = 0; d < ndim; d++)
             {
                 coords[d] = remaining / outStrides[d];
@@ -848,7 +868,10 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
         if (size == 0) return;
         if (size > source.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds source buffer length ({source.Size}).");
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds source buffer capacity ({source.Size}).");
+        if (size > destination.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds destination buffer capacity ({destination.Size}).");
+
         var s = DownloadBuffer(source);
         // Use destination.Size for the array to preserve trailing elements when size < destination.Size
         float[] d;
@@ -860,7 +883,7 @@ public sealed unsafe partial class VulkanBackend
         {
             d = DownloadBuffer(destination);
         }
-        Array.Copy(s, 0, d, 0, Math.Min(size, destination.Size));
+        Array.Copy(s, 0, d, 0, size);
         UploadToBuffer(d, destination);
     }
 
@@ -868,6 +891,17 @@ public sealed unsafe partial class VulkanBackend
         int srcCols, int destTotalCols, int destColOffset)
     {
         EnsureInitialized();
+
+        if (destTotalCols <= 0)
+            throw new ArgumentOutOfRangeException(nameof(destTotalCols), destTotalCols, "destTotalCols must be positive.");
+        if (destColOffset < 0 || destColOffset >= destTotalCols)
+            throw new ArgumentOutOfRangeException(nameof(destColOffset), destColOffset,
+                $"destColOffset must be in [0, {destTotalCols}).");
+        if (numRows < 0)
+            throw new ArgumentOutOfRangeException(nameof(numRows), numRows, "numRows must be non-negative.");
+        if (srcCols <= 0)
+            throw new ArgumentOutOfRangeException(nameof(srcCols), srcCols, "srcCols must be positive.");
+
         var s = DownloadBuffer(source);
         // Only download destination if the strided copy does not cover all columns,
         // since we need to preserve existing data in non-written columns.
