@@ -181,29 +181,83 @@ public sealed partial class WebGpuBackend
         }
         else
         {
-            // For grouped heads, compute Q gradients per Q-head and accumulate KV gradients
-            // across the group. Use the standard backward with numQHeads for gradQuery,
-            // then reduce KV grads by summing over the head group.
+            // Grouped query attention: multiple Q-heads share a single KV-head.
+            // We compute per-(batch, Q-head) gradients and accumulate K/V gradients
+            // into the corresponding shared KV-head.
             int headRatio = numQHeads / numKVHeads;
-            Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
-            Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
-            // Process each KV-head group
-            int qHeadStride = seqLen * headDim;
-            int kvHeadStride = seqLen * headDim;
-            using var tempGradK = (WebGpuBuffer)AllocateBuffer(batch * seqLen * headDim);
-            using var tempGradV = (WebGpuBuffer)AllocateBuffer(batch * seqLen * headDim);
-            for (int kvh = 0; kvh < numKVHeads; kvh++)
+
+            // Zero KV gradients; we'll accumulate into them.
+            Fill(gradKey, 0f, batch * numKVHeads * seqLen * headDim);
+            Fill(gradValue, 0f, batch * numKVHeads * seqLen * headDim);
+
+            // Each (batch=1, head=1) instance covers seqLen * headDim elements.
+            int headStride = seqLen * headDim;
+
+            // Temporary buffers for per-(batch, head) slicing and gradient computation.
+            // Each slice is for a single (batch=1, numHeads=1) attention operation.
+            using var sliceGO = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceQ = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceK = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceV = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceAttn = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceGQ = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var tempGradK = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var tempGradV = (WebGpuBuffer)AllocateBuffer(headStride);
+            // Reusable buffers for reading current KV grad slices during accumulation
+            using var currentGK = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var currentGV = (WebGpuBuffer)AllocateBuffer(headStride);
+
+            var goBuffer = (WebGpuBuffer)gradOutput;
+            var qBuffer = (WebGpuBuffer)query;
+            var kBuffer = (WebGpuBuffer)key;
+            var vBuffer = (WebGpuBuffer)value;
+            var attnBuffer = (WebGpuBuffer)attentionWeights;
+            var gqBuffer = (WebGpuBuffer)gradQuery;
+            var gkBuffer = (WebGpuBuffer)gradKey;
+            var gvBuffer = (WebGpuBuffer)gradValue;
+
+            // Iterate over batch, KV-head, and Q-heads within each KV group.
+            for (int b = 0; b < batch; b++)
             {
-                for (int g = 0; g < headRatio; g++)
+                for (int kvh = 0; kvh < numKVHeads; kvh++)
                 {
-                    int qh = kvh * headRatio + g;
-                    // Compute backward for this Q-head against its KV-head
-                    // The standard backward computes gradQ, gradK, gradV for a single head group
-                    ScaledDotProductAttentionBackward(gradOutput, query, key, value, attentionWeights,
-                        gradQuery, tempGradK, tempGradV, batch, 1, seqLen, headDim, scale, false);
-                    // Accumulate KV gradients
-                    Add(gradKey, tempGradK, gradKey, batch * seqLen * headDim);
-                    Add(gradValue, tempGradV, gradValue, batch * seqLen * headDim);
+                    // Copy the KV-head slice for this (batch, kvh) into temp buffers
+                    int kvBhIndex = b * numKVHeads + kvh;
+                    int kvOffset = kvBhIndex * headStride;
+                    sliceK.CopyFromBuffer(kBuffer, kvOffset, 0, headStride);
+                    sliceV.CopyFromBuffer(vBuffer, kvOffset, 0, headStride);
+
+                    for (int g = 0; g < headRatio; g++)
+                    {
+                        int qh = kvh * headRatio + g;
+
+                        // Flattened (batch * head) index for this Q-head
+                        int qBhIndex = b * numQHeads + qh;
+                        int qOffset = qBhIndex * headStride;
+
+                        // Copy per-head slices for Q, gradOutput, and attentionWeights
+                        sliceGO.CopyFromBuffer(goBuffer, qOffset, 0, headStride);
+                        sliceQ.CopyFromBuffer(qBuffer, qOffset, 0, headStride);
+                        sliceAttn.CopyFromBuffer(attnBuffer, qOffset, 0, headStride);
+
+                        // Compute backward gradients for this single (batch=1, head=1) slice
+                        ScaledDotProductAttentionBackward(
+                            sliceGO, sliceQ, sliceK, sliceV, sliceAttn,
+                            sliceGQ, tempGradK, tempGradV,
+                            1, 1, seqLen, headDim, scale, false);
+
+                        // Write gradQuery back to the correct Q-head offset
+                        gqBuffer.CopyFromBuffer(sliceGQ, 0, qOffset, headStride);
+
+                        // Accumulate KV gradients into the shared KV-head position:
+                        // gradKey[kvOffset..] += tempGradK, gradValue[kvOffset..] += tempGradV
+                        currentGK.CopyFromBuffer(gkBuffer, kvOffset, 0, headStride);
+                        currentGV.CopyFromBuffer(gvBuffer, kvOffset, 0, headStride);
+                        Add(currentGK, tempGradK, currentGK, headStride);
+                        Add(currentGV, tempGradV, currentGV, headStride);
+                        gkBuffer.CopyFromBuffer(currentGK, 0, kvOffset, headStride);
+                        gvBuffer.CopyFromBuffer(currentGV, 0, kvOffset, headStride);
+                    }
                 }
             }
         }
