@@ -492,26 +492,33 @@ public sealed partial class MetalBackend
 
     /// <summary>
     /// Computes standard deviation across elements: sqrt(variance).
+    /// Uses GPU reductions for both mean and variance to avoid downloading the input buffer.
     /// </summary>
     public float StdDev(IGpuBuffer input, int size)
     {
         ThrowIfDisposed();
 
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
 
-        // Compute mean via GPU Sum reduction
+        // Step 1: Compute mean via GPU Sum reduction
         float mean = Sum(input, size) / size;
 
-        // Compute variance: download, compute squared diffs, upload, reduce
-        float[] data = DownloadBuffer(input);
-        float varSum = 0.0f;
-        for (int i = 0; i < size; i++)
-        {
-            float diff = data[i] - mean;
-            varSum += diff * diff;
-        }
+        // Step 2: Compute variance entirely on GPU using existing element-wise ops:
+        //   temp = input - mean  (per-element subtract via AddScalar with -mean)
+        //   temp = temp * temp   (per-element square via Multiply)
+        //   variance = Sum(temp) / size  (GPU reduction)
+        using var temp = new MetalGpuBuffer(_device, size);
+        AddScalar(input, temp, -mean, size);
+        Multiply(temp, temp, temp, size);
+        float varianceSum = Sum(temp, size);
 
-        return MathF.Sqrt(varSum / size);
+        // Clamp variance to avoid NaN from floating-point round-off
+        float variance = Math.Max(0, varianceSum / size);
+        return MathF.Sqrt(variance);
     }
 
     /// <summary>
