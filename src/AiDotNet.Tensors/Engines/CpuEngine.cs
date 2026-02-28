@@ -17907,4 +17907,151 @@ public class CpuEngine : IEngine
     }
 
     #endregion
+
+    #region Tensor-Level Activation Aliases
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorSigmoid<T>(Tensor<T> tensor)
+    {
+        return Sigmoid(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorReLU<T>(Tensor<T> tensor)
+    {
+        return ReLU(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorGELU<T>(Tensor<T> tensor)
+    {
+        return GELU(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorSiLU<T>(Tensor<T> tensor)
+    {
+        // SiLU (Sigmoid Linear Unit) is mathematically equivalent to Swish
+        return Swish(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorTanh<T>(Tensor<T> tensor)
+    {
+        return Tanh(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
+    {
+        return LeakyReLU(tensor, alpha);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorMish<T>(Tensor<T> tensor)
+    {
+        return Mish(tensor);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorHardSwish<T>(Tensor<T> tensor)
+    {
+        return HardSwish(tensor);
+    }
+
+    #endregion
+
+    #region Tensor-Level Composite Operations
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorLayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon = 1e-5)
+    {
+        return LayerNorm(input, gamma, beta, epsilon, out _, out _);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (input == null)
+            throw new ArgumentNullException(nameof(input));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // std = sqrt(variance)
+        var variance = ReduceVariance(input, axes, keepDims);
+        var varianceData = variance.ToArray();
+        var resultData = new T[varianceData.Length];
+
+        for (int i = 0; i < varianceData.Length; i++)
+        {
+            resultData[i] = numOps.Sqrt(varianceData[i]);
+        }
+
+        return new Tensor<T>(variance.Shape, new Vector<T>(resultData));
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesMatch(a.Shape, b.Shape))
+        {
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        }
+
+        // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
+        // Using a + t*(b-a) is more numerically stable and requires fewer ops
+        var diff = TensorSubtract(b, a);  // b - a
+        var scaled = TensorMultiplyScalar(diff, t);  // t * (b - a)
+        return TensorAdd(a, scaled);  // a + t * (b - a)
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesMatch(a.Shape, b.Shape))
+        {
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(a.Shape);
+
+        // Single pass: result[i] = scaleA * a[i] + scaleB * b[i]
+        // Avoids 2 intermediate tensor allocations from the original 3-pass approach
+        for (int i = 0; i < a.Length; i++)
+        {
+            var val = numOps.Add(
+                numOps.Multiply(a.GetFlat(i), scaleA),
+                numOps.Multiply(b.GetFlat(i), scaleB));
+            result.SetFlat(i, val);
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        return MaxPool2D(input, poolSize, stride, padding);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    {
+        return AvgPool2D(input, poolSize, stride, padding);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
+    {
+        return Conv2D(input, kernel, stride, padding, dilation);
+    }
+
+    #endregion
 }

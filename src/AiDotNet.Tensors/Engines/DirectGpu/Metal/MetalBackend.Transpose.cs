@@ -440,6 +440,88 @@ public sealed partial class MetalBackend
     }
 
     /// <summary>
+    /// Fused linear interpolation: output = a + t * (b - a)
+    /// </summary>
+    public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+    {
+        ThrowIfDisposed();
+
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || output is not MetalGpuBuffer outBuffer)
+        {
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        }
+
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "lerp_fused");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBuffer(outBuffer, 2);
+        encoder.SetBytes(t, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    /// <summary>
+    /// Fused scaled addition: output = scaleA * a + scaleB * b
+    /// </summary>
+    public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+    {
+        ThrowIfDisposed();
+
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || output is not MetalGpuBuffer outBuffer)
+        {
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        }
+
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "add_scaled");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBuffer(outBuffer, 2);
+        encoder.SetBytes(scaleA, 3);
+        encoder.SetBytes(scaleB, 4);
+        encoder.SetBytes((uint)size, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    /// <summary>
+    /// Computes standard deviation across elements: sqrt(variance).
+    /// Uses GPU reductions for both mean and variance to avoid downloading the input buffer.
+    /// </summary>
+    public float StdDev(IGpuBuffer input, int size)
+    {
+        ThrowIfDisposed();
+
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
+        if (size <= 1) return 0.0f;
+
+        // Step 1: Compute mean via GPU Sum reduction
+        float mean = Sum(input, size) / size;
+
+        // Step 2: Compute variance entirely on GPU using existing element-wise ops:
+        //   temp = input - mean  (per-element subtract via AddScalar with -mean)
+        //   temp = temp * temp   (per-element square via Multiply)
+        //   variance = Sum(temp) / size  (GPU reduction)
+        using var temp = new MetalGpuBuffer(_device, size);
+        AddScalar(input, temp, -mean, size);
+        Multiply(temp, temp, temp, size);
+        float varianceSum = Sum(temp, size);
+
+        // Clamp variance to avoid NaN from floating-point round-off
+        float variance = Math.Max(0, varianceSum / size);
+        return MathF.Sqrt(variance);
+    }
+
+    /// <summary>
     /// Scatter-add operation.
     /// </summary>
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)

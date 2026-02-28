@@ -390,6 +390,35 @@ kernel void broadcast_add_first(
         C[idx] = A[idx] + B[i];
     }
 }
+
+// Fused linear interpolation: output = a + t * (b - a)
+kernel void lerp_fused(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant float& t [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        C[gid] = fma(t, B[gid] - A[gid], A[gid]);
+    }
+}
+
+// Fused scaled addition: output = scaleA * a + scaleB * b
+kernel void add_scaled(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant float& scaleA [[buffer(3)]],
+    constant float& scaleB [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        C[gid] = fma(scaleA, A[gid], scaleB * B[gid]);
+    }
+}
 ";
 
     #endregion

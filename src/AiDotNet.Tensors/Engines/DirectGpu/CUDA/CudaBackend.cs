@@ -5954,6 +5954,147 @@ public sealed class CudaBackend : IAsyncGpuBackend
         Add(D, C, D, size);
     }
 
+    public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        if (!_kernelCache.TryGetValue("lerp_fused", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: lerp_fused");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outPtr = output.Handle;
+        float tVal = t;
+        int n = size;
+        void** args = stackalloc void*[5];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outPtr;
+        args[3] = &tVal;
+        args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        if (!_kernelCache.TryGetValue("add_scaled", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: add_scaled");
+
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outPtr = output.Handle;
+        float sA = scaleA;
+        float sB = scaleB;
+        int n = size;
+        void** args = stackalloc void*[6];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outPtr;
+        args[3] = &sA;
+        args[4] = &sB;
+        args[5] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe float StdDev(IGpuBuffer input, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
+        if (size <= 1) return 0.0f;
+
+        using var _ = PushContext();
+        int blockSize = DefaultBlockSize;
+        int gridSize = (size + blockSize - 1) / blockSize;
+
+        // Step 1: Compute mean via GPU reduction
+        float mean;
+        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        {
+            var zeroData = new float[1];
+            using var meanBuffer = AllocateBuffer(zeroData);
+
+            IntPtr inputPtr = input.Handle;
+            IntPtr meanPtr = meanBuffer.Handle;
+            int n = size;
+            void** args = stackalloc void*[3];
+            args[0] = &inputPtr;
+            args[1] = &meanPtr;
+            args[2] = &n;
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            Synchronize();
+
+            float[] meanResult = DownloadBuffer(meanBuffer);
+            mean = meanResult[0] / size;
+        }
+        else
+        {
+            mean = Sum(input, size) / size;
+        }
+
+        // Step 2: Compute variance via GPU reduction
+        float variance;
+        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        {
+            var zeroData = new float[1];
+            using var varianceBuffer = AllocateBuffer(zeroData);
+
+            IntPtr inputPtr = input.Handle;
+            IntPtr varPtr = varianceBuffer.Handle;
+            float meanVal = mean;
+            int n = size;
+            void** args = stackalloc void*[4];
+            args[0] = &inputPtr;
+            args[1] = &varPtr;
+            args[2] = &meanVal;
+            args[3] = &n;
+            uint sharedBytes = (uint)(blockSize * sizeof(float));
+            LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
+            Synchronize();
+
+            float[] varResult = DownloadBuffer(varianceBuffer);
+            variance = varResult[0] / size;
+        }
+        else
+        {
+            // Fallback: download and compute on CPU
+            float[] data = DownloadBuffer(input);
+            float varSum = 0.0f;
+            for (int i = 0; i < size; i++)
+            {
+                float diff = data[i] - mean;
+                varSum += diff * diff;
+            }
+            variance = varSum / size;
+        }
+
+        // Clamp variance to avoid NaN from floating-point round-off
+        variance = Math.Max(0, variance);
+        return MathF.Sqrt(variance);
+    }
+
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
         if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))

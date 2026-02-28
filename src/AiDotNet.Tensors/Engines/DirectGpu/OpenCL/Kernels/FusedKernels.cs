@@ -664,6 +664,105 @@ __kernel void residual_batchnorm_relu(
     float result = g * normalized + b + residual[idx];
     output[idx] = fmax(0.0f, result);  // ReLU
 }
+
+// ===========================================================================
+// FUSED ELEMENT-WISE KERNELS
+// ===========================================================================
+
+// Fused linear interpolation: output = (1-t)*a + t*b = a + t*(b-a)
+// Uses fused multiply-add (fma) for precision
+__kernel void lerp_fused(
+    __global const float* a,
+    __global const float* b,
+    __global float* output,
+    const float t,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    output[idx] = fma(t, b[idx] - a[idx], a[idx]);
+}
+
+// Fused scaled addition: output = scaleA * a + scaleB * b
+// Used for diffusion noise mixing: alpha * signal + sigma * noise
+__kernel void add_scaled(
+    __global const float* a,
+    __global const float* b,
+    __global float* output,
+    const float scaleA,
+    const float scaleB,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    if (idx >= size) return;
+
+    output[idx] = fma(scaleA, a[idx], scaleB * b[idx]);
+}
+
+// ===========================================================================
+// REDUCTION KERNELS
+// ===========================================================================
+
+// Parallel sum reduction using local memory
+__kernel void reduce_sum_local(
+    __global const float* input,
+    __global float* partialSums,
+    __local float* sdata,
+    const int size)
+{
+    const int tid = get_local_id(0);
+    const int gid = get_global_id(0);
+
+    float sum = 0.0f;
+    for (int i = gid; i < size; i += get_global_size(0)) {
+        sum += input[i];
+    }
+    sdata[tid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        partialSums[get_group_id(0)] = sdata[0];
+    }
+}
+
+// Parallel variance reduction given a known mean
+__kernel void reduce_variance_local(
+    __global const float* input,
+    __global float* partialSums,
+    __local float* sdata,
+    const float mean,
+    const int size)
+{
+    const int tid = get_local_id(0);
+    const int gid = get_global_id(0);
+
+    float sum = 0.0f;
+    for (int i = gid; i < size; i += get_global_size(0)) {
+        float diff = input[i] - mean;
+        sum += diff * diff;
+    }
+    sdata[tid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        partialSums[get_group_id(0)] = sdata[0];
+    }
+}
 ";
         }
 
@@ -679,7 +778,9 @@ __kernel void residual_batchnorm_relu(
                 "layernorm_relu", "layernorm_gelu",
                 "residual_layernorm", "scaled_softmax", "bias_dropout",
                 "batchnorm_relu", "batchnorm_gelu",
-                "batchnorm_sigmoid", "batchnorm_tanh", "residual_batchnorm_relu"
+                "batchnorm_sigmoid", "batchnorm_tanh", "residual_batchnorm_relu",
+                "lerp_fused", "add_scaled",
+                "reduce_sum_local", "reduce_variance_local"
             };
         }
     }

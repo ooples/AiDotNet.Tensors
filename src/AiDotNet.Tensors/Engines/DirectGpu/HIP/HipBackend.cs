@@ -7056,6 +7056,172 @@ public sealed class HipBackend : IAsyncGpuBackend
         Add(D, C, D, size);
     }
 
+    public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        if (!_kernelCache.TryGetValue("lerp_fused", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: lerp_fused");
+
+        var handles = new GCHandle[5];
+        try
+        {
+            handles[0] = GCHandle.Alloc(a.Handle, GCHandleType.Pinned);
+            handles[1] = GCHandle.Alloc(b.Handle, GCHandleType.Pinned);
+            handles[2] = GCHandle.Alloc(output.Handle, GCHandleType.Pinned);
+            handles[3] = GCHandle.Alloc(t, GCHandleType.Pinned);
+            handles[4] = GCHandle.Alloc(size, GCHandleType.Pinned);
+
+            var args = new IntPtr[5];
+            for (int i = 0; i < 5; i++) args[i] = handles[i].AddrOfPinnedObject();
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+        }
+        finally
+        {
+            foreach (var h in handles) if (h.IsAllocated) h.Free();
+        }
+    }
+
+    public unsafe void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        if (!_kernelCache.TryGetValue("add_scaled", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: add_scaled");
+
+        var handles = new GCHandle[6];
+        try
+        {
+            handles[0] = GCHandle.Alloc(a.Handle, GCHandleType.Pinned);
+            handles[1] = GCHandle.Alloc(b.Handle, GCHandleType.Pinned);
+            handles[2] = GCHandle.Alloc(output.Handle, GCHandleType.Pinned);
+            handles[3] = GCHandle.Alloc(scaleA, GCHandleType.Pinned);
+            handles[4] = GCHandle.Alloc(scaleB, GCHandleType.Pinned);
+            handles[5] = GCHandle.Alloc(size, GCHandleType.Pinned);
+
+            var args = new IntPtr[6];
+            for (int i = 0; i < 6; i++) args[i] = handles[i].AddrOfPinnedObject();
+
+            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+        }
+        finally
+        {
+            foreach (var h in handles) if (h.IsAllocated) h.Free();
+        }
+    }
+
+    public unsafe float StdDev(IGpuBuffer input, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
+        if (size <= 1) return 0.0f;
+
+        const int blockSize = 256;
+        int gridSize = (size + blockSize - 1) / blockSize;
+
+        // Step 1: Compute mean via GPU reduction
+        float mean;
+        if (_kernelCache.TryGetValue("reduce_mean_kernel", out var meanKernel))
+        {
+            var zeroData = new float[1];
+            using var meanBuffer = AllocateBuffer(zeroData);
+
+            var meanHandles = new GCHandle[3];
+            try
+            {
+                meanHandles[0] = GCHandle.Alloc(input.Handle, GCHandleType.Pinned);
+                meanHandles[1] = GCHandle.Alloc(meanBuffer.Handle, GCHandleType.Pinned);
+                meanHandles[2] = GCHandle.Alloc(size, GCHandleType.Pinned);
+
+                var meanArgs = new IntPtr[3];
+                for (int i = 0; i < 3; i++) meanArgs[i] = meanHandles[i].AddrOfPinnedObject();
+
+                uint sharedBytes = (uint)(blockSize * sizeof(float));
+                LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, meanArgs);
+                Synchronize();
+            }
+            finally
+            {
+                foreach (var h in meanHandles) if (h.IsAllocated) h.Free();
+            }
+
+            float[] meanResult = DownloadBuffer(meanBuffer);
+            mean = meanResult[0] / size;
+        }
+        else
+        {
+            mean = Sum(input, size) / size;
+        }
+
+        // Step 2: Compute variance via GPU reduction
+        float variance;
+        if (_kernelCache.TryGetValue("reduce_variance_kernel", out var varKernel))
+        {
+            var zeroData = new float[1];
+            using var varianceBuffer = AllocateBuffer(zeroData);
+
+            var varHandles = new GCHandle[4];
+            try
+            {
+                varHandles[0] = GCHandle.Alloc(input.Handle, GCHandleType.Pinned);
+                varHandles[1] = GCHandle.Alloc(varianceBuffer.Handle, GCHandleType.Pinned);
+                varHandles[2] = GCHandle.Alloc(mean, GCHandleType.Pinned);
+                varHandles[3] = GCHandle.Alloc(size, GCHandleType.Pinned);
+
+                var varArgs = new IntPtr[4];
+                for (int i = 0; i < 4; i++) varArgs[i] = varHandles[i].AddrOfPinnedObject();
+
+                uint sharedBytes = (uint)(blockSize * sizeof(float));
+                LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, varArgs);
+                Synchronize();
+            }
+            finally
+            {
+                foreach (var h in varHandles) if (h.IsAllocated) h.Free();
+            }
+
+            float[] varResult = DownloadBuffer(varianceBuffer);
+            variance = varResult[0] / size;
+        }
+        else
+        {
+            // Fallback: download and compute on CPU
+            float[] data = DownloadBuffer(input);
+            float varSum = 0.0f;
+            for (int i = 0; i < size; i++)
+            {
+                float diff = data[i] - mean;
+                varSum += diff * diff;
+            }
+            variance = varSum / size;
+        }
+
+        // Clamp variance to avoid NaN from floating-point round-off
+        variance = Math.Max(0, variance);
+        return MathF.Sqrt(variance);
+    }
+
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
         // CPU fallback for scatter - no dedicated kernel

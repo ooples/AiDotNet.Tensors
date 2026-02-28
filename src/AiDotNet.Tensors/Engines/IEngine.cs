@@ -6580,4 +6580,164 @@ public interface IEngine
     Tensor<T> TensorOuter<T>(Tensor<T> a, Tensor<T> b);
 
     #endregion
+
+    #region Tensor-Level Activation Operations
+
+    /// <summary>
+    /// Applies element-wise sigmoid activation: 1 / (1 + exp(-x)).
+    /// Alias for <see cref="Sigmoid{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with sigmoid applied element-wise.</returns>
+    Tensor<T> TensorSigmoid<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise ReLU activation: max(0, x).
+    /// Alias for <see cref="ReLU{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with ReLU applied element-wise.</returns>
+    Tensor<T> TensorReLU<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+    /// Alias for <see cref="GELU{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with GELU applied element-wise.</returns>
+    Tensor<T> TensorGELU<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise SiLU (Sigmoid Linear Unit) activation: x * sigmoid(x).
+    /// Also known as Swish. Default activation in modern diffusion models.
+    /// Alias for <see cref="Swish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with SiLU applied element-wise.</returns>
+    Tensor<T> TensorSiLU<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise tanh activation.
+    /// Alias for <see cref="Tanh{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with tanh applied element-wise.</returns>
+    Tensor<T> TensorTanh<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise Leaky ReLU activation: x if x > 0, else alpha * x.
+    /// Alias for <see cref="LeakyReLU{T}(Tensor{T}, T)"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <param name="alpha">Negative slope coefficient (commonly 0.01).</param>
+    /// <returns>Tensor with Leaky ReLU applied element-wise.</returns>
+    Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha);
+
+    /// <summary>
+    /// Applies element-wise Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x)).
+    /// Alias for <see cref="Mish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with Mish applied element-wise.</returns>
+    Tensor<T> TensorMish<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Applies element-wise HardSwish activation: x * relu6(x + 3) / 6.
+    /// Alias for <see cref="HardSwish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">Input tensor.</param>
+    /// <returns>Tensor with HardSwish applied element-wise.</returns>
+    Tensor<T> TensorHardSwish<T>(Tensor<T> tensor);
+
+    #endregion
+
+    #region Tensor-Level Composite Operations
+
+    /// <summary>
+    /// Applies layer normalization on a tensor.
+    /// Alias for <see cref="LayerNorm{T}"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Input tensor.</param>
+    /// <param name="gamma">Scale parameter tensor.</param>
+    /// <param name="beta">Shift parameter tensor.</param>
+    /// <param name="epsilon">Small constant for numerical stability.</param>
+    /// <returns>Normalized tensor.</returns>
+    Tensor<T> TensorLayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon = 1e-5);
+
+    /// <summary>
+    /// Computes standard deviation along specified axes.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">Input tensor.</param>
+    /// <param name="axes">Axes along which to compute standard deviation.</param>
+    /// <param name="keepDims">Whether to keep reduced dimensions.</param>
+    /// <returns>Tensor containing standard deviations along specified axes.</returns>
+    Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims);
+
+    /// <summary>
+    /// Linearly interpolates between two tensors element-wise: (1 - t) * a + t * b.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="a">Start tensor.</param>
+    /// <param name="b">End tensor.</param>
+    /// <param name="t">Interpolation factor (0 = a, 1 = b).</param>
+    /// <returns>Interpolated tensor.</returns>
+    Tensor<T> TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t);
+
+    /// <summary>
+    /// Computes fused scaled addition of two tensors: scaleA * a + scaleB * b.
+    /// Commonly used for noise mixing in diffusion models (alpha * signal + sigma * noise).
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="a">First tensor.</param>
+    /// <param name="b">Second tensor.</param>
+    /// <param name="scaleA">Scale factor for first tensor.</param>
+    /// <param name="scaleB">Scale factor for second tensor.</param>
+    /// <returns>Result tensor: scaleA * a + scaleB * b.</returns>
+    Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB);
+
+    /// <summary>
+    /// Alias for <see cref="MaxPool2D{T}(Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">4D input tensor [batch, channels, height, width].</param>
+    /// <param name="poolSize">Pooling window size.</param>
+    /// <param name="stride">Stride. If 0, defaults to poolSize.</param>
+    /// <param name="padding">Zero-padding size.</param>
+    /// <returns>Pooled tensor.</returns>
+    Tensor<T> TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
+
+    /// <summary>
+    /// Alias for <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">4D input tensor [batch, channels, height, width].</param>
+    /// <param name="poolSize">Pooling window size.</param>
+    /// <param name="stride">Stride. If 0, defaults to poolSize.</param>
+    /// <param name="padding">Zero-padding size.</param>
+    /// <returns>Pooled tensor.</returns>
+    Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
+
+    /// <summary>
+    /// Alias for <see cref="Conv2D{T}(Tensor{T}, Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">4D input tensor [batch, channels, height, width].</param>
+    /// <param name="kernel">4D kernel tensor [outChannels, inChannels, kH, kW].</param>
+    /// <param name="stride">Convolution stride.</param>
+    /// <param name="padding">Zero-padding size.</param>
+    /// <param name="dilation">Dilation factor.</param>
+    /// <returns>Convolution result tensor.</returns>
+    Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
+
+    #endregion
 }

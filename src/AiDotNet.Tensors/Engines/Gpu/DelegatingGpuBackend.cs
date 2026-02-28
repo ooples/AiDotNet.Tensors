@@ -1244,6 +1244,18 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.Fma(A, B, C, D, size);
 
     /// <inheritdoc/>
+    public virtual void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+        => Inner.Lerp(a, b, output, t, size);
+
+    /// <inheritdoc/>
+    public virtual void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+        => Inner.AddScaled(a, b, output, scaleA, scaleB, size);
+
+    /// <inheritdoc/>
+    public virtual float StdDev(IGpuBuffer input, int size)
+        => Inner.StdDev(input, size);
+
+    /// <inheritdoc/>
     public virtual void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
         => Inner.ScatterAdd(source, indices, destination, sourceSize, destSize);
 
