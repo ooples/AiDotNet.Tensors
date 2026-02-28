@@ -404,9 +404,8 @@ public sealed partial class WebGpuBackend
     public void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
         // OctonionSource: binding(0)=A, binding(1)=B, binding(2)=C, uniform: count
-        var uniforms = new float[] { BitConverter.Int32BitsToSingle(count) };
         Dispatch3BufferAsync("Octonion", WebGpuKernels.OctonionSource, "octonion_multiply",
-            a, b, output, uniforms, count).GetAwaiter().GetResult();
+            a, b, output, MakeUniform1(count), count).GetAwaiter().GetResult();
     }
 
     public void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count) => Add(a, b, output, count * 8);
@@ -789,6 +788,12 @@ public sealed partial class WebGpuBackend
         var whhData = DownloadBufferData(weightsHh);
         var allCData = DownloadBufferData(allC);
 
+        // Download weight gradient accumulators once before the loop to avoid
+        // O(seqLen) GPU roundtrips. We accumulate in CPU arrays and upload once after.
+        var gWihData = DownloadBufferData(gradWeightsIh);
+        var gWhhData = DownloadBufferData(gradWeightsHh);
+        var gBiasData = DownloadBufferData(gradBiasIh);
+
         // Iterate backwards through time
         for (int t = seqLen - 1; t >= 0; t--)
         {
@@ -957,11 +962,7 @@ public sealed partial class WebGpuBackend
                 }
             }
 
-            // Accumulate weight gradients: gradW_ih += gradGates^T * input_t, gradW_hh += gradGates^T * h_prev
-            var gWihData = DownloadBufferData(gradWeightsIh);
-            var gWhhData = DownloadBufferData(gradWeightsHh);
-            var gBiasData = DownloadBufferData(gradBiasIh);
-
+            // Accumulate weight gradients into CPU arrays (hoisted outside the loop)
             for (int b = 0; b < batch; b++)
             {
                 for (int gate = 0; gate < 4; gate++)
@@ -981,14 +982,15 @@ public sealed partial class WebGpuBackend
                 }
             }
 
-            UploadToBuffer(gWihData, gradWeightsIh);
-            UploadToBuffer(gWhhData, gradWeightsHh);
-            UploadToBuffer(gBiasData, gradBiasIh);
-
             // Update running gradients
             UploadToBuffer(newGradH, gradH);
             UploadToBuffer(newGradC, gradC);
         }
+
+        // Upload accumulated weight gradients once after the loop completes
+        UploadToBuffer(gWihData, gradWeightsIh);
+        UploadToBuffer(gWhhData, gradWeightsHh);
+        UploadToBuffer(gBiasData, gradBiasIh);
 
         // Copy final gradients
         Copy(gradH, gradHInit, cellTotal);

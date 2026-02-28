@@ -190,8 +190,10 @@ public sealed partial class WebGpuBackend
             Fill(gradKey, 0f, batch * numKVHeads * seqLen * headDim);
             Fill(gradValue, 0f, batch * numKVHeads * seqLen * headDim);
 
-            // Each (batch=1, head=1) instance covers seqLen * headDim elements.
+            // Each (batch=1, head=1) Q/K/V slice covers seqLen * headDim elements.
             int headStride = seqLen * headDim;
+            // Attention weights are (seqLen, seqLen) per head, not (seqLen, headDim).
+            int attnStride = seqLen * seqLen;
 
             // Temporary buffers for per-(batch, head) slicing and gradient computation.
             // Each slice is for a single (batch=1, numHeads=1) attention operation.
@@ -199,7 +201,7 @@ public sealed partial class WebGpuBackend
             using var sliceQ = (WebGpuBuffer)AllocateBuffer(headStride);
             using var sliceK = (WebGpuBuffer)AllocateBuffer(headStride);
             using var sliceV = (WebGpuBuffer)AllocateBuffer(headStride);
-            using var sliceAttn = (WebGpuBuffer)AllocateBuffer(headStride);
+            using var sliceAttn = (WebGpuBuffer)AllocateBuffer(attnStride);
             using var sliceGQ = (WebGpuBuffer)AllocateBuffer(headStride);
             using var tempGradK = (WebGpuBuffer)AllocateBuffer(headStride);
             using var tempGradV = (WebGpuBuffer)AllocateBuffer(headStride);
@@ -235,10 +237,12 @@ public sealed partial class WebGpuBackend
                         int qBhIndex = b * numQHeads + qh;
                         int qOffset = qBhIndex * headStride;
 
-                        // Copy per-head slices for Q, gradOutput, and attentionWeights
+                        // Copy per-head slices for Q, gradOutput, and attentionWeights.
+                        // Attention weights are (seqLen, seqLen) per head, indexed by Q-head.
                         sliceGO.CopyFromBuffer(goBuffer, qOffset, 0, headStride);
                         sliceQ.CopyFromBuffer(qBuffer, qOffset, 0, headStride);
-                        sliceAttn.CopyFromBuffer(attnBuffer, qOffset, 0, headStride);
+                        int attnOffset = qBhIndex * attnStride;
+                        sliceAttn.CopyFromBuffer(attnBuffer, attnOffset, 0, attnStride);
 
                         // Compute backward gradients for this single (batch=1, head=1) slice
                         ScaledDotProductAttentionBackward(
@@ -929,7 +933,7 @@ public sealed partial class WebGpuBackend
             int totalK = outerSize * k;
             var valData = DownloadBufferData(values);
             var idxData = DownloadBufferData(indices);
-            var rng = new Random();
+            var rng = Random.Shared;
             for (int b = 0; b < outerSize; b++)
             {
                 int baseIdx = b * k;
