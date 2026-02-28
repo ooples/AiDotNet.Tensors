@@ -257,9 +257,11 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        // Zero-fill gradient to allow training to proceed.
-        // DirectGpuTensorEngine catches exceptions and falls back to CPU for accurate gradients.
-        Fill(gradInput, 0f, batch * inChannels * inHeight * inWidth);
+        // Throw so DirectGpuTensorEngine catches and falls back to CpuEngine
+        // which has the correct deformable conv backward implementation.
+        throw new NotSupportedException(
+            "DeformableConv2DBackwardInput requires bilinear interpolation gradients not available in WebGPU. " +
+            "DirectGpuTensorEngine automatically falls back to CpuEngine.");
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -270,7 +272,9 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Fill(gradWeights, 0f, outChannels * (inChannels / groups) * kernelH * kernelW);
+        throw new NotSupportedException(
+            "DeformableConv2DBackwardWeights requires bilinear interpolation gradients not available in WebGPU. " +
+            "DirectGpuTensorEngine automatically falls back to CpuEngine.");
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -281,8 +285,9 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        int offsetChannels = 2 * deformGroups * kernelH * kernelW;
-        Fill(gradOffsets, 0f, batch * offsetChannels * outHeight * outWidth);
+        throw new NotSupportedException(
+            "DeformableConv2DBackwardOffset requires bilinear interpolation gradients not available in WebGPU. " +
+            "DirectGpuTensorEngine automatically falls back to CpuEngine.");
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -293,8 +298,9 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        int maskChannels = deformGroups * kernelH * kernelW;
-        Fill(gradMask, 0f, batch * maskChannels * outHeight * outWidth);
+        throw new NotSupportedException(
+            "DeformableConv2DBackwardMask requires bilinear interpolation gradients not available in WebGPU. " +
+            "DirectGpuTensorEngine automatically falls back to CpuEngine.");
     }
 
     #endregion
@@ -634,10 +640,10 @@ public sealed partial class WebGpuBackend
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        // Zero-fill gradients to allow training to proceed.
-        // DirectGpuTensorEngine catches exceptions and falls back to CPU for accurate gradients.
-        Fill(gradInput, 0f, batch * channels * inHeight * inWidth);
-        Fill(gradGrid, 0f, batch * outHeight * outWidth * 2);
+        throw new NotSupportedException(
+            "GridSampleBackward requires bilinear interpolation gradients with atomic scatter-add " +
+            "not efficiently supported in WebGPU compute shaders. " +
+            "DirectGpuTensorEngine automatically falls back to CpuEngine for this operation.");
     }
 
     #endregion
