@@ -23,6 +23,7 @@ public class GpuCpuConsistencyTests
 {
     private readonly bool _isVulkanAvailable;
     private readonly VulkanBackend? _backend;
+    private readonly bool _isDirectGpuAvailable;
     private const float Tolerance = 1e-5f;
     private const float RelativeTolerance = 1e-4f;
 
@@ -37,11 +38,35 @@ public class GpuCpuConsistencyTests
         {
             _isVulkanAvailable = false;
         }
+
+        // Probe DirectGpuEngine availability (CUDA, OpenCL, HIP) separately from Vulkan.
+        // Tests that use DirectGpuTensorEngine should check this instead of Vulkan.
+        try
+        {
+            using var probe = new DirectGpuTensorEngine();
+            _isDirectGpuAvailable = probe.IsGpuAvailable;
+        }
+        catch
+        {
+            _isDirectGpuAvailable = false;
+        }
     }
 
+    /// <summary>
+    /// Skips the test if Vulkan is not available. Use for tests that call VulkanBackend directly.
+    /// </summary>
     private void SkipIfNoGpu()
     {
-        Skip.If(!_isVulkanAvailable, "GPU not available on this system");
+        Skip.If(!_isVulkanAvailable, "Vulkan GPU backend not available on this system");
+    }
+
+    /// <summary>
+    /// Skips the test if no DirectGpu backend (CUDA, OpenCL, or HIP) is available.
+    /// Use for tests that use DirectGpuTensorEngine.
+    /// </summary>
+    private void SkipIfNoDirectGpu()
+    {
+        Skip.If(!_isDirectGpuAvailable, "No DirectGpu backend (CUDA/OpenCL/HIP) available on this system");
     }
 
     private static bool AreClose(float expected, float actual, float tolerance = Tolerance)
@@ -648,7 +673,7 @@ public class GpuCpuConsistencyTests
     [SkippableFact]
     public void TensorLerp_GpuMatchesCpu()
     {
-        SkipIfNoGpu();
+        SkipIfNoDirectGpu();
 
         var random = new Random(42);
         const int size = 1000;
@@ -686,7 +711,7 @@ public class GpuCpuConsistencyTests
     [SkippableFact]
     public void TensorLerp_BoundaryInterpolation_GpuMatchesCpu()
     {
-        SkipIfNoGpu();
+        SkipIfNoDirectGpu();
 
         var a = new Tensor<float>(new[] { 4 });
         var b = new Tensor<float>(new[] { 4 });
@@ -719,7 +744,7 @@ public class GpuCpuConsistencyTests
     [SkippableFact]
     public void TensorAddScaled_GpuMatchesCpu()
     {
-        SkipIfNoGpu();
+        SkipIfNoDirectGpu();
 
         var random = new Random(42);
         const int size = 1000;
@@ -758,7 +783,7 @@ public class GpuCpuConsistencyTests
     [SkippableFact]
     public void TensorAddScaled_DiffusionNoiseMixing_GpuMatchesCpu()
     {
-        SkipIfNoGpu();
+        SkipIfNoDirectGpu();
 
         // Simulate diffusion noise mixing: alpha * signal + sigma * noise
         var random = new Random(123);
