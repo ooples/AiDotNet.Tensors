@@ -14,19 +14,26 @@ public sealed partial class WebGpuBackend
         IGpuBuffer output, IGpuBuffer? attentionWeights, IGpuBuffer? mask,
         int batch, int numHeads, int seqLen, int headDim, float scale, bool isCausal)
     {
-        // AttentionSource: binding(0)=query, binding(1)=key, binding(2)=value, binding(3)=output, binding(4)=uniform
-        // Uniform: batch_heads, seq_len, head_dim, pad
+        // AttentionSource: binding(0)=query, binding(1)=key, binding(2)=value, binding(3)=output,
+        // binding(4)=mask, binding(5)=uniform
+        // Uniform: batch_heads, seq_len, head_dim, is_causal, scale, has_mask, pad, pad
         int batchHeads = batch * numHeads;
+        bool hasMask = mask is not null;
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchHeads),
             BitConverter.Int32BitsToSingle(seqLen),
             BitConverter.Int32BitsToSingle(headDim),
-            0
+            BitConverter.Int32BitsToSingle(isCausal ? 1 : 0),
+            scale,
+            BitConverter.Int32BitsToSingle(hasMask ? 1 : 0),
+            0, 0
         };
         int totalElements = batchHeads * seqLen * headDim;
-        Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
-            query, key, value, output, uniforms, totalElements).GetAwaiter().GetResult();
+        // Use the mask buffer if provided, otherwise pass the shared dummy buffer for the binding slot
+        IGpuBuffer maskBuffer = mask ?? (IGpuBuffer)SharedDummyBuffer;
+        Dispatch5BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
+            query, key, value, output, maskBuffer, uniforms, totalElements).GetAwaiter().GetResult();
         // attentionWeights not produced by this kernel; fill with zeros if requested
         if (attentionWeights is not null)
             Fill(attentionWeights, 0f, batchHeads * seqLen * seqLen);
@@ -69,43 +76,32 @@ public sealed partial class WebGpuBackend
     {
         // Use the full sequence lengths: seqQ for queries, seqK for keys/values.
         // When seqQ == seqK, delegate to standard attention. When they differ,
-        // we must handle the asymmetric case. The current AttentionSource kernel
-        // assumes seqQ == seqK, so we use seqK as the shared dimension and
-        // dispatch over seqQ output positions.
-        // For the WebGPU fallback, use seqK as the KV dimension and dispatch
-        // the full output domain (batch * numHeads * seqQ * headDim).
+        // we must handle the asymmetric case.
         int batchHeads = batch * numHeads;
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batchHeads),
-            BitConverter.Int32BitsToSingle(seqQ),
-            BitConverter.Int32BitsToSingle(headDim),
-            0
-        };
         int totalElements = batchHeads * seqQ * headDim;
-        // When seqQ == seqK, use the standard kernel directly
+        // When seqQ == seqK, use the standard attention path
         if (seqQ == seqK)
         {
-            Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
-                query, key, value, output, uniforms, totalElements).GetAwaiter().GetResult();
+            ScaledDotProductAttention(query, key, value, output, null, attentionBias,
+                batch, numHeads, seqQ, headDim, scale, isCausal);
         }
         else
         {
-            // For asymmetric lengths, we must pad KV to seqQ or compute manually.
-            // Use the standard kernel with seqK for correct KV access.
-            // Re-interpret: set seq_len = seqK for the kernel's KV loop range.
+            // For asymmetric lengths, use seqK for the kernel's KV loop range.
             // The output still covers seqQ positions, so we dispatch over seqQ.
             var asymUniforms = new float[]
             {
                 BitConverter.Int32BitsToSingle(batchHeads),
                 BitConverter.Int32BitsToSingle(seqK),
                 BitConverter.Int32BitsToSingle(headDim),
-                0
+                BitConverter.Int32BitsToSingle(isCausal ? 1 : 0),
+                scale,
+                BitConverter.Int32BitsToSingle(attentionBias is not null ? 1 : 0),
+                0, 0
             };
-            // Dispatch: the kernel iterates k_pos up to seq_len (=seqK), outputs seqQ positions.
-            // We dispatch over the full Q output size.
-            Dispatch4BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
-                query, key, value, output, asymUniforms, totalElements).GetAwaiter().GetResult();
+            IGpuBuffer maskBuffer = attentionBias ?? (IGpuBuffer)SharedDummyBuffer;
+            Dispatch5BufferAsync("Attention", WebGpuKernels.AttentionSource, "scaled_dot_product_attention",
+                query, key, value, output, maskBuffer, asymUniforms, totalElements).GetAwaiter().GetResult();
         }
         // Fill softmaxStats with per-head logsumexp values (zeros for now, actual stats would require a separate kernel)
         Fill(softmaxStats, 0f, batch * numHeads * seqQ);

@@ -3394,14 +3394,19 @@ fn ftrl_update(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read> attn_mask: array<f32>;
 
 struct Params {
     batch_heads: u32,
     seq_len: u32,
     head_dim: u32,
-    _pad: u32,
+    is_causal: u32,
+    scale: f32,
+    has_mask: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn scaled_dot_product_attention(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -3411,9 +3416,10 @@ fn scaled_dot_product_attention(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = idx % params.head_dim;
     let q_pos = (idx / params.head_dim) % params.seq_len;
     let bh = idx / (params.head_dim * params.seq_len);
-    let scale = 1.0 / sqrt(f32(params.head_dim));
+    let scale = params.scale;
     let q_base = bh * params.seq_len * params.head_dim + q_pos * params.head_dim;
     let kv_base = bh * params.seq_len * params.head_dim;
+    let mask_base = bh * params.seq_len * params.seq_len + q_pos * params.seq_len;
     // Compute attention scores for this query position
     var max_score: f32 = -3.402823e+38;
     for (var k_pos: u32 = 0u; k_pos < params.seq_len; k_pos = k_pos + 1u) {
@@ -3421,7 +3427,16 @@ fn scaled_dot_product_attention(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i: u32 = 0u; i < params.head_dim; i = i + 1u) {
             dot = dot + query[q_base + i] * key[kv_base + k_pos * params.head_dim + i];
         }
-        max_score = max(max_score, dot * scale);
+        var score = dot * scale;
+        // Apply causal mask: positions where k_pos > q_pos are masked out
+        if (params.is_causal != 0u && k_pos > q_pos) {
+            score = -3.402823e+38;
+        }
+        // Apply additive mask if provided
+        if (params.has_mask != 0u) {
+            score = score + attn_mask[mask_base + k_pos];
+        }
+        max_score = max(max_score, score);
     }
     // Softmax and weighted sum
     var sum_exp: f32 = 0.0;
@@ -3431,7 +3446,14 @@ fn scaled_dot_product_attention(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i: u32 = 0u; i < params.head_dim; i = i + 1u) {
             dot = dot + query[q_base + i] * key[kv_base + k_pos * params.head_dim + i];
         }
-        let weight = exp(dot * scale - max_score);
+        var score = dot * scale;
+        if (params.is_causal != 0u && k_pos > q_pos) {
+            score = -3.402823e+38;
+        }
+        if (params.has_mask != 0u) {
+            score = score + attn_mask[mask_base + k_pos];
+        }
+        let weight = exp(score - max_score);
         sum_exp = sum_exp + weight;
         result = result + weight * value[kv_base + k_pos * params.head_dim + d];
     }
