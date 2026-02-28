@@ -220,33 +220,20 @@ public sealed partial class WebGpuBackend
     {
         // Deformable conv uses offsets to compute sampling positions with bilinear interpolation
         int hasMask = mask is not null ? 1 : 0;
-        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
-        IGpuBuffer maskBuf = mask is not null ? mask : dummyMask;
-        var uniforms = new float[]
+        WebGpuBuffer? dummyMask = null;
+        try
         {
-            BitConverter.Int32BitsToSingle(batch),
-            BitConverter.Int32BitsToSingle(inChannels),
-            BitConverter.Int32BitsToSingle(outChannels),
-            BitConverter.Int32BitsToSingle(inHeight),
-            BitConverter.Int32BitsToSingle(inWidth),
-            BitConverter.Int32BitsToSingle(outHeight),
-            BitConverter.Int32BitsToSingle(outWidth),
-            BitConverter.Int32BitsToSingle(kernelH),
-            BitConverter.Int32BitsToSingle(kernelW),
-            BitConverter.Int32BitsToSingle(strideH),
-            BitConverter.Int32BitsToSingle(strideW),
-            BitConverter.Int32BitsToSingle(padH),
-            BitConverter.Int32BitsToSingle(padW),
-            BitConverter.Int32BitsToSingle(dilationH),
-            BitConverter.Int32BitsToSingle(dilationW),
-            BitConverter.Int32BitsToSingle(deformGroups),
-            BitConverter.Int32BitsToSingle(hasMask),
-            0, 0, 0 // padding to 20 floats (80 bytes)
-        };
-        int total = batch * outChannels * outHeight * outWidth;
-        Dispatch5BufferAsync("DeformableConv2D", WebGpuKernels.DeformableConv2DSource,
-            "deformable_conv2d", input, weights, offsets, maskBuf, output,
-            uniforms, total).GetAwaiter().GetResult();
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int total = batch * outChannels * outHeight * outWidth;
+            Dispatch5BufferAsync("DeformableConv2D", WebGpuKernels.DeformableConv2DSource,
+                "deformable_conv2d", input, weights, offsets, maskBuf, output,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
@@ -257,7 +244,21 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        throw new NotSupportedException("DeformableConv2DBackwardInput is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
+        int hasMask = mask is not null ? 1 : 0;
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int total = batch * inChannels * inHeight * inWidth;
+            Dispatch5BufferAsync("DeformableConv2DBackwardInput", WebGpuKernels.DeformableConv2DBackwardInputSource,
+                "deformable_conv2d_backward_input", gradOutput, weights, offsets, maskBuf, gradInput,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -268,7 +269,22 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        throw new NotSupportedException("DeformableConv2DBackwardWeights is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
+        int hasMask = mask is not null ? 1 : 0;
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int inChannelsPerGroup = inChannels / groups;
+            int total = outChannels * inChannelsPerGroup * kernelH * kernelW;
+            Dispatch5BufferAsync("DeformableConv2DBackwardWeights", WebGpuKernels.DeformableConv2DBackwardWeightsSource,
+                "deformable_conv2d_backward_weights", gradOutput, input, offsets, maskBuf, gradWeights,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -279,7 +295,22 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        throw new NotSupportedException("DeformableConv2DBackwardOffset is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
+        int hasMask = mask is not null ? 1 : 0;
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int kernelSize = kernelH * kernelW;
+            int total = batch * deformGroups * 2 * kernelSize * outHeight * outWidth;
+            Dispatch6BufferAsync("DeformableConv2DBackwardOffset", WebGpuKernels.DeformableConv2DBackwardOffsetSource,
+                "deformable_conv2d_backward_offset", gradOutput, input, weights, offsets, maskBuf, gradOffsets,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -290,7 +321,13 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        throw new NotSupportedException("DeformableConv2DBackwardMask is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
+        var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, 0);
+        int kernelSize = kernelH * kernelW;
+        int total = batch * deformGroups * kernelSize * outHeight * outWidth;
+        Dispatch5BufferAsync("DeformableConv2DBackwardMask", WebGpuKernels.DeformableConv2DBackwardMaskSource,
+            "deformable_conv2d_backward_mask", gradOutput, input, weights, offsets, gradMask,
+            uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -630,7 +667,23 @@ public sealed partial class WebGpuBackend
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        throw new NotSupportedException("GridSampleBackward is not yet implemented for WebGPU. Use CPU engine for grid sample backward.");
+        // Zero-init gradInput before atomic scatter-add
+        Fill(gradInput, 0f, batch * channels * inHeight * inWidth);
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(paddingMode),
+            BitConverter.Int32BitsToSingle(alignCorners ? 1 : 0)
+        };
+        int total = batch * outHeight * outWidth;
+        Dispatch5BufferAsync("GridSampleBackward", WebGpuKernels.GridSampleBackwardSource,
+            "grid_sample_backward", gradOutput, input, grid, gradInput, gradGrid,
+            uniforms, total).GetAwaiter().GetResult();
     }
 
     #endregion
@@ -886,8 +939,8 @@ public sealed partial class WebGpuBackend
     public void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
         int batchSize, int normalizedSize, float epsilon)
     {
-        // RMSNormSource: binding(0)=input, binding(1)=gamma, binding(2)=output
-        // Uniform: batch_size, feature_size, epsilon (padded to 4 floats)
+        // RMSNormSource: binding(0)=input, binding(1)=gamma, binding(2)=output, binding(3)=saveRms
+        // Uniform at binding(4): batch_size, feature_size, epsilon (padded to 4 floats)
         // Dispatch: 1 workgroup per batch element
         var uniforms = new float[]
         {
@@ -896,10 +949,8 @@ public sealed partial class WebGpuBackend
             epsilon,
             0 // padding
         };
-        Dispatch3Buffer3DAsync("RMSNorm", WebGpuKernels.RMSNormSource, "rms_norm",
-            input, gamma, output, uniforms, batchSize, 1, 1).GetAwaiter().GetResult();
-        // saveRms not populated by GPU kernel; fill with zeros for compatibility
-        Fill(saveRms, 0f, batchSize);
+        Dispatch4Buffer3DAsync("RMSNorm", WebGpuKernels.RMSNormSource, "rms_norm",
+            input, gamma, output, saveRms, uniforms, batchSize, 1, 1).GetAwaiter().GetResult();
     }
 
     public void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -916,7 +967,15 @@ public sealed partial class WebGpuBackend
         int totalElements = batchSize * normalizedSize;
         Dispatch3BufferAsync("NormBackward", WebGpuKernels.NormBackwardSource, "rms_norm_backward",
             gradOutput, input, gradInput, uniforms, totalElements).GetAwaiter().GetResult();
-        Fill(gradGamma, 0f, normalizedSize);
+        // Compute gradGamma = sum_b(gradOutput[b,i] * input[b,i] / rms[b])
+        var gammaUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(normalizedSize),
+            0, 0
+        };
+        Dispatch4BufferAsync("RmsNormGradGamma", WebGpuKernels.RmsNormGradGammaSource, "rmsnorm_grad_gamma",
+            gradOutput, input, saveRms, gradGamma, gammaUniforms, normalizedSize).GetAwaiter().GetResult();
     }
 
     #endregion
