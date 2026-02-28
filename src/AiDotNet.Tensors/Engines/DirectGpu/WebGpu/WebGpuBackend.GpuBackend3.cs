@@ -115,8 +115,11 @@ public sealed partial class WebGpuBackend
     {
         // Delegate to the standard attention backward with seqQ as the shared length.
         // When seqQ != seqK, we use seqQ for the query gradient and seqK for KV gradients.
+        // Flash attention does not materialize attention weights, so pass a dummy buffer
+        // for the attentionWeights slot (the backward kernel recomputes weights internally).
         int seqLen = Math.Min(seqQ, seqK);
-        ScaledDotProductAttentionBackward(gradOutput, query, key, value, output, gradQuery, gradKey, gradValue,
+        IGpuBuffer dummyAttnWeights = SharedDummyBuffer;
+        ScaledDotProductAttentionBackward(gradOutput, query, key, value, dummyAttnWeights, gradQuery, gradKey, gradValue,
             batch, numHeads, seqLen, headDim, scale, isCausal);
         // Zero-fill any remaining elements if seqQ > seqK or vice versa
         if (seqQ > seqLen)
@@ -125,7 +128,7 @@ public sealed partial class WebGpuBackend
             if (extraQ > 0)
             {
                 Fill(gradQuery, 0f, batch * numHeads * seqQ * headDim);
-                ScaledDotProductAttentionBackward(gradOutput, query, key, value, output, gradQuery, gradKey, gradValue,
+                ScaledDotProductAttentionBackward(gradOutput, query, key, value, dummyAttnWeights, gradQuery, gradKey, gradValue,
                     batch, numHeads, seqLen, headDim, scale, isCausal);
             }
         }
