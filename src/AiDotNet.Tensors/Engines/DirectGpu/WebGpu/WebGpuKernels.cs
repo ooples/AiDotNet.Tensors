@@ -6091,6 +6091,41 @@ fn batch_norm_backward_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Packs per-channel stats from 5 separate GPU buffers into a single interleaved buffer
+    /// for BatchNorm backward pass 2. Layout: [gamma, mean, invVar, sumGrad, sumGradXhat] per channel.
+    /// Bindings: gamma(0), mean(1), invVar(2), gradBeta(3), gradGamma(4), packedOut(5=write)
+    /// Dispatched per channel (workSize = channels).
+    /// </summary>
+    public const string PackBatchNormStatsSource = @"
+@group(0) @binding(0) var<storage, read> gamma: array<f32>;
+@group(0) @binding(1) var<storage, read> mean_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> inv_var: array<f32>;
+@group(0) @binding(3) var<storage, read> sum_grad: array<f32>;
+@group(0) @binding(4) var<storage, read> sum_grad_xhat: array<f32>;
+@group(0) @binding(5) var<storage, read_write> packed_out: array<f32>;
+
+struct PackParams {
+    channels: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+@group(0) @binding(6) var<uniform> params: PackParams;
+
+@compute @workgroup_size(256)
+fn pack_bn_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= params.channels) { return; }
+    let base_idx = c * 5u;
+    packed_out[base_idx] = gamma[c];
+    packed_out[base_idx + 1u] = mean_buf[c];
+    packed_out[base_idx + 2u] = inv_var[c];
+    packed_out[base_idx + 3u] = sum_grad[c];
+    packed_out[base_idx + 4u] = sum_grad_xhat[c];
+}
+";
+
+    /// <summary>
     /// BatchNorm backward pass 2: compute gradInput using precomputed gradGamma and gradBeta.
     /// Uses a packed stats buffer: [gamma, mean, invVar, sumGrad, sumGradXhat] per channel (5 floats per channel).
     /// Bindings: gradOutput(0), input(1), packedStats(2), gradInput(3=write)
@@ -6978,7 +7013,7 @@ fn gru_cell_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
                LocallyConnectedConv2DBackwardWeightsSource +
                DeformableConv2DSource +
                ConvTranspose2DBackwardInputSource + ConvTranspose2DBackwardKernelSource +
-               BatchNormBackwardStatsSource + BatchNormBackwardDataSource +
+               BatchNormBackwardStatsSource + PackBatchNormStatsSource + BatchNormBackwardDataSource +
                AvgPoolCountPadSource + AvgPoolCountPadBackwardSource +
                Pool3DWithIndicesSource + GridSampleExtSource +
                LayerNormBackwardFullSource + AdaptiveAvgPool2DSource +

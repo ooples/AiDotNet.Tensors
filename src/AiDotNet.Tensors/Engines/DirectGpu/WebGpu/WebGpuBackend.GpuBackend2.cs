@@ -161,17 +161,8 @@ public sealed partial class WebGpuBackend
             "locally_connected_conv2d", input, weights, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
         if (bias is not null)
         {
-            // Add bias per output channel
-            int spatial = outHeight * outWidth;
-            var biasUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(outChannels),
-                BitConverter.Int32BitsToSingle(spatial),
-                0
-            };
-            Dispatch2BufferAsync("BiasGrad", WebGpuKernels.BiasGradSource, "bias_grad",
-                output, bias, biasUniforms, outChannels).GetAwaiter().GetResult();
+            // Add bias per output channel using Conv2DBiasAdd kernel (output[idx] += bias[channel])
+            Conv2DBiasAdd(output, bias, batch, outChannels, outHeight * outWidth);
         }
     }
 
@@ -710,26 +701,20 @@ public sealed partial class WebGpuBackend
             gradOutput, input, saveMean, saveInvVar, gradGamma, gradBeta,
             statsUniforms, channels).GetAwaiter().GetResult();
 
-        // Pass 2: Compute gradInput per element using packed per-channel stats
+        // Pass 2: Pack per-channel stats on GPU, then compute gradInput per element.
         // Pack [gamma, mean, invVar, sumGrad, sumGradXhat] per channel (5 floats per channel)
-        var gammaData = DownloadBufferData(gamma);
-        var meanData = DownloadBufferData(saveMean);
-        var invVarData = DownloadBufferData(saveInvVar);
-        var sumGradData = DownloadBufferData(gradGamma);     // gradGamma holds sum_grad_xhat after Pass 1
-        var sumGradBetaData = DownloadBufferData(gradBeta);  // gradBeta holds sum_grad after Pass 1
-
-        var packedData = new float[channels * 5];
-        for (int c = 0; c < channels; c++)
+        // entirely on GPU to avoid 5 synchronous CPU downloads.
+        using var packedStats = (WebGpuBuffer)AllocateBuffer(channels * 5);
+        var packUniforms = new float[]
         {
-            int baseIdx = c * 5;
-            packedData[baseIdx] = gammaData[c];
-            packedData[baseIdx + 1] = meanData[c];
-            packedData[baseIdx + 2] = invVarData[c];
-            packedData[baseIdx + 3] = sumGradBetaData[c];  // sum_grad (gradBeta from pass 1)
-            packedData[baseIdx + 4] = sumGradData[c];       // sum_grad_xhat (gradGamma from pass 1)
-        }
-
-        using var packedStats = (WebGpuBuffer)AllocateBuffer(packedData);
+            BitConverter.Int32BitsToSingle(channels),
+            0, 0, 0 // _pad
+        };
+        // gamma(0), saveMean(1), saveInvVar(2), gradBeta=sum_grad(3), gradGamma=sum_grad_xhat(4), packedOut(5=write)
+        Dispatch6BufferAsync("PackBatchNormStats", WebGpuKernels.PackBatchNormStatsSource,
+            "pack_bn_stats",
+            gamma, saveMean, saveInvVar, gradBeta, gradGamma, packedStats,
+            packUniforms, channels).GetAwaiter().GetResult();
 
         // Bindings: gradOutput(0), input(1), packedStats(2), gradInput(3=rw) + uniform
         var dataUniforms = new float[]
