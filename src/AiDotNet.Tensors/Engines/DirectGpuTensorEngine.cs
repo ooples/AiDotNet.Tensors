@@ -74,7 +74,7 @@ internal sealed class ActivationCacheEntry : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -9741,7 +9741,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     #region Tensor-Level Activation GPU Dispatch
 
-    Tensor<T> IEngine.TensorSigmoid<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorSigmoid<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9754,7 +9754,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorReLU<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorReLU<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9767,7 +9767,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorGELU<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorGELU<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9780,7 +9780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorSiLU<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9793,7 +9793,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorTanh<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorTanh<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9806,7 +9806,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
+    public override Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (!TryGetBackend(out var backend))
             return base.TensorLeakyReLU(tensor, alpha);
@@ -9827,7 +9827,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorMish<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9840,7 +9840,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
+    public override Tensor<T> TensorHardSwish<T>(Tensor<T> tensor)
     {
         try
         {
@@ -9857,7 +9857,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
 
     #region Tensor-Level Composite GPU Dispatch
 
-    Tensor<T> IEngine.TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
+    public override Tensor<T> TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
     {
         // Single fused GPU kernel: output[i] = a[i] + t * (b[i] - a[i])
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
@@ -9883,7 +9883,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
+    public override Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
     {
         // Single fused GPU kernel: output[i] = scaleA * a[i] + scaleB * b[i]
         if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape, b.Shape))
@@ -9910,19 +9910,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, IEngine, IDisposable
         }
     }
 
-    Tensor<T> IEngine.TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    public override Tensor<T> TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
     {
         // GPU dispatch already handled by the existing MaxPool2D method override
         return MaxPool2D(input, poolSize, stride, padding);
     }
 
-    Tensor<T> IEngine.TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    public override Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
     {
         // GPU dispatch already handled by the existing AvgPool2D method override
         return AvgPool2D(input, poolSize, stride, padding);
     }
 
-    Tensor<T> IEngine.TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
+    public override Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
         // GPU dispatch handled by FusedConv2D which already has GPU acceleration
         return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);

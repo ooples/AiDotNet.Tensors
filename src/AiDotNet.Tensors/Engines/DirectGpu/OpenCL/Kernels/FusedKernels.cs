@@ -704,7 +704,7 @@ __kernel void add_scaled(
 // REDUCTION KERNELS
 // ===========================================================================
 
-// Parallel sum reduction using local memory
+// Parallel sum reduction using dynamic local memory
 __kernel void reduce_sum_local(
     __global const float* input,
     __global float* partialSums,

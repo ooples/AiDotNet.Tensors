@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe class VulkanBackend : IDisposable
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 {
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -57,14 +57,42 @@ public sealed unsafe class VulkanBackend : IDisposable
     public bool IsAvailable => _initialized && !_disposed;
 
     /// <summary>
+    /// Gets the backend name.
+    /// </summary>
+    public string BackendName => "Vulkan";
+
+    /// <summary>
     /// Gets the device name.
     /// </summary>
     public string DeviceName => _device.DeviceName;
 
     /// <summary>
-    /// Gets the vendor name.
+    /// Gets the GPU vendor (AMD, NVIDIA, Intel).
+    /// Required by <see cref="IDirectGpuBackend"/>.
+    /// </summary>
+    public string DeviceVendor => _device.VendorName;
+
+    /// <summary>
+    /// Gets the GPU vendor name (convenience alias for <see cref="DeviceVendor"/>).
     /// </summary>
     public string VendorName => _device.VendorName;
+
+    /// <summary>
+    /// Gets the number of compute units. Returns the maximum workgroup invocations,
+    /// which is the closest Vulkan equivalent to OpenCL's CL_DEVICE_MAX_COMPUTE_UNITS.
+    /// </summary>
+    public int ComputeUnits => (int)_device.Limits.maxComputeWorkGroupInvocations;
+
+    /// <summary>
+    /// Gets the total device-local (global) memory in bytes.
+    /// Sums all device-local memory heaps instead of using MaxStorageBufferRange.
+    /// </summary>
+    public long GlobalMemoryBytes => _device.TotalDeviceLocalMemoryBytes;
+
+    /// <summary>
+    /// Gets the local (shared) memory per workgroup in bytes.
+    /// </summary>
+    public long LocalMemoryBytes => _device.MaxSharedMemorySize;
 
     /// <summary>
     /// Gets the maximum workgroup size.
@@ -231,7 +259,9 @@ public sealed unsafe class VulkanBackend : IDisposable
         // Upload data
         stagingA.WriteData(a);
         stagingB.WriteData(b);
-        _transfer!.CopyToDevice(stagingA, bufferA);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        _transfer.CopyToDevice(stagingA, bufferA);
         _transfer.CopyToDevice(stagingB, bufferB);
 
         // Get or create pipeline
@@ -291,7 +321,9 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Upload data
         stagingA.WriteData(input);
-        _transfer!.CopyToDevice(stagingA, bufferA);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        _transfer.CopyToDevice(stagingA, bufferA);
 
         // Get or create pipeline
         var pipeline = GetOrCreatePipeline(kernelType, 2, sizeof(uint));
@@ -350,7 +382,9 @@ public sealed unsafe class VulkanBackend : IDisposable
 
         // Upload data
         stagingA.WriteData(input);
-        _transfer!.CopyToDevice(stagingA, bufferA);
+        if (_transfer is null)
+            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+        _transfer.CopyToDevice(stagingA, bufferA);
 
         // Get or create pipeline (push constants: uint size, float scalar)
         var pipeline = GetOrCreatePipeline(VulkanKernelType.ScalarMultiply, 2, sizeof(uint) + sizeof(float));

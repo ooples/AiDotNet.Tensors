@@ -6741,3 +6741,11 @@ public interface IEngine
 
     #endregion
 }
+
+/// <summary>
+/// Marker interface retained for backward compatibility. All tensor-level operations
+/// are now part of <see cref="IEngine"/> directly.
+/// </summary>
+public interface ITensorLevelEngine : IEngine
+{
+}

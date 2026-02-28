@@ -7892,6 +7892,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
         {
+            if (size <= 0) return;
             var k = _kernelCache["fma"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -7900,20 +7901,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)D).Buffer.Handle);
             k.SetArg(arg++, size);
 
-            k.Execute1D(size, Math.Min(256, size));
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
         {
-            if (size <= 0)
-                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
-            if (a.Size < size)
-                throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
-            if (b.Size < size)
-                throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
-            if (output.Size < size)
-                throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
-
+            if (size <= 0) return;
             var k = _kernelCache["lerp_fused"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7922,21 +7916,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, t);
             k.SetArg(arg++, size);
 
-            int lerpLocalSize = CalculateOptimalWorkGroupSize1D(size);
-            k.Execute1D(size, lerpLocalSize);
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
         {
-            if (size <= 0)
-                throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
-            if (a.Size < size)
-                throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
-            if (b.Size < size)
-                throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
-            if (output.Size < size)
-                throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
-
+            if (size <= 0) return;
             var k = _kernelCache["add_scaled"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -7946,8 +7932,8 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, scaleB);
             k.SetArg(arg++, size);
 
-            int addScaledLocalSize = CalculateOptimalWorkGroupSize1D(size);
-            k.Execute1D(size, addScaledLocalSize);
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            k.Execute1D(size, localSize);
         }
 
         public float StdDev(IGpuBuffer input, int size)
@@ -7988,7 +7974,7 @@ KERNEL VARIANTS (A/B testing):
                 for (int i = 0; i < partials.Length; i++)
                     varianceSum += partials[i];
 
-                // Clamp variance to avoid NaN from floating-point round-off
+                // Clamp variance to zero before sqrt to handle floating-point roundoff
                 float gpuVariance = Math.Max(0, varianceSum / size);
                 return MathF.Sqrt(gpuVariance);
             }
@@ -8002,9 +7988,9 @@ KERNEL VARIANTS (A/B testing):
                 varSum += diff * diff;
             }
 
-            // Clamp variance to avoid NaN from floating-point round-off
-            float cpuVariance = Math.Max(0, varSum / size);
-            return MathF.Sqrt(cpuVariance);
+            // Clamp variance to zero before sqrt to handle floating-point roundoff
+            float variance = Math.Max(0, varSum / size);
+            return MathF.Sqrt(variance);
         }
 
         public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
