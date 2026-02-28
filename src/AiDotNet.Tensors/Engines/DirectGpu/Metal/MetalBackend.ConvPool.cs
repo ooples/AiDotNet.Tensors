@@ -376,11 +376,66 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        throw new NotSupportedException("DeformableConv2D is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
+        var inputData = DownloadBuffer(input);
+        var weightsData = DownloadBuffer(weights);
+        var offsetsData = DownloadBuffer(offsets);
+        float[]? maskData = mask is not null ? DownloadBuffer(mask) : null;
+        var result = new float[batch * outChannels * outHeight * outWidth];
+        int inChannelsPerGroup = inChannels / groups;
+        int kernelSize = kernelH * kernelW;
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int oc = 0; oc < outChannels; oc++)
+            {
+                int dg = oc / (outChannels / deformGroups);
+                for (int oh = 0; oh < outHeight; oh++)
+                {
+                    for (int ow = 0; ow < outWidth; ow++)
+                    {
+                        float sum = 0;
+                        int g = oc / (outChannels / groups);
+                        for (int ic = 0; ic < inChannelsPerGroup; ic++)
+                        {
+                            int actualIC = g * inChannelsPerGroup + ic;
+                            for (int kh = 0; kh < kernelH; kh++)
+                            {
+                                for (int kw = 0; kw < kernelW; kw++)
+                                {
+                                    int kIdx = kh * kernelW + kw;
+                                    int offBase = ((b * deformGroups + dg) * 2 * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                    int offBaseY = ((b * deformGroups + dg) * 2 * kernelSize + kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                    float offH = offsetsData[offBase];
+                                    float offW = offsetsData[offBaseY];
+
+                                    float h = oh * strideH - padH + kh * dilationH + offH;
+                                    float w = ow * strideW - padW + kw * dilationW + offW;
+
+                                    float val = BilinearSample(inputData, b, actualIC, h, w, inHeight, inWidth, inChannels);
+
+                                    if (maskData is not null)
+                                    {
+                                        int mIdx = ((b * deformGroups + dg) * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                        val *= maskData[mIdx];
+                                    }
+
+                                    int wIdx = ((oc * inChannelsPerGroup + ic) * kernelH + kh) * kernelW + kw;
+                                    sum += val * weightsData[wIdx];
+                                }
+                            }
+                        }
+                        result[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+                    }
+                }
+            }
+        }
+        UploadToBuffer(output, result);
     }
 
     /// <summary>
-    /// Deformable Conv2D backward for input.
+    /// Deformable Conv2D backward for input gradients.
+    /// Each input pixel accumulates gradients from all output positions that sampled it
+    /// via bilinear interpolation with learned offsets.
     /// </summary>
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
         int batch, int inChannels, int inHeight, int inWidth,
@@ -391,11 +446,84 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        throw new NotSupportedException("DeformableConv2DBackwardInput is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
+        var gradOutputData = DownloadBuffer(gradOutput);
+        var weightsData = DownloadBuffer(weights);
+        var offsetsData = DownloadBuffer(offsets);
+        float[]? maskData = mask is not null ? DownloadBuffer(mask) : null;
+        var gradInputData = new float[batch * inChannels * inHeight * inWidth];
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int kernelSize = kernelH * kernelW;
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int ic = 0; ic < inChannels; ic++)
+            {
+                int g = ic / inChannelsPerGroup;
+                int icLocal = ic - g * inChannelsPerGroup;
+                for (int ih = 0; ih < inHeight; ih++)
+                {
+                    for (int iw = 0; iw < inWidth; iw++)
+                    {
+                        float sumGrad = 0;
+                        for (int ocOff = 0; ocOff < outChannelsPerGroup; ocOff++)
+                        {
+                            int oc = g * outChannelsPerGroup + ocOff;
+                            int dg = oc / (outChannels / deformGroups);
+                            for (int oh = 0; oh < outHeight; oh++)
+                            {
+                                for (int ow = 0; ow < outWidth; ow++)
+                                {
+                                    for (int kh = 0; kh < kernelH; kh++)
+                                    {
+                                        for (int kw = 0; kw < kernelW; kw++)
+                                        {
+                                            int kIdx = kh * kernelW + kw;
+                                            int offIdx = ((b * deformGroups + dg) * 2 * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                            int offIdxY = ((b * deformGroups + dg) * 2 * kernelSize + kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                            float h = oh * strideH - padH + kh * dilationH + offsetsData[offIdx];
+                                            float w = ow * strideW - padW + kw * dilationW + offsetsData[offIdxY];
+
+                                            int hLow = (int)MathF.Floor(h);
+                                            int wLow = (int)MathF.Floor(w);
+                                            float lh = h - hLow;
+                                            float lw = w - wLow;
+
+                                            float wc = 0;
+                                            if (ih == hLow && iw == wLow) wc = (1 - lh) * (1 - lw);
+                                            else if (ih == hLow && iw == wLow + 1) wc = (1 - lh) * lw;
+                                            else if (ih == hLow + 1 && iw == wLow) wc = lh * (1 - lw);
+                                            else if (ih == hLow + 1 && iw == wLow + 1) wc = lh * lw;
+                                            else continue;
+
+                                            float goVal = gradOutputData[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                                            int wIdx = ((oc * inChannelsPerGroup + icLocal) * kernelH + kh) * kernelW + kw;
+                                            float contrib = goVal * weightsData[wIdx] * wc;
+
+                                            if (maskData is not null)
+                                            {
+                                                int mIdx = ((b * deformGroups + dg) * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                                contrib *= maskData[mIdx];
+                                            }
+                                            sumGrad += contrib;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        int idx = ((b * inChannels + ic) * inHeight + ih) * inWidth + iw;
+                        gradInputData[idx] = sumGrad;
+                    }
+                }
+            }
+        }
+        UploadToBuffer(gradInput, gradInputData);
     }
 
     /// <summary>
-    /// Deformable Conv2D backward for weights.
+    /// Deformable Conv2D backward for weight gradients.
+    /// Each weight element accumulates gradients from all batch and spatial positions
+    /// using bilinear-interpolated input samples.
     /// </summary>
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
         int batch, int inChannels, int inHeight, int inWidth,
@@ -406,11 +534,63 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        throw new NotSupportedException("DeformableConv2DBackwardWeights is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
+        var gradOutputData = DownloadBuffer(gradOutput);
+        var inputData = DownloadBuffer(input);
+        var offsetsData = DownloadBuffer(offsets);
+        float[]? maskData = mask is not null ? DownloadBuffer(mask) : null;
+        int inChannelsPerGroup = inChannels / groups;
+        var gradWeightsData = new float[outChannels * inChannelsPerGroup * kernelH * kernelW];
+        int kernelSize = kernelH * kernelW;
+
+        for (int oc = 0; oc < outChannels; oc++)
+        {
+            int g = oc / (outChannels / groups);
+            int dg = oc / (outChannels / deformGroups);
+            for (int icLocal = 0; icLocal < inChannelsPerGroup; icLocal++)
+            {
+                int ic = g * inChannelsPerGroup + icLocal;
+                for (int kh = 0; kh < kernelH; kh++)
+                {
+                    for (int kw = 0; kw < kernelW; kw++)
+                    {
+                        int kIdx = kh * kernelW + kw;
+                        float sumGrad = 0;
+                        for (int b = 0; b < batch; b++)
+                        {
+                            for (int oh = 0; oh < outHeight; oh++)
+                            {
+                                for (int ow = 0; ow < outWidth; ow++)
+                                {
+                                    int offIdx = ((b * deformGroups + dg) * 2 * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                    int offIdxY = ((b * deformGroups + dg) * 2 * kernelSize + kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                    float h = oh * strideH - padH + kh * dilationH + offsetsData[offIdx];
+                                    float w = ow * strideW - padW + kw * dilationW + offsetsData[offIdxY];
+
+                                    float inputVal = BilinearSample(inputData, b, ic, h, w, inHeight, inWidth, inChannels);
+
+                                    if (maskData is not null)
+                                    {
+                                        int mIdx = ((b * deformGroups + dg) * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                                        inputVal *= maskData[mIdx];
+                                    }
+
+                                    float goVal = gradOutputData[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                                    sumGrad += goVal * inputVal;
+                                }
+                            }
+                        }
+                        int wIdx = ((oc * inChannelsPerGroup + icLocal) * kernelH + kh) * kernelW + kw;
+                        gradWeightsData[wIdx] = sumGrad;
+                    }
+                }
+            }
+        }
+        UploadToBuffer(gradWeights, gradWeightsData);
     }
 
     /// <summary>
-    /// Deformable Conv2D backward for offsets.
+    /// Deformable Conv2D backward for offset gradients.
+    /// Computes gradients through the bilinear interpolation with respect to the spatial offsets.
     /// </summary>
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
         int batch, int inChannels, int inHeight, int inWidth,
@@ -421,11 +601,98 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        throw new NotSupportedException("DeformableConv2DBackwardOffset is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
+        var gradOutputData = DownloadBuffer(gradOutput);
+        var inputData = DownloadBuffer(input);
+        var weightsData = DownloadBuffer(weights);
+        var offsetsData = DownloadBuffer(offsets);
+        float[]? maskData = mask is not null ? DownloadBuffer(mask) : null;
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int kernelSize = kernelH * kernelW;
+        int totalOffsets = batch * deformGroups * 2 * kernelSize * outHeight * outWidth;
+        var gradOffsetsData = new float[totalOffsets];
+
+        for (int idx = 0; idx < totalOffsets; idx++)
+        {
+            int ow = idx % outWidth;
+            int oh = (idx / outWidth) % outHeight;
+            int offsetComp = (idx / (outWidth * outHeight)) % (2 * kernelSize);
+            int dg = (idx / (outWidth * outHeight * 2 * kernelSize)) % deformGroups;
+            int b = idx / (outWidth * outHeight * 2 * kernelSize * deformGroups);
+
+            int isYOffset = offsetComp >= kernelSize ? 1 : 0;
+            int kIdx = offsetComp % kernelSize;
+            int kh = kIdx / kernelW;
+            int kw = kIdx % kernelW;
+
+            int offIdxX = ((b * deformGroups + dg) * 2 * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+            int offIdxY = ((b * deformGroups + dg) * 2 * kernelSize + kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+            float offsetH = offsetsData[offIdxX];
+            float offsetW = offsetsData[offIdxY];
+
+            float h = oh * strideH - padH + kh * dilationH + offsetH;
+            float w = ow * strideW - padW + kw * dilationW + offsetW;
+
+            int hLow = (int)MathF.Floor(h);
+            int wLow = (int)MathF.Floor(w);
+            int hHigh = hLow + 1;
+            int wHigh = wLow + 1;
+            float lh = h - hLow;
+            float lw = w - wLow;
+
+            float sumGrad = 0;
+            int outChPerDg = outChannels / deformGroups;
+
+            for (int ocOff = 0; ocOff < outChPerDg; ocOff++)
+            {
+                int oc = dg * outChPerDg + ocOff;
+                int g = oc / outChannelsPerGroup;
+
+                float goVal = gradOutputData[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+
+                if (maskData is not null)
+                {
+                    int mIdx = ((b * deformGroups + dg) * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+                    goVal *= maskData[mIdx];
+                }
+
+                for (int icOff = 0; icOff < inChannelsPerGroup; icOff++)
+                {
+                    int ic = g * inChannelsPerGroup + icOff;
+                    int wIdx = ((oc * inChannelsPerGroup + icOff) * kernelH + kh) * kernelW + kw;
+                    float weightVal = weightsData[wIdx];
+
+                    int inBase = (b * inChannels + ic) * inHeight * inWidth;
+                    float v00 = 0, v01 = 0, v10 = 0, v11 = 0;
+                    if (hLow >= 0 && hLow < inHeight && wLow >= 0 && wLow < inWidth)
+                        v00 = inputData[inBase + hLow * inWidth + wLow];
+                    if (hLow >= 0 && hLow < inHeight && wHigh >= 0 && wHigh < inWidth)
+                        v01 = inputData[inBase + hLow * inWidth + wHigh];
+                    if (hHigh >= 0 && hHigh < inHeight && wLow >= 0 && wLow < inWidth)
+                        v10 = inputData[inBase + hHigh * inWidth + wLow];
+                    if (hHigh >= 0 && hHigh < inHeight && wHigh >= 0 && wHigh < inWidth)
+                        v11 = inputData[inBase + hHigh * inWidth + wHigh];
+
+                    if (isYOffset == 0)
+                    {
+                        float gradH = (1 - lw) * (v10 - v00) + lw * (v11 - v01);
+                        sumGrad += goVal * weightVal * gradH;
+                    }
+                    else
+                    {
+                        float gradW = (1 - lh) * (v01 - v00) + lh * (v11 - v10);
+                        sumGrad += goVal * weightVal * gradW;
+                    }
+                }
+            }
+            gradOffsetsData[idx] = sumGrad;
+        }
+        UploadToBuffer(gradOffsets, gradOffsetsData);
     }
 
     /// <summary>
-    /// Deformable Conv2D backward for mask (DCNv2).
+    /// Deformable Conv2D backward for mask gradients (DCNv2).
+    /// Computes how each modulation mask value affects the output loss.
     /// </summary>
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
         int batch, int inChannels, int inHeight, int inWidth,
@@ -436,7 +703,53 @@ public sealed partial class MetalBackend
         int groups, int deformGroups)
     {
         ThrowIfDisposed();
-        throw new NotSupportedException("DeformableConv2DBackwardMask is not yet implemented for the Metal backend. Use the CPU engine as a fallback.");
+        var gradOutputData = DownloadBuffer(gradOutput);
+        var inputData = DownloadBuffer(input);
+        var weightsData = DownloadBuffer(weights);
+        var offsetsData = DownloadBuffer(offsets);
+        int inChannelsPerGroup = inChannels / groups;
+        int outChannelsPerGroup = outChannels / groups;
+        int kernelSize = kernelH * kernelW;
+        int totalMask = batch * deformGroups * kernelSize * outHeight * outWidth;
+        var gradMaskData = new float[totalMask];
+
+        for (int idx = 0; idx < totalMask; idx++)
+        {
+            int ow = idx % outWidth;
+            int oh = (idx / outWidth) % outHeight;
+            int kIdx = (idx / (outWidth * outHeight)) % kernelSize;
+            int dg = (idx / (outWidth * outHeight * kernelSize)) % deformGroups;
+            int b = idx / (outWidth * outHeight * kernelSize * deformGroups);
+
+            int kh = kIdx / kernelW;
+            int kw = kIdx % kernelW;
+
+            int offIdxX = ((b * deformGroups + dg) * 2 * kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+            int offIdxY = ((b * deformGroups + dg) * 2 * kernelSize + kernelSize + kIdx) * outHeight * outWidth + oh * outWidth + ow;
+            float h = oh * strideH - padH + kh * dilationH + offsetsData[offIdxX];
+            float w = ow * strideW - padW + kw * dilationW + offsetsData[offIdxY];
+
+            float sumGrad = 0;
+            int outChPerDg = outChannels / deformGroups;
+
+            for (int ocOff = 0; ocOff < outChPerDg; ocOff++)
+            {
+                int oc = dg * outChPerDg + ocOff;
+                int g = oc / outChannelsPerGroup;
+                float goVal = gradOutputData[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+
+                for (int icOff = 0; icOff < inChannelsPerGroup; icOff++)
+                {
+                    int ic = g * inChannelsPerGroup + icOff;
+                    int wIdx = ((oc * inChannelsPerGroup + icOff) * kernelH + kh) * kernelW + kw;
+                    float weightVal = weightsData[wIdx];
+                    float inputVal = BilinearSample(inputData, b, ic, h, w, inHeight, inWidth, inChannels);
+                    sumGrad += goVal * weightVal * inputVal;
+                }
+            }
+            gradMaskData[idx] = sumGrad;
+        }
+        UploadToBuffer(gradMask, gradMaskData);
     }
 
     #endregion
@@ -898,6 +1211,38 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         throw new NotSupportedException("MaxPool3DBackward is not yet implemented in the Metal backend. Use MaxPool2DBackward or implement a CPU fallback.");
+    }
+
+    #endregion
+
+    #region Bilinear Sampling Helper
+
+    private static float BilinearSample(float[] input, int b, int c, float h, float w,
+        int inHeight, int inWidth, int inChannels)
+    {
+        int hLow = (int)MathF.Floor(h);
+        int wLow = (int)MathF.Floor(w);
+        int hHigh = hLow + 1;
+        int wHigh = wLow + 1;
+
+        float lh = h - hLow;
+        float lw = w - wLow;
+        float hh = 1.0f - lh;
+        float hw = 1.0f - lw;
+
+        float v1 = 0, v2 = 0, v3 = 0, v4 = 0;
+        int baseIdx = (b * inChannels + c) * inHeight * inWidth;
+
+        if (hLow >= 0 && hLow < inHeight && wLow >= 0 && wLow < inWidth)
+            v1 = input[baseIdx + hLow * inWidth + wLow];
+        if (hLow >= 0 && hLow < inHeight && wHigh >= 0 && wHigh < inWidth)
+            v2 = input[baseIdx + hLow * inWidth + wHigh];
+        if (hHigh >= 0 && hHigh < inHeight && wLow >= 0 && wLow < inWidth)
+            v3 = input[baseIdx + hHigh * inWidth + wLow];
+        if (hHigh >= 0 && hHigh < inHeight && wHigh >= 0 && wHigh < inWidth)
+            v4 = input[baseIdx + hHigh * inWidth + wHigh];
+
+        return hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
     }
 
     #endregion
