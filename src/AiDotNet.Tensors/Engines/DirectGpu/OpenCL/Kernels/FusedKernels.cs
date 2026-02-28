@@ -708,9 +708,9 @@ __kernel void add_scaled(
 __kernel void reduce_sum_local(
     __global const float* input,
     __global float* partialSums,
+    __local float* sdata,
     const int size)
 {
-    __local float sdata[256];
     const int tid = get_local_id(0);
     const int gid = get_global_id(0);
 
@@ -737,10 +737,10 @@ __kernel void reduce_sum_local(
 __kernel void reduce_variance_local(
     __global const float* input,
     __global float* partialSums,
+    __local float* sdata,
     const float mean,
     const int size)
 {
-    __local float sdata[256];
     const int tid = get_local_id(0);
     const int gid = get_global_id(0);
 

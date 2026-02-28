@@ -7974,8 +7974,9 @@ KERNEL VARIANTS (A/B testing):
 
                 varKernel.SetArg(0, bufferA.Handle);
                 varKernel.SetArg(1, partial.Handle);
-                varKernel.SetArg(2, mean);
-                varKernel.SetArg(3, size);
+                varKernel.SetLocalArg(2, localSize * sizeof(float));
+                varKernel.SetArg(3, mean);
+                varKernel.SetArg(4, size);
 
                 varKernel.Execute1D(size, localSize);
 
