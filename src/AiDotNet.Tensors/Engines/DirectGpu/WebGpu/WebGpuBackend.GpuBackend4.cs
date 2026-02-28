@@ -783,9 +783,11 @@ public sealed partial class WebGpuBackend
         Fill(gradH, 0f, cellTotal);
         Fill(gradC, 0f, cellTotal);
 
-        // Download weights for CPU-side gradient accumulation
+        // Download weights and cell states once for CPU-side gradient accumulation
+        // (allC is not mutated during backward, so download it once outside the loop)
         var wihData = DownloadBufferData(weightsIh);
         var whhData = DownloadBufferData(weightsHh);
+        var allCData = DownloadBufferData(allC);
 
         // Iterate backwards through time
         for (int t = seqLen - 1; t >= 0; t--)
@@ -819,9 +821,6 @@ public sealed partial class WebGpuBackend
             var hData = DownloadBufferData(gradH);
             var cData = DownloadBufferData(gradC);
             var cPrevData = DownloadBufferData(cPrev);
-
-            // Get current cell state
-            var allCData = DownloadBufferData(allC);
 
             // Recompute gates for this timestep from allH, allC, input
             // h_prev for this timestep

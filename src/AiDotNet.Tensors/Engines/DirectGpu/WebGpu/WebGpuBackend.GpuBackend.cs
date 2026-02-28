@@ -249,7 +249,31 @@ public sealed partial class WebGpuBackend
 
     public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
-        Fill(gradInput, 0f, numCapsules * capsuleDim);
+        // CPU fallback: compute squash Jacobian and propagate gradients
+        var goData = DownloadBufferData(gradOutput);
+        var inData = DownloadBufferData(input);
+        var giData = new float[numCapsules * capsuleDim];
+        for (int c = 0; c < numCapsules; c++)
+        {
+            int off = c * capsuleDim;
+            float sqNorm = 0;
+            for (int d = 0; d < capsuleDim; d++)
+                sqNorm += inData[off + d] * inData[off + d];
+            float norm = MathF.Sqrt(sqNorm + epsilon);
+            float scale = sqNorm / ((1 + sqNorm) * norm);
+            float dscale = 1f / ((1 + sqNorm) * (1 + sqNorm) * norm);
+            for (int d = 0; d < capsuleDim; d++)
+            {
+                float gi = 0;
+                for (int k = 0; k < capsuleDim; k++)
+                {
+                    float jac = (d == k ? scale : 0f) - dscale * inData[off + d] * inData[off + k];
+                    gi += jac * goData[off + k];
+                }
+                giData[off + d] = gi;
+            }
+        }
+        UploadToBuffer(giData, gradInput);
     }
 
     public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,

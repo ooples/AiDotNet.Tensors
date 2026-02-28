@@ -257,7 +257,7 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Fill(gradInput, 0f, batch * inChannels * inHeight * inWidth);
+        throw new NotSupportedException("DeformableConv2DBackwardInput is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -268,7 +268,7 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Fill(gradWeights, 0f, outChannels * inChannels * kernelH * kernelW);
+        throw new NotSupportedException("DeformableConv2DBackwardWeights is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -279,7 +279,7 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Fill(gradOffsets, 0f, batch * deformGroups * 2 * kernelH * kernelW * outHeight * outWidth);
+        throw new NotSupportedException("DeformableConv2DBackwardOffset is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -290,7 +290,7 @@ public sealed partial class WebGpuBackend
         int dilationH, int dilationW,
         int groups, int deformGroups)
     {
-        Fill(gradMask, 0f, batch * deformGroups * kernelH * kernelW * outHeight * outWidth);
+        throw new NotSupportedException("DeformableConv2DBackwardMask is not yet implemented for WebGPU. Use CPU engine for deformable conv backward.");
     }
 
     #endregion
@@ -515,7 +515,23 @@ public sealed partial class WebGpuBackend
         int inDepth, int inHeight, int inWidth,
         int outDepth, int outHeight, int outWidth)
     {
-        Fill(gradInput, 0f, batch * channels * inDepth * inHeight * inWidth);
+        // CPU scatter fallback: scatter gradients back to max locations
+        int inSpatial = inDepth * inHeight * inWidth;
+        int outSpatial = outDepth * outHeight * outWidth;
+        var goData = DownloadBufferData(gradOutput);
+        var idxData = DownloadBufferData(indices);
+        var giData = new float[batch * channels * inSpatial];
+        for (int bc = 0; bc < batch * channels; bc++)
+        {
+            for (int o = 0; o < outSpatial; o++)
+            {
+                int outIdx = bc * outSpatial + o;
+                int maxIdx = BitConverter.SingleToInt32Bits(idxData[outIdx]);
+                if ((uint)maxIdx < (uint)inSpatial)
+                    giData[bc * inSpatial + maxIdx] += goData[outIdx];
+            }
+        }
+        UploadToBuffer(giData, gradInput);
     }
 
     public void NearestNeighborUpsample3D(IGpuBuffer input, IGpuBuffer output,
@@ -614,8 +630,7 @@ public sealed partial class WebGpuBackend
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int paddingMode = 0, bool alignCorners = false)
     {
-        Fill(gradInput, 0f, batch * channels * inHeight * inWidth);
-        Fill(gradGrid, 0f, batch * outHeight * outWidth * 2);
+        throw new NotSupportedException("GridSampleBackward is not yet implemented for WebGPU. Use CPU engine for grid sample backward.");
     }
 
     #endregion
@@ -830,8 +845,42 @@ public sealed partial class WebGpuBackend
         int totalElements = batch * channels * spatialSize;
         Dispatch3BufferAsync("NormBackward", WebGpuKernels.NormBackwardSource, "layer_norm_backward",
             gradOutput, input, gradInput, uniforms, totalElements).GetAwaiter().GetResult();
-        Fill(gradGamma, 0f, channels);
-        Fill(gradBeta, 0f, channels);
+
+        // Compute gradGamma and gradBeta via CPU reduction
+        // gradBeta[c] = sum over (batch, spatial) of gradOutput[b,c,s]
+        // gradGamma[c] = sum over (batch, spatial) of gradOutput[b,c,s] * normalized_input[b,c,s]
+        var goData = DownloadBufferData(gradOutput);
+        var inData = DownloadBufferData(input);
+        var gGamma = new float[channels];
+        var gBeta = new float[channels];
+        for (int b = 0; b < batch; b++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                int offset = (b * channels + c) * spatialSize;
+                // Compute mean and variance for normalization
+                float mean = 0;
+                for (int s = 0; s < spatialSize; s++)
+                    mean += inData[offset + s];
+                mean /= spatialSize;
+                float var = 0;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    float diff = inData[offset + s] - mean;
+                    var += diff * diff;
+                }
+                var /= spatialSize;
+                float invStd = 1f / MathF.Sqrt(var + epsilon);
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    float normalized = (inData[offset + s] - mean) * invStd;
+                    gBeta[c] += goData[offset + s];
+                    gGamma[c] += goData[offset + s] * normalized;
+                }
+            }
+        }
+        UploadToBuffer(gGamma, gradGamma);
+        UploadToBuffer(gBeta, gradBeta);
     }
 
     public void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,

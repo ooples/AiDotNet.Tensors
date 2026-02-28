@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDirectGpuBackend
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
 {
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;
@@ -713,10 +713,11 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
         new float[] { BitConverter.Int32BitsToSingle(a), BitConverter.Int32BitsToSingle(b), 0, 0 };
 
     internal static float[] MakeOptimizerUniforms(int size, float lr, float beta1, float beta2,
-        float epsilon, float weightDecay, float t, float extra = 0) =>
+        float epsilon, float weightDecay, int t, float extra = 0) =>
         new float[]
         {
-            BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay, t, extra
+            BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay,
+            BitConverter.Int32BitsToSingle(t), extra
         };
 
     internal async Task Dispatch1BufferAsync(string moduleName, string source, string kernelName,
@@ -882,7 +883,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
     }
 
     /// <summary>
-    /// Packs ConvParams uniform (13 u32 fields, padded to 16 floats).
+    /// Packs ConvParams uniform (15 u32 fields, padded to 16 floats).
     /// </summary>
     internal static float[] MakeConvUniforms(int batch, int inChannels, int outChannels,
         int inHeight, int inWidth, int outHeight, int outWidth,
