@@ -371,6 +371,10 @@ public sealed unsafe partial class VulkanBackend
     public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
     {
         EnsureInitialized();
+        if (K % 4 != 0)
+            throw new ArgumentException($"K ({K}) must be a multiple of 4 for 2:4 sparsity.", nameof(K));
+        if (M <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "M must be positive.");
         var dense = DownloadBuffer(denseInput);
         int sparseK = K / 2;
         var sv = new float[M * sparseK];
@@ -403,6 +407,10 @@ public sealed unsafe partial class VulkanBackend
     public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
         EnsureInitialized();
+        if (K % 4 != 0)
+            throw new ArgumentException($"K ({K}) must be a multiple of 4 for 2:4 sparsity.", nameof(K));
+        if (M <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "M must be positive.");
         var sv = DownloadBuffer(sparseValues);
         var floatIndices = DownloadBuffer(sparseIndices);
         var sparseIndicesData = new byte[M * K / 4];
@@ -460,8 +468,12 @@ public sealed unsafe partial class VulkanBackend
         {
             int rowStart = SingleToInt32BitsCompat(rows[i]);
             int rowEnd = SingleToInt32BitsCompat(rows[i + 1]);
+            if (rowStart < 0 || rowEnd < rowStart || rowEnd > nnz)
+                throw new ArgumentOutOfRangeException(nameof(csrRowPointers), $"CSR row pointer range [{rowStart}, {rowEnd}) for row {i} is invalid (nnz={nnz}).");
             for (int idx = rowStart; idx < rowEnd; idx++)
             {
+                if ((uint)idx >= (uint)vals.Length)
+                    throw new ArgumentOutOfRangeException(nameof(csrValues), $"CSR element index {idx} exceeds values buffer length ({vals.Length}).");
                 int col = SingleToInt32BitsCompat(cols[idx]);
                 if ((uint)col >= (uint)K)
                     throw new ArgumentOutOfRangeException(nameof(csrColIndices), $"Decoded CSR column index {col} at position {idx} is out of range [0, {K}).");
@@ -1551,18 +1563,44 @@ public sealed unsafe partial class VulkanBackend
 
                 int cgOff = t * batch * gateSize + b * gateSize;
                 var newDh = new float[hiddenSize];
+
+                // Cached gates are already activated (sigmoid for r/z, tanh for n)
+                // so we use them directly without re-applying activations.
+                // First pass: compute dN for each hidden unit (needed for dR computation)
+                var dNArr = new float[hiddenSize];
+                var dZArr = new float[hiddenSize];
                 for (int i = 0; i < hiddenSize; i++)
                 {
-                    float r = 1f / (1f + MathF.Exp(-cg[cgOff + i]));
-                    float z = 1f / (1f + MathF.Exp(-cg[cgOff + hiddenSize + i]));
-                    float n_ = MathF.Tanh(cg[cgOff + 2 * hiddenSize + i]);
+                    float r = cg[cgOff + i];               // already sigmoid-activated
+                    float z = cg[cgOff + hiddenSize + i];   // already sigmoid-activated
+                    float n_ = cg[cgOff + 2 * hiddenSize + i]; // already tanh-activated
                     float hPrev = aH[hOff + b * hiddenSize + i];
                     float localDh = dH[b * hiddenSize + i];
 
                     // ht = (1-z)*n + z*hPrev
-                    float dN = localDh * (1f - z) * (1f - n_ * n_);
-                    float dZ = localDh * (hPrev - n_) * z * (1f - z);
-                    float dR = 0f; // simplified: r gate affects n computation
+                    // dL/dn (pre-tanh) = dL/dht * (1-z) * (1-n^2)
+                    dNArr[i] = localDh * (1f - z) * (1f - n_ * n_);
+                    // dL/dz (pre-sigmoid) = dL/dht * (hPrev - n) * z * (1-z)
+                    dZArr[i] = localDh * (hPrev - n_) * z * (1f - z);
+                }
+
+                // Second pass: compute dR using chain rule through n's dependence on r
+                // n = tanh(W_in*x + b_in + r*(W_hn*hPrev + b_hn))
+                // dn/dr_i = sum_j(dN_j * W_hn[j,i] * hPrev_i) -- but the inner sum couples through r*hPrev
+                // For each hidden unit i: dR_i = r_i*(1-r_i) * sum_j(dN_j * hPrev_i * W_hn[j,i])
+                for (int i = 0; i < hiddenSize; i++)
+                {
+                    float r = cg[cgOff + i];
+                    float hPrev = aH[hOff + b * hiddenSize + i];
+
+                    float dRPre = 0f;
+                    for (int j = 0; j < hiddenSize; j++)
+                        dRPre += dNArr[j] * wHh[(2 * hiddenSize + j) * hiddenSize + i] * hPrev;
+                    float dR = dRPre * r * (1f - r);
+
+                    float dZ = dZArr[i];
+                    float dN = dNArr[i];
+                    float localDh = dH[b * hiddenSize + i];
 
                     float[] dGates = { dR, dZ, dN };
                     for (int gi = 0; gi < 3; gi++)
@@ -1581,9 +1619,10 @@ public sealed unsafe partial class VulkanBackend
                             gI[t * batch * inputSize + b * inputSize + k] += dGates[gi] * wIh[(gi * hiddenSize + i) * inputSize + k];
 
                     // gradient to previous hidden state
-                    newDh[i] = localDh * z;
+                    newDh[i] = localDh * cg[cgOff + hiddenSize + i]; // z
                     for (int k = 0; k < hiddenSize; k++)
                     {
+                        newDh[k] += dR * wHh[i * hiddenSize + k];
                         newDh[k] += dZ * wHh[(hiddenSize + i) * hiddenSize + k];
                         newDh[k] += dN * wHh[(2 * hiddenSize + i) * hiddenSize + k];
                     }
@@ -1623,6 +1662,20 @@ public sealed unsafe partial class VulkanBackend
         for (int b = 0; b < batch; b++)
         {
             int off = b * hiddenSize;
+
+            // First pass: compute dN for all hidden units (needed for dR)
+            var dNArr = new float[hiddenSize];
+            for (int i = 0; i < hiddenSize; i++)
+            {
+                float z = zGate[off + i];
+                float n_ = nGate[off + i];
+                float localDh = dH[off + i];
+
+                // ht = (1-z)*n + z*hPrev
+                dNArr[i] = localDh * (1f - z) * (1f - n_ * n_);
+            }
+
+            // Second pass: compute all gate gradients including proper dR
             for (int i = 0; i < hiddenSize; i++)
             {
                 float r = rGate[off + i];
@@ -1631,10 +1684,14 @@ public sealed unsafe partial class VulkanBackend
                 float hPrev = pH[off + i];
                 float localDh = dH[off + i];
 
-                // ht = (1-z)*n + z*hPrev
+                // dR_i = r_i*(1-r_i) * sum_j(dN_j * W_hn[j,i] * hPrev_i)
+                float dRPre = 0f;
+                for (int j = 0; j < hiddenSize; j++)
+                    dRPre += dNArr[j] * wHh[(2 * hiddenSize + j) * hiddenSize + i] * hPrev;
+
                 gZ[off + i] = localDh * (hPrev - n_) * z * (1f - z);
-                gN[off + i] = localDh * (1f - z) * (1f - n_ * n_);
-                gR[off + i] = 0f; // r affects the computation of n through r*hPrev
+                gN[off + i] = dNArr[i];
+                gR[off + i] = dRPre * r * (1f - r);
                 gPH[off + i] = localDh * z;
             }
         }

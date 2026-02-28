@@ -768,7 +768,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var go = DownloadBuffer(gradOutput);
         var idx = DownloadBuffer(indices);
-        var gi = new float[batch * channels * inHeight * inWidth];
+        int inSpatial = inHeight * inWidth;
+        var gi = new float[batch * channels * inSpatial];
         for (int b = 0; b < batch; b++)
             for (int c = 0; c < channels; c++)
                 for (int oh = 0; oh < outHeight; oh++)
@@ -776,7 +777,9 @@ public sealed unsafe partial class VulkanBackend
                     {
                         int outIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
                         int maxIdx = SingleToInt32BitsCompat(idx[outIdx]);
-                        gi[(b * channels + c) * inHeight * inWidth + maxIdx] += go[outIdx];
+                        if ((uint)maxIdx >= (uint)inSpatial)
+                            throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxIdx} at position {outIdx} is out of range [0, {inSpatial}).");
+                        gi[(b * channels + c) * inSpatial + maxIdx] += go[outIdx];
                     }
         UploadToBuffer(gi, gradInput);
     }
@@ -930,6 +933,8 @@ public sealed unsafe partial class VulkanBackend
             for (int c = 0; c < channels; c++)
             {
                 int maxI = SingleToInt32BitsCompat(idx[b * channels + c]);
+                if ((uint)maxI >= (uint)spatial)
+                    throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxI} at batch {b}, channel {c} is out of range [0, {spatial}).");
                 gi[(b * channels + c) * spatial + maxI] = go[b * channels + c];
             }
         UploadToBuffer(gi, gradInput);
@@ -1014,6 +1019,8 @@ public sealed unsafe partial class VulkanBackend
                 {
                     int outIdx = (b * channels + c) * outSize + i;
                     int maxI = SingleToInt32BitsCompat(idx[outIdx]);
+                    if ((uint)maxI >= (uint)inSpatial)
+                        throw new ArgumentOutOfRangeException(nameof(indices), $"Decoded pooling index {maxI} at position {outIdx} is out of range [0, {inSpatial}).");
                     gi[(b * channels + c) * inSpatial + maxI] += go[outIdx];
                 }
         UploadToBuffer(gi, gradInput);
