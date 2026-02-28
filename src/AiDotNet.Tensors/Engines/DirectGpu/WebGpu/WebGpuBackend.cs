@@ -883,7 +883,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     }
 
     /// <summary>
-    /// Packs ConvParams uniform (15 u32 fields, padded to 16 floats).
+    /// Packs DeformConvParams uniform (18 u32 fields + 2 padding, 20 floats / 80 bytes).
     /// </summary>
     internal static float[] MakeDeformConvUniforms(int batch, int inChannels, int outChannels,
         int inHeight, int inWidth, int outHeight, int outWidth,
