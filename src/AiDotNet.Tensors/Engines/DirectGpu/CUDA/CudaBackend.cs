@@ -6090,6 +6090,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             variance = varSum / size;
         }
 
+        // Clamp variance to avoid NaN from floating-point round-off
+        variance = Math.Max(0, variance);
         return MathF.Sqrt(variance);
     }
 

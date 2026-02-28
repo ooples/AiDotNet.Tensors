@@ -6580,27 +6580,12 @@ public interface IEngine
     Tensor<T> TensorOuter<T>(Tensor<T> a, Tensor<T> b);
 
     #endregion
-}
 
-/// <summary>
-/// Extended engine interface for tensor-level convenience operations.
-/// Separates new tensor-level methods from <see cref="IEngine"/> to avoid
-/// breaking existing implementations that only implement the core interface.
-/// </summary>
-/// <remarks>
-/// <para>
-/// This interface provides higher-level operations (activations, normalization,
-/// pooling, etc.) that delegate to the primitive operations defined in <see cref="IEngine"/>.
-/// Engines that support these operations should implement this interface in addition to
-/// <see cref="IEngine"/>.
-/// </para>
-/// </remarks>
-public interface ITensorLevelEngine : IEngine
-{
     #region Tensor-Level Activation Operations
 
     /// <summary>
     /// Applies element-wise sigmoid activation: 1 / (1 + exp(-x)).
+    /// Alias for <see cref="Sigmoid{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6609,6 +6594,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise ReLU activation: max(0, x).
+    /// Alias for <see cref="ReLU{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6617,6 +6603,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+    /// Alias for <see cref="GELU{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6625,7 +6612,8 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise SiLU (Sigmoid Linear Unit) activation: x * sigmoid(x).
-    /// Also known as Swish.
+    /// Also known as Swish. Default activation in modern diffusion models.
+    /// Alias for <see cref="Swish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6634,6 +6622,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise tanh activation.
+    /// Alias for <see cref="Tanh{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6642,15 +6631,17 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise Leaky ReLU activation: x if x > 0, else alpha * x.
+    /// Alias for <see cref="LeakyReLU{T}(Tensor{T}, T)"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
-    /// <param name="alpha">Negative slope coefficient.</param>
+    /// <param name="alpha">Negative slope coefficient (commonly 0.01).</param>
     /// <returns>Tensor with Leaky ReLU applied element-wise.</returns>
     Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha);
 
     /// <summary>
     /// Applies element-wise Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x)).
+    /// Alias for <see cref="Mish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6659,6 +6650,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies element-wise HardSwish activation: x * relu6(x + 3) / 6.
+    /// Alias for <see cref="HardSwish{T}(Tensor{T})"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">Input tensor.</param>
@@ -6671,6 +6663,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Applies layer normalization on a tensor.
+    /// Alias for <see cref="LayerNorm{T}"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="input">Input tensor.</param>
@@ -6702,6 +6695,7 @@ public interface ITensorLevelEngine : IEngine
 
     /// <summary>
     /// Computes fused scaled addition of two tensors: scaleA * a + scaleB * b.
+    /// Commonly used for noise mixing in diffusion models (alpha * signal + sigma * noise).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="a">First tensor.</param>
@@ -6712,7 +6706,7 @@ public interface ITensorLevelEngine : IEngine
     Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB);
 
     /// <summary>
-    /// Applies max pooling on a 4D input tensor.
+    /// Alias for <see cref="MaxPool2D{T}(Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="input">4D input tensor [batch, channels, height, width].</param>
@@ -6723,7 +6717,7 @@ public interface ITensorLevelEngine : IEngine
     Tensor<T> TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
 
     /// <summary>
-    /// Applies average pooling on a 4D input tensor.
+    /// Alias for <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="input">4D input tensor [batch, channels, height, width].</param>
@@ -6734,7 +6728,7 @@ public interface ITensorLevelEngine : IEngine
     Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
 
     /// <summary>
-    /// Applies 2D convolution on input tensor.
+    /// Alias for <see cref="Conv2D{T}(Tensor{T}, Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="input">4D input tensor [batch, channels, height, width].</param>
@@ -6746,4 +6740,12 @@ public interface ITensorLevelEngine : IEngine
     Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
 
     #endregion
+}
+
+/// <summary>
+/// Marker interface retained for backward compatibility. All tensor-level operations
+/// are now part of <see cref="IEngine"/> directly.
+/// </summary>
+public interface ITensorLevelEngine : IEngine
+{
 }

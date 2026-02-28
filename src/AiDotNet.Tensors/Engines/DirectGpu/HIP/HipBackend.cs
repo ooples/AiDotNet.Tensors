@@ -7058,6 +7058,15 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
     {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
         if (!_kernelCache.TryGetValue("lerp_fused", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: lerp_fused");
 
@@ -7085,6 +7094,15 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
     {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
         if (!_kernelCache.TryGetValue("add_scaled", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: add_scaled");
 
@@ -7113,11 +7131,11 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe float StdDev(IGpuBuffer input, int size)
     {
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
-        if (size > input.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
 
         const int blockSize = 256;
         int gridSize = (size + blockSize - 1) / blockSize;
@@ -7199,8 +7217,8 @@ public sealed class HipBackend : IAsyncGpuBackend
             variance = varSum / size;
         }
 
-        // Clamp variance to zero before sqrt to handle floating-point roundoff
-        if (variance < 0f) variance = 0f;
+        // Clamp variance to avoid NaN from floating-point round-off
+        variance = Math.Max(0, variance);
         return MathF.Sqrt(variance);
     }
 

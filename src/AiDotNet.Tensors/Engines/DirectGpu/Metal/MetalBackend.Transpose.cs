@@ -492,32 +492,33 @@ public sealed partial class MetalBackend
 
     /// <summary>
     /// Computes standard deviation across elements: sqrt(variance).
+    /// Uses GPU reductions for both mean and variance to avoid downloading the input buffer.
     /// </summary>
     public float StdDev(IGpuBuffer input, int size)
     {
         ThrowIfDisposed();
 
-        if (size < 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
         if (size <= 1) return 0.0f;
-        if (size > input.Size)
-            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
 
-        // Welford's algorithm for numerically stable variance computation
-        float[] data = DownloadBuffer(input);
-        double mean = 0;
-        double m2 = 0;
-        for (int i = 0; i < size; i++)
-        {
-            double delta = data[i] - mean;
-            mean += delta / (i + 1);
-            double delta2 = data[i] - mean;
-            m2 += delta * delta2;
-        }
-        double variance = m2 / size;
-        // Clamp variance to zero before sqrt to handle floating-point roundoff
-        if (variance < 0) variance = 0;
-        return (float)Math.Sqrt(variance);
+        // Step 1: Compute mean via GPU Sum reduction
+        float mean = Sum(input, size) / size;
+
+        // Step 2: Compute variance entirely on GPU using existing element-wise ops:
+        //   temp = input - mean  (per-element subtract via AddScalar with -mean)
+        //   temp = temp * temp   (per-element square via Multiply)
+        //   variance = Sum(temp) / size  (GPU reduction)
+        using var temp = new MetalGpuBuffer(_device, size);
+        AddScalar(input, temp, -mean, size);
+        Multiply(temp, temp, temp, size);
+        float varianceSum = Sum(temp, size);
+
+        // Clamp variance to avoid NaN from floating-point round-off
+        float variance = Math.Max(0, varianceSum / size);
+        return MathF.Sqrt(variance);
     }
 
     /// <summary>

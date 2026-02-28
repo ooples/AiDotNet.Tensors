@@ -105,6 +105,8 @@ public class TensorLevelOpsTests
         Assert.Equal(0.7310586f, result[1], Tolerance);
         // SiLU(-1) = -1 * sigmoid(-1) ~= -0.2689
         Assert.Equal(-0.2689414f, result[2], Tolerance);
+        // SiLU(2) = 2 * sigmoid(2) = 2 * (1/(1+exp(-2))) ~= 2 * 0.8808 ~= 1.7616
+        Assert.Equal(2f * (1f / (1f + (float)Math.Exp(-2.0))), result[3], Tolerance);
     }
 
     #endregion
@@ -215,28 +217,33 @@ public class TensorLevelOpsTests
         var result = _engine.TensorLayerNorm(input, gamma, beta, 1e-5);
 
         Assert.Equal(new[] { 2, 3 }, result.Shape);
-
         // After normalization with identity gamma and zero beta,
-        // each row should have mean approximately 0 and std approximately 1
-        int rows = result.Shape[0];
-        int cols = result.Shape[1];
-        for (int r = 0; r < rows; r++)
-        {
-            float rowMean = 0f;
-            for (int c = 0; c < cols; c++)
-                rowMean += result[r, c];
-            rowMean /= cols;
-            Assert.Equal(0f, rowMean, 1e-4f);
+        // each row should have mean ~0 and std ~1
 
-            float rowVar = 0f;
-            for (int c = 0; c < cols; c++)
+        for (int row = 0; row < 2; row++)
+        {
+            // Compute mean of the row
+            float sum = 0f;
+            for (int col = 0; col < 3; col++)
             {
-                float diff = result[r, c] - rowMean;
-                rowVar += diff * diff;
+                sum += result[row, col];
             }
-            rowVar /= cols;
-            float rowStd = MathF.Sqrt(rowVar);
-            Assert.Equal(1f, rowStd, 0.01f);
+
+            float mean = sum / 3f;
+
+            // Compute standard deviation of the row
+            float varianceSum = 0f;
+            for (int col = 0; col < 3; col++)
+            {
+                float diff = result[row, col] - mean;
+                varianceSum += diff * diff;
+            }
+
+            float variance = varianceSum / 3f;
+            float std = (float)Math.Sqrt(variance);
+
+            Assert.Equal(0f, mean, Tolerance);
+            Assert.Equal(1f, std, Tolerance);
         }
     }
 
@@ -407,6 +414,17 @@ public class TensorLevelOpsTests
         Assert.Equal(1, result.Shape[1]);
         Assert.Equal(2, result.Shape[2]);
         Assert.Equal(2, result.Shape[3]);
+
+        // Verify actual pooled values:
+        // Input 4x4 (row-major): 0,1,2,3 / 4,5,6,7 / 8,9,10,11 / 12,13,14,15
+        // Top-left 2x2 [0,1,4,5] -> max = 5
+        Assert.Equal(5f, result.AsSpan()[0], Tolerance);
+        // Top-right 2x2 [2,3,6,7] -> max = 7
+        Assert.Equal(7f, result.AsSpan()[1], Tolerance);
+        // Bottom-left 2x2 [8,9,12,13] -> max = 13
+        Assert.Equal(13f, result.AsSpan()[2], Tolerance);
+        // Bottom-right 2x2 [10,11,14,15] -> max = 15
+        Assert.Equal(15f, result.AsSpan()[3], Tolerance);
     }
 
     #endregion
@@ -419,7 +437,7 @@ public class TensorLevelOpsTests
         var input = new Tensor<float>(new[] { 1, 1, 4, 4 });
         for (int i = 0; i < 16; i++)
         {
-            input.AsWritableSpan()[i] = 1f; // All ones
+            input.AsWritableSpan()[i] = i; // Varying values 0..15
         }
 
         var result = _engine.TensorAvgPool2D(input, poolSize: 2, stride: 2);
@@ -430,11 +448,15 @@ public class TensorLevelOpsTests
         Assert.Equal(2, result.Shape[2]);
         Assert.Equal(2, result.Shape[3]);
 
-        // Average of all 1s = 1
-        for (int i = 0; i < result.Length; i++)
-        {
-            Assert.Equal(1f, result.AsSpan()[i], Tolerance);
-        }
+        // Input 4x4 (row-major): 0,1,2,3 / 4,5,6,7 / 8,9,10,11 / 12,13,14,15
+        // Top-left 2x2 [0,1,4,5] -> avg = (0+1+4+5)/4 = 2.5
+        Assert.Equal(2.5f, result.AsSpan()[0], Tolerance);
+        // Top-right 2x2 [2,3,6,7] -> avg = (2+3+6+7)/4 = 4.5
+        Assert.Equal(4.5f, result.AsSpan()[1], Tolerance);
+        // Bottom-left 2x2 [8,9,12,13] -> avg = (8+9+12+13)/4 = 10.5
+        Assert.Equal(10.5f, result.AsSpan()[2], Tolerance);
+        // Bottom-right 2x2 [10,11,14,15] -> avg = (10+11+14+15)/4 = 12.5
+        Assert.Equal(12.5f, result.AsSpan()[3], Tolerance);
     }
 
     #endregion
@@ -512,6 +534,24 @@ public class TensorLevelOpsTests
         var mish2 = _engine.TensorMish(input);
         for (int i = 0; i < 4; i++)
             Assert.Equal(mish1[i], mish2[i], Tolerance);
+
+        // TensorSiLU matches Swish
+        var silu1 = _engine.Swish(input);
+        var silu2 = _engine.TensorSiLU(input);
+        for (int i = 0; i < 4; i++)
+            Assert.Equal(silu1[i], silu2[i], Tolerance);
+
+        // TensorLeakyReLU matches LeakyReLU
+        var lrelu1 = _engine.LeakyReLU(input, 0.01f);
+        var lrelu2 = _engine.TensorLeakyReLU(input, 0.01f);
+        for (int i = 0; i < 4; i++)
+            Assert.Equal(lrelu1[i], lrelu2[i], Tolerance);
+
+        // TensorHardSwish matches HardSwish
+        var hs1 = _engine.HardSwish(input);
+        var hs2 = _engine.TensorHardSwish(input);
+        for (int i = 0; i < 4; i++)
+            Assert.Equal(hs1[i], hs2[i], Tolerance);
     }
 
     #endregion

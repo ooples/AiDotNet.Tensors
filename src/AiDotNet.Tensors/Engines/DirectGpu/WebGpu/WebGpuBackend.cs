@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// Always check IsAvailable before using GPU operations.
 /// </para>
 /// </remarks>
-public sealed partial class WebGpuBackend : IDisposable
+public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
 {
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;
@@ -40,20 +40,54 @@ public sealed partial class WebGpuBackend : IDisposable
     private bool _initialized;
     private bool _disposed;
 
+    // Shared dummy buffer for optimizer kernels that require unused buffer slots.
+    // Avoids per-call allocation overhead for SGD, NAG, Lion, etc.
+    private WebGpuBuffer? _sharedDummyBuffer;
+
     /// <summary>
-    /// Gets whether WebGPU is available and initialized.
+    /// Gets a shared single-element dummy buffer for kernel dispatch padding.
+    /// Lazily allocated on first use.
     /// </summary>
+    private WebGpuBuffer SharedDummyBuffer
+    {
+        get
+        {
+            if (_sharedDummyBuffer is null || !_sharedDummyBuffer.IsValid)
+                _sharedDummyBuffer = (WebGpuBuffer)AllocateBuffer(1);
+            return _sharedDummyBuffer;
+        }
+    }
+
+    /// <inheritdoc/>
     public bool IsAvailable => _initialized && !_disposed;
+
+    /// <inheritdoc/>
+    public string BackendName => "WebGPU";
 
     /// <summary>
     /// Gets the backend type identifier.
     /// </summary>
     public string BackendType => "WebGPU";
 
-    /// <summary>
-    /// Gets the device name.
-    /// </summary>
+    /// <inheritdoc/>
     public string DeviceName => _device.AdapterInfo;
+
+    /// <inheritdoc/>
+    public string DeviceVendor => _device.AdapterInfo ?? "Unknown";
+
+    /// <inheritdoc/>
+    public int ComputeUnits => 1;
+
+    /// <inheritdoc/>
+    public long GlobalMemoryBytes => _device.MaxBufferSize;
+
+    /// <inheritdoc/>
+    /// <summary>
+    /// Gets the local (workgroup) memory in bytes.
+    /// WebGPU reports MaxStorageBufferBindingSize for shared memory limits.
+    /// We use a reasonable default of 16KB for workgroup shared memory.
+    /// </summary>
+    public long LocalMemoryBytes => 16384L;
 
     /// <summary>
     /// Gets the maximum buffer size in bytes.
@@ -661,6 +695,256 @@ public sealed partial class WebGpuBackend : IDisposable
 
     #endregion
 
+    #region Generalized GPU Dispatch Helpers
+
+    private static float[] MakeUniform1(int size) =>
+        new float[] { BitConverter.Int32BitsToSingle(size), 0, 0, 0 };
+
+    private static float[] MakeUniform2(int size, float p1) =>
+        new float[] { BitConverter.Int32BitsToSingle(size), p1, 0, 0 };
+
+    private static float[] MakeUniform3(int size, float p1, float p2) =>
+        new float[] { BitConverter.Int32BitsToSingle(size), p1, p2, 0 };
+
+    private static float[] MakeUniform4(int size, float p1, float p2, float p3) =>
+        new float[] { BitConverter.Int32BitsToSingle(size), p1, p2, p3 };
+
+    private static float[] MakeUniformInts2(int a, int b) =>
+        new float[] { BitConverter.Int32BitsToSingle(a), BitConverter.Int32BitsToSingle(b), 0, 0 };
+
+    internal static float[] MakeOptimizerUniforms(int size, float lr, float beta1, float beta2,
+        float epsilon, float weightDecay, int t, float extra = 0) =>
+        new float[]
+        {
+            BitConverter.Int32BitsToSingle(size), lr, beta1, beta2, epsilon, weightDecay,
+            BitConverter.Int32BitsToSingle(t), extra
+        };
+
+    internal async Task Dispatch1BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch2BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch3BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch4BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch5BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, IGpuBuffer e,
+        float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var eBuffer = (WebGpuBuffer)e;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer, eBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch6BufferAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, IGpuBuffer e, IGpuBuffer f,
+        float[] uniformParams, int workSize)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var eBuffer = (WebGpuBuffer)e;
+        var fBuffer = (WebGpuBuffer)f;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer, eBuffer, fBuffer);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch3Buffer2DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workgroupsX, int workgroupsY)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch2Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, float[] uniformParams, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch3Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, float[] uniformParams, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    internal async Task Dispatch4Buffer3DAsync(string moduleName, string source, string kernelName,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, IGpuBuffer d, float[] uniformParams,
+        int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        ThrowIfNotInitialized();
+        var aBuffer = (WebGpuBuffer)a;
+        var bBuffer = (WebGpuBuffer)b;
+        var cBuffer = (WebGpuBuffer)c;
+        var dBuffer = (WebGpuBuffer)d;
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
+            pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, workgroupsZ);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
+    /// <summary>
+    /// Packs ConvParams uniform (15 u32 fields, padded to 16 floats).
+    /// </summary>
+    internal static float[] MakeConvUniforms(int batch, int inChannels, int outChannels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        int dilationH = 1, int dilationW = 1)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(inChannels),
+            BitConverter.Int32BitsToSingle(outChannels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW),
+            BitConverter.Int32BitsToSingle(dilationH),
+            BitConverter.Int32BitsToSingle(dilationW),
+            0 // padding to 16 floats (64 bytes)
+        };
+    }
+
+    /// <summary>
+    /// Packs PoolParams uniform (12 u32 fields = 48 bytes).
+    /// </summary>
+    internal static float[] MakePoolUniforms(int batch, int channels,
+        int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        return new float[]
+        {
+            BitConverter.Int32BitsToSingle(batch),
+            BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inHeight),
+            BitConverter.Int32BitsToSingle(inWidth),
+            BitConverter.Int32BitsToSingle(outHeight),
+            BitConverter.Int32BitsToSingle(outWidth),
+            BitConverter.Int32BitsToSingle(kernelH),
+            BitConverter.Int32BitsToSingle(kernelW),
+            BitConverter.Int32BitsToSingle(strideH),
+            BitConverter.Int32BitsToSingle(strideW),
+            BitConverter.Int32BitsToSingle(padH),
+            BitConverter.Int32BitsToSingle(padW)
+        };
+    }
+
+    /// <summary>
+    /// Calculates workgroup counts for conv/pool 3D dispatch with @workgroup_size(8,8,1).
+    /// </summary>
+    internal static (int wgX, int wgY, int wgZ) CalcWorkgroups8x8(int width, int height, int depthSlices)
+    {
+        return ((width + 7) / 8, (height + 7) / 8, depthSlices);
+    }
+
+    #endregion
+
     #region Helper Methods
 
     private async Task<int> GetOrCreatePipelineAsync(string moduleName, string source, string entryPoint)
@@ -691,57 +975,7 @@ public sealed partial class WebGpuBackend : IDisposable
 
     #endregion
 
-    #region Synchronous Wrappers
-
-    /// <summary>
-    /// Element-wise addition (synchronous).
-    /// </summary>
-    public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        AddAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise subtraction (synchronous).
-    /// </summary>
-    public void Sub(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        SubAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise multiplication (synchronous).
-    /// </summary>
-    public void Mul(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        MulAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Element-wise division (synchronous).
-    /// </summary>
-    public void Div(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
-    {
-        DivAsync(A, B, C, size).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Matrix multiplication (synchronous).
-    /// </summary>
-    public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
-    {
-        GemmAsync(A, B, C, M, N, K, alpha, beta).GetAwaiter().GetResult();
-    }
-
-    /// <summary>
-    /// Sum reduction (synchronous).
-    /// </summary>
-    public float Sum(IGpuBuffer A, int size)
-    {
-        return SumAsync(A, size).GetAwaiter().GetResult();
-    }
-
-    #endregion
+    // Synchronous wrappers are defined in WebGpuBackend.GpuBackend.cs as part of IDirectGpuBackend implementation
 
     /// <summary>
     /// Disposes the WebGPU backend and releases resources.
@@ -754,6 +988,8 @@ public sealed partial class WebGpuBackend : IDisposable
         }
 
         _disposed = true;
+        _sharedDummyBuffer?.Dispose();
+        _sharedDummyBuffer = null;
         _shaderLibrary.Dispose();
         _pipelineCache.Clear();
     }
