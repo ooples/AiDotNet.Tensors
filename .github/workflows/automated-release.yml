@@ -102,8 +102,8 @@ jobs:
 
           # Check for fixes/refactor/perf/docs (conventional format with colon)
           if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ (fix|refactor|perf|docs)(\(.*\))?:" > /dev/null; then
-            BUMP_TYPE="minor"
-            echo "Found fix:/refactor:/perf:/docs: commits - will bump MINOR version"
+            BUMP_TYPE="patch"
+            echo "Found fix:/refactor:/perf:/docs: commits - will bump PATCH version"
           fi
 
           # FALLBACK: Check for common non-conventional patterns (without colon)
@@ -113,8 +113,8 @@ jobs:
           fi
 
           if [ "$BUMP_TYPE" = "none" ] && echo "$COMMITS" | grep -iE "^[a-f0-9]+ (fix|update|improve|enhance|resolve|patch|correct|repair) " > /dev/null; then
-            BUMP_TYPE="minor"
-            echo "Found Fix/Update/Improve commits - will bump MINOR version"
+            BUMP_TYPE="patch"
+            echo "Found Fix/Update/Improve commits - will bump PATCH version"
           fi
 
           case $BUMP_TYPE in
@@ -128,6 +128,10 @@ jobs:
               MINOR=$((MINOR + 1))
               PATCH=0
               echo "Bumping MINOR: $CURRENT_VERSION -> $MAJOR.$MINOR.$PATCH"
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              echo "Bumping PATCH: $CURRENT_VERSION -> $MAJOR.$MINOR.$PATCH"
               ;;
             none)
               echo "No conventional commits found, no version bump"
@@ -311,6 +315,8 @@ jobs:
 
           # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
           # Only pack if all required native binaries are present for both architectures
+          # Note: MoltenVK is not in the solution file, so dotnet restore/build above skips it.
+          # We must restore and build it separately before packing.
           $moltenVKProj = "src/AiDotNet.Native.MoltenVK/AiDotNet.Native.MoltenVK.csproj"
           $moltenVKFiles = @(
             "src/AiDotNet.Native.MoltenVK/runtimes/osx-arm64/native/libMoltenVK.dylib",
@@ -322,6 +328,11 @@ jobs:
           )
           $allPresent = (Test-Path $moltenVKProj) -and ($moltenVKFiles | ForEach-Object { Test-Path $_ }) -notcontains $false
           if ($allPresent) {
+            Write-Host "Restoring and building AiDotNet.Native.MoltenVK..."
+            dotnet restore $moltenVKProj
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            dotnet build $moltenVKProj -c Release --no-restore
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             Write-Host "Packing AiDotNet.Native.MoltenVK..."
             dotnet pack $moltenVKProj -c Release -o out --no-build /p:PackageVersion=$VERSION
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
