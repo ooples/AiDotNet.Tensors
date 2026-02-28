@@ -48,16 +48,23 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
 
-        var storage = VulkanBuffer.CreateStorageBuffer(size);
-        var staging = VulkanBuffer.CreateStagingBuffer(size);
-        if (storage is null || staging is null)
+        VulkanBuffer? storage = null;
+        VulkanBuffer? staging = null;
+        try
+        {
+            storage = VulkanBuffer.CreateStorageBuffer(size);
+            staging = VulkanBuffer.CreateStagingBuffer(size);
+            if (storage is null || staging is null)
+                throw new InvalidOperationException("Failed to allocate Vulkan GPU buffer.");
+
+            return new VulkanGpuBuffer(storage, staging, size);
+        }
+        catch
         {
             storage?.Dispose();
             staging?.Dispose();
-            throw new InvalidOperationException("Failed to allocate Vulkan GPU buffer.");
+            throw;
         }
-
-        return new VulkanGpuBuffer(storage, staging, size);
     }
 
     /// <summary>
@@ -66,7 +73,8 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     /// <remarks>
     /// The upload is performed synchronously via a staging buffer copy.
     /// For large data sets, consider pre-allocating and uploading in batches.
-    /// If upload fails, the buffer is disposed to prevent resource leaks.
+    /// If upload fails or the staging buffer is not writable, the buffer is
+    /// disposed to prevent resource leaks and an exception is thrown.
     /// </remarks>
     internal static VulkanGpuBuffer Create(float[] data, VulkanBufferTransfer transfer)
     {
@@ -77,6 +85,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
         var buffer = Create(data.Length);
         try
         {
+            // WriteData returns silently if staging is not host-visible or disposed.
+            // Since we just created the buffer, these conditions indicate a serious
+            // allocation failure, so we verify the staging buffer is valid first.
+            if (buffer.Staging.Handle == IntPtr.Zero)
+                throw new InvalidOperationException("Staging buffer handle is invalid after allocation.");
+
             buffer.Staging.WriteData(data);
             transfer.CopyToDevice(buffer.Staging, buffer.Storage);
         }
