@@ -10,15 +10,15 @@ public sealed unsafe partial class VulkanBackend
 {
     #region Internal Helpers
 
-    // Bit conversion helpers using safe BitConverter methods
+    // Bit conversion helpers compatible with net471 and later
     private static int SingleToInt32BitsCompat(float value)
     {
-        return BitConverter.SingleToInt32Bits(value);
+        return Unsafe.As<float, int>(ref value);
     }
 
     private static float Int32BitsToSingleCompat(int value)
     {
-        return BitConverter.Int32BitsToSingle(value);
+        return Unsafe.As<int, float>(ref value);
     }
 
     private static float AsinhCompat(float x)

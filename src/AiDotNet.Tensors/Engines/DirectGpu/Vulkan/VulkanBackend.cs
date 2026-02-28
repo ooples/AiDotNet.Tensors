@@ -73,6 +73,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     public string DeviceVendor => _device.VendorName;
 
     /// <summary>
+    /// Gets the GPU vendor name (convenience alias for <see cref="DeviceVendor"/>).
+    /// </summary>
+    public string VendorName => _device.VendorName;
+
+    /// <summary>
     /// Gets the number of compute units. Returns the maximum workgroup invocations,
     /// which is the closest Vulkan equivalent to OpenCL's CL_DEVICE_MAX_COMPUTE_UNITS.
     /// </summary>
