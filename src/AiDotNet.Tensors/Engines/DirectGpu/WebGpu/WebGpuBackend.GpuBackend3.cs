@@ -731,6 +731,77 @@ public sealed partial class WebGpuBackend
             A, B, C, D, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
+    public void Lerp(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float t, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        // lerp(a, b, t) = a + t * (b - a)
+        // CPU fallback: download, compute, upload
+        var aData = DownloadBufferData(a);
+        var bData = DownloadBufferData(b);
+        var result = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            result[i] = aData[i] + t * (bData[i] - aData[i]);
+        }
+        UploadToBuffer(result, output);
+    }
+
+    public void AddScaled(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, float scaleA, float scaleB, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (a.Size < size)
+            throw new ArgumentException($"Buffer 'a' capacity ({a.Size}) is less than size ({size}).", nameof(a));
+        if (b.Size < size)
+            throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
+        if (output.Size < size)
+            throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        // result = scaleA * a + scaleB * b
+        // CPU fallback: download, compute, upload
+        var aData = DownloadBufferData(a);
+        var bData = DownloadBufferData(b);
+        var result = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            result[i] = scaleA * aData[i] + scaleB * bData[i];
+        }
+        UploadToBuffer(result, output);
+    }
+
+    public float StdDev(IGpuBuffer input, int size)
+    {
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, "Size must be positive.");
+        if (input.Size < size)
+            throw new ArgumentException($"Buffer 'input' capacity ({input.Size}) is less than size ({size}).", nameof(input));
+        if (size <= 1) return 0.0f;
+
+        // CPU fallback: download and compute
+        var data = DownloadBufferData(input);
+        float mean = 0f;
+        for (int i = 0; i < size; i++)
+            mean += data[i];
+        mean /= size;
+
+        float variance = 0f;
+        for (int i = 0; i < size; i++)
+        {
+            float diff = data[i] - mean;
+            variance += diff * diff;
+        }
+        variance = Math.Max(0, variance / size);
+        return MathF.Sqrt(variance);
+    }
+
     public void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
         if (sourceSize <= 0)

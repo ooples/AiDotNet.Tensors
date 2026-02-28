@@ -773,7 +773,7 @@ extern ""C"" __global__ void reduce_mean_kernel(
     float* __restrict__ output,
     int size)
 {
-    __shared__ float sdata[256];
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -805,7 +805,7 @@ extern ""C"" __global__ void reduce_variance_kernel(
     float mean,
     int size)
 {
-    __shared__ float sdata[256];
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
