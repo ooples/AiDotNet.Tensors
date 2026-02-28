@@ -17996,8 +17996,6 @@ public class CpuEngine : IEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-
         // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
         // Using a + t*(b-a) is more numerically stable and requires fewer ops
         var diff = TensorSubtract(b, a);  // b - a
@@ -18010,6 +18008,11 @@ public class CpuEngine : IEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesMatch(a.Shape, b.Shape))
+        {
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
