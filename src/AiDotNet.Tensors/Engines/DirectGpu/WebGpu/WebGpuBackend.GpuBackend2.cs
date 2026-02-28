@@ -220,14 +220,20 @@ public sealed partial class WebGpuBackend
     {
         // Deformable conv uses offsets to compute sampling positions with bilinear interpolation
         int hasMask = mask is not null ? 1 : 0;
-        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
-        IGpuBuffer maskBuf = mask is not null ? mask : dummyMask;
-        var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
-        int total = batch * outChannels * outHeight * outWidth;
-        Dispatch5BufferAsync("DeformableConv2D", WebGpuKernels.DeformableConv2DSource,
-            "deformable_conv2d", input, weights, offsets, maskBuf, output,
-            uniforms, total).GetAwaiter().GetResult();
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int total = batch * outChannels * outHeight * outWidth;
+            Dispatch5BufferAsync("DeformableConv2D", WebGpuKernels.DeformableConv2DSource,
+                "deformable_conv2d", input, weights, offsets, maskBuf, output,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
@@ -239,14 +245,20 @@ public sealed partial class WebGpuBackend
         int groups, int deformGroups)
     {
         int hasMask = mask is not null ? 1 : 0;
-        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
-        IGpuBuffer maskBuf = mask ?? dummyMask;
-        var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
-        int total = batch * inChannels * inHeight * inWidth;
-        Dispatch5BufferAsync("DeformableConv2DBackwardInput", WebGpuKernels.DeformableConv2DBackwardInputSource,
-            "deformable_conv2d_backward_input", gradOutput, weights, offsets, maskBuf, gradInput,
-            uniforms, total).GetAwaiter().GetResult();
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int total = batch * inChannels * inHeight * inWidth;
+            Dispatch5BufferAsync("DeformableConv2DBackwardInput", WebGpuKernels.DeformableConv2DBackwardInputSource,
+                "deformable_conv2d_backward_input", gradOutput, weights, offsets, maskBuf, gradInput,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -258,15 +270,21 @@ public sealed partial class WebGpuBackend
         int groups, int deformGroups)
     {
         int hasMask = mask is not null ? 1 : 0;
-        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
-        IGpuBuffer maskBuf = mask ?? dummyMask;
-        var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
-        int inChannelsPerGroup = inChannels / groups;
-        int total = outChannels * inChannelsPerGroup * kernelH * kernelW;
-        Dispatch5BufferAsync("DeformableConv2DBackwardWeights", WebGpuKernels.DeformableConv2DBackwardWeightsSource,
-            "deformable_conv2d_backward_weights", gradOutput, input, offsets, maskBuf, gradWeights,
-            uniforms, total).GetAwaiter().GetResult();
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int inChannelsPerGroup = inChannels / groups;
+            int total = outChannels * inChannelsPerGroup * kernelH * kernelW;
+            Dispatch5BufferAsync("DeformableConv2DBackwardWeights", WebGpuKernels.DeformableConv2DBackwardWeightsSource,
+                "deformable_conv2d_backward_weights", gradOutput, input, offsets, maskBuf, gradWeights,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -278,15 +296,21 @@ public sealed partial class WebGpuBackend
         int groups, int deformGroups)
     {
         int hasMask = mask is not null ? 1 : 0;
-        using var dummyMask = (WebGpuBuffer)AllocateBuffer(1);
-        IGpuBuffer maskBuf = mask ?? dummyMask;
-        var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
-            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
-        int kernelSize = kernelH * kernelW;
-        int total = batch * deformGroups * 2 * kernelSize * outHeight * outWidth;
-        Dispatch6BufferAsync("DeformableConv2DBackwardOffset", WebGpuKernels.DeformableConv2DBackwardOffsetSource,
-            "deformable_conv2d_backward_offset", gradOutput, input, weights, offsets, maskBuf, gradOffsets,
-            uniforms, total).GetAwaiter().GetResult();
+        WebGpuBuffer? dummyMask = null;
+        try
+        {
+            IGpuBuffer maskBuf;
+            if (mask is not null) { maskBuf = mask; }
+            else { dummyMask = (WebGpuBuffer)AllocateBuffer(1); maskBuf = dummyMask; }
+            var uniforms = MakeDeformConvUniforms(batch, inChannels, outChannels, inHeight, inWidth, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, groups, deformGroups, hasMask);
+            int kernelSize = kernelH * kernelW;
+            int total = batch * deformGroups * 2 * kernelSize * outHeight * outWidth;
+            Dispatch6BufferAsync("DeformableConv2DBackwardOffset", WebGpuKernels.DeformableConv2DBackwardOffsetSource,
+                "deformable_conv2d_backward_offset", gradOutput, input, weights, offsets, maskBuf, gradOffsets,
+                uniforms, total).GetAwaiter().GetResult();
+        }
+        finally { dummyMask?.Dispose(); }
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,

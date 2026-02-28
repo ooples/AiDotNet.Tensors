@@ -6288,17 +6288,38 @@ fn gsb_reflect(x: f32, lo: f32, hi: f32) -> f32 {
     return v + lo;
 }
 
-fn gsb_apply_padding(px: f32, size: u32) -> f32 {
+fn gsb_apply_padding(px: f32, size: u32) -> vec2<f32> {
     if (gsb_p.padding_mode == 1u) {
-        return clamp(px, 0.0, f32(size - 1u));
-    } else if (gsb_p.padding_mode == 2u) {
-        if (gsb_p.align_corners > 0u) {
-            return gsb_reflect(px, 0.0, f32(size - 1u));
-        } else {
-            return gsb_reflect(px, -0.5, f32(size) - 0.5);
+        // Border: clamp. Derivative is 0 when clamped, 1 when in range.
+        let lo = 0.0;
+        let hi = f32(size - 1u);
+        if (px < lo || px > hi) {
+            return vec2<f32>(clamp(px, lo, hi), 0.0);
         }
+        return vec2<f32>(px, 1.0);
+    } else if (gsb_p.padding_mode == 2u) {
+        // Reflection: derivative is +1 or -1 depending on period parity.
+        var lo: f32; var hi: f32;
+        if (gsb_p.align_corners > 0u) {
+            lo = 0.0; hi = f32(size - 1u);
+        } else {
+            lo = -0.5; hi = f32(size) - 0.5;
+        }
+        let span = hi - lo;
+        if (span <= 0.0) { return vec2<f32>(lo, 0.0); }
+        var v = px - lo;
+        var sign: f32 = 1.0;
+        if (v < 0.0) { v = -v; sign = -1.0; }
+        let periods = floor(v / span);
+        v = v - periods * span;
+        if (u32(periods) % 2u == 1u) {
+            v = span - v;
+            sign = -sign;
+        }
+        return vec2<f32>(v + lo, sign);
     }
-    return px;
+    // Zeros mode: no coordinate transform, derivative is 1.
+    return vec2<f32>(px, 1.0);
 }
 
 fn gsb_in_bounds(y: i32, x: i32) -> bool {
@@ -6353,9 +6374,11 @@ fn grid_sample_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         gm_y = 0.5 * f32(gsb_p.in_height);
     }
 
-    // Apply padding mode to coordinates
-    ix = gsb_apply_padding(ix, gsb_p.in_width);
-    iy = gsb_apply_padding(iy, gsb_p.in_height);
+    // Apply padding mode to coordinates with Jacobian
+    let pad_x = gsb_apply_padding(ix, gsb_p.in_width);
+    let pad_y = gsb_apply_padding(iy, gsb_p.in_height);
+    ix = pad_x.x; iy = pad_y.x;
+    let dpad_x = pad_x.y; let dpad_y = pad_y.y;
 
     let ix0 = i32(floor(ix)); let iy0 = i32(floor(iy));
     let ix1 = ix0 + 1; let iy1 = iy0 + 1;
@@ -6375,8 +6398,8 @@ fn grid_sample_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         let v10 = gsb_safe_sample(in_base, iy1, ix0);
         let v11 = gsb_safe_sample(in_base, iy1, ix1);
 
-        grad_grid_x += go * (wy0 * (v01 - v00) + wy1 * (v11 - v10)) * gm_x;
-        grad_grid_y += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gm_y;
+        grad_grid_x += go * (wy0 * (v01 - v00) + wy1 * (v11 - v10)) * gm_x * dpad_x;
+        grad_grid_y += go * (wx0 * (v10 - v00) + wx1 * (v11 - v01)) * gm_y * dpad_y;
 
         gsb_safe_atomic_add(in_base, iy0, ix0, go * wy0 * wx0);
         gsb_safe_atomic_add(in_base, iy0, ix1, go * wy0 * wx1);
