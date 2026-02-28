@@ -17984,7 +17984,10 @@ public class CpuEngine : IEngine
 
         for (int i = 0; i < varianceData.Length; i++)
         {
-            resultData[i] = numOps.Sqrt(varianceData[i]);
+            // Clamp variance to zero before sqrt to handle floating-point roundoff
+            // that can produce tiny negative values from reduction operations
+            T v = numOps.LessThan(varianceData[i], numOps.Zero) ? numOps.Zero : varianceData[i];
+            resultData[i] = numOps.Sqrt(v);
         }
 
         return new Tensor<T>(variance.Shape, new Vector<T>(resultData));
@@ -17995,8 +17998,6 @@ public class CpuEngine : IEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-
-        var numOps = MathHelper.GetNumericOperations<T>();
 
         // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
         // Using a + t*(b-a) is more numerically stable and requires fewer ops
