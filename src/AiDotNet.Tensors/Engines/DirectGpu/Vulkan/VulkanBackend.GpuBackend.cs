@@ -81,6 +81,16 @@ public sealed unsafe partial class VulkanBackend
     private void GpuBinaryOp(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, VulkanKernelType kernelType)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
+        if (size > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds first input buffer length ({A.Size}).");
+        if (size > B.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds second input buffer length ({B.Size}).");
+        if (size > C.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({C.Size}).");
+
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var vbC = AsVulkan(C);
@@ -99,6 +109,14 @@ public sealed unsafe partial class VulkanBackend
     private void GpuUnaryOp(IGpuBuffer A, IGpuBuffer B, int size, VulkanKernelType kernelType)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
+        if (size > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({A.Size}).");
+        if (size > B.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds output buffer length ({B.Size}).");
+
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
 
@@ -206,6 +224,18 @@ public sealed unsafe partial class VulkanBackend
     public void Copy(IGpuBuffer source, int srcOffset, IGpuBuffer destination, int destOffset, int size)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
+        if (srcOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(srcOffset), "Source offset must be non-negative.");
+        if (destOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(destOffset), "Destination offset must be non-negative.");
+        if (srcOffset + size > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Source offset ({srcOffset}) + size ({size}) exceeds source buffer length ({source.Size}).");
+        if (destOffset + size > destination.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Destination offset ({destOffset}) + size ({size}) exceeds destination buffer length ({destination.Size}).");
+
         var src = DownloadBuffer(source);
         // Only download destination when partial copy needs to preserve existing data
         float[] dst;
@@ -241,10 +271,17 @@ public sealed unsafe partial class VulkanBackend
     /// <summary>
     /// Allocates a GPU buffer for raw byte data.
     /// </summary>
+    /// <param name="size">The number of bytes to allocate.</param>
+    /// <returns>
+    /// A GPU buffer whose <see cref="IGpuBuffer.Size"/> is the number of float elements
+    /// needed to hold <paramref name="size"/> bytes (i.e., <c>ceil(size / 4)</c>), and whose
+    /// <see cref="IGpuBuffer.SizeInBytes"/> is <c>Size * 4</c>.
+    /// Callers must track the original byte count separately for correct data interpretation.
+    /// </returns>
     /// <remarks>
     /// Vulkan storage buffers are float-typed, so byte data is packed into float elements.
-    /// The buffer's Size property reflects the float element count, not the original byte count.
-    /// Callers must track the original byte count separately for correct data interpretation.
+    /// For example, <c>AllocateByteBuffer(10)</c> returns a buffer with <c>Size == 3</c>
+    /// (3 floats = 12 bytes, enough for the requested 10 bytes).
     /// </remarks>
     public IGpuBuffer AllocateByteBuffer(int size)
     {
@@ -690,6 +727,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
+        if (size > input.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds input buffer length ({input.Size}).");
         var data = DownloadBuffer(input);
         // Welford's algorithm for numerically stable variance computation
         double mean = 0;
@@ -702,6 +741,8 @@ public sealed unsafe partial class VulkanBackend
             m2 += delta * delta2;
         }
         double variance = m2 / size;
+        // Clamp variance to zero before sqrt to handle floating-point roundoff
+        if (variance < 0) variance = 0;
         return (float)Math.Sqrt(variance);
     }
 
@@ -789,9 +830,23 @@ public sealed unsafe partial class VulkanBackend
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
         EnsureInitialized();
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Size must be non-negative.");
+        if (size == 0) return;
+        if (size > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds source buffer length ({source.Size}).");
         var s = DownloadBuffer(source);
-        var d = new float[size];
-        Array.Copy(s, 0, d, 0, size);
+        // Use destination.Size for the array to preserve trailing elements when size < destination.Size
+        float[] d;
+        if (size >= destination.Size)
+        {
+            d = new float[destination.Size];
+        }
+        else
+        {
+            d = DownloadBuffer(destination);
+        }
+        Array.Copy(s, 0, d, 0, Math.Min(size, destination.Size));
         UploadToBuffer(d, destination);
     }
 
