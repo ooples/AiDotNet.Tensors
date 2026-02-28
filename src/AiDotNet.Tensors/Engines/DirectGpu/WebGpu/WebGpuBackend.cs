@@ -987,6 +987,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend
         }
 
         _disposed = true;
+        _sharedDummyBuffer?.Dispose();
+        _sharedDummyBuffer = null;
         _shaderLibrary.Dispose();
         _pipelineCache.Clear();
     }
