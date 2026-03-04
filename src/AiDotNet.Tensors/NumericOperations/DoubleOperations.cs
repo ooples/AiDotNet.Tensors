@@ -819,9 +819,29 @@ public class DoubleOperations : INumericOperations<double>
     /// <remarks>
     /// Uses AVX-512/AVX2/SSE for hardware acceleration on .NET 8+, with fallback on pre-.NET 8 targets.
     /// </remarks>
-    public void Add(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
+    public unsafe void Add(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* yPtr = y)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* yp = yPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Add(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new ReadOnlySpan<double>(yp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Add(x, y, destination);
 #else
         TensorPrimitivesCore.InvokeSpanSpanIntoSpan<AddOperatorDouble>(x, y, destination);
@@ -831,9 +851,29 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise subtraction using SIMD-optimized TensorPrimitives.
     /// </summary>
-    public void Subtract(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
+    public unsafe void Subtract(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* yPtr = y)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* yp = yPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Subtract(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new ReadOnlySpan<double>(yp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Subtract(x, y, destination);
 #else
         TensorPrimitivesCore.InvokeSpanSpanIntoSpan<SubtractOperatorDouble>(x, y, destination);
@@ -843,9 +883,29 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise multiplication using SIMD-optimized TensorPrimitives.
     /// </summary>
-    public void Multiply(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
+    public unsafe void Multiply(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* yPtr = y)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* yp = yPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Multiply(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new ReadOnlySpan<double>(yp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Multiply(x, y, destination);
 #else
         TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(x, y, destination);
@@ -855,9 +915,29 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise division using SIMD-optimized TensorPrimitives.
     /// </summary>
-    public void Divide(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
+    public unsafe void Divide(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* yPtr = y)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* yp = yPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Divide(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new ReadOnlySpan<double>(yp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Divide(x, y, destination);
 #else
         TensorPrimitivesCore.InvokeSpanSpanIntoSpan<DivideOperatorDouble>(x, y, destination);
@@ -954,9 +1034,26 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes exponential using SIMD-optimized TensorPrimitives.
     /// </summary>
-    public void Exp(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Exp(ReadOnlySpan<double> x, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Exp(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Exp(x, destination);
 #else
         TensorPrimitivesCore.InvokeSpanIntoSpan<ExpOperatorDouble>(x, destination);
@@ -964,11 +1061,28 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Computes natural logarithm using SIMD-optimized TensorPrimitives.
+    /// Computes natural logarithm with parallel processing for large arrays.
     /// </summary>
-    public void Log(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Log(ReadOnlySpan<double> x, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Log(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Log(x, destination);
 #else
         TensorPrimitivesCore.InvokeSpanIntoSpan<LogOperatorDouble>(x, destination);
@@ -976,11 +1090,28 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Computes hyperbolic tangent using SIMD-optimized TensorPrimitives.
+    /// Computes hyperbolic tangent with parallel processing for large arrays.
     /// </summary>
-    public void Tanh(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Tanh(ReadOnlySpan<double> x, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Tanh(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Tanh(x, destination);
 #else
         TensorPrimitivesCore.InvokeSpanIntoSpan<TanhOperatorDouble>(x, destination);
