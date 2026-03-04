@@ -13329,15 +13329,16 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(condition.Shape);
-        int totalElements = condition.Shape.Aggregate(1, (a, b) => a * b);
+        var condSpan = condition.AsSpan();
+        var xSpan = x.AsSpan();
+        var ySpan = y.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        Parallel.For(0, totalElements, i =>
+        for (int i = 0; i < condSpan.Length; i++)
         {
-            T condVal = condition.GetFlat(i);
-            // Condition is true if not equal to zero
-            bool isTrue = !numOps.Equals(condVal, numOps.Zero);
-            result.SetFlat(i, isTrue ? x.GetFlat(i) : y.GetFlat(i));
-        });
+            bool isTrue = !numOps.Equals(condSpan[i], numOps.Zero);
+            dest[i] = isTrue ? xSpan[i] : ySpan[i];
+        }
 
         return result;
     }
@@ -13779,20 +13780,9 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Subtract(scalar, tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Subtract(scalar, tensor.GetFlat(i)));
-            }
-        }
+        // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
+        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
+        numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
@@ -14284,18 +14274,20 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(predictions.Shape);
-        int totalElements = predictions.Length;
+        var predSpan = predictions.AsSpan();
+        var targetSpan = targets.AsSpan();
+        var dest = result.AsWritableSpan();
+        T upperBound = numOps.Subtract(numOps.One, epsilon);
+        double upperVal = numOps.ToDouble(upperBound);
+        double epsVal = numOps.ToDouble(epsilon);
 
-        Parallel.For(0, totalElements, i =>
+        for (int i = 0; i < predSpan.Length; i++)
         {
-            T p = predictions.GetFlat(i);
-            T t = targets.GetFlat(i);
+            T p = predSpan[i];
+            T t = targetSpan[i];
 
-            // Clip for numerical stability using comparisons
-            T upperBound = numOps.Subtract(numOps.One, epsilon);
+            // Clip for numerical stability
             double pVal = numOps.ToDouble(p);
-            double upperVal = numOps.ToDouble(upperBound);
-            double epsVal = numOps.ToDouble(epsilon);
             T clippedUpper = pVal < upperVal ? p : upperBound;
             double clippedUpperVal = numOps.ToDouble(clippedUpper);
             T pClipped = clippedUpperVal > epsVal ? clippedUpper : epsilon;
@@ -14305,12 +14297,10 @@ public class CpuEngine : ITensorLevelEngine
             T log1MinusP = numOps.Log(numOps.Subtract(numOps.One, pClipped));
             T oneMinusT = numOps.Subtract(numOps.One, t);
 
-            T loss = numOps.Negate(numOps.Add(
+            dest[i] = numOps.Negate(numOps.Add(
                 numOps.Multiply(t, logP),
                 numOps.Multiply(oneMinusT, log1MinusP)));
-
-            result.SetFlat(i, loss);
-        });
+        }
 
         return result;
     }
@@ -14323,18 +14313,20 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(predictions.Shape);
-        int totalElements = predictions.Length;
+        var predSpan = predictions.AsSpan();
+        var targetSpan = targets.AsSpan();
+        var dest = result.AsWritableSpan();
+        T upperBound = numOps.Subtract(numOps.One, epsilon);
+        double upperVal = numOps.ToDouble(upperBound);
+        double epsVal = numOps.ToDouble(epsilon);
 
-        Parallel.For(0, totalElements, i =>
+        for (int i = 0; i < predSpan.Length; i++)
         {
-            T p = predictions.GetFlat(i);
-            T t = targets.GetFlat(i);
+            T p = predSpan[i];
+            T t = targetSpan[i];
 
-            // Clip for numerical stability using comparisons
-            T upperBound = numOps.Subtract(numOps.One, epsilon);
+            // Clip for numerical stability
             double pVal = numOps.ToDouble(p);
-            double upperVal = numOps.ToDouble(upperBound);
-            double epsVal = numOps.ToDouble(epsilon);
             T clippedUpper = pVal < upperVal ? p : upperBound;
             double clippedUpperVal = numOps.ToDouble(clippedUpper);
             T pClipped = clippedUpperVal > epsVal ? clippedUpper : epsilon;
@@ -14345,9 +14337,8 @@ public class CpuEngine : ITensorLevelEngine
             T oneMinusT = numOps.Subtract(numOps.One, t);
             T termB = numOps.Divide(oneMinusT, oneMinusP);
 
-            T grad = numOps.Subtract(termB, termA);
-            result.SetFlat(i, grad);
-        });
+            dest[i] = numOps.Subtract(termB, termA);
+        }
 
         return result;
     }
@@ -14815,11 +14806,11 @@ public class CpuEngine : ITensorLevelEngine
         if (func == null) throw new ArgumentNullException(nameof(func));
 
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        Parallel.For(0, tensor.Length, i =>
-        {
-            result.SetFlat(i, func(tensor.GetFlat(i)));
-        });
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = func(src[i]);
 
         return result;
     }
@@ -14831,14 +14822,14 @@ public class CpuEngine : ITensorLevelEngine
         if (mask == null) throw new ArgumentNullException(nameof(mask));
 
         var result = tensor.Clone();
+        var maskSpan = mask.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        Parallel.For(0, tensor.Length, i =>
+        for (int i = 0; i < maskSpan.Length; i++)
         {
-            if (mask.GetFlat(i))
-            {
-                result.SetFlat(i, value);
-            }
-        });
+            if (maskSpan[i])
+                dest[i] = value;
+        }
 
         return result;
     }
@@ -15820,16 +15811,16 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input.Shape);
-        int totalElements = input.Length;
+        var src = input.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        Parallel.For(0, totalElements, i =>
+        for (int i = 0; i < src.Length; i++)
         {
-            double x = numOps.ToDouble(input.GetFlat(i));
+            double x = numOps.ToDouble(src[i]);
             double sigmoid = 1.0 / (1.0 + Math.Exp(-x));
             double swish = x * sigmoid;
-            double derivative = swish + sigmoid * (1.0 - swish);
-            result.SetFlat(i, numOps.FromDouble(derivative));
-        });
+            dest[i] = numOps.FromDouble(swish + sigmoid * (1.0 - swish));
+        }
 
         return result;
     }
@@ -15841,14 +15832,11 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input.Shape);
-        int totalElements = input.Length;
+        var src = input.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        Parallel.For(0, totalElements, i =>
-        {
-            T val = input.GetFlat(i);
-            bool positive = numOps.ToDouble(val) > 0;
-            result.SetFlat(i, positive ? numOps.One : alpha);
-        });
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.ToDouble(src[i]) > 0 ? numOps.One : alpha;
 
         return result;
     }
@@ -15860,22 +15848,22 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input.Shape);
-        int totalElements = input.Length;
+        var src = input.AsSpan();
+        var dest = result.AsWritableSpan();
 
         const double sqrtTwoOverPi = 0.7978845608028654; // sqrt(2/pi)
         const double coeff = 0.044715;
 
-        Parallel.For(0, totalElements, i =>
+        for (int i = 0; i < src.Length; i++)
         {
-            double x = numOps.ToDouble(input.GetFlat(i));
+            double x = numOps.ToDouble(src[i]);
             double x3 = x * x * x;
             double inner = sqrtTwoOverPi * (x + coeff * x3);
             double tanh = Math.Tanh(inner);
             double sech2 = 1.0 - tanh * tanh;
             double innerDeriv = sqrtTwoOverPi * (1.0 + 3.0 * coeff * x * x);
-            double derivative = 0.5 * (1.0 + tanh) + 0.5 * x * sech2 * innerDeriv;
-            result.SetFlat(i, numOps.FromDouble(derivative));
-        });
+            dest[i] = numOps.FromDouble(0.5 * (1.0 + tanh) + 0.5 * x * sech2 * innerDeriv);
+        }
 
         return result;
     }
