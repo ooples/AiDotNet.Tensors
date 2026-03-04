@@ -1,10 +1,14 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
+#endif
+#if NET8_0_OR_GREATER
+using System.Numerics.Tensors;
 #endif
 
 namespace AiDotNet.Tensors.Engines.Simd
@@ -345,6 +349,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET8_0_OR_GREATER
+            TensorPrimitives.Exp(input, output);
+#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -353,6 +360,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Exp(input[i]);
 #endif
             }
+#endif
         }
 
         /// <summary>
@@ -515,13 +523,42 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-            // Scalar implementation (transcendental functions don't vectorize well without special libs)
+#if NET8_0_OR_GREATER
+            // SIMD-optimized: Mish(x) = x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))
+            // Use TensorPrimitives for vectorized exp, log, tanh
+            float[] tempBuf = ArrayPool<float>.Shared.Rent(length);
+            float[] temp2Buf = ArrayPool<float>.Shared.Rent(length);
+            try
+            {
+                var temp = tempBuf.AsSpan(0, length);
+                var temp2 = temp2Buf.AsSpan(0, length);
+
+                // Step 1: temp = exp(x)
+                TensorPrimitives.Exp(input, temp);
+                // Step 2: temp = 1 + exp(x) = softplus_inner
+                TensorPrimitives.Add(temp, 1.0f, temp);
+                // Step 3: temp = log(1 + exp(x)) = softplus(x)
+                TensorPrimitives.Log(temp, temp);
+                // Step 4: For numerical stability, clamp softplus: if x > 20, softplus ≈ x
+                for (int i = 0; i < length; i++)
+                {
+                    if (input[i] > 20f) temp[i] = input[i];
+                }
+                // Step 5: temp2 = tanh(softplus(x))
+                TensorPrimitives.Tanh(temp, temp2);
+                // Step 6: output = x * tanh(softplus(x))
+                TensorPrimitives.Multiply(input, temp2, output);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(tempBuf);
+                ArrayPool<float>.Shared.Return(temp2Buf);
+            }
+#else
             for (int i = 0; i < length; i++)
             {
                 float x = input[i];
 #if NET5_0_OR_GREATER
-                // softplus(x) = ln(1 + exp(x))
-                // For numerical stability: if x > 20, softplus(x) approx x
                 float softplus = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
                 output[i] = x * MathF.Tanh(softplus);
 #else
@@ -529,6 +566,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = x * (float)Math.Tanh(softplus);
 #endif
             }
+#endif
         }
 
         /// <summary>
@@ -545,7 +583,22 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-            // Scalar implementation (sigmoid requires exp which doesn't vectorize well without special libs)
+#if NET8_0_OR_GREATER
+            // SIMD-optimized: Swish(x) = x * sigmoid(x)
+            float[] tempBuf = ArrayPool<float>.Shared.Rent(length);
+            try
+            {
+                var temp = tempBuf.AsSpan(0, length);
+                // Step 1: temp = sigmoid(x)
+                TensorPrimitives.Sigmoid(input, temp);
+                // Step 2: output = x * sigmoid(x)
+                TensorPrimitives.Multiply(input, temp, output);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(tempBuf);
+            }
+#else
             for (int i = 0; i < length; i++)
             {
                 float x = input[i];
@@ -556,6 +609,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
                 output[i] = x * sigmoid;
             }
+#endif
         }
 
         /// <summary>
@@ -571,9 +625,62 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             int length = output.Length;
+            int i = 0;
 
-            // Scalar implementation (exp doesn't vectorize well without special libs)
-            for (int i = 0; i < length; i++)
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var vzero = Vector256<float>.Zero;
+                var valpha = Vector256.Create(alpha);
+                var vone = Vector256.Create(1.0f);
+                int simdLength = length & ~7;
+
+                // Use TensorPrimitives for vectorized exp on .NET 8+, then blend
+#if NET8_0_OR_GREATER
+                // Compute exp(x) for entire span first, then blend positive/negative
+                float[] expBuf = ArrayPool<float>.Shared.Rent(length);
+                try
+                {
+                    var expSpan = expBuf.AsSpan(0, length);
+                    TensorPrimitives.Exp(input, expSpan);
+
+                    for (; i < simdLength; i += 8)
+                    {
+                        var x = ReadVector256(input, i);
+                        var expx = ReadVector256(expSpan, i);
+                        // negative path: alpha * (exp(x) - 1)
+                        var negResult = Avx.Multiply(valpha, Avx.Subtract(expx, vone));
+                        // mask: x > 0
+                        var mask = Avx.CompareGreaterThan(x, vzero);
+                        // blend: positive keeps x, negative gets alpha*(exp(x)-1)
+                        WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(expBuf);
+                }
+#else
+                for (; i < simdLength; i += 8)
+                {
+                    var x = ReadVector256(input, i);
+                    // For scalar exp per element on pre-.NET 8
+                    Span<float> expTmp = stackalloc float[8];
+                    for (int j = 0; j < 8; j++)
+                    {
+                        expTmp[j] = MathF.Exp(input[i + j]);
+                    }
+                    var expx = ReadVector256(expTmp, 0);
+                    var negResult = Avx.Multiply(valpha, Avx.Subtract(expx, vone));
+                    var mask = Avx.CompareGreaterThan(x, vzero);
+                    WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
+                }
+#endif
+            }
+#endif
+
+            // Scalar fallback
+            for (; i < length; i++)
             {
                 float x = input[i];
                 if (x > 0f)
@@ -1003,6 +1110,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET8_0_OR_GREATER
+            TensorPrimitives.Sin(input, output);
+#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1011,6 +1121,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Sin(input[i]);
 #endif
             }
+#endif
         }
 
         /// <summary>
@@ -1027,6 +1138,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+#if NET8_0_OR_GREATER
+            TensorPrimitives.Cos(input, output);
+#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1035,6 +1149,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Cos(input[i]);
 #endif
             }
+#endif
         }
 
         /// <summary>
@@ -1053,6 +1168,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("All spans must have the same length.");
             }
 
+#if NET8_0_OR_GREATER
+            TensorPrimitives.Sin(input, sinOutput);
+            TensorPrimitives.Cos(input, cosOutput);
+#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1062,6 +1181,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 cosOutput[i] = (float)Math.Cos(input[i]);
 #endif
             }
+#endif
         }
 
         /// <summary>
@@ -1371,23 +1491,31 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float HorizontalSum(Vector256<float> v)
         {
-            Span<float> tmp = stackalloc float[8];
-            Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(tmp)), v);
-            float sum = 0f;
-            for (int i = 0; i < tmp.Length; i++)
-            {
-                sum += tmp[i];
-            }
-
-            return sum;
+            // SIMD shuffle reduction: no stack spill
+            // Step 1: Add upper 128 bits to lower 128 bits
+            var lo = v.GetLower();
+            var hi = Avx.ExtractVector128(v, 1);
+            var sum128 = Sse.Add(lo, hi);
+            return HorizontalSum(sum128);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float HorizontalSum(Vector128<float> v)
         {
-            Span<float> tmp = stackalloc float[4];
-            Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(tmp)), v);
-            return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+            // SIMD shuffle reduction: [a, b, c, d]
+            // movehdup: [b, b, d, d], add with [a, b, c, d] -> [a+b, ?, c+d, ?]
+            if (Sse3.IsSupported)
+            {
+                var shuf = Sse3.MoveHighAndDuplicate(v); // [b, b, d, d]
+                var sums = Sse.Add(v, shuf);              // [a+b, ?, c+d, ?]
+                var hi = Sse.MoveHighToLow(sums, sums);   // [c+d, ?, ?, ?]
+                return Sse.AddScalar(sums, hi).ToScalar(); // a+b+c+d
+            }
+            // SSE fallback
+            var shuf2 = Sse.Shuffle(v, v, 0b_10_11_00_01); // [b, a, d, c]
+            var sums2 = Sse.Add(v, shuf2);                  // [a+b, a+b, c+d, c+d]
+            var hi2 = Sse.MoveHighToLow(sums2, sums2);      // [c+d, c+d, ?, ?]
+            return Sse.AddScalar(sums2, hi2).ToScalar();     // a+b+c+d
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1425,17 +1553,19 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static double HorizontalSum(Vector256<double> v)
         {
-            Span<double> tmp = stackalloc double[4];
-            Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref MemoryMarshal.GetReference(tmp)), v);
-            return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+            // SIMD shuffle reduction: add upper 128 to lower 128, then reduce 128-bit
+            var lo = v.GetLower();
+            var hi = Avx.ExtractVector128(v.AsDouble(), 1);
+            var sum128 = Sse2.Add(lo, hi);
+            return HorizontalSum(sum128);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static double HorizontalSum(Vector128<double> v)
         {
-            Span<double> tmp = stackalloc double[2];
-            Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref MemoryMarshal.GetReference(tmp)), v);
-            return tmp[0] + tmp[1];
+            // [a, b] -> shuffle to [b, a], add -> [a+b, a+b]
+            var hi = Sse2.Shuffle(v, v, 0b_01);
+            return Sse2.AddScalar(v, hi).ToScalar();
         }
 #endif
     }

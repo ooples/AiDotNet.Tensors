@@ -5,6 +5,7 @@ using System.Numerics.Tensors;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.Operators;
+using static AiDotNet.Tensors.Helpers.CpuParallelSettings;
 
 namespace AiDotNet.Tensors.NumericOperations;
 /// <summary>
@@ -35,6 +36,16 @@ namespace AiDotNet.Tensors.NumericOperations;
 /// </remarks>
 public class DoubleOperations : INumericOperations<double>
 {
+    /// <summary>
+    /// Threshold for parallel processing to maximize memory bandwidth.
+    /// </summary>
+    private const int ParallelThreshold = 50000;
+
+    /// <summary>
+    /// Minimum chunk size per thread to ensure cache efficiency.
+    /// </summary>
+    private const int MinChunkSize = 8192;
+
     /// <summary>
     /// Adds two double values together.
     /// </summary>
@@ -870,7 +881,46 @@ public class DoubleOperations : INumericOperations<double>
     /// </summary>
     public double Sum(ReadOnlySpan<double> x)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            int maxDegree = MaxDegreeOfParallelism;
+            int numChunks = Math.Min(maxDegree, (length + MinChunkSize - 1) / MinChunkSize);
+            if (numChunks <= 1)
+            {
+                return TensorPrimitives.Sum(x);
+            }
+
+            // Pad to cache line boundaries (64 bytes / 8 bytes per double = 8 doubles)
+            const int CacheLinePadding = 8;
+            var partialSums = new double[numChunks * CacheLinePadding];
+            int chunkSize = (length + numChunks - 1) / numChunks;
+
+            unsafe
+            {
+                fixed (double* xPtr = x)
+                {
+                    var xp = xPtr;
+                    Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
+                    {
+                        int start = i * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            partialSums[i * CacheLinePadding] = TensorPrimitives.Sum(new ReadOnlySpan<double>(xp + start, count));
+                        }
+                    });
+                }
+            }
+
+            double totalSum = 0;
+            for (int i = 0; i < numChunks; i++)
+            {
+                totalSum += partialSums[i * CacheLinePadding];
+            }
+            return totalSum;
+        }
         return TensorPrimitives.Sum(x);
 #else
         return TensorPrimitivesCore.Sum(x);
@@ -940,9 +990,26 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes sigmoid using SIMD-optimized TensorPrimitives.
     /// </summary>
-    public void Sigmoid(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Sigmoid(ReadOnlySpan<double> x, Span<double> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Sigmoid(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Sigmoid(x, destination);
 #else
         VectorizedOperationsFallback.Sigmoid(this, x, destination);
@@ -1189,62 +1256,172 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Computes LeakyReLU activation using SIMD-optimized SimdKernels.
+    /// Computes LeakyReLU activation with parallel chunking for large arrays.
     /// </summary>
-    public void LeakyReLU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
+    public unsafe void LeakyReLU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.LeakyReLU(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        alpha,
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.LeakyReLU(x, alpha, destination);
     }
 
     /// <summary>
-    /// Computes GELU (Gaussian Error Linear Unit) activation using SIMD-optimized SimdKernels.
+    /// Computes GELU activation with parallel chunking for large arrays.
     /// </summary>
-    public void GELU(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void GELU(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.GELU(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.GELU(x, destination);
     }
 
     /// <summary>
-    /// Computes Mish activation using SIMD-optimized SimdKernels.
+    /// Computes Mish activation with parallel chunking for large arrays.
     /// </summary>
-    public void Mish(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Mish(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.Mish(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.Mish(x, destination);
     }
 
     /// <summary>
-    /// Computes Swish/SiLU activation using SIMD-optimized SimdKernels.
+    /// Computes Swish/SiLU activation with parallel chunking for large arrays.
     /// </summary>
-    public void Swish(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void Swish(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.Swish(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.Swish(x, destination);
     }
 
     /// <summary>
-    /// Computes ELU (Exponential Linear Unit) activation using SIMD-optimized SimdKernels.
+    /// Computes ELU activation with parallel chunking for large arrays.
     /// </summary>
-    public void ELU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
+    public unsafe void ELU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.ELU(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        alpha,
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.ELU(x, alpha, destination);
     }
 
     /// <summary>
-    /// Computes ReLU activation using SIMD-optimized SimdKernels.
+    /// Computes ReLU activation with parallel chunking for large arrays.
     /// </summary>
-    public void ReLU(ReadOnlySpan<double> x, Span<double> destination)
+    public unsafe void ReLU(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (double* xPtr = x)
+            fixed (double* destPtr = destination)
+            {
+                double* xp = xPtr;
+                double* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.ReLU(
+                        new ReadOnlySpan<double>(xp + start, count),
+                        new Span<double>(dp + start, count));
+                });
+            }
+            return;
+        }
         Engines.Simd.SimdKernels.ReLU(x, destination);
     }
 

@@ -1042,8 +1042,10 @@ public class FloatOperations : INumericOperations<float>
                 return TensorPrimitives.Sum(x);
             }
 
-            // Allocate array for partial sums - each thread writes to its own slot
-            var partialSums = new float[numChunks];
+            // Pad partial sums to cache line boundaries (64 bytes / 4 bytes per float = 16 floats)
+            // to prevent false sharing between threads writing to adjacent slots
+            const int CacheLinePadding = 16; // 64 bytes / sizeof(float)
+            var partialSums = new float[numChunks * CacheLinePadding];
             int chunkSize = (length + numChunks - 1) / numChunks;
 
             unsafe
@@ -1057,7 +1059,7 @@ public class FloatOperations : INumericOperations<float>
                         int count = Math.Min(chunkSize, length - start);
                         if (count > 0)
                         {
-                            partialSums[i] = TensorPrimitives.Sum(new ReadOnlySpan<float>(xp + start, count));
+                            partialSums[i * CacheLinePadding] = TensorPrimitives.Sum(new ReadOnlySpan<float>(xp + start, count));
                         }
                     });
                 }
@@ -1067,7 +1069,7 @@ public class FloatOperations : INumericOperations<float>
             float totalSum = 0;
             for (int i = 0; i < numChunks; i++)
             {
-                totalSum += partialSums[i];
+                totalSum += partialSums[i * CacheLinePadding];
             }
             return totalSum;
         }
