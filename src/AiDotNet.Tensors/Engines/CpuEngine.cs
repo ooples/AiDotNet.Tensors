@@ -2241,22 +2241,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        // Use SIMD-friendly loop with parallel execution for large tensors
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Equals(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Equals(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Equals(src[i], value) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2274,21 +2263,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
-        {
-            Parallel.For(0, a.Length, i =>
-            {
-                result.SetFlat(i, numOps.Equals(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                result.SetFlat(i, numOps.Equals(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < srcA.Length; i++)
+            dest[i] = numOps.Equals(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2300,21 +2280,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, !numOps.Equals(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, !numOps.Equals(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = !numOps.Equals(src[i], value) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2332,21 +2302,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
-        {
-            Parallel.For(0, a.Length, i =>
-            {
-                result.SetFlat(i, !numOps.Equals(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                result.SetFlat(i, !numOps.Equals(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < srcA.Length; i++)
+            dest[i] = !numOps.Equals(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2364,21 +2325,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
-        {
-            Parallel.For(0, a.Length, i =>
-            {
-                result.SetFlat(i, numOps.GreaterThan(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                result.SetFlat(i, numOps.GreaterThan(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < srcA.Length; i++)
+            dest[i] = numOps.GreaterThan(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2390,21 +2342,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.GreaterThan(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.GreaterThan(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.GreaterThan(src[i], value) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2422,21 +2364,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
-        {
-            Parallel.For(0, a.Length, i =>
-            {
-                result.SetFlat(i, numOps.LessThan(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                result.SetFlat(i, numOps.LessThan(a.GetFlat(i), b.GetFlat(i)) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < srcA.Length; i++)
+            dest[i] = numOps.LessThan(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2448,21 +2381,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.LessThan(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.LessThan(tensor.GetFlat(i), value) ? numOps.One : numOps.Zero);
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.LessThan(src[i], value) ? numOps.One : numOps.Zero;
 
         return result;
     }
@@ -2538,21 +2461,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Power(tensor.GetFlat(i), exponent));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Power(tensor.GetFlat(i), exponent));
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Power(src[i], exponent);
 
         return result;
     }
@@ -2567,21 +2480,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(bases.Shape);
+        var srcB = bases.AsSpan();
+        var srcE = exponents.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (bases.Length > 10000)
-        {
-            Parallel.For(0, bases.Length, i =>
-            {
-                result.SetFlat(i, numOps.Power(bases.GetFlat(i), exponents.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < bases.Length; i++)
-            {
-                result.SetFlat(i, numOps.Power(bases.GetFlat(i), exponents.GetFlat(i)));
-            }
-        }
+        for (int i = 0; i < srcB.Length; i++)
+            dest[i] = numOps.Power(srcB[i], srcE[i]);
 
         return result;
     }
@@ -2593,21 +2497,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Floor(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Floor(tensor.GetFlat(i)));
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Floor(src[i]);
 
         return result;
     }
@@ -2619,21 +2513,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Ceiling(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Ceiling(tensor.GetFlat(i)));
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Ceiling(src[i]);
 
         return result;
     }
@@ -2645,21 +2529,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Frac(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Frac(tensor.GetFlat(i)));
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Frac(src[i]);
 
         return result;
     }
@@ -2671,21 +2545,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Sin(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Sin(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2697,21 +2557,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Cos(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Cos(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2905,21 +2751,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Power(tensor.GetFlat(i), exponent));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Power(tensor.GetFlat(i), exponent));
-            }
-        }
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.Power(src[i], exponent);
 
         return result;
     }
@@ -2934,24 +2770,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
+        for (int i = 0; i < srcA.Length; i++)
         {
-            Parallel.For(0, a.Length, i =>
-            {
-                var aVal = a.GetFlat(i);
-                var bVal = b.GetFlat(i);
-                result.SetFlat(i, numOps.GreaterThan(aVal, bVal) ? aVal : bVal);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                var aVal = a.GetFlat(i);
-                var bVal = b.GetFlat(i);
-                result.SetFlat(i, numOps.GreaterThan(aVal, bVal) ? aVal : bVal);
-            }
+            var aVal = srcA[i];
+            var bVal = srcB[i];
+            dest[i] = numOps.GreaterThan(aVal, bVal) ? aVal : bVal;
         }
 
         return result;
@@ -2964,22 +2791,13 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
+        for (int i = 0; i < src.Length; i++)
         {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                var tVal = tensor.GetFlat(i);
-                result.SetFlat(i, numOps.GreaterThan(tVal, value) ? tVal : value);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                var tVal = tensor.GetFlat(i);
-                result.SetFlat(i, numOps.GreaterThan(tVal, value) ? tVal : value);
-            }
+            var tVal = src[i];
+            dest[i] = numOps.GreaterThan(tVal, value) ? tVal : value;
         }
 
         return result;
@@ -2995,24 +2813,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
+        var srcA = a.AsSpan();
+        var srcB = b.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (a.Length > 10000)
+        for (int i = 0; i < srcA.Length; i++)
         {
-            Parallel.For(0, a.Length, i =>
-            {
-                var aVal = a.GetFlat(i);
-                var bVal = b.GetFlat(i);
-                result.SetFlat(i, numOps.LessThan(aVal, bVal) ? aVal : bVal);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < a.Length; i++)
-            {
-                var aVal = a.GetFlat(i);
-                var bVal = b.GetFlat(i);
-                result.SetFlat(i, numOps.LessThan(aVal, bVal) ? aVal : bVal);
-            }
+            var aVal = srcA[i];
+            var bVal = srcB[i];
+            dest[i] = numOps.LessThan(aVal, bVal) ? aVal : bVal;
         }
 
         return result;
@@ -3025,22 +2834,13 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
+        for (int i = 0; i < src.Length; i++)
         {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                var tVal = tensor.GetFlat(i);
-                result.SetFlat(i, numOps.LessThan(tVal, value) ? tVal : value);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                var tVal = tensor.GetFlat(i);
-                result.SetFlat(i, numOps.LessThan(tVal, value) ? tVal : value);
-            }
+            var tVal = src[i];
+            dest[i] = numOps.LessThan(tVal, value) ? tVal : value;
         }
 
         return result;
@@ -3053,26 +2853,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
 
-        if (tensor.Length > 10000)
+        for (int i = 0; i < src.Length; i++)
         {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                var val = tensor.GetFlat(i);
-                if (numOps.LessThan(val, min)) val = min;
-                else if (numOps.GreaterThan(val, max)) val = max;
-                result.SetFlat(i, val);
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                var val = tensor.GetFlat(i);
-                if (numOps.LessThan(val, min)) val = min;
-                else if (numOps.GreaterThan(val, max)) val = max;
-                result.SetFlat(i, val);
-            }
+            var val = src[i];
+            if (numOps.LessThan(val, min)) val = min;
+            else if (numOps.GreaterThan(val, max)) val = max;
+            dest[i] = val;
         }
 
         return result;
