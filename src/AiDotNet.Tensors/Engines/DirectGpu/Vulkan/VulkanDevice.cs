@@ -2,9 +2,11 @@
 // Vulkan device initialization and management for GPU compute.
 
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -41,6 +43,11 @@ public sealed unsafe class VulkanDevice : IDisposable
     private bool _disposed;
 
     private readonly object _submitLock = new();
+
+    // Per-thread command resources for concurrent Vulkan operations.
+    // Vulkan command pools are NOT thread-safe - each thread needs its own pool.
+    private readonly ConcurrentDictionary<int, ThreadCommandResources> _threadResources = new();
+
     private string _deviceName = string.Empty;
     private string _vendorName = string.Empty;
     private VkPhysicalDeviceLimits _limits;
@@ -616,20 +623,92 @@ public sealed unsafe class VulkanDevice : IDisposable
     }
 
     /// <summary>
-    /// Submits a command buffer and waits for completion.
+    /// Acquires per-thread command resources (command pool, command buffer, fence).
+    /// Each thread gets its own pool to avoid Vulkan thread-safety violations.
     /// </summary>
-    public void SubmitAndWait(IntPtr commandBuffer)
+    public ThreadCommandResources AcquireThreadResources()
     {
-        if (_device == IntPtr.Zero || _computeQueue == IntPtr.Zero || _fence == IntPtr.Zero)
+        if (!_initialized || _disposed)
+        {
+            throw new InvalidOperationException("Vulkan device not initialized.");
+        }
+
+        int threadId = Environment.CurrentManagedThreadId;
+        if (_threadResources.TryGetValue(threadId, out var existing))
+        {
+            return existing;
+        }
+
+        // Create per-thread command pool
+        var poolCreateInfo = new VkCommandPoolCreateInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            pNext = null,
+            flags = VkCommandPoolCreateFlags.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            queueFamilyIndex = _computeQueueFamily
+        };
+
+        IntPtr commandPool;
+        int poolResult = VulkanNativeBindings.vkCreateCommandPool(_device, &poolCreateInfo, IntPtr.Zero, out commandPool);
+        if (poolResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            throw new InvalidOperationException($"Failed to create per-thread command pool: {poolResult}");
+        }
+
+        // Allocate command buffer from per-thread pool
+        var allocInfo = new VkCommandBufferAllocateInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            pNext = null,
+            commandPool = commandPool,
+            level = VulkanNativeBindings.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            commandBufferCount = 1
+        };
+
+        IntPtr commandBuffer;
+        int allocResult = VulkanNativeBindings.vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer);
+        if (allocResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            VulkanNativeBindings.vkDestroyCommandPool(_device, commandPool, IntPtr.Zero);
+            throw new InvalidOperationException($"Failed to allocate per-thread command buffer: {allocResult}");
+        }
+
+        // Create per-thread fence
+        var fenceCreateInfo = new VkFenceCreateInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            pNext = null,
+            flags = 0
+        };
+
+        IntPtr fence;
+        int fenceResult = VulkanNativeBindings.vkCreateFence(_device, &fenceCreateInfo, IntPtr.Zero, out fence);
+        if (fenceResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            VulkanNativeBindings.vkDestroyCommandPool(_device, commandPool, IntPtr.Zero);
+            throw new InvalidOperationException($"Failed to create per-thread fence: {fenceResult}");
+        }
+
+        var resources = new ThreadCommandResources(commandPool, commandBuffer, fence);
+        _threadResources.TryAdd(threadId, resources);
+        return resources;
+    }
+
+    /// <summary>
+    /// Submits a command buffer and waits for completion using per-thread fence.
+    /// </summary>
+    public void SubmitAndWait(IntPtr commandBuffer, IntPtr fence)
+    {
+        if (_device == IntPtr.Zero || _computeQueue == IntPtr.Zero || fence == IntPtr.Zero)
         {
             return;
         }
 
-        // Vulkan spec requires external synchronization for vkQueueSubmit
+        // Vulkan spec requires external synchronization for vkQueueSubmit on the same queue
         lock (_submitLock)
         {
             // Reset fence
-            var fencePtr = _fence;
+            var fencePtr = fence;
             VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
 
             var submitInfo = new VkSubmitInfo
@@ -645,22 +724,47 @@ public sealed unsafe class VulkanDevice : IDisposable
                 pSignalSemaphores = null
             };
 
-            var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, _fence);
+            var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, fence);
             if (submitResult != VulkanNativeBindings.VK_SUCCESS)
             {
                 throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
             }
-
-            var waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
-            if (waitResult != VulkanNativeBindings.VK_SUCCESS)
-            {
-                throw new InvalidOperationException($"vkWaitForFences failed with error code {waitResult}");
-            }
         }
+
+        // Wait outside the submit lock - each thread has its own fence
+        var waitFencePtr = fence;
+        var waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &waitFencePtr, 1, ulong.MaxValue);
+        if (waitResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            throw new InvalidOperationException($"vkWaitForFences failed with error code {waitResult}");
+        }
+    }
+
+    /// <summary>
+    /// Submits a command buffer and waits for completion using the shared fence (legacy).
+    /// </summary>
+    public void SubmitAndWait(IntPtr commandBuffer)
+    {
+        SubmitAndWait(commandBuffer, _fence);
     }
 
     private void Cleanup()
     {
+        // Clean up per-thread resources
+        foreach (var kvp in _threadResources)
+        {
+            var res = kvp.Value;
+            if (res.Fence != IntPtr.Zero && _device != IntPtr.Zero)
+            {
+                VulkanNativeBindings.vkDestroyFence(_device, res.Fence, IntPtr.Zero);
+            }
+            if (res.CommandPool != IntPtr.Zero && _device != IntPtr.Zero)
+            {
+                VulkanNativeBindings.vkDestroyCommandPool(_device, res.CommandPool, IntPtr.Zero);
+            }
+        }
+        _threadResources.Clear();
+
         if (_fence != IntPtr.Zero)
         {
             VulkanNativeBindings.vkDestroyFence(_device, _fence, IntPtr.Zero);
@@ -705,5 +809,23 @@ public sealed unsafe class VulkanDevice : IDisposable
     public override string ToString()
     {
         return $"VulkanDevice[{_vendorName} {_deviceName}]";
+    }
+}
+
+/// <summary>
+/// Per-thread Vulkan command resources (command pool, command buffer, fence).
+/// Each thread needs its own command pool because Vulkan command pools are not thread-safe.
+/// </summary>
+public readonly struct ThreadCommandResources
+{
+    public IntPtr CommandPool { get; }
+    public IntPtr CommandBuffer { get; }
+    public IntPtr Fence { get; }
+
+    public ThreadCommandResources(IntPtr commandPool, IntPtr commandBuffer, IntPtr fence)
+    {
+        CommandPool = commandPool;
+        CommandBuffer = commandBuffer;
+        Fence = fence;
     }
 }

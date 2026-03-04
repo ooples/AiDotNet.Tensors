@@ -109,10 +109,11 @@ public sealed unsafe partial class VulkanBackend
         if (pipeline is null)
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
 
+        var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
         }
     }
 
@@ -134,10 +135,11 @@ public sealed unsafe partial class VulkanBackend
         if (pipeline is null)
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
 
+        var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
         }
     }
 
@@ -464,10 +466,11 @@ public sealed unsafe partial class VulkanBackend
         if (pipeline is null)
             throw new InvalidOperationException("Failed to create scalar multiply pipeline.");
 
+        var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage);
-            RecordAndExecuteComputeWithScalarUnlocked(pipeline, size, scalar);
+            RecordAndExecuteComputeWithScalarUnlocked(pipeline, size, scalar, threadRes);
         }
     }
 
