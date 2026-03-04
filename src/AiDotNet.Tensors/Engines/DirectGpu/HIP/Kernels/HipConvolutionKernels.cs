@@ -322,6 +322,199 @@ extern ""C"" __global__ void conv_transpose2d_backward_kernel(
     gradKernel[idx] = sum;
 }
 
+// ===========================================================================
+// SHARED-MEMORY TILED CONV2D
+// ===========================================================================
+#define TILE_OUT 16
+
+extern ""C"" __global__ void conv2d_tiled(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    int tileRow = blockIdx.y * TILE_OUT;
+    int tileCol = blockIdx.x * TILE_OUT;
+    int oc = blockIdx.z % outChannels;
+    int b  = blockIdx.z / outChannels;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int oh = tileRow + ty;
+    int ow = tileCol + tx;
+
+    int effKH = (kernelH - 1) * dilationH + 1;
+    int effKW = (kernelW - 1) * dilationW + 1;
+    int tileInH = TILE_OUT * strideH + effKH - strideH;
+    int tileInW = TILE_OUT * strideW + effKW - strideW;
+
+    extern __shared__ float smem[];
+
+    float sum = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        int inRowStart = tileRow * strideH - padH;
+        int inColStart = tileCol * strideW - padW;
+
+        int tilesPerThread = (tileInH * tileInW + TILE_OUT * TILE_OUT - 1) / (TILE_OUT * TILE_OUT);
+        int tid = ty * TILE_OUT + tx;
+
+        for (int t = 0; t < tilesPerThread; t++) {
+            int idx = tid + t * TILE_OUT * TILE_OUT;
+            if (idx < tileInH * tileInW) {
+                int sy = idx / tileInW;
+                int sx = idx % tileInW;
+                int iy = inRowStart + sy;
+                int ix = inColStart + sx;
+                float val = 0.0f;
+                if (iy >= 0 && iy < inHeight && ix >= 0 && ix < inWidth) {
+                    val = input[((b * inChannels + ic) * inHeight + iy) * inWidth + ix];
+                }
+                smem[idx] = val;
+            }
+        }
+        __syncthreads();
+
+        if (oh < outHeight && ow < outWidth) {
+            for (int kh = 0; kh < kernelH; kh++) {
+                for (int kw = 0; kw < kernelW; kw++) {
+                    int sy = ty * strideH + kh * dilationH;
+                    int sx = tx * strideW + kw * dilationW;
+                    float inVal = smem[sy * tileInW + sx];
+                    float wVal = weight[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
+                    sum += inVal * wVal;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (oh < outHeight && ow < outWidth) {
+        output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+    }
+}
+
+// ===========================================================================
+// WINOGRAD F(2x2, 3x3) CONVOLUTION
+// ===========================================================================
+
+__device__ __forceinline__ void winograd_input_transform(const float tile[4][4], float d[4][4])
+{
+    float tmp[4][4];
+    for (int j = 0; j < 4; j++) {
+        tmp[0][j] = tile[0][j] - tile[2][j];
+        tmp[1][j] = tile[1][j] + tile[2][j];
+        tmp[2][j] = -tile[1][j] + tile[2][j];
+        tmp[3][j] = tile[1][j] - tile[3][j];
+    }
+    for (int i = 0; i < 4; i++) {
+        d[i][0] = tmp[i][0] - tmp[i][2];
+        d[i][1] = tmp[i][1] + tmp[i][2];
+        d[i][2] = -tmp[i][1] + tmp[i][2];
+        d[i][3] = tmp[i][1] - tmp[i][3];
+    }
+}
+
+__device__ __forceinline__ void winograd_filter_transform(const float g[3][3], float u[4][4])
+{
+    float tmp[4][3];
+    for (int j = 0; j < 3; j++) {
+        tmp[0][j] = g[0][j];
+        tmp[1][j] = 0.5f * (g[0][j] + g[1][j] + g[2][j]);
+        tmp[2][j] = 0.5f * (g[0][j] - g[1][j] + g[2][j]);
+        tmp[3][j] = g[2][j];
+    }
+    for (int i = 0; i < 4; i++) {
+        u[i][0] = tmp[i][0];
+        u[i][1] = 0.5f * (tmp[i][0] + tmp[i][1] + tmp[i][2]);
+        u[i][2] = 0.5f * (tmp[i][0] - tmp[i][1] + tmp[i][2]);
+        u[i][3] = tmp[i][2];
+    }
+}
+
+__device__ __forceinline__ void winograd_output_transform(const float m[4][4], float out2x2[2][2])
+{
+    float tmp[2][4];
+    for (int j = 0; j < 4; j++) {
+        tmp[0][j] = m[0][j] + m[1][j] + m[2][j];
+        tmp[1][j] = m[1][j] - m[2][j] - m[3][j];
+    }
+    out2x2[0][0] = tmp[0][0] + tmp[0][1] + tmp[0][2];
+    out2x2[0][1] = tmp[0][1] - tmp[0][2] - tmp[0][3];
+    out2x2[1][0] = tmp[1][0] + tmp[1][1] + tmp[1][2];
+    out2x2[1][1] = tmp[1][1] - tmp[1][2] - tmp[1][3];
+}
+
+extern ""C"" __global__ void conv2d_winograd_f2x2_3x3(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int padH, int padW)
+{
+    int tilesH = (outHeight + 1) / 2;
+    int tilesW = (outWidth + 1) / 2;
+
+    int tileIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalTiles = batch * outChannels * tilesH * tilesW;
+    if (tileIdx >= totalTiles) return;
+
+    int tw = tileIdx % tilesW;
+    int th = (tileIdx / tilesW) % tilesH;
+    int oc = (tileIdx / (tilesW * tilesH)) % outChannels;
+    int b  = tileIdx / (tilesW * tilesH * outChannels);
+
+    int outRow = th * 2;
+    int outCol = tw * 2;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        float tile[4][4];
+        int inRow = outRow - padH;
+        int inCol = outCol - padW;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                int r = inRow + i;
+                int c = inCol + j;
+                tile[i][j] = (r >= 0 && r < inHeight && c >= 0 && c < inWidth)
+                    ? input[((b * inChannels + ic) * inHeight + r) * inWidth + c]
+                    : 0.0f;
+            }
+        }
+
+        float g[3][3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                g[i][j] = weight[((oc * inChannels + ic) * 3 + i) * 3 + j];
+
+        float d[4][4], u[4][4];
+        winograd_input_transform(tile, d);
+        winograd_filter_transform(g, u);
+
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                acc[i][j] += d[i][j] * u[i][j];
+    }
+
+    float out2x2[2][2];
+    winograd_output_transform(acc, out2x2);
+
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            int r = outRow + i;
+            int c = outCol + j;
+            if (r < outHeight && c < outWidth) {
+                output[((b * outChannels + oc) * outHeight + r) * outWidth + c] = out2x2[i][j];
+            }
+        }
+    }
+}
+
 extern ""C"" __global__ void conv3d_direct(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inDepth, int inHeight, int inWidth,
@@ -367,7 +560,8 @@ extern ""C"" __global__ void conv3d_direct(
         {
             "im2col", "col2im", "conv2d_direct", "conv2d_backward_input",
             "conv2d_backward_kernel", "depthwise_conv2d", "conv_transpose2d",
-            "conv_transpose2d_backward_input", "conv_transpose2d_backward_kernel", "conv3d_direct"
+            "conv_transpose2d_backward_input", "conv_transpose2d_backward_kernel",
+            "conv2d_tiled", "conv2d_winograd_f2x2_3x3", "conv3d_direct"
         };
     }
 }

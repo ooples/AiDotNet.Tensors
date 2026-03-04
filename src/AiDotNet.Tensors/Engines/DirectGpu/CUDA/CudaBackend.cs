@@ -2262,6 +2262,20 @@ public sealed class CudaBackend : IAsyncGpuBackend
             "cuLaunchKernel2DSharedMem");
     }
 
+    private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMemBytes = 0)
+    {
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(
+                kernel,
+                gridX, gridY, gridZ,
+                blockX, blockY, blockZ,
+                sharedMemBytes,
+                _stream,
+                (IntPtr)args,
+                IntPtr.Zero),
+            "cuLaunchKernel3D");
+    }
+
     private static void ValidateGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer? C, int M, int N, int K)
     {
         if (M <= 0 || N <= 0 || K <= 0)
@@ -2414,34 +2428,113 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        if (!_kernelCache.TryGetValue("conv2d_direct", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct");
-
         using var _ = PushContext();
-        int totalOutput = batch * outChannels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
-        void** args = stackalloc void*[17];
-        args[0] = &inputPtr;
-        args[1] = &kernelPtr;
-        args[2] = &outputPtr;
-        args[3] = &batch;
-        args[4] = &inChannels;
-        args[5] = &inHeight;
-        args[6] = &inWidth;
-        args[7] = &outChannels;
-        args[8] = &outHeight;
-        args[9] = &outWidth;
-        args[10] = &kernelH;
-        args[11] = &kernelW;
-        args[12] = &strideH;
-        args[13] = &strideW;
-        args[14] = &padH;
-        args[15] = &padW;
-        args[16] = &totalOutput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+
+        // Route 3x3 stride-1 dilation-1 convolutions through Winograd F(2x2,3x3)
+        if (kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1 &&
+            dilationH == 1 && dilationW == 1 &&
+            _kernelCache.TryGetValue("conv2d_winograd_f2x2_3x3", out var winogradKernel))
+        {
+            int tilesH = (outHeight + 1) / 2;
+            int tilesW = (outWidth + 1) / 2;
+            int totalTiles = batch * outChannels * tilesH * tilesW;
+            uint gridX = (uint)((totalTiles + DefaultBlockSize - 1) / DefaultBlockSize);
+
+            void** wArgs = stackalloc void*[12];
+            wArgs[0] = &inputPtr;
+            wArgs[1] = &kernelPtr;
+            wArgs[2] = &outputPtr;
+            wArgs[3] = &batch;
+            wArgs[4] = &inChannels;
+            wArgs[5] = &inHeight;
+            wArgs[6] = &inWidth;
+            wArgs[7] = &outChannels;
+            wArgs[8] = &outHeight;
+            wArgs[9] = &outWidth;
+            wArgs[10] = &padH;
+            wArgs[11] = &padW;
+            LaunchKernel(winogradKernel, gridX, DefaultBlockSize, wArgs);
+            return;
+        }
+
+        // Use shared-memory tiled kernel when available
+        if (_kernelCache.TryGetValue("conv2d_tiled", out var tiledKernel))
+        {
+            const int TILE_OUT = 16;
+            uint gx = (uint)((outWidth + TILE_OUT - 1) / TILE_OUT);
+            uint gy = (uint)((outHeight + TILE_OUT - 1) / TILE_OUT);
+            uint gz = (uint)(batch * outChannels);
+
+            // Shared memory: one input channel tile at a time
+            int effKH = (kernelH - 1) * dilationH + 1;
+            int effKW = (kernelW - 1) * dilationW + 1;
+            int tileInH = TILE_OUT * strideH + effKH - strideH;
+            int tileInW = TILE_OUT * strideW + effKW - strideW;
+            uint sharedMem = (uint)(tileInH * tileInW * sizeof(float));
+
+            void** tArgs = stackalloc void*[17];
+            tArgs[0] = &inputPtr;
+            tArgs[1] = &kernelPtr;
+            tArgs[2] = &outputPtr;
+            tArgs[3] = &batch;
+            tArgs[4] = &inChannels;
+            tArgs[5] = &inHeight;
+            tArgs[6] = &inWidth;
+            tArgs[7] = &outChannels;
+            tArgs[8] = &outHeight;
+            tArgs[9] = &outWidth;
+            tArgs[10] = &kernelH;
+            tArgs[11] = &kernelW;
+            tArgs[12] = &strideH;
+            tArgs[13] = &strideW;
+            tArgs[14] = &padH;
+            tArgs[15] = &padW;
+            tArgs[16] = &dilationH;
+            // Note: dilationW is tArgs[17] but the kernel reads it from the parameter list
+            // The tiled kernel uses the same 17 params as conv2d_direct (minus dilationW which
+            // is passed as the 18th)
+            void** tArgs2 = stackalloc void*[18];
+            for (int i = 0; i < 17; i++) tArgs2[i] = tArgs[i];
+            tArgs2[17] = &dilationW;
+
+            LaunchKernel3D(tiledKernel, gx, gy, gz, TILE_OUT, TILE_OUT, 1, tArgs2, sharedMem);
+            return;
+        }
+
+        // Fallback: direct convolution with correct 3D grid
+        if (!_kernelCache.TryGetValue("conv2d_direct", out var cudaKernel))
+            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct");
+
+        {
+            const int BLOCK = 16;
+            uint dgx = (uint)((outWidth + BLOCK - 1) / BLOCK);
+            uint dgy = (uint)((outHeight + BLOCK - 1) / BLOCK);
+            uint dgz = (uint)(batch * outChannels);
+
+            void** dArgs = stackalloc void*[18];
+            dArgs[0] = &inputPtr;
+            dArgs[1] = &kernelPtr;
+            dArgs[2] = &outputPtr;
+            dArgs[3] = &batch;
+            dArgs[4] = &inChannels;
+            dArgs[5] = &inHeight;
+            dArgs[6] = &inWidth;
+            dArgs[7] = &outChannels;
+            dArgs[8] = &outHeight;
+            dArgs[9] = &outWidth;
+            dArgs[10] = &kernelH;
+            dArgs[11] = &kernelW;
+            dArgs[12] = &strideH;
+            dArgs[13] = &strideW;
+            dArgs[14] = &padH;
+            dArgs[15] = &padW;
+            dArgs[16] = &dilationH;
+            dArgs[17] = &dilationW;
+            LaunchKernel3D(cudaKernel, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, dArgs, 0);
+        }
     }
 
     public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -2455,12 +2548,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_input");
 
         using var _ = PushContext();
-        int totalInput = batch * inChannels * inHeight * inWidth;
-        uint gridX = (uint)((totalInput + DefaultBlockSize - 1) / DefaultBlockSize);
+        const int BLOCK = 16;
+        uint gx = (uint)((inWidth + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((inHeight + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(batch * inChannels);
+
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr gradInputPtr = gradInput.Handle;
-        void** args = stackalloc void*[17];
+        void** args = stackalloc void*[18];
         args[0] = &gradOutputPtr;
         args[1] = &kernelPtr;
         args[2] = &gradInputPtr;
@@ -2477,8 +2573,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &strideW;
         args[14] = &padH;
         args[15] = &padW;
-        args[16] = &totalInput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[16] = &dilationH;
+        args[17] = &dilationW;
+        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
     }
 
     public unsafe void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -2492,12 +2589,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
         using var _ = PushContext();
-        int totalKernel = outChannels * inChannels * kernelH * kernelW;
-        uint gridX = (uint)((totalKernel + DefaultBlockSize - 1) / DefaultBlockSize);
+        const int BLOCK = 16;
+        uint gx = (uint)((kernelW + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((kernelH + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(outChannels * inChannels);
+
         IntPtr inputPtr = input.Handle;
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr gradKernelPtr = gradKernel.Handle;
-        void** args = stackalloc void*[17];
+        void** args = stackalloc void*[18];
         args[0] = &inputPtr;
         args[1] = &gradOutputPtr;
         args[2] = &gradKernelPtr;
@@ -2514,8 +2614,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &strideW;
         args[14] = &padH;
         args[15] = &padW;
-        args[16] = &totalKernel;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[16] = &dilationH;
+        args[17] = &dilationW;
+        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
     }
 
     public unsafe void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
