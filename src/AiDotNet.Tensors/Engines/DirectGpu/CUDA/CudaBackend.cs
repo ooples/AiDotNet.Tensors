@@ -47,6 +47,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
     private readonly CudaPinnedBufferPool _pinnedPool = new();
+    private IntPtr _wmmaModule;
+    private int _ccMajor;
+    private int _ccMinor;
+    private bool _hasWmmaSupport;
 
     public bool IsAvailable { get; }
     public string BackendName => "CUDA";
@@ -164,6 +168,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasCreate(out _cublasHandle), "cublasCreate");
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
             CuBlasNative.cublasSetMathMode(_cublasHandle, CuBlasNative.CUBLAS_TENSOR_OP_MATH);
+
+            var cc = GetComputeCapability(device);
+            _ccMajor = cc.Major;
+            _ccMinor = cc.Minor;
 
             CompileAllKernels(device);
 
@@ -367,6 +375,22 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         // Compile GRU sequence kernels (forward/backward for BPTT training)
         _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
+
+        // Compile WMMA Tensor Core kernels for Volta+ (sm_70+)
+        if (_ccMajor >= 7)
+        {
+            try
+            {
+                _wmmaModule = CompileKernelModule(device, CudaWmmaKernels.GetSource(), "wmma_kernels", CudaWmmaKernels.GetKernelNames());
+                _hasWmmaSupport = true;
+            }
+            catch
+            {
+                // WMMA compilation may fail if NVRTC doesn't support mma.h headers.
+                // Fall back to Phase 3 tiled GEMM kernels silently.
+                _hasWmmaSupport = false;
+            }
+        }
     }
 
     private static string GetNvrtcLog(IntPtr program)
@@ -2208,6 +2232,14 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K)
     {
+        // Try WMMA tensor core kernel first (sm_70+, 2-4x faster for large matrices)
+        string wmmaName = kernelName + "_wmma";
+        if (_hasWmmaSupport && _kernelCache.TryGetValue(wmmaName, out var wmmaKernel))
+        {
+            ExecuteWmmaGemm(wmmaKernel, A, B, bias, output, M, N, K);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
 
@@ -2236,6 +2268,37 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[6] = &k;
 
         LaunchKernel2D(kernel, gridX, gridY, 1, BLOCK_DIM, BLOCK_DIM, args);
+    }
+
+    private unsafe void ExecuteWmmaGemm(IntPtr kernel, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K)
+    {
+        using var _ = PushContext();
+
+        // 32x32 CTA tile with 128 threads (4 warps, each computing 16x16 via tensor cores)
+        const int WMMA_TILE = 32;
+        const int WMMA_THREADS = 128;
+        uint gridX = (uint)((N + WMMA_TILE - 1) / WMMA_TILE);
+        uint gridY = (uint)((M + WMMA_TILE - 1) / WMMA_TILE);
+
+        IntPtr aPtr = A.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outPtr = output.Handle;
+        int m = M, n = N, k = K;
+
+        void** args = stackalloc void*[7];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &biasPtr;
+        args[3] = &outPtr;
+        args[4] = &m;
+        args[5] = &n;
+        args[6] = &k;
+
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, WMMA_THREADS, 1, 1,
+                0, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(WMMA)");
     }
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
@@ -8489,6 +8552,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_gruModule);
             _gruModule = IntPtr.Zero;
+        }
+
+        if (_wmmaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_wmmaModule);
+            _wmmaModule = IntPtr.Zero;
         }
 
         if (_fusedConvolutionModule != IntPtr.Zero)
