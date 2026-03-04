@@ -956,9 +956,29 @@ public class FloatOperations : INumericOperations<float>
     /// Performs element-wise subtraction using SIMD-optimized TensorPrimitives.
     /// Memory-bound operation - single-threaded SIMD saturates memory bandwidth.
     /// </summary>
-    public void Subtract(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
+    public unsafe void Subtract(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* yPtr = y)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* yp = yPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Subtract(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new ReadOnlySpan<float>(yp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Subtract(x, y, destination);
 #else
         VectorizedOperationsFallback.Subtract(_instance, x, y, destination);
@@ -999,9 +1019,29 @@ public class FloatOperations : INumericOperations<float>
     /// Performs element-wise division using SIMD-optimized TensorPrimitives.
     /// Memory-bound operation - single-threaded SIMD saturates memory bandwidth.
     /// </summary>
-    public void Divide(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
+    public unsafe void Divide(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* yPtr = y)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* yp = yPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Divide(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new ReadOnlySpan<float>(yp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Divide(x, y, destination);
 #else
         VectorizedOperationsFallback.Divide(_instance, x, y, destination);
@@ -1107,11 +1147,28 @@ public class FloatOperations : INumericOperations<float>
     }
 
     /// <summary>
-    /// Computes exponential using SIMD-optimized TensorPrimitives.
+    /// Computes exponential using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
     /// </summary>
-    public void Exp(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Exp(ReadOnlySpan<float> x, Span<float> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Exp(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Exp(x, destination);
 #else
         VectorizedOperationsFallback.Exp(_instance, x, destination);
@@ -1119,11 +1176,28 @@ public class FloatOperations : INumericOperations<float>
     }
 
     /// <summary>
-    /// Computes natural logarithm using SIMD-optimized TensorPrimitives.
+    /// Computes natural logarithm using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
     /// </summary>
-    public void Log(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Log(ReadOnlySpan<float> x, Span<float> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Log(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Log(x, destination);
 #else
         VectorizedOperationsFallback.Log(_instance, x, destination);
@@ -1131,11 +1205,28 @@ public class FloatOperations : INumericOperations<float>
     }
 
     /// <summary>
-    /// Computes hyperbolic tangent using SIMD-optimized TensorPrimitives.
+    /// Computes hyperbolic tangent using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
     /// </summary>
-    public void Tanh(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Tanh(ReadOnlySpan<float> x, Span<float> destination)
     {
+        int length = x.Length;
 #if NET8_0_OR_GREATER
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    TensorPrimitives.Tanh(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
         TensorPrimitives.Tanh(x, destination);
 #else
         VectorizedOperationsFallback.Tanh(_instance, x, destination);
