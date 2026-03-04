@@ -3474,7 +3474,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[11] = &epsilon;
         args[12] = &momentum;
         args[13] = &trainingInt;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per channel, 256 threads, 1 shared array for parallel reduction
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3507,7 +3508,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[9] = &channels;
         args[10] = &spatialSize;
         args[11] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 3 shared arrays for dGamma, dBeta, sumDyXmu parallel reductions
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(3 * DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3534,7 +3536,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[6] = &batchSize;
         args[7] = &normalizedSize;
         args[8] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3566,7 +3569,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[8] = &batchSize;
         args[9] = &normalizedSize;
         args[10] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 2 shared arrays for sumDy and sumDyXmu
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3595,7 +3599,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[8] = &channels;
         args[9] = &spatialSize;
         args[10] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per (batch, group), 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3623,7 +3628,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[7] = &channels;
         args[8] = &spatialSize;
         args[9] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per (batch, channel), 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void InstanceNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3764,7 +3770,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[9] = &channels;
         args[10] = &spatialSize;
         args[11] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // InstanceNormBackward: 1 block per (batch, channel)
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -3787,7 +3794,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[4] = &batchSize;
         args[5] = &normalizedSize;
         args[6] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -3815,7 +3823,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[6] = &batchSize;
         args[7] = &normalizedSize;
         args[8] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
 
         // Compute gradGamma using rmsnorm_grad_gamma kernel
         if (!_kernelCache.TryGetValue("rmsnorm_grad_gamma", out var kernel2))
