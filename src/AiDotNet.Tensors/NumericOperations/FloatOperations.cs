@@ -960,7 +960,8 @@ public class FloatOperations : INumericOperations<float>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* yPtr = y)
@@ -1023,7 +1024,8 @@ public class FloatOperations : INumericOperations<float>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* yPtr = y)
@@ -1153,7 +1155,8 @@ public class FloatOperations : INumericOperations<float>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* destPtr = destination)
@@ -1182,7 +1185,8 @@ public class FloatOperations : INumericOperations<float>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* destPtr = destination)
@@ -1211,7 +1215,8 @@ public class FloatOperations : INumericOperations<float>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* destPtr = destination)
@@ -1240,7 +1245,8 @@ public class FloatOperations : INumericOperations<float>
     public unsafe void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
     {
         int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (float* xPtr = x)
             fixed (float* destPtr = destination)

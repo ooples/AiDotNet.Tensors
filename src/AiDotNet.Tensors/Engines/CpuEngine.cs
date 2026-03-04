@@ -17218,6 +17218,8 @@ public class CpuEngine : ITensorLevelEngine
         if (sparseTargets)
         {
             int targetClass = (int)numOps.ToDouble(targetData[b]);
+            if (targetClass < 0 || targetClass >= numClasses)
+                throw new ArgumentOutOfRangeException(nameof(targetData), $"Target class {targetClass} is out of range [0, {numClasses}).");
             loss = -(numOps.ToDouble(predData[offset + targetClass]) - logSumExp);
         }
         else

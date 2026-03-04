@@ -823,7 +823,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* yPtr = y)
@@ -855,7 +856,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* yPtr = y)
@@ -887,7 +889,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* yPtr = y)
@@ -919,7 +922,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            y.Length >= length && destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* yPtr = y)
@@ -1038,7 +1042,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* destPtr = destination)
@@ -1067,7 +1072,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* destPtr = destination)
@@ -1096,7 +1102,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* destPtr = destination)
@@ -1125,7 +1132,8 @@ public class DoubleOperations : INumericOperations<double>
     {
         int length = x.Length;
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
+            destination.Length >= length)
         {
             fixed (double* xPtr = x)
             fixed (double* destPtr = destination)

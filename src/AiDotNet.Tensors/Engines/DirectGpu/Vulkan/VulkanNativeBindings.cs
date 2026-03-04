@@ -36,6 +36,31 @@ public static unsafe class VulkanNativeBindings
     private const string VulkanLinux = "libvulkan.so.1";
     private const string VulkanMacOS = "libvulkan.1.dylib"; // MoltenVK
 
+#if NET5_0_OR_GREATER
+    static VulkanNativeBindings()
+    {
+        // On macOS, DllImport entries reference "libvulkan.so.1" (Linux name).
+        // Remap to "libvulkan.1.dylib" so MoltenVK is found correctly.
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
+                typeof(VulkanNativeBindings).Assembly,
+                (libraryName, assembly, searchPath) =>
+                {
+                    if (libraryName == VulkanLinux)
+                    {
+                        if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                            VulkanMacOS, assembly, searchPath, out var handle))
+                        {
+                            return handle;
+                        }
+                    }
+                    return IntPtr.Zero;
+                });
+        }
+    }
+#endif
+
     /// <summary>
     /// Gets the Vulkan library name for the current platform.
     /// </summary>

@@ -1502,6 +1502,14 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float HorizontalSum(Vector128<float> v)
         {
+#if NET8_0_OR_GREATER
+            if (AdvSimd.Arm64.IsSupported)
+            {
+                // ARM NEON: pairwise add reduction
+                var pair = AdvSimd.Arm64.AddPairwise(v, v); // [a+b, c+d, a+b, c+d]
+                return pair.ToScalar() + pair.GetElement(1);
+            }
+#endif
             // SIMD shuffle reduction: [a, b, c, d]
             // movehdup: [b, b, d, d], add with [a, b, c, d] -> [a+b, ?, c+d, ?]
             if (Sse3.IsSupported)
@@ -1511,11 +1519,16 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var hi = Sse.MoveHighToLow(sums, sums);   // [c+d, ?, ?, ?]
                 return Sse.AddScalar(sums, hi).ToScalar(); // a+b+c+d
             }
-            // SSE fallback
-            var shuf2 = Sse.Shuffle(v, v, 0b_10_11_00_01); // [b, a, d, c]
-            var sums2 = Sse.Add(v, shuf2);                  // [a+b, a+b, c+d, c+d]
-            var hi2 = Sse.MoveHighToLow(sums2, sums2);      // [c+d, c+d, ?, ?]
-            return Sse.AddScalar(sums2, hi2).ToScalar();     // a+b+c+d
+            if (Sse.IsSupported)
+            {
+                // SSE fallback
+                var shuf2 = Sse.Shuffle(v, v, 0b_10_11_00_01); // [b, a, d, c]
+                var sums2 = Sse.Add(v, shuf2);                  // [a+b, a+b, c+d, c+d]
+                var hi2 = Sse.MoveHighToLow(sums2, sums2);      // [c+d, c+d, ?, ?]
+                return Sse.AddScalar(sums2, hi2).ToScalar();     // a+b+c+d
+            }
+            // Scalar fallback for platforms without SSE or NEON
+            return v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1563,9 +1576,20 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static double HorizontalSum(Vector128<double> v)
         {
-            // [a, b] -> shuffle to [b, a], add -> [a+b, a+b]
-            var hi = Sse2.Shuffle(v, v, 0b_01);
-            return Sse2.AddScalar(v, hi).ToScalar();
+#if NET8_0_OR_GREATER
+            if (AdvSimd.Arm64.IsSupported)
+            {
+                return AdvSimd.Arm64.AddPairwiseScalar(v).ToScalar();
+            }
+#endif
+            if (Sse2.IsSupported)
+            {
+                // [a, b] -> shuffle to [b, a], add -> [a+b, a+b]
+                var hi = Sse2.Shuffle(v, v, 0b_01);
+                return Sse2.AddScalar(v, hi).ToScalar();
+            }
+            // Scalar fallback
+            return v.GetElement(0) + v.GetElement(1);
         }
 #endif
     }
