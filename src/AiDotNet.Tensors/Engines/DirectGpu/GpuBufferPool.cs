@@ -28,6 +28,23 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         _maxSize = maxSize > 0 ? maxSize : int.MaxValue;
     }
 
+    /// <summary>
+    /// Rounds up to the next power of two for bucket key.
+    /// This increases cache hit rate by reducing the number of distinct bucket sizes.
+    /// A request for 1000 elements reuses a buffer allocated for 1024 elements.
+    /// </summary>
+    private static int NextPowerOfTwo(int size)
+    {
+        if (size <= 0) return 1;
+        size--;
+        size |= size >> 1;
+        size |= size >> 2;
+        size |= size >> 4;
+        size |= size >> 8;
+        size |= size >> 16;
+        return size + 1;
+    }
+
     public bool TryRent(int size, out TBuffer? buffer)
     {
         buffer = null;
@@ -36,7 +53,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return false;
         }
 
-        if (_buckets.TryGetValue(size, out var bucket) && bucket.Buffers.TryTake(out var candidate))
+        // Use power-of-two bucket key for higher cache hit rate
+        int bucketKey = NextPowerOfTwo(size);
+        if (_buckets.TryGetValue(bucketKey, out var bucket) && bucket.Buffers.TryTake(out var candidate))
         {
             Interlocked.Decrement(ref bucket.Count);
             candidate.MarkRented();
@@ -55,7 +74,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        var bucket = _buckets.GetOrAdd(buffer.Size, _ => new Bucket());
+        // Use power-of-two bucket key matching TryRent
+        int bucketKey = NextPowerOfTwo(buffer.Size);
+        var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
         int count = Interlocked.Increment(ref bucket.Count);
         if (Volatile.Read(ref _disposed) != 0)
         {

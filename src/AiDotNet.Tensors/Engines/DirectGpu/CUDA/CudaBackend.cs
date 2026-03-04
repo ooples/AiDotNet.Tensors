@@ -40,7 +40,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _gruModule;
     private IntPtr _fp16Module;
     private bool _disposed;
-    private const int MaxPooledBufferElements = 1_048_576;
+    private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
@@ -51,6 +51,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private int _ccMajor;
     private int _ccMinor;
     private bool _hasWmmaSupport;
+
+    [ThreadStatic]
+    private static IntPtr _threadCurrentContext;
 
     public bool IsAvailable { get; }
     public string BackendName => "CUDA";
@@ -188,18 +191,26 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private readonly struct CudaContextScope : IDisposable
     {
-        private readonly bool _active;
+        private readonly bool _needsPop;
 
         public CudaContextScope(IntPtr context)
         {
-            _active = context != IntPtr.Zero;
-            if (_active)
+            // Skip push/pop if this thread already has the right context set
+            if (context != IntPtr.Zero && _threadCurrentContext != context)
+            {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
+                _threadCurrentContext = context;
+                _needsPop = true;
+            }
+            else
+            {
+                _needsPop = false;
+            }
         }
 
         public void Dispose()
         {
-            if (_active)
+            if (_needsPop)
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
         }
     }

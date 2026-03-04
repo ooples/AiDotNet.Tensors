@@ -42,7 +42,7 @@ public sealed class HipBackend : IAsyncGpuBackend
     private readonly Dictionary<string, IntPtr> _kernelCache;
     private AmdGpuArchitecture _architecture;
     private bool _disposed;
-    private const int MaxPooledBufferElements = 1_048_576;
+    private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<HipGpuBuffer> _bufferPool =
         new GpuBufferPool<HipGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
@@ -585,17 +585,12 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     private unsafe void LaunchKernelOnStream(IntPtr kernel, uint gridX, uint blockSize, IntPtr[] args, IntPtr stream, uint sharedMem = 0)
     {
-        GCHandle argsHandle = GCHandle.Alloc(args, GCHandleType.Pinned);
-        try
+        fixed (IntPtr* argsPtr = args)
         {
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, 1, 1, blockSize, 1, 1,
-                sharedMem, stream, argsHandle.AddrOfPinnedObject(), IntPtr.Zero);
+                sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
             HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-        }
-        finally
-        {
-            argsHandle.Free();
         }
     }
 
@@ -635,18 +630,13 @@ public sealed class HipBackend : IAsyncGpuBackend
                 "Reduce batch size or use cell-level operations.");
         }
 
-        GCHandle argsHandle = GCHandle.Alloc(args, GCHandleType.Pinned);
-        try
+        fixed (IntPtr* argsPtr = args)
         {
             // Use hipModuleLaunchCooperativeKernel for module-obtained kernels (via hipModuleGetFunction)
             var result = HipNativeBindings.hipModuleLaunchCooperativeKernel(
                 kernel, gridX, 1, 1, blockSize, 1, 1,
-                sharedMemBytes, _stream, argsHandle.AddrOfPinnedObject());
+                sharedMemBytes, _stream, (IntPtr)argsPtr);
             HipNativeBindings.CheckError(result, "hipModuleLaunchCooperativeKernel");
-        }
-        finally
-        {
-            argsHandle.Free();
         }
     }
 
@@ -657,18 +647,13 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     private unsafe void LaunchKernel2DOnStream(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, IntPtr[] args, IntPtr stream, uint sharedMem = 0)
     {
-        GCHandle argsHandle = GCHandle.Alloc(args, GCHandleType.Pinned);
-        try
+        fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, gridY, 1, blockX, blockY, 1,
-                sharedMem, stream, argsHandle.AddrOfPinnedObject(), IntPtr.Zero);
+                sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
             HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-        }
-        finally
-        {
-            argsHandle.Free();
         }
     }
 
@@ -679,18 +664,13 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     private unsafe void LaunchKernel3DOnStream(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, IntPtr[] args, IntPtr stream, uint sharedMem = 0)
     {
-        GCHandle argsHandle = GCHandle.Alloc(args, GCHandleType.Pinned);
-        try
+        fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, gridY, gridZ, blockX, blockY, blockZ,
-                sharedMem, stream, argsHandle.AddrOfPinnedObject(), IntPtr.Zero);
+                sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
             HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-        }
-        finally
-        {
-            argsHandle.Free();
         }
     }
 
@@ -711,67 +691,45 @@ public sealed class HipBackend : IAsyncGpuBackend
         uint gridX = (uint)((N + BN - 1) / BN);
         uint gridY = (uint)((M + BM - 1) / BM);
 
-        var handles = new GCHandle[7];
-        try
+        IntPtr aHandle = A.Handle, bHandle = B.Handle, biasHandle = bias.Handle, outHandle = output.Handle;
+        var args = new IntPtr[]
         {
-            handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
-            handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
-            handles[2] = GCHandle.Alloc(bias.Handle, GCHandleType.Pinned);
-            handles[3] = GCHandle.Alloc(output.Handle, GCHandleType.Pinned);
-            handles[4] = GCHandle.Alloc(M, GCHandleType.Pinned);
-            handles[5] = GCHandle.Alloc(N, GCHandleType.Pinned);
-            handles[6] = GCHandle.Alloc(K, GCHandleType.Pinned);
+            (IntPtr)(&aHandle),
+            (IntPtr)(&bHandle),
+            (IntPtr)(&biasHandle),
+            (IntPtr)(&outHandle),
+            (IntPtr)(&M),
+            (IntPtr)(&N),
+            (IntPtr)(&K)
+        };
 
-            var args = new IntPtr[]
-            {
-                handles[0].AddrOfPinnedObject(),
-                handles[1].AddrOfPinnedObject(),
-                handles[2].AddrOfPinnedObject(),
-                handles[3].AddrOfPinnedObject(),
-                handles[4].AddrOfPinnedObject(),
-                handles[5].AddrOfPinnedObject(),
-                handles[6].AddrOfPinnedObject()
-            };
-
-            // HIP kernel launch uses unmanaged interop with the driver API.
-            LaunchKernel2DOnStream(kernel, gridX, gridY, BLOCK_DIM, BLOCK_DIM, args, stream);
-            if (synchronize)
-            {
-                // HIP stream synchronization requires unmanaged interop.
-                var syncResult = HipNativeBindings.hipStreamSynchronize(stream);
-                HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize");
-            }
-        }
-        finally
+        // HIP kernel launch uses unmanaged interop with the driver API.
+        LaunchKernel2DOnStream(kernel, gridX, gridY, BLOCK_DIM, BLOCK_DIM, args, stream);
+        if (synchronize)
         {
-            foreach (var h in handles)
-                if (h.IsAllocated)
-                    h.Free();
+            // HIP stream synchronization requires unmanaged interop.
+            var syncResult = HipNativeBindings.hipStreamSynchronize(stream);
+            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize");
         }
     }
 
     #region Memory Management
 
-    public IGpuBuffer AllocateBuffer(float[] data)
+    public unsafe IGpuBuffer AllocateBuffer(float[] data)
     {
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
 
         if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
         {
-            GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-            try
+            fixed (float* dataPtr = data)
             {
                 var result = HipNativeBindings.hipMemcpy(
                     pooled.Handle,
-                    handle.AddrOfPinnedObject(),
+                    (IntPtr)dataPtr,
                     size,
                     HipMemcpyKind.HostToDevice); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
                 HipNativeBindings.CheckError(result, "hipMemcpy H2D");
-            }
-            finally
-            {
-                handle.Free();
             }
 
             return pooled;
@@ -781,19 +739,14 @@ public sealed class HipBackend : IAsyncGpuBackend
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
 
         // Copy data to device
-        GCHandle allocHandle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        try
+        fixed (float* dataPtr = data)
         {
             var copyResult = HipNativeBindings.hipMemcpy(
                 devicePtr,
-                allocHandle.AddrOfPinnedObject(),
+                (IntPtr)dataPtr,
                 size,
                 HipMemcpyKind.HostToDevice); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
             HipNativeBindings.CheckError(copyResult, "hipMemcpy H2D");
-        }
-        finally
-        {
-            allocHandle.Free();
         }
 
         return new HipGpuBuffer(devicePtr, data.Length, ReturnBufferToPool);
@@ -829,24 +782,19 @@ public sealed class HipBackend : IAsyncGpuBackend
         return result;
     }
 
-    public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
+    public unsafe void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         var hipBuffer = (HipGpuBuffer)buffer;
         var size = (UIntPtr)(hipBuffer.Size * sizeof(float));
 
-        GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
-        try
+        fixed (float* destPtr = destination)
         {
             var result = HipNativeBindings.hipMemcpy(
-                handle.AddrOfPinnedObject(),
+                (IntPtr)destPtr,
                 hipBuffer.Handle,
                 size,
                 HipMemcpyKind.DeviceToHost);
             HipNativeBindings.CheckError(result, "hipMemcpy D2H");
-        }
-        finally
-        {
-            handle.Free();
         }
     }
 
