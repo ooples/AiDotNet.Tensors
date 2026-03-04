@@ -38,14 +38,14 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     private bool _disposed;
 
     /// <summary>
-    /// Default Supabase project URL for AiDotNet telemetry.
+    /// Environment variable name for the Supabase project URL.
     /// </summary>
-    public const string DefaultSupabaseUrl = "https://yfkqwpgjahoamlgckjib.supabase.co";
+    public const string SupabaseUrlEnvVar = "AIDOTNET_TELEMETRY_URL";
 
     /// <summary>
-    /// Default anon key for read/insert operations.
+    /// Environment variable name for the Supabase anon key.
     /// </summary>
-    public const string DefaultAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlma3F3cGdqYWhvYW1sZ2NramliIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjczMDc0MjUsImV4cCI6MjA4Mjg4MzQyNX0.166oZVGXdnuXMmPzWeKb3fs2qNi0BQHwn502TWxDrwQ";
+    public const string SupabaseKeyEnvVar = "AIDOTNET_TELEMETRY_KEY";
 
     /// <inheritdoc/>
     public bool IsEnabled => _isEnabled && !_disposed;
@@ -54,16 +54,25 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// Creates a new Supabase telemetry client.
     /// </summary>
     /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
-    /// <param name="supabaseUrl">Supabase project URL (optional, uses default).</param>
-    /// <param name="supabaseKey">Supabase anon key (optional, uses default).</param>
+    /// <param name="supabaseUrl">Supabase project URL (optional, reads from AIDOTNET_TELEMETRY_URL env var).</param>
+    /// <param name="supabaseKey">Supabase anon key (optional, reads from AIDOTNET_TELEMETRY_KEY env var).</param>
     public SupabaseTelemetryClient(
         bool enabled = true,
         string? supabaseUrl = null,
         string? supabaseKey = null)
     {
-        _isEnabled = enabled;
-        _supabaseUrl = supabaseUrl ?? DefaultSupabaseUrl;
-        _supabaseKey = supabaseKey ?? DefaultAnonKey;
+        _supabaseUrl = supabaseUrl
+            ?? Environment.GetEnvironmentVariable(SupabaseUrlEnvVar)
+            ?? string.Empty;
+        _supabaseKey = supabaseKey
+            ?? Environment.GetEnvironmentVariable(SupabaseKeyEnvVar)
+            ?? string.Empty;
+
+        // Disable telemetry if credentials are not configured
+        _isEnabled = enabled
+            && !string.IsNullOrWhiteSpace(_supabaseUrl)
+            && !string.IsNullOrWhiteSpace(_supabaseKey);
+
         _clientHash = GenerateClientHash();
         _aidotnetVersion = GetAidotnetVersion();
 
@@ -71,8 +80,12 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
-        _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
-        _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+
+        if (_isEnabled)
+        {
+            _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
+            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+        }
     }
 
     /// <inheritdoc/>
