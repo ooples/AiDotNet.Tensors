@@ -14,12 +14,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             return @"
 #include <math.h>
 
-// Block size for tiling in FlashAttention
-#define FLASH_BLOCK_SIZE 64
+// Tile sizes for shared-memory tiled attention
+#define ATTN_BR 32   // Query tile size (threads per block)
+#define ATTN_BC 32   // KV tile size
 #define MAX_HEAD_DIM 128
 
 // ===========================================================================
 // SCALED DOT-PRODUCT ATTENTION
+// Uses online softmax + shared memory for K/V tiles.
+// Eliminates float scores[1024] VLA, supports arbitrary seqK.
+// Grid: (ceil(seqQ/ATTN_BR), batch*numHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void scaled_dot_product_attention(
@@ -37,66 +42,112 @@ extern ""C"" __global__ void scaled_dot_product_attention(
     int isCausal,
     int storeWeights)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bh = blockIdx.y;
 
-    if (bh >= batch * numHeads || qi >= seqQ) return;
+    if (bh >= batch * numHeads) return;
 
-    // Offsets
-    int qOffset = bh * seqQ * headDim + qi * headDim;
-    int kOffset = bh * seqK * headDim;
-    int vOffset = bh * seqK * headDim;
-    int oOffset = bh * seqQ * headDim + qi * headDim;
-    int wOffset = bh * seqQ * seqK + qi * seqK;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
 
-    // Compute attention scores and find max for numerical stability
-    float maxScore = -INFINITY;
-    float scores[1024];
+    int kBase = bh * seqK * headDim;
+    int vBase = bh * seqK * headDim;
 
-    for (int ki = 0; ki < seqK; ki++) {
-        if (isCausal && ki > qi) {
-            scores[ki] = -INFINITY;
-            continue;
+    // Per-thread online softmax accumulators
+    float rowMax = -INFINITY;
+    float rowSum = 0.0f;
+    float outAcc[MAX_HEAD_DIM];
+    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+
+    // Also need to store weights if requested: use a second pass
+    // For storeWeights, we need logsumexp = rowMax + log(rowSum)
+
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
+
+        // Early exit for causal: all keys in tile are after all queries in block
+        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+
+        // Cooperative load K tile into shared memory
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
         }
-
-        float score = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
+        // Cooperative load V tile
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
-        score *= scale;
-        scores[ki] = score;
-        maxScore = fmaxf(maxScore, score);
+        __syncthreads();
+
+        if (qi < seqQ) {
+            int qOffset = bh * seqQ * headDim + qi * headDim;
+
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                if (isCausal && ki > qi) continue;
+
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * Ks[t * headDim + d];
+                }
+                score *= scale;
+
+                // Online softmax update
+                float newMax = fmaxf(rowMax, score);
+                float rescale = expf(rowMax - newMax);
+                float expScore = expf(score - newMax);
+                rowSum = rowSum * rescale + expScore;
+
+                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                    outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
+                }
+                rowMax = newMax;
+            }
+        }
+        __syncthreads();
     }
 
-    // Compute softmax
-    float sumExp = 0.0f;
-    for (int ki = 0; ki < seqK; ki++) {
-        float expScore = expf(scores[ki] - maxScore);
-        scores[ki] = expScore;
-        sumExp += expScore;
-    }
-
-    // Normalize and compute output
-    for (int d = 0; d < headDim; d++) {
-        float val = 0.0f;
-        for (int ki = 0; ki < seqK; ki++) {
-            float weight = scores[ki] / sumExp;
-            val += weight * value[vOffset + ki * headDim + d];
+    // Write output
+    if (qi < seqQ) {
+        int oOffset = bh * seqQ * headDim + qi * headDim;
+        float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
+        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+            output[oOffset + d] = outAcc[d] * invSum;
         }
-        output[oOffset + d] = val;
-    }
 
-    // Store attention weights if requested
-    if (storeWeights) {
-        for (int ki = 0; ki < seqK; ki++) {
-            attentionWeights[wOffset + ki] = scores[ki] / sumExp;
+        // Store attention weights if requested (requires recomputation with known logsumexp)
+        if (storeWeights) {
+            float logsumexp = rowMax + logf(rowSum);
+            int wOffset = bh * seqQ * seqK + qi * seqK;
+            int qOffset = bh * seqQ * headDim + qi * headDim;
+            int kOff = bh * seqK * headDim;
+            for (int ki = 0; ki < seqK; ki++) {
+                if (isCausal && ki > qi) {
+                    attentionWeights[wOffset + ki] = 0.0f;
+                    continue;
+                }
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * key[kOff + ki * headDim + d];
+                }
+                score *= scale;
+                attentionWeights[wOffset + ki] = expf(score - logsumexp);
+            }
         }
     }
 }
 
 // ===========================================================================
 // FLASH ATTENTION V2
-// Memory-efficient attention using online softmax and tiling
+// Tiled algorithm with shared memory for K/V. Online softmax eliminates VLA.
+// Single expf per score (no double computation).
+// Grid: (ceil(seqQ/ATTN_BR), batch*numHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void flash_attention_v2(
@@ -112,108 +163,107 @@ extern ""C"" __global__ void flash_attention_v2(
     int headDim,
     float scale,
     int isCausal,
-    const float* attentionBias,  // [batch * heads * seqQ * seqK] or [heads * seqQ * seqK] (optional, NULL if unused)
-    int hasBias,                 // 0 = no bias, 1 = has bias
-    int biasBatchStride)         // numHeads * seqQ * seqK for 4D, 0 for 3D broadcast
+    const float* attentionBias,  // optional, NULL if unused
+    int hasBias,
+    int biasBatchStride)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bh = blockIdx.y;
 
-    if (bh >= batch * numHeads || qi >= seqQ) return;
+    if (bh >= batch * numHeads) return;
 
-    // Offsets
-    int qOffset = bh * seqQ * headDim + qi * headDim;
-    int kOffset = bh * seqK * headDim;
-    int vOffset = bh * seqK * headDim;
-    int oOffset = bh * seqQ * headDim + qi * headDim;
-    int sOffset = bh * seqQ + qi;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
 
-    // Bias offset base: b * biasBatchStride + h * seqQ * seqK + qi * seqK
+    int kBase = bh * seqK * headDim;
+    int vBase = bh * seqK * headDim;
+
+    // Bias offset computation
     int biasBase = 0;
-    if (hasBias) {
+    if (hasBias && qi < seqQ) {
         int b = bh / numHeads;
         int h = bh % numHeads;
         biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
     }
 
-    // Initialize accumulators for online softmax
+    // Per-thread online softmax accumulators
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
-
-    // Initialize output accumulator
     float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-        outAcc[d] = 0.0f;
+    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
+
+        // Early exit for causal
+        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+
+        // Cooperative load K tile
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
+        }
+        // Cooperative load V tile
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
+        }
+        __syncthreads();
+
+        if (qi < seqQ) {
+            int qOffset = bh * seqQ * headDim + qi * headDim;
+
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                if (isCausal && ki > qi) continue;
+
+                // Compute Q dot K (K from shared memory)
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * Ks[t * headDim + d];
+                }
+                score *= scale;
+                if (hasBias) score += attentionBias[biasBase + ki];
+
+                // Online softmax: single expf per score
+                float newMax = fmaxf(rowMax, score);
+                float rescale = expf(rowMax - newMax);
+                float expScore = expf(score - newMax);
+                rowSum = rowSum * rescale + expScore;
+
+                // Accumulate weighted V (V from shared memory)
+                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                    outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
+                }
+                rowMax = newMax;
+            }
+        }
+        __syncthreads();
     }
 
-    // Process key-value pairs in blocks for memory efficiency
-    for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += FLASH_BLOCK_SIZE) {
-        int kvBlockEnd = min(kvBlockStart + FLASH_BLOCK_SIZE, seqK);
+    // Final normalization and write
+    if (qi < seqQ) {
+        int oOffset = bh * seqQ * headDim + qi * headDim;
+        int sOffset = bh * seqQ + qi;
 
-        // Skip block if causal and all keys are after query
-        if (isCausal && kvBlockStart > qi) continue;
-
-        // Find max in this block
-        float blockMax = -INFINITY;
-        for (int ki = kvBlockStart; ki < kvBlockEnd; ki++) {
-            if (isCausal && ki > qi) continue;
-
-            float score = 0.0f;
-            for (int d = 0; d < headDim; d++) {
-                score += query[qOffset + d] * key[kOffset + ki * headDim + d];
-            }
-            score *= scale;
-            if (hasBias) score += attentionBias[biasBase + ki];
-            blockMax = fmaxf(blockMax, score);
-        }
-
-        // New global max and rescale factor
-        float newMax = fmaxf(rowMax, blockMax);
-        float rescale = expf(rowMax - newMax);
-        float newSum = rowSum * rescale;
-
-        // Rescale output accumulator
+        float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
         for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-            outAcc[d] *= rescale;
+            output[oOffset + d] = outAcc[d] * invSum;
         }
-
-        // Add contributions from this block
-        for (int ki = kvBlockStart; ki < kvBlockEnd; ki++) {
-            if (isCausal && ki > qi) continue;
-
-            float score = 0.0f;
-            for (int d = 0; d < headDim; d++) {
-                score += query[qOffset + d] * key[kOffset + ki * headDim + d];
-            }
-            score *= scale;
-            if (hasBias) score += attentionBias[biasBase + ki];
-
-            float expScore = expf(score - newMax);
-            newSum += expScore;
-
-            // Accumulate weighted value
-            for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-                outAcc[d] += expScore * value[vOffset + ki * headDim + d];
-            }
-        }
-
-        rowMax = newMax;
-        rowSum = newSum;
+        softmaxStats[sOffset] = rowMax + logf(fmaxf(rowSum, 1e-20f));
     }
-
-    // Final normalization and write output
-    float invSum = 1.0f / rowSum;
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-        output[oOffset + d] = outAcc[d] * invSum;
-    }
-
-    // Store log-sum-exp for backward pass
-    softmaxStats[sOffset] = rowMax + logf(rowSum);
 }
 
 // ===========================================================================
 // FLASH ATTENTION BACKWARD
-// Recomputes attention weights during backward pass
+// Recomputes attention weights during backward pass.
+// Uses shared memory for K/V tiles to reduce global memory reads.
+// Grid: (ceil(seqQ/ATTN_BR), batch*numHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void flash_attention_backward(
@@ -237,80 +287,112 @@ extern ""C"" __global__ void flash_attention_backward(
     int hasBias,
     int biasBatchStride)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bh = blockIdx.y;
 
-    if (bh >= batch * numHeads || qi >= seqQ) return;
+    if (bh >= batch * numHeads) return;
 
-    // Offsets
-    int qOffset = bh * seqQ * headDim + qi * headDim;
-    int kOffset = bh * seqK * headDim;
-    int vOffset = bh * seqK * headDim;
-    int gOffset = bh * seqQ * headDim + qi * headDim;
-    int sOffset = bh * seqQ + qi;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
 
-    // Bias offset base
-    int biasBase = 0;
-    if (hasBias) {
-        int b = bh / numHeads;
-        int h = bh % numHeads;
-        biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
-    }
+    int kBase = bh * seqK * headDim;
+    int vBase = bh * seqK * headDim;
 
-    float logsumexp = softmaxStats[sOffset];
-
-    // Compute dO @ O (for softmax backward)
+    // Pre-compute per-thread constants
+    float logsumexp = 0.0f;
     float doO = 0.0f;
-    for (int d = 0; d < headDim; d++) {
-        doO += gradOutput[gOffset + d] * output[qOffset + d];
+    int qOffset = 0, gOffset = 0;
+    int biasBase = 0;
+
+    if (qi < seqQ) {
+        qOffset = bh * seqQ * headDim + qi * headDim;
+        gOffset = bh * seqQ * headDim + qi * headDim;
+        int sOffset = bh * seqQ + qi;
+        logsumexp = softmaxStats[sOffset];
+
+        if (hasBias) {
+            int b = bh / numHeads;
+            int h = bh % numHeads;
+            biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
+        }
+
+        // Compute dO dot O
+        for (int d = 0; d < headDim; d++) {
+            doO += gradOutput[gOffset + d] * output[qOffset + d];
+        }
     }
 
-    // Process each key position
-    for (int ki = 0; ki < seqK; ki++) {
-        if (isCausal && ki > qi) continue;
+    // Process KV in tiles
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
 
-        // Recompute attention score (must match forward pass exactly)
-        float score = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
+        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+
+        // Cooperative load K, V tiles
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
         }
-        score *= scale;
-        if (hasBias) score += attentionBias[biasBase + ki];
-
-        // Recompute attention weight
-        float attnWeight = expf(score - logsumexp);
-
-        // Gradient w.r.t. V: attnWeight * gradOutput
-        for (int d = 0; d < headDim; d++) {
-            atomicAdd(&gradValue[vOffset + ki * headDim + d],
-                      attnWeight * gradOutput[gOffset + d]);
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
+        __syncthreads();
 
-        // Compute dO @ v
-        float doV = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            doV += gradOutput[gOffset + d] * value[vOffset + ki * headDim + d];
+        if (qi < seqQ) {
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                if (isCausal && ki > qi) continue;
+
+                // Recompute attention score from shared memory K
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * Ks[t * headDim + d];
+                }
+                score *= scale;
+                if (hasBias) score += attentionBias[biasBase + ki];
+
+                float attnWeight = expf(score - logsumexp);
+
+                // Gradient w.r.t. V
+                for (int d = 0; d < headDim; d++) {
+                    atomicAdd(&gradValue[vBase + ki * headDim + d],
+                              attnWeight * gradOutput[gOffset + d]);
+                }
+
+                // Compute dO dot V from shared memory
+                float doV = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    doV += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                }
+
+                float dS = attnWeight * (doV - doO) * scale;
+
+                // Gradient w.r.t. Q (from shared memory K)
+                for (int d = 0; d < headDim; d++) {
+                    gradQuery[qOffset + d] += dS * Ks[t * headDim + d];
+                }
+
+                // Gradient w.r.t. K
+                for (int d = 0; d < headDim; d++) {
+                    atomicAdd(&gradKey[kBase + ki * headDim + d],
+                              dS * query[qOffset + d]);
+                }
+            }
         }
-
-        // dS = attnWeight * (doV - doO) * scale
-        float dS = attnWeight * (doV - doO) * scale;
-
-        // Gradient w.r.t. Q: dS * K
-        for (int d = 0; d < headDim; d++) {
-            gradQuery[qOffset + d] += dS * key[kOffset + ki * headDim + d];
-        }
-
-        // Gradient w.r.t. K: dS * Q
-        for (int d = 0; d < headDim; d++) {
-            atomicAdd(&gradKey[kOffset + ki * headDim + d],
-                      dS * query[qOffset + d]);
-        }
+        __syncthreads();
     }
 }
 
 // ===========================================================================
 // GROUPED QUERY ATTENTION (GQA)
-// Multiple query heads share the same key-value head
+// Uses online softmax + shared memory. Eliminates float scores[1024] VLA.
+// Grid: (ceil(seqQ/ATTN_BR), batch*numQHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void grouped_query_attention(
@@ -322,7 +404,7 @@ extern ""C"" __global__ void grouped_query_attention(
     int batch,
     int numQHeads,
     int numKVHeads,
-    int queriesPerKV,            // numQHeads / numKVHeads
+    int queriesPerKV,
     int seqQ,
     int seqK,
     int headDim,
@@ -330,68 +412,107 @@ extern ""C"" __global__ void grouped_query_attention(
     int isCausal,
     int storeWeights)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bqh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bqh = blockIdx.y;
 
-    if (qi >= seqQ || bqh >= batch * numQHeads) return;
+    if (bqh >= batch * numQHeads) return;
 
     int b = bqh / numQHeads;
     int qh = bqh % numQHeads;
-    int kvh = qh / queriesPerKV;  // Which KV head this query uses
+    int kvh = qh / queriesPerKV;
 
-    // Offsets
-    int qOffset = bqh * seqQ * headDim + qi * headDim;
-    int kOffset = (b * numKVHeads + kvh) * seqK * headDim;
-    int vOffset = (b * numKVHeads + kvh) * seqK * headDim;
-    int oOffset = bqh * seqQ * headDim + qi * headDim;
-    int wOffset = bqh * seqQ * seqK + qi * seqK;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
 
-    // Compute attention scores
-    float maxScore = -INFINITY;
-    float scores[1024];
+    int kBase = (b * numKVHeads + kvh) * seqK * headDim;
+    int vBase = (b * numKVHeads + kvh) * seqK * headDim;
 
-    for (int ki = 0; ki < seqK; ki++) {
-        if (isCausal && ki > qi) {
-            scores[ki] = -INFINITY;
-            continue;
+    // Per-thread online softmax
+    float rowMax = -INFINITY;
+    float rowSum = 0.0f;
+    float outAcc[MAX_HEAD_DIM];
+    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
+
+        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+
+        // Cooperative load K, V tiles
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
         }
-
-        float score = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
-        score *= scale;
-        scores[ki] = score;
-        maxScore = fmaxf(maxScore, score);
+        __syncthreads();
+
+        if (qi < seqQ) {
+            int qOffset = bqh * seqQ * headDim + qi * headDim;
+
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                if (isCausal && ki > qi) continue;
+
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * Ks[t * headDim + d];
+                }
+                score *= scale;
+
+                float newMax = fmaxf(rowMax, score);
+                float rescale = expf(rowMax - newMax);
+                float expScore = expf(score - newMax);
+                rowSum = rowSum * rescale + expScore;
+
+                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                    outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
+                }
+                rowMax = newMax;
+            }
+        }
+        __syncthreads();
     }
 
-    // Softmax normalization
-    float sumExp = 0.0f;
-    for (int ki = 0; ki < seqK; ki++) {
-        float expScore = expf(scores[ki] - maxScore);
-        scores[ki] = expScore;
-        sumExp += expScore;
-    }
-
-    // Compute output and optionally store weights
-    for (int d = 0; d < headDim; d++) {
-        float val = 0.0f;
-        for (int ki = 0; ki < seqK; ki++) {
-            float weight = scores[ki] / sumExp;
-            val += weight * value[vOffset + ki * headDim + d];
+    if (qi < seqQ) {
+        int oOffset = bqh * seqQ * headDim + qi * headDim;
+        float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
+        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+            output[oOffset + d] = outAcc[d] * invSum;
         }
-        output[oOffset + d] = val;
-    }
 
-    if (storeWeights) {
-        for (int ki = 0; ki < seqK; ki++) {
-            attentionWeights[wOffset + ki] = scores[ki] / sumExp;
+        if (storeWeights) {
+            float logsumexp = rowMax + logf(fmaxf(rowSum, 1e-20f));
+            int wOffset = bqh * seqQ * seqK + qi * seqK;
+            int qOffset = bqh * seqQ * headDim + qi * headDim;
+            for (int ki = 0; ki < seqK; ki++) {
+                if (isCausal && ki > qi) {
+                    attentionWeights[wOffset + ki] = 0.0f;
+                    continue;
+                }
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * key[kBase + ki * headDim + d];
+                }
+                score *= scale;
+                attentionWeights[wOffset + ki] = expf(score - logsumexp);
+            }
         }
     }
 }
 
 // ===========================================================================
 // GQA BACKWARD
+// Uses shared memory for K/V tiles. Eliminates float gradWeights[1024] VLA.
+// Computes gradWeights on-the-fly per KV tile.
+// Grid: (ceil(seqQ/ATTN_BR), batch*numQHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void grouped_query_attention_backward(
@@ -412,64 +533,117 @@ extern ""C"" __global__ void grouped_query_attention_backward(
     int headDim,
     float scale)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bqh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bqh = blockIdx.y;
 
-    if (qi >= seqQ || bqh >= batch * numQHeads) return;
+    if (bqh >= batch * numQHeads) return;
 
-    int b = bqh / numQHeads;
+    int b_idx = bqh / numQHeads;
     int qh = bqh % numQHeads;
     int kvh = qh / queriesPerKV;
 
-    // Offsets
-    int qOffset = bqh * seqQ * headDim + qi * headDim;
-    int kOffset = (b * numKVHeads + kvh) * seqK * headDim;
-    int vOffset = (b * numKVHeads + kvh) * seqK * headDim;
-    int gOffset = bqh * seqQ * headDim + qi * headDim;
-    int wOffset = bqh * seqQ * seqK + qi * seqK;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
 
-    // Compute gradients w.r.t. attention weights: gradOutput @ V^T
-    float gradWeights[1024];
-    for (int ki = 0; ki < seqK; ki++) {
-        float sum = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            sum += gradOutput[gOffset + d] * value[vOffset + ki * headDim + d];
+    int kBase = (b_idx * numKVHeads + kvh) * seqK * headDim;
+    int vBase = (b_idx * numKVHeads + kvh) * seqK * headDim;
+
+    // Pre-compute per-thread dot(weights, gradWeights) over ALL seqK
+    // This requires a full pass, but we use tiled approach
+    float dotWgW = 0.0f;
+    int qOffset = 0, gOffset = 0, wOffset = 0;
+
+    if (qi < seqQ) {
+        qOffset = bqh * seqQ * headDim + qi * headDim;
+        gOffset = bqh * seqQ * headDim + qi * headDim;
+        wOffset = bqh * seqQ * seqK + qi * seqK;
+
+        // First pass: compute dot(weights, gradWeights) using tiles
+        for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+            int tileSize = min(ATTN_BC, seqK - kvStart);
+
+            // Load V tile for gradWeight computation
+            for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+                int row = i / headDim;
+                int col = i % headDim;
+                Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
+            }
+            __syncthreads();
+
+            if (qi < seqQ) {
+                for (int t = 0; t < tileSize; t++) {
+                    int ki = kvStart + t;
+                    float weight = attentionWeights[wOffset + ki];
+                    float gw = 0.0f;
+                    for (int d = 0; d < headDim; d++) {
+                        gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                    }
+                    dotWgW += weight * gw;
+                }
+            }
+            __syncthreads();
         }
-        gradWeights[ki] = sum;
     }
 
-    // Softmax backward: gradScores = weights * (gradWeights - dot(weights, gradWeights))
-    float dotProduct = 0.0f;
-    for (int ki = 0; ki < seqK; ki++) {
-        dotProduct += attentionWeights[wOffset + ki] * gradWeights[ki];
-    }
+    // Second pass: compute actual gradients using tiles
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
 
-    // Compute gradients
-    for (int ki = 0; ki < seqK; ki++) {
-        float weight = attentionWeights[wOffset + ki];
-        float gradScore = weight * (gradWeights[ki] - dotProduct) * scale;
-
-        // Gradient w.r.t. V (accumulated across query heads using atomics)
-        for (int d = 0; d < headDim; d++) {
-            atomicAdd(&gradValue[vOffset + ki * headDim + d],
-                      weight * gradOutput[gOffset + d]);
+        // Load K, V tiles
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
         }
-
-        // Gradient w.r.t. Q
-        for (int d = 0; d < headDim; d++) {
-            gradQuery[qOffset + d] += gradScore * key[kOffset + ki * headDim + d];
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
+        __syncthreads();
 
-        // Gradient w.r.t. K (accumulated across query heads using atomics)
-        for (int d = 0; d < headDim; d++) {
-            atomicAdd(&gradKey[kOffset + ki * headDim + d],
-                      gradScore * query[qOffset + d]);
+        if (qi < seqQ) {
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                float weight = attentionWeights[wOffset + ki];
+
+                // Compute gradWeight for this position
+                float gw = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                }
+
+                float gradScore = weight * (gw - dotWgW) * scale;
+
+                // Gradient w.r.t. V
+                for (int d = 0; d < headDim; d++) {
+                    atomicAdd(&gradValue[vBase + ki * headDim + d],
+                              weight * gradOutput[gOffset + d]);
+                }
+
+                // Gradient w.r.t. Q (K from shared memory)
+                for (int d = 0; d < headDim; d++) {
+                    gradQuery[qOffset + d] += gradScore * Ks[t * headDim + d];
+                }
+
+                // Gradient w.r.t. K
+                for (int d = 0; d < headDim; d++) {
+                    atomicAdd(&gradKey[kBase + ki * headDim + d],
+                              gradScore * query[qOffset + d]);
+                }
+            }
         }
+        __syncthreads();
     }
 }
 
 // ===========================================================================
 // FLASH ATTENTION FORWARD (Compatibility version without stats)
+// Same tiled shared-memory approach. Fixed double expf computation.
+// Grid: (ceil(seqLen/ATTN_BR), batch*numHeads), Block: (ATTN_BR, 1)
+// Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
 extern ""C"" __global__ void flash_attention_forward(
@@ -484,43 +658,75 @@ extern ""C"" __global__ void flash_attention_forward(
     float scale,
     int isCausal)
 {
-    int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    int bh = blockIdx.y * blockDim.y + threadIdx.y;
+    int qBase = blockIdx.x * ATTN_BR;
+    int qi = qBase + threadIdx.x;
+    int bh = blockIdx.y;
 
-    if (bh >= batch * numHeads || qi >= seqLen) return;
+    if (bh >= batch * numHeads) return;
 
-    int qOffset = bh * seqLen * headDim + qi * headDim;
-    int kOffset = bh * seqLen * headDim;
-    int vOffset = bh * seqLen * headDim;
-    int oOffset = bh * seqLen * headDim + qi * headDim;
+    extern __shared__ float smem[];
+    float* Ks = smem;                        // [ATTN_BC * headDim]
+    float* Vs = smem + ATTN_BC * headDim;    // [ATTN_BC * headDim]
+
+    int kBase = bh * seqLen * headDim;
+    int vBase = bh * seqLen * headDim;
 
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
     float outAcc[MAX_HEAD_DIM];
     for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
 
-    for (int ki = 0; ki < seqLen; ki++) {
-        if (isCausal && ki > qi) continue;
+    for (int kvStart = 0; kvStart < seqLen; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqLen - kvStart);
 
-        float score = 0.0f;
-        for (int d = 0; d < headDim; d++) {
-            score += query[qOffset + d] * key[kOffset + ki * headDim + d];
+        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+
+        // Cooperative load K, V tiles
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Ks[row * headDim + col] = key[kBase + (kvStart + row) * headDim + col];
         }
-        score *= scale;
-
-        float newMax = fmaxf(rowMax, score);
-        float rescale = expf(rowMax - newMax);
-        rowSum = rowSum * rescale + expf(score - newMax);
-
-        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-            outAcc[d] = outAcc[d] * rescale + expf(score - newMax) * value[vOffset + ki * headDim + d];
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
-        rowMax = newMax;
+        __syncthreads();
+
+        if (qi < seqLen) {
+            int qOffset = bh * seqLen * headDim + qi * headDim;
+
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                if (isCausal && ki > qi) continue;
+
+                float score = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    score += query[qOffset + d] * Ks[t * headDim + d];
+                }
+                score *= scale;
+
+                float newMax = fmaxf(rowMax, score);
+                float rescale = expf(rowMax - newMax);
+                float expScore = expf(score - newMax);  // Single expf, cached
+                rowSum = rowSum * rescale + expScore;
+
+                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                    outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
+                }
+                rowMax = newMax;
+            }
+        }
+        __syncthreads();
     }
 
-    float invSum = 1.0f / rowSum;
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
-        output[oOffset + d] = outAcc[d] * invSum;
+    if (qi < seqLen) {
+        int oOffset = bh * seqLen * headDim + qi * headDim;
+        float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
+        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+            output[oOffset + d] = outAcc[d] * invSum;
+        }
     }
 }
 ";

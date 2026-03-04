@@ -2090,6 +2090,20 @@ public sealed class CudaBackend : IAsyncGpuBackend
             "cuLaunchKernel2D");
     }
 
+    private unsafe void LaunchKernel2DWithSharedMem(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedMemBytes, void** args)
+    {
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(
+                kernel,
+                gridX, gridY, 1,
+                blockX, blockY, 1,
+                sharedMemBytes,
+                _stream,
+                (IntPtr)args,
+                IntPtr.Zero),
+            "cuLaunchKernel2DSharedMem");
+    }
+
     private static void ValidateGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer? C, int M, int N, int K)
     {
         if (M <= 0 || N <= 0 || K <= 0)
@@ -4112,7 +4126,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &hasBias;
         args[14] = &biasBatchStride;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args);
+        // Shared memory: 2 * ATTN_BC(32) * headDim * sizeof(float)
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     public unsafe void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4123,7 +4139,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         using var _ = PushContext();
         var kernel = _kernelCache["flash_attention_backward"];
-        uint gridX = (uint)((seqQ + 63) / 64);
+        uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
@@ -4159,7 +4175,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[17] = &hasBias;
         args[18] = &biasBatchStride;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 64, 1, args);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4199,7 +4216,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         for (int i = 0; i < 14; i++) args2[i] = args[i];
         args2[14] = &storeWeights;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args2);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args2);
     }
 
     public unsafe void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4239,7 +4257,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[14] = &headDim;
         args[15] = &scale;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     #endregion

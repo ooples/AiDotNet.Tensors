@@ -5169,7 +5169,8 @@ public sealed class HipBackend : IAsyncGpuBackend
 
             uint gridX = (uint)((seqQ + 31) / 32);
             uint gridY = (uint)(batch * numHeads);
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args);
+            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
         }
         finally
@@ -5216,9 +5217,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[19];
             for (int i = 0; i < 19; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            uint gridX = (uint)((seqQ + 63) / 64);
+            uint gridX = (uint)((seqQ + 31) / 32);
             uint gridY = (uint)(batch * numHeads);
-            LaunchKernel2D(krnl, gridX, gridY, 64, 1, args);
+            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
         }
         finally
@@ -5263,7 +5265,8 @@ public sealed class HipBackend : IAsyncGpuBackend
 
             uint gridX = (uint)((seqQ + 31) / 32);
             uint gridY = (uint)(batch * numQHeads);
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args);
+            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
         }
         finally
@@ -5307,7 +5310,8 @@ public sealed class HipBackend : IAsyncGpuBackend
 
             uint gridX = (uint)((seqQ + 31) / 32);
             uint gridY = (uint)(batch * numQHeads);
-            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args);
+            uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+            LaunchKernel2D(krnl, gridX, gridY, 32, 1, args, sharedBytes);
             Synchronize();
         }
         finally
