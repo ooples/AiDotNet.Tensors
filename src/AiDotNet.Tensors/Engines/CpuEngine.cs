@@ -4630,7 +4630,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Fallback to parallel loops for non-float/double or when BLAS unavailable
-        // Use flat GetFlat/SetFlat to avoid params int[] allocations from the multi-dim indexer
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
+
         Parallel.For(0, m, i =>
         {
             for (int j = 0; j < p; j++)
@@ -4638,9 +4641,9 @@ public class CpuEngine : ITensorLevelEngine
                 T sum = numOps.Zero;
                 for (int k = 0; k < n; k++)
                 {
-                    sum = numOps.Add(sum, numOps.Multiply(a.GetFlat(i * n + k), b.GetFlat(k * p + j)));
+                    sum = numOps.Add(sum, numOps.Multiply(aData[i * n + k], bData[k * p + j]));
                 }
-                result.SetFlat(i * p + j, sum);
+                rData[i * p + j] = sum;
             }
         });
 
@@ -4684,6 +4687,10 @@ public class CpuEngine : ITensorLevelEngine
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
 
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
+
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
@@ -4702,11 +4709,9 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int k = 0; k < n; k++)
                     {
-                        T aVal = a.GetFlat(aOffset + i * n + k);
-                        T bVal = b.GetFlat(k * p + j);
-                        sum = numOps.Add(sum, numOps.Multiply(aVal, bVal));
+                        sum = numOps.Add(sum, numOps.Multiply(aData[aOffset + i * n + k], bData[k * p + j]));
                     }
-                    result.SetFlat(resultOffset + i * p + j, sum);
+                    rData[resultOffset + i * p + j] = sum;
                 }
             }
         });
@@ -4757,6 +4762,10 @@ public class CpuEngine : ITensorLevelEngine
         int matrixSizeB = n * p;
         int matrixSizeResult = m * p;
 
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
+
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
@@ -4776,11 +4785,9 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int k = 0; k < n; k++)
                     {
-                        T aVal = a.GetFlat(aOffset + i * n + k);
-                        T bVal = b.GetFlat(bOffset + k * p + j);
-                        sum = numOps.Add(sum, numOps.Multiply(aVal, bVal));
+                        sum = numOps.Add(sum, numOps.Multiply(aData[aOffset + i * n + k], bData[bOffset + k * p + j]));
                     }
-                    result.SetFlat(resultOffset + i * p + j, sum);
+                    rData[resultOffset + i * p + j] = sum;
                 }
             }
         });
