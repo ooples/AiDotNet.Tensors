@@ -15876,6 +15876,8 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
         var result = new Tensor<T>(outputShape);
+        var inputData = input.GetDataArray();
+        var resultData = result.GetDataArray();
 
         // Handle batched input
         int batchSize = input.Length / n;
@@ -15886,7 +15888,7 @@ public class CpuEngine : ITensorLevelEngine
             var signal = new Vector<T>(nFft);
             int inputOffset = batchIdx * n;
             for (int i = 0; i < n; i++)
-                signal[i] = input.GetFlat(inputOffset + i);
+                signal[i] = inputData[inputOffset + i];
             for (int i = n; i < nFft; i++)
                 signal[i] = numOps.Zero;
 
@@ -15897,8 +15899,8 @@ public class CpuEngine : ITensorLevelEngine
             int outputOffset = batchIdx * numFreqs * 2;
             for (int k = 0; k < numFreqs; k++)
             {
-                result.SetFlat(outputOffset + k * 2, realOut[k]);
-                result.SetFlat(outputOffset + k * 2 + 1, imagOut[k]);
+                resultData[outputOffset + k * 2] = realOut[k];
+                resultData[outputOffset + k * 2 + 1] = imagOut[k];
             }
         });
 
@@ -15918,6 +15920,8 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
         var result = new Tensor<T>(outputShape);
+        var inputData = input.GetDataArray();
+        var resultData = result.GetDataArray();
 
         // Handle batched input
         int batchSize = input.Length / (numFreqs * 2);
@@ -15932,8 +15936,8 @@ public class CpuEngine : ITensorLevelEngine
             // Copy positive frequencies
             for (int k = 0; k < numFreqs; k++)
             {
-                realIn[k] = input.GetFlat(inputOffset + k * 2);
-                imagIn[k] = input.GetFlat(inputOffset + k * 2 + 1);
+                realIn[k] = inputData[inputOffset + k * 2];
+                imagIn[k] = inputData[inputOffset + k * 2 + 1];
             }
 
             // Conjugate symmetry for negative frequencies
@@ -15951,7 +15955,7 @@ public class CpuEngine : ITensorLevelEngine
             T scale = numOps.FromDouble(1.0 / nFft);
             for (int i = 0; i < outputLength; i++)
             {
-                result.SetFlat(outputOffset + i, numOps.Multiply(realOut[i], scale));
+                resultData[outputOffset + i] = numOps.Multiply(realOut[i], scale);
             }
         });
 
@@ -15971,6 +15975,10 @@ public class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var outReal = new Tensor<T>(inputReal.Shape);
         var outImag = new Tensor<T>(inputImag.Shape);
+        var inputRealData = inputReal.GetDataArray();
+        var inputImagData = inputImag.GetDataArray();
+        var outRealData = outReal.GetDataArray();
+        var outImagData = outImag.GetDataArray();
 
         int batchSize = inputReal.Length / n;
 
@@ -15982,16 +15990,16 @@ public class CpuEngine : ITensorLevelEngine
 
             for (int i = 0; i < n; i++)
             {
-                realIn[i] = inputReal.GetFlat(offset + i);
-                imagIn[i] = inputImag.GetFlat(offset + i);
+                realIn[i] = inputRealData[offset + i];
+                imagIn[i] = inputImagData[offset + i];
             }
 
             var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: false);
 
             for (int i = 0; i < n; i++)
             {
-                outReal.SetFlat(offset + i, realOut[i]);
-                outImag.SetFlat(offset + i, imagOut[i]);
+                outRealData[offset + i] = realOut[i];
+                outImagData[offset + i] = imagOut[i];
             }
         });
 
@@ -16013,6 +16021,10 @@ public class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var outReal = new Tensor<T>(inputReal.Shape);
         var outImag = new Tensor<T>(inputImag.Shape);
+        var inputRealData = inputReal.GetDataArray();
+        var inputImagData = inputImag.GetDataArray();
+        var outRealData = outReal.GetDataArray();
+        var outImagData = outImag.GetDataArray();
 
         int batchSize = inputReal.Length / n;
         T scale = numOps.FromDouble(1.0 / n);
@@ -16025,16 +16037,16 @@ public class CpuEngine : ITensorLevelEngine
 
             for (int i = 0; i < n; i++)
             {
-                realIn[i] = inputReal.GetFlat(offset + i);
-                imagIn[i] = inputImag.GetFlat(offset + i);
+                realIn[i] = inputRealData[offset + i];
+                imagIn[i] = inputImagData[offset + i];
             }
 
             var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
 
             for (int i = 0; i < n; i++)
             {
-                outReal.SetFlat(offset + i, numOps.Multiply(realOut[i], scale));
-                outImag.SetFlat(offset + i, numOps.Multiply(imagOut[i], scale));
+                outRealData[offset + i] = numOps.Multiply(realOut[i], scale);
+                outImagData[offset + i] = numOps.Multiply(imagOut[i], scale);
             }
         });
 
@@ -16060,6 +16072,10 @@ public class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var outReal = new Tensor<T>(inputReal.Shape);
         var outImag = new Tensor<T>(inputImag.Shape);
+        var tempRealData = tempReal.GetDataArray();
+        var tempImagData = tempImag.GetDataArray();
+        var outRealData = outReal.GetDataArray();
+        var outImagData = outImag.GetDataArray();
 
         // FFT along rows (second-to-last dimension)
         int batchSize = inputReal.Length / (height * width);
@@ -16075,8 +16091,8 @@ public class CpuEngine : ITensorLevelEngine
                 for (int row = 0; row < height; row++)
                 {
                     int idx = batchIdx * height * width + row * width + col;
-                    realIn[row] = tempReal.GetFlat(idx);
-                    imagIn[row] = tempImag.GetFlat(idx);
+                    realIn[row] = tempRealData[idx];
+                    imagIn[row] = tempImagData[idx];
                 }
 
                 var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: false);
@@ -16084,8 +16100,8 @@ public class CpuEngine : ITensorLevelEngine
                 for (int row = 0; row < height; row++)
                 {
                     int idx = batchIdx * height * width + row * width + col;
-                    outReal.SetFlat(idx, realOut[row]);
-                    outImag.SetFlat(idx, imagOut[row]);
+                    outRealData[idx] = realOut[row];
+                    outImagData[idx] = imagOut[row];
                 }
             }
         });
@@ -16112,6 +16128,12 @@ public class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var outReal = new Tensor<T>(inputReal.Shape);
         var outImag = new Tensor<T>(inputImag.Shape);
+        var inputRealData = inputReal.GetDataArray();
+        var inputImagData = inputImag.GetDataArray();
+        var tempRealData = tempReal.GetDataArray();
+        var tempImagData = tempImag.GetDataArray();
+        var outRealData = outReal.GetDataArray();
+        var outImagData = outImag.GetDataArray();
 
         int batchSize = inputReal.Length / (height * width);
         T scale = numOps.FromDouble(1.0 / (height * width));
@@ -16127,8 +16149,8 @@ public class CpuEngine : ITensorLevelEngine
                 for (int row = 0; row < height; row++)
                 {
                     int idx = batchIdx * height * width + row * width + col;
-                    realIn[row] = inputReal.GetFlat(idx);
-                    imagIn[row] = inputImag.GetFlat(idx);
+                    realIn[row] = inputRealData[idx];
+                    imagIn[row] = inputImagData[idx];
                 }
 
                 var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
@@ -16136,8 +16158,8 @@ public class CpuEngine : ITensorLevelEngine
                 for (int row = 0; row < height; row++)
                 {
                     int idx = batchIdx * height * width + row * width + col;
-                    tempReal.SetFlat(idx, realOut[row]);
-                    tempImag.SetFlat(idx, imagOut[row]);
+                    tempRealData[idx] = realOut[row];
+                    tempImagData[idx] = imagOut[row];
                 }
             }
 
@@ -16150,16 +16172,16 @@ public class CpuEngine : ITensorLevelEngine
 
                 for (int col = 0; col < width; col++)
                 {
-                    realIn[col] = tempReal.GetFlat(rowOffset + col);
-                    imagIn[col] = tempImag.GetFlat(rowOffset + col);
+                    realIn[col] = tempRealData[rowOffset + col];
+                    imagIn[col] = tempImagData[rowOffset + col];
                 }
 
                 var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
 
                 for (int col = 0; col < width; col++)
                 {
-                    outReal.SetFlat(rowOffset + col, numOps.Multiply(realOut[col], scale));
-                    outImag.SetFlat(rowOffset + col, numOps.Multiply(imagOut[col], scale));
+                    outRealData[rowOffset + col] = numOps.Multiply(realOut[col], scale);
+                    outImagData[rowOffset + col] = numOps.Multiply(imagOut[col], scale);
                 }
             }
         });
@@ -16194,6 +16216,8 @@ public class CpuEngine : ITensorLevelEngine
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
             paddedInput = new Tensor<T>(paddedShape);
+            var inputData = input.GetDataArray();
+            var paddedData = paddedInput.GetDataArray();
 
             int batchSize = input.Length / signalLength;
             for (int b = 0; b < batchSize; b++)
@@ -16203,16 +16227,15 @@ public class CpuEngine : ITensorLevelEngine
 
                 // Reflect padding at start
                 for (int i = 0; i < padAmount; i++)
-                    paddedInput.SetFlat(outputOffset + i, input.GetFlat(inputOffset + padAmount - i));
+                    paddedData[outputOffset + i] = inputData[inputOffset + padAmount - i];
 
                 // Copy original
-                for (int i = 0; i < signalLength; i++)
-                    paddedInput.SetFlat(outputOffset + padAmount + i, input.GetFlat(inputOffset + i));
+                Array.Copy(inputData, inputOffset, paddedData, outputOffset + padAmount, signalLength);
 
                 // Reflect padding at end
                 for (int i = 0; i < padAmount; i++)
-                    paddedInput.SetFlat(outputOffset + padAmount + signalLength + i,
-                        input.GetFlat(inputOffset + signalLength - 2 - i));
+                    paddedData[outputOffset + padAmount + signalLength + i] =
+                        inputData[inputOffset + signalLength - 2 - i];
             }
             signalLength = paddedShape[^1];
         }
@@ -16236,6 +16259,10 @@ public class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var magOut = new Tensor<T>(newShape);
         var phOut = new Tensor<T>(newShape);
+        var paddedInputData = paddedInput.GetDataArray();
+        var windowData = window.GetDataArray();
+        var magOutData = magOut.GetDataArray();
+        var phOutData = phOut.GetDataArray();
 
         int batchSizeStft = paddedInput.Length / signalLength;
 
@@ -16250,9 +16277,7 @@ public class CpuEngine : ITensorLevelEngine
                 int inputOffset = batchIdx * signalLength;
                 for (int i = 0; i < nFft; i++)
                 {
-                    T sample = paddedInput.GetFlat(inputOffset + start + i);
-                    T win = window.GetFlat(i);
-                    frameData[i] = numOps.Multiply(sample, win);
+                    frameData[i] = numOps.Multiply(paddedInputData[inputOffset + start + i], windowData[i]);
                 }
 
                 // Compute FFT
@@ -16267,8 +16292,8 @@ public class CpuEngine : ITensorLevelEngine
                     double mag = Math.Sqrt(re * re + im * im);
                     double ph = Math.Atan2(im, re);
 
-                    magOut.SetFlat(outputOffset + k * numFrames + frame, numOps.FromDouble(mag));
-                    phOut.SetFlat(outputOffset + k * numFrames + frame, numOps.FromDouble(ph));
+                    magOutData[outputOffset + k * numFrames + frame] = numOps.FromDouble(mag);
+                    phOutData[outputOffset + k * numFrames + frame] = numOps.FromDouble(ph);
                 }
             }
         });
@@ -16305,6 +16330,11 @@ public class CpuEngine : ITensorLevelEngine
         outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
         var result = new Tensor<T>(outputShape);
         var windowSum = new Tensor<T>(outputShape);
+        var magData = magnitude.GetDataArray();
+        var phaseData = phase.GetDataArray();
+        var windowData = window.GetDataArray();
+        var resultData = result.GetDataArray();
+        var windowSumData = windowSum.GetDataArray();
 
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
@@ -16322,8 +16352,8 @@ public class CpuEngine : ITensorLevelEngine
                 // Positive frequencies
                 for (int k = 0; k < numFreqs; k++)
                 {
-                    double mag = numOps.ToDouble(magnitude.GetFlat(magOffset + k * numFrames + frame));
-                    double ph = numOps.ToDouble(phase.GetFlat(magOffset + k * numFrames + frame));
+                    double mag = numOps.ToDouble(magData[magOffset + k * numFrames + frame]);
+                    double ph = numOps.ToDouble(phaseData[magOffset + k * numFrames + frame]);
                     realIn[k] = numOps.FromDouble(mag * Math.Cos(ph));
                     imagIn[k] = numOps.FromDouble(mag * Math.Sin(ph));
                 }
@@ -16340,22 +16370,19 @@ public class CpuEngine : ITensorLevelEngine
                 T scale = numOps.FromDouble(1.0 / nFft);
 
                 // Overlap-add
-                int start = frame * hopLength;
-                int actualStart = center ? start : start;
-                int writeStart = center ? Math.Max(0, start - nFft / 2) : start;
+                int writeStart = center ? Math.Max(0, frame * hopLength - nFft / 2) : frame * hopLength;
 
                 for (int i = 0; i < nFft; i++)
                 {
                     int outIdx = writeStart + i;
                     if (outIdx >= 0 && outIdx < outputLength)
                     {
-                        T sample = numOps.Multiply(numOps.Multiply(realOut[i], scale), window.GetFlat(i));
-                        T existing = result.GetFlat(outputOffset + outIdx);
-                        result.SetFlat(outputOffset + outIdx, numOps.Add(existing, sample));
+                        int resultIdx = outputOffset + outIdx;
+                        T sample = numOps.Multiply(numOps.Multiply(realOut[i], scale), windowData[i]);
+                        resultData[resultIdx] = numOps.Add(resultData[resultIdx], sample);
 
-                        T winSquared = numOps.Multiply(window.GetFlat(i), window.GetFlat(i));
-                        T existingWin = windowSum.GetFlat(outputOffset + outIdx);
-                        windowSum.SetFlat(outputOffset + outIdx, numOps.Add(existingWin, winSquared));
+                        T winSquared = numOps.Multiply(windowData[i], windowData[i]);
+                        windowSumData[resultIdx] = numOps.Add(windowSumData[resultIdx], winSquared);
                     }
                 }
             }
@@ -16363,12 +16390,11 @@ public class CpuEngine : ITensorLevelEngine
             // Normalize by window sum
             for (int i = 0; i < outputLength; i++)
             {
-                T winSum = windowSum.GetFlat(outputOffset + i);
-                double winSumD = numOps.ToDouble(winSum);
+                int idx = outputOffset + i;
+                double winSumD = numOps.ToDouble(windowSumData[idx]);
                 if (winSumD > 1e-8)
                 {
-                    T val = result.GetFlat(outputOffset + i);
-                    result.SetFlat(outputOffset + i, numOps.Divide(val, winSum));
+                    resultData[idx] = numOps.Divide(resultData[idx], windowSumData[idx]);
                 }
             }
         }
@@ -16410,6 +16436,9 @@ public class CpuEngine : ITensorLevelEngine
         var melShape = magnitude.Shape.ToArray();
         melShape[^2] = nMels;
         var melSpec = new Tensor<T>(melShape);
+        var melFilterData = melFilterbank.GetDataArray();
+        var powerSpecData = powerSpec.GetDataArray();
+        var melSpecData = melSpec.GetDataArray();
 
         for (int batchIdx = 0; batchIdx < batchSize; batchIdx++)
         {
@@ -16423,11 +16452,11 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int f = 0; f < numFreqs; f++)
                     {
-                        T filterVal = melFilterbank.GetFlat(m * numFreqs + f);
-                        T powerVal = powerSpec.GetFlat(inputOffset + f * numFrames + t);
-                        sum = numOps.Add(sum, numOps.Multiply(filterVal, powerVal));
+                        sum = numOps.Add(sum, numOps.Multiply(
+                            melFilterData[m * numFreqs + f],
+                            powerSpecData[inputOffset + f * numFrames + t]));
                     }
-                    melSpec.SetFlat(outputOffset + m * numFrames + t, sum);
+                    melSpecData[outputOffset + m * numFrames + t] = sum;
                 }
             }
         }
@@ -16435,18 +16464,16 @@ public class CpuEngine : ITensorLevelEngine
         // Convert to dB scale if requested
         if (powerToDb)
         {
-            T refValue = numOps.One;
-            T minDb = numOps.FromDouble(-80.0);
-            T epsilon = numOps.FromDouble(1e-10);
+            double minDbD = -80.0;
+            double epsilonD = 1e-10;
 
             for (int i = 0; i < melSpec.Length; i++)
             {
-                T val = melSpec.GetFlat(i);
-                double valD = numOps.ToDouble(val);
-                valD = Math.Max(valD, numOps.ToDouble(epsilon));
-                double db = 10.0 * Math.Log10(valD / numOps.ToDouble(refValue));
-                db = Math.Max(db, numOps.ToDouble(minDb));
-                melSpec.SetFlat(i, numOps.FromDouble(db));
+                double valD = numOps.ToDouble(melSpecData[i]);
+                valD = Math.Max(valD, epsilonD);
+                double db = 10.0 * Math.Log10(valD);
+                db = Math.Max(db, minDbD);
+                melSpecData[i] = numOps.FromDouble(db);
             }
         }
 
@@ -16473,10 +16500,11 @@ public class CpuEngine : ITensorLevelEngine
         // Initialize with random phase
         var random = RandomHelper.ThreadSafeRandom;
         var phase = new Tensor<T>(magnitude.Shape);
+        var phaseData = phase.GetDataArray();
         for (int i = 0; i < phase.Length; i++)
         {
             double randomPhase = random.NextDouble() * 2.0 * Math.PI - Math.PI;
-            phase.SetFlat(i, numOps.FromDouble(randomPhase));
+            phaseData[i] = numOps.FromDouble(randomPhase);
         }
 
         Tensor<T>? previousPhase = null;
@@ -16492,16 +16520,19 @@ public class CpuEngine : ITensorLevelEngine
             // Apply momentum for faster convergence
             if (previousPhase != null && momentum > 0)
             {
+                var newPhaseData = newPhase.GetDataArray();
+                var prevPhaseData = previousPhase.GetDataArray();
+                phaseData = phase.GetDataArray();
                 for (int i = 0; i < phase.Length; i++)
                 {
-                    double currPhase = numOps.ToDouble(newPhase.GetFlat(i));
-                    double prevPhase = numOps.ToDouble(previousPhase.GetFlat(i));
-                    double diff = currPhase - prevPhase;
+                    double currPh = numOps.ToDouble(newPhaseData[i]);
+                    double prevPh = numOps.ToDouble(prevPhaseData[i]);
+                    double diff = currPh - prevPh;
                     // Wrap to [-pi, pi]
                     while (diff > Math.PI) diff -= 2 * Math.PI;
                     while (diff < -Math.PI) diff += 2 * Math.PI;
-                    double accelerated = prevPhase + diff * (1 + momentum);
-                    phase.SetFlat(i, numOps.FromDouble(accelerated));
+                    double accelerated = prevPh + diff * (1 + momentum);
+                    phaseData[i] = numOps.FromDouble(accelerated);
                 }
             }
             else
