@@ -246,7 +246,7 @@ jobs:
 
       - name: Build
         if: steps.version.outputs.should_release == 'true'
-        run: dotnet build -c Release --no-restore
+        run: dotnet build -c Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
 
   pack:
     name: Pack NuGet
@@ -275,7 +275,7 @@ jobs:
       - name: Restore and Build
         run: |
           dotnet restore
-          dotnet build -c Release --no-restore
+          dotnet build -c Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
 
       - name: Pack NuGet packages
         shell: pwsh

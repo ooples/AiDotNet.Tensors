@@ -1,7 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -38,12 +40,12 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     private bool _disposed;
 
     /// <summary>
-    /// Environment variable name for the Supabase project URL.
+    /// Environment variable name for the Supabase project URL (override).
     /// </summary>
     public const string SupabaseUrlEnvVar = "AIDOTNET_TELEMETRY_URL";
 
     /// <summary>
-    /// Environment variable name for the Supabase anon key.
+    /// Environment variable name for the Supabase anon key (override).
     /// </summary>
     public const string SupabaseKeyEnvVar = "AIDOTNET_TELEMETRY_KEY";
 
@@ -53,20 +55,22 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <summary>
     /// Creates a new Supabase telemetry client.
     /// </summary>
+    /// <remarks>
+    /// Credential resolution order (first non-empty wins):
+    /// 1. Constructor parameters (explicit override)
+    /// 2. Environment variables (AIDOTNET_TELEMETRY_URL / AIDOTNET_TELEMETRY_KEY)
+    /// 3. Assembly metadata embedded at build time by CI/CD
+    /// </remarks>
     /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
-    /// <param name="supabaseUrl">Supabase project URL (optional, reads from AIDOTNET_TELEMETRY_URL env var).</param>
-    /// <param name="supabaseKey">Supabase anon key (optional, reads from AIDOTNET_TELEMETRY_KEY env var).</param>
+    /// <param name="supabaseUrl">Supabase project URL (optional).</param>
+    /// <param name="supabaseKey">Supabase anon key (optional).</param>
     public SupabaseTelemetryClient(
         bool enabled = true,
         string? supabaseUrl = null,
         string? supabaseKey = null)
     {
-        _supabaseUrl = supabaseUrl
-            ?? Environment.GetEnvironmentVariable(SupabaseUrlEnvVar)
-            ?? string.Empty;
-        _supabaseKey = supabaseKey
-            ?? Environment.GetEnvironmentVariable(SupabaseKeyEnvVar)
-            ?? string.Empty;
+        _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar, "TelemetryUrl");
+        _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar, "TelemetryKey");
 
         // Disable telemetry if credentials are not configured
         _isEnabled = enabled
@@ -85,6 +89,44 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         {
             _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
             _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+        }
+    }
+
+    /// <summary>
+    /// Resolves a credential value: constructor param > env var > assembly metadata.
+    /// </summary>
+    private static string ResolveCredential(string? explicitValue, string envVarName, string metadataKey)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitValue))
+        {
+            return explicitValue;
+        }
+
+        var envValue = Environment.GetEnvironmentVariable(envVarName);
+        if (!string.IsNullOrWhiteSpace(envValue))
+        {
+            return envValue;
+        }
+
+        return GetAssemblyMetadata(metadataKey);
+    }
+
+    /// <summary>
+    /// Reads a value from AssemblyMetadata attributes embedded at build time.
+    /// </summary>
+    private static string GetAssemblyMetadata(string key)
+    {
+        try
+        {
+            var assembly = typeof(SupabaseTelemetryClient).Assembly;
+            var attribute = assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(a => string.Equals(a.Key, key, StringComparison.Ordinal));
+            return attribute?.Value ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
         }
     }
 
