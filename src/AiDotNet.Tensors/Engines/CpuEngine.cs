@@ -1786,6 +1786,10 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(outputShape);
 
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
+
         // Handle 2D case (no batch dimensions) - try BLAS first
         if (rank == 2)
         {
@@ -1794,24 +1798,23 @@ public class CpuEngine : ITensorLevelEngine
                 return result;
             }
 
-            // Fallback: flat indexing to avoid params int[] allocations
-            for (int i = 0; i < m; i++)
+            // Fallback: direct array access to avoid bounds checking
+            Parallel.For(0, m, i =>
             {
                 for (int j = 0; j < n; j++)
                 {
                     T sum = numOps.Zero;
                     for (int p = 0; p < k; p++)
                     {
-                        sum = numOps.Add(sum, numOps.Multiply(a.GetFlat(i * k + p), b.GetFlat(p * n + j)));
+                        sum = numOps.Add(sum, numOps.Multiply(aData[i * k + p], bData[p * n + j]));
                     }
-                    result.SetFlat(i * n + j, sum);
+                    rData[i * n + j] = sum;
                 }
-            }
+            });
             return result;
         }
 
         // Handle ND case with batch dimensions (N >= 3)
-        // Use span-based access instead of ToArray() copies
         int matrixSizeA = m * k;
         int matrixSizeB = k * n;
         int matrixSizeResult = m * n;
@@ -1828,7 +1831,7 @@ public class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            // Scalar fallback using GetFlat/SetFlat
+            // Scalar fallback with direct array access
             for (int i = 0; i < m; i++)
             {
                 for (int j = 0; j < n; j++)
@@ -1836,11 +1839,9 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int p = 0; p < k; p++)
                     {
-                        T aVal = a.GetFlat(aOffset + i * k + p);
-                        T bVal = b.GetFlat(bOffset + p * n + j);
-                        sum = numOps.Add(sum, numOps.Multiply(aVal, bVal));
+                        sum = numOps.Add(sum, numOps.Multiply(aData[aOffset + i * k + p], bData[bOffset + p * n + j]));
                     }
-                    result.SetFlat(resultOffset + i * n + j, sum);
+                    rData[resultOffset + i * n + j] = sum;
                 }
             }
         });
@@ -12814,6 +12815,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var result = new Tensor<TValue>(outputShape);
         var embData = embeddings.GetDataArray();
+        var resultData = result.GetDataArray();
         var idxData = indices.GetDataArray();
 
         // For each index, copy the entire embedding row
@@ -12829,11 +12831,8 @@ public class CpuEngine : ITensorLevelEngine
             int srcOffset = tokenIdx * embeddingDim;
             int dstOffset = i * embeddingDim;
 
-            // Vectorized copy of embedding row
-            for (int d = 0; d < embeddingDim; d++)
-            {
-                result.SetFlat(dstOffset + d, embData[srcOffset + d]);
-            }
+            // Direct array copy of embedding row
+            Array.Copy(embData, srcOffset, resultData, dstOffset, embeddingDim);
         }
 
         return result;
@@ -12852,6 +12851,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<TValue>();
         var gradEmbeddings = new Tensor<TValue>(new[] { vocabSize, embeddingDim });
+        var gradEmbData = gradEmbeddings.GetDataArray();
 
         var gradData = gradOutput.GetDataArray();
         var idxData = indices.GetDataArray();
@@ -12870,12 +12870,10 @@ public class CpuEngine : ITensorLevelEngine
             int srcOffset = i * embeddingDim;
             int dstOffset = tokenIdx * embeddingDim;
 
-            // Accumulate gradient for this embedding row
+            // Accumulate gradient for this embedding row - direct array access
             for (int d = 0; d < embeddingDim; d++)
             {
-                TValue current = gradEmbeddings.GetFlat(dstOffset + d);
-                TValue grad = gradData[srcOffset + d];
-                gradEmbeddings.SetFlat(dstOffset + d, numOps.Add(current, grad));
+                gradEmbData[dstOffset + d] = numOps.Add(gradEmbData[dstOffset + d], gradData[srcOffset + d]);
             }
         }
 
