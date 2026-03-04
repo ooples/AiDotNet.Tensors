@@ -184,6 +184,20 @@ public static class CuBlasNative
     public static extern CudaResult cuMemFree(IntPtr devicePtr);
 
     /// <summary>
+    /// Allocates page-locked (pinned) host memory.
+    /// Pinned memory enables true async DMA transfers without requiring
+    /// a fixed block to keep the source/destination pinned.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAllocHost_v2")]
+    public static extern CudaResult cuMemAllocHost(out IntPtr hostPtr, ulong byteSize);
+
+    /// <summary>
+    /// Frees page-locked (pinned) host memory.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemFreeHost")]
+    public static extern CudaResult cuMemFreeHost(IntPtr hostPtr);
+
+    /// <summary>
     /// Copies memory from host to device.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoD_v2")]

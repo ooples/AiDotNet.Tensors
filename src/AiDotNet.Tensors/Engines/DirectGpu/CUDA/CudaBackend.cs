@@ -46,6 +46,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
+    private readonly CudaPinnedBufferPool _pinnedPool = new();
 
     public bool IsAvailable { get; }
     public string BackendName => "CUDA";
@@ -1383,8 +1384,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var partialBuffer = AllocateBuffer(gridSize);
         LaunchReductionKernel("reduce_sum", A, partialBuffer, size, blockSize);
-        Synchronize();
-
+        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
         var partials = DownloadBuffer(partialBuffer);
         float sum = 0.0f;
         for (int i = 0; i < partials.Length; i++)
@@ -1438,9 +1438,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 currentSize = gridSize;
             }
 
-            Synchronize();
-
-            // Download just the single scalar result
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             var result = new float[1];
             DownloadBuffer(currentBuffer, result);
             return result[0];
@@ -1466,8 +1464,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var partialBuffer = AllocateBuffer(gridSize);
         LaunchReductionKernel("reduce_max", A, partialBuffer, size, blockSize);
-        Synchronize();
-
+        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
         var partials = DownloadBuffer(partialBuffer);
         float max = float.MinValue;
         for (int i = 0; i < partials.Length; i++)
@@ -1589,17 +1586,35 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
         using var _ = PushContext();
-        fixed (float* dataPtr = data)
+        int byteSize = data.Length * sizeof(float);
+
+        // Use pinned host memory for true async DMA transfer.
+        // Unlike a fixed block, pinned memory stays resident without synchronization,
+        // enabling real compute-transfer overlap.
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
             var result = CudaNativeBindings.cuMemcpyHtoDAsync(
                 buffer.Handle,
-                (IntPtr)dataPtr,
-                (ulong)(data.Length * sizeof(float)),
+                pinnedPtr,
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyHtoDAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
+            // Record an event so we know when to return the pinned buffer.
+            // For now, we synchronize the stream to safely return the buffer.
+            // A future optimization could use event callbacks to defer the return.
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned upload)");
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -1610,17 +1625,29 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
         using var _ = PushContext();
-        fixed (float* dataPtr = data)
+        int byteSize = data.Length * sizeof(float);
+
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
             var result = CudaNativeBindings.cuMemcpyHtoDAsync(
                 buffer.Handle,
-                (IntPtr)dataPtr,
-                (ulong)(data.Length * sizeof(float)),
+                pinnedPtr,
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyHtoDAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned upload)");
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -1632,17 +1659,30 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
         using var _ = PushContext();
-        fixed (float* destPtr = destination)
+        int byteSize = destination.Length * sizeof(float);
+
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
             var result = CudaNativeBindings.cuMemcpyDtoHAsync(
-                (IntPtr)destPtr,
+                pinnedPtr,
                 buffer.Handle,
-                (ulong)(destination.Length * sizeof(float)),
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyDtoHAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
+            // Must synchronize before copying out of pinned buffer
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned download)");
+
+            fixed (float* dst = destination)
+            {
+                Buffer.MemoryCopy((void*)pinnedPtr, dst, byteSize, byteSize);
+            }
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -8266,6 +8306,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             return;
 
         _disposed = true;
+        _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
         if (_cublasHandle != IntPtr.Zero)

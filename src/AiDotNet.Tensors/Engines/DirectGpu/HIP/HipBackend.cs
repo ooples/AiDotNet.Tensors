@@ -46,6 +46,7 @@ public sealed class HipBackend : IAsyncGpuBackend
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<HipGpuBuffer> _bufferPool =
         new GpuBufferPool<HipGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+    private readonly HipPinnedBufferPool _pinnedPool = new();
     private HipDeviceProperties _deviceProps;
     private bool _supportsCooperativeLaunch;
 
@@ -8549,58 +8550,92 @@ public sealed class HipBackend : IAsyncGpuBackend
     }
 
     /// <inheritdoc/>
-    public void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
+    public unsafe void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
     {
-        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        int byteSize = data.Length * sizeof(float);
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
         try
         {
-            var size = (UIntPtr)(data.Length * sizeof(float));
+            // Copy managed data to pinned host memory
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
             var result = HipNativeBindings.hipMemcpyAsync(
                 buffer.Handle,
-                handle.AddrOfPinnedObject(),
-                size,
+                pinnedPtr,
+                (UIntPtr)byteSize,
                 HipMemcpyKind.HostToDevice,
                 stream.Handle);
             HipNativeBindings.CheckError(result, "hipMemcpyAsync H2D");
-            // Synchronize stream to ensure transfer completes before freeing the pinned handle
+
+            // Synchronize to safely return the pinned buffer
             var syncResult = HipNativeBindings.hipStreamSynchronize(stream.Handle);
-            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize");
+            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize(pinned upload)");
         }
         finally
         {
-            handle.Free();
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
     /// <inheritdoc/>
-    public void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
+    public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
     {
-        // Copy to array for pinning (ReadOnlySpan can't be pinned directly)
-        var array = data.ToArray();
-        UploadBufferAsync(array, buffer, stream);
+        int byteSize = data.Length * sizeof(float);
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
+        {
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
+            var result = HipNativeBindings.hipMemcpyAsync(
+                buffer.Handle,
+                pinnedPtr,
+                (UIntPtr)byteSize,
+                HipMemcpyKind.HostToDevice,
+                stream.Handle);
+            HipNativeBindings.CheckError(result, "hipMemcpyAsync H2D");
+
+            var syncResult = HipNativeBindings.hipStreamSynchronize(stream.Handle);
+            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize(pinned upload)");
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
+        }
     }
 
     /// <inheritdoc/>
-    public void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
+    public unsafe void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
     {
-        var handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
+        int byteSize = destination.Length * sizeof(float);
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
         try
         {
-            var size = (UIntPtr)(destination.Length * sizeof(float));
             var result = HipNativeBindings.hipMemcpyAsync(
-                handle.AddrOfPinnedObject(),
+                pinnedPtr,
                 buffer.Handle,
-                size,
+                (UIntPtr)byteSize,
                 HipMemcpyKind.DeviceToHost,
                 stream.Handle);
             HipNativeBindings.CheckError(result, "hipMemcpyAsync D2H");
-            // Synchronize stream to ensure transfer completes before freeing the pinned handle
+
+            // Must synchronize before copying out of pinned buffer
             var syncResult = HipNativeBindings.hipStreamSynchronize(stream.Handle);
-            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize");
+            HipNativeBindings.CheckError(syncResult, "hipStreamSynchronize(pinned download)");
+
+            fixed (float* dst = destination)
+            {
+                Buffer.MemoryCopy((void*)pinnedPtr, dst, byteSize, byteSize);
+            }
         }
         finally
         {
-            handle.Free();
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -9778,6 +9813,7 @@ public sealed class HipBackend : IAsyncGpuBackend
         _defaultStream?.Dispose();
         _defaultStream = null;
         _bufferPool.Dispose();
+        _pinnedPool.Dispose();
 
         // Unload all kernel modules
         if (_mfmaModule != IntPtr.Zero)
