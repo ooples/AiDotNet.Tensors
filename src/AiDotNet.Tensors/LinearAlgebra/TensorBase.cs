@@ -343,6 +343,15 @@ public abstract class TensorBase<T>
     }
 
     /// <summary>
+    /// Gets a reference to the underlying array without copying. This is safe because
+    /// VectorBase always allocates _memory from a T[].
+    /// </summary>
+    internal T[] GetDataArray()
+    {
+        return _data.GetDataArray();
+    }
+
+    /// <summary>
     /// Gets the value at a flat (linear) index in the underlying data.
     /// </summary>
     /// <param name="flatIndex">The flat index (0 to Length-1).</param>

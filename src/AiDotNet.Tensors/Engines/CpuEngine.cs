@@ -109,7 +109,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Check for division by zero before calling TensorPrimitivesHelper
         var numOps = MathHelper.GetNumericOperations<T>();
-        var bArray = b.ToArray();
+        var bArray = b.GetDataArray();
         for (int i = 0; i < bArray.Length; i++)
         {
             if (numOps.Equals(bArray[i], numOps.Zero))
@@ -646,7 +646,7 @@ public class CpuEngine : ITensorLevelEngine
         // For float and double, use SIMD-accelerated operators
         if (typeof(T) == typeof(float))
         {
-            T[] inputData = vector.ToArray();
+            T[] inputData = vector.GetDataArray();
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as float[] since we know T is float
@@ -666,7 +666,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            T[] inputData = vector.ToArray();
+            T[] inputData = vector.GetDataArray();
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as double[] since we know T is double
@@ -706,7 +706,7 @@ public class CpuEngine : ITensorLevelEngine
         // For float and double, use SIMD-accelerated operators
         if (typeof(T) == typeof(float))
         {
-            T[] inputData = vector.ToArray();
+            T[] inputData = vector.GetDataArray();
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as float[] since we know T is float
@@ -726,7 +726,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            T[] inputData = vector.ToArray();
+            T[] inputData = vector.GetDataArray();
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as double[] since we know T is double
@@ -1596,8 +1596,8 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
 
         var result = new Matrix<T>(a.Length, b.Length);
-        var aArray = a.ToArray();
-        var bArray = b.ToArray();
+        var aArray = a.GetDataArray();
+        var bArray = b.GetDataArray();
 
         // Use SIMD-optimized TensorPrimitives for float type
         if (typeof(T) == typeof(float) && bArray.Length >= 16)
@@ -1679,7 +1679,7 @@ public class CpuEngine : ITensorLevelEngine
                 nameof(values));
 
         // No vectorization benefit - column access is strided
-        var valuesArray = values.ToArray();
+        var valuesArray = values.GetDataArray();
         for (int i = 0; i < matrix.Rows; i++)
         {
             matrix[i, columnIndex] = valuesArray[i];
@@ -1699,7 +1699,7 @@ public class CpuEngine : ITensorLevelEngine
                 nameof(values));
 
         // Row access is contiguous - direct assignment
-        var valuesArray = values.ToArray();
+        var valuesArray = values.GetDataArray();
         for (int j = 0; j < matrix.Columns; j++)
         {
             matrix[rowIndex, j] = valuesArray[j];
@@ -3733,7 +3733,7 @@ public class CpuEngine : ITensorLevelEngine
         // TensorPrimitives doesn't have ReLU directly, but has Max
         // For now, use element-wise max with zero
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputArray = vector.ToArray();
+        var inputArray = vector.GetDataArray();
         var outputArray = new T[inputArray.Length];
 
         // For float, we could use TensorPrimitives.Max with scalar zero
@@ -4101,7 +4101,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[actualDim] = halfSize;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[inputData.Length / 2];
 
         // Calculate strides for the dimension
@@ -4151,8 +4151,8 @@ public class CpuEngine : ITensorLevelEngine
         int dimSize = input.Shape[actualDim];
         int halfSize = dimSize / 2;
 
-        var inputData = input.ToArray();
-        var gradOutData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
         var gradInputData = new T[inputData.Length];
 
         int innerSize = 1;
@@ -4215,7 +4215,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[actualDim] = halfSize;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[inputData.Length / 2];
 
         int innerSize = 1;
@@ -4269,8 +4269,8 @@ public class CpuEngine : ITensorLevelEngine
         int dimSize = input.Shape[actualDim];
         int halfSize = dimSize / 2;
 
-        var inputData = input.ToArray();
-        var gradOutData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
         var gradInputData = new T[inputData.Length];
 
         int innerSize = 1;
@@ -4343,7 +4343,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[actualDim] = halfSize;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[inputData.Length / 2];
 
         int innerSize = 1;
@@ -4395,8 +4395,8 @@ public class CpuEngine : ITensorLevelEngine
         int dimSize = input.Shape[actualDim];
         int halfSize = dimSize / 2;
 
-        var inputData = input.ToArray();
-        var gradOutData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
         var gradInputData = new T[inputData.Length];
 
         int innerSize = 1;
@@ -4462,7 +4462,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[actualDim] = halfSize;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[inputData.Length / 2];
 
         int innerSize = 1;
@@ -4513,8 +4513,8 @@ public class CpuEngine : ITensorLevelEngine
         int dimSize = input.Shape[actualDim];
         int halfSize = dimSize / 2;
 
-        var inputData = input.ToArray();
-        var gradOutData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
         var gradInputData = new T[inputData.Length];
 
         int innerSize = 1;
@@ -4831,9 +4831,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check kernel size, stride, padding, and dilation parameters.");
 
         var result = new Tensor<T>([batch, outChannels, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var outputData = result.GetDataArray();
 
         Parallel.For(0, batch * outChannels, idx =>
         {
@@ -4909,8 +4909,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradInput = new T[batch * inChannels * height * width];
-        var gradOutputData = gradOutput.ToArray();
-        var kernelData = kernel.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var kernelData = kernel.GetDataArray();
 
         // Initialize to zero
         for (int i = 0; i < gradInput.Length; i++)
@@ -4990,8 +4990,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
 
         for (int i = 0; i < gradKernel.Length; i++)
             gradKernel[i] = numOps.Zero;
@@ -5063,8 +5063,8 @@ public class CpuEngine : ITensorLevelEngine
         // Use local variable to avoid capturing out parameter in lambda
         var indices = new int[batch, channels, outputHeight, outputWidth, 2];
 
-        var inputData = input.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
 
         Parallel.For(0, batch * channels, idx =>
         {
@@ -5126,7 +5126,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradInput = new T[batch * channels * height * width];
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         for (int i = 0; i < gradInput.Length; i++)
             gradInput[i] = numOps.Zero;
@@ -5178,7 +5178,7 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[batch * channels * outputHeight * outputWidth];
         T poolArea = numOps.FromDouble(poolH * poolW);
 
@@ -5232,7 +5232,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradInput = new T[batch * channels * height * width];
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         T poolArea = numOps.FromDouble(poolH * poolW);
 
         for (int i = 0; i < gradInput.Length; i++)
@@ -5291,8 +5291,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = (width + 2 * padW - kernelWidth) / strideW + 1;
         int outChannels = inChannels * multiplier;
 
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
         var outputData = new T[batch * outChannels * outputHeight * outputWidth];
 
         Parallel.For(0, batch * outChannels, idx =>
@@ -5358,8 +5358,8 @@ public class CpuEngine : ITensorLevelEngine
         int outChannels = inChannels * multiplier;
 
         var gradInput = new T[batch * inChannels * height * width];
-        var gradOutputData = gradOutput.ToArray();
-        var kernelData = kernel.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var kernelData = kernel.GetDataArray();
 
         for (int i = 0; i < gradInput.Length; i++)
             gradInput[i] = numOps.Zero;
@@ -5425,8 +5425,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradKernel = new T[inChannels * multiplier * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
 
         for (int i = 0; i < gradKernel.Length; i++)
             gradKernel[i] = numOps.Zero;
@@ -5505,8 +5505,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = (height - 1) * strideH - 2 * padH + kernelHeight + outPadH;
         int outputWidth = (width - 1) * strideW - 2 * padW + kernelWidth + outPadW;
 
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
         var outputData = new T[batch * outChannels * outputHeight * outputWidth];
 
         for (int i = 0; i < outputData.Length; i++)
@@ -5612,8 +5612,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradKernel = new T[inChannels * outChannels * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
 
         for (int i = 0; i < gradKernel.Length; i++)
             gradKernel[i] = numOps.Zero;
@@ -5741,11 +5741,11 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>([batch, outChannels, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
-        var offsetData = offset.ToArray();
-        var maskData = mask?.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
+        var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
         Parallel.For(0, batch * outChannels, idx =>
@@ -5907,11 +5907,11 @@ public class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradInput = new Tensor<T>(inputShape);
-        var gradInputData = gradInput.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var kernelData = kernel.ToArray();
-        var offsetData = offset.ToArray();
-        var maskData = mask?.ToArray();
+        var gradInputData = gradInput.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
 
         // Use a lock array to avoid race conditions during atomic adds
         var locks = new object[batch * inChannels * height * width];
@@ -6074,11 +6074,11 @@ public class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradKernel = new Tensor<T>(kernelShape);
-        var gradKernelData = gradKernel.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var offsetData = offset.ToArray();
-        var maskData = mask?.ToArray();
+        var gradKernelData = gradKernel.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
 
         // Use locks for atomic operations on kernel gradients
         var locks = new object[outChannels * inChannels * kernelHeight * kernelWidth];
@@ -6195,12 +6195,12 @@ public class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradOffset = new Tensor<T>(offset.Shape);
-        var gradOffsetData = gradOffset.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
-        var offsetData = offset.ToArray();
-        var maskData = mask?.ToArray();
+        var gradOffsetData = gradOffset.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
+        var maskData = mask?.GetDataArray();
 
         Parallel.For(0, batch, b =>
         {
@@ -6508,11 +6508,11 @@ public class CpuEngine : ITensorLevelEngine
 
         // Mask shape: [batch, kernel_h*kernel_w, out_h, out_w]
         var gradMask = new Tensor<T>([batch, numKernelPositions, outputHeight, outputWidth]);
-        var gradMaskData = gradMask.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
-        var offsetData = offset.ToArray();
+        var gradMaskData = gradMask.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var offsetData = offset.GetDataArray();
 
         Parallel.For(0, batch, b =>
         {
@@ -6602,9 +6602,9 @@ public class CpuEngine : ITensorLevelEngine
         if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
 
         var gradInput = new Tensor<T>(inputShape);
-        var gradInputData = gradInput.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var gridData = grid.ToArray();
+        var gradInputData = gradInput.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var gridData = grid.GetDataArray();
 
         // Use locks for atomic addition - NHWC layout
         var locks = new object[batch * height * width * channels];
@@ -6673,10 +6673,10 @@ public class CpuEngine : ITensorLevelEngine
         if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
 
         var gradGrid = new Tensor<T>(grid.Shape);
-        var gradGridData = gradGrid.ToArray();
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gridData = grid.ToArray();
+        var gradGridData = gradGrid.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gridData = grid.GetDataArray();
 
         Parallel.For(0, batch, b =>
         {
@@ -6780,9 +6780,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
+        var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
         Parallel.For(0, batch * outChannels, idx =>
@@ -6877,8 +6877,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[4];
 
         var gradInputData = new T[batch * inChannels * depth * height * width];
-        var gradOutputData = gradOutput.ToArray();
-        var kernelData = kernel.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var kernelData = kernel.GetDataArray();
 
         // Initialize to zero
         for (int i = 0; i < gradInputData.Length; i++)
@@ -6976,8 +6976,8 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[4];
 
         var gradKernelData = new T[outChannels * inChannels * kernelDepth * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
 
         // Initialize to zero
         for (int i = 0; i < gradKernelData.Length; i++)
@@ -7081,8 +7081,8 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
         Parallel.For(0, batch * channels, idx =>
@@ -7166,8 +7166,8 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
         var localMaxIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
 
         // Parallel over batch * channels
@@ -7249,7 +7249,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[4];
 
         var gradInputData = new T[batch * channels * depth * height * width];
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         // Initialize to zero
         for (int i = 0; i < gradInputData.Length; i++)
@@ -7325,8 +7325,8 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.ToArray();
-        var outputData = result.ToArray();
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
         Parallel.For(0, batch * channels, idx =>
@@ -7401,7 +7401,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[4];
 
         var gradInputData = new T[batch * channels * depth * height * width];
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         // Initialize to zero
         for (int i = 0; i < gradInputData.Length; i++)
@@ -7491,7 +7491,7 @@ public class CpuEngine : ITensorLevelEngine
         int outWidth = width * scaleW;
 
         var outputData = new T[batch * channels * outDepth * outHeight * outWidth];
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
 
         // Use parallel processing over batch and channels
         Parallel.For(0, batch * channels, bc =>
@@ -7540,7 +7540,7 @@ public class CpuEngine : ITensorLevelEngine
         int outWidth = width * scaleW;
 
         var gradInputData = new T[batch * channels * depth * height * width];
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         // Initialize gradient input to zero
         for (int i = 0; i < gradInputData.Length; i++)
@@ -7618,8 +7618,8 @@ public class CpuEngine : ITensorLevelEngine
         int outWidth = (inWidth - 1) * strideW - 2 * padW + kW + outPadW;
 
         var outputData = new T[batch * outChannels * outDepth * outHeight * outWidth];
-        var inputData = input.ToArray();
-        var kernelData = kernel.ToArray();
+        var inputData = input.GetDataArray();
+        var kernelData = kernel.GetDataArray();
         var mergeLock = new object();
 
         // Use Parallel.For with true per-task local accumulators to avoid race conditions
@@ -7723,8 +7723,8 @@ public class CpuEngine : ITensorLevelEngine
         int padD = padding[0], padH = padding[1], padW = padding[2];
 
         var gradKernelData = new T[inChannels * outChannels * kD * kH * kW];
-        var inputData = input.ToArray();
-        var gradOutputData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         // Use Parallel.For with localInit/localFinally for thread-safe accumulation
         var mergeLock = new object();
@@ -7834,9 +7834,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Calculated output dimensions ({expectedOutputH}x{expectedOutputW}) do not match weights dimensions ({outputHeight}x{outputWidth}). Check input, kernel, and stride parameters.");
 
         var result = new Tensor<T>(new[] { batch, outChannels, outputHeight, outputWidth });
-        var inputData = input.ToArray();
-        var weightsData = weights.ToArray();
-        var biasData = bias?.ToArray();
+        var inputData = input.GetDataArray();
+        var weightsData = weights.GetDataArray();
+        var biasData = bias?.GetDataArray();
 
         Parallel.For(0, batch, b => // Process each batch independently
         {
@@ -7911,8 +7911,8 @@ public class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1];
 
         var finalGradInput = new T[batch * inChannels * inputHeight * inputWidth];
-        var gradOutputData = gradOutput.ToArray();
-        var weightsData = weights.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var weightsData = weights.GetDataArray();
 
         Parallel.For(0, batch * inChannels * inputHeight * inputWidth, idx =>
         {
@@ -7976,8 +7976,8 @@ public class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1];
 
         var gradWeights = new T[weightsShape.Aggregate(1, (acc, val) => acc * val)];
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
 
         for (int i = 0; i < gradWeights.Length; i++)
             gradWeights[i] = numOps.Zero;
@@ -8033,7 +8033,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
 
         var gradBias = new T[outChannels]; // Bias gradient is 1D [outChannels]
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         for (int i = 0; i < gradBias.Length; i++)
             gradBias[i] = numOps.Zero;
@@ -8072,7 +8072,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0 || axis >= rank)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[inputData.Length];
 
         // Compute outer and inner sizes
@@ -8125,8 +8125,8 @@ public class CpuEngine : ITensorLevelEngine
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var gradOutputData = gradOutput.ToArray();
-        var outputData = output.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var outputData = output.GetDataArray();
         var gradInputData = new T[outputData.Length];
 
         int outerSize = 1, axisSize = output.Shape[axis], innerSize = 1;
@@ -8170,7 +8170,7 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var shape = input.Shape;
         const double eps = 1e-10;
 
@@ -8195,7 +8195,7 @@ public class CpuEngine : ITensorLevelEngine
             return softResult;
 
         // Hard mode: create one-hot and use straight-through estimator
-        var softData = softResult.ToArray();
+        var softData = softResult.GetDataArray();
         var hardData = new T[softData.Length];
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -8241,7 +8241,7 @@ public class CpuEngine : ITensorLevelEngine
         // Gradient flows through softmax, scaled by 1/temperature
         var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = softmaxGrad.ToArray();
+        var gradData = softmaxGrad.GetDataArray();
         var scale = numOps.FromDouble(1.0 / temperature);
 
         for (int i = 0; i < gradData.Length; i++)
@@ -8263,7 +8263,7 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var shape = input.Shape;
         var outputData = new T[inputData.Length];
 
@@ -8344,9 +8344,9 @@ public class CpuEngine : ITensorLevelEngine
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var outputData = output.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var outputData = output.GetDataArray();
         var shape = output.Shape;
         var gradInputData = new T[outputData.Length];
 
@@ -8427,7 +8427,7 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var shape = input.Shape;
         var outputData = new T[inputData.Length];
 
@@ -8495,8 +8495,8 @@ public class CpuEngine : ITensorLevelEngine
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var gradOutputData = gradOutput.ToArray();
-        var outputData = output.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var outputData = output.GetDataArray();
         var shape = output.Shape;
         var gradInputData = new T[outputData.Length];
 
@@ -8549,7 +8549,7 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var shape = input.Shape;
         var normalizedData = new T[inputData.Length];
 
@@ -8600,7 +8600,7 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var shape = input.Shape;
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
@@ -8640,7 +8640,7 @@ public class CpuEngine : ITensorLevelEngine
         // Get softmax gradient with respect to normalized input
         var normalizedTensor = new Tensor<T>(shape, new Vector<T>(normalizedData));
         var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
-        var softmaxGradData = softmaxGrad.ToArray();
+        var softmaxGradData = softmaxGrad.GetDataArray();
 
         // Chain rule through L2 normalization
         var gradInputData = new T[inputData.Length];
@@ -8703,9 +8703,9 @@ public class CpuEngine : ITensorLevelEngine
         int batch = workingInput.Shape[0];
         int features = workingInput.Shape[1];
 
-        var inputData = workingInput.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = workingInput.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
 
         var meanData = new T[features];
         var varData = new T[features];
@@ -8765,9 +8765,9 @@ public class CpuEngine : ITensorLevelEngine
         int width = input.Shape[2];
         int spatialSize = height * width;
 
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
 
         var meanData = new T[channels];
         var varData = new T[channels];
@@ -8834,9 +8834,9 @@ public class CpuEngine : ITensorLevelEngine
         int spatialSize = height * width;
         int elementsPerChannel = batch * spatialSize;
 
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
 
         var meanData = new T[channels];
         var varData = new T[channels];
@@ -8922,11 +8922,11 @@ public class CpuEngine : ITensorLevelEngine
         int features = input.Shape[1];
         T batchT = numOps.FromDouble(batch);
 
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var meanData = mean.ToArray();
-        var varData = variance.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
 
         var gradGammaData = new T[features];
         var gradBetaData = new T[features];
@@ -9005,11 +9005,11 @@ public class CpuEngine : ITensorLevelEngine
         int elementsPerChannel = batch * spatialSize;
         T elementsT = numOps.FromDouble(elementsPerChannel);
 
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var meanData = mean.ToArray();
-        var varData = variance.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
 
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -9139,9 +9139,9 @@ public class CpuEngine : ITensorLevelEngine
 
         int featureSize = gamma.Length; // product of normalized dimensions
 
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
 
         var meanData = new T[batchSize];
         var varData = new T[batchSize];
@@ -9212,11 +9212,11 @@ public class CpuEngine : ITensorLevelEngine
         int featureSize = gamma.Length;
         T featureSizeT = numOps.FromDouble(featureSize);
 
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var meanData = mean.ToArray();
-        var varData = variance.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
 
         var gradGammaData = new T[featureSize];
         var gradBetaData = new T[featureSize];
@@ -9305,9 +9305,9 @@ public class CpuEngine : ITensorLevelEngine
 
         int groupSize = channelsPerGroup * spatialSize;  // Elements per group
 
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
 
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
@@ -9410,11 +9410,11 @@ public class CpuEngine : ITensorLevelEngine
         int groupSize = channelsPerGroup * spatialSize;
         T groupSizeT = numOps.FromDouble(groupSize);
 
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var meanData = mean.ToArray();
-        var varData = variance.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
 
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -9530,8 +9530,8 @@ public class CpuEngine : ITensorLevelEngine
         if (batchDims == 0) { batchSize = 1; batchShape = [1]; }
 
         int featureSize = gamma.Length;
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
@@ -9574,10 +9574,10 @@ public class CpuEngine : ITensorLevelEngine
         if (batchDims == 0) batchSize = 1;
 
         int featureSize = gamma.Length;
-        var gradOutputData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var rmsData = rms.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var rmsData = rms.GetDataArray();
         var gradGammaData = new T[featureSize];
         var gradInputData = new T[input.Length];
         for (int f = 0; f < featureSize; f++) gradGammaData[f] = numOps.Zero;
@@ -9664,8 +9664,8 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute attention scores: Q @ K^T -> [batch, heads, seqQ, seqK]
         var scoresData = new T[batch * heads * seqQ * seqK];
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
 
         Parallel.For(0, batch * heads, bh =>
         {
@@ -9739,7 +9739,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute output: weights @ V -> [batch, heads, seqQ, d_v]
         var outputData = new T[batch * heads * seqQ * d_v];
-        var valueData = value.ToArray();
+        var valueData = value.GetDataArray();
 
         Parallel.For(0, batch * heads, bh =>
         {
@@ -9802,11 +9802,11 @@ public class CpuEngine : ITensorLevelEngine
 
         T scaleFactor = numOps.FromDouble(scale);
 
-        var gradOutData = gradOutput.ToArray();
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
-        var valueData = value.ToArray();
-        var weightsData = attentionWeights.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
+        var valueData = value.GetDataArray();
+        var weightsData = attentionWeights.GetDataArray();
 
         var gradVData = new T[batch * heads * seqK * d_v];
         var gradQData = new T[batch * heads * seqQ * d_k];
@@ -9963,7 +9963,7 @@ public class CpuEngine : ITensorLevelEngine
                     $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
                     nameof(attentionBias));
             }
-            biasData = attentionBias.ToArray();
+            biasData = attentionBias.GetDataArray();
             hasBias = true;
         }
 
@@ -9975,9 +9975,9 @@ public class CpuEngine : ITensorLevelEngine
         const int BLOCK_Q = 64;
         const int BLOCK_KV = 64;
 
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
-        var valueData = value.ToArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
+        var valueData = value.GetDataArray();
 
         // Output and statistics
         var outputData = new T[batch * heads * seqQ * headDim];
@@ -10153,12 +10153,12 @@ public class CpuEngine : ITensorLevelEngine
         const int BLOCK_Q = 64;
         const int BLOCK_KV = 64;
 
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
-        var valueData = value.ToArray();
-        var outputData = output.ToArray();
-        var gradOutData = gradOutput.ToArray();
-        var statsData = softmaxStats.ToArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
+        var valueData = value.GetDataArray();
+        var outputData = output.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var statsData = softmaxStats.GetDataArray();
 
         var gradQData = new T[batch * heads * seqQ * headDim];
         var gradKData = new T[batch * heads * seqK * headDim];
@@ -10194,7 +10194,7 @@ public class CpuEngine : ITensorLevelEngine
                     $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
                     nameof(attentionBias));
             }
-            biasData = attentionBias.ToArray();
+            biasData = attentionBias.GetDataArray();
             hasBias = true;
         }
 
@@ -10357,9 +10357,9 @@ public class CpuEngine : ITensorLevelEngine
         T scaleFactor = numOps.FromDouble(scaleValue);
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
-        var valueData = value.ToArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
+        var valueData = value.GetDataArray();
 
         var outputData = new T[batch * numQHeads * seqQ * headDim];
         var weightsData = new T[batch * numQHeads * seqQ * seqK];
@@ -10478,11 +10478,11 @@ public class CpuEngine : ITensorLevelEngine
 
         T scaleFactor = numOps.FromDouble(scale);
 
-        var queryData = query.ToArray();
-        var keyData = key.ToArray();
-        var valueData = value.ToArray();
-        var weightsData = attentionWeights.ToArray();
-        var gradOutData = gradOutput.ToArray();
+        var queryData = query.GetDataArray();
+        var keyData = key.GetDataArray();
+        var valueData = value.GetDataArray();
+        var weightsData = attentionWeights.GetDataArray();
+        var gradOutData = gradOutput.GetDataArray();
 
         var gradQData = new T[batch * numQHeads * seqQ * headDim];
         var gradKData = new T[batch * numKVHeads * seqK * headDim];
@@ -11046,7 +11046,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {source.Rank}");
 
         // Determine output size along scatter dimension
-        var indicesData = indices.ToArray();
+        var indicesData = indices.GetDataArray();
         int maxIndex = 0;
         for (int i = 0; i < indicesData.Length; i++)
         {
@@ -11058,7 +11058,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = source.Shape.ToArray();
         outputShape[actualDim] = outDimSize;
 
-        var sourceData = source.ToArray();
+        var sourceData = source.GetDataArray();
         var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
 
         // Initialize to zero
@@ -11110,8 +11110,8 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? sourceShape.Length + dim : dim;
 
-        var gradOutData = gradOutput.ToArray();
-        var indicesData = indices.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var indicesData = indices.GetDataArray();
         var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
 
         int innerSize = 1;
@@ -11159,7 +11159,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? source.Rank + dim : dim;
 
-        var indicesData = indices.ToArray();
+        var indicesData = indices.GetDataArray();
         int maxIndex = 0;
         for (int i = 0; i < indicesData.Length; i++)
         {
@@ -11170,7 +11170,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = source.Shape.ToArray();
         outputShape[actualDim] = outDimSize;
 
-        var sourceData = source.ToArray();
+        var sourceData = source.GetDataArray();
         var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
         var countData = new int[outDimSize];
 
@@ -11244,9 +11244,9 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? sourceShape.Length + dim : dim;
 
-        var gradOutData = gradOutput.ToArray();
-        var indicesData = indices.ToArray();
-        var countsData = counts.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var indicesData = indices.GetDataArray();
+        var countsData = counts.GetDataArray();
         var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
 
         int innerSize = 1;
@@ -11296,7 +11296,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? source.Rank + dim : dim;
 
-        var indicesData = indices.ToArray();
+        var indicesData = indices.GetDataArray();
         int maxIndex = 0;
         for (int i = 0; i < indicesData.Length; i++)
         {
@@ -11307,7 +11307,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = source.Shape.ToArray();
         outputShape[actualDim] = outDimSize;
 
-        var sourceData = source.ToArray();
+        var sourceData = source.GetDataArray();
         int outputLength = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputLength];
         var argmaxData = new int[outputLength];
@@ -11370,8 +11370,8 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? sourceShape.Length + dim : dim;
 
-        var gradOutData = gradOutput.ToArray();
-        var argmaxData = argmax.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var argmaxData = argmax.GetDataArray();
         var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
 
         // Initialize to zero
@@ -11424,7 +11424,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? source.Rank + dim : dim;
 
-        var indicesData = indices.ToArray();
+        var indicesData = indices.GetDataArray();
         int maxIndex = 0;
         for (int i = 0; i < indicesData.Length; i++)
         {
@@ -11432,7 +11432,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         int numGroups = outputSize ?? (maxIndex + 1);
 
-        var sourceData = source.ToArray();
+        var sourceData = source.GetDataArray();
         var outputData = new T[sourceData.Length];
 
         int innerSize = 1;
@@ -11513,7 +11513,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int actualDim = dim < 0 ? output.Rank + dim : dim;
 
-        var indicesData = indices.ToArray();
+        var indicesData = indices.GetDataArray();
         int maxIndex = 0;
         for (int i = 0; i < indicesData.Length; i++)
         {
@@ -11521,8 +11521,8 @@ public class CpuEngine : ITensorLevelEngine
         }
         int numGroups = maxIndex + 1;
 
-        var gradOutData = gradOutput.ToArray();
-        var outData = output.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var outData = output.GetDataArray();
         var gradInputData = new T[gradOutData.Length];
 
         int innerSize = 1;
@@ -11615,7 +11615,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input.Shape;
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
 
         // Validate and normalize axes
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
@@ -11690,7 +11690,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < inputSize; i++)
             gradInputData[i] = numOps.Zero;
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         for (int i = 0; i < maxIndices.Length; i++)
         {
@@ -11708,7 +11708,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input.Shape;
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
 
         // Validate and normalize axes
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
@@ -11794,7 +11794,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradOutputShape = gradOutput.Shape;
         var inputStrides = ComputeStrides(inputShape);
         var outputStrides = ComputeStrides(gradOutputShape);
@@ -11847,12 +11847,12 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var inputShape = input.Shape;
 
         // First compute the mean
         var mean = ReduceMean(input, axes, keepDims: true);
-        var meanData = mean.ToArray();
+        var meanData = mean.GetDataArray();
         var meanShape = mean.Shape;
 
         // Normalize axes
@@ -11947,11 +11947,11 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(mean));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var inputShape = input.Shape;
-        var meanData = mean.ToArray();
+        var meanData = mean.GetDataArray();
         var meanShape = mean.Shape;
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradOutputShape = gradOutput.Shape;
 
         int inputSize = inputData.Length;
@@ -11996,7 +11996,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute variance first
         var variance = ReduceVariance(input, axes, keepDims);
-        var varianceData = variance.ToArray();
+        var varianceData = variance.GetDataArray();
 
         // Apply log(variance + epsilon)
         T eps = numOps.FromDouble(epsilon);
@@ -12021,13 +12021,13 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(variance));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var inputShape = input.Shape;
-        var meanData = mean.ToArray();
+        var meanData = mean.GetDataArray();
         var meanShape = mean.Shape;
-        var varianceData = variance.ToArray();
+        var varianceData = variance.GetDataArray();
         var varianceShape = variance.Shape;
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradOutputShape = gradOutput.Shape;
 
         int inputSize = inputData.Length;
@@ -12215,7 +12215,7 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height * scaleH;
         int newWidth = width * scaleW;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[flatBatch * newHeight * newWidth];
 
         Parallel.For(0, flatBatch, fb =>
@@ -12274,7 +12274,7 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height * scaleH;
         int newWidth = width * scaleW;
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradInputData = new T[totalInput];
 
         for (int i = 0; i < gradInputData.Length; i++)
@@ -12319,7 +12319,7 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[batch * newChannels * newHeight * newWidth];
 
         Parallel.For(0, batch, b =>
@@ -12360,7 +12360,7 @@ public class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradInputData = new T[batch * channels * height * width];
 
         Parallel.For(0, batch, b =>
@@ -12596,7 +12596,7 @@ public class CpuEngine : ITensorLevelEngine
         if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
             throw new ArgumentException("Crop region is out of bounds");
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[batch * channels * height * width];
 
         Parallel.For(0, batch * channels, bc =>
@@ -12634,7 +12634,7 @@ public class CpuEngine : ITensorLevelEngine
         int cropHeight = gradOutputShape[2];
         int cropWidth = gradOutputShape[3];
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradInputData = new T[batch * channels * inputHeight * inputWidth];
 
         for (int i = 0; i < gradInputData.Length; i++)
@@ -12679,7 +12679,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < rank - 2; i++)
             batchSize *= shape[i];
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var outputData = new T[batchSize * newHeight * newWidth];
 
         for (int i = 0; i < outputData.Length; i++)
@@ -12722,7 +12722,7 @@ public class CpuEngine : ITensorLevelEngine
         int paddedHeight = gradOutputShape[rank - 2];
         int paddedWidth = gradOutputShape[rank - 1];
 
-        var gradOutputData = gradOutput.ToArray();
+        var gradOutputData = gradOutput.GetDataArray();
         var gradInputData = new T[batchSize * height * width];
 
         Parallel.For(0, batchSize, b =>
@@ -12782,7 +12782,7 @@ public class CpuEngine : ITensorLevelEngine
         int axisOffset = 0;
         foreach (var tensor in tensors)
         {
-            var tensorData = tensor.ToArray();
+            var tensorData = tensor.GetDataArray();
             var tensorShape = tensor.Shape;
             var tensorStrides = ComputeStrides(tensorShape);
 
@@ -12831,8 +12831,8 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[indices.Rank] = embeddingDim;
 
         var result = new Tensor<TValue>(outputShape);
-        var embData = embeddings.ToArray();
-        var idxData = indices.ToArray();
+        var embData = embeddings.GetDataArray();
+        var idxData = indices.GetDataArray();
 
         // For each index, copy the entire embedding row
         for (int i = 0; i < numIndices; i++)
@@ -12871,8 +12871,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<TValue>();
         var gradEmbeddings = new Tensor<TValue>(new[] { vocabSize, embeddingDim });
 
-        var gradData = gradOutput.ToArray();
-        var idxData = indices.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var idxData = indices.GetDataArray();
         int numIndices = indices.Length;
 
         // Scatter-add: for each index, accumulate gradients to the embedding row
@@ -12925,9 +12925,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"epsilons length ({epsilons.Shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
 
         var output = new Tensor<T>([batchSize, numCenters]);
-        var inputData = input.ToArray();
-        var centersData = centers.ToArray();
-        var epsilonsData = epsilons.ToArray();
+        var inputData = input.GetDataArray();
+        var centersData = centers.GetDataArray();
+        var epsilonsData = epsilons.GetDataArray();
 
         // Compute exp(-epsilon * ||x - center||Ã‚Â²) for each (sample, center) pair
         for (int b = 0; b < batchSize; b++)
@@ -12993,11 +12993,11 @@ public class CpuEngine : ITensorLevelEngine
         var gradCenters = new Tensor<T>(centers.Shape);
         var gradEpsilons = new Tensor<T>(epsilons.Shape);
 
-        var inputData = input.ToArray();
-        var centersData = centers.ToArray();
-        var epsilonsData = epsilons.ToArray();
-        var outputData = output.ToArray();
-        var gradOutputData = gradOutput.ToArray();
+        var inputData = input.GetDataArray();
+        var centersData = centers.GetDataArray();
+        var epsilonsData = epsilons.GetDataArray();
+        var outputData = output.GetDataArray();
+        var gradOutputData = gradOutput.GetDataArray();
 
         // For RBF: K = exp(-epsilon * ||x - c||Ã‚Â²)
         // dK/dx = K * (-epsilon) * 2 * (x - c) = -2 * epsilon * K * (x - c)
@@ -13314,8 +13314,8 @@ public class CpuEngine : ITensorLevelEngine
         if (source.Length != destination.Length)
             throw new ArgumentException($"Tensor lengths must match. Got {source.Length} and {destination.Length}");
 
-        var sourceArray = source.ToArray();
-        var destArray = destination.ToArray();
+        var sourceArray = source.GetDataArray();
+        var destArray = destination.GetDataArray();
         Array.Copy(sourceArray, destArray, sourceArray.Length);
     }
 
@@ -16671,7 +16671,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = realInput.Length;
         if (n <= 1)
-            return (new Vector<T>(realInput.ToArray()), new Vector<T>(imagInput.ToArray()));
+            return (new Vector<T>(realInput.GetDataArray()), new Vector<T>(imagInput.GetDataArray()));
 
         // Pad to power of 2 if needed
         int nPadded = NextPowerOf2(n);
@@ -16694,8 +16694,8 @@ public class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            realWork = new Vector<T>(realInput.ToArray());
-            imagWork = new Vector<T>(imagInput.ToArray());
+            realWork = new Vector<T>(realInput.GetDataArray());
+            imagWork = new Vector<T>(imagInput.GetDataArray());
         }
 
         // Bit-reversal permutation
@@ -16801,7 +16801,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> Softplus<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var data = input.ToArray();
+        var data = input.GetDataArray();
         var result = new T[data.Length];
 
         for (int i = 0; i < data.Length; i++)
@@ -16817,7 +16817,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> HardSwish<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var data = input.ToArray();
+        var data = input.GetDataArray();
         var result = new T[data.Length];
 
         for (int i = 0; i < data.Length; i++)
@@ -16834,8 +16834,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
 
         for (int i = 0; i < gradData.Length; i++)
@@ -16851,8 +16851,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var outData = output.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var outData = output.GetDataArray();
         var result = new T[gradData.Length];
 
         for (int i = 0; i < gradData.Length; i++)
@@ -16869,8 +16869,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var outData = output.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var outData = output.GetDataArray();
         var result = new T[gradData.Length];
 
         for (int i = 0; i < gradData.Length; i++)
@@ -16887,8 +16887,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
 
         const double sqrtTwoPi = 0.7978845608028654;
@@ -16912,8 +16912,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var inputData = input.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
 
         for (int i = 0; i < gradData.Length; i++)
@@ -16935,9 +16935,9 @@ public class CpuEngine : ITensorLevelEngine
         int spatialSize = 1;
         for (int i = 2; i < input.Rank; i++) spatialSize *= input.Shape[i];
 
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var betaData = beta.ToArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var betaData = beta.GetDataArray();
         var meanData = new T[batch * channels];
         var varData = new T[batch * channels];
         var resultData = new T[input.Length];
@@ -16987,11 +16987,11 @@ public class CpuEngine : ITensorLevelEngine
         int spatialSize = 1;
         for (int i = 2; i < input.Rank; i++) spatialSize *= input.Shape[i];
 
-        var gradOutData = gradOutput.ToArray();
-        var inputData = input.ToArray();
-        var gammaData = gamma.ToArray();
-        var meanData = mean.ToArray();
-        var varData = variance.ToArray();
+        var gradOutData = gradOutput.GetDataArray();
+        var inputData = input.GetDataArray();
+        var gammaData = gamma.GetDataArray();
+        var meanData = mean.GetDataArray();
+        var varData = variance.GetDataArray();
         var gradInputData = new T[input.Length];
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -17053,7 +17053,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var maskData = new T[inputData.Length];
         var resultData = new T[inputData.Length];
 
@@ -17090,8 +17090,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> DropoutBackward<T>(Tensor<T> gradOutput, Tensor<T> mask, double dropoutRate)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var maskData = mask.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var maskData = mask.GetDataArray();
         var resultData = new T[gradData.Length];
 
         for (int i = 0; i < gradData.Length; i++)
@@ -17106,8 +17106,8 @@ public class CpuEngine : ITensorLevelEngine
         int vocabSize = embeddingTable.Shape[0];
         int embeddingDim = embeddingTable.Shape[^1];
         int numIndices = indices.Length;
-        var tableData = embeddingTable.ToArray();
-        var indicesData = indices.ToArray();
+        var tableData = embeddingTable.GetDataArray();
+        var indicesData = indices.GetDataArray();
         var resultData = new T[numIndices * embeddingDim];
 
         for (int i = 0; i < numIndices; i++)
@@ -17138,8 +17138,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> EmbeddingBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.ToArray();
-        var indicesData = indices.ToArray();
+        var gradData = gradOutput.GetDataArray();
+        var indicesData = indices.GetDataArray();
         var resultData = new T[vocabSize * embeddingDim];
 
         for (int i = 0; i < indices.Length; i++)
@@ -17168,8 +17168,8 @@ public class CpuEngine : ITensorLevelEngine
         int batchSize = predictions.Shape[0];
         int numClasses = predictions.Shape[1];
 
-        var predData = predictions.ToArray();
-        var targetData = targets.ToArray();
+        var predData = predictions.GetDataArray();
+        var targetData = targets.GetDataArray();
 
         // Parallel batch processing with thread-local accumulators
         double totalLoss = 0;
@@ -17243,8 +17243,8 @@ public class CpuEngine : ITensorLevelEngine
         int batchSize = predictions.Shape[0];
         int numClasses = predictions.Shape[1];
 
-        var predData = predictions.ToArray();
-        var targetData = targets.ToArray();
+        var predData = predictions.GetDataArray();
+        var targetData = targets.GetDataArray();
         var gradData = new T[predictions.Length];
         bool sparseTargets = targets.Rank == 1;
 
@@ -17343,7 +17343,7 @@ public class CpuEngine : ITensorLevelEngine
         int width = input.Shape[3];
         int spatialSize = height * width;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
 
@@ -17375,7 +17375,7 @@ public class CpuEngine : ITensorLevelEngine
         int width = input.Shape[3];
         int spatialSize = height * width;
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var resultData = new T[batch * channels];
         int totalChannels = batch * channels;
 
@@ -17408,7 +17408,7 @@ public class CpuEngine : ITensorLevelEngine
         int inHeight = input.Shape[2];
         int inWidth = input.Shape[3];
 
-        var inputData = input.ToArray();
+        var inputData = input.GetDataArray();
         var resultData = new T[batch * channels * outputHeight * outputWidth];
 
         for (int b = 0; b < batch; b++)
@@ -17551,7 +17551,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // std = sqrt(variance)
         var variance = ReduceVariance(input, axes, keepDims);
-        var varianceData = variance.ToArray();
+        var varianceData = variance.GetDataArray();
         var resultData = new T[varianceData.Length];
 
         for (int i = 0; i < varianceData.Length; i++)
