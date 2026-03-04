@@ -2000,36 +2000,17 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(referenceShape);
         int length = tensors[0].Length;
 
-        // Single-pass addition: accumulate all tensors element by element
-        // This avoids n-1 intermediate allocations from chained binary additions
-        if (length > 10000)
+        // Chain pairwise additions using span-based numOps: result = t0 + t1 + t2 + ...
+        // First: result = tensors[0] + tensors[1]
+        var result = new Tensor<T>(referenceShape);
+        numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+
+        // Accumulate remaining tensors into result
+        for (int t = 2; t < tensors.Length; t++)
         {
-            // Parallel execution for large tensors
-            Parallel.For(0, length, i =>
-            {
-                T sum = numOps.Zero;
-                for (int t = 0; t < tensors.Length; t++)
-                {
-                    sum = numOps.Add(sum, tensors[t].GetFlat(i));
-                }
-                result.SetFlat(i, sum);
-            });
-        }
-        else
-        {
-            // Sequential execution for smaller tensors (avoids parallel overhead)
-            for (int i = 0; i < length; i++)
-            {
-                T sum = numOps.Zero;
-                for (int t = 0; t < tensors.Length; t++)
-                {
-                    sum = numOps.Add(sum, tensors[t].GetFlat(i));
-                }
-                result.SetFlat(i, sum);
-            }
+            numOps.Add(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
         return result;
@@ -2167,36 +2148,14 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(referenceShape);
-        int length = tensors[0].Length;
 
-        // Single-pass multiplication: accumulate all tensors element by element
-        // This avoids n-1 intermediate allocations from chained binary multiplications
-        if (length > 10000)
+        // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
+        var result = new Tensor<T>(referenceShape);
+        numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+
+        for (int t = 2; t < tensors.Length; t++)
         {
-            // Parallel execution for large tensors
-            Parallel.For(0, length, i =>
-            {
-                T product = numOps.One;
-                for (int t = 0; t < tensors.Length; t++)
-                {
-                    product = numOps.Multiply(product, tensors[t].GetFlat(i));
-                }
-                result.SetFlat(i, product);
-            });
-        }
-        else
-        {
-            // Sequential execution for smaller tensors (avoids parallel overhead)
-            for (int i = 0; i < length; i++)
-            {
-                T product = numOps.One;
-                for (int t = 0; t < tensors.Length; t++)
-                {
-                    product = numOps.Multiply(product, tensors[t].GetFlat(i));
-                }
-                result.SetFlat(i, product);
-            }
+            numOps.Multiply(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
         return result;
