@@ -16803,11 +16803,23 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetDataArray();
         var result = new T[data.Length];
+        int length = data.Length;
 
-        for (int i = 0; i < data.Length; i++)
+        if (data is float[] dF && result is float[] rF)
         {
-            double x = numOps.ToDouble(data[i]);
-            result[i] = numOps.FromDouble(Math.Log(1.0 + Math.Exp(x)));
+            Parallel.For(0, length, i =>
+            {
+                float x = dF[i];
+                rF[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+            });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = numOps.ToDouble(data[i]);
+                result[i] = numOps.FromDouble(x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x)));
+            }
         }
 
         return new Tensor<T>(input.Shape, new Vector<T>(result));
@@ -16819,12 +16831,25 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetDataArray();
         var result = new T[data.Length];
+        int length = data.Length;
 
-        for (int i = 0; i < data.Length; i++)
+        if (data is float[] dF && result is float[] rF)
         {
-            double x = numOps.ToDouble(data[i]);
-            double clip = Math.Min(Math.Max(x + 3.0, 0.0), 6.0);
-            result[i] = numOps.FromDouble(x * clip / 6.0);
+            Parallel.For(0, length, i =>
+            {
+                float x = dF[i];
+                float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
+                rF[i] = x * clip / 6f;
+            });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = numOps.ToDouble(data[i]);
+                double clip = Math.Min(Math.Max(x + 3.0, 0.0), 6.0);
+                result[i] = numOps.FromDouble(x * clip / 6.0);
+            }
         }
 
         return new Tensor<T>(input.Shape, new Vector<T>(result));
@@ -16837,11 +16862,19 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
+        int length = gradData.Length;
 
-        for (int i = 0; i < gradData.Length; i++)
+        if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
-            double inputVal = numOps.ToDouble(inputData[i]);
-            result[i] = inputVal > 0 ? gradData[i] : numOps.Zero;
+            Parallel.For(0, length, i => { rF[i] = iF[i] > 0f ? gF[i] : 0f; });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double inputVal = numOps.ToDouble(inputData[i]);
+                result[i] = inputVal > 0 ? gradData[i] : numOps.Zero;
+            }
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
@@ -16854,12 +16887,20 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
         var result = new T[gradData.Length];
+        int length = gradData.Length;
 
-        for (int i = 0; i < gradData.Length; i++)
+        if (gradData is float[] gF && outData is float[] oF && result is float[] rF)
         {
-            double s = numOps.ToDouble(outData[i]);
-            double grad = numOps.ToDouble(gradData[i]);
-            result[i] = numOps.FromDouble(grad * s * (1.0 - s));
+            Parallel.For(0, length, i => { rF[i] = gF[i] * oF[i] * (1f - oF[i]); });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double s = numOps.ToDouble(outData[i]);
+                double grad = numOps.ToDouble(gradData[i]);
+                result[i] = numOps.FromDouble(grad * s * (1.0 - s));
+            }
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
@@ -16872,12 +16913,20 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
         var result = new T[gradData.Length];
+        int length = gradData.Length;
 
-        for (int i = 0; i < gradData.Length; i++)
+        if (gradData is float[] gF && outData is float[] oF && result is float[] rF)
         {
-            double t = numOps.ToDouble(outData[i]);
-            double grad = numOps.ToDouble(gradData[i]);
-            result[i] = numOps.FromDouble(grad * (1.0 - t * t));
+            Parallel.For(0, length, i => { rF[i] = gF[i] * (1f - oF[i] * oF[i]); });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double t = numOps.ToDouble(outData[i]);
+                double grad = numOps.ToDouble(gradData[i]);
+                result[i] = numOps.FromDouble(grad * (1.0 - t * t));
+            }
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
@@ -16890,19 +16939,37 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
+        int length = gradData.Length;
 
         const double sqrtTwoPi = 0.7978845608028654;
         const double coeff = 0.044715;
 
-        for (int i = 0; i < gradData.Length; i++)
+        if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
-            double x = numOps.ToDouble(inputData[i]);
-            double grad = numOps.ToDouble(gradData[i]);
-            double tanhArg = sqrtTwoPi * (x + coeff * x * x * x);
-            double tanhVal = Math.Tanh(tanhArg);
-            double sechSq = 1.0 - tanhVal * tanhVal;
-            double derivative = 0.5 * (1.0 + tanhVal) + 0.5 * x * sechSq * sqrtTwoPi * (1.0 + 3.0 * coeff * x * x);
-            result[i] = numOps.FromDouble(grad * derivative);
+            const float sqrtTwoPiF = 0.7978845608028654f;
+            const float coeffF = 0.044715f;
+            Parallel.For(0, length, i =>
+            {
+                float x = iF[i];
+                float tanhArg = sqrtTwoPiF * (x + coeffF * x * x * x);
+                float tanhVal = MathF.Tanh(tanhArg);
+                float sechSq = 1f - tanhVal * tanhVal;
+                float derivative = 0.5f * (1f + tanhVal) + 0.5f * x * sechSq * sqrtTwoPiF * (1f + 3f * coeffF * x * x);
+                rF[i] = gF[i] * derivative;
+            });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = numOps.ToDouble(inputData[i]);
+                double grad = numOps.ToDouble(gradData[i]);
+                double tanhArg = sqrtTwoPi * (x + coeff * x * x * x);
+                double tanhVal = Math.Tanh(tanhArg);
+                double sechSq = 1.0 - tanhVal * tanhVal;
+                double derivative = 0.5 * (1.0 + tanhVal) + 0.5 * x * sechSq * sqrtTwoPi * (1.0 + 3.0 * coeff * x * x);
+                result[i] = numOps.FromDouble(grad * derivative);
+            }
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
@@ -16915,12 +16982,21 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
         var result = new T[gradData.Length];
+        int length = gradData.Length;
 
-        for (int i = 0; i < gradData.Length; i++)
+        if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
-            double inputVal = numOps.ToDouble(inputData[i]);
-            double grad = numOps.ToDouble(gradData[i]);
-            result[i] = numOps.FromDouble(inputVal > 0 ? grad : grad * negativeSlope);
+            float slopeF = (float)negativeSlope;
+            Parallel.For(0, length, i => { rF[i] = iF[i] > 0f ? gF[i] : gF[i] * slopeF; });
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double inputVal = numOps.ToDouble(inputData[i]);
+                double grad = numOps.ToDouble(gradData[i]);
+                result[i] = numOps.FromDouble(inputVal > 0 ? grad : grad * negativeSlope);
+            }
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
@@ -16942,33 +17018,68 @@ public class CpuEngine : ITensorLevelEngine
         var varData = new T[batch * channels];
         var resultData = new T[input.Length];
 
-        for (int b = 0; b < batch; b++)
+        if (inputData is float[] iF && gammaData is float[] gF && betaData is float[] bF
+            && meanData is float[] mF && varData is float[] vF && resultData is float[] rF)
         {
-            for (int c = 0; c < channels; c++)
+            float epsF = (float)epsilon;
+            Parallel.For(0, batch * channels, idx =>
             {
-                int offset = (b * channels + c) * spatialSize;
-                double sum = 0;
-                for (int s = 0; s < spatialSize; s++)
-                    sum += numOps.ToDouble(inputData[offset + s]);
-                double meanVal = sum / spatialSize;
-                meanData[b * channels + c] = numOps.FromDouble(meanVal);
+                int b2 = idx / channels;
+                int c2 = idx % channels;
+                int offset = (b2 * channels + c2) * spatialSize;
 
-                double sumSq = 0;
+                float sum = 0f;
+                for (int s = 0; s < spatialSize; s++)
+                    sum += iF[offset + s];
+                float meanVal = sum / spatialSize;
+                mF[idx] = meanVal;
+
+                float sumSq = 0f;
                 for (int s = 0; s < spatialSize; s++)
                 {
-                    double diff = numOps.ToDouble(inputData[offset + s]) - meanVal;
+                    float diff = iF[offset + s] - meanVal;
                     sumSq += diff * diff;
                 }
-                double varVal = sumSq / spatialSize;
-                varData[b * channels + c] = numOps.FromDouble(varVal);
-                double invStd = 1.0 / Math.Sqrt(varVal + epsilon);
+                float varVal = sumSq / spatialSize;
+                vF[idx] = varVal;
+                float invStd = 1f / MathF.Sqrt(varVal + epsF);
+                float gVal = gF[c2];
+                float bVal = bF[c2];
 
-                double g = numOps.ToDouble(gammaData[c]);
-                double be = numOps.ToDouble(betaData[c]);
                 for (int s = 0; s < spatialSize; s++)
+                    rF[offset + s] = (iF[offset + s] - meanVal) * invStd * gVal + bVal;
+            });
+        }
+        else
+        {
+            for (int b2 = 0; b2 < batch; b2++)
+            {
+                for (int c2 = 0; c2 < channels; c2++)
                 {
-                    double x = numOps.ToDouble(inputData[offset + s]);
-                    resultData[offset + s] = numOps.FromDouble((x - meanVal) * invStd * g + be);
+                    int offset = (b2 * channels + c2) * spatialSize;
+                    double sum = 0;
+                    for (int s = 0; s < spatialSize; s++)
+                        sum += numOps.ToDouble(inputData[offset + s]);
+                    double meanVal = sum / spatialSize;
+                    meanData[b2 * channels + c2] = numOps.FromDouble(meanVal);
+
+                    double sumSq = 0;
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        double diff = numOps.ToDouble(inputData[offset + s]) - meanVal;
+                        sumSq += diff * diff;
+                    }
+                    double varVal = sumSq / spatialSize;
+                    varData[b2 * channels + c2] = numOps.FromDouble(varVal);
+                    double invStd = 1.0 / Math.Sqrt(varVal + epsilon);
+
+                    double g = numOps.ToDouble(gammaData[c2]);
+                    double be = numOps.ToDouble(betaData[c2]);
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        double x = numOps.ToDouble(inputData[offset + s]);
+                        resultData[offset + s] = numOps.FromDouble((x - meanVal) * invStd * g + be);
+                    }
                 }
             }
         }
