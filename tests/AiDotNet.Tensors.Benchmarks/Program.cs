@@ -121,6 +121,49 @@ class Program
             return;
         }
 
+        // Run competitive benchmarks vs TorchSharp (GPU)
+        if (args[0] == "--vs-torchsharp-gpu")
+        {
+            BenchmarkRunner.Run<TorchSharpComparisonBenchmarks>();
+            return;
+        }
+
+        // Run competitive benchmarks vs TorchSharp (CPU)
+        if (args[0] == "--vs-torchsharp-cpu")
+        {
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>();
+            return;
+        }
+
+        // Run competitive benchmarks vs TensorFlow (GPU)
+        if (args[0] == "--vs-tensorflow-gpu")
+        {
+            BenchmarkRunner.Run<TensorFlowComparisonBenchmarks>();
+            return;
+        }
+
+        // Run competitive benchmarks vs TensorFlow (CPU)
+        if (args[0] == "--vs-tensorflow-cpu")
+        {
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>();
+            return;
+        }
+
+        // Run competitive benchmarks vs ML.NET (CPU)
+        if (args[0] == "--vs-mlnet-cpu")
+        {
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>();
+            return;
+        }
+
+        // Run all competitive benchmarks
+        if (args[0] == "--vs-all")
+        {
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>();
+            return;
+        }
+
 #if NET7_0_OR_GREATER
         // Run WebGPU backend diagnostics (browser context)
         if (args[0] == "--webgpu")
@@ -185,6 +228,14 @@ class Program
         Console.WriteLine("  --metal-bench   : Run formal Metal backend benchmarks (macOS)");
         Console.WriteLine("  --webgpu-bench  : Run formal WebGPU backend benchmarks (.NET 7+)");
         Console.WriteLine("  --crosslib-bench: Run formal cross-library GPU benchmarks");
+        Console.WriteLine();
+        Console.WriteLine("Competitive Benchmarks vs Other Libraries:");
+        Console.WriteLine("  --vs-torchsharp-gpu : AiDotNet GPU vs TorchSharp CUDA");
+        Console.WriteLine("  --vs-torchsharp-cpu : AiDotNet CPU vs TorchSharp CPU");
+        Console.WriteLine("  --vs-tensorflow-gpu : AiDotNet GPU vs TensorFlow.NET GPU");
+        Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");
+        Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
+        Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
 #endif
     }
 }
