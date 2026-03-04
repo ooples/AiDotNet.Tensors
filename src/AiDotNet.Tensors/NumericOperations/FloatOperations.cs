@@ -1142,37 +1142,32 @@ public class FloatOperations : INumericOperations<float>
 
     /// <summary>
     /// Computes sigmoid using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
+    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    public void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
     {
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            var pool = ArrayPool<float>.Shared;
-            var xArray = pool.Rent(length);
-            var destArray = pool.Rent(length);
-            try
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
             {
-                x.CopyTo(xArray);
-
+                float* xp = xPtr;
+                float* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
 #if NET8_0_OR_GREATER
                     TensorPrimitives.Sigmoid(
-                        new ReadOnlySpan<float>(xArray, start, count),
-                        new Span<float>(destArray, start, count));
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
 #else
-                    for (int i = start; i < start + count; i++)
-                        destArray[i] = 1.0f / (1.0f + (float)Math.Exp(-xArray[i]));
+                    for (int i = 0; i < count; i++)
+                    {
+                        int idx = start + i;
+                        dp[idx] = 1.0f / (1.0f + (float)Math.Exp(-xp[idx]));
+                    }
 #endif
                 });
-
-                new ReadOnlySpan<float>(destArray, 0, length).CopyTo(destination);
-            }
-            finally
-            {
-                pool.Return(xArray);
-                pool.Return(destArray);
             }
             return;
         }
@@ -1459,19 +1454,7 @@ public class FloatOperations : INumericOperations<float>
     /// Computes LeakyReLU element-wise using SIMD-optimized SimdKernels.
     /// Simple comparison operation - single-threaded SIMD saturates memory bandwidth.
     /// </summary>
-    public void LeakyReLU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
-    {
-        if (x.Length != destination.Length)
-            throw new ArgumentException("Spans must have the same length");
-
-        Engines.Simd.SimdKernels.LeakyReLU(x, alpha, destination);
-    }
-
-    /// <summary>
-    /// Computes GELU (Gaussian Error Linear Unit) element-wise using SIMD-optimized SimdKernels with parallel processing for large arrays.
-    /// Uses approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    /// </summary>
-    public void GELU(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void LeakyReLU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
@@ -1479,26 +1462,49 @@ public class FloatOperations : INumericOperations<float>
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            var pool = ArrayPool<float>.Shared;
-            var xArray = pool.Rent(length);
-            var destArray = pool.Rent(length);
-            try
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
             {
-                x.CopyTo(xArray);
+                float* xp = xPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.LeakyReLU(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        alpha,
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
 
+        Engines.Simd.SimdKernels.LeakyReLU(x, alpha, destination);
+    }
+
+    /// <summary>
+    /// Computes GELU (Gaussian Error Linear Unit) element-wise using SIMD-optimized SimdKernels with parallel processing for large arrays.
+    /// Uses approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
+    /// </summary>
+    public unsafe void GELU(ReadOnlySpan<float> x, Span<float> destination)
+    {
+        if (x.Length != destination.Length)
+            throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
                     Engines.Simd.SimdKernels.GELU(
-                        new ReadOnlySpan<float>(xArray, start, count),
-                        new Span<float>(destArray, start, count));
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
                 });
-
-                new ReadOnlySpan<float>(destArray, 0, length).CopyTo(destination);
-            }
-            finally
-            {
-                pool.Return(xArray);
-                pool.Return(destArray);
             }
             return;
         }
@@ -1509,8 +1515,9 @@ public class FloatOperations : INumericOperations<float>
     /// <summary>
     /// Computes Mish activation element-wise using SIMD-optimized SimdKernels with parallel processing for large arrays.
     /// x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    public void Mish(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Mish(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
@@ -1518,26 +1525,17 @@ public class FloatOperations : INumericOperations<float>
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            var pool = ArrayPool<float>.Shared;
-            var xArray = pool.Rent(length);
-            var destArray = pool.Rent(length);
-            try
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
             {
-                x.CopyTo(xArray);
-
+                float* xp = xPtr;
+                float* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
                     Engines.Simd.SimdKernels.Mish(
-                        new ReadOnlySpan<float>(xArray, start, count),
-                        new Span<float>(destArray, start, count));
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
                 });
-
-                new ReadOnlySpan<float>(destArray, 0, length).CopyTo(destination);
-            }
-            finally
-            {
-                pool.Return(xArray);
-                pool.Return(destArray);
             }
             return;
         }
@@ -1548,8 +1546,9 @@ public class FloatOperations : INumericOperations<float>
     /// <summary>
     /// Computes Swish/SiLU activation element-wise using SIMD-optimized SimdKernels with parallel processing for large arrays.
     /// x * sigmoid(x) = x / (1 + exp(-x))
+    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    public void Swish(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void Swish(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
@@ -1557,26 +1556,17 @@ public class FloatOperations : INumericOperations<float>
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            var pool = ArrayPool<float>.Shared;
-            var xArray = pool.Rent(length);
-            var destArray = pool.Rent(length);
-            try
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
             {
-                x.CopyTo(xArray);
-
+                float* xp = xPtr;
+                float* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
                     Engines.Simd.SimdKernels.Swish(
-                        new ReadOnlySpan<float>(xArray, start, count),
-                        new Span<float>(destArray, start, count));
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
                 });
-
-                new ReadOnlySpan<float>(destArray, 0, length).CopyTo(destination);
-            }
-            finally
-            {
-                pool.Return(xArray);
-                pool.Return(destArray);
             }
             return;
         }
@@ -1587,8 +1577,9 @@ public class FloatOperations : INumericOperations<float>
     /// <summary>
     /// Computes ELU (Exponential Linear Unit) element-wise using SIMD-optimized SimdKernels with parallel processing for large arrays.
     /// x if x > 0, alpha * (exp(x) - 1) otherwise
+    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    public void ELU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
+    public unsafe void ELU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
@@ -1596,27 +1587,18 @@ public class FloatOperations : INumericOperations<float>
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            var pool = ArrayPool<float>.Shared;
-            var xArray = pool.Rent(length);
-            var destArray = pool.Rent(length);
-            try
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
             {
-                x.CopyTo(xArray);
-
+                float* xp = xPtr;
+                float* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
                     Engines.Simd.SimdKernels.ELU(
-                        new ReadOnlySpan<float>(xArray, start, count),
+                        new ReadOnlySpan<float>(xp + start, count),
                         alpha,
-                        new Span<float>(destArray, start, count));
+                        new Span<float>(dp + start, count));
                 });
-
-                new ReadOnlySpan<float>(destArray, 0, length).CopyTo(destination);
-            }
-            finally
-            {
-                pool.Return(xArray);
-                pool.Return(destArray);
             }
             return;
         }
@@ -1626,13 +1608,30 @@ public class FloatOperations : INumericOperations<float>
 
     /// <summary>
     /// Computes ReLU (Rectified Linear Unit) element-wise using SIMD-optimized operations.
-    /// max(0, x) - Memory-bound operation where single-threaded SIMD is optimal.
-    /// Note: Parallelism adds copy overhead that hurts performance for simple ops like ReLU.
+    /// max(0, x) - Uses parallel chunking with unsafe pointers for zero-copy parallelization.
     /// </summary>
-    public void ReLU(ReadOnlySpan<float> x, Span<float> destination)
+    public unsafe void ReLU(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
+
+        int length = x.Length;
+        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
+        {
+            fixed (float* xPtr = x)
+            fixed (float* destPtr = destination)
+            {
+                float* xp = xPtr;
+                float* dp = destPtr;
+                ParallelForChunks(length, MinChunkSize, (start, count) =>
+                {
+                    Engines.Simd.SimdKernels.ReLU(
+                        new ReadOnlySpan<float>(xp + start, count),
+                        new Span<float>(dp + start, count));
+                });
+            }
+            return;
+        }
 
         Engines.Simd.SimdKernels.ReLU(x, destination);
     }
