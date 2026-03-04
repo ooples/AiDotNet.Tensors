@@ -13318,12 +13318,17 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>([n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
+
         Parallel.For(0, n, i =>
         {
-            T ai = a.GetFlat(i);
+            T ai = aData[i];
+            int rowOffset = i * m;
             for (int j = 0; j < m; j++)
             {
-                result[i, j] = numOps.Multiply(ai, b.GetFlat(j));
+                rData[rowOffset + j] = numOps.Multiply(ai, bData[j]);
             }
         });
 
@@ -13512,6 +13517,9 @@ public class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
 
+        var tensorData = tensor.GetDataArray();
+        var resultData = result.GetDataArray();
+
         Parallel.For(0, outerSize * innerSize, flatIdx =>
         {
             int outer = flatIdx / innerSize;
@@ -13521,8 +13529,8 @@ public class CpuEngine : ITensorLevelEngine
             for (int a = 0; a < axisSize; a++)
             {
                 int srcIdx = (outer * axisSize + a) * innerSize + inner;
-                cumSum = numOps.Add(cumSum, tensor.GetFlat(srcIdx));
-                result.SetFlat(srcIdx, cumSum);
+                cumSum = numOps.Add(cumSum, tensorData[srcIdx]);
+                resultData[srcIdx] = cumSum;
             }
         });
 
@@ -13580,6 +13588,10 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
+        var resultData = result.GetDataArray();
+        double meanD = numOps.ToDouble(mean);
+        double stdD = numOps.ToDouble(stddev);
+
         // Box-Muller transform for normal distribution
         for (int i = 0; i < totalElements; i += 2)
         {
@@ -13593,12 +13605,9 @@ public class CpuEngine : ITensorLevelEngine
             double z0 = mag * Math.Cos(2.0 * Math.PI * u2);
             double z1 = mag * Math.Sin(2.0 * Math.PI * u2);
 
-            double meanD = numOps.ToDouble(mean);
-            double stdD = numOps.ToDouble(stddev);
-
-            result.SetFlat(i, numOps.FromDouble(z0 * stdD + meanD));
+            resultData[i] = numOps.FromDouble(z0 * stdD + meanD);
             if (i + 1 < totalElements)
-                result.SetFlat(i + 1, numOps.FromDouble(z1 * stdD + meanD));
+                resultData[i + 1] = numOps.FromDouble(z1 * stdD + meanD);
         }
 
         return result;
@@ -13618,6 +13627,8 @@ public class CpuEngine : ITensorLevelEngine
         double maxD = numOps.ToDouble(max);
         double range = maxD - minD;
 
+        var resultData = result.GetDataArray();
+
         if (totalElements > 10000)
         {
             // For seeded random with parallelism, we need thread-local randoms
@@ -13631,8 +13642,7 @@ public class CpuEngine : ITensorLevelEngine
                 Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
                     (i, state, localRandom) =>
                     {
-                        double value = localRandom.NextDouble() * range + minD;
-                        result.SetFlat(i, numOps.FromDouble(value));
+                        resultData[i] = numOps.FromDouble(localRandom.NextDouble() * range + minD);
                         return localRandom;
                     },
                     _ => { });
@@ -13641,8 +13651,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 Parallel.For(0, totalElements, i =>
                 {
-                    double value = RandomHelper.ThreadSafeRandom.NextDouble() * range + minD;
-                    result.SetFlat(i, numOps.FromDouble(value));
+                    resultData[i] = numOps.FromDouble(RandomHelper.ThreadSafeRandom.NextDouble() * range + minD);
                 });
             }
         }
@@ -13650,8 +13659,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             for (int i = 0; i < totalElements; i++)
             {
-                double value = random.NextDouble() * range + minD;
-                result.SetFlat(i, numOps.FromDouble(value));
+                resultData[i] = numOps.FromDouble(random.NextDouble() * range + minD);
             }
         }
 
@@ -13671,6 +13679,8 @@ public class CpuEngine : ITensorLevelEngine
         double dropoutRateD = numOps.ToDouble(dropoutRate);
         T zero = numOps.Zero;
 
+        var resultData = result.GetDataArray();
+
         if (totalElements > 10000)
         {
             // For seeded random with parallelism, we need thread-local randoms
@@ -13684,8 +13694,7 @@ public class CpuEngine : ITensorLevelEngine
                 Parallel.For(0, totalElements, () => RandomHelper.CreateSeededRandom(seeds[Thread.CurrentThread.ManagedThreadId % seeds.Length]),
                     (i, state, localRandom) =>
                     {
-                        T value = localRandom.NextDouble() < dropoutRateD ? zero : scale;
-                        result.SetFlat(i, value);
+                        resultData[i] = localRandom.NextDouble() < dropoutRateD ? zero : scale;
                         return localRandom;
                     },
                     _ => { });
@@ -13694,8 +13703,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 Parallel.For(0, totalElements, i =>
                 {
-                    T value = RandomHelper.ThreadSafeRandom.NextDouble() < dropoutRateD ? zero : scale;
-                    result.SetFlat(i, value);
+                    resultData[i] = RandomHelper.ThreadSafeRandom.NextDouble() < dropoutRateD ? zero : scale;
                 });
             }
         }
@@ -13703,8 +13711,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             for (int i = 0; i < totalElements; i++)
             {
-                T value = random.NextDouble() < dropoutRateD ? zero : scale;
-                result.SetFlat(i, value);
+                resultData[i] = random.NextDouble() < dropoutRateD ? zero : scale;
             }
         }
 
@@ -13753,9 +13760,12 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>([n, n]);
         result.Fill(numOps.Zero);
 
+        var diagData = diagonal.GetDataArray();
+        var resultData = result.GetDataArray();
+
         for (int i = 0; i < n; i++)
         {
-            result[i, i] = diagonal.GetFlat(i);
+            resultData[i * n + i] = diagData[i];
         }
 
         return result;
@@ -14097,12 +14107,15 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>([numIndices, depth]);
         result.Fill(numOps.Zero);
 
+        var idxData = indices.GetDataArray();
+        var resultData = result.GetDataArray();
+
         for (int i = 0; i < numIndices; i++)
         {
-            int idx = indices.GetFlat(i);
+            int idx = idxData[i];
             if (idx >= 0 && idx < depth)
             {
-                result[i, idx] = numOps.One;
+                resultData[i * depth + idx] = numOps.One;
             }
         }
 
@@ -14132,18 +14145,21 @@ public class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
 
+        var tensorData = tensor.GetDataArray();
+        var resultData = result.GetDataArray();
+
         Parallel.For(0, outerSize * innerSize, flatIdx =>
         {
             int outer = flatIdx / innerSize;
             int inner = flatIdx % innerSize;
 
-            T maxVal = tensor.GetFlat((outer * axisSize) * innerSize + inner);
+            T maxVal = tensorData[(outer * axisSize) * innerSize + inner];
             int maxIdx = 0;
 
             for (int a = 1; a < axisSize; a++)
             {
                 int srcIdx = (outer * axisSize + a) * innerSize + inner;
-                T val = tensor.GetFlat(srcIdx);
+                T val = tensorData[srcIdx];
                 if (numOps.ToDouble(val) > numOps.ToDouble(maxVal))
                 {
                     maxVal = val;
@@ -14151,7 +14167,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            result.SetFlat(flatIdx, maxIdx);
+            resultData[flatIdx] = maxIdx;
         });
 
         return result;
@@ -14180,18 +14196,21 @@ public class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
 
+        var tensorData = tensor.GetDataArray();
+        var resultData = result.GetDataArray();
+
         Parallel.For(0, outerSize * innerSize, flatIdx =>
         {
             int outer = flatIdx / innerSize;
             int inner = flatIdx % innerSize;
 
-            T minVal = tensor.GetFlat((outer * axisSize) * innerSize + inner);
+            T minVal = tensorData[(outer * axisSize) * innerSize + inner];
             int minIdx = 0;
 
             for (int a = 1; a < axisSize; a++)
             {
                 int srcIdx = (outer * axisSize + a) * innerSize + inner;
-                T val = tensor.GetFlat(srcIdx);
+                T val = tensorData[srcIdx];
                 if (numOps.ToDouble(val) < numOps.ToDouble(minVal))
                 {
                     minVal = val;
@@ -14199,7 +14218,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            result.SetFlat(flatIdx, minIdx);
+            resultData[flatIdx] = minIdx;
         });
 
         return result;
