@@ -64,6 +64,55 @@ class Program
             return;
         }
 
+        // GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)
+        if (args[0] == "--activation")
+        {
+            GpuActivationBenchmark.Run();
+            return;
+        }
+
+        // GPU normalization benchmarks (BN, LN, GN, IN, RmsNorm)
+        if (args[0] == "--norm")
+        {
+            GpuNormalizationBenchmark.Run();
+            return;
+        }
+
+        // GPU attention benchmarks (FlashAttention, ScaledDotProduct)
+        if (args[0] == "--attn")
+        {
+            GpuAttentionBenchmark.Run();
+            return;
+        }
+
+        // GPU convolution benchmarks (Conv2D, Depthwise)
+        if (args[0] == "--conv")
+        {
+            GpuConvolutionBenchmark.Run();
+            return;
+        }
+
+        // Capture full baseline to CSV for A/B testing across phases
+        if (args[0] == "--baseline")
+        {
+            string phase = args.Length > 1 ? args[1] : "phase0";
+            string? csvPath = args.Length > 2 ? args[2] : null;
+            GpuBaselineResults.CaptureBaseline(phase, csvPath);
+            return;
+        }
+
+        // Compare two baseline CSVs for regressions
+        if (args[0] == "--compare")
+        {
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: --compare <before.csv> <after.csv>");
+                return;
+            }
+            GpuBaselineResults.CompareBaselines(args[1], args[2]);
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {
@@ -170,6 +219,12 @@ class Program
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");
         Console.WriteLine("  --directgpu: Run DirectGpu comprehensive benchmark (all 10 optimizations)");
+        Console.WriteLine("  --activation: Run GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU)");
+        Console.WriteLine("  --norm      : Run GPU normalization benchmarks (BN, LN, GN, IN, RmsNorm)");
+        Console.WriteLine("  --attn      : Run GPU attention benchmarks (FlashAttention, SDPA)");
+        Console.WriteLine("  --conv      : Run GPU convolution benchmarks (Conv2D, Depthwise)");
+        Console.WriteLine("  --baseline  : Capture full baseline to CSV (--baseline [phase] [csv])");
+        Console.WriteLine("  --compare   : Compare baselines (--compare before.csv after.csv)");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
