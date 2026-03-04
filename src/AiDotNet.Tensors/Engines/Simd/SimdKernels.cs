@@ -1394,14 +1394,37 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
+#if NET8_0_OR_GREATER
+            double[] tempBuf = ArrayPool<double>.Shared.Rent(length);
+            double[] temp2Buf = ArrayPool<double>.Shared.Rent(length);
+            try
+            {
+                var temp = tempBuf.AsSpan(0, length);
+                var temp2 = temp2Buf.AsSpan(0, length);
+
+                TensorPrimitives.Exp(input, temp);
+                TensorPrimitives.Add(temp, 1.0, temp);
+                TensorPrimitives.Log(temp, temp);
+                for (int i = 0; i < length; i++)
+                {
+                    if (input[i] > 20.0) temp[i] = input[i];
+                }
+                TensorPrimitives.Tanh(temp, temp2);
+                TensorPrimitives.Multiply(input, temp2, output);
+            }
+            finally
+            {
+                ArrayPool<double>.Shared.Return(tempBuf);
+                ArrayPool<double>.Shared.Return(temp2Buf);
+            }
+#else
             for (int i = 0; i < length; i++)
             {
                 double x = input[i];
-                // softplus(x) = ln(1 + exp(x))
-                // For numerical stability: if x > 20, softplus(x) approx x
                 double softplus = x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x));
                 output[i] = x * Math.Tanh(softplus);
             }
+#endif
         }
 
         /// <summary>
@@ -1417,12 +1440,26 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
+#if NET8_0_OR_GREATER
+            double[] tempBuf = ArrayPool<double>.Shared.Rent(length);
+            try
+            {
+                var temp = tempBuf.AsSpan(0, length);
+                TensorPrimitives.Sigmoid(input, temp);
+                TensorPrimitives.Multiply(input, temp, output);
+            }
+            finally
+            {
+                ArrayPool<double>.Shared.Return(tempBuf);
+            }
+#else
             for (int i = 0; i < length; i++)
             {
                 double x = input[i];
                 double sigmoid = 1.0 / (1.0 + Math.Exp(-x));
                 output[i] = x * sigmoid;
             }
+#endif
         }
 
         /// <summary>
@@ -1437,18 +1474,37 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             int length = output.Length;
+            int i = 0;
 
-            for (int i = 0; i < length; i++)
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && length >= 4)
+            {
+                var vzero = Vector256<double>.Zero;
+                var valpha = Vector256.Create(alpha);
+                var vone = Vector256.Create(1.0);
+                int simdLength = length & ~3;
+
+                for (; i < simdLength; i += 4)
+                {
+                    var vx = ReadVector256Double(input, i);
+                    var mask = Avx.Compare(vx, vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    // Scalar exp for negative values (no AVX exp intrinsic for double)
+                    var expResult = Vector256.Create(
+                        input[i] <= 0 ? Math.Exp(input[i]) : 0.0,
+                        input[i + 1] <= 0 ? Math.Exp(input[i + 1]) : 0.0,
+                        input[i + 2] <= 0 ? Math.Exp(input[i + 2]) : 0.0,
+                        input[i + 3] <= 0 ? Math.Exp(input[i + 3]) : 0.0);
+                    var negPart = Avx.Multiply(valpha, Avx.Subtract(expResult, vone));
+                    var result = Avx.BlendVariable(negPart, vx, mask);
+                    WriteVector256Double(output, i, result);
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
                 double x = input[i];
-                if (x > 0)
-                {
-                    output[i] = x;
-                }
-                else
-                {
-                    output[i] = alpha * (Math.Exp(x) - 1.0);
-                }
+                output[i] = x > 0 ? x : alpha * (Math.Exp(x) - 1.0);
             }
         }
 

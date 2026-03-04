@@ -3259,7 +3259,8 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Optimized Conv2D using multiple strategies for float tensors.
-    /// Tries in order: oneDNN, SIMD direct conv, Winograd, im2col+GEMM.
+    /// Tries in order: oneDNN, fused im2col-GEMM, Winograd, SIMD direct conv, im2col+GEMM fallback.
+    /// BLAS-based approaches are preferred over SIMD direct conv for most sizes.
     /// </summary>
     private void Conv2DWithIm2ColFloat(
         Tensor<float> input,
@@ -3286,14 +3287,7 @@ public class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // Strategy 2: Try SIMD direct convolution for 3x3 kernels with stride=1
-        if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
-            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
-        {
-            return;
-        }
-
-        // Strategy 3: Try fused im2col-GEMM with cache tiling for larger convolutions
+        // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
         if (FusedConvHelper.ShouldUseFusedConv(kernelHeight, kernelWidth, stride, stride,
             outputHeight, outputWidth, inChannels, outChannels))
         {
@@ -3311,8 +3305,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 #endif
 
-        // Strategy 4: Try Winograd for large 3x3 convolutions with stride=1, dilation=1
-        // (Only reached on net471 or when fused conv doesn't apply)
+        // Strategy 3: Try Winograd for large 3x3 convolutions with stride=1, dilation=1
         if (WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
         {
             var inputSpan = input.Data.Span;
@@ -3325,6 +3318,15 @@ public class CpuEngine : ITensorLevelEngine
                 outChannels, padding, padding);
             return;
         }
+
+#if !NET471
+        // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
+        if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
+            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
+        {
+            return;
+        }
+#endif
 
         // Strategy 5: Fallback to im2col + GEMM (works for all cases)
         Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
@@ -4871,7 +4873,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -5107,7 +5109,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Assign local variable to out parameter after parallel section
         maxIndices = indices;
-        return new Tensor<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -6830,7 +6832,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, outChannels, outputDepth, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -7132,7 +7134,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -7226,7 +7228,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         maxIndices = localMaxIndices;
-        return new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -7372,7 +7374,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth], new Vector<T>(outputData));
+        return result;
     }
 
     /// <inheritdoc/>
