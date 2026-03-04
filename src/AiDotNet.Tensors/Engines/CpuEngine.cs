@@ -2979,42 +2979,43 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>(new[] { batch, channels, outputHeight, outputWidth });
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
 
-        for (int b = 0; b < batch; b++)
+        // Parallelize over batch * channels
+        Parallel.For(0, batch * channels, idx =>
         {
-            for (int c = 0; c < channels; c++)
+            int b = idx / channels;
+            int c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+
+            for (int oh = 0; oh < outputHeight; oh++)
             {
-                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    for (int ow = 0; ow < outputWidth; ow++)
+                    T maxValue = numOps.MinValue;
+
+                    for (int kh = 0; kh < poolSize; kh++)
                     {
-                        // Use MinValue for type-safe initialization (works for all numeric types)
-                        T maxValue = numOps.MinValue;
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
 
-                        for (int kh = 0; kh < poolSize; kh++)
+                        for (int kw = 0; kw < poolSize; kw++)
                         {
-                            for (int kw = 0; kw < poolSize; kw++)
-                            {
-                                int ih = oh * stride + kh - padding;
-                                int iw = ow * stride + kw - padding;
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
 
-                                // Check bounds (handle padding)
-                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
-                                {
-                                    T value = input[b, c, ih, iw];
-                                    if (numOps.GreaterThan(value, maxValue))
-                                    {
-                                        maxValue = value;
-                                    }
-                                }
-                            }
+                            T value = inputData[inputBaseOffset + ih * width + iw];
+                            if (numOps.GreaterThan(value, maxValue))
+                                maxValue = value;
                         }
-
-                        result[b, c, oh, ow] = maxValue;
                     }
+
+                    outputData[outputBaseOffset + oh * outputWidth + ow] = maxValue;
                 }
             }
-        }
+        });
 
         return result;
     }
@@ -3048,48 +3049,41 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = new Tensor<T>(new[] { batch, channels, outputHeight, outputWidth });
+        var inputData = input.GetDataArray();
+        var outputData = result.GetDataArray();
 
-        for (int b = 0; b < batch; b++)
+        Parallel.For(0, batch * channels, idx =>
         {
-            for (int c = 0; c < channels; c++)
+            int b = idx / channels;
+            int c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * height * width;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+
+            for (int oh = 0; oh < outputHeight; oh++)
             {
-                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    for (int ow = 0; ow < outputWidth; ow++)
+                    T sum = numOps.Zero;
+                    int count = 0;
+
+                    for (int kh = 0; kh < poolSize; kh++)
                     {
-                        T sum = numOps.Zero;
-                        int count = 0;
-
-                        for (int kh = 0; kh < poolSize; kh++)
+                        int ih = oh * stride + kh - padding;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
                         {
-                            for (int kw = 0; kw < poolSize; kw++)
-                            {
-                                int ih = oh * stride + kh - padding;
-                                int iw = ow * stride + kw - padding;
-
-                                // Check bounds (handle padding)
-                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
-                                {
-                                    sum = numOps.Add(sum, input[b, c, ih, iw]);
-                                    count++;
-                                }
-                            }
-                        }
-
-                        // Calculate average
-                        if (count > 0)
-                        {
-                            var countValue = numOps.FromDouble(count);
-                            result[b, c, oh, ow] = numOps.Divide(sum, countValue);
-                        }
-                        else
-                        {
-                            result[b, c, oh, ow] = numOps.Zero;
+                            int iw = ow * stride + kw - padding;
+                            if (iw < 0 || iw >= width) continue;
+                            sum = numOps.Add(sum, inputData[inputBaseOffset + ih * width + iw]);
+                            count++;
                         }
                     }
+
+                    outputData[outputBaseOffset + oh * outputWidth + ow] =
+                        count > 0 ? numOps.Divide(sum, numOps.FromDouble(count)) : numOps.Zero;
                 }
             }
-        }
+        });
 
         return result;
     }
@@ -5127,13 +5121,17 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput.Shape[2];
         int outputWidth = gradOutput.Shape[3];
 
-        var gradInput = new T[batch * channels * height * width];
+        var result = new Tensor<T>(inputShape);
+        var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
 
-        for (int i = 0; i < gradInput.Length; i++)
-            gradInput[i] = numOps.Zero;
+        // Initialize to zero
+        for (int i = 0; i < gradInputData.Length; i++)
+            gradInputData[i] = numOps.Zero;
 
-        for (int b = 0; b < batch; b++)
+        // Note: Cannot parallelize across batch*channels because multiple output positions
+        // may map to the same input position within a channel. Parallelize across batches only.
+        Parallel.For(0, batch, b =>
         {
             for (int c = 0; c < channels; c++)
             {
@@ -5147,13 +5145,13 @@ public class CpuEngine : ITensorLevelEngine
                         int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
                         int gradInIdx = ((b * channels + c) * height + maxH) * width + maxW;
 
-                        gradInput[gradInIdx] = numOps.Add(gradInput[gradInIdx], gradOutputData[gradOutIdx]);
+                        gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], gradOutputData[gradOutIdx]);
                     }
                 }
             }
-        }
+        });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInput));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -5233,40 +5231,45 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput.Shape[2];
         int outputWidth = gradOutput.Shape[3];
 
-        var gradInput = new T[batch * channels * height * width];
+        var result = new Tensor<T>(inputShape);
+        var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         T poolArea = numOps.FromDouble(poolH * poolW);
 
-        for (int i = 0; i < gradInput.Length; i++)
-            gradInput[i] = numOps.Zero;
+        // Initialize to zero
+        for (int i = 0; i < gradInputData.Length; i++)
+            gradInputData[i] = numOps.Zero;
 
-        for (int b = 0; b < batch; b++)
+        // Parallelize across batches (within a batch*channel, output positions scatter to overlapping input regions)
+        Parallel.For(0, batch, b =>
         {
             for (int c = 0; c < channels; c++)
             {
+                int inputBaseOffset = (b * channels + c) * height * width;
+                int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+
                 for (int oh = 0; oh < outputHeight; oh++)
                 {
                     for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        int gradOutIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                        T grad = numOps.Divide(gradOutputData[gradOutIdx], poolArea);
+                        T grad = numOps.Divide(gradOutputData[outputBaseOffset + oh * outputWidth + ow], poolArea);
 
                         for (int kh = 0; kh < poolH; kh++)
                         {
+                            int ih = oh * strideH + kh;
                             for (int kw = 0; kw < poolW; kw++)
                             {
-                                int ih = oh * strideH + kh;
                                 int iw = ow * strideW + kw;
-                                int gradInIdx = ((b * channels + c) * height + ih) * width + iw;
-                                gradInput[gradInIdx] = numOps.Add(gradInput[gradInIdx], grad);
+                                int gradInIdx = inputBaseOffset + ih * width + iw;
+                                gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], grad);
                             }
                         }
                     }
                 }
             }
-        }
+        });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInput));
+        return result;
     }
 
     /// <inheritdoc/>
@@ -9149,37 +9152,35 @@ public class CpuEngine : ITensorLevelEngine
         var varData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        // Compute mean per batch position
-        for (int b = 0; b < batchSize; b++)
+        // Compute mean, variance, normalize and scale - all fused per batch position
+        Parallel.For(0, batchSize, b =>
         {
+            int offset = b * featureSize;
+            T featureSizeT = numOps.FromDouble(featureSize);
+
+            // Mean
             T sum = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
-            {
-                sum = numOps.Add(sum, inputData[b * featureSize + f]);
-            }
-            meanData[b] = numOps.Divide(sum, numOps.FromDouble(featureSize));
-        }
+                sum = numOps.Add(sum, inputData[offset + f]);
+            T m = numOps.Divide(sum, featureSizeT);
+            meanData[b] = m;
 
-        // Compute variance per batch position
-        for (int b = 0; b < batchSize; b++)
-        {
+            // Variance
             T sumSq = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
             {
-                T diff = numOps.Subtract(inputData[b * featureSize + f], meanData[b]);
+                T diff = numOps.Subtract(inputData[offset + f], m);
                 sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
             }
-            varData[b] = numOps.Divide(sumSq, numOps.FromDouble(featureSize));
-        }
+            T v = numOps.Divide(sumSq, featureSizeT);
+            varData[b] = v;
 
-        // Normalize and scale
-        Parallel.For(0, batchSize, b =>
-        {
-            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(varData[b], eps)));
+            // Normalize and scale
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(v, eps)));
             for (int f = 0; f < featureSize; f++)
             {
-                T normalized = numOps.Multiply(numOps.Subtract(inputData[b * featureSize + f], meanData[b]), invStd);
-                outputData[b * featureSize + f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
+                T normalized = numOps.Multiply(numOps.Subtract(inputData[offset + f], m), invStd);
+                outputData[offset + f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
             }
         });
 
@@ -9316,67 +9317,50 @@ public class CpuEngine : ITensorLevelEngine
         var varData = new T[batch * numGroups];
         var outputData = new T[input.Length];
 
-        // Compute mean per group
-        for (int b = 0; b < batch; b++)
+        // Fused mean + variance + normalize per batch*group
+        Parallel.For(0, batch * numGroups, idx =>
         {
-            for (int g = 0; g < numGroups; g++)
+            int b = idx / numGroups;
+            int g = idx % numGroups;
+            int startChannel = g * channelsPerGroup;
+            int batchOffset = b * (channels * spatialSize);
+            T groupSizeT = numOps.FromDouble(groupSize);
+
+            // Compute mean
+            T sum = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
             {
-                T sum = numOps.Zero;
-                int startChannel = g * channelsPerGroup;
-
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channel = startChannel + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * (channels * spatialSize) + channel * spatialSize + s;
-                        sum = numOps.Add(sum, inputData[idx]);
-                    }
-                }
-
-                meanData[b * numGroups + g] = numOps.Divide(sum, numOps.FromDouble(groupSize));
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                    sum = numOps.Add(sum, inputData[chanOffset + s]);
             }
-        }
+            T groupMean = numOps.Divide(sum, groupSizeT);
+            meanData[b * numGroups + g] = groupMean;
 
-        // Compute variance per group
-        for (int b = 0; b < batch; b++)
-        {
-            for (int g = 0; g < numGroups; g++)
+            // Compute variance
+            T sumSq = numOps.Zero;
+            for (int c = 0; c < channelsPerGroup; c++)
             {
-                T sumSq = numOps.Zero;
-                T groupMean = meanData[b * numGroups + g];
-                int startChannel = g * channelsPerGroup;
-
-                for (int c = 0; c < channelsPerGroup; c++)
-                {
-                    int channel = startChannel + c;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        int idx = b * (channels * spatialSize) + channel * spatialSize + s;
-                        T diff = numOps.Subtract(inputData[idx], groupMean);
-                        sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
-                    }
-                }
-
-                varData[b * numGroups + g] = numOps.Divide(sumSq, numOps.FromDouble(groupSize));
-            }
-        }
-
-        // Normalize and apply scale/shift (gamma/beta are per-channel)
-        Parallel.For(0, batch, b =>
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                int g = c / channelsPerGroup;
-                T groupMean = meanData[b * numGroups + g];
-                T groupVar = varData[b * numGroups + g];
-                T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
-
+                int chanOffset = batchOffset + (startChannel + c) * spatialSize;
                 for (int s = 0; s < spatialSize; s++)
                 {
-                    int idx = b * (channels * spatialSize) + c * spatialSize + s;
-                    T normalized = numOps.Multiply(numOps.Subtract(inputData[idx], groupMean), invStd);
-                    outputData[idx] = numOps.Add(numOps.Multiply(gammaData[c], normalized), betaData[c]);
+                    T diff = numOps.Subtract(inputData[chanOffset + s], groupMean);
+                    sumSq = numOps.Add(sumSq, numOps.Multiply(diff, diff));
+                }
+            }
+            T groupVar = numOps.Divide(sumSq, groupSizeT);
+            varData[b * numGroups + g] = groupVar;
+
+            // Normalize and apply scale/shift
+            T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(groupVar, eps)));
+            for (int c = 0; c < channelsPerGroup; c++)
+            {
+                int channel = startChannel + c;
+                int chanOffset = batchOffset + channel * spatialSize;
+                for (int s = 0; s < spatialSize; s++)
+                {
+                    T normalized = numOps.Multiply(numOps.Subtract(inputData[chanOffset + s], groupMean), invStd);
+                    outputData[chanOffset + s] = numOps.Add(numOps.Multiply(gammaData[channel], normalized), betaData[channel]);
                 }
             }
         });
@@ -9537,22 +9521,25 @@ public class CpuEngine : ITensorLevelEngine
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        for (int b = 0; b < batchSize; b++)
+        Parallel.For(0, batchSize, b =>
         {
+            int offset = b * featureSize;
+            T featureSizeT = numOps.FromDouble(featureSize);
+
+            // RMS
             T sumSq = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
             {
-                T val = inputData[b * featureSize + f];
+                T val = inputData[offset + f];
                 sumSq = numOps.Add(sumSq, numOps.Multiply(val, val));
             }
-            rmsData[b] = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, numOps.FromDouble(featureSize)), eps));
-        }
+            T rmsVal = numOps.Sqrt(numOps.Add(numOps.Divide(sumSq, featureSizeT), eps));
+            rmsData[b] = rmsVal;
 
-        Parallel.For(0, batchSize, b =>
-        {
-            T invRms = numOps.Divide(numOps.One, rmsData[b]);
+            // Normalize and scale
+            T invRms = numOps.Divide(numOps.One, rmsVal);
             for (int f = 0; f < featureSize; f++)
-                outputData[b * featureSize + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[b * featureSize + f], invRms));
+                outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
         });
 
         rms = new Tensor<T>(batchShape, new Vector<T>(rmsData));
@@ -17520,41 +17507,42 @@ public class CpuEngine : ITensorLevelEngine
         int inWidth = input.Shape[3];
 
         var inputData = input.GetDataArray();
-        var resultData = new T[batch * channels * outputHeight * outputWidth];
+        var result = new Tensor<T>([batch, channels, outputHeight, outputWidth]);
+        var resultData = result.GetDataArray();
 
-        for (int b = 0; b < batch; b++)
+        Parallel.For(0, batch * channels, idx =>
         {
-            for (int c = 0; c < channels; c++)
+            int b = idx / channels;
+            int c = idx % channels;
+            int inputBaseOffset = (b * channels + c) * inHeight * inWidth;
+            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
+
+            for (int oh = 0; oh < outputHeight; oh++)
             {
-                for (int oh = 0; oh < outputHeight; oh++)
+                int startH = (int)Math.Floor((double)oh * inHeight / outputHeight);
+                int endH = (int)Math.Ceiling((double)(oh + 1) * inHeight / outputHeight);
+
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    int startH = (int)Math.Floor((double)oh * inHeight / outputHeight);
-                    int endH = (int)Math.Ceiling((double)(oh + 1) * inHeight / outputHeight);
+                    int startW = (int)Math.Floor((double)ow * inWidth / outputWidth);
+                    int endW = (int)Math.Ceiling((double)(ow + 1) * inWidth / outputWidth);
 
-                    for (int ow = 0; ow < outputWidth; ow++)
+                    double sum = 0;
+                    int count = 0;
+                    for (int ih = startH; ih < endH; ih++)
                     {
-                        int startW = (int)Math.Floor((double)ow * inWidth / outputWidth);
-                        int endW = (int)Math.Ceiling((double)(ow + 1) * inWidth / outputWidth);
-
-                        double sum = 0;
-                        int count = 0;
-                        for (int ih = startH; ih < endH; ih++)
+                        for (int iw = startW; iw < endW; iw++)
                         {
-                            for (int iw = startW; iw < endW; iw++)
-                            {
-                                int idx = ((b * channels + c) * inHeight + ih) * inWidth + iw;
-                                sum += numOps.ToDouble(inputData[idx]);
-                                count++;
-                            }
+                            sum += numOps.ToDouble(inputData[inputBaseOffset + ih * inWidth + iw]);
+                            count++;
                         }
-                        int outIdx = ((b * channels + c) * outputHeight + oh) * outputWidth + ow;
-                        resultData[outIdx] = numOps.FromDouble(sum / count);
                     }
+                    resultData[outputBaseOffset + oh * outputWidth + ow] = numOps.FromDouble(sum / count);
                 }
             }
-        }
+        });
 
-        return new Tensor<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(resultData));
+        return result;
     }
 
     #endregion
