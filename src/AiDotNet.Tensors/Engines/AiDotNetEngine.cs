@@ -1,3 +1,4 @@
+using System.Threading;
 using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines;
@@ -30,7 +31,6 @@ namespace AiDotNet.Tensors.Engines;
 public static class AiDotNetEngine
 {
     private static IEngine _current;
-    private static readonly object _lock = new object();
 
     /// <summary>
     /// Static constructor initializes with CPU engine by default.
@@ -46,7 +46,8 @@ public static class AiDotNetEngine
     /// <remarks>
     /// <para>
     /// Changing the engine affects all subsequent operations. The change is global
-    /// and thread-safe.
+    /// and thread-safe. Uses lock-free Volatile.Read/Write for optimal performance
+    /// on the hot read path.
     /// </para>
     /// <para><b>For Beginners:</b> This is like choosing between CPU and GPU mode.
     ///
@@ -68,10 +69,7 @@ public static class AiDotNetEngine
     {
         get
         {
-            lock (_lock)
-            {
-                return _current;
-            }
+            return Volatile.Read(ref _current);
         }
         set
         {
@@ -80,10 +78,7 @@ public static class AiDotNetEngine
                 throw new ArgumentNullException(nameof(value), "Engine cannot be null");
             }
 
-            lock (_lock)
-            {
-                _current = value;
-            }
+            Volatile.Write(ref _current, value);
         }
     }
 

@@ -2199,11 +2199,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        for (int i = 0; i < tensor.Length; i++)
-        {
-            result.SetFlat(i, numOps.Multiply(tensor.GetFlat(i), scalar));
-        }
+        numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
@@ -2482,21 +2478,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Log(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Log(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2508,21 +2490,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Exp(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Exp(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2534,21 +2502,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Sqrt(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Sqrt(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2560,21 +2514,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Abs(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Abs(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2586,21 +2526,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-
-        if (tensor.Length > 10000)
-        {
-            Parallel.For(0, tensor.Length, i =>
-            {
-                result.SetFlat(i, numOps.Negate(tensor.GetFlat(i)));
-            });
-        }
-        else
-        {
-            for (int i = 0; i < tensor.Length; i++)
-            {
-                result.SetFlat(i, numOps.Negate(tensor.GetFlat(i)));
-            }
-        }
+        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -3225,60 +3151,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        T maxVal = tensor.GetFlat(0);
-
-        // Parallel reduction for large tensors
-        if (tensor.Length > 10000)
-        {
-            int workerCount = Environment.ProcessorCount;
-            var localMaxes = new T[workerCount];
-            var hasValue = new bool[workerCount];
-            int chunkSize = (tensor.Length + workerCount - 1) / workerCount;
-
-            Parallel.For(0, workerCount, threadIdx =>
-            {
-                int start = threadIdx * chunkSize;
-                int end = Math.Min(start + chunkSize, tensor.Length);
-                if (start >= tensor.Length) return;
-
-                T localMax = tensor.GetFlat(start);
-                for (int i = start + 1; i < end; i++)
-                {
-                    var val = tensor.GetFlat(i);
-                    if (numOps.GreaterThan(val, localMax))
-                        localMax = val;
-                }
-                localMaxes[threadIdx] = localMax;
-                hasValue[threadIdx] = true;
-            });
-
-            // Combine only populated slots
-            bool first = true;
-            for (int i = 0; i < workerCount; i++)
-            {
-                if (!hasValue[i]) continue;
-                if (first)
-                {
-                    maxVal = localMaxes[i];
-                    first = false;
-                }
-                else if (numOps.GreaterThan(localMaxes[i], maxVal))
-                {
-                    maxVal = localMaxes[i];
-                }
-            }
-        }
-        else
-        {
-            for (int i = 1; i < tensor.Length; i++)
-            {
-                var val = tensor.GetFlat(i);
-                if (numOps.GreaterThan(val, maxVal))
-                    maxVal = val;
-            }
-        }
-
-        return maxVal;
+        return numOps.Max(tensor.AsSpan());
     }
 
     /// <inheritdoc/>
@@ -3288,60 +3161,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        T minVal = tensor.GetFlat(0);
-
-        // Parallel reduction for large tensors
-        if (tensor.Length > 10000)
-        {
-            int workerCount = Environment.ProcessorCount;
-            var localMins = new T[workerCount];
-            var hasValue = new bool[workerCount];
-            int chunkSize = (tensor.Length + workerCount - 1) / workerCount;
-
-            Parallel.For(0, workerCount, threadIdx =>
-            {
-                int start = threadIdx * chunkSize;
-                int end = Math.Min(start + chunkSize, tensor.Length);
-                if (start >= tensor.Length) return;
-
-                T localMin = tensor.GetFlat(start);
-                for (int i = start + 1; i < end; i++)
-                {
-                    var val = tensor.GetFlat(i);
-                    if (numOps.LessThan(val, localMin))
-                        localMin = val;
-                }
-                localMins[threadIdx] = localMin;
-                hasValue[threadIdx] = true;
-            });
-
-            // Combine only populated slots
-            bool first = true;
-            for (int i = 0; i < workerCount; i++)
-            {
-                if (!hasValue[i]) continue;
-                if (first)
-                {
-                    minVal = localMins[i];
-                    first = false;
-                }
-                else if (numOps.LessThan(localMins[i], minVal))
-                {
-                    minVal = localMins[i];
-                }
-            }
-        }
-        else
-        {
-            for (int i = 1; i < tensor.Length; i++)
-            {
-                var val = tensor.GetFlat(i);
-                if (numOps.LessThan(val, minVal))
-                    minVal = val;
-            }
-        }
-
-        return minVal;
+        return numOps.Min(tensor.AsSpan());
     }
 
     /// <inheritdoc/>
@@ -5066,6 +4886,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Fallback to parallel loops for non-float/double or when BLAS unavailable
+        // Use flat GetFlat/SetFlat to avoid params int[] allocations from the multi-dim indexer
         Parallel.For(0, m, i =>
         {
             for (int j = 0; j < p; j++)
@@ -5073,9 +4894,9 @@ public class CpuEngine : ITensorLevelEngine
                 T sum = numOps.Zero;
                 for (int k = 0; k < n; k++)
                 {
-                    sum = numOps.Add(sum, numOps.Multiply(a[i, k], b[k, j]));
+                    sum = numOps.Add(sum, numOps.Multiply(a.GetFlat(i * n + k), b.GetFlat(k * p + j)));
                 }
-                result[i, j] = sum;
+                result.SetFlat(i * p + j, sum);
             }
         });
 
@@ -5115,9 +4936,6 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[aRank - 1] = p;
 
         var result = new Tensor<T>(outputShape);
-        var aData = a.ToArray();
-        var bData = b.ToArray();
-        var resultData = result.ToArray();
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
@@ -5134,16 +4952,16 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int k = 0; k < n; k++)
                     {
-                        T aVal = aData[aOffset + i * n + k];
-                        T bVal = bData[k * p + j];
+                        T aVal = a.GetFlat(aOffset + i * n + k);
+                        T bVal = b.GetFlat(k * p + j);
                         sum = numOps.Add(sum, numOps.Multiply(aVal, bVal));
                     }
-                    resultData[resultOffset + i * p + j] = sum;
+                    result.SetFlat(resultOffset + i * p + j, sum);
                 }
             }
         });
 
-        return new Tensor<T>(outputShape, new Vector<T>(resultData));
+        return result;
     }
 
     /// <summary>
@@ -13231,18 +13049,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        T sum = numOps.Zero;
-        int length = tensor.Length;
-
-        // Use SIMD-friendly sequential access pattern
-        var data = tensor.ToArray();
-        for (int i = 0; i < length; i++)
-        {
-            T val = data[i];
-            sum = numOps.Add(sum, numOps.Multiply(val, val));
-        }
-
-        return sum;
+        return numOps.Dot(tensor.AsSpan(), tensor.AsSpan());
     }
 
     /// <inheritdoc/>
@@ -14317,12 +14124,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        int totalElements = tensor.Length;
-
-        Parallel.For(0, totalElements, i =>
-        {
-            result.SetFlat(i, numOps.Add(tensor.GetFlat(i), scalar));
-        });
+        numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
@@ -14334,12 +14136,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        int totalElements = tensor.Length;
-
-        Parallel.For(0, totalElements, i =>
-        {
-            result.SetFlat(i, numOps.Subtract(tensor.GetFlat(i), scalar));
-        });
+        numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
@@ -14351,12 +14148,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        int totalElements = tensor.Length;
-
-        Parallel.For(0, totalElements, i =>
-        {
-            result.SetFlat(i, numOps.Divide(tensor.GetFlat(i), scalar));
-        });
+        numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
