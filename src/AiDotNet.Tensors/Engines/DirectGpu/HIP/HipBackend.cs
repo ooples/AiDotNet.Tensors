@@ -1207,67 +1207,74 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("add_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: add_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("add_vectors", A, B, C, size);
     }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("subtract_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: subtract_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("subtract_vectors", A, B, C, size);
     }
 
     public void Multiply(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("multiply_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: multiply_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("multiply_vectors", A, B, C, size);
     }
 
     public void Divide(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("divide_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: divide_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("divide_vectors", A, B, C, size);
     }
 
     public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("min_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: min_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("min_vectors", A, B, C, size);
     }
 
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        if (!_kernelCache.TryGetValue("max_vectors", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: max_vectors");
-
-        LaunchBinaryOp(krnl, A, B, C, size);
+        LaunchBinaryOpAutoVec4("max_vectors", A, B, C, size);
     }
 
     public unsafe void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
+        if (size % 4 == 0 && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Krnl))
+        {
+            int size4 = size / 4;
+            var handles = new GCHandle[4];
+            try
+            {
+                handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
+                handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
+                handles[2] = GCHandle.Alloc(scalar, GCHandleType.Pinned);
+                handles[3] = GCHandle.Alloc(size4, GCHandleType.Pinned);
+
+                var args = new IntPtr[4];
+                for (int i = 0; i < 4; i++) args[i] = handles[i].AddrOfPinnedObject();
+
+                uint grid = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(vec4Krnl, grid, DefaultBlockSize, args);
+                Synchronize();
+            }
+            finally
+            {
+                foreach (var h in handles) if (h.IsAllocated) h.Free();
+            }
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("scale_vector", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: scale_vector");
 
-        var handles = new GCHandle[4];
+        var handles2 = new GCHandle[4];
         try
         {
-            handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
-            handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
-            handles[2] = GCHandle.Alloc(scalar, GCHandleType.Pinned);
-            handles[3] = GCHandle.Alloc(size, GCHandleType.Pinned);
+            handles2[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
+            handles2[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
+            handles2[2] = GCHandle.Alloc(scalar, GCHandleType.Pinned);
+            handles2[3] = GCHandle.Alloc(size, GCHandleType.Pinned);
 
             var args = new IntPtr[4];
-            for (int i = 0; i < 4; i++) args[i] = handles[i].AddrOfPinnedObject();
+            for (int i = 0; i < 4; i++) args[i] = handles2[i].AddrOfPinnedObject();
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
@@ -1275,7 +1282,7 @@ public sealed class HipBackend : IAsyncGpuBackend
         }
         finally
         {
-            foreach (var h in handles) if (h.IsAllocated) h.Free();
+            foreach (var h in handles2) if (h.IsAllocated) h.Free();
         }
     }
 
@@ -1313,18 +1320,12 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("abs_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: abs_vector");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("abs_vector", A, B, size);
     }
 
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("exp_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: exp_vector");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("exp_vector", A, B, size);
     }
 
     public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
@@ -1353,10 +1354,7 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Log(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("log_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log_vector");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("log_vector", A, B, size);
     }
 
     public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
@@ -1377,10 +1375,7 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("sqrt_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sqrt_vector");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("sqrt_vector", A, B, size);
     }
 
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size)
@@ -1393,18 +1388,12 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Relu(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("relu", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: relu");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("relu", A, B, size);
     }
 
     public void Sigmoid(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("sigmoid", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sigmoid");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("sigmoid", A, B, size);
     }
 
     private unsafe void LaunchUnaryOp(IntPtr krnl, IGpuBuffer A, IGpuBuffer B, int size)
@@ -1429,20 +1418,46 @@ public sealed class HipBackend : IAsyncGpuBackend
         }
     }
 
+    /// <summary>
+    /// Launches a unary op with automatic vec4 selection when size is divisible by 4.
+    /// </summary>
+    private unsafe void LaunchUnaryOpAutoVec4(string kernelName, IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Krnl))
+        {
+            int size4 = size / 4;
+            var handles = new GCHandle[3];
+            try
+            {
+                handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
+                handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
+                handles[2] = GCHandle.Alloc(size4, GCHandleType.Pinned);
+                var args = new IntPtr[3];
+                for (int i = 0; i < 3; i++) args[i] = handles[i].AddrOfPinnedObject();
+                uint grid = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(vec4Krnl, grid, DefaultBlockSize, args);
+                Synchronize();
+            }
+            finally
+            {
+                foreach (var h in handles) if (h.IsAllocated) h.Free();
+            }
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        LaunchUnaryOp(krnl, A, B, size);
+    }
+
     public void Tanh(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("tanh_activation", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: tanh_activation");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("tanh_activation", A, B, size);
     }
 
     public void Gelu(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("gelu", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: gelu");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("gelu", A, B, size);
     }
 
     public unsafe void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
@@ -1554,10 +1569,7 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Swish(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("swish", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: swish");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("swish", A, B, size);
     }
 
     public unsafe void SwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
@@ -1968,10 +1980,7 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Negate(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("negate_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: negate_vector");
-
-        LaunchUnaryOp(krnl, A, B, size);
+        LaunchUnaryOpAutoVec4("negate_vector", A, B, size);
     }
 
     public void Floor(IGpuBuffer A, IGpuBuffer B, int size)
@@ -7367,6 +7376,39 @@ public sealed class HipBackend : IAsyncGpuBackend
         {
             foreach (var h in handles) if (h.IsAllocated) h.Free();
         }
+    }
+
+    /// <summary>
+    /// Launches a binary op with automatic vec4 selection when size is divisible by 4.
+    /// </summary>
+    private unsafe void LaunchBinaryOpAutoVec4(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Krnl))
+        {
+            int size4 = size / 4;
+            var handles = new GCHandle[4];
+            try
+            {
+                handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
+                handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
+                handles[2] = GCHandle.Alloc(C.Handle, GCHandleType.Pinned);
+                handles[3] = GCHandle.Alloc(size4, GCHandleType.Pinned);
+                var args = new IntPtr[4];
+                for (int i = 0; i < 4; i++) args[i] = handles[i].AddrOfPinnedObject();
+                uint grid = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+                LaunchKernel(vec4Krnl, grid, DefaultBlockSize, args);
+                Synchronize();
+            }
+            finally
+            {
+                foreach (var h in handles) if (h.IsAllocated) h.Free();
+            }
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl))
+            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        LaunchBinaryOp(krnl, A, B, C, size);
     }
 
     #endregion

@@ -1882,6 +1882,22 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // Try vec4 variant for 4x throughput on bandwidth-limited ops
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr inPtrV = input.Handle;
+            IntPtr outPtrV = output.Handle;
+            void** argsV = stackalloc void*[3];
+            argsV[0] = &inPtrV;
+            argsV[1] = &outPtrV;
+            argsV[2] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
@@ -1899,6 +1915,24 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        // Try vec4 variant for 4x throughput on bandwidth-limited ops
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr aPtrV = A.Handle;
+            IntPtr bPtrV = B.Handle;
+            IntPtr cPtrV = C.Handle;
+            void** argsV = stackalloc void*[4];
+            argsV[0] = &aPtrV;
+            argsV[1] = &bPtrV;
+            argsV[2] = &cPtrV;
+            argsV[3] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
@@ -1918,6 +1952,24 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
+        // Try vec4 variant
+        if (size % 4 == 0 && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr aPtrV = A.Handle;
+            IntPtr bPtrV = B.Handle;
+            float scalarV = scalar;
+            void** argsV = stackalloc void*[4];
+            argsV[0] = &aPtrV;
+            argsV[1] = &bPtrV;
+            argsV[2] = &scalarV;
+            argsV[3] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("scale_vector", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: scale_vector");
 
