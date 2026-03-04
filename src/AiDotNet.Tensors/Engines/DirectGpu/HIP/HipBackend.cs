@@ -704,9 +704,12 @@ public sealed class HipBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"HIP fused kernel not found: {kernelName}");
 
-        const int TILE_SIZE = 16;
-        uint gridX = (uint)((N + TILE_SIZE - 1) / TILE_SIZE);
-        uint gridY = (uint)((M + TILE_SIZE - 1) / TILE_SIZE);
+        // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
+        const int BM = 128;
+        const int BN = 128;
+        const int BLOCK_DIM = 16;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
 
         var handles = new GCHandle[7];
         try
@@ -731,7 +734,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             };
 
             // HIP kernel launch uses unmanaged interop with the driver API.
-            LaunchKernel2DOnStream(kernel, gridX, gridY, TILE_SIZE, TILE_SIZE, args, stream);
+            LaunchKernel2DOnStream(kernel, gridX, gridY, BLOCK_DIM, BLOCK_DIM, args, stream);
             if (synchronize)
             {
                 // HIP stream synchronization requires unmanaged interop.

@@ -18,12 +18,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             return @"
 #include <math.h>
 
-#define TILE_SIZE 16
+// ===========================================================================
+// GEMM TILING PARAMETERS
+// 128x128 CTA tile with 8x8 register blocking per thread.
+// 16x16 thread block, each thread computes 8x8 = 64 output elements.
+// Shared memory: As[BK][BM] + Bs[BK][BN] = 2 * 16 * 128 * 4 = 16 KB.
+// ===========================================================================
+#define BM 128
+#define BN 128
+#define BK 16
+#define TM 8
+#define TN 8
+#define BLOCK_DIM 16
 
 // ===========================================================================
 // FUSED KERNELS: GEMM + BIAS + ACTIVATION
 // Single kernel for entire DenseLayer forward pass.
 // Eliminates memory round-trips between operations.
+// Uses 128x128 tiling with 8x8 register blocking for high throughput.
 // ===========================================================================
 
 // Fused GEMM + Bias + ReLU
@@ -35,35 +47,72 @@ extern ""C"" __global__ void gemm_bias_relu(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        // Cooperative load of A tile [BM x BK] into shared memory
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        // Cooperative load of B tile [BK x BN] into shared memory
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
+        // Register-blocked inner product
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float result = sum + bias[col];
-        C[row * N + col] = fmaxf(0.0f, result);
+    // Write results with bias + ReLU
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float result = acc[m][n] + bias[col];
+                C[row * N + col] = fmaxf(0.0f, result);
+            }
+        }
     }
 }
 
@@ -76,41 +125,72 @@ extern ""C"" __global__ void gemm_bias_gelu(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float x = sum + bias[col];
-
-        // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        const float SQRT_2_OVER_PI = 0.7978845608f;
-        const float COEFF = 0.044715f;
-        float x3 = x * x * x;
-        float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
-        C[row * N + col] = 0.5f * x * (1.0f + tanhf(inner));
+    const float SQRT_2_OVER_PI = 0.7978845608f;
+    const float COEFF = 0.044715f;
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float x = acc[m][n] + bias[col];
+                float x3 = x * x * x;
+                float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
+                C[row * N + col] = 0.5f * x * (1.0f + tanhf(inner));
+            }
+        }
     }
 }
 
@@ -123,35 +203,68 @@ extern ""C"" __global__ void gemm_bias_sigmoid(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float x = sum + bias[col];
-        C[row * N + col] = 1.0f / (1.0f + expf(-x));
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float x = acc[m][n] + bias[col];
+                C[row * N + col] = 1.0f / (1.0f + expf(-x));
+            }
+        }
     }
 }
 
@@ -164,35 +277,68 @@ extern ""C"" __global__ void gemm_bias_tanh(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float x = sum + bias[col];
-        C[row * N + col] = tanhf(x);
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float x = acc[m][n] + bias[col];
+                C[row * N + col] = tanhf(x);
+            }
+        }
     }
 }
 
@@ -205,34 +351,66 @@ extern ""C"" __global__ void gemm_bias(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        C[row * N + col] = sum + bias[col];
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N)
+                C[row * N + col] = acc[m][n] + bias[col];
+        }
     }
 }
 
@@ -245,36 +423,69 @@ extern ""C"" __global__ void gemm_bias_swish(
     float* __restrict__ C,
     int M, int N, int K)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float x = sum + bias[col];
-        float sigmoid = 1.0f / (1.0f + expf(-x));
-        C[row * N + col] = x * sigmoid;
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float x = acc[m][n] + bias[col];
+                float sigmoid = 1.0f / (1.0f + expf(-x));
+                C[row * N + col] = x * sigmoid;
+            }
+        }
     }
 }
 
@@ -287,35 +498,68 @@ extern ""C"" __global__ void gemm_bias_leaky_relu(
     float* __restrict__ C,
     int M, int N, int K, float alpha)
 {
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * BLOCK_DIM + tx;
+    int rowStart = blockIdx.y * BM + ty * TM;
+    int colStart = blockIdx.x * BN + tx * TN;
 
-    float sum = 0.0f;
-    int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
 
-    for (int t = 0; t < numTiles; t++) {
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        As[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
-
+    int numTilesK = (K + BK - 1) / BK;
+    for (int t = 0; t < numTilesK; t++) {
+        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i % BM;
+            int smCol = i / BM;
+            int gRow = blockIdx.y * BM + smRow;
+            int gCol = t * BK + smCol;
+            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
+            int smRow = i / BN;
+            int smCol = i % BN;
+            int gRow = t * BK + smRow;
+            int gCol = blockIdx.x * BN + smCol;
+            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
         __syncthreads();
 
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum = fmaf(As[threadIdx.y][k], Bs[k][threadIdx.x], sum);
+        for (int k = 0; k < BK; k++) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; m++) a[m] = As[k][ty * TM + m];
+            #pragma unroll
+            for (int n = 0; n < TN; n++) b[n] = Bs[k][tx * TN + n];
+            #pragma unroll
+            for (int m = 0; m < TM; m++)
+                #pragma unroll
+                for (int n = 0; n < TN; n++)
+                    acc[m][n] = fmaf(a[m], b[n], acc[m][n]);
         }
-
         __syncthreads();
     }
 
-    if (row < M && col < N) {
-        float x = sum + bias[col];
-        C[row * N + col] = x >= 0.0f ? x : alpha * x;
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int row = rowStart + m;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int col = colStart + n;
+            if (col < N) {
+                float x = acc[m][n] + bias[col];
+                C[row * N + col] = x >= 0.0f ? x : alpha * x;
+            }
+        }
     }
 }
 

@@ -1853,9 +1853,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var _ = PushContext();
 
-        const int TILE_SIZE = 16;
-        uint gridX = (uint)((N + TILE_SIZE - 1) / TILE_SIZE);
-        uint gridY = (uint)((M + TILE_SIZE - 1) / TILE_SIZE);
+        // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
+        const int BM = 128;
+        const int BN = 128;
+        const int BLOCK_DIM = 16;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
 
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
@@ -1872,7 +1875,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[5] = &n;
         args[6] = &k;
 
-        LaunchKernel2DOnStream(kernel, gridX, gridY, 1, TILE_SIZE, TILE_SIZE, args, stream.Handle);
+        LaunchKernel2DOnStream(kernel, gridX, gridY, 1, BLOCK_DIM, BLOCK_DIM, args, stream.Handle);
     }
 
     #endregion
@@ -2144,9 +2147,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var _ = PushContext();
 
-        const int TILE_SIZE = 16;
-        uint gridX = (uint)((N + TILE_SIZE - 1) / TILE_SIZE);
-        uint gridY = (uint)((M + TILE_SIZE - 1) / TILE_SIZE);
+        // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
+        const int BM = 128;
+        const int BN = 128;
+        const int BLOCK_DIM = 16;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
 
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
@@ -2163,7 +2169,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[5] = &n;
         args[6] = &k;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, TILE_SIZE, TILE_SIZE, args);
+        LaunchKernel2D(kernel, gridX, gridY, 1, BLOCK_DIM, BLOCK_DIM, args);
     }
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
