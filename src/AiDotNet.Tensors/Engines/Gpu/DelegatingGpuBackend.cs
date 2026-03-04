@@ -105,6 +105,14 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         => Inner.GemmBias(A, B, bias, M, N, K);
 
+    /// <inheritdoc/>
+    public virtual IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+        => Inner.GemmBiasSwish(A, B, bias, M, N, K);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+        => Inner.GemmBiasLeakyRelu(A, B, bias, M, N, K, alpha);
+
     #endregion
 
     #region Broadcast Operations

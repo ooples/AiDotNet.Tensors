@@ -625,6 +625,67 @@ public sealed class CudaBackend : IAsyncGpuBackend
         return output;
     }
 
+    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+    {
+        ValidateBiasBuffer(bias, N);
+        var output = AllocateBuffer(M * N);
+        ExecuteFusedGemm("gemm_bias_swish", A, B, bias, output, M, N, K);
+        return output;
+    }
+
+    public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+    {
+        ValidateBiasBuffer(bias, N);
+        var output = AllocateBuffer(M * N);
+
+        // LeakyReLU kernel has an extra alpha parameter
+        string wmmaName = "gemm_bias_leaky_relu_wmma";
+        string scalarName = "gemm_bias_leaky_relu";
+        bool useWmma = _hasWmmaSupport && _kernelCache.TryGetValue(wmmaName, out var wmmaKernel);
+        string kernelName = useWmma ? wmmaName : scalarName;
+
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
+
+        using var _ = PushContext();
+        IntPtr aPtr = A.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outPtr = output.Handle;
+        int m = M, n = N, k = K;
+
+        void** args = stackalloc void*[8];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &biasPtr;
+        args[3] = &outPtr;
+        args[4] = &m;
+        args[5] = &n;
+        args[6] = &k;
+        args[7] = &alpha;
+
+        if (useWmma)
+        {
+            const int WMMA_TILE = 32;
+            uint gridX = (uint)((N + WMMA_TILE - 1) / WMMA_TILE);
+            uint gridY = (uint)((M + WMMA_TILE - 1) / WMMA_TILE);
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, 128, 1, 1,
+                    0, _stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel(WMMA LeakyReLU)");
+        }
+        else
+        {
+            const int BM = 128;
+            const int BN = 128;
+            uint gridX = (uint)((N + BN - 1) / BN);
+            uint gridY = (uint)((M + BM - 1) / BM);
+            LaunchKernel2D(kernel, gridX, gridY, 1, 16, 16, args);
+        }
+
+        return output;
+    }
+
     public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))

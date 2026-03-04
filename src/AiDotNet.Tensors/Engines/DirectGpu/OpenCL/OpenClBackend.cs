@@ -2147,6 +2147,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return ExecuteFusedGemm("gemm_bias", A, B, bias, M, N, K);
         }
 
+        public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+        {
+            var temp = GemmBias(A, B, bias, M, N, K);
+            var output = AllocateBuffer(M * N);
+            Silu(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+
+        public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+        {
+            var temp = GemmBias(A, B, bias, M, N, K);
+            var output = AllocateBuffer(M * N);
+            LeakyRelu(temp, output, alpha, M * N);
+            temp.Dispose();
+            return output;
+        }
+
         private IGpuBuffer ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             if (_context == null)

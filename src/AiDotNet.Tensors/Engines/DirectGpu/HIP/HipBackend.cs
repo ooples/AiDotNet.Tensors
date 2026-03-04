@@ -1138,6 +1138,51 @@ public sealed class HipBackend : IAsyncGpuBackend
         return output;
     }
 
+    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+    {
+        var output = AllocateBuffer(M * N);
+        ExecuteFusedGemm("gemm_bias_swish", A, B, bias, output, M, N, K);
+        return output;
+    }
+
+    public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+    {
+        var output = AllocateBuffer(M * N);
+
+        if (!_kernelCache.TryGetValue("gemm_bias_leaky_relu", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: gemm_bias_leaky_relu");
+
+        const int BM = 128;
+        const int BN = 128;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
+
+        var handles = new GCHandle[8];
+        try
+        {
+            handles[0] = GCHandle.Alloc(A.Handle, GCHandleType.Pinned);
+            handles[1] = GCHandle.Alloc(B.Handle, GCHandleType.Pinned);
+            handles[2] = GCHandle.Alloc(bias.Handle, GCHandleType.Pinned);
+            handles[3] = GCHandle.Alloc(output.Handle, GCHandleType.Pinned);
+            handles[4] = GCHandle.Alloc(M, GCHandleType.Pinned);
+            handles[5] = GCHandle.Alloc(N, GCHandleType.Pinned);
+            handles[6] = GCHandle.Alloc(K, GCHandleType.Pinned);
+            handles[7] = GCHandle.Alloc(alpha, GCHandleType.Pinned);
+
+            var args = new IntPtr[8];
+            for (int i = 0; i < 8; i++) args[i] = handles[i].AddrOfPinnedObject();
+
+            LaunchKernel2D(krnl, gridX, gridY, 16, 16, args);
+            Synchronize();
+        }
+        finally
+        {
+            foreach (var h in handles) if (h.IsAllocated) h.Free();
+        }
+
+        return output;
+    }
+
     public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add", out var krnl))

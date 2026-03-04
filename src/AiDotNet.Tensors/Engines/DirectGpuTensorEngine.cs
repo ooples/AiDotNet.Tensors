@@ -1190,31 +1190,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // Use fused GPU kernels when available
             // Only use GPU path for natively supported fused ops (with bias)
-            // For cases with bias and activation
+            // KernelFusionManager patterns: Gemm+Bias+Activation are executed as single fused kernels
             if (bias != null && activation != FusedActivationType.None)
             {
-                // Use fused kernels for common activations (most efficient)
-                switch (activation)
+                // Dispatch through fused kernel lookup (covers ReLU, GELU, Sigmoid, Tanh, Swish, LeakyReLU)
+                resultBuffer = activation switch
                 {
-                    case FusedActivationType.ReLU:
-                        resultBuffer = backend.GemmBiasRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.GELU:
-                        resultBuffer = backend.GemmBiasGelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.Sigmoid:
-                        resultBuffer = backend.GemmBiasSigmoid(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.Tanh:
-                        resultBuffer = backend.GemmBiasTanh(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    default:
-                        // For other activations (LeakyReLU, Swish, etc.), use GemmBias + separate activation kernel
-                        resultBuffer = backend.GemmBias(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        int size = batchSize * outputFeatures;
-                        ApplyGpuActivation(backend, resultBuffer, size, activation);
-                        break;
-                }
+                    FusedActivationType.ReLU => backend.GemmBiasRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.GELU => backend.GemmBiasGelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Sigmoid => backend.GemmBiasSigmoid(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Tanh => backend.GemmBiasTanh(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Swish => backend.GemmBiasSwish(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.LeakyReLU => backend.GemmBiasLeakyRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    _ => FusedGemmWithSeparateActivation(backend, inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures, activation)
+                };
             }
             else if (bias != null && activation == FusedActivationType.None)
             {
@@ -1486,6 +1475,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void ApplyGpuActivation(IDirectGpuBackend backend, IGpuBuffer buffer, int size, FusedActivationType activation)
     {
         ApplyGpuActivation(backend, buffer, buffer, size, activation);
+    }
+
+    private static IGpuBuffer FusedGemmWithSeparateActivation(
+        IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer bias,
+        int M, int N, int K, FusedActivationType activation)
+    {
+        var result = backend.GemmBias(input, weights, bias, M, N, K);
+        int size = M * N;
+        ApplyGpuActivation(backend, result, size, activation);
+        return result;
     }
 
     /// <summary>
