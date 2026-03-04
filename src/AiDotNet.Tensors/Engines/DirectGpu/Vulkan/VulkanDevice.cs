@@ -303,7 +303,7 @@ public sealed unsafe class VulkanDevice : IDisposable
                         };
 
                         var result = VulkanNativeBindings.vkCreateInstance(&createInfo, IntPtr.Zero, out _instance_vk);
-                        if (result == VulkanNativeBindings.VK_SUCCESS)
+                        if (result == VulkanNativeBindings.VK_SUCCESS && _instance_vk != IntPtr.Zero)
                         {
                             return true;
                         }
@@ -326,13 +326,20 @@ public sealed unsafe class VulkanDevice : IDisposable
                 };
 
                 var fallbackResult = VulkanNativeBindings.vkCreateInstance(&fallbackCreateInfo, IntPtr.Zero, out _instance_vk);
-                return fallbackResult == VulkanNativeBindings.VK_SUCCESS;
+                return fallbackResult == VulkanNativeBindings.VK_SUCCESS && _instance_vk != IntPtr.Zero;
             }
         }
     }
 
     private bool SelectPhysicalDevice()
     {
+        // Guard: never call vkEnumeratePhysicalDevices with an invalid instance.
+        // The Vulkan loader will crash the process (VUID-vkEnumeratePhysicalDevices-instance-parameter).
+        if (_instance_vk == IntPtr.Zero)
+        {
+            return false;
+        }
+
         uint deviceCount = 0;
         var result = VulkanNativeBindings.vkEnumeratePhysicalDevices(_instance_vk, ref deviceCount, null);
         if (result != VulkanNativeBindings.VK_SUCCESS || deviceCount == 0)
