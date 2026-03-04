@@ -2067,6 +2067,10 @@ public sealed class HipBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("softmax", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: softmax");
 
+        // 1 block per batch element, 256 threads cooperate on parallel reduction
+        // Shared memory: ceil(256/64) = 4 wavefronts * sizeof(float) = 16 bytes
+        uint sharedBytes = (DefaultBlockSize / 64 + 1) * sizeof(float);
+
         var handles = new GCHandle[4];
         try
         {
@@ -2078,8 +2082,8 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[4];
             for (int i = 0; i < 4; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            uint grid = (uint)batchSize;
+            LaunchKernel(krnl, grid, DefaultBlockSize, args, sharedBytes);
             Synchronize();
         }
         finally

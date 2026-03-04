@@ -2097,7 +2097,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: softmax");
 
         using var _ = PushContext();
-        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        // 1 block per batch element, 256 threads cooperate on parallel reduction
+        // Shared memory: ceil(256/32) = 8 warps * sizeof(float) = 32 bytes
+        uint grid = (uint)batchSize;
+        const uint blockSize = 256;
+        uint sharedMem = (blockSize / 32) * sizeof(float);
+
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         int batches = batchSize;
@@ -2107,7 +2113,11 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[1] = &outputPtr;
         args[2] = &batches;
         args[3] = &feats;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, blockSize, 1, 1,
+                sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(softmax)");
     }
 
     private unsafe void LaunchReductionKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, int blockSize)

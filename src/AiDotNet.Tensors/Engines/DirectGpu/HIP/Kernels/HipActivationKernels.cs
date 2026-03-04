@@ -104,30 +104,69 @@ extern ""C"" __global__ void swish_backward(const float* gradOutput, const float
     gradInput[idx] = gradOutput[idx] * (swish + sigmoid * (1.0f - swish));
 }
 
+// Warp-level reduction helpers using HIP shuffle intrinsics
+__device__ __forceinline__ float warpReduceMax(float val) {
+    for (int offset = 32; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down(val, offset));
+    return val;
+}
+
+__device__ __forceinline__ float warpReduceSum(float val) {
+    for (int offset = 32; offset > 0; offset >>= 1)
+        val += __shfl_down(val, offset);
+    return val;
+}
+
+// Parallel softmax: 1 block per row, 256 threads cooperate on reduction
+// Uses warp shuffles for the last warp, shared memory tree for inter-warp
 extern ""C"" __global__ void softmax(const float* input, float* output, int batchSize, int features)
 {
-    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch = blockIdx.x;
     if (batch >= batchSize) return;
 
-    float maxVal = -INFINITY;
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
     int baseIdx = batch * features;
-    for (int f = 0; f < features; f++)
-    {
-        float v = input[baseIdx + f];
-        if (v > maxVal) maxVal = v;
-    }
+    int warpId = tid / 64;
+    int lane = tid % 64;
 
-    float sumExp = 0.0f;
-    for (int f = 0; f < features; f++)
-    {
+    // Phase 1: Find max (parallel reduction with warp shuffles)
+    float localMax = -INFINITY;
+    for (int f = tid; f < features; f += blockDim.x) {
+        localMax = fmaxf(localMax, input[baseIdx + f]);
+    }
+    localMax = warpReduceMax(localMax);
+    int numWarps = (blockDim.x + 63) / 64;
+    if (lane == 0) smem[warpId] = localMax;
+    __syncthreads();
+    if (warpId == 0) {
+        localMax = (lane < numWarps) ? smem[lane] : -INFINITY;
+        localMax = warpReduceMax(localMax);
+    }
+    if (tid == 0) smem[0] = localMax;
+    __syncthreads();
+    float maxVal = smem[0];
+
+    // Phase 2: Compute sum of exp(x - max)
+    float localSum = 0.0f;
+    for (int f = tid; f < features; f += blockDim.x) {
         float expVal = expf(input[baseIdx + f] - maxVal);
         output[baseIdx + f] = expVal;
-        sumExp += expVal;
+        localSum += expVal;
     }
+    localSum = warpReduceSum(localSum);
+    if (lane == 0) smem[warpId] = localSum;
+    __syncthreads();
+    if (warpId == 0) {
+        localSum = (lane < numWarps) ? smem[lane] : 0.0f;
+        localSum = warpReduceSum(localSum);
+    }
+    if (tid == 0) smem[0] = localSum;
+    __syncthreads();
+    float invSum = (smem[0] > 0.0f) ? (1.0f / smem[0]) : 1.0f;
 
-    float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 1.0f;
-    for (int f = 0; f < features; f++)
-    {
+    // Phase 3: Normalize
+    for (int f = tid; f < features; f += blockDim.x) {
         output[baseIdx + f] *= invSum;
     }
 }
