@@ -9671,11 +9671,9 @@ public class CpuEngine : ITensorLevelEngine
 
         Parallel.For(0, batch * heads, bh =>
         {
-            int b = bh / heads;
-            int h = bh % heads;
-            int qOffset = (b * heads + h) * seqQ * d_k;
-            int kOffset = (b * heads + h) * seqK * d_k;
-            int sOffset = (b * heads + h) * seqQ * seqK;
+            int qOffset = bh * seqQ * d_k;
+            int kOffset = bh * seqK * d_k;
+            int sOffset = bh * seqQ * seqK;
 
             for (int i = 0; i < seqQ; i++)
             {
