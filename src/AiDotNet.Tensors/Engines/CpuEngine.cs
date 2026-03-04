@@ -3725,23 +3725,11 @@ public class CpuEngine : ITensorLevelEngine
         if (vector == null)
             throw new ArgumentNullException(nameof(vector));
 
-        // ReLU(x) = max(0, x)
-        // TensorPrimitives doesn't have ReLU directly, but has Max
-        // For now, use element-wise max with zero
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputArray = vector.GetDataArray();
-        var outputArray = new T[inputArray.Length];
+        var result = new Vector<T>(vector.Length);
+        numOps.ReLU(vector.AsSpan(), result.AsWritableSpan());
 
-        // For float, we could use TensorPrimitives.Max with scalar zero
-        // For now, manual implementation that works for all types
-        for (int i = 0; i < inputArray.Length; i++)
-        {
-            outputArray[i] = numOps.GreaterThan(inputArray[i], numOps.Zero)
-                ? inputArray[i]
-                : numOps.Zero;
-        }
-
-        return new Vector<T>(outputArray);
+        return result;
     }
 
     public Tensor<T> Tanh<T>(Tensor<T> tensor)
