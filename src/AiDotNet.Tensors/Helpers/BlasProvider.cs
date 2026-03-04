@@ -409,11 +409,20 @@ internal static class BlasProvider
         }
 
         // Try MKL.NET first (preferred for best performance)
-        if (TryInitializeMklNet())
+        // Wrapped in try-catch because on net471, the JIT may throw FileNotFoundException
+        // when trying to resolve the MKL.NET assembly before entering TryInitializeMklNet's own try-catch
+        try
         {
-            Trace("[BLAS] Initialized MKL.NET successfully");
-            _useMklNet = true;
-            return true;
+            if (TryInitializeMklNet())
+            {
+                Trace("[BLAS] Initialized MKL.NET successfully");
+                _useMklNet = true;
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Trace($"[BLAS] MKL.NET JIT load failed: {ex.GetType().Name}: {ex.Message}");
         }
         Trace("[BLAS] MKL.NET not available, trying native libraries...");
 
