@@ -289,7 +289,8 @@ internal static class OpenClKernelSources
         __kernel void tanh_activation(__global const float* input, __global float* output, const int size) {
             int idx = get_global_id(0);
             if (idx >= size) return;
-            output[idx] = tanh(input[idx]);
+            float x = clamp(input[idx], -20.0f, 20.0f);
+            output[idx] = tanh(x);
         }
 
         // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))

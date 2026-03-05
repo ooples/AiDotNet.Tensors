@@ -444,7 +444,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     /// </summary>
     public void Tanh(ReadOnlySpan<float> input, Span<float> result)
     {
-        ExecuteUnaryOp(input, result, VulkanKernelType.Tanh);
+        // Clamp extreme values to avoid NaN from GPU tanh shader overflow.
+        // tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
+        var clamped = new float[input.Length];
+        for (int i = 0; i < input.Length; i++)
+        {
+            clamped[i] = Math.Max(-20.0f, Math.Min(20.0f, input[i]));
+        }
+        ExecuteUnaryOp(clamped, result, VulkanKernelType.Tanh);
     }
 
     /// <summary>

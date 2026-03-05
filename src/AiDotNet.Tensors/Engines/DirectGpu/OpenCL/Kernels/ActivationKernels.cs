@@ -58,6 +58,8 @@ __kernel void sigmoid(
 }
 
 // Tanh: (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+// Clamp input to [-20, 20] to avoid NaN on some GPU drivers for extreme values.
+// tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
 __kernel void tanh_activation(
     __global const float* input,
     __global float* output,
@@ -66,7 +68,8 @@ __kernel void tanh_activation(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = tanh(input[idx]);
+    float x = clamp(input[idx], -20.0f, 20.0f);
+    output[idx] = tanh(x);
 }
 
 // GELU (Gaussian Error Linear Unit) - approximation
