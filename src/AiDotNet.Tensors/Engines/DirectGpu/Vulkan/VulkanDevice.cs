@@ -633,6 +633,9 @@ public sealed unsafe class VulkanDevice : IDisposable
             throw new InvalidOperationException("Vulkan device not initialized.");
         }
 
+        // Managed thread IDs can be reused after a thread exits, but this is safe:
+        // Vulkan resources are thread-agnostic handles, and SubmitAndWait uses a lock
+        // for queue serialization. Reused IDs simply reuse valid, idle resources.
         int threadId = Environment.CurrentManagedThreadId;
         if (_threadResources.TryGetValue(threadId, out var existing))
         {
@@ -707,9 +710,13 @@ public sealed unsafe class VulkanDevice : IDisposable
         // Vulkan spec requires external synchronization for vkQueueSubmit on the same queue
         lock (_submitLock)
         {
-            // Reset fence
+            // Reset fence before reuse
             var fencePtr = fence;
-            VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
+            int resetResult = VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
+            if (resetResult != VulkanNativeBindings.VK_SUCCESS)
+            {
+                throw new InvalidOperationException($"vkResetFences failed with result: {resetResult}");
+            }
 
             var submitInfo = new VkSubmitInfo
             {

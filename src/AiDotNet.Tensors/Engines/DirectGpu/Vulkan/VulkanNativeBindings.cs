@@ -47,6 +47,7 @@ public static unsafe class VulkanNativeBindings
                 typeof(VulkanNativeBindings).Assembly,
                 (libraryName, assembly, searchPath) =>
                 {
+                    // Only remap Vulkan library names; pass through all other libraries
                     if (libraryName == VulkanLinux)
                     {
                         if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
@@ -55,6 +56,7 @@ public static unsafe class VulkanNativeBindings
                             return handle;
                         }
                     }
+                    // Return IntPtr.Zero for non-Vulkan libraries so the default resolver handles them
                     return IntPtr.Zero;
                 });
         }

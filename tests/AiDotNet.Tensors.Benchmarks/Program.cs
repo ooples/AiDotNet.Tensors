@@ -156,11 +156,12 @@ class Program
             return;
         }
 
-        // Run all competitive benchmarks
+        // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
             BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>();
             BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>();
             return;
         }
 

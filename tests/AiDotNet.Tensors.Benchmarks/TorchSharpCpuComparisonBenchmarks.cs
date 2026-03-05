@@ -117,6 +117,20 @@ public class TorchSharpCpuComparisonBenchmarks
         _torchConvKernel?.Dispose();
     }
 
+    [IterationSetup]
+    public void IterationSetup()
+    {
+        // Reset mutable vectors so in-place benchmarks don't degenerate across iterations
+        foreach (var size in VectorSizes)
+        {
+            var dataA = CreateData(size, seedOffset: size);
+            Array.Copy(dataA, _aiVectorsA[size].GetDataArray(), size);
+
+            _torchVectorsA[size].Dispose();
+            _torchVectorsA[size] = torch.tensor(dataA, new long[] { size }, device: _torchDevice);
+        }
+    }
+
     private void Warmup()
     {
         _ = AiDotNetEngine.Current.TensorMatMul(_aiMatricesA[MatrixSizes[0]], _aiMatricesB[MatrixSizes[0]]);

@@ -247,7 +247,12 @@ public abstract class VectorBase<T>
     {
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            return segment.Array;
+            // Safety: verify the segment covers the full array from offset 0.
+            // All VectorBase constructors allocate fresh arrays, so this should always hold.
+            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            {
+                return segment.Array;
+            }
         }
         return _memory.ToArray();
     }

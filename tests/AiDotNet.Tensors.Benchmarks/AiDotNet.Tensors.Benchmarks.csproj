@@ -20,7 +20,7 @@
     <PackageReference Include="TensorFlow.NET" Version="0.150.0" />
     <PackageReference Include="SciSharp.TensorFlow.Redist" Version="2.16.0" />
     <PackageReference Include="TorchSharp" Version="0.106.0" />
-    <PackageReference Include="TorchSharp-cuda-windows" Version="0.106.0" />
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.106.0" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
 
   <ItemGroup>
