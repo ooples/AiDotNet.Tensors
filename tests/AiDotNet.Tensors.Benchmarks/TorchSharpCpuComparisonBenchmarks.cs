@@ -293,6 +293,14 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
+    public void RawTensorPrimitives_Sigmoid()
+    {
+        System.Numerics.Tensors.TensorPrimitives.Sigmoid(
+            _rawArraysA[VectorSizes[1]].AsSpan(),
+            _rawDestination[VectorSizes[1]].AsSpan());
+    }
+
+    [Benchmark]
     public void TorchSharp_Sigmoid()
     {
         _torchVectorsA[VectorSizes[1]].sigmoid_();

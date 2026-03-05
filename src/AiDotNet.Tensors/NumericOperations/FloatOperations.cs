@@ -1641,29 +1641,13 @@ public class FloatOperations : INumericOperations<float>
     /// Computes ReLU (Rectified Linear Unit) element-wise using SIMD-optimized operations.
     /// max(0, x) - Uses parallel chunking with unsafe pointers for zero-copy parallelization.
     /// </summary>
-    public unsafe void ReLU(ReadOnlySpan<float> x, Span<float> destination)
+    public void ReLU(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    Engines.Simd.SimdKernels.ReLU(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-
+        // ReLU is a simple comparison per element - memory-bandwidth-bound.
+        // Single-threaded SIMD saturates memory bandwidth; parallelism adds overhead.
         Engines.Simd.SimdKernels.ReLU(x, destination);
     }
 
