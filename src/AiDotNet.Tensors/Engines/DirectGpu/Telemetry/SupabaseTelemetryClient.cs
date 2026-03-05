@@ -57,13 +57,15 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// </summary>
     /// <remarks>
     /// Credential resolution order (first non-empty wins):
-    /// 1. Constructor parameters (explicit override)
-    /// 2. Environment variables (AIDOTNET_TELEMETRY_URL / AIDOTNET_TELEMETRY_KEY)
-    /// 3. Assembly metadata embedded at build time by CI/CD
+    /// <list type="number">
+    /// <item>Constructor parameters (explicit override)</item>
+    /// <item>Environment variables (<see cref="SupabaseUrlEnvVar"/> / <see cref="SupabaseKeyEnvVar"/>)</item>
+    /// <item>Assembly metadata embedded at build time by CI/CD</item>
+    /// </list>
     /// </remarks>
     /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
-    /// <param name="supabaseUrl">Supabase project URL (optional).</param>
-    /// <param name="supabaseKey">Supabase anon key (optional).</param>
+    /// <param name="supabaseUrl">Supabase project URL (optional, resolved via <see cref="SupabaseUrlEnvVar"/> or assembly metadata if omitted).</param>
+    /// <param name="supabaseKey">Supabase anon key (optional, resolved via <see cref="SupabaseKeyEnvVar"/> or assembly metadata if omitted).</param>
     public SupabaseTelemetryClient(
         bool enabled = true,
         string? supabaseUrl = null,
@@ -72,10 +74,12 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar, "TelemetryUrl");
         _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar, "TelemetryKey");
 
-        // Disable telemetry if credentials are not configured
+        // Disable telemetry if credentials are missing or URL is not a valid absolute URI
         _isEnabled = enabled
             && !string.IsNullOrWhiteSpace(_supabaseUrl)
-            && !string.IsNullOrWhiteSpace(_supabaseKey);
+            && !string.IsNullOrWhiteSpace(_supabaseKey)
+            && Uri.TryCreate(_supabaseUrl, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
 
         _clientHash = GenerateClientHash();
         _aidotnetVersion = GetAidotnetVersion();
@@ -85,6 +89,9 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
             Timeout = TimeSpan.FromSeconds(10)
         };
 
+        // Always configure auth headers when enabled so the client is ready for use.
+        // Headers are set once at construction; callers who need to toggle enablement
+        // should create a new client instance.
         if (_isEnabled)
         {
             _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
@@ -97,13 +104,13 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// </summary>
     private static string ResolveCredential(string? explicitValue, string envVarName, string metadataKey)
     {
-        if (!string.IsNullOrWhiteSpace(explicitValue))
+        if (explicitValue is not null && !string.IsNullOrWhiteSpace(explicitValue))
         {
             return explicitValue;
         }
 
         var envValue = Environment.GetEnvironmentVariable(envVarName);
-        if (!string.IsNullOrWhiteSpace(envValue))
+        if (envValue is not null && !string.IsNullOrWhiteSpace(envValue))
         {
             return envValue;
         }
@@ -285,7 +292,14 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <inheritdoc/>
     public async Task OptOutAsync(CancellationToken cancellationToken = default)
     {
+        bool wasEnabled = _isEnabled;
         _isEnabled = false;
+
+        // Skip the network call if telemetry was already disabled (no credentials configured)
+        if (!wasEnabled)
+        {
+            return;
+        }
 
         try
         {
@@ -317,6 +331,13 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <inheritdoc/>
     public async Task<bool> IsOptedOutAsync(CancellationToken cancellationToken = default)
     {
+        // If telemetry is disabled (no credentials), treat as not opted out
+        // to avoid exception-driven control flow on unconfigured clients
+        if (!IsEnabled)
+        {
+            return false;
+        }
+
         try
         {
             var url = $"{_supabaseUrl}/rest/v1/telemetry_consent" +
