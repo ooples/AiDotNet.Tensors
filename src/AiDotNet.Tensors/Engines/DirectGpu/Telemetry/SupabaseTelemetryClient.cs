@@ -1,7 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -35,17 +37,18 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     private readonly string _clientHash;
     private readonly string _aidotnetVersion;
     private bool _isEnabled;
+    private bool _optedOut;
     private bool _disposed;
 
     /// <summary>
-    /// Default Supabase project URL for AiDotNet telemetry.
+    /// Environment variable name for the Supabase project URL (override).
     /// </summary>
-    public const string DefaultSupabaseUrl = "https://yfkqwpgjahoamlgckjib.supabase.co";
+    public const string SupabaseUrlEnvVar = "AIDOTNET_TELEMETRY_URL";
 
     /// <summary>
-    /// Default anon key for read/insert operations.
+    /// Environment variable name for the Supabase anon key (override).
     /// </summary>
-    public const string DefaultAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlma3F3cGdqYWhvYW1sZ2NramliIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjczMDc0MjUsImV4cCI6MjA4Mjg4MzQyNX0.166oZVGXdnuXMmPzWeKb3fs2qNi0BQHwn502TWxDrwQ";
+    public const string SupabaseKeyEnvVar = "AIDOTNET_TELEMETRY_KEY";
 
     /// <inheritdoc/>
     public bool IsEnabled => _isEnabled && !_disposed;
@@ -53,17 +56,32 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <summary>
     /// Creates a new Supabase telemetry client.
     /// </summary>
+    /// <remarks>
+    /// Credential resolution order (first non-empty wins):
+    /// <list type="number">
+    /// <item>Constructor parameters (explicit override)</item>
+    /// <item>Environment variables (<see cref="SupabaseUrlEnvVar"/> / <see cref="SupabaseKeyEnvVar"/>)</item>
+    /// <item>Assembly metadata embedded at build time by CI/CD</item>
+    /// </list>
+    /// </remarks>
     /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
-    /// <param name="supabaseUrl">Supabase project URL (optional, uses default).</param>
-    /// <param name="supabaseKey">Supabase anon key (optional, uses default).</param>
+    /// <param name="supabaseUrl">Supabase project URL (optional, resolved via <see cref="SupabaseUrlEnvVar"/> or assembly metadata if omitted).</param>
+    /// <param name="supabaseKey">Supabase anon key (optional, resolved via <see cref="SupabaseKeyEnvVar"/> or assembly metadata if omitted).</param>
     public SupabaseTelemetryClient(
         bool enabled = true,
         string? supabaseUrl = null,
         string? supabaseKey = null)
     {
-        _isEnabled = enabled;
-        _supabaseUrl = supabaseUrl ?? DefaultSupabaseUrl;
-        _supabaseKey = supabaseKey ?? DefaultAnonKey;
+        _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar, "TelemetryUrl");
+        _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar, "TelemetryKey");
+
+        // Disable telemetry if credentials are missing or URL is not a valid HTTPS URI
+        _isEnabled = enabled
+            && !string.IsNullOrWhiteSpace(_supabaseUrl)
+            && !string.IsNullOrWhiteSpace(_supabaseKey)
+            && Uri.TryCreate(_supabaseUrl, UriKind.Absolute, out var uri)
+            && uri.Scheme == Uri.UriSchemeHttps;
+
         _clientHash = GenerateClientHash();
         _aidotnetVersion = GetAidotnetVersion();
 
@@ -71,8 +89,54 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
-        _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
-        _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+
+        // Always configure auth headers when enabled so the client is ready for use.
+        // Headers are set once at construction; callers who need to toggle enablement
+        // should create a new client instance.
+        // Use TryAddWithoutValidation to avoid FormatException on malformed key values.
+        if (_isEnabled)
+        {
+            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("apikey", _supabaseKey);
+            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
+        }
+    }
+
+    /// <summary>
+    /// Resolves a credential value: constructor param > env var > assembly metadata.
+    /// </summary>
+    private static string ResolveCredential(string? explicitValue, string envVarName, string metadataKey)
+    {
+        if (explicitValue is not null && !string.IsNullOrWhiteSpace(explicitValue))
+        {
+            return explicitValue.Trim();
+        }
+
+        var envValue = Environment.GetEnvironmentVariable(envVarName);
+        if (envValue is not null && !string.IsNullOrWhiteSpace(envValue))
+        {
+            return envValue.Trim();
+        }
+
+        return GetAssemblyMetadata(metadataKey).Trim();
+    }
+
+    /// <summary>
+    /// Reads a value from AssemblyMetadata attributes embedded at build time.
+    /// </summary>
+    private static string GetAssemblyMetadata(string key)
+    {
+        try
+        {
+            var assembly = typeof(SupabaseTelemetryClient).Assembly;
+            var attribute = assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(a => string.Equals(a.Key, key, StringComparison.Ordinal));
+            return attribute?.Value ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     /// <inheritdoc/>
@@ -230,7 +294,15 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <inheritdoc/>
     public async Task OptOutAsync(CancellationToken cancellationToken = default)
     {
+        bool wasEnabled = _isEnabled;
         _isEnabled = false;
+        _optedOut = true;
+
+        // Skip the network call if telemetry was already disabled (no credentials configured)
+        if (!wasEnabled)
+        {
+            return;
+        }
 
         try
         {
@@ -262,6 +334,18 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <inheritdoc/>
     public async Task<bool> IsOptedOutAsync(CancellationToken cancellationToken = default)
     {
+        // If the user explicitly opted out locally, respect that immediately
+        if (_optedOut)
+        {
+            return true;
+        }
+
+        // If telemetry is disabled (no credentials), we can't query the server
+        if (!IsEnabled)
+        {
+            return false;
+        }
+
         try
         {
             var url = $"{_supabaseUrl}/rest/v1/telemetry_consent" +

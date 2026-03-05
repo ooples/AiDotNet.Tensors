@@ -86,4 +86,26 @@
     <Compile Remove="Helpers\FusedConvHelper.cs" />
   </ItemGroup>
 
+  <!--
+    Telemetry credentials: injected at build time via CI/CD.
+    Pass -p:TelemetryUrl=... -p:TelemetryKey=... during dotnet build/pack.
+    Values are embedded as AssemblyMetadata so the published NuGet DLL has them,
+    but the source code never contains credentials.
+  -->
+  <PropertyGroup>
+    <TelemetryUrl Condition="'$(TelemetryUrl)' == ''"></TelemetryUrl>
+    <TelemetryKey Condition="'$(TelemetryKey)' == ''"></TelemetryKey>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>TelemetryUrl</_Parameter1>
+      <_Parameter2>$(TelemetryUrl)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>TelemetryKey</_Parameter1>
+      <_Parameter2>$(TelemetryKey)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>
