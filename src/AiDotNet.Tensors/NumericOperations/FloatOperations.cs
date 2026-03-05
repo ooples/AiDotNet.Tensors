@@ -1196,12 +1196,7 @@ public class FloatOperations : INumericOperations<float>
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
-#if NET8_0_OR_GREATER
         Engines.Simd.SimdKernels.ConvertToHalf(source, destination);
-#else
-        for (int i = 0; i < source.Length; i++)
-            destination[i] = (Half)source[i];
-#endif
     }
 
     /// <summary>
@@ -1212,12 +1207,7 @@ public class FloatOperations : INumericOperations<float>
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
-#if NET8_0_OR_GREATER
         Engines.Simd.SimdKernels.ConvertToSingle(source, destination);
-#else
-        for (int i = 0; i < source.Length; i++)
-            destination[i] = (float)source[i];
-#endif
     }
 
     #region Vectorized Activation Functions

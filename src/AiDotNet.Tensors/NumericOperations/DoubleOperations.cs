@@ -1250,12 +1250,7 @@ public class DoubleOperations : INumericOperations<double>
     /// </summary>
     public void ToFloatSpan(ReadOnlySpan<double> source, Span<float> destination)
     {
-#if NET8_0_OR_GREATER
         Engines.Simd.SimdKernels.ConvertDoubleToFloat(source, destination);
-#else
-        for (int i = 0; i < source.Length; i++)
-            destination[i] = (float)source[i];
-#endif
     }
 
     /// <summary>
