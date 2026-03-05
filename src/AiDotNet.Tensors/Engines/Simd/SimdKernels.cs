@@ -7,10 +7,6 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 #endif
-#if NET8_0_OR_GREATER
-using System.Numerics.Tensors;
-#endif
-
 namespace AiDotNet.Tensors.Engines.Simd
 {
     /// <summary>
@@ -341,6 +337,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>
+        /// Computes element-wise exp(x) using a fast Cephes-style polynomial approximation with AVX2/FMA.
+        /// Processes 32 floats per iteration (4x unrolled) for maximum throughput.
+        /// Relative error ~0.01% across the valid range [-87.3, 88.7].
+        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Exp(ReadOnlySpan<float> input, Span<float> output)
         {
@@ -349,10 +350,33 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-#if NET8_0_OR_GREATER
-            TensorPrimitives.Exp(input, output);
-#else
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(output, i, FastExp256(ReadVector256(input, i)));
+                    WriteVector256(output, i + 8, FastExp256(ReadVector256(input, i + 8)));
+                    WriteVector256(output, i + 16, FastExp256(ReadVector256(input, i + 16)));
+                    WriteVector256(output, i + 24, FastExp256(ReadVector256(input, i + 24)));
+                }
+            }
+
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, FastExp256(ReadVector256(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Exp(input[i]);
@@ -360,8 +384,236 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Exp(input[i]);
 #endif
             }
-#endif
         }
+
+        /// <summary>
+        /// Computes element-wise exp(x) for double precision using scalar Math.Exp fallback.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Exp(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                output[i] = Math.Exp(input[i]);
+            }
+        }
+
+        /// <summary>
+        /// Computes element-wise sigmoid: 1/(1+exp(-x)) using fast vectorized exp.
+        /// Processes 32 floats per iteration (4x unrolled).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Sigmoid(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var vone = Vector256.Create(1.0f);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var neg0 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i));
+                    var neg1 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 8));
+                    var neg2 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 16));
+                    var neg3 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 24));
+                    WriteVector256(output, i, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg0))));
+                    WriteVector256(output, i + 8, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg1))));
+                    WriteVector256(output, i + 16, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg2))));
+                    WriteVector256(output, i + 24, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg3))));
+                }
+            }
+
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var vone = Vector256.Create(1.0f);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var neg = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i));
+                    WriteVector256(output, i, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg))));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = 1.0f / (1.0f + MathF.Exp(-input[i]));
+#else
+                output[i] = 1.0f / (1.0f + (float)Math.Exp(-input[i]));
+#endif
+            }
+        }
+
+        /// <summary>
+        /// Computes element-wise sigmoid for double precision.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Sigmoid(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                output[i] = 1.0 / (1.0 + Math.Exp(-input[i]));
+            }
+        }
+
+        /// <summary>
+        /// Computes element-wise tanh using fast vectorized exp: tanh(x) = 2*sigmoid(2x) - 1.
+        /// Processes 32 floats per iteration (4x unrolled).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Tanh(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var vone = Vector256.Create(1.0f);
+                var vtwo = Vector256.Create(2.0f);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    // tanh(x) = 2*sigmoid(2x) - 1
+                    var x0 = Avx.Multiply(vtwo, ReadVector256(input, i));
+                    var x1 = Avx.Multiply(vtwo, ReadVector256(input, i + 8));
+                    var x2 = Avx.Multiply(vtwo, ReadVector256(input, i + 16));
+                    var x3 = Avx.Multiply(vtwo, ReadVector256(input, i + 24));
+                    var negx0 = Avx.Subtract(Vector256<float>.Zero, x0);
+                    var negx1 = Avx.Subtract(Vector256<float>.Zero, x1);
+                    var negx2 = Avx.Subtract(Vector256<float>.Zero, x2);
+                    var negx3 = Avx.Subtract(Vector256<float>.Zero, x3);
+                    var sig0 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx0)));
+                    var sig1 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx1)));
+                    var sig2 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx2)));
+                    var sig3 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx3)));
+                    WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, sig0), vone));
+                    WriteVector256(output, i + 8, Avx.Subtract(Avx.Multiply(vtwo, sig1), vone));
+                    WriteVector256(output, i + 16, Avx.Subtract(Avx.Multiply(vtwo, sig2), vone));
+                    WriteVector256(output, i + 24, Avx.Subtract(Avx.Multiply(vtwo, sig3), vone));
+                }
+            }
+
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var vone = Vector256.Create(1.0f);
+                var vtwo = Vector256.Create(2.0f);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.Multiply(vtwo, ReadVector256(input, i));
+                    var neg = Avx.Subtract(Vector256<float>.Zero, x);
+                    var sig = Avx.Divide(vone, Avx.Add(vone, FastExp256(neg)));
+                    WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, sig), vone));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Tanh(input[i]);
+#else
+                output[i] = (float)Math.Tanh(input[i]);
+#endif
+            }
+        }
+
+        /// <summary>
+        /// Computes element-wise tanh for double precision.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Tanh(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                output[i] = Math.Tanh(input[i]);
+            }
+        }
+
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// Fast vectorized exp(x) using Cephes-style 6th-order minimax polynomial approximation.
+        /// Range reduction: x = n*ln2 + r, then exp(x) = 2^n * exp(r).
+        /// Uses IEEE 754 exponent manipulation for 2^n reconstruction.
+        /// Relative error ~0.01% across [-87.3, 88.7].
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FastExp256(Vector256<float> x)
+        {
+            // Clamp to avoid inf/nan (exp(-87.3) ~ 1e-38, exp(88.7) ~ 3.4e38)
+            var clampMin = Vector256.Create(-87.3365f);
+            var clampMax = Vector256.Create(88.7228f);
+            x = Avx.Max(clampMin, Avx.Min(clampMax, x));
+
+            // Range reduction: n = round(x / ln2)
+            var log2e = Vector256.Create(1.44269504088896341f); // 1/ln(2)
+            var ln2hi = Vector256.Create(0.693359375f);          // ln(2) high part
+            var ln2lo = Vector256.Create(-2.12194440e-4f);       // ln(2) low part
+
+            // n = round(x * log2(e))
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(x, log2e));
+
+            // r = x - n * ln2 (using hi/lo split for precision)
+            var r = Fma.MultiplyAddNegated(n, ln2hi, x);
+            r = Fma.MultiplyAddNegated(n, ln2lo, r);
+
+            // Polynomial: exp(r) = 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720
+            // Horner's form: ((((c6*r + c5)*r + c4)*r + c3)*r + c2)*r + c1)*r + c0
+            var c0 = Vector256.Create(1.0f);
+            var c1 = Vector256.Create(1.0f);
+            var c2 = Vector256.Create(0.5f);
+            var c3 = Vector256.Create(0.166666666666f);  // 1/6
+            var c4 = Vector256.Create(0.041666666666f);  // 1/24
+            var c5 = Vector256.Create(0.008333333333f);  // 1/120
+            var c6 = Vector256.Create(0.001388888888f);  // 1/720
+
+            var poly = Fma.MultiplyAdd(c6, r, c5);
+            poly = Fma.MultiplyAdd(poly, r, c4);
+            poly = Fma.MultiplyAdd(poly, r, c3);
+            poly = Fma.MultiplyAdd(poly, r, c2);
+            poly = Fma.MultiplyAdd(poly, r, c1);
+            poly = Fma.MultiplyAdd(poly, r, c0);
+
+            // Reconstruct: exp(x) = 2^n * exp(r)
+            // 2^n via IEEE 754: add n to the exponent bits of 1.0f (bias = 127)
+            var nInt = Avx.ConvertToVector256Int32(n);
+            var pow2n = Avx2.Add(nInt, Vector256.Create(127));
+            pow2n = Avx2.ShiftLeftLogical(pow2n, 23); // shift to exponent position
+            var scale = pow2n.AsSingle();
+
+            return Avx.Multiply(poly, scale);
+        }
+#endif
 
         /// <summary>
         /// Computes LeakyReLU element-wise using SIMD: max(alpha * x, x).
@@ -511,7 +763,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// Computes Mish activation element-wise: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x))).
-        /// Optimized using SIMD vectorization where available.
+        /// Uses our own fast Exp/Log/Tanh kernels for maximum throughput.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Mish(ReadOnlySpan<float> input, Span<float> output)
@@ -523,9 +775,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-#if NET8_0_OR_GREATER
-            // SIMD-optimized: Mish(x) = x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))
-            // Use TensorPrimitives for vectorized exp, log, tanh
+            // Use our own fast SIMD kernels: Mish(x) = x * tanh(softplus(x))
             float[] tempBuf = ArrayPool<float>.Shared.Rent(length);
             float[] temp2Buf = ArrayPool<float>.Shared.Rent(length);
             try
@@ -534,44 +784,32 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var temp2 = temp2Buf.AsSpan(0, length);
 
                 // Step 1: temp = exp(x)
-                TensorPrimitives.Exp(input, temp);
-                // Step 2: temp = 1 + exp(x) = softplus_inner
-                TensorPrimitives.Add(temp, 1.0f, temp);
-                // Step 3: temp = log(1 + exp(x)) = softplus(x)
-                TensorPrimitives.Log(temp, temp);
-                // Step 4: For numerical stability, clamp softplus: if x > 20, softplus ≈ x
+                Exp(input, temp);
+                // Step 2: temp = 1 + exp(x), then log -> softplus
                 for (int i = 0; i < length; i++)
                 {
-                    if (input[i] > 20f) temp[i] = input[i];
+                    temp[i] = input[i] > 20f ? input[i] :
+#if NET5_0_OR_GREATER
+                        MathF.Log(1f + temp[i]);
+#else
+                        (float)Math.Log(1.0 + temp[i]);
+#endif
                 }
-                // Step 5: temp2 = tanh(softplus(x))
-                TensorPrimitives.Tanh(temp, temp2);
-                // Step 6: output = x * tanh(softplus(x))
-                TensorPrimitives.Multiply(input, temp2, output);
+                // Step 3: temp2 = tanh(softplus(x))
+                Tanh(temp, temp2);
+                // Step 4: output = x * tanh(softplus(x))
+                VectorMultiply(input, temp2, output);
             }
             finally
             {
                 ArrayPool<float>.Shared.Return(tempBuf);
                 ArrayPool<float>.Shared.Return(temp2Buf);
             }
-#else
-            for (int i = 0; i < length; i++)
-            {
-                float x = input[i];
-#if NET5_0_OR_GREATER
-                float softplus = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
-                output[i] = x * MathF.Tanh(softplus);
-#else
-                float softplus = x > 20f ? x : (float)Math.Log(1.0 + Math.Exp(x));
-                output[i] = x * (float)Math.Tanh(softplus);
-#endif
-            }
-#endif
         }
 
         /// <summary>
-        /// Computes Swish/SiLU activation element-wise: x * sigmoid(x) = x / (1 + exp(-x)).
-        /// Uses SIMD vectorization for the multiplication portion.
+        /// Computes Swish/SiLU activation element-wise: x * sigmoid(x).
+        /// Uses our own fast Sigmoid and VectorMultiply kernels.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Swish(ReadOnlySpan<float> input, Span<float> output)
@@ -583,38 +821,22 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-#if NET8_0_OR_GREATER
-            // SIMD-optimized: Swish(x) = x * sigmoid(x)
             float[] tempBuf = ArrayPool<float>.Shared.Rent(length);
             try
             {
                 var temp = tempBuf.AsSpan(0, length);
-                // Step 1: temp = sigmoid(x)
-                TensorPrimitives.Sigmoid(input, temp);
-                // Step 2: output = x * sigmoid(x)
-                TensorPrimitives.Multiply(input, temp, output);
+                Sigmoid(input, temp);
+                VectorMultiply(input, temp, output);
             }
             finally
             {
                 ArrayPool<float>.Shared.Return(tempBuf);
             }
-#else
-            for (int i = 0; i < length; i++)
-            {
-                float x = input[i];
-#if NET5_0_OR_GREATER
-                float sigmoid = 1f / (1f + MathF.Exp(-x));
-#else
-                float sigmoid = 1f / (1f + (float)Math.Exp(-x));
-#endif
-                output[i] = x * sigmoid;
-            }
-#endif
         }
 
         /// <summary>
         /// Computes ELU (Exponential Linear Unit) element-wise: x if x > 0, alpha * (exp(x) - 1) otherwise.
-        /// Uses SIMD vectorization for comparison and blending where available.
+        /// Uses FastExp256 for vectorized exp computation.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void ELU(ReadOnlySpan<float> input, float alpha, Span<float> output)
@@ -628,54 +850,24 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vzero = Vector256<float>.Zero;
                 var valpha = Vector256.Create(alpha);
                 var vone = Vector256.Create(1.0f);
                 int simdLength = length & ~7;
 
-                // Use TensorPrimitives for vectorized exp on .NET 8+, then blend
-#if NET8_0_OR_GREATER
-                // Compute exp(x) for entire span first, then blend positive/negative
-                float[] expBuf = ArrayPool<float>.Shared.Rent(length);
-                try
-                {
-                    var expSpan = expBuf.AsSpan(0, length);
-                    TensorPrimitives.Exp(input, expSpan);
-
-                    for (; i < simdLength; i += 8)
-                    {
-                        var x = ReadVector256(input, i);
-                        var expx = ReadVector256(expSpan, i);
-                        // negative path: alpha * (exp(x) - 1)
-                        var negResult = Avx.Multiply(valpha, Avx.Subtract(expx, vone));
-                        // mask: x > 0
-                        var mask = Avx.CompareGreaterThan(x, vzero);
-                        // blend: positive keeps x, negative gets alpha*(exp(x)-1)
-                        WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
-                    }
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(expBuf);
-                }
-#else
                 for (; i < simdLength; i += 8)
                 {
                     var x = ReadVector256(input, i);
-                    // For scalar exp per element on pre-.NET 8
-                    Span<float> expTmp = stackalloc float[8];
-                    for (int j = 0; j < 8; j++)
-                    {
-                        expTmp[j] = MathF.Exp(input[i + j]);
-                    }
-                    var expx = ReadVector256(expTmp, 0);
+                    var expx = FastExp256(x);
+                    // negative path: alpha * (exp(x) - 1)
                     var negResult = Avx.Multiply(valpha, Avx.Subtract(expx, vone));
+                    // mask: x > 0
                     var mask = Avx.CompareGreaterThan(x, vzero);
+                    // blend: positive keeps x, negative gets alpha*(exp(x)-1)
                     WriteVector256(output, i, Avx.BlendVariable(negResult, x, mask));
                 }
-#endif
             }
 #endif
 
@@ -1110,9 +1302,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-#if NET8_0_OR_GREATER
-            TensorPrimitives.Sin(input, output);
-#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1121,7 +1310,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Sin(input[i]);
 #endif
             }
-#endif
         }
 
         /// <summary>
@@ -1138,9 +1326,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-#if NET8_0_OR_GREATER
-            TensorPrimitives.Cos(input, output);
-#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1149,7 +1334,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = (float)Math.Cos(input[i]);
 #endif
             }
-#endif
         }
 
         /// <summary>
@@ -1168,10 +1352,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("All spans must have the same length.");
             }
 
-#if NET8_0_OR_GREATER
-            TensorPrimitives.Sin(input, sinOutput);
-            TensorPrimitives.Cos(input, cosOutput);
-#else
             for (int i = 0; i < input.Length; i++)
             {
 #if NET5_0_OR_GREATER
@@ -1181,7 +1361,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 cosOutput[i] = (float)Math.Cos(input[i]);
 #endif
             }
-#endif
         }
 
         /// <summary>
@@ -1394,37 +1573,12 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-#if NET8_0_OR_GREATER
-            double[] tempBuf = ArrayPool<double>.Shared.Rent(length);
-            double[] temp2Buf = ArrayPool<double>.Shared.Rent(length);
-            try
-            {
-                var temp = tempBuf.AsSpan(0, length);
-                var temp2 = temp2Buf.AsSpan(0, length);
-
-                TensorPrimitives.Exp(input, temp);
-                TensorPrimitives.Add(temp, 1.0, temp);
-                TensorPrimitives.Log(temp, temp);
-                for (int i = 0; i < length; i++)
-                {
-                    if (input[i] > 20.0) temp[i] = input[i];
-                }
-                TensorPrimitives.Tanh(temp, temp2);
-                TensorPrimitives.Multiply(input, temp2, output);
-            }
-            finally
-            {
-                ArrayPool<double>.Shared.Return(tempBuf);
-                ArrayPool<double>.Shared.Return(temp2Buf);
-            }
-#else
             for (int i = 0; i < length; i++)
             {
                 double x = input[i];
                 double softplus = x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x));
                 output[i] = x * Math.Tanh(softplus);
             }
-#endif
         }
 
         /// <summary>
@@ -1440,26 +1594,12 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = output.Length;
 
-#if NET8_0_OR_GREATER
-            double[] tempBuf = ArrayPool<double>.Shared.Rent(length);
-            try
-            {
-                var temp = tempBuf.AsSpan(0, length);
-                TensorPrimitives.Sigmoid(input, temp);
-                TensorPrimitives.Multiply(input, temp, output);
-            }
-            finally
-            {
-                ArrayPool<double>.Shared.Return(tempBuf);
-            }
-#else
             for (int i = 0; i < length; i++)
             {
                 double x = input[i];
                 double sigmoid = 1.0 / (1.0 + Math.Exp(-x));
                 output[i] = x * sigmoid;
             }
-#endif
         }
 
         /// <summary>
