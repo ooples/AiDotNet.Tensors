@@ -108,16 +108,16 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     {
         if (explicitValue is not null && !string.IsNullOrWhiteSpace(explicitValue))
         {
-            return explicitValue;
+            return explicitValue.Trim();
         }
 
         var envValue = Environment.GetEnvironmentVariable(envVarName);
         if (envValue is not null && !string.IsNullOrWhiteSpace(envValue))
         {
-            return envValue;
+            return envValue.Trim();
         }
 
-        return GetAssemblyMetadata(metadataKey);
+        return GetAssemblyMetadata(metadataKey).Trim();
     }
 
     /// <summary>
