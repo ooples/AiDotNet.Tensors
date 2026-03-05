@@ -80,7 +80,7 @@ public class GpuCpuConsistencyTests
     private static bool IsSubnormal(float value)
     {
         // A subnormal (denormalized) float has exponent bits all zero but non-zero mantissa
-        return value != 0.0f && MathF.Abs(value) < 1.175494351e-38f; // float.MinValue (normalized)
+        return value != 0.0f && MathF.Abs(value) < 1.175494351e-38f; // smallest positive normal float
     }
 
     private static bool AreCloseRelative(float expected, float actual, float relativeTolerance = RelativeTolerance)

@@ -2,6 +2,7 @@
 // Complete Vulkan GPU compute backend for tensor operations.
 
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -446,12 +447,19 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     {
         // Clamp extreme values to avoid NaN from GPU tanh shader overflow.
         // tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
-        var clamped = new float[input.Length];
-        for (int i = 0; i < input.Length; i++)
+        var clamped = ArrayPool<float>.Shared.Rent(input.Length);
+        try
         {
-            clamped[i] = Math.Max(-20.0f, Math.Min(20.0f, input[i]));
+            for (int i = 0; i < input.Length; i++)
+            {
+                clamped[i] = Math.Max(-20.0f, Math.Min(20.0f, input[i]));
+            }
+            ExecuteUnaryOp(clamped.AsSpan(0, input.Length), result, VulkanKernelType.Tanh);
         }
-        ExecuteUnaryOp(clamped, result, VulkanKernelType.Tanh);
+        finally
+        {
+            ArrayPool<float>.Shared.Return(clamped);
+        }
     }
 
     /// <summary>
