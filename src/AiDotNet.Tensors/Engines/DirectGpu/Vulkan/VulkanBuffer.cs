@@ -409,7 +409,6 @@ public sealed unsafe class VulkanBuffer : IDisposable
 public sealed unsafe class VulkanBufferTransfer : IDisposable
 {
     private readonly VulkanDevice _device;
-    private IntPtr _commandBuffer;
     private bool _disposed;
 
     /// <summary>
@@ -418,33 +417,6 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
     public VulkanBufferTransfer()
     {
         _device = VulkanDevice.Instance;
-        AllocateCommandBuffer();
-    }
-
-    private void AllocateCommandBuffer()
-    {
-        if (!_device.IsInitialized)
-        {
-            return;
-        }
-
-        var allocInfo = new VkCommandBufferAllocateInfo
-        {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            pNext = null,
-            commandPool = _device.CommandPool,
-            level = VulkanNativeBindings.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            commandBufferCount = 1
-        };
-
-        IntPtr cmdBuffer;
-        int result = VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
-        if (result != VulkanNativeBindings.VK_SUCCESS || cmdBuffer == IntPtr.Zero)
-        {
-            throw new InvalidOperationException($"Failed to allocate Vulkan transfer command buffer: {result}");
-        }
-
-        _commandBuffer = cmdBuffer;
     }
 
     /// <summary>
@@ -454,15 +426,18 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
     /// <param name="device">The destination device buffer.</param>
     public void CopyToDevice(VulkanBuffer staging, VulkanBuffer device)
     {
-        if (_commandBuffer == IntPtr.Zero || _disposed)
+        if (_disposed)
         {
             return;
         }
 
+        var threadRes = _device.AcquireThreadResources();
+        var cmdBuffer = threadRes.CommandBuffer;
+
         ulong copySize = Math.Min(staging.SizeInBytes, device.SizeInBytes);
 
         // Reset and begin command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         var beginInfo = new VkCommandBufferBeginInfo
         {
@@ -472,7 +447,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(_commandBuffer, &beginInfo);
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
         // Record copy command
         var copyRegion = new VkBufferCopy
@@ -483,7 +458,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         VulkanNativeBindings.vkCmdCopyBuffer(
-            _commandBuffer, staging.Handle, device.Handle, 1, &copyRegion);
+            cmdBuffer, staging.Handle, device.Handle, 1, &copyRegion);
 
         // Add memory barrier to ensure copy completes before compute
         var barrier = new VkBufferMemoryBarrier
@@ -500,15 +475,15 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         VulkanNativeBindings.vkCmdPipelineBarrier(
-            _commandBuffer,
+            cmdBuffer,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, IntPtr.Zero, 1, &barrier, 0, IntPtr.Zero);
 
-        VulkanNativeBindings.vkEndCommandBuffer(_commandBuffer);
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
-        // Submit and wait
-        _device.SubmitAndWait(_commandBuffer);
+        // Submit and wait using per-thread fence
+        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
     /// <summary>
@@ -518,15 +493,18 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
     /// <param name="staging">The destination staging buffer.</param>
     public void CopyFromDevice(VulkanBuffer device, VulkanBuffer staging)
     {
-        if (_commandBuffer == IntPtr.Zero || _disposed)
+        if (_disposed)
         {
             return;
         }
 
+        var threadRes = _device.AcquireThreadResources();
+        var cmdBuffer = threadRes.CommandBuffer;
+
         ulong copySize = Math.Min(device.SizeInBytes, staging.SizeInBytes);
 
         // Reset and begin command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         var beginInfo = new VkCommandBufferBeginInfo
         {
@@ -536,7 +514,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(_commandBuffer, &beginInfo);
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
         // Add memory barrier to ensure compute writes are visible
         var preBarrier = new VkBufferMemoryBarrier
@@ -553,7 +531,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         VulkanNativeBindings.vkCmdPipelineBarrier(
-            _commandBuffer,
+            cmdBuffer,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, IntPtr.Zero, 1, &preBarrier, 0, IntPtr.Zero);
@@ -567,7 +545,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         VulkanNativeBindings.vkCmdCopyBuffer(
-            _commandBuffer, device.Handle, staging.Handle, 1, &copyRegion);
+            cmdBuffer, device.Handle, staging.Handle, 1, &copyRegion);
 
         // Add post-transfer barrier to ensure copy completes before host read
         var postBarrier = new VkBufferMemoryBarrier
@@ -584,15 +562,15 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         };
 
         VulkanNativeBindings.vkCmdPipelineBarrier(
-            _commandBuffer,
+            cmdBuffer,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
             VkPipelineStageFlags.VK_PIPELINE_STAGE_HOST_BIT,
             0, 0, IntPtr.Zero, 1, &postBarrier, 0, IntPtr.Zero);
 
-        VulkanNativeBindings.vkEndCommandBuffer(_commandBuffer);
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
-        // Submit and wait
-        _device.SubmitAndWait(_commandBuffer);
+        // Submit and wait using per-thread fence
+        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
     /// <summary>
@@ -606,13 +584,6 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         }
 
         _disposed = true;
-
-        if (_commandBuffer != IntPtr.Zero && _device.IsInitialized)
-        {
-            var cmdPtr = _commandBuffer;
-            VulkanNativeBindings.vkFreeCommandBuffers(
-                _device.Device, _device.CommandPool, 1, &cmdPtr);
-            _commandBuffer = IntPtr.Zero;
-        }
+        // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
     }
 }

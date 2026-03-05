@@ -1,3 +1,4 @@
+using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using AiDotNet.Tensors.Benchmarks;
 
@@ -5,6 +6,10 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 class Program
 {
+    // TensorFlow.Binding NuGet is not built in Release mode, so we must disable the validator
+    private static readonly IConfig BenchConfig = DefaultConfig.Instance
+        .WithOptions(ConfigOptions.DisableOptimizationsValidator);
+
     static void Main(string[] args)
     {
         // Run quick performance test first for immediate feedback
@@ -61,6 +66,55 @@ class Program
         if (args[0] == "--directgpu")
         {
             DirectGpuGemmBenchmark.RunComprehensive();
+            return;
+        }
+
+        // GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)
+        if (args[0] == "--activation")
+        {
+            GpuActivationBenchmark.Run();
+            return;
+        }
+
+        // GPU normalization benchmarks (BN, LN, GN, IN, RmsNorm)
+        if (args[0] == "--norm")
+        {
+            GpuNormalizationBenchmark.Run();
+            return;
+        }
+
+        // GPU attention benchmarks (FlashAttention, ScaledDotProduct)
+        if (args[0] == "--attn")
+        {
+            GpuAttentionBenchmark.Run();
+            return;
+        }
+
+        // GPU convolution benchmarks (Conv2D, Depthwise)
+        if (args[0] == "--conv")
+        {
+            GpuConvolutionBenchmark.Run();
+            return;
+        }
+
+        // Capture full baseline to CSV for A/B testing across phases
+        if (args[0] == "--baseline")
+        {
+            string phase = args.Length > 1 ? args[1] : "phase0";
+            string? csvPath = args.Length > 2 ? args[2] : null;
+            GpuBaselineResults.CaptureBaseline(phase, csvPath);
+            return;
+        }
+
+        // Compare two baseline CSVs for regressions
+        if (args[0] == "--compare")
+        {
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: --compare <before.csv> <after.csv>");
+                return;
+            }
+            GpuBaselineResults.CompareBaselines(args[1], args[2]);
             return;
         }
 
@@ -121,6 +175,50 @@ class Program
             return;
         }
 
+        // Run competitive benchmarks vs TorchSharp (GPU)
+        if (args[0] == "--vs-torchsharp-gpu")
+        {
+            BenchmarkRunner.Run<TorchSharpComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run competitive benchmarks vs TorchSharp (CPU)
+        if (args[0] == "--vs-torchsharp-cpu")
+        {
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run competitive benchmarks vs TensorFlow (GPU)
+        if (args[0] == "--vs-tensorflow-gpu")
+        {
+            BenchmarkRunner.Run<TensorFlowComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run competitive benchmarks vs TensorFlow (CPU)
+        if (args[0] == "--vs-tensorflow-cpu")
+        {
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run competitive benchmarks vs ML.NET (CPU)
+        if (args[0] == "--vs-mlnet-cpu")
+        {
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
+        if (args[0] == "--vs-all")
+        {
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
 #if NET7_0_OR_GREATER
         // Run WebGPU backend diagnostics (browser context)
         if (args[0] == "--webgpu")
@@ -170,6 +268,12 @@ class Program
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");
         Console.WriteLine("  --directgpu: Run DirectGpu comprehensive benchmark (all 10 optimizations)");
+        Console.WriteLine("  --activation: Run GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)");
+        Console.WriteLine("  --norm      : Run GPU normalization benchmarks (BN, LN, GN, IN, RmsNorm)");
+        Console.WriteLine("  --attn      : Run GPU attention benchmarks (FlashAttention, SDPA)");
+        Console.WriteLine("  --conv      : Run GPU convolution benchmarks (Conv2D, Depthwise)");
+        Console.WriteLine("  --baseline  : Capture full baseline to CSV (--baseline [phase] [csv])");
+        Console.WriteLine("  --compare   : Compare baselines (--compare before.csv after.csv)");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
@@ -185,6 +289,14 @@ class Program
         Console.WriteLine("  --metal-bench   : Run formal Metal backend benchmarks (macOS)");
         Console.WriteLine("  --webgpu-bench  : Run formal WebGPU backend benchmarks (.NET 7+)");
         Console.WriteLine("  --crosslib-bench: Run formal cross-library GPU benchmarks");
+        Console.WriteLine();
+        Console.WriteLine("Competitive Benchmarks vs Other Libraries:");
+        Console.WriteLine("  --vs-torchsharp-gpu : AiDotNet GPU vs TorchSharp CUDA");
+        Console.WriteLine("  --vs-torchsharp-cpu : AiDotNet CPU vs TorchSharp CPU");
+        Console.WriteLine("  --vs-tensorflow-gpu : AiDotNet GPU vs TensorFlow.NET GPU");
+        Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");
+        Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
+        Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
 #endif
     }
 }

@@ -18,9 +18,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 // NORMALIZATION KERNELS
 // ===========================================================================
 
-// Batch Normalization forward pass
-// Input: [batch, channels, spatialSize]
-// Computes: y = gamma * (x - mean) / sqrt(var + eps) + beta
+// Batch Normalization forward pass — workgroup-parallel
+// 1 workgroup per channel, threads cooperate on batch*spatial reduction
 __kernel void batchnorm_forward(
     __global const float* input,
     __global float* output,
@@ -35,57 +34,77 @@ __kernel void batchnorm_forward(
     const int spatialSize,
     const float epsilon,
     const float momentum,
-    const int training)
+    const int training,
+    __local float* localBuf)
 {
-    const int c = get_global_id(0);
+    const int c = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (c >= channels) return;
 
     int batchSpatial = batch * spatialSize;
+    float mean, invVar;
 
-    // Compute mean
-    float mean = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            mean += input[(b * channels + c) * spatialSize + s];
-        }
-    }
-    mean /= (float)batchSpatial;
-
-    // Compute variance
-    float var = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            float diff = input[(b * channels + c) * spatialSize + s] - mean;
-            var += diff * diff;
-        }
-    }
-    var /= (float)batchSpatial;
-
-    float invVar = 1.0f / sqrt(var + epsilon);
-
-    // Save for backward pass
-    saveMean[c] = mean;
-    saveInvVar[c] = invVar;
-
-    // Update running statistics if training
     if (training) {
-        runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
-        runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
+        // Training: compute mean/var from batch data
+        float threadSum = 0.0f;
+        for (int i = lid; i < batchSpatial; i += localSize) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            threadSum += input[(b * channels + c) * spatialSize + s];
+        }
+        localBuf[lid] = threadSum;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        mean = localBuf[0] / (float)batchSpatial;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        float threadVar = 0.0f;
+        for (int i = lid; i < batchSpatial; i += localSize) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            float diff = input[(b * channels + c) * spatialSize + s] - mean;
+            threadVar += diff * diff;
+        }
+        localBuf[lid] = threadVar;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float var = localBuf[0] / (float)batchSpatial;
+        invVar = 1.0f / sqrt(var + epsilon);
+
+        if (lid == 0) {
+            saveMean[c] = mean;
+            saveInvVar[c] = invVar;
+            runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
+            runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    } else {
+        // Inference: use running statistics
+        mean = runningMean[c];
+        invVar = 1.0f / sqrt(runningVar[c] + epsilon);
     }
 
     // Normalize and apply affine transform
     float g = gamma[c];
     float b_val = beta[c];
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            int idx = (b * channels + c) * spatialSize + s;
-            float normalized = (input[idx] - mean) * invVar;
-            output[idx] = g * normalized + b_val;
-        }
+    for (int i = lid; i < batchSpatial; i += localSize) {
+        int b = i / spatialSize;
+        int s = i % spatialSize;
+        int idx = (b * channels + c) * spatialSize + s;
+        float normalized = (input[idx] - mean) * invVar;
+        output[idx] = g * normalized + b_val;
     }
 }
 
-// Batch Normalization backward pass
+// Batch Normalization backward pass — workgroup-parallel
 __kernel void batchnorm_backward(
     __global const float* gradOutput,
     __global const float* input,
@@ -98,9 +117,14 @@ __kernel void batchnorm_backward(
     const int batch,
     const int channels,
     const int spatialSize,
-    const float epsilon)
+    const float epsilon,
+    __local float* localBuf,
+    __local float* localBuf2)
 {
-    const int c = get_global_id(0);
+    const int c = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (c >= channels) return;
 
     int batchSpatial = batch * spatialSize;
@@ -108,42 +132,67 @@ __kernel void batchnorm_backward(
     float invVar = saveInvVar[c];
     float g = gamma[c];
 
-    // Compute gradGamma and gradBeta
-    float dGamma = 0.0f;
-    float dBeta = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            int idx = (b * channels + c) * spatialSize + s;
-            float normalized = (input[idx] - mean) * invVar;
-            dGamma += gradOutput[idx] * normalized;
-            dBeta += gradOutput[idx];
-        }
+    // Phase 1: Parallel reduction for gradGamma, gradBeta, and gamma-scaled sums
+    float tDGamma = 0.0f;
+    float tDBeta = 0.0f;
+    float tSumDxhat = 0.0f;
+    float tSumDxhatXhat = 0.0f;
+    for (int i = lid; i < batchSpatial; i += localSize) {
+        int b = i / spatialSize;
+        int s = i % spatialSize;
+        int idx = (b * channels + c) * spatialSize + s;
+        float xhat = (input[idx] - mean) * invVar;
+        float dxhat = gradOutput[idx] * g;
+        tDGamma += gradOutput[idx] * xhat;
+        tDBeta += gradOutput[idx];
+        tSumDxhat += dxhat;
+        tSumDxhatXhat += dxhat * xhat;
     }
-    gradGamma[c] = dGamma;
-    gradBeta[c] = dBeta;
-
-    // Compute gradInput
-    float sumDy = dBeta;
-    float sumDyXmu = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            int idx = (b * channels + c) * spatialSize + s;
-            sumDyXmu += gradOutput[idx] * (input[idx] - mean);
+    localBuf[lid] = tDGamma;
+    localBuf2[lid] = tDBeta;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            localBuf[lid] += localBuf[lid + stride];
+            localBuf2[lid] += localBuf2[lid + stride];
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
+    if (lid == 0) {
+        gradGamma[c] = localBuf[0];
+        gradBeta[c] = localBuf2[0];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            int idx = (b * channels + c) * spatialSize + s;
-            float xmu = input[idx] - mean;
-            float dxhat = gradOutput[idx] * g;
-            gradInput[idx] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)batchSpatial);
+    // Phase 2: Reduce sum(dxhat) and sum(dxhat * xhat)
+    localBuf[lid] = tSumDxhat;
+    localBuf2[lid] = tSumDxhatXhat;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            localBuf[lid] += localBuf[lid + stride];
+            localBuf2[lid] += localBuf2[lid + stride];
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float sumDxhat = localBuf[0];
+    float sumDxhatXhat = localBuf2[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 3: Compute gradInput
+    float invN = 1.0f / (float)batchSpatial;
+    for (int i = lid; i < batchSpatial; i += localSize) {
+        int b = i / spatialSize;
+        int s = i % spatialSize;
+        int idx = (b * channels + c) * spatialSize + s;
+        float xhat = (input[idx] - mean) * invVar;
+        float dxhat = gradOutput[idx] * g;
+        gradInput[idx] = invVar * (dxhat - invN * (sumDxhat + xhat * sumDxhatXhat));
     }
 }
 
-// Layer Normalization forward pass
-// Normalizes over the last dimension (features)
+// Layer Normalization forward pass — workgroup-parallel
+// 1 workgroup per batch element, threads cooperate on mean/var reduction
 __kernel void layernorm_forward(
     __global const float* input,
     __global float* output,
@@ -153,40 +202,62 @@ __kernel void layernorm_forward(
     __global float* saveInvVar,
     const int batchSize,
     const int normalizedSize,
-    const float epsilon)
+    const float epsilon,
+    __local float* localBuf)
 {
-    const int b = get_global_id(0);
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (b >= batchSize) return;
 
-    // Compute mean
-    float mean = 0.0f;
-    for (int i = 0; i < normalizedSize; i++) {
-        mean += input[b * normalizedSize + i];
-    }
-    mean /= (float)normalizedSize;
+    __global const float* rowIn = input + b * normalizedSize;
 
-    // Compute variance
-    float var = 0.0f;
-    for (int i = 0; i < normalizedSize; i++) {
-        float diff = input[b * normalizedSize + i] - mean;
-        var += diff * diff;
+    // Phase 1: Parallel sum for mean
+    float threadSum = 0.0f;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        threadSum += rowIn[i];
     }
-    var /= (float)normalizedSize;
+    localBuf[lid] = threadSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float mean = localBuf[0] / (float)normalizedSize;
+    barrier(CLK_LOCAL_MEM_FENCE);
 
+    // Phase 2: Parallel sum for variance
+    float threadVar = 0.0f;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float diff = rowIn[i] - mean;
+        threadVar += diff * diff;
+    }
+    localBuf[lid] = threadVar;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float var = localBuf[0] / (float)normalizedSize;
     float invVar = 1.0f / sqrt(var + epsilon);
 
-    saveMean[b] = mean;
-    saveInvVar[b] = invVar;
+    // Save stats (only thread 0)
+    if (lid == 0) {
+        saveMean[b] = mean;
+        saveInvVar[b] = invVar;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Normalize and apply affine transform
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        float normalized = (input[idx] - mean) * invVar;
-        output[idx] = gamma[i] * normalized + beta[i];
+    // Phase 3: Normalize and apply affine transform
+    __global float* rowOut = output + b * normalizedSize;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float normalized = (rowIn[i] - mean) * invVar;
+        rowOut[i] = gamma[i] * normalized + beta[i];
     }
 }
 
-// Layer Normalization backward pass
+// Layer Normalization backward pass — workgroup-parallel
 __kernel void layernorm_backward(
     __global const float* gradOutput,
     __global const float* input,
@@ -198,30 +269,49 @@ __kernel void layernorm_backward(
     __global float* gradBeta,
     const int batchSize,
     const int normalizedSize,
-    const float epsilon)
+    const float epsilon,
+    __local float* localBuf,
+    __local float* localBuf2)
 {
-    const int b = get_global_id(0);
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (b >= batchSize) return;
 
     float mean = saveMean[b];
     float invVar = saveInvVar[b];
+    __global const float* rowIn = input + b * normalizedSize;
+    __global const float* rowGrad = gradOutput + b * normalizedSize;
 
-    // Compute intermediate sums
-    float sumDy = 0.0f;
-    float sumDyXmu = 0.0f;
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        float dy = gradOutput[idx] * gamma[i];
-        sumDy += dy;
-        sumDyXmu += dy * (input[idx] - mean);
+    // Phase 1: Parallel reduction for sumDy and sumDyXmu
+    float tSumDy = 0.0f;
+    float tSumDyXmu = 0.0f;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float dy = rowGrad[i] * gamma[i];
+        tSumDy += dy;
+        tSumDyXmu += dy * (rowIn[i] - mean);
     }
+    localBuf[lid] = tSumDy;
+    localBuf2[lid] = tSumDyXmu;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            localBuf[lid] += localBuf[lid + stride];
+            localBuf2[lid] += localBuf2[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float sumDy = localBuf[0];
+    float sumDyXmu = localBuf2[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Compute gradInput
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        float xmu = input[idx] - mean;
-        float dxhat = gradOutput[idx] * gamma[i];
-        gradInput[idx] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)normalizedSize);
+    // Phase 2: Compute gradInput
+    __global float* rowGradIn = gradInput + b * normalizedSize;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float xmu = rowIn[i] - mean;
+        float dxhat = rowGrad[i] * gamma[i];
+        rowGradIn[i] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)normalizedSize);
     }
 }
 
@@ -361,8 +451,8 @@ __kernel void instancenorm_forward(
     }
 }
 
-// RMS Normalization forward pass
-// y = x / sqrt(mean(x^2) + eps) * gamma
+// RMS Normalization forward pass — workgroup-parallel
+// 1 workgroup per batch element, threads cooperate on sum-of-squares reduction
 __kernel void rmsnorm_forward(
     __global const float* input,
     __global float* output,
@@ -370,32 +460,46 @@ __kernel void rmsnorm_forward(
     __global float* saveRms,
     const int batchSize,
     const int normalizedSize,
-    const float epsilon)
+    const float epsilon,
+    __local float* localBuf)
 {
-    const int b = get_global_id(0);
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (b >= batchSize) return;
 
-    // Compute mean of squares
-    float meanSq = 0.0f;
-    for (int i = 0; i < normalizedSize; i++) {
-        float x = input[b * normalizedSize + i];
-        meanSq += x * x;
-    }
-    meanSq /= (float)normalizedSize;
+    __global const float* rowIn = input + b * normalizedSize;
 
+    // Phase 1: Parallel sum of squares
+    float threadSumSq = 0.0f;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float x = rowIn[i];
+        threadSumSq += x * x;
+    }
+    localBuf[lid] = threadSumSq;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float meanSq = localBuf[0] / (float)normalizedSize;
     float rms = sqrt(meanSq + epsilon);
     float invRms = 1.0f / rms;
-    saveRms[b] = rms;
 
-    // Normalize and scale
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        output[idx] = input[idx] * invRms * gamma[i];
+    if (lid == 0) {
+        saveRms[b] = rms;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 2: Normalize and scale
+    __global float* rowOut = output + b * normalizedSize;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        rowOut[i] = rowIn[i] * invRms * gamma[i];
     }
 }
 
-// RMS Normalization backward pass
-// Computes gradients for input and gamma
+// RMS Normalization backward pass — workgroup-parallel
 __kernel void rmsnorm_backward(
     __global const float* gradOutput,
     __global const float* input,
@@ -405,32 +509,43 @@ __kernel void rmsnorm_backward(
     __global float* gradGamma,
     const int batchSize,
     const int normalizedSize,
-    const float epsilon)
+    const float epsilon,
+    __local float* localBuf)
 {
-    const int b = get_global_id(0);
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (b >= batchSize) return;
 
     float rms = saveRms[b];
     float invRms = 1.0f / rms;
     float invRms3 = invRms * invRms * invRms;
 
-    // Compute sum of (gradOutput * gamma * input) for this sample
-    float sumGradGammaX = 0.0f;
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        sumGradGammaX += gradOutput[idx] * gamma[i] * input[idx];
+    __global const float* rowIn = input + b * normalizedSize;
+    __global const float* rowGrad = gradOutput + b * normalizedSize;
+
+    // Phase 1: Parallel reduction for sumGradGammaX
+    float tSum = 0.0f;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        tSum += rowGrad[i] * gamma[i] * rowIn[i];
     }
+    localBuf[lid] = tSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float sumGradGammaX = localBuf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Compute gradInput for this sample
-    for (int i = 0; i < normalizedSize; i++) {
-        int idx = b * normalizedSize + i;
-        float x = input[idx];
-        float dy = gradOutput[idx];
+    // Phase 2: Compute gradInput
+    __global float* rowGradIn = gradInput + b * normalizedSize;
+    for (int i = lid; i < normalizedSize; i += localSize) {
+        float x = rowIn[i];
+        float dy = rowGrad[i];
         float g = gamma[i];
-
-        // d/dx (x / rms * gamma) = gamma * (1/rms - x^2 / (n * rms^3))
-        // Simplified: gamma * invRms - x * sumGradGammaX * invRms^3 / n
-        gradInput[idx] = g * dy * invRms - x * sumGradGammaX * invRms3 / (float)normalizedSize;
+        rowGradIn[i] = g * dy * invRms - x * sumGradGammaX * invRms3 / (float)normalizedSize;
     }
 }
 

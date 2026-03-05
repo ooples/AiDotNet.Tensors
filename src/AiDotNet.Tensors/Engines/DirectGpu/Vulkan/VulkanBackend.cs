@@ -2,6 +2,7 @@
 // Complete Vulkan GPU compute backend for tensor operations.
 
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -41,7 +42,6 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     private readonly ConcurrentDictionary<(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize), VulkanComputePipeline> _pipelineCache;
     private readonly ConcurrentDictionary<VulkanKernelType, VulkanShaderModule> _shaderCache;
     private VulkanBufferTransfer? _transfer;
-    private IntPtr _commandBuffer;
     private readonly object _computeLock = new object();
     private bool _initialized;
     private bool _disposed;
@@ -138,31 +138,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
         }
 
         _transfer = new VulkanBufferTransfer();
-        AllocateCommandBuffer();
 
         _initialized = true;
         return true;
-    }
-
-    private void AllocateCommandBuffer()
-    {
-        var allocInfo = new VkCommandBufferAllocateInfo
-        {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            pNext = null,
-            commandPool = _device.CommandPool,
-            level = VulkanNativeBindings.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            commandBufferCount = 1
-        };
-
-        IntPtr cmdBuffer;
-        int result = VulkanNativeBindings.vkAllocateCommandBuffers(_device.Device, &allocInfo, &cmdBuffer);
-        if (result != VulkanNativeBindings.VK_SUCCESS || cmdBuffer == IntPtr.Zero)
-        {
-            throw new InvalidOperationException($"Failed to allocate Vulkan command buffer: {result}");
-        }
-
-        _commandBuffer = cmdBuffer;
     }
 
     /// <summary>
@@ -271,11 +249,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
         }
 
+        // Acquire per-thread resources and execute
+        var threadRes = _device.AcquireThreadResources();
+
         // Lock around descriptor set update + dispatch to prevent concurrent mutation
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(bufferA, bufferB, bufferC);
-            RecordAndExecuteComputeUnlocked(pipeline, size);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
         }
 
         // Download results
@@ -332,11 +313,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
             throw new InvalidOperationException($"Failed to create pipeline for {kernelType}.");
         }
 
+        // Acquire per-thread resources and execute
+        var threadRes = _device.AcquireThreadResources();
+
         // Lock around descriptor set update + dispatch to prevent concurrent mutation
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(bufferA, bufferB);
-            RecordAndExecuteComputeUnlocked(pipeline, size);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
         }
 
         // Download results
@@ -393,11 +377,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
             throw new InvalidOperationException("Failed to create scalar multiply pipeline.");
         }
 
+        // Acquire per-thread resources and execute
+        var threadRes = _device.AcquireThreadResources();
+
         // Lock around descriptor set update + dispatch to prevent concurrent mutation
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(bufferA, bufferB);
-            RecordAndExecuteComputeWithScalarUnlocked(pipeline, size, scalar);
+            RecordAndExecuteComputeWithScalarUnlocked(pipeline, size, scalar, threadRes);
         }
 
         // Download results
@@ -458,16 +445,32 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     /// </summary>
     public void Tanh(ReadOnlySpan<float> input, Span<float> result)
     {
-        ExecuteUnaryOp(input, result, VulkanKernelType.Tanh);
+        // Clamp extreme values to avoid NaN from GPU tanh shader overflow.
+        // tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
+        var clamped = ArrayPool<float>.Shared.Rent(input.Length);
+        try
+        {
+            for (int i = 0; i < input.Length; i++)
+            {
+                clamped[i] = Math.Max(-20.0f, Math.Min(20.0f, input[i]));
+            }
+            ExecuteUnaryOp(clamped.AsSpan(0, input.Length), result, VulkanKernelType.Tanh);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(clamped);
+        }
     }
 
     /// <summary>
     /// Records and executes a compute dispatch. Caller MUST hold _computeLock.
     /// </summary>
-    private void RecordAndExecuteComputeUnlocked(VulkanComputePipeline pipeline, int elementCount)
+    private void RecordAndExecuteComputeUnlocked(VulkanComputePipeline pipeline, int elementCount, ThreadCommandResources threadRes)
     {
+        var cmdBuffer = threadRes.CommandBuffer;
+
         // Reset command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         // Begin recording
         var beginInfo = new VkCommandBufferBeginInfo
@@ -478,18 +481,18 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(_commandBuffer, &beginInfo);
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
         // Bind pipeline
         VulkanNativeBindings.vkCmdBindPipeline(
-            _commandBuffer,
+            cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Handle);
 
         // Bind descriptor set
         var descriptorSet = pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(
-            _commandBuffer,
+            cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Layout,
             0, 1, &descriptorSet,
@@ -498,7 +501,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
         // Push constants (size)
         uint size = (uint)elementCount;
         VulkanNativeBindings.vkCmdPushConstants(
-            _commandBuffer,
+            cmdBuffer,
             pipeline.Layout,
             VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT,
             0,
@@ -507,22 +510,24 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 
         // Dispatch compute
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
-        VulkanNativeBindings.vkCmdDispatch(_commandBuffer, workgroupCount, 1, 1);
+        VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         // End recording
-        VulkanNativeBindings.vkEndCommandBuffer(_commandBuffer);
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
-        // Submit and wait
-        _device.SubmitAndWait(_commandBuffer);
+        // Submit and wait using per-thread fence
+        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
     /// <summary>
     /// Records and executes a compute dispatch with scalar push constant. Caller MUST hold _computeLock.
     /// </summary>
-    private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar)
+    private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar, ThreadCommandResources threadRes)
     {
+        var cmdBuffer = threadRes.CommandBuffer;
+
         // Reset command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(_commandBuffer, 0);
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         // Begin recording
         var beginInfo = new VkCommandBufferBeginInfo
@@ -533,18 +538,18 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(_commandBuffer, &beginInfo);
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
         // Bind pipeline
         VulkanNativeBindings.vkCmdBindPipeline(
-            _commandBuffer,
+            cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Handle);
 
         // Bind descriptor set
         var descriptorSet = pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(
-            _commandBuffer,
+            cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Layout,
             0, 1, &descriptorSet,
@@ -559,7 +564,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
         fixed (byte* pPushData = pushData)
         {
             VulkanNativeBindings.vkCmdPushConstants(
-                _commandBuffer,
+                cmdBuffer,
                 pipeline.Layout,
                 VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT,
                 0,
@@ -569,13 +574,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 
         // Dispatch compute
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
-        VulkanNativeBindings.vkCmdDispatch(_commandBuffer, workgroupCount, 1, 1);
+        VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         // End recording
-        VulkanNativeBindings.vkEndCommandBuffer(_commandBuffer);
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
-        // Submit and wait
-        _device.SubmitAndWait(_commandBuffer);
+        // Submit and wait using per-thread fence
+        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
     /// <summary>
@@ -593,14 +598,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
         // Wait for device to finish
         _device.WaitIdle();
 
-        // Dispose command buffer
-        if (_commandBuffer != IntPtr.Zero)
-        {
-            var cmdPtr = _commandBuffer;
-            VulkanNativeBindings.vkFreeCommandBuffers(
-                _device.Device, _device.CommandPool, 1, &cmdPtr);
-            _commandBuffer = IntPtr.Zero;
-        }
+        // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
         // Dispose pipelines
         foreach (var pipeline in _pipelineCache.Values)

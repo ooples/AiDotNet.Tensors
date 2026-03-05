@@ -1,0 +1,423 @@
+using System;
+using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
+
+namespace AiDotNet.Tensors.Engines.Simd;
+
+/// <summary>
+/// High-performance General Matrix Multiply (GEMM) using BLIS/GotoBLAS tiled architecture.
+/// C[m,n] += A[m,k] * B[k,n] with FMA micro-kernel, panel packing, and cache-level blocking.
+/// </summary>
+internal static class SimdGemm
+{
+    // Cache blocking parameters (tuned for typical L1=32KB, L2=256KB, L3=8MB)
+    private const int Mc = 256;  // Panel height for A (fits in L2)
+    private const int Kc = 512;  // Panel depth (fits in L1)
+    private const int Nc = 4096; // Panel width for B (fits in L3)
+
+    // Micro-kernel register block: 6 rows x 16 columns
+    // 6 rows * 16 cols = 96 floats = 12 Vector256<float> accumulators
+    private const int Mr = 6;
+    private const int Nr = 16;
+
+    /// <summary>
+    /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
+    /// All matrices are in row-major order. C is cleared before computation.
+    /// </summary>
+    public static void Sgemm(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n)
+    {
+        c.Clear();
+        SgemmAdd(a, b, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Computes C += A * B (accumulates into C without clearing).
+    /// </summary>
+    public static void SgemmAdd(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
+        {
+            SgemmTiled(a, b, c, m, k, n);
+            return;
+        }
+#endif
+        SgemmScalar(a, b, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Scalar GEMM fallback for platforms without AVX2/FMA.
+    /// </summary>
+    private static void SgemmScalar(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n)
+    {
+        for (int i = 0; i < m; i++)
+        {
+            int aRowBase = i * k;
+            int cRowBase = i * n;
+            for (int p = 0; p < k; p++)
+            {
+                float aip = a[aRowBase + p];
+                int bRowBase = p * n;
+                for (int j = 0; j < n; j++)
+                {
+                    c[cRowBase + j] += aip * b[bRowBase + j];
+                }
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Tiled GEMM with panel packing and FMA micro-kernel.
+    /// Follows BLIS architecture: loop order is jc -> pc -> ic -> jr -> ir.
+    /// </summary>
+    private static void SgemmTiled(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n)
+    {
+        // Allocate packed panels from ArrayPool
+        int packedASize = Mc * Kc;
+        int packedBSize = Kc * Nc;
+        float[] packedABuf = ArrayPool<float>.Shared.Rent(packedASize);
+        float[] packedBBuf = ArrayPool<float>.Shared.Rent(packedBSize);
+
+        try
+        {
+            // 5th loop: over N dimension in blocks of Nc
+            for (int jc = 0; jc < n; jc += Nc)
+            {
+                int nc = Math.Min(Nc, n - jc);
+
+                // 4th loop: over K dimension in blocks of Kc
+                for (int pc = 0; pc < k; pc += Kc)
+                {
+                    int kc = Math.Min(Kc, k - pc);
+
+                    // Pack B panel: B[pc:pc+kc, jc:jc+nc] -> packedB in column-panel layout
+                    PackB(b, packedBBuf, n, pc, kc, jc, nc);
+
+                    // 3rd loop: over M dimension in blocks of Mc (parallelizable)
+                    bool useParallel = m >= Mc * 2 && Environment.ProcessorCount > 1;
+                    int numRowBlocks = (m + Mc - 1) / Mc;
+
+                    if (useParallel)
+                    {
+                        // Pin source A array once (read-only, safe for parallel reads)
+                        float[] aArray = a.ToArray();
+                        // Use c directly via pinning — MacroKernel writes to disjoint row blocks,
+                        // so parallel writes are safe without copying.
+                        float[] cArray = new float[c.Length];
+                        c.CopyTo(cArray); // Copy current accumulated C values once
+
+                        System.Threading.Tasks.Parallel.For(0, numRowBlocks, iiBlock =>
+                        {
+                            int ic = iiBlock * Mc;
+                            int mc = Math.Min(Mc, m - ic);
+
+                            // Each thread gets its own packed A buffer
+                            float[] localPackedA = ArrayPool<float>.Shared.Rent(mc * kc);
+                            try
+                            {
+                                PackA(aArray.AsSpan(), localPackedA, k, ic, mc, pc, kc);
+                                MacroKernel(localPackedA, packedBBuf, cArray.AsSpan(), mc, nc, kc, n, ic, jc);
+                            }
+                            finally
+                            {
+                                ArrayPool<float>.Shared.Return(localPackedA);
+                            }
+                        });
+
+                        cArray.AsSpan().CopyTo(c);
+                    }
+                    else
+                    {
+                        for (int ic = 0; ic < m; ic += Mc)
+                        {
+                            int mc = Math.Min(Mc, m - ic);
+
+                            // Pack A panel: A[ic:ic+mc, pc:pc+kc] -> packedA in row-panel layout
+                            PackA(a, packedABuf, k, ic, mc, pc, kc);
+
+                            // Macro-kernel: multiply packed panels
+                            MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(packedABuf);
+            ArrayPool<float>.Shared.Return(packedBBuf);
+        }
+    }
+
+    /// <summary>
+    /// Pack A[ic:ic+mc, pc:pc+kc] into row-panel format for sequential access in micro-kernel.
+    /// Layout: groups of Mr rows, each stored as Mr x kc contiguous block.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, int ic, int mc, int pc, int kc)
+    {
+        int pos = 0;
+        int i = 0;
+
+        // Full Mr-row panels
+        for (; i + Mr <= mc; i += Mr)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                for (int ii = 0; ii < Mr; ii++)
+                {
+                    packed[pos++] = a[(ic + i + ii) * lda + pc + p];
+                }
+            }
+        }
+
+        // Remaining rows (less than Mr)
+        int remaining = mc - i;
+        if (remaining > 0)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                for (int ii = 0; ii < remaining; ii++)
+                {
+                    packed[pos++] = a[(ic + i + ii) * lda + pc + p];
+                }
+                // Pad with zeros
+                for (int ii = remaining; ii < Mr; ii++)
+                {
+                    packed[pos++] = 0;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pack B[pc:pc+kc, jc:jc+nc] into column-panel format.
+    /// Layout: groups of Nr columns, each stored as kc x Nr contiguous block.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, int pc, int kc, int jc, int nc)
+    {
+        int pos = 0;
+        int j = 0;
+
+        // Full Nr-column panels
+        for (; j + Nr <= nc; j += Nr)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                int bRow = (pc + p) * ldb + jc + j;
+                for (int jj = 0; jj < Nr; jj++)
+                {
+                    packed[pos++] = b[bRow + jj];
+                }
+            }
+        }
+
+        // Remaining columns (less than Nr)
+        int remaining = nc - j;
+        if (remaining > 0)
+        {
+            for (int p = 0; p < kc; p++)
+            {
+                int bRow = (pc + p) * ldb + jc + j;
+                for (int jj = 0; jj < remaining; jj++)
+                {
+                    packed[pos++] = b[bRow + jj];
+                }
+                for (int jj = remaining; jj < Nr; jj++)
+                {
+                    packed[pos++] = 0;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Macro-kernel: iterate over packed panels with Mr x Nr micro-kernel tiles.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void MacroKernel(
+        float[] packedA,
+        float[] packedB,
+        Span<float> c,
+        int mc, int nc, int kc,
+        int ldc, int icOffset, int jcOffset)
+    {
+        int nrBlocks = (nc + Nr - 1) / Nr;
+        int mrBlocks = (mc + Mr - 1) / Mr;
+
+        for (int jr = 0; jr < nrBlocks; jr++)
+        {
+            int jLocal = jr * Nr;
+            int nc_actual = Math.Min(Nr, nc - jLocal);
+            int bPanelOffset = jr * kc * Nr;
+
+            for (int ir = 0; ir < mrBlocks; ir++)
+            {
+                int iLocal = ir * Mr;
+                int mc_actual = Math.Min(Mr, mc - iLocal);
+                int aPanelOffset = ir * kc * Mr;
+
+                if (mc_actual == Mr && nc_actual == Nr)
+                {
+                    // Full micro-kernel
+                    MicroKernel6x16(
+                        packedA, aPanelOffset,
+                        packedB, bPanelOffset,
+                        c, ldc,
+                        icOffset + iLocal, jcOffset + jLocal,
+                        kc);
+                }
+                else
+                {
+                    // Edge case: partial tile
+                    MicroKernelScalar(
+                        packedA, aPanelOffset,
+                        packedB, bPanelOffset,
+                        c, ldc,
+                        icOffset + iLocal, jcOffset + jLocal,
+                        kc, mc_actual, nc_actual);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 6x16 FMA micro-kernel: computes a 6-row x 16-column tile of C.
+    /// Uses 12 Vector256 accumulators (6 rows x 2 vectors of 8 floats = 16 columns).
+    /// Inner loop over K dimension broadcasts A elements and FMA with B row.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void MicroKernel6x16(
+        float[] packedA, int aOffset,
+        float[] packedB, int bOffset,
+        Span<float> c, int ldc,
+        int cRow, int cCol,
+        int kc)
+    {
+        // 12 accumulators: 6 rows x 2 Vector256 (16 columns)
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+
+        ref float aRef = ref MemoryMarshal.GetArrayDataReference(packedA);
+        ref float bRef = ref MemoryMarshal.GetArrayDataReference(packedB);
+
+        for (int p = 0; p < kc; p++)
+        {
+            // Load B row (Nr=16 = 2 vectors of 8)
+            int bIdx = bOffset + p * Nr;
+            var b0 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx)));
+            var b1 = Unsafe.ReadUnaligned<Vector256<float>>(
+                ref Unsafe.As<float, byte>(ref Unsafe.Add(ref bRef, bIdx + 8)));
+
+            // Load A column (Mr=6 values)
+            int aIdx = aOffset + p * Mr;
+            var a0 = Vector256.Create(Unsafe.Add(ref aRef, aIdx));
+            var a1 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 1));
+            var a2 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 2));
+            var a3 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 3));
+            var a4 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 4));
+            var a5 = Vector256.Create(Unsafe.Add(ref aRef, aIdx + 5));
+
+            // FMA: C[i,j] += A[i,p] * B[p,j]
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+        }
+
+        // Store results back to C (accumulate)
+        ref float cRef = ref MemoryMarshal.GetReference(c);
+        StoreAccumRow(ref cRef, cRow, cCol, ldc, c00, c01);
+        StoreAccumRow(ref cRef, cRow + 1, cCol, ldc, c10, c11);
+        StoreAccumRow(ref cRef, cRow + 2, cCol, ldc, c20, c21);
+        StoreAccumRow(ref cRef, cRow + 3, cCol, ldc, c30, c31);
+        StoreAccumRow(ref cRef, cRow + 4, cCol, ldc, c40, c41);
+        StoreAccumRow(ref cRef, cRow + 5, cCol, ldc, c50, c51);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreAccumRow(
+        ref float cRef, int row, int col, int ldc,
+        Vector256<float> v0, Vector256<float> v1)
+    {
+        int offset = row * ldc + col;
+        ref float target = ref Unsafe.Add(ref cRef, offset);
+
+        var existing0 = Unsafe.ReadUnaligned<Vector256<float>>(
+            ref Unsafe.As<float, byte>(ref target));
+        var existing1 = Unsafe.ReadUnaligned<Vector256<float>>(
+            ref Unsafe.As<float, byte>(ref Unsafe.Add(ref target, 8)));
+
+        Unsafe.WriteUnaligned(
+            ref Unsafe.As<float, byte>(ref target),
+            Avx.Add(existing0, v0));
+        Unsafe.WriteUnaligned(
+            ref Unsafe.As<float, byte>(ref Unsafe.Add(ref target, 8)),
+            Avx.Add(existing1, v1));
+    }
+
+    /// <summary>
+    /// Scalar micro-kernel for edge cases where tile is smaller than Mr x Nr.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void MicroKernelScalar(
+        float[] packedA, int aOffset,
+        float[] packedB, int bOffset,
+        Span<float> c, int ldc,
+        int cRow, int cCol,
+        int kc, int mr, int nr)
+    {
+        for (int p = 0; p < kc; p++)
+        {
+            for (int i = 0; i < mr; i++)
+            {
+                float aVal = packedA[aOffset + p * Mr + i];
+                int cIdx = (cRow + i) * ldc + cCol;
+                int bIdx = bOffset + p * Nr;
+                for (int j = 0; j < nr; j++)
+                {
+                    c[cIdx + j] += aVal * packedB[bIdx + j];
+                }
+            }
+        }
+    }
+#endif
+}

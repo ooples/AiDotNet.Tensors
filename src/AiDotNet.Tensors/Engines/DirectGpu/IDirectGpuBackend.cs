@@ -185,6 +185,16 @@ public interface IDirectGpuBackend : IDisposable
     /// <returns>Output buffer (M x N).</returns>
     IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K);
 
+    /// <summary>
+    /// Fused GEMM + Bias + Swish: output = Swish(A * B + bias) = x * sigmoid(x)
+    /// </summary>
+    IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K);
+
+    /// <summary>
+    /// Fused GEMM + Bias + LeakyReLU: output = LeakyReLU(A * B + bias, alpha)
+    /// </summary>
+    IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f);
+
     #endregion
 
     #region Broadcast Operations

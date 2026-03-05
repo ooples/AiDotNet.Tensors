@@ -98,28 +98,42 @@ __kernel void gelu_backward(
     gradInput[idx] = gradOutput[idx] * (0.5f * (1.0f + tanhInner) + 0.5f * x * sech2 * dInner);
 }
 
-// Softmax backward (assumes gradOutput already multiplied with loss derivative)
+// Softmax backward — workgroup-parallel with local memory reduction
 __kernel void softmax_backward(
     __global const float* gradOutput,
     __global const float* output,
     __global float* gradInput,
     const int batchSize,
-    const int features)
+    const int features,
+    __local float* localBuf)
 {
-    const int b = get_global_id(0);
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (b >= batchSize) return;
 
-    // Compute dot(gradOutput, output)
-    float dotProd = 0.0f;
-    for (int f = 0; f < features; f++) {
-        int idx = b * features + f;
-        dotProd += gradOutput[idx] * output[idx];
-    }
+    __global const float* rowGrad = gradOutput + b * features;
+    __global const float* rowOut = output + b * features;
+    __global float* rowGradIn = gradInput + b * features;
 
-    // gradInput = output * (gradOutput - dotProd)
-    for (int f = 0; f < features; f++) {
-        int idx = b * features + f;
-        gradInput[idx] = output[idx] * (gradOutput[idx] - dotProd);
+    // Phase 1: Parallel dot product reduction
+    float threadDot = 0.0f;
+    for (int f = lid; f < features; f += localSize) {
+        threadDot += rowGrad[f] * rowOut[f];
+    }
+    localBuf[lid] = threadDot;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float dotProd = localBuf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 2: Compute gradInput
+    for (int f = lid; f < features; f += localSize) {
+        rowGradIn[f] = rowOut[f] * (rowGrad[f] - dotProd);
     }
 }
 

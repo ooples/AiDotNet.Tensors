@@ -241,6 +241,23 @@ public abstract class VectorBase<T>
     }
 
     /// <summary>
+    /// Gets a reference to the underlying array without copying.
+    /// </summary>
+    internal T[] GetDataArray()
+    {
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
+        {
+            // Safety: verify the segment covers the full array from offset 0.
+            // All VectorBase constructors allocate fresh arrays, so this should always hold.
+            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            {
+                return segment.Array;
+            }
+        }
+        return _memory.ToArray();
+    }
+
+    /// <summary>
     /// Gets a read-only memory view of the vector's data without copying.
     /// </summary>
     /// <returns>A read-only memory over the vector's elements.</returns>

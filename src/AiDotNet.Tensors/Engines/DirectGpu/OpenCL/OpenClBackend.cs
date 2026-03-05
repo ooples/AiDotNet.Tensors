@@ -2147,6 +2147,46 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return ExecuteFusedGemm("gemm_bias", A, B, bias, M, N, K);
         }
 
+        public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+        {
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                Silu(temp, output, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
+        }
+
+        public IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+        {
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                LeakyRelu(temp, output, alpha, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
+        }
+
         private IGpuBuffer ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             if (_context == null)
@@ -2554,8 +2594,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(2, batchSize);
             kernel.SetArg(3, features);
 
-            // One work-item per batch
-            kernel.Execute1D(batchSize, 1);
+            // Workgroup-parallel: 1 workgroup per batch row, 256 threads cooperate
+            int localSize = Math.Min(256, features);
+            // Round to power of 2 for efficient reduction
+            localSize = (int)Math.Pow(2, Math.Floor(Math.Log(localSize, 2)));
+            localSize = Math.Max(1, localSize);
+            kernel.SetLocalArg(4, localSize * sizeof(float));
+            // Global size = batchSize * localSize, local size = localSize
+            kernel.Execute1D(batchSize * localSize, localSize);
             // No sync - can be chained asynchronously
         }
 
@@ -4972,30 +5018,93 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
-            var k = _kernelCache["conv2d_direct"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k.SetArg(arg++, batch);
-            k.SetArg(arg++, inChannels);
-            k.SetArg(arg++, inHeight);
-            k.SetArg(arg++, inWidth);
-            k.SetArg(arg++, outChannels);
-            k.SetArg(arg++, outHeight);
-            k.SetArg(arg++, outWidth);
-            k.SetArg(arg++, kernelH);
-            k.SetArg(arg++, kernelW);
-            k.SetArg(arg++, strideH);
-            k.SetArg(arg++, strideW);
-            k.SetArg(arg++, padH);
-            k.SetArg(arg++, padW);
-            k.SetArg(arg++, dilationH);
-            k.SetArg(arg++, dilationW);
+            // Route: Winograd (3x3 stride-1 dilation-1) → Tiled (shared mem) → Direct fallback
+            bool useWinograd = kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1
+                               && dilationH == 1 && dilationW == 1;
+            bool useTiled = !useWinograd && kernelH <= 7 && kernelW <= 7;
 
-            // Work distribution: (outWidth, outHeight, batch * outChannels)
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
+            if (useWinograd && _kernelCache.ContainsKey("conv2d_winograd_f2x2_3x3"))
+            {
+                var k = _kernelCache["conv2d_winograd_f2x2_3x3"];
+                uint arg = 0;
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k.SetArg(arg++, batch);
+                k.SetArg(arg++, inChannels);
+                k.SetArg(arg++, inHeight);
+                k.SetArg(arg++, inWidth);
+                k.SetArg(arg++, outChannels);
+                k.SetArg(arg++, outHeight);
+                k.SetArg(arg++, outWidth);
+                k.SetArg(arg++, padH);
+                k.SetArg(arg++, padW);
+
+                int numTilesX = (outWidth + 1) / 2;
+                int numTilesY = (outHeight + 1) / 2;
+                k.Execute3D(numTilesX, numTilesY, batch * outChannels, 8, 8, 1);
+            }
+            else if (useTiled)
+            {
+                const int TILE_OUT = 16;
+                var k = _kernelCache["conv2d_tiled"];
+                uint arg = 0;
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k.SetArg(arg++, batch);
+                k.SetArg(arg++, inChannels);
+                k.SetArg(arg++, inHeight);
+                k.SetArg(arg++, inWidth);
+                k.SetArg(arg++, outChannels);
+                k.SetArg(arg++, outHeight);
+                k.SetArg(arg++, outWidth);
+                k.SetArg(arg++, kernelH);
+                k.SetArg(arg++, kernelW);
+                k.SetArg(arg++, strideH);
+                k.SetArg(arg++, strideW);
+                k.SetArg(arg++, padH);
+                k.SetArg(arg++, padW);
+                k.SetArg(arg++, dilationH);
+                k.SetArg(arg++, dilationW);
+
+                // Shared memory for input tile: (TILE_OUT*stride + (kernelH-1)*dilation) * (TILE_OUT*stride + (kernelW-1)*dilation) * sizeof(float)
+                int tileInH = TILE_OUT * strideH + (kernelH - 1) * dilationH;
+                int tileInW = TILE_OUT * strideW + (kernelW - 1) * dilationW;
+                int sharedMemSize = tileInH * tileInW * sizeof(float);
+                k.SetLocalArg(arg++, sharedMemSize);
+
+                int numTilesX = (outWidth + TILE_OUT - 1) / TILE_OUT;
+                int numTilesY = (outHeight + TILE_OUT - 1) / TILE_OUT;
+                k.Execute3D(numTilesX * TILE_OUT, numTilesY * TILE_OUT, batch * outChannels, TILE_OUT, TILE_OUT, 1);
+            }
+            else
+            {
+                // Fallback: direct conv2d with 3D grid
+                var k = _kernelCache["conv2d_direct"];
+                uint arg = 0;
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+                k.SetArg(arg++, batch);
+                k.SetArg(arg++, inChannels);
+                k.SetArg(arg++, inHeight);
+                k.SetArg(arg++, inWidth);
+                k.SetArg(arg++, outChannels);
+                k.SetArg(arg++, outHeight);
+                k.SetArg(arg++, outWidth);
+                k.SetArg(arg++, kernelH);
+                k.SetArg(arg++, kernelW);
+                k.SetArg(arg++, strideH);
+                k.SetArg(arg++, strideW);
+                k.SetArg(arg++, padH);
+                k.SetArg(arg++, padW);
+                k.SetArg(arg++, dilationH);
+                k.SetArg(arg++, dilationW);
+
+                int localX = 8, localY = 8, localZ = 1;
+                k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);
+            }
         }
 
         public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -5936,7 +6045,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, momentum);
             k.SetArg(arg++, training ? 1 : 0);
 
-            k.Execute1D(channels, Math.Min(64, channels));
+            // Workgroup-parallel: 1 workgroup per channel, 256 threads cooperate
+            int bnLocalSize = Math.Min(256, batch * spatialSize);
+            bnLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, bnLocalSize), 2)));
+            bnLocalSize = Math.Max(1, bnLocalSize);
+            k.SetLocalArg(arg++, bnLocalSize * sizeof(float));
+            k.Execute1D(channels * bnLocalSize, bnLocalSize);
         }
 
         public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -5958,7 +6072,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, spatialSize);
             k.SetArg(arg++, epsilon);
 
-            k.Execute1D(channels, Math.Min(64, channels));
+            // Workgroup-parallel: 1 workgroup per channel, 256 threads cooperate
+            int bnbLocalSize = Math.Min(256, batch * spatialSize);
+            bnbLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, bnbLocalSize), 2)));
+            bnbLocalSize = Math.Max(1, bnbLocalSize);
+            k.SetLocalArg(arg++, bnbLocalSize * sizeof(float));
+            k.SetLocalArg(arg++, bnbLocalSize * sizeof(float));
+            k.Execute1D(channels * bnbLocalSize, bnbLocalSize);
         }
 
         public void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -5976,7 +6096,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, normalizedSize);
             k.SetArg(arg++, epsilon);
 
-            k.Execute1D(batchSize, Math.Min(64, batchSize));
+            // Workgroup-parallel: 1 workgroup per batch element
+            int lnLocalSize = Math.Min(256, normalizedSize);
+            lnLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, lnLocalSize), 2)));
+            lnLocalSize = Math.Max(1, lnLocalSize);
+            k.SetLocalArg(arg++, lnLocalSize * sizeof(float));
+            k.Execute1D(batchSize * lnLocalSize, lnLocalSize);
         }
 
         public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -5998,7 +6123,13 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, normalizedSize);
             k.SetArg(arg++, epsilon);
 
-            k.Execute1D(batchSize, Math.Min(64, batchSize));
+            // Workgroup-parallel: 1 workgroup per batch element
+            int lnbLocalSize = Math.Min(256, normalizedSize);
+            lnbLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, lnbLocalSize), 2)));
+            lnbLocalSize = Math.Max(1, lnbLocalSize);
+            k.SetLocalArg(arg++, lnbLocalSize * sizeof(float));
+            k.SetLocalArg(arg++, lnbLocalSize * sizeof(float));
+            k.Execute1D(batchSize * lnbLocalSize, lnbLocalSize);
 
             // Then accumulate gradient params
             var kp = _kernelCache["layernorm_grad_params"];
@@ -6187,7 +6318,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, normalizedSize);
             k.SetArg(arg++, epsilon);
 
-            k.Execute1D(batchSize, Math.Min(64, batchSize));
+            // Workgroup-parallel: 1 workgroup per batch element
+            int rmsLocalSize = Math.Min(256, normalizedSize);
+            rmsLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, rmsLocalSize), 2)));
+            rmsLocalSize = Math.Max(1, rmsLocalSize);
+            k.SetLocalArg(arg++, rmsLocalSize * sizeof(float));
+            k.Execute1D(batchSize * rmsLocalSize, rmsLocalSize);
         }
 
         public void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -6206,7 +6342,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, normalizedSize);
             k.SetArg(arg++, epsilon);
 
-            k.Execute1D(batchSize, Math.Min(64, batchSize));
+            // Workgroup-parallel: 1 workgroup per batch element
+            int rmsbLocalSize = Math.Min(256, normalizedSize);
+            rmsbLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, rmsbLocalSize), 2)));
+            rmsbLocalSize = Math.Max(1, rmsbLocalSize);
+            k.SetLocalArg(arg++, rmsbLocalSize * sizeof(float));
+            k.Execute1D(batchSize * rmsbLocalSize, rmsbLocalSize);
 
             // Compute gradGamma
             var k2 = _kernelCache["rmsnorm_grad_gamma"];
@@ -6864,7 +7005,12 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, batchSize);
             k.SetArg(arg++, features);
 
-            k.Execute1D(batchSize, Math.Min(64, batchSize));
+            // Workgroup-parallel: 1 workgroup per batch row
+            int smLocalSize = Math.Min(256, features);
+            smLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, smLocalSize), 2)));
+            smLocalSize = Math.Max(1, smLocalSize);
+            k.SetLocalArg(arg++, smLocalSize * sizeof(float));
+            k.Execute1D(batchSize * smLocalSize, smLocalSize);
         }
 
         public void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)

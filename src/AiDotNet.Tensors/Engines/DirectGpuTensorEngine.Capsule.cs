@@ -291,7 +291,7 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException($"Input dim mismatch: input has {inputDim}, weights has {weightsInputDim}");
 
         // Upload weights to GPU
-        var weightsArray = weights.ToArray();
+        var weightsArray = weights.GetDataArray();
         var weightsData = new float[weights.Length];
         for (int i = 0; i < weights.Length; i++)
             weightsData[i] = Convert.ToSingle(weightsArray[i]);
@@ -385,7 +385,7 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException($"Input dim mismatch: input has {inputDim}, weights has {weightsInputDim}");
 
         // Upload weights to GPU
-        var weightsArray = weights.ToArray();
+        var weightsArray = weights.GetDataArray();
         var weightsData = new float[weights.Length];
         for (int i = 0; i < weights.Length; i++)
             weightsData[i] = Convert.ToSingle(weightsArray[i]);

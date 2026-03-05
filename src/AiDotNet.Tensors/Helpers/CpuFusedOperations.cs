@@ -1,8 +1,5 @@
 using System;
 using System.Threading.Tasks;
-#if NET8_0_OR_GREATER
-using System.Numerics.Tensors;
-#endif
 using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Helpers;

@@ -58,6 +58,8 @@ __kernel void sigmoid(
 }
 
 // Tanh: (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+// Clamp input to [-20, 20] to avoid NaN on some GPU drivers for extreme values.
+// tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
 __kernel void tanh_activation(
     __global const float* input,
     __global float* output,
@@ -66,7 +68,8 @@ __kernel void tanh_activation(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = tanh(input[idx]);
+    float x = clamp(input[idx], -20.0f, 20.0f);
+    output[idx] = tanh(x);
 }
 
 // GELU (Gaussian Error Linear Unit) - approximation
@@ -101,35 +104,66 @@ __kernel void swish(
     output[idx] = x / (1.0f + exp(-x));
 }
 
-// Softmax (per batch row)
-// Two-pass: first find max, then compute exp and normalize
+// Softmax (per batch row) — workgroup-parallel with local memory reduction
+// Each workgroup handles one batch row, threads cooperate on max/sum reduction
 __kernel void softmax(
     __global const float* input,
     __global float* output,
     const int batchSize,
-    const int features)
+    const int features,
+    __local float* localBuf)
 {
-    const int batch = get_global_id(0);
+    const int batch = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
     if (batch >= batchSize) return;
 
-    // Find max for numerical stability
-    float maxVal = -INFINITY;
-    for (int f = 0; f < features; f++) {
-        maxVal = fmax(maxVal, input[batch * features + f]);
+    __global const float* rowIn = input + batch * features;
+    __global float* rowOut = output + batch * features;
+
+    // Phase 1: Each thread finds max over its strided elements
+    float threadMax = -INFINITY;
+    for (int f = lid; f < features; f += localSize) {
+        threadMax = fmax(threadMax, rowIn[f]);
     }
 
-    // Compute exp and sum
-    float sumExp = 0.0f;
-    for (int f = 0; f < features; f++) {
-        float expVal = exp(input[batch * features + f] - maxVal);
-        output[batch * features + f] = expVal;
-        sumExp += expVal;
+    // Reduce max across workgroup
+    localBuf[lid] = threadMax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            localBuf[lid] = fmax(localBuf[lid], localBuf[lid + stride]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float rowMax = localBuf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 2: Each thread computes exp and partial sum
+    float threadSum = 0.0f;
+    for (int f = lid; f < features; f += localSize) {
+        float e = exp(rowIn[f] - rowMax);
+        rowOut[f] = e;
+        threadSum += e;
     }
 
-    // Normalize
-    float invSum = 1.0f / sumExp;
-    for (int f = 0; f < features; f++) {
-        output[batch * features + f] *= invSum;
+    // Reduce sum across workgroup
+    localBuf[lid] = threadSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            localBuf[lid] += localBuf[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float rowSum = localBuf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 3: Normalize
+    float invSum = 1.0f / rowSum;
+    for (int f = lid; f < features; f += localSize) {
+        rowOut[f] *= invSum;
     }
 }
 

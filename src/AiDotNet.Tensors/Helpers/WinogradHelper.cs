@@ -1,6 +1,5 @@
 using System;
 using System.Buffers;
-using System.Numerics.Tensors;
 
 namespace AiDotNet.Tensors.Helpers;
 
