@@ -375,6 +375,18 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipFree(IntPtr ptr);
 
+    /// <summary>
+    /// Allocates page-locked (pinned) host memory for true async DMA transfers.
+    /// </summary>
+    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
+    public static extern HipError hipHostMalloc(ref IntPtr ptr, UIntPtr size, uint flags);
+
+    /// <summary>
+    /// Frees page-locked (pinned) host memory.
+    /// </summary>
+    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
+    public static extern HipError hipHostFree(IntPtr ptr);
+
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipMemcpy(
         IntPtr dst,

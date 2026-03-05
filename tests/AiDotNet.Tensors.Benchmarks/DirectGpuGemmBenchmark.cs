@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Sparsity;
@@ -331,6 +332,40 @@ public static class DirectGpuGemmBenchmark
         Console.WriteLine("═══════════════════════════════════════════════════════════════════");
         Console.WriteLine("BACKEND AVAILABILITY DIAGNOSTICS");
         Console.WriteLine("═══════════════════════════════════════════════════════════════════");
+        Console.WriteLine();
+
+        // Check CUDA availability
+        Console.WriteLine("[CUDA Backend Check]");
+        try
+        {
+            bool cudaDriverAvailable = CudaNativeBindings.IsAvailable;
+            Console.WriteLine($"  CudaNativeBindings.IsAvailable (nvcuda.dll): {cudaDriverAvailable}");
+            bool nvrtcAvailable = NvrtcNativeBindings.IsAvailable;
+            Console.WriteLine($"  NvrtcNativeBindings.IsAvailable (nvrtc DLL): {nvrtcAvailable}");
+            Console.WriteLine($"  CudaBackend.IsCudaAvailable: {CudaBackend.IsCudaAvailable}");
+            if (CudaBackend.IsCudaAvailable)
+            {
+                try
+                {
+                    Console.WriteLine("  Attempting to create CudaBackend...");
+                    var cudaTest = new CudaBackend();
+                    Console.WriteLine($"  CudaBackend created. IsAvailable={cudaTest.IsAvailable}, Device={cudaTest.DeviceName}");
+                    cudaTest.Dispose();
+                }
+                catch (Exception cbEx)
+                {
+                    Console.WriteLine($"  CudaBackend constructor threw: {cbEx.GetType().Name}: {cbEx.Message}");
+                    if (cbEx.InnerException != null)
+                        Console.WriteLine($"    Inner: {cbEx.InnerException.GetType().Name}: {cbEx.InnerException.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Exception checking CUDA: {ex.GetType().Name}: {ex.Message}");
+            if (ex.InnerException != null)
+                Console.WriteLine($"    Inner: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
+        }
         Console.WriteLine();
 
         // Check HIP availability

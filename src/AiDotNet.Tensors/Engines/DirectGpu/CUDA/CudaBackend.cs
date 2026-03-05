@@ -2,6 +2,7 @@
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -40,12 +41,20 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _gruModule;
     private IntPtr _fp16Module;
     private bool _disposed;
-    private const int MaxPooledBufferElements = 1_048_576;
+    private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
+    private readonly CudaPinnedBufferPool _pinnedPool = new();
+    private IntPtr _wmmaModule;
+    private int _ccMajor;
+    private int _ccMinor;
+    private bool _hasWmmaSupport;
+
+    [ThreadStatic]
+    private static IntPtr _threadCurrentContext;
 
     public bool IsAvailable { get; }
     public string BackendName => "CUDA";
@@ -164,6 +173,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, _stream), "cublasSetStream");
             CuBlasNative.cublasSetMathMode(_cublasHandle, CuBlasNative.CUBLAS_TENSOR_OP_MATH);
 
+            var cc = GetComputeCapability(device);
+            _ccMajor = cc.Major;
+            _ccMinor = cc.Minor;
+
             CompileAllKernels(device);
 
             IsAvailable = true;
@@ -171,6 +184,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
+            System.Diagnostics.Trace.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
             DeviceName = "None";
             IsAvailable = false;
             Dispose();
@@ -179,25 +193,65 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private readonly struct CudaContextScope : IDisposable
     {
-        private readonly bool _active;
+        private readonly bool _needsPop;
 
         public CudaContextScope(IntPtr context)
         {
-            _active = context != IntPtr.Zero;
-            if (_active)
+            // Skip push/pop if this thread already has the right context set
+            if (context != IntPtr.Zero && _threadCurrentContext != context)
+            {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
+                _threadCurrentContext = context;
+                _needsPop = true;
+            }
+            else
+            {
+                _needsPop = false;
+            }
         }
 
         public void Dispose()
         {
-            if (_active)
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
+            if (_needsPop)
+            {
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out var prev), "cuCtxPopCurrent");
+                _threadCurrentContext = prev;
+            }
         }
     }
 
     private CudaContextScope PushContext()
     {
         return new CudaContextScope(_cudaContext);
+    }
+
+    private static string? GetCudaIncludePath()
+    {
+        // Check CUDA_PATH environment variable first
+        var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
+
+        // Fall back to scanning standard install location
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var basePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "NVIDIA GPU Computing Toolkit", "CUDA");
+            if (Directory.Exists(basePath))
+            {
+                var versions = Directory.GetDirectories(basePath, "v*");
+                Array.Sort(versions);
+                if (versions.Length > 0)
+                    cudaPath = versions[^1];
+            }
+        }
+
+        if (string.IsNullOrEmpty(cudaPath))
+            return null;
+
+        var includePath = Path.Combine(cudaPath, "include");
+        return Directory.Exists(includePath) ? includePath : null;
     }
 
     private static (int Major, int Minor) GetComputeCapability(int device)
@@ -276,9 +330,48 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private IntPtr CompileKernelModule(int device, string source, string moduleName, string[] kernelNames)
     {
+        // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
+        // CUDA device math functions (expf, sqrtf, tanhf, etc.) are built-in.
+        // We prepend defines for macros normally provided by those headers.
+        source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
+                       .Replace("#include <float.h>", "// float.h stripped for NVRTC (built-in)")
+                       .Replace("#include <stdio.h>", "// stdio.h stripped for NVRTC");
+
+        // Prepend standard macro definitions that NVRTC doesn't provide by default
+        const string nvrtcPreamble = @"
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+#ifndef NAN
+#define NAN __int_as_float(0x7fffffff)
+#endif
+#ifndef FLT_MAX
+#define FLT_MAX 3.402823466e+38f
+#endif
+#ifndef FLT_MIN
+#define FLT_MIN 1.175494351e-38f
+#endif
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_F
+#define M_PI_F 3.14159265f
+#endif
+";
+        source = nvrtcPreamble + source;
+
         var (major, minor) = GetComputeCapability(device);
-        string arch = $"--gpu-architecture=compute_{major}{minor}";
-        string[] options = new[] { arch, "--use_fast_math" };
+        // Use sm_XX to generate device-native CUBIN (avoids PTX ISA version issues
+        // when the toolkit is newer than the driver's max supported CUDA version).
+        string arch = $"--gpu-architecture=sm_{major}{minor}";
+        var optionsList = new List<string> { arch, "--use_fast_math" };
+
+        // Add CUDA include path for headers like cooperative_groups.h, cuda_fp16.h, mma.h
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+
+        string[] options = optionsList.ToArray();
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
@@ -299,25 +392,55 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException($"NVRTC compile failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}\n{log}");
         }
 
-        result = NvrtcNativeBindings.nvrtcGetPTXSize(program, out UIntPtr ptxSize);
-        if (result != NvrtcResult.Success || ptxSize == UIntPtr.Zero)
+        // sm_XX targets produce CUBIN (native binary) which avoids PTX ISA version
+        // compatibility issues between toolkit and driver versions.
+        // compute_XX targets produce PTX (intermediate) which needs JIT by the driver.
+        bool useCubin = arch.Contains("sm_");
+        IntPtr binary;
+        UIntPtr binarySize;
+
+        if (useCubin)
         {
-            NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
-            throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
+            result = NvrtcNativeBindings.nvrtcGetCUBINSize(program, out binarySize);
+            if (result != NvrtcResult.Success || binarySize == UIntPtr.Zero)
+            {
+                NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
+                throw new InvalidOperationException($"NVRTC failed to return CUBIN size for {moduleName}.");
+            }
+
+            binary = Marshal.AllocHGlobal((int)binarySize);
+            result = NvrtcNativeBindings.nvrtcGetCUBIN(program, binary);
+        }
+        else
+        {
+            result = NvrtcNativeBindings.nvrtcGetPTXSize(program, out binarySize);
+            if (result != NvrtcResult.Success || binarySize == UIntPtr.Zero)
+            {
+                NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
+                throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
+            }
+
+            binary = Marshal.AllocHGlobal((int)binarySize);
+            result = NvrtcNativeBindings.nvrtcGetPTX(program, binary);
         }
 
-        IntPtr ptx = Marshal.AllocHGlobal((int)ptxSize);
-        result = NvrtcNativeBindings.nvrtcGetPTX(program, ptx);
         NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
 
         if (result != NvrtcResult.Success)
         {
-            Marshal.FreeHGlobal(ptx);
-            throw new InvalidOperationException($"NVRTC get PTX failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
+            Marshal.FreeHGlobal(binary);
+            throw new InvalidOperationException($"NVRTC get {(useCubin ? "CUBIN" : "PTX")} failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
         }
 
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out IntPtr module, ptx), $"cuModuleLoadData({moduleName})");
-        Marshal.FreeHGlobal(ptx);
+        IntPtr module;
+        try
+        {
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out module, binary), $"cuModuleLoadData({moduleName})");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(binary);
+        }
 
         foreach (var kernelName in kernelNames)
         {
@@ -359,13 +482,52 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _specializedModule = CompileKernelModule(device, CudaSpecializedKernels.GetSource(), "specialized_kernels", CudaSpecializedKernels.GetKernelNames());
 
         // Compile FP16 conversion kernels (half-precision float conversion)
-        _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
+        // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
+        try
+        {
+            _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
+        }
+        catch
+        {
+            // FP16 kernels are optional — fall back to FP32 paths.
+        }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
-        _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
+        try
+        {
+            _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
+        }
+        catch
+        {
+            // LSTM kernels may need special headers — optional.
+        }
 
         // Compile GRU sequence kernels (forward/backward for BPTT training)
-        _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
+        // Needs cooperative_groups.h which may not be in minimal CUDA Toolkit installs.
+        try
+        {
+            _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
+        }
+        catch
+        {
+            // GRU kernels need cooperative_groups.h — optional.
+        }
+
+        // Compile WMMA Tensor Core kernels for Volta+ (sm_70+)
+        if (_ccMajor >= 7)
+        {
+            try
+            {
+                _wmmaModule = CompileKernelModule(device, CudaWmmaKernels.GetSource(), "wmma_kernels", CudaWmmaKernels.GetKernelNames());
+                _hasWmmaSupport = true;
+            }
+            catch
+            {
+                // WMMA compilation may fail if NVRTC doesn't support mma.h headers.
+                // Fall back to Phase 3 tiled GEMM kernels silently.
+                _hasWmmaSupport = false;
+            }
+        }
     }
 
     private static string GetNvrtcLog(IntPtr program)
@@ -597,6 +759,67 @@ public sealed class CudaBackend : IAsyncGpuBackend
         ValidateBiasBuffer(bias, N);
         var output = MatMul(A, B, M, N, K);
         ApplyBiasInPlace(output, bias, M, N);
+        return output;
+    }
+
+    public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+    {
+        ValidateBiasBuffer(bias, N);
+        var output = AllocateBuffer(M * N);
+        ExecuteFusedGemm("gemm_bias_swish", A, B, bias, output, M, N, K);
+        return output;
+    }
+
+    public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
+    {
+        ValidateBiasBuffer(bias, N);
+        var output = AllocateBuffer(M * N);
+
+        // LeakyReLU kernel has an extra alpha parameter
+        string wmmaName = "gemm_bias_leaky_relu_wmma";
+        string scalarName = "gemm_bias_leaky_relu";
+        bool useWmma = _hasWmmaSupport && _kernelCache.TryGetValue(wmmaName, out var wmmaKernel);
+        string kernelName = useWmma ? wmmaName : scalarName;
+
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
+
+        using var _ = PushContext();
+        IntPtr aPtr = A.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outPtr = output.Handle;
+        int m = M, n = N, k = K;
+
+        void** args = stackalloc void*[8];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &biasPtr;
+        args[3] = &outPtr;
+        args[4] = &m;
+        args[5] = &n;
+        args[6] = &k;
+        args[7] = &alpha;
+
+        if (useWmma)
+        {
+            const int WMMA_TILE = 32;
+            uint gridX = (uint)((N + WMMA_TILE - 1) / WMMA_TILE);
+            uint gridY = (uint)((M + WMMA_TILE - 1) / WMMA_TILE);
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, 128, 1, 1,
+                    0, _stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel(WMMA LeakyReLU)");
+        }
+        else
+        {
+            const int BM = 128;
+            const int BN = 128;
+            uint gridX = (uint)((N + BN - 1) / BN);
+            uint gridY = (uint)((M + BM - 1) / BM);
+            LaunchKernel2D(kernel, gridX, gridY, 1, 16, 16, args);
+        }
+
         return output;
     }
 
@@ -1383,8 +1606,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var partialBuffer = AllocateBuffer(gridSize);
         LaunchReductionKernel("reduce_sum", A, partialBuffer, size, blockSize);
-        Synchronize();
-
+        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
         var partials = DownloadBuffer(partialBuffer);
         float sum = 0.0f;
         for (int i = 0; i < partials.Length; i++)
@@ -1438,9 +1660,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 currentSize = gridSize;
             }
 
-            Synchronize();
-
-            // Download just the single scalar result
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             var result = new float[1];
             DownloadBuffer(currentBuffer, result);
             return result[0];
@@ -1466,8 +1686,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var partialBuffer = AllocateBuffer(gridSize);
         LaunchReductionKernel("reduce_max", A, partialBuffer, size, blockSize);
-        Synchronize();
-
+        // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
         var partials = DownloadBuffer(partialBuffer);
         float max = float.MinValue;
         for (int i = 0; i < partials.Length; i++)
@@ -1587,19 +1806,39 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        fixed (float* dataPtr = data)
+        int byteSize = data.Length * sizeof(float);
+
+        // Use pinned host memory for true async DMA transfer.
+        // Unlike a fixed block, pinned memory stays resident without synchronization,
+        // enabling real compute-transfer overlap.
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
             var result = CudaNativeBindings.cuMemcpyHtoDAsync(
                 buffer.Handle,
-                (IntPtr)dataPtr,
-                (ulong)(data.Length * sizeof(float)),
+                pinnedPtr,
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyHtoDAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
+            // Record an event so we know when to return the pinned buffer.
+            // For now, we synchronize the stream to safely return the buffer.
+            // A future optimization could use event callbacks to defer the return.
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned upload)");
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -1608,19 +1847,33 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        fixed (float* dataPtr = data)
+        int byteSize = data.Length * sizeof(float);
+
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
+            fixed (float* src = data)
+            {
+                Buffer.MemoryCopy(src, (void*)pinnedPtr, byteSize, byteSize);
+            }
+
             var result = CudaNativeBindings.cuMemcpyHtoDAsync(
                 buffer.Handle,
-                (IntPtr)dataPtr,
-                (ulong)(data.Length * sizeof(float)),
+                pinnedPtr,
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyHtoDAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned upload)");
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -1630,19 +1883,34 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (destination.Length > buffer.Size)
+            throw new ArgumentException($"Destination ({destination.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        fixed (float* destPtr = destination)
+        int byteSize = destination.Length * sizeof(float);
+
+        var pinnedPtr = _pinnedPool.Rent(byteSize);
+        try
         {
             var result = CudaNativeBindings.cuMemcpyDtoHAsync(
-                (IntPtr)destPtr,
+                pinnedPtr,
                 buffer.Handle,
-                (ulong)(destination.Length * sizeof(float)),
+                (ulong)byteSize,
                 stream.Handle);
             CuBlasNative.CheckCudaResult(result, "cuMemcpyDtoHAsync");
-            // Synchronize stream to ensure transfer completes before the fixed block exits
+
+            // Must synchronize before copying out of pinned buffer
             var syncResult = CudaNativeBindings.cuStreamSynchronize(stream.Handle);
-            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize");
+            CuBlasNative.CheckCudaResult(syncResult, "cuStreamSynchronize(pinned download)");
+
+            fixed (float* dst = destination)
+            {
+                Buffer.MemoryCopy((void*)pinnedPtr, dst, byteSize, byteSize);
+            }
+        }
+        finally
+        {
+            _pinnedPool.Return(pinnedPtr, byteSize);
         }
     }
 
@@ -1813,9 +2081,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         using var _ = PushContext();
 
-        const int TILE_SIZE = 16;
-        uint gridX = (uint)((N + TILE_SIZE - 1) / TILE_SIZE);
-        uint gridY = (uint)((M + TILE_SIZE - 1) / TILE_SIZE);
+        // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
+        const int BM = 128;
+        const int BN = 128;
+        const int BLOCK_DIM = 16;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
 
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
@@ -1832,13 +2103,29 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[5] = &n;
         args[6] = &k;
 
-        LaunchKernel2DOnStream(kernel, gridX, gridY, 1, TILE_SIZE, TILE_SIZE, args, stream.Handle);
+        LaunchKernel2DOnStream(kernel, gridX, gridY, 1, BLOCK_DIM, BLOCK_DIM, args, stream.Handle);
     }
 
     #endregion
 
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // Try vec4 variant for 4x throughput on bandwidth-limited ops
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr inPtrV = input.Handle;
+            IntPtr outPtrV = output.Handle;
+            void** argsV = stackalloc void*[3];
+            argsV[0] = &inPtrV;
+            argsV[1] = &outPtrV;
+            argsV[2] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
@@ -1856,6 +2143,24 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        // Try vec4 variant for 4x throughput on bandwidth-limited ops
+        if (size % 4 == 0 && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr aPtrV = A.Handle;
+            IntPtr bPtrV = B.Handle;
+            IntPtr cPtrV = C.Handle;
+            void** argsV = stackalloc void*[4];
+            argsV[0] = &aPtrV;
+            argsV[1] = &bPtrV;
+            argsV[2] = &cPtrV;
+            argsV[3] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
@@ -1875,6 +2180,24 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
+        // Try vec4 variant
+        if (size % 4 == 0 && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
+        {
+            using var _v = PushContext();
+            int size4 = size / 4;
+            uint gridV = (uint)((size4 + DefaultBlockSize - 1) / DefaultBlockSize);
+            IntPtr aPtrV = A.Handle;
+            IntPtr bPtrV = B.Handle;
+            float scalarV = scalar;
+            void** argsV = stackalloc void*[4];
+            argsV[0] = &aPtrV;
+            argsV[1] = &bPtrV;
+            argsV[2] = &scalarV;
+            argsV[3] = &size4;
+            LaunchKernel(vec4Kernel, gridV, DefaultBlockSize, argsV);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("scale_vector", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: scale_vector");
 
@@ -1917,7 +2240,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: softmax");
 
         using var _ = PushContext();
-        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+
+        // 1 block per batch element, 256 threads cooperate on parallel reduction
+        // Shared memory: ceil(256/32) = 8 warps * sizeof(float) = 32 bytes
+        uint grid = (uint)batchSize;
+        const uint blockSize = 256;
+        uint sharedMem = (blockSize / 32) * sizeof(float);
+
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         int batches = batchSize;
@@ -1927,7 +2256,11 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[1] = &outputPtr;
         args[2] = &batches;
         args[3] = &feats;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, blockSize, 1, 1,
+                sharedMem, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(softmax)");
     }
 
     private unsafe void LaunchReductionKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, int blockSize)
@@ -2047,6 +2380,34 @@ public sealed class CudaBackend : IAsyncGpuBackend
             "cuLaunchKernel2D");
     }
 
+    private unsafe void LaunchKernel2DWithSharedMem(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, uint sharedMemBytes, void** args)
+    {
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(
+                kernel,
+                gridX, gridY, 1,
+                blockX, blockY, 1,
+                sharedMemBytes,
+                _stream,
+                (IntPtr)args,
+                IntPtr.Zero),
+            "cuLaunchKernel2DSharedMem");
+    }
+
+    private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMemBytes = 0)
+    {
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(
+                kernel,
+                gridX, gridY, gridZ,
+                blockX, blockY, blockZ,
+                sharedMemBytes,
+                _stream,
+                (IntPtr)args,
+                IntPtr.Zero),
+            "cuLaunchKernel3D");
+    }
+
     private static void ValidateGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer? C, int M, int N, int K)
     {
         if (M <= 0 || N <= 0 || K <= 0)
@@ -2099,14 +2460,25 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private unsafe void ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K)
     {
+        // Try WMMA tensor core kernel first (sm_70+, 2-4x faster for large matrices)
+        string wmmaName = kernelName + "_wmma";
+        if (_hasWmmaSupport && _kernelCache.TryGetValue(wmmaName, out var wmmaKernel))
+        {
+            ExecuteWmmaGemm(wmmaKernel, A, B, bias, output, M, N, K);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
 
         using var _ = PushContext();
 
-        const int TILE_SIZE = 16;
-        uint gridX = (uint)((N + TILE_SIZE - 1) / TILE_SIZE);
-        uint gridY = (uint)((M + TILE_SIZE - 1) / TILE_SIZE);
+        // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
+        const int BM = 128;
+        const int BN = 128;
+        const int BLOCK_DIM = 16;
+        uint gridX = (uint)((N + BN - 1) / BN);
+        uint gridY = (uint)((M + BM - 1) / BM);
 
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
@@ -2123,7 +2495,38 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[5] = &n;
         args[6] = &k;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, TILE_SIZE, TILE_SIZE, args);
+        LaunchKernel2D(kernel, gridX, gridY, 1, BLOCK_DIM, BLOCK_DIM, args);
+    }
+
+    private unsafe void ExecuteWmmaGemm(IntPtr kernel, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K)
+    {
+        using var _ = PushContext();
+
+        // 32x32 CTA tile with 128 threads (4 warps, each computing 16x16 via tensor cores)
+        const int WMMA_TILE = 32;
+        const int WMMA_THREADS = 128;
+        uint gridX = (uint)((N + WMMA_TILE - 1) / WMMA_TILE);
+        uint gridY = (uint)((M + WMMA_TILE - 1) / WMMA_TILE);
+
+        IntPtr aPtr = A.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outPtr = output.Handle;
+        int m = M, n = N, k = K;
+
+        void** args = stackalloc void*[7];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &biasPtr;
+        args[3] = &outPtr;
+        args[4] = &m;
+        args[5] = &n;
+        args[6] = &k;
+
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, gridX, gridY, 1, WMMA_THREADS, 1, 1,
+                0, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel(WMMA)");
     }
 
     private static void ValidateBatchedGemmArgs(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount)
@@ -2157,34 +2560,113 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        if (!_kernelCache.TryGetValue("conv2d_direct", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct");
-
         using var _ = PushContext();
-        int totalOutput = batch * outChannels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
-        void** args = stackalloc void*[17];
-        args[0] = &inputPtr;
-        args[1] = &kernelPtr;
-        args[2] = &outputPtr;
-        args[3] = &batch;
-        args[4] = &inChannels;
-        args[5] = &inHeight;
-        args[6] = &inWidth;
-        args[7] = &outChannels;
-        args[8] = &outHeight;
-        args[9] = &outWidth;
-        args[10] = &kernelH;
-        args[11] = &kernelW;
-        args[12] = &strideH;
-        args[13] = &strideW;
-        args[14] = &padH;
-        args[15] = &padW;
-        args[16] = &totalOutput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+
+        // Route 3x3 stride-1 dilation-1 convolutions through Winograd F(2x2,3x3)
+        if (kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1 &&
+            dilationH == 1 && dilationW == 1 &&
+            _kernelCache.TryGetValue("conv2d_winograd_f2x2_3x3", out var winogradKernel))
+        {
+            int tilesH = (outHeight + 1) / 2;
+            int tilesW = (outWidth + 1) / 2;
+            int totalTiles = batch * outChannels * tilesH * tilesW;
+            uint gridX = (uint)((totalTiles + DefaultBlockSize - 1) / DefaultBlockSize);
+
+            void** wArgs = stackalloc void*[12];
+            wArgs[0] = &inputPtr;
+            wArgs[1] = &kernelPtr;
+            wArgs[2] = &outputPtr;
+            wArgs[3] = &batch;
+            wArgs[4] = &inChannels;
+            wArgs[5] = &inHeight;
+            wArgs[6] = &inWidth;
+            wArgs[7] = &outChannels;
+            wArgs[8] = &outHeight;
+            wArgs[9] = &outWidth;
+            wArgs[10] = &padH;
+            wArgs[11] = &padW;
+            LaunchKernel(winogradKernel, gridX, DefaultBlockSize, wArgs);
+            return;
+        }
+
+        // Use shared-memory tiled kernel when available
+        if (_kernelCache.TryGetValue("conv2d_tiled", out var tiledKernel))
+        {
+            const int TILE_OUT = 16;
+            uint gx = (uint)((outWidth + TILE_OUT - 1) / TILE_OUT);
+            uint gy = (uint)((outHeight + TILE_OUT - 1) / TILE_OUT);
+            uint gz = (uint)(batch * outChannels);
+
+            // Shared memory: one input channel tile at a time
+            int effKH = (kernelH - 1) * dilationH + 1;
+            int effKW = (kernelW - 1) * dilationW + 1;
+            int tileInH = TILE_OUT * strideH + effKH - strideH;
+            int tileInW = TILE_OUT * strideW + effKW - strideW;
+            uint sharedMem = (uint)(tileInH * tileInW * sizeof(float));
+
+            void** tArgs = stackalloc void*[17];
+            tArgs[0] = &inputPtr;
+            tArgs[1] = &kernelPtr;
+            tArgs[2] = &outputPtr;
+            tArgs[3] = &batch;
+            tArgs[4] = &inChannels;
+            tArgs[5] = &inHeight;
+            tArgs[6] = &inWidth;
+            tArgs[7] = &outChannels;
+            tArgs[8] = &outHeight;
+            tArgs[9] = &outWidth;
+            tArgs[10] = &kernelH;
+            tArgs[11] = &kernelW;
+            tArgs[12] = &strideH;
+            tArgs[13] = &strideW;
+            tArgs[14] = &padH;
+            tArgs[15] = &padW;
+            tArgs[16] = &dilationH;
+            // Note: dilationW is tArgs[17] but the kernel reads it from the parameter list
+            // The tiled kernel uses the same 17 params as conv2d_direct (minus dilationW which
+            // is passed as the 18th)
+            void** tArgs2 = stackalloc void*[18];
+            for (int i = 0; i < 17; i++) tArgs2[i] = tArgs[i];
+            tArgs2[17] = &dilationW;
+
+            LaunchKernel3D(tiledKernel, gx, gy, gz, TILE_OUT, TILE_OUT, 1, tArgs2, sharedMem);
+            return;
+        }
+
+        // Fallback: direct convolution with correct 3D grid
+        if (!_kernelCache.TryGetValue("conv2d_direct", out var cudaKernel))
+            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct");
+
+        {
+            const int BLOCK = 16;
+            uint dgx = (uint)((outWidth + BLOCK - 1) / BLOCK);
+            uint dgy = (uint)((outHeight + BLOCK - 1) / BLOCK);
+            uint dgz = (uint)(batch * outChannels);
+
+            void** dArgs = stackalloc void*[18];
+            dArgs[0] = &inputPtr;
+            dArgs[1] = &kernelPtr;
+            dArgs[2] = &outputPtr;
+            dArgs[3] = &batch;
+            dArgs[4] = &inChannels;
+            dArgs[5] = &inHeight;
+            dArgs[6] = &inWidth;
+            dArgs[7] = &outChannels;
+            dArgs[8] = &outHeight;
+            dArgs[9] = &outWidth;
+            dArgs[10] = &kernelH;
+            dArgs[11] = &kernelW;
+            dArgs[12] = &strideH;
+            dArgs[13] = &strideW;
+            dArgs[14] = &padH;
+            dArgs[15] = &padW;
+            dArgs[16] = &dilationH;
+            dArgs[17] = &dilationW;
+            LaunchKernel3D(cudaKernel, dgx, dgy, dgz, (uint)BLOCK, (uint)BLOCK, 1, dArgs, 0);
+        }
     }
 
     public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -2198,12 +2680,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_input");
 
         using var _ = PushContext();
-        int totalInput = batch * inChannels * inHeight * inWidth;
-        uint gridX = (uint)((totalInput + DefaultBlockSize - 1) / DefaultBlockSize);
+        const int BLOCK = 16;
+        uint gx = (uint)((inWidth + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((inHeight + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(batch * inChannels);
+
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr gradInputPtr = gradInput.Handle;
-        void** args = stackalloc void*[17];
+        void** args = stackalloc void*[18];
         args[0] = &gradOutputPtr;
         args[1] = &kernelPtr;
         args[2] = &gradInputPtr;
@@ -2220,8 +2705,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &strideW;
         args[14] = &padH;
         args[15] = &padW;
-        args[16] = &totalInput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[16] = &dilationH;
+        args[17] = &dilationW;
+        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
     }
 
     public unsafe void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -2235,12 +2721,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
         using var _ = PushContext();
-        int totalKernel = outChannels * inChannels * kernelH * kernelW;
-        uint gridX = (uint)((totalKernel + DefaultBlockSize - 1) / DefaultBlockSize);
+        const int BLOCK = 16;
+        uint gx = (uint)((kernelW + BLOCK - 1) / BLOCK);
+        uint gy = (uint)((kernelH + BLOCK - 1) / BLOCK);
+        uint gz = (uint)(outChannels * inChannels);
+
         IntPtr inputPtr = input.Handle;
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr gradKernelPtr = gradKernel.Handle;
-        void** args = stackalloc void*[17];
+        void** args = stackalloc void*[18];
         args[0] = &inputPtr;
         args[1] = &gradOutputPtr;
         args[2] = &gradKernelPtr;
@@ -2257,8 +2746,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &strideW;
         args[14] = &padH;
         args[15] = &padW;
-        args[16] = &totalKernel;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[16] = &dilationH;
+        args[17] = &dilationW;
+        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
     }
 
     public unsafe void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -2314,12 +2804,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: depthwise_conv2d");
 
         using var _ = PushContext();
-        int totalOutput = batch * channels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
-        void** args = stackalloc void*[14];
+        void** args = stackalloc void*[15];
         args[0] = &inputPtr;
         args[1] = &kernelPtr;
         args[2] = &outputPtr;
@@ -2333,8 +2821,14 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[10] = &kernelW;
         args[11] = &strideH;
         args[12] = &strideW;
-        args[13] = &totalOutput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[13] = &padH;
+        args[14] = &padW;
+        // Kernel uses 3D grid: blockIdx.x→outWidth, blockIdx.y→outHeight, blockIdx.z→batch*channels
+        const uint blockDimXY = 16;
+        uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
+        uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
+        uint gz = (uint)(batch * channels);
+        LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
     public unsafe void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -2348,8 +2842,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv_transpose2d");
 
         using var _ = PushContext();
-        int totalOutput = batch * outChannels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
@@ -2372,7 +2864,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[15] = &padW;
         args[16] = &outputPadH;
         args[17] = &outputPadW;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        // Kernel uses 3D grid: blockIdx.x→outWidth, blockIdx.y→outHeight, blockIdx.z→batch*outChannels
+        const uint blockDimXY = 16;
+        uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
+        uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
+        uint gz = (uint)(batch * outChannels);
+        LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
     public unsafe void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -3428,7 +3925,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[11] = &epsilon;
         args[12] = &momentum;
         args[13] = &trainingInt;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per channel, 256 threads, 1 shared array for parallel reduction
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3461,7 +3959,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[9] = &channels;
         args[10] = &spatialSize;
         args[11] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 3 shared arrays for dGamma, dBeta, sumDyXmu parallel reductions
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(3 * DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3488,7 +3987,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[6] = &batchSize;
         args[7] = &normalizedSize;
         args[8] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3520,7 +4020,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[8] = &batchSize;
         args[9] = &normalizedSize;
         args[10] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 2 shared arrays for sumDy and sumDyXmu
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3549,7 +4050,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[8] = &channels;
         args[9] = &spatialSize;
         args[10] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per (batch, group), 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void InstanceNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -3577,7 +4079,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[7] = &channels;
         args[8] = &spatialSize;
         args[9] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per (batch, channel), 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void InstanceNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -3718,7 +4221,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[9] = &channels;
         args[10] = &spatialSize;
         args[11] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // InstanceNormBackward: 1 block per (batch, channel)
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -3741,7 +4245,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[4] = &batchSize;
         args[5] = &normalizedSize;
         args[6] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
     public unsafe void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -3769,7 +4274,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[6] = &batchSize;
         args[7] = &normalizedSize;
         args[8] = &epsilon;
-        LaunchKernel(kernel, gridX, DefaultBlockSize, args);
+        // 1 block per batch element, 1 shared array
+        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
 
         // Compute gradGamma using rmsnorm_grad_gamma kernel
         if (!_kernelCache.TryGetValue("rmsnorm_grad_gamma", out var kernel2))
@@ -4057,7 +4563,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &hasBias;
         args[14] = &biasBatchStride;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args);
+        // Shared memory: 2 * ATTN_BC(32) * headDim * sizeof(float)
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     public unsafe void FlashAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4068,7 +4576,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         using var _ = PushContext();
         var kernel = _kernelCache["flash_attention_backward"];
-        uint gridX = (uint)((seqQ + 63) / 64);
+        uint gridX = (uint)((seqQ + 31) / 32);
         uint gridY = (uint)(batch * numHeads);
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
@@ -4104,7 +4612,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[17] = &hasBias;
         args[18] = &biasBatchStride;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 64, 1, args);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     public unsafe void GroupedQueryAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4144,7 +4653,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         for (int i = 0; i < 14; i++) args2[i] = args[i];
         args2[14] = &storeWeights;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args2);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args2);
     }
 
     public unsafe void GroupedQueryAttentionBackward(IGpuBuffer gradOutput, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -4184,7 +4694,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[14] = &headDim;
         args[15] = &scale;
 
-        LaunchKernel2D(kernel, gridX, gridY, 1, 32, 1, args);
+        uint sharedBytes = (uint)(2 * 32 * headDim * sizeof(float));
+        LaunchKernel2DWithSharedMem(kernel, gridX, gridY, 32, 1, sharedBytes, args);
     }
 
     #endregion
@@ -8266,6 +8777,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             return;
 
         _disposed = true;
+        _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
         if (_cublasHandle != IntPtr.Zero)
@@ -8362,6 +8874,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_gruModule);
             _gruModule = IntPtr.Zero;
+        }
+
+        if (_wmmaModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_wmmaModule);
+            _wmmaModule = IntPtr.Zero;
         }
 
         if (_fusedConvolutionModule != IntPtr.Zero)

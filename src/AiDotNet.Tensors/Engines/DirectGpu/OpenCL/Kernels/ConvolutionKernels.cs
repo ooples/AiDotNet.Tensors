@@ -486,6 +486,240 @@ __kernel void conv_transpose2d_backward_weights(
     gradWeights[idx] = sum;
 }
 
+// ===========================================================================
+// TILED CONV2D WITH SHARED MEMORY
+// 16x16 output tile, cooperative input tile loading with halo
+// ===========================================================================
+
+#define TILE_OUT 16
+
+__kernel void conv2d_tiled(
+    __global const float* input,
+    __global const float* weights,
+    __global float* output,
+    const int batch,
+    const int inChannels,
+    const int inHeight,
+    const int inWidth,
+    const int outChannels,
+    const int outHeight,
+    const int outWidth,
+    const int kernelH,
+    const int kernelW,
+    const int strideH,
+    const int strideW,
+    const int padH,
+    const int padW,
+    const int dilationH,
+    const int dilationW,
+    __local float* sharedInput)
+{
+    // Each workgroup handles one output tile for one (batch, outChannel) pair
+    const int tileX = get_group_id(0);  // output tile column
+    const int tileY = get_group_id(1);  // output tile row
+    const int boc = get_group_id(2);    // batch * outChannels + oc
+    const int oc = boc % outChannels;
+    const int b = boc / outChannels;
+
+    const int lidX = get_local_id(0);
+    const int lidY = get_local_id(1);
+    const int outX = tileX * TILE_OUT + lidX;
+    const int outY = tileY * TILE_OUT + lidY;
+
+    if (b >= batch) return;
+
+    float sum = 0.0f;
+
+    // Process one input channel at a time through shared memory
+    for (int ic = 0; ic < inChannels; ic++) {
+        // Compute shared memory tile dimensions (input tile = output tile * stride + kernel halo)
+        int tileInH = TILE_OUT * strideH + (kernelH - 1) * dilationH;
+        int tileInW = TILE_OUT * strideW + (kernelW - 1) * dilationW;
+        int tileInStartH = tileY * TILE_OUT * strideH - padH;
+        int tileInStartW = tileX * TILE_OUT * strideW - padW;
+
+        // Cooperative loading of input tile into shared memory
+        int totalElements = tileInH * tileInW;
+        int threadsPerGroup = TILE_OUT * TILE_OUT;
+        for (int i = lidY * TILE_OUT + lidX; i < totalElements; i += threadsPerGroup) {
+            int localH = i / tileInW;
+            int localW = i % tileInW;
+            int globalH = tileInStartH + localH;
+            int globalW = tileInStartW + localW;
+            float val = 0.0f;
+            if (globalH >= 0 && globalH < inHeight && globalW >= 0 && globalW < inWidth) {
+                val = input[((b * inChannels + ic) * inHeight + globalH) * inWidth + globalW];
+            }
+            sharedInput[localH * tileInW + localW] = val;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Compute convolution for this output element using shared memory
+        if (outX < outWidth && outY < outHeight) {
+            for (int kh = 0; kh < kernelH; kh++) {
+                for (int kw = 0; kw < kernelW; kw++) {
+                    int localH = lidY * strideH + kh * dilationH;
+                    int localW = lidX * strideW + kw * dilationW;
+                    float inVal = sharedInput[localH * tileInW + localW];
+                    float wVal = weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
+                    sum += inVal * wVal;
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (outX < outWidth && outY < outHeight) {
+        output[((b * outChannels + oc) * outHeight + outY) * outWidth + outX] = sum;
+    }
+}
+
+// ===========================================================================
+// WINOGRAD F(2x2, 3x3) CONVOLUTION
+// Reduces multiplications from 36 to 16 per 2x2 output tile for 3x3 kernels
+// stride=1, dilation=1 only
+// ===========================================================================
+
+__kernel void conv2d_winograd_f2x2_3x3(
+    __global const float* input,
+    __global const float* weights,
+    __global float* output,
+    const int batch,
+    const int inChannels,
+    const int inHeight,
+    const int inWidth,
+    const int outChannels,
+    const int outHeight,
+    const int outWidth,
+    const int padH,
+    const int padW)
+{
+    // Each work-item computes one 2x2 output tile
+    const int tileX = get_global_id(0);  // tile column index
+    const int tileY = get_global_id(1);  // tile row index
+    const int boc = get_global_id(2);    // batch * outChannels + oc
+    const int oc = boc % outChannels;
+    const int b = boc / outChannels;
+
+    int numTilesX = (outWidth + 1) / 2;
+    int numTilesY = (outHeight + 1) / 2;
+    if (tileX >= numTilesX || tileY >= numTilesY || b >= batch) return;
+
+    int outBaseY = tileY * 2;
+    int outBaseX = tileX * 2;
+
+    // Accumulate across input channels in transform domain
+    float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+    float m4 = 0.0f, m5 = 0.0f, m6 = 0.0f, m7 = 0.0f;
+    float m8 = 0.0f, m9 = 0.0f, m10 = 0.0f, m11 = 0.0f;
+    float m12 = 0.0f, m13 = 0.0f, m14 = 0.0f, m15 = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        // Load 4x4 input tile
+        float d[4][4];
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                int ih = outBaseY + r - padH;
+                int iw = outBaseX + c - padW;
+                d[r][c] = (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth)
+                    ? input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw]
+                    : 0.0f;
+            }
+        }
+
+        // B^T * d * B (input transform)
+        float bt0 = d[0][0] - d[2][0];
+        float bt1 = d[1][0] + d[2][0];
+        float bt2 = d[2][0] - d[1][0];
+        float bt3 = d[1][0] - d[3][0];
+        float bt4 = d[0][1] - d[2][1];
+        float bt5 = d[1][1] + d[2][1];
+        float bt6 = d[2][1] - d[1][1];
+        float bt7 = d[1][1] - d[3][1];
+        float bt8 = d[0][2] - d[2][2];
+        float bt9 = d[1][2] + d[2][2];
+        float bt10 = d[2][2] - d[1][2];
+        float bt11 = d[1][2] - d[3][2];
+        float bt12 = d[0][3] - d[2][3];
+        float bt13 = d[1][3] + d[2][3];
+        float bt14 = d[2][3] - d[1][3];
+        float bt15 = d[1][3] - d[3][3];
+
+        float v0 = bt0 - bt8;
+        float v1 = bt4 + bt8;
+        float v2 = bt8 - bt4;
+        float v3 = bt4 - bt12;
+        float v4 = bt1 - bt9;
+        float v5 = bt5 + bt9;
+        float v6 = bt9 - bt5;
+        float v7 = bt5 - bt13;
+        float v8 = bt2 - bt10;
+        float v9 = bt6 + bt10;
+        float v10 = bt10 - bt6;
+        float v11 = bt6 - bt14;
+        float v12 = bt3 - bt11;
+        float v13 = bt7 + bt11;
+        float v14 = bt11 - bt7;
+        float v15 = bt7 - bt15;
+
+        // Load 3x3 filter and compute G * g * G^T (filter transform)
+        float g[3][3];
+        for (int r = 0; r < 3; r++) {
+            for (int c2 = 0; c2 < 3; c2++) {
+                g[r][c2] = weights[((oc * inChannels + ic) * 3 + r) * 3 + c2];
+            }
+        }
+
+        float u0 = g[0][0];
+        float u1 = 0.5f * (g[0][0] + g[0][1] + g[0][2]);
+        float u2 = 0.5f * (g[0][0] - g[0][1] + g[0][2]);
+        float u3 = g[0][2];
+        float u4 = 0.5f * (g[0][0] + g[1][0] + g[2][0]);
+        float u5 = 0.25f * (g[0][0]+g[0][1]+g[0][2]+g[1][0]+g[1][1]+g[1][2]+g[2][0]+g[2][1]+g[2][2]);
+        float u6 = 0.25f * (g[0][0]-g[0][1]+g[0][2]+g[1][0]-g[1][1]+g[1][2]+g[2][0]-g[2][1]+g[2][2]);
+        float u7 = 0.5f * (g[0][2] + g[1][2] + g[2][2]);
+        float u8 = 0.5f * (g[0][0] - g[1][0] + g[2][0]);
+        float u9 = 0.25f * (g[0][0]+g[0][1]+g[0][2]-g[1][0]-g[1][1]-g[1][2]+g[2][0]+g[2][1]+g[2][2]);
+        float u10 = 0.25f * (g[0][0]-g[0][1]+g[0][2]-g[1][0]+g[1][1]-g[1][2]+g[2][0]-g[2][1]+g[2][2]);
+        float u11 = 0.5f * (g[0][2] - g[1][2] + g[2][2]);
+        float u12 = g[2][0];
+        float u13 = 0.5f * (g[2][0] + g[2][1] + g[2][2]);
+        float u14 = 0.5f * (g[2][0] - g[2][1] + g[2][2]);
+        float u15 = g[2][2];
+
+        // Element-wise multiply (accumulate)
+        m0 += v0 * u0;   m1 += v1 * u1;   m2 += v2 * u2;   m3 += v3 * u3;
+        m4 += v4 * u4;   m5 += v5 * u5;   m6 += v6 * u6;   m7 += v7 * u7;
+        m8 += v8 * u8;   m9 += v9 * u9;   m10 += v10 * u10; m11 += v11 * u11;
+        m12 += v12 * u12; m13 += v13 * u13; m14 += v14 * u14; m15 += v15 * u15;
+    }
+
+    // A^T * M * A (output transform)
+    float t0 = m0 + m4 + m8;
+    float t1 = m1 + m5 + m9;
+    float t2 = m2 + m6 + m10;
+    float t3 = m3 + m7 + m11;
+    float t4 = m4 - m8 - m12;
+    float t5 = m5 - m9 - m13;
+    float t6 = m6 - m10 - m14;
+    float t7 = m7 - m11 - m15;
+
+    float y00 = t0 + t1 + t2;
+    float y01 = t1 - t2 - t3;
+    float y10 = t4 + t5 + t6;
+    float y11 = t5 - t6 - t7;
+
+    // Write output (handle boundary)
+    if (outBaseY < outHeight && outBaseX < outWidth)
+        output[((b * outChannels + oc) * outHeight + outBaseY) * outWidth + outBaseX] = y00;
+    if (outBaseY < outHeight && outBaseX + 1 < outWidth)
+        output[((b * outChannels + oc) * outHeight + outBaseY) * outWidth + outBaseX + 1] = y01;
+    if (outBaseY + 1 < outHeight && outBaseX < outWidth)
+        output[((b * outChannels + oc) * outHeight + (outBaseY + 1)) * outWidth + outBaseX] = y10;
+    if (outBaseY + 1 < outHeight && outBaseX + 1 < outWidth)
+        output[((b * outChannels + oc) * outHeight + (outBaseY + 1)) * outWidth + outBaseX + 1] = y11;
+}
+
 // Conv3D for volumetric data
 __kernel void conv3d_direct(
     __global const float* input,
@@ -564,6 +798,8 @@ __kernel void conv3d_direct(
                 "conv_transpose2d",
                 "conv_transpose2d_backward_input",
                 "conv_transpose2d_backward_weights",
+                "conv2d_tiled",
+                "conv2d_winograd_f2x2_3x3",
                 "conv3d_direct"
             };
         }

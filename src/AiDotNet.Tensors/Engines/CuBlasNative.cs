@@ -1,5 +1,6 @@
 #if !NET462
 using System;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines;
@@ -93,14 +94,126 @@ public enum CudaResult
 public static class CuBlasNative
 {
     // cuBLAS library name varies by platform and CUDA version
-    // Windows: cublas64_12.dll (CUDA 12.x), nvcuda.dll
-    // Linux: libcublas.so.12, libcuda.so.1
+    // The DllImport resolver below handles version fallback at runtime.
 #if WINDOWS
     private const string CublasLibrary = "cublas64_12";
     private const string CudaLibrary = "nvcuda";
+
+    private static readonly string[] CublasWindowsCandidates =
+    [
+        "cublas64_13",
+        "cublas64_12",
+        "cublas64_11"
+    ];
 #else
     private const string CublasLibrary = "libcublas.so.12";
     private const string CudaLibrary = "libcuda.so.1";
+
+    private static readonly string[] CublasLinuxCandidates =
+    [
+        "libcublas.so.13",
+        "libcublas.so.12",
+        "libcublas.so.11",
+        "libcublas.so"
+    ];
+#endif
+
+#if !NET471
+    static CuBlasNative()
+    {
+        try
+        {
+            NativeLibrary.SetDllImportResolver(typeof(CuBlasNative).Assembly, ResolveCuBlasLibrary);
+        }
+        catch (InvalidOperationException)
+        {
+            // A resolver was already registered for this assembly — skip.
+        }
+    }
+
+    private static IntPtr ResolveCuBlasLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        // Only intercept cuBLAS resolution — let nvcuda/libcuda resolve normally
+        if (libraryName != CublasLibrary)
+            return IntPtr.Zero;
+
+#if WINDOWS
+        var candidates = CublasWindowsCandidates;
+#else
+        var candidates = CublasLinuxCandidates;
+#endif
+        // First try standard DLL search (PATH, system dirs, etc.)
+        foreach (var candidate in candidates)
+        {
+            if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
+                return handle;
+        }
+
+        // If not found via standard search, try full paths from CUDA_PATH
+        var cudaBinDirs = GetCudaBinDirectories();
+        foreach (var dir in cudaBinDirs)
+        {
+            foreach (var candidate in candidates)
+            {
+                var ext = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows) ? ".dll" : ".so";
+                var fullPath = System.IO.Path.Combine(dir, candidate + ext);
+                if (NativeLibrary.TryLoad(fullPath, out var handle))
+                    return handle;
+            }
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static string[] GetCudaBinDirectories()
+    {
+        var dirs = new System.Collections.Generic.List<string>();
+
+        var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
+        if (string.IsNullOrEmpty(cudaPath))
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
+
+        if (string.IsNullOrEmpty(cudaPath))
+        {
+            // Scan standard install location
+            var basePath = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "NVIDIA GPU Computing Toolkit", "CUDA");
+            if (System.IO.Directory.Exists(basePath))
+            {
+                var versions = System.IO.Directory.GetDirectories(basePath, "v*");
+                Array.Sort(versions);
+                if (versions.Length > 0)
+                    cudaPath = versions[^1];
+            }
+        }
+
+        if (!string.IsNullOrEmpty(cudaPath))
+        {
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            {
+                // Windows: CUDA 13+ uses bin\x64; older versions use bin
+                var binX64 = System.IO.Path.Combine(cudaPath, "bin", "x64");
+                if (System.IO.Directory.Exists(binX64))
+                    dirs.Add(binX64);
+                var bin = System.IO.Path.Combine(cudaPath, "bin");
+                if (System.IO.Directory.Exists(bin))
+                    dirs.Add(bin);
+            }
+            else
+            {
+                // Linux: lib64 (standard), lib (fallback)
+                var lib64 = System.IO.Path.Combine(cudaPath, "lib64");
+                if (System.IO.Directory.Exists(lib64))
+                    dirs.Add(lib64);
+                var lib = System.IO.Path.Combine(cudaPath, "lib");
+                if (System.IO.Directory.Exists(lib))
+                    dirs.Add(lib);
+            }
+        }
+
+        return dirs.ToArray();
+    }
 #endif
 
     #region CUDA Driver API
@@ -182,6 +295,20 @@ public static class CuBlasNative
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemFree_v2")]
     public static extern CudaResult cuMemFree(IntPtr devicePtr);
+
+    /// <summary>
+    /// Allocates page-locked (pinned) host memory.
+    /// Pinned memory enables true async DMA transfers without requiring
+    /// a fixed block to keep the source/destination pinned.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAllocHost_v2")]
+    public static extern CudaResult cuMemAllocHost(out IntPtr hostPtr, ulong byteSize);
+
+    /// <summary>
+    /// Frees page-locked (pinned) host memory.
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemFreeHost")]
+    public static extern CudaResult cuMemFreeHost(IntPtr hostPtr);
 
     /// <summary>
     /// Copies memory from host to device.

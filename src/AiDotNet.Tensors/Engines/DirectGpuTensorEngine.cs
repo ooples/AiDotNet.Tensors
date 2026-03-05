@@ -58,6 +58,34 @@ internal sealed class ActivationCacheEntry : IDisposable
 }
 
 /// <summary>
+/// Scope that enables GPU-resident caching of intermediate results.
+/// When active, output buffers from GPU operations are cached in the activation cache,
+/// allowing chained operations to reuse GPU buffers without re-uploading.
+/// </summary>
+public sealed class GpuScope : IDisposable
+{
+    [ThreadStatic]
+    private static int _depth;
+
+    /// <summary>
+    /// Returns true if a GpuScope is currently active on this thread.
+    /// </summary>
+    internal static bool IsActive => _depth > 0;
+
+    internal GpuScope()
+    {
+        _depth++;
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        if (_depth > 0)
+            _depth--;
+    }
+}
+
+/// <summary>
 /// IEngine implementation that routes supported ops to DirectGpuEngine and falls back to CPU.
 /// </summary>
 /// <remarks>
@@ -96,7 +124,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // CAUTION: ClearActivationCache should not be called during active GPU operations.
     private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
     private readonly object _activationCacheLock = new();
-    private const int DefaultActivationCacheSize = 16;
+    private const int DefaultActivationCacheSize = 256;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
     private long _activationCacheTimestamp = 0;
 
@@ -123,7 +151,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Gets or sets the maximum number of activation cache entries.
     /// Larger values use more GPU memory but reduce re-uploads for deep networks.
-    /// Default is 16.
+    /// Default is 256, sized for typical DNN layer chains.
     /// </summary>
     public int MaxActivationCacheSize
     {
@@ -136,6 +164,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     string IEngine.Name => Name;
 
     bool IEngine.SupportsGpu => SupportsGpu;
+
+    /// <summary>
+    /// Begins a GPU scope that enables activation caching for intermediate results.
+    /// Within this scope, GPU output buffers are retained in the activation cache,
+    /// so chained operations (e.g., GEMM + Bias + ReLU) avoid redundant CPU-GPU transfers.
+    /// </summary>
+    public GpuScope BeginGpuScope() => new GpuScope();
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
     {
@@ -676,12 +711,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
-        using var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
-        // Note: DownloadBuffer uses blocking read (clEnqueueReadBuffer blocking=true),
-        // so Synchronize() is redundant and has been removed for performance
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
+            bufferB.Dispose();
+            throw;
+        }
     }
 
     private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
@@ -693,11 +741,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
-        using var bufferC = AllocateOutputBuffer(backend, left.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-        // Note: DownloadBuffer uses blocking read, Synchronize() removed for performance
-        float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-        return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        var bufferC = AllocateOutputBuffer(backend, left.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
+            else
+                bufferC.Dispose();
+
+            return result;
+        }
+        catch
+        {
+            bufferC.Dispose();
+            throw;
+        }
     }
 
     private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
@@ -706,11 +768,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
-        using var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-        // Note: DownloadBuffer uses blocking read, Synchronize() removed for performance
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
+            bufferB.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -725,11 +801,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var bufferA = AllocateBufferFromSpan(backend, left);
         using var bufferB = AllocateBufferFromSpan(backend, right);
-        using var bufferC = AllocateOutputBuffer(backend, left.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-        // Note: DownloadBuffer uses blocking read, Synchronize() removed for performance
-        float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-        return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        var bufferC = AllocateOutputBuffer(backend, left.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
+            else
+                bufferC.Dispose();
+
+            return result;
+        }
+        catch
+        {
+            bufferC.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -741,11 +831,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
 
         using var bufferA = AllocateBufferFromSpan(backend, input);
-        using var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-        // Note: DownloadBuffer uses blocking read, Synchronize() removed for performance
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
+            bufferB.Dispose();
+            throw;
+        }
     }
 
     private static bool ShapesMatch(int[] left, int[] right)
@@ -1126,31 +1230,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // Use fused GPU kernels when available
             // Only use GPU path for natively supported fused ops (with bias)
-            // For cases with bias and activation
+            // KernelFusionManager patterns: Gemm+Bias+Activation are executed as single fused kernels
             if (bias != null && activation != FusedActivationType.None)
             {
-                // Use fused kernels for common activations (most efficient)
-                switch (activation)
+                // Dispatch through fused kernel lookup (covers ReLU, GELU, Sigmoid, Tanh, Swish, LeakyReLU)
+                resultBuffer = activation switch
                 {
-                    case FusedActivationType.ReLU:
-                        resultBuffer = backend.GemmBiasRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.GELU:
-                        resultBuffer = backend.GemmBiasGelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.Sigmoid:
-                        resultBuffer = backend.GemmBiasSigmoid(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    case FusedActivationType.Tanh:
-                        resultBuffer = backend.GemmBiasTanh(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        break;
-                    default:
-                        // For other activations (LeakyReLU, Swish, etc.), use GemmBias + separate activation kernel
-                        resultBuffer = backend.GemmBias(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures);
-                        int size = batchSize * outputFeatures;
-                        ApplyGpuActivation(backend, resultBuffer, size, activation);
-                        break;
-                }
+                    FusedActivationType.ReLU => backend.GemmBiasRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.GELU => backend.GemmBiasGelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Sigmoid => backend.GemmBiasSigmoid(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Tanh => backend.GemmBiasTanh(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.Swish => backend.GemmBiasSwish(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    FusedActivationType.LeakyReLU => backend.GemmBiasLeakyRelu(inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures),
+                    _ => FusedGemmWithSeparateActivation(backend, inputBuffer.Buffer, weightsBuffer.Buffer, biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures, activation)
+                };
             }
             else if (bias != null && activation == FusedActivationType.None)
             {
@@ -1422,6 +1515,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void ApplyGpuActivation(IDirectGpuBackend backend, IGpuBuffer buffer, int size, FusedActivationType activation)
     {
         ApplyGpuActivation(backend, buffer, buffer, size, activation);
+    }
+
+    private static IGpuBuffer FusedGemmWithSeparateActivation(
+        IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer bias,
+        int M, int N, int K, FusedActivationType activation)
+    {
+        var result = backend.GemmBias(input, weights, bias, M, N, K);
+        int size = M * N;
+        ApplyGpuActivation(backend, result, size, activation);
+        return result;
     }
 
     /// <summary>

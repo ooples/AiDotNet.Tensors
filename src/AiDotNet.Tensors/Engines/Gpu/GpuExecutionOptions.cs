@@ -121,11 +121,20 @@ public sealed class GpuExecutionOptions
     {
     }
 
+    private static readonly Lazy<GpuExecutionOptions> _cachedEnvironmentOptions =
+        new Lazy<GpuExecutionOptions>(() => BuildFromEnvironment(), System.Threading.LazyThreadSafetyMode.PublicationOnly);
+
     /// <summary>
     /// Creates options initialized from environment variables.
+    /// Results are cached after the first call since environment variables rarely change at runtime.
     /// </summary>
     /// <returns>Options configured from environment variables.</returns>
     public static GpuExecutionOptions FromEnvironment()
+    {
+        return _cachedEnvironmentOptions.Value.Clone();
+    }
+
+    private static GpuExecutionOptions BuildFromEnvironment()
     {
         var options = new GpuExecutionOptions();
 
