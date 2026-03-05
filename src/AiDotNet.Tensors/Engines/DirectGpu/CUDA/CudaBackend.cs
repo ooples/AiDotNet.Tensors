@@ -2788,12 +2788,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: depthwise_conv2d");
 
         using var _ = PushContext();
-        int totalOutput = batch * channels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
-        void** args = stackalloc void*[14];
+        void** args = stackalloc void*[15];
         args[0] = &inputPtr;
         args[1] = &kernelPtr;
         args[2] = &outputPtr;
@@ -2807,8 +2805,14 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[10] = &kernelW;
         args[11] = &strideH;
         args[12] = &strideW;
-        args[13] = &totalOutput;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        args[13] = &padH;
+        args[14] = &padW;
+        // Kernel uses 3D grid: blockIdx.x→outWidth, blockIdx.y→outHeight, blockIdx.z→batch*channels
+        const uint blockDimXY = 16;
+        uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
+        uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
+        uint gz = (uint)(batch * channels);
+        LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
     public unsafe void ConvTranspose2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -2822,8 +2826,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv_transpose2d");
 
         using var _ = PushContext();
-        int totalOutput = batch * outChannels * outHeight * outWidth;
-        uint gridX = (uint)((totalOutput + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
         IntPtr outputPtr = output.Handle;
@@ -2846,7 +2848,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[15] = &padW;
         args[16] = &outputPadH;
         args[17] = &outputPadW;
-        LaunchKernel(cudaKernel, gridX, DefaultBlockSize, args);
+        // Kernel uses 3D grid: blockIdx.x→outWidth, blockIdx.y→outHeight, blockIdx.z→batch*outChannels
+        const uint blockDimXY = 16;
+        uint gx = (uint)((outWidth + blockDimXY - 1) / blockDimXY);
+        uint gy = (uint)((outHeight + blockDimXY - 1) / blockDimXY);
+        uint gz = (uint)(batch * outChannels);
+        LaunchKernel3D(cudaKernel, gx, gy, gz, blockDimXY, blockDimXY, 1, args);
     }
 
     public unsafe void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,

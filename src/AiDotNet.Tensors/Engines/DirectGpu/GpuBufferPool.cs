@@ -57,6 +57,16 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         int bucketKey = NextPowerOfTwo(size);
         if (_buckets.TryGetValue(bucketKey, out var bucket) && bucket.Buffers.TryTake(out var candidate))
         {
+            // Verify the pooled buffer's actual allocation is large enough.
+            // Power-of-two bucketing can match a smaller buffer (e.g., 6272 → bucket 8192)
+            // with a larger request (e.g., 8192 → bucket 8192).
+            if (candidate.Size < size)
+            {
+                // Return the too-small buffer and fall through to fresh allocation
+                bucket.Buffers.Add(candidate);
+                return false;
+            }
+
             Interlocked.Decrement(ref bucket.Count);
             candidate.MarkRented();
             buffer = candidate;
