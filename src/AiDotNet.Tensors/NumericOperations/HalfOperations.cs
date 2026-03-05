@@ -1,7 +1,5 @@
 using System;
-#if NET8_0_OR_GREATER
-using System.Numerics.Tensors;
-#endif
+using System.Buffers;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -252,186 +250,322 @@ public class HalfOperations : INumericOperations<Half>
     #region IVectorizedOperations<Half> Implementation
 
     /// <summary>
-    /// Performs element-wise addition. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Performs element-wise addition. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Add(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Add(x, y, destination);
-#else
-        VectorizedOperationsFallback.Add(this, x, y, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            Engines.Simd.SimdKernels.VectorAdd(xf.AsSpan(0, len), yf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Performs element-wise subtraction. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Performs element-wise subtraction. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Subtract(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Subtract(x, y, destination);
-#else
-        VectorizedOperationsFallback.Subtract(this, x, y, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            Engines.Simd.SimdKernels.VectorSubtract(xf.AsSpan(0, len), yf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Performs element-wise multiplication. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Performs element-wise multiplication. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Multiply(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Multiply(x, y, destination);
-#else
-        VectorizedOperationsFallback.Multiply(this, x, y, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            Engines.Simd.SimdKernels.VectorMultiply(xf.AsSpan(0, len), yf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Performs element-wise division. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Performs element-wise division. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Divide(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Divide(x, y, destination);
-#else
-        VectorizedOperationsFallback.Divide(this, x, y, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            Engines.Simd.SimdKernels.VectorDivide(xf.AsSpan(0, len), yf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes dot product. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes dot product. Converts to float, uses SIMD SimdKernels.
     /// </summary>
     public Half Dot(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Dot(x, y);
-#else
-        return VectorizedOperationsFallback.Dot(this, x, y);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            return (Half)Engines.Simd.SimdKernels.DotProduct(xf.AsSpan(0, len), yf.AsSpan(0, len));
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+        }
     }
 
     /// <summary>
-    /// Computes sum. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes sum. Converts to float, uses SIMD SimdKernels.
     /// </summary>
     public Half Sum(ReadOnlySpan<Half> x)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Sum(x);
-#else
-        return VectorizedOperationsFallback.Sum(this, x);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            return (Half)Engines.Simd.SimdKernels.Sum(xf.AsSpan(0, len));
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+        }
     }
 
     /// <summary>
-    /// Finds maximum. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Finds maximum. Converts to float, uses SIMD SimdKernels.
     /// </summary>
     public Half Max(ReadOnlySpan<Half> x)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Max(x);
-#else
-        return VectorizedOperationsFallback.Max(this, x);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            return (Half)Engines.Simd.SimdKernels.Max(xf.AsSpan(0, len));
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+        }
     }
 
     /// <summary>
-    /// Finds minimum. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Finds minimum. Converts to float, uses SIMD SimdKernels.
     /// </summary>
     public Half Min(ReadOnlySpan<Half> x)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Min(x);
-#else
-        return VectorizedOperationsFallback.Min(this, x);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            return (Half)Engines.Simd.SimdKernels.Min(xf.AsSpan(0, len));
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+        }
     }
 
     /// <summary>
-    /// Computes exponential. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes exponential. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Exp(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Exp(x, destination);
-#else
-        VectorizedOperationsFallback.Exp(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Exp(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes natural logarithm. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes natural logarithm. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Log(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Log(x, destination);
-#else
-        VectorizedOperationsFallback.Log(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Log(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes hyperbolic tangent. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes hyperbolic tangent. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Tanh(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Tanh(x, destination);
-#else
-        VectorizedOperationsFallback.Tanh(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Tanh(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes sigmoid. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes sigmoid. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Sigmoid(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Sigmoid(x, destination);
-#else
-        VectorizedOperationsFallback.Sigmoid(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Sigmoid(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes base-2 logarithm. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes base-2 logarithm. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void Log2(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Log2(x, destination);
-#else
-        VectorizedOperationsFallback.Log2(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Log2(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes softmax. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes softmax. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
     public void SoftMax(ReadOnlySpan<Half> x, Span<Half> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.SoftMax(x, destination);
-#else
-        VectorizedOperationsFallback.SoftMax(this, x, destination);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.SoftMax(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
     }
 
     /// <summary>
-    /// Computes cosine similarity. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes cosine similarity. Converts to float, uses SIMD SimdKernels.
     /// </summary>
     public Half CosineSimilarity(ReadOnlySpan<Half> x, ReadOnlySpan<Half> y)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.CosineSimilarity(x, y);
-#else
-        return VectorizedOperationsFallback.CosineSimilarity(this, x, y);
-#endif
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] yf = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            HalfToFloat(y, yf);
+            return (Half)Engines.Simd.SimdKernels.CosineSimilarity(xf.AsSpan(0, len), yf.AsSpan(0, len));
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(yf);
+        }
     }
-
-    private static readonly HalfOperations _instance = new();
 
     /// <summary>
     /// Fills a span with a specified value.
@@ -442,75 +576,190 @@ public class HalfOperations : INumericOperations<Half>
     /// Multiplies each element in a span by a scalar value.
     /// </summary>
     public void MultiplyScalar(ReadOnlySpan<Half> x, Half scalar, Span<Half> destination)
-        => VectorizedOperationsFallback.MultiplyScalar(_instance, x, scalar, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.MultiplyScalar(xf.AsSpan(0, len), (float)scalar, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
     /// Divides each element in a span by a scalar value.
     /// </summary>
     public void DivideScalar(ReadOnlySpan<Half> x, Half scalar, Span<Half> destination)
-        => VectorizedOperationsFallback.DivideScalar(_instance, x, scalar, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.DivideScalar(xf.AsSpan(0, len), (float)scalar, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
     /// Adds a scalar value to each element in a span.
     /// </summary>
     public void AddScalar(ReadOnlySpan<Half> x, Half scalar, Span<Half> destination)
-        => VectorizedOperationsFallback.AddScalar(_instance, x, scalar, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.AddScalar(xf.AsSpan(0, len), (float)scalar, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
     /// Subtracts a scalar value from each element in a span.
     /// </summary>
     public void SubtractScalar(ReadOnlySpan<Half> x, Half scalar, Span<Half> destination)
-        => VectorizedOperationsFallback.SubtractScalar(_instance, x, scalar, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.SubtractScalar(xf.AsSpan(0, len), (float)scalar, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
-    /// Computes square root of each element. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes square root of each element. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Sqrt(ReadOnlySpan<Half> x, Span<Half> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Sqrt<Half>(x, destination);
-#else
-    public void Sqrt(ReadOnlySpan<Half> x, Span<Half> destination)
-        => VectorizedOperationsFallback.Sqrt(_instance, x, destination);
-#endif
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Sqrt(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
-    /// Computes absolute value of each element. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Computes absolute value of each element. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Abs(ReadOnlySpan<Half> x, Span<Half> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Abs<Half>(x, destination);
-#else
-    public void Abs(ReadOnlySpan<Half> x, Span<Half> destination)
-        => VectorizedOperationsFallback.Abs(_instance, x, destination);
-#endif
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Abs(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
-    /// Negates each element. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Negates each element. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Negate(ReadOnlySpan<Half> x, Span<Half> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Negate<Half>(x, destination);
-#else
-    public void Negate(ReadOnlySpan<Half> x, Span<Half> destination)
-        => VectorizedOperationsFallback.Negate(_instance, x, destination);
-#endif
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Negate(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
-    /// Clips each element to the specified range. Falls back to loops.
+    /// Clips each element to the specified range.
     /// </summary>
     public void Clip(ReadOnlySpan<Half> x, Half min, Half max, Span<Half> destination)
-        => VectorizedOperationsFallback.Clip(_instance, x, min, max, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Clamp(xf.AsSpan(0, len), (float)min, (float)max, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
-    /// Raises each element to a specified power. Uses SIMD on .NET 8+, falls back to loops on older frameworks.
+    /// Raises each element to a specified power. Converts to float, uses SIMD SimdKernels, converts back.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Pow(ReadOnlySpan<Half> x, Half power, Span<Half> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Pow<Half>(x, power, destination);
-#else
-    public void Pow(ReadOnlySpan<Half> x, Half power, Span<Half> destination)
-        => VectorizedOperationsFallback.Pow(_instance, x, power, destination);
-#endif
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.Pow(xf.AsSpan(0, len), (float)power, df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     /// <summary>
     /// Copies elements from source to destination.
@@ -588,4 +837,26 @@ public class HalfOperations : INumericOperations<Half>
 
     public void ReLU(ReadOnlySpan<Half> x, Span<Half> destination)
         => VectorizedOperationsFallback.ReLU(this, x, destination);
+
+    /// <summary>
+    /// Converts Half span to float array for SIMD processing.
+    /// </summary>
+    private static void HalfToFloat(ReadOnlySpan<Half> source, float[] destination)
+    {
+        for (int i = 0; i < source.Length; i++)
+        {
+            destination[i] = (float)source[i];
+        }
+    }
+
+    /// <summary>
+    /// Converts float array back to Half span after SIMD processing.
+    /// </summary>
+    private static void FloatToHalf(float[] source, Span<Half> destination, int length)
+    {
+        for (int i = 0; i < length; i++)
+        {
+            destination[i] = (Half)source[i];
+        }
+    }
 }

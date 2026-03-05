@@ -36,7 +36,9 @@ extern ""C"" __global__ void tanh_activation(const float* input, float* output, 
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    output[idx] = tanhf(input[idx]);
+    // Clamp to avoid NaN on some GPU drivers; tanh saturates to +/-1 for |x| > ~10
+    float x = fminf(fmaxf(input[idx], -20.0f), 20.0f);
+    output[idx] = tanhf(x);
 }
 
 extern ""C"" __global__ void gelu(const float* input, float* output, int size)

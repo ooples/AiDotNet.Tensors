@@ -525,7 +525,9 @@ kernel void tanh_activation(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = tanh(A[gid]);
+        // Clamp to avoid NaN on some GPU drivers; tanh saturates to +/-1 for |x| > ~10
+        float x = clamp(A[gid], -20.0f, 20.0f);
+        B[gid] = tanh(x);
     }
 }
 

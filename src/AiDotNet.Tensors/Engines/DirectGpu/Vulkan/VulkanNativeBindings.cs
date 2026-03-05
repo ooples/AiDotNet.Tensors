@@ -36,6 +36,33 @@ public static unsafe class VulkanNativeBindings
     private const string VulkanLinux = "libvulkan.so.1";
     private const string VulkanMacOS = "libvulkan.1.dylib"; // MoltenVK
 
+#if NET5_0_OR_GREATER
+    static VulkanNativeBindings()
+    {
+        // On macOS, DllImport entries reference "libvulkan.so.1" (Linux name).
+        // Remap to "libvulkan.1.dylib" so MoltenVK is found correctly.
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
+                typeof(VulkanNativeBindings).Assembly,
+                (libraryName, assembly, searchPath) =>
+                {
+                    // Only remap Vulkan library names; pass through all other libraries
+                    if (libraryName == VulkanLinux)
+                    {
+                        if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                            VulkanMacOS, assembly, searchPath, out var handle))
+                        {
+                            return handle;
+                        }
+                    }
+                    // Return IntPtr.Zero for non-Vulkan libraries so the default resolver handles them
+                    return IntPtr.Zero;
+                });
+        }
+    }
+#endif
+
     /// <summary>
     /// Gets the Vulkan library name for the current platform.
     /// </summary>
@@ -63,21 +90,37 @@ public static unsafe class VulkanNativeBindings
             try
             {
 #if NET5_0_OR_GREATER
-                // .NET 5+ can use NativeLibrary
-                var handle = System.Runtime.InteropServices.NativeLibrary.Load(LibraryName);
-                if (handle != IntPtr.Zero)
+                // .NET 5+ can use NativeLibrary.TryLoad for safe probing
+                if (System.Runtime.InteropServices.NativeLibrary.TryLoad(LibraryName, out var handle))
                 {
                     System.Runtime.InteropServices.NativeLibrary.Free(handle);
                     return true;
                 }
+                return false;
 #else
-                // For .NET Framework, try to call a Vulkan function
-                // If it doesn't throw, Vulkan is available
-                uint count = 0;
-                var result = vkEnumeratePhysicalDevices(IntPtr.Zero, ref count, null);
-                // VK_ERROR_INITIALIZATION_FAILED is expected with null instance
-                // but it means Vulkan is loaded
-                return true;
+                // For .NET Framework, probe for the library via LoadLibrary/dlopen.
+                // NEVER call Vulkan API functions with an invalid (null) instance handle --
+                // the Vulkan loader will crash the process with
+                // VUID-vkEnumeratePhysicalDevices-instance-parameter.
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    var libHandle = NativeMethods.LoadLibraryW(LibraryName);
+                    if (libHandle != IntPtr.Zero)
+                    {
+                        NativeMethods.FreeLibrary(libHandle);
+                        return true;
+                    }
+                }
+                else
+                {
+                    var libHandle = NativeMethods.dlopen(LibraryName, 0x0001 /* RTLD_LAZY */);
+                    if (libHandle != IntPtr.Zero)
+                    {
+                        NativeMethods.dlclose(libHandle);
+                        return true;
+                    }
+                }
+                return false;
 #endif
             }
             catch
@@ -87,6 +130,24 @@ public static unsafe class VulkanNativeBindings
             return false;
         }
     }
+
+#if !NET5_0_OR_GREATER
+    private static class NativeMethods
+    {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr LoadLibraryW(string lpFileName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool FreeLibrary(IntPtr hModule);
+
+        [DllImport("libdl.so.2", EntryPoint = "dlopen")]
+        public static extern IntPtr dlopen(string filename, int flags);
+
+        [DllImport("libdl.so.2", EntryPoint = "dlclose")]
+        public static extern int dlclose(IntPtr handle);
+    }
+#endif
 
     #endregion
 

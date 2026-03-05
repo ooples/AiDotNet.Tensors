@@ -40,13 +40,10 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length != y.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var xArray = x.ToArray();
-        var yArray = y.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Add(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Add(xArray, yArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -57,13 +54,10 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length != y.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var xArray = x.ToArray();
-        var yArray = y.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Subtract(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Subtract(xArray, yArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -74,13 +68,10 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length != y.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var xArray = x.ToArray();
-        var yArray = y.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Multiply(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Multiply(xArray, yArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -91,13 +82,10 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length != y.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var xArray = x.ToArray();
-        var yArray = y.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Divide(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Divide(xArray, yArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -108,10 +96,7 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length != y.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var xArray = x.ToArray();
-        var yArray = y.ToArray();
-
-        return NumOps.Dot(xArray, yArray);
+        return NumOps.Dot(x.AsSpan(), y.AsSpan());
     }
 
     /// <summary>
@@ -119,8 +104,7 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static T Sum(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        return NumOps.Sum(xArray);
+        return NumOps.Sum(x.AsSpan());
     }
 
     /// <summary>
@@ -131,8 +115,7 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length == 0)
             throw new ArgumentException(VectorCannotBeEmpty);
 
-        var xArray = x.ToArray();
-        return NumOps.Max(xArray);
+        return NumOps.Max(x.AsSpan());
     }
 
     /// <summary>
@@ -143,8 +126,7 @@ public static class TensorPrimitivesHelper<T>
         if (x.Length == 0)
             throw new ArgumentException(VectorCannotBeEmpty);
 
-        var xArray = x.ToArray();
-        return NumOps.Min(xArray);
+        return NumOps.Min(x.AsSpan());
     }
 
     /// <summary>
@@ -152,12 +134,10 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Exp(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Exp(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Exp(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -165,12 +145,10 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Log(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Log(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Log(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -181,12 +159,10 @@ public static class TensorPrimitivesHelper<T>
     /// </remarks>
     public static Vector<T> Sqrt(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Sqrt(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Sqrt(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -194,12 +170,10 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Tanh(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Tanh(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Tanh(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -207,12 +181,10 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Sigmoid(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Sigmoid(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Sigmoid(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -225,13 +197,11 @@ public static class TensorPrimitivesHelper<T>
     /// <param name="alpha">Negative slope coefficient (typically 0.01).</param>
     public static Vector<T> LeakyReLU(Vector<T> x, double alpha = 0.01)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
         T alphaT = NumOps.FromDouble(alpha);
+        NumOps.LeakyReLU(x.AsSpan(), alphaT, result.AsWritableSpan());
 
-        NumOps.LeakyReLU(xArray, alphaT, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -244,12 +214,10 @@ public static class TensorPrimitivesHelper<T>
     /// <param name="x">Input vector.</param>
     public static Vector<T> GELU(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.GELU(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.GELU(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -261,12 +229,10 @@ public static class TensorPrimitivesHelper<T>
     /// <param name="x">Input vector.</param>
     public static Vector<T> Mish(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Mish(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Mish(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -278,12 +244,10 @@ public static class TensorPrimitivesHelper<T>
     /// <param name="x">Input vector.</param>
     public static Vector<T> Swish(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Swish(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Swish(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -296,13 +260,11 @@ public static class TensorPrimitivesHelper<T>
     /// <param name="alpha">Scale factor for negative values (typically 1.0).</param>
     public static Vector<T> ELU(Vector<T> x, double alpha = 1.0)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
         T alphaT = NumOps.FromDouble(alpha);
+        NumOps.ELU(x.AsSpan(), alphaT, result.AsWritableSpan());
 
-        NumOps.ELU(xArray, alphaT, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -310,12 +272,10 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Log2(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.Log2(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.Log2(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -323,15 +283,13 @@ public static class TensorPrimitivesHelper<T>
     /// </summary>
     public static Vector<T> Softmax(Vector<T> x)
     {
-        var xArray = x.ToArray();
-        if (xArray.Length == 0)
+        if (x.Length == 0)
             throw new ArgumentException("Vector cannot be empty", nameof(x));
 
-        var result = new T[xArray.Length];
+        var result = new Vector<T>(x.Length);
+        NumOps.SoftMax(x.AsSpan(), result.AsWritableSpan());
 
-        NumOps.SoftMax(xArray, result);
-
-        return new Vector<T>(result);
+        return result;
     }
 
     /// <summary>
@@ -342,10 +300,7 @@ public static class TensorPrimitivesHelper<T>
         if (a.Length != b.Length)
             throw new ArgumentException(VectorsSameLength);
 
-        var aArray = a.ToArray();
-        var bArray = b.ToArray();
-
-        return NumOps.CosineSimilarity(aArray, bArray);
+        return NumOps.CosineSimilarity(a.AsSpan(), b.AsSpan());
     }
 
     #endregion

@@ -47,7 +47,7 @@ public static class CpuParallelSettings
     /// This ensures each parallel task processes at least this many elements
     /// to avoid excessive task creation overhead.
     /// </remarks>
-    public const int MinChunkSize = 4096;
+    public const int MinChunkSize = 8192;
 
     /// <summary>
     /// Executes a parallel for loop with chunked iterations.
