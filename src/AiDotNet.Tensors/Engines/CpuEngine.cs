@@ -3724,37 +3724,9 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        int length = tensor.Length;
-
-        // Use parallel TensorPrimitives for large float/double tensors
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            if (typeof(T) == typeof(float))
-            {
-                var data = tensor.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    var floatSpan = ((Memory<float>)(object)data).Span.Slice(start, count);
-                    TensorPrimitives.Sigmoid(floatSpan, floatSpan);
-                });
-                return;
-            }
-
-            if (typeof(T) == typeof(double))
-            {
-                var data = tensor.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    var doubleSpan = ((Memory<double>)(object)data).Span.Slice(start, count);
-                    TensorPrimitives.Sigmoid(doubleSpan, doubleSpan);
-                });
-                return;
-            }
-        }
-#endif
-
-        // Fallback for small tensors, non-float/double types, or older .NET
+        // Sigmoid is compute-bound (Exp per element). SIMD vectorization within
+        // TensorPrimitives already maximizes throughput; parallelization with
+        // Memory<T> boxing overhead is counterproductive.
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -3825,44 +3797,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        int length = tensor.Length;
-
-        // Use parallel TensorPrimitives for large float/double tensors
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            if (typeof(T) == typeof(float))
-            {
-                var data = tensor.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    var floatSpan = ((Memory<float>)(object)data).Span.Slice(start, count);
-                    // ReLU = max(x, 0), TensorPrimitives.Max with zeros is fastest
-                    for (int i = 0; i < count; i++)
-                    {
-                        if (floatSpan[i] < 0) floatSpan[i] = 0;
-                    }
-                });
-                return;
-            }
-
-            if (typeof(T) == typeof(double))
-            {
-                var data = tensor.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    var doubleSpan = ((Memory<double>)(object)data).Span.Slice(start, count);
-                    for (int i = 0; i < count; i++)
-                    {
-                        if (doubleSpan[i] < 0) doubleSpan[i] = 0;
-                    }
-                });
-                return;
-            }
-        }
-#endif
-
-        // Fallback for small tensors, non-float/double types, or older .NET
+        // ReLU is a simple comparison per element - memory-bandwidth-bound.
+        // Parallelization with Memory<T> boxing overhead is counterproductive.
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
     }

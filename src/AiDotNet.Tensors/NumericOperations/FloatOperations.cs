@@ -1199,35 +1199,10 @@ public class FloatOperations : INumericOperations<float>
     /// Computes sigmoid using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
     /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    public unsafe void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
+    public void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
     {
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-#if NET8_0_OR_GREATER
-                    TensorPrimitives.Sigmoid(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new Span<float>(dp + start, count));
-#else
-                    for (int i = 0; i < count; i++)
-                    {
-                        int idx = start + i;
-                        dp[idx] = 1.0f / (1.0f + (float)Math.Exp(-xp[idx]));
-                    }
-#endif
-                });
-            }
-            return;
-        }
-
+        // Sigmoid is compute-bound (Exp per element). Single-threaded SIMD already
+        // maximizes ALU throughput; thread parallelism adds overhead without benefit.
 #if NET8_0_OR_GREATER
         TensorPrimitives.Sigmoid(x, destination);
 #else
