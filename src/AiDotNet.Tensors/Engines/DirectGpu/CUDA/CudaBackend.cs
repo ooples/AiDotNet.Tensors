@@ -2,6 +2,7 @@
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -183,6 +184,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
+            System.Diagnostics.Trace.WriteLine($"CudaBackend initialization failed: {ex.GetType().Name}: {ex.Message}");
             DeviceName = "None";
             IsAvailable = false;
             Dispose();
@@ -218,6 +220,35 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private CudaContextScope PushContext()
     {
         return new CudaContextScope(_cudaContext);
+    }
+
+    private static string? GetCudaIncludePath()
+    {
+        // Check CUDA_PATH environment variable first
+        var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
+
+        // Fall back to scanning standard install location
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var basePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "NVIDIA GPU Computing Toolkit", "CUDA");
+            if (Directory.Exists(basePath))
+            {
+                var versions = Directory.GetDirectories(basePath, "v*");
+                Array.Sort(versions);
+                if (versions.Length > 0)
+                    cudaPath = versions[^1];
+            }
+        }
+
+        if (string.IsNullOrEmpty(cudaPath))
+            return null;
+
+        var includePath = Path.Combine(cudaPath, "include");
+        return Directory.Exists(includePath) ? includePath : null;
     }
 
     private static (int Major, int Minor) GetComputeCapability(int device)
@@ -296,9 +327,48 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private IntPtr CompileKernelModule(int device, string source, string moduleName, string[] kernelNames)
     {
+        // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
+        // CUDA device math functions (expf, sqrtf, tanhf, etc.) are built-in.
+        // We prepend defines for macros normally provided by those headers.
+        source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
+                       .Replace("#include <float.h>", "// float.h stripped for NVRTC (built-in)")
+                       .Replace("#include <stdio.h>", "// stdio.h stripped for NVRTC");
+
+        // Prepend standard macro definitions that NVRTC doesn't provide by default
+        const string nvrtcPreamble = @"
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+#ifndef NAN
+#define NAN __int_as_float(0x7fffffff)
+#endif
+#ifndef FLT_MAX
+#define FLT_MAX 3.402823466e+38f
+#endif
+#ifndef FLT_MIN
+#define FLT_MIN 1.175494351e-38f
+#endif
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_PI_F
+#define M_PI_F 3.14159265f
+#endif
+";
+        source = nvrtcPreamble + source;
+
         var (major, minor) = GetComputeCapability(device);
-        string arch = $"--gpu-architecture=compute_{major}{minor}";
-        string[] options = new[] { arch, "--use_fast_math" };
+        // Use sm_XX to generate device-native CUBIN (avoids PTX ISA version issues
+        // when the toolkit is newer than the driver's max supported CUDA version).
+        string arch = $"--gpu-architecture=sm_{major}{minor}";
+        var optionsList = new List<string> { arch, "--use_fast_math" };
+
+        // Add CUDA include path for headers like cooperative_groups.h, cuda_fp16.h, mma.h
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+
+        string[] options = optionsList.ToArray();
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
@@ -319,25 +389,48 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException($"NVRTC compile failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}\n{log}");
         }
 
-        result = NvrtcNativeBindings.nvrtcGetPTXSize(program, out UIntPtr ptxSize);
-        if (result != NvrtcResult.Success || ptxSize == UIntPtr.Zero)
+        // sm_XX targets produce CUBIN (native binary) which avoids PTX ISA version
+        // compatibility issues between toolkit and driver versions.
+        // compute_XX targets produce PTX (intermediate) which needs JIT by the driver.
+        bool useCubin = arch.Contains("sm_");
+        IntPtr binary;
+        UIntPtr binarySize;
+
+        if (useCubin)
         {
-            NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
-            throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
+            result = NvrtcNativeBindings.nvrtcGetCUBINSize(program, out binarySize);
+            if (result != NvrtcResult.Success || binarySize == UIntPtr.Zero)
+            {
+                NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
+                throw new InvalidOperationException($"NVRTC failed to return CUBIN size for {moduleName}.");
+            }
+
+            binary = Marshal.AllocHGlobal((int)binarySize);
+            result = NvrtcNativeBindings.nvrtcGetCUBIN(program, binary);
+        }
+        else
+        {
+            result = NvrtcNativeBindings.nvrtcGetPTXSize(program, out binarySize);
+            if (result != NvrtcResult.Success || binarySize == UIntPtr.Zero)
+            {
+                NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
+                throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
+            }
+
+            binary = Marshal.AllocHGlobal((int)binarySize);
+            result = NvrtcNativeBindings.nvrtcGetPTX(program, binary);
         }
 
-        IntPtr ptx = Marshal.AllocHGlobal((int)ptxSize);
-        result = NvrtcNativeBindings.nvrtcGetPTX(program, ptx);
         NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
 
         if (result != NvrtcResult.Success)
         {
-            Marshal.FreeHGlobal(ptx);
-            throw new InvalidOperationException($"NVRTC get PTX failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
+            Marshal.FreeHGlobal(binary);
+            throw new InvalidOperationException($"NVRTC get {(useCubin ? "CUBIN" : "PTX")} failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
         }
 
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out IntPtr module, ptx), $"cuModuleLoadData({moduleName})");
-        Marshal.FreeHGlobal(ptx);
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out IntPtr module, binary), $"cuModuleLoadData({moduleName})");
+        Marshal.FreeHGlobal(binary);
 
         foreach (var kernelName in kernelNames)
         {
@@ -379,13 +472,36 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _specializedModule = CompileKernelModule(device, CudaSpecializedKernels.GetSource(), "specialized_kernels", CudaSpecializedKernels.GetKernelNames());
 
         // Compile FP16 conversion kernels (half-precision float conversion)
-        _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
+        // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
+        try
+        {
+            _fp16Module = CompileKernelModule(device, CudaFp16Kernels.GetSource(), "fp16_kernels", CudaFp16Kernels.GetKernelNames());
+        }
+        catch
+        {
+            // FP16 kernels are optional — fall back to FP32 paths.
+        }
 
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
-        _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
+        try
+        {
+            _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
+        }
+        catch
+        {
+            // LSTM kernels may need special headers — optional.
+        }
 
         // Compile GRU sequence kernels (forward/backward for BPTT training)
-        _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
+        // Needs cooperative_groups.h which may not be in minimal CUDA Toolkit installs.
+        try
+        {
+            _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
+        }
+        catch
+        {
+            // GRU kernels need cooperative_groups.h — optional.
+        }
 
         // Compile WMMA Tensor Core kernels for Volta+ (sm_70+)
         if (_ccMajor >= 7)
