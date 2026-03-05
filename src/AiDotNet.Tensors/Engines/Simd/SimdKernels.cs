@@ -28,34 +28,39 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
             {
-                int simdLength = length & ~7;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Add(ReadVector256(a, i), ReadVector256(b, i)));
+                    WriteVector256(result, i + 8, Avx.Add(ReadVector256(a, i + 8), ReadVector256(b, i + 8)));
+                    WriteVector256(result, i + 16, Avx.Add(ReadVector256(a, i + 16), ReadVector256(b, i + 16)));
+                    WriteVector256(result, i + 24, Avx.Add(ReadVector256(a, i + 24), ReadVector256(b, i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var va = ReadVector256(a, i);
-                    var vb = ReadVector256(b, i);
-                    WriteVector256(result, i, Avx.Add(va, vb));
+                    WriteVector256(result, i, Avx.Add(ReadVector256(a, i), ReadVector256(b, i)));
                 }
             }
-            else if (Sse.IsSupported && length >= 4)
+            else if (Sse.IsSupported && length - i >= 4)
             {
-                int simdLength = length & ~3;
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var va = ReadVector128(a, i);
-                    var vb = ReadVector128(b, i);
-                    WriteVector128(result, i, Sse.Add(va, vb));
+                    WriteVector128(result, i, Sse.Add(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-            else if (AdvSimd.IsSupported && length >= 4)
+            else if (AdvSimd.IsSupported && length - i >= 4)
             {
-                int simdLength = length & ~3;
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var va = ReadVector128(a, i);
-                    var vb = ReadVector128(b, i);
-                    WriteVector128(result, i, AdvSimd.Add(va, vb));
+                    WriteVector128(result, i, AdvSimd.Add(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
 #endif
@@ -63,6 +68,61 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
                 result[i] = a[i] + b[i];
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorSubtract(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Subtract(ReadVector256(a, i), ReadVector256(b, i)));
+                    WriteVector256(result, i + 8, Avx.Subtract(ReadVector256(a, i + 8), ReadVector256(b, i + 8)));
+                    WriteVector256(result, i + 16, Avx.Subtract(ReadVector256(a, i + 16), ReadVector256(b, i + 16)));
+                    WriteVector256(result, i + 24, Avx.Subtract(ReadVector256(a, i + 24), ReadVector256(b, i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(result, i, Avx.Subtract(ReadVector256(a, i), ReadVector256(b, i)));
+                }
+            }
+            else if (Sse.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector128(result, i, Sse.Subtract(ReadVector128(a, i), ReadVector128(b, i)));
+                }
+            }
+            else if (AdvSimd.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector128(result, i, AdvSimd.Subtract(ReadVector128(a, i), ReadVector128(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] - b[i];
             }
         }
 
@@ -78,34 +138,39 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
             {
-                int simdLength = length & ~7;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), ReadVector256(b, i)));
+                    WriteVector256(result, i + 8, Avx.Multiply(ReadVector256(a, i + 8), ReadVector256(b, i + 8)));
+                    WriteVector256(result, i + 16, Avx.Multiply(ReadVector256(a, i + 16), ReadVector256(b, i + 16)));
+                    WriteVector256(result, i + 24, Avx.Multiply(ReadVector256(a, i + 24), ReadVector256(b, i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var va = ReadVector256(a, i);
-                    var vb = ReadVector256(b, i);
-                    WriteVector256(result, i, Avx.Multiply(va, vb));
+                    WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), ReadVector256(b, i)));
                 }
             }
-            else if (Sse.IsSupported && length >= 4)
+            else if (Sse.IsSupported && length - i >= 4)
             {
-                int simdLength = length & ~3;
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var va = ReadVector128(a, i);
-                    var vb = ReadVector128(b, i);
-                    WriteVector128(result, i, Sse.Multiply(va, vb));
+                    WriteVector128(result, i, Sse.Multiply(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
-            else if (AdvSimd.IsSupported && length >= 4)
+            else if (AdvSimd.IsSupported && length - i >= 4)
             {
-                int simdLength = length & ~3;
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var va = ReadVector128(a, i);
-                    var vb = ReadVector128(b, i);
-                    WriteVector128(result, i, AdvSimd.Multiply(va, vb));
+                    WriteVector128(result, i, AdvSimd.Multiply(ReadVector128(a, i), ReadVector128(b, i)));
                 }
             }
 #endif
@@ -114,6 +179,145 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 result[i] = a[i] * b[i];
             }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorDivide(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Divide(ReadVector256(a, i), ReadVector256(b, i)));
+                    WriteVector256(result, i + 8, Avx.Divide(ReadVector256(a, i + 8), ReadVector256(b, i + 8)));
+                    WriteVector256(result, i + 16, Avx.Divide(ReadVector256(a, i + 16), ReadVector256(b, i + 16)));
+                    WriteVector256(result, i + 24, Avx.Divide(ReadVector256(a, i + 24), ReadVector256(b, i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(result, i, Avx.Divide(ReadVector256(a, i), ReadVector256(b, i)));
+                }
+            }
+            else if (Sse.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector128(result, i, Sse.Divide(ReadVector128(a, i), ReadVector128(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] / b[i];
+            }
+        }
+
+        /// <summary>Adds a scalar to each element: result[i] = a[i] + scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void AddScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
+        {
+            if (a.Length != result.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Add(ReadVector256(a, i), vs));
+                    WriteVector256(result, i + 8, Avx.Add(ReadVector256(a, i + 8), vs));
+                    WriteVector256(result, i + 16, Avx.Add(ReadVector256(a, i + 16), vs));
+                    WriteVector256(result, i + 24, Avx.Add(ReadVector256(a, i + 24), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(result, i, Avx.Add(ReadVector256(a, i), vs));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] + scalar;
+            }
+        }
+
+        /// <summary>Multiplies each element by a scalar: result[i] = a[i] * scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void MultiplyScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
+        {
+            if (a.Length != result.Length)
+            {
+                throw new ArgumentException("Input and output spans must have the same length.");
+            }
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), vs));
+                    WriteVector256(result, i + 8, Avx.Multiply(ReadVector256(a, i + 8), vs));
+                    WriteVector256(result, i + 16, Avx.Multiply(ReadVector256(a, i + 16), vs));
+                    WriteVector256(result, i + 24, Avx.Multiply(ReadVector256(a, i + 24), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(result, i, Avx.Multiply(ReadVector256(a, i), vs));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * scalar;
+            }
+        }
+
+        /// <summary>Divides each element by a scalar: result[i] = a[i] / scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void DivideScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
+        {
+            // Multiply by reciprocal for better performance
+            MultiplyScalar(a, 1.0f / scalar, result);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1430,6 +1634,825 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        #region Missing Math Kernels (Log, Sqrt, Abs, Negate, Clamp, Pow, SoftMax, Max, Min)
+
+        /// <summary>Element-wise natural log using SIMD.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Log(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < input.Length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Log(input[i]);
+#else
+                output[i] = (float)Math.Log(input[i]);
+#endif
+            }
+        }
+
+        /// <summary>Element-wise natural log for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Log(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                output[i] = Math.Log(input[i]);
+            }
+        }
+
+        /// <summary>Element-wise log base 2.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Log2(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < input.Length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Log2(input[i]);
+#else
+                output[i] = (float)(Math.Log(input[i]) / Math.Log(2.0));
+#endif
+            }
+        }
+
+        /// <summary>Element-wise log base 2 for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Log2(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < input.Length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = Math.Log2(input[i]);
+#else
+                output[i] = Math.Log(input[i]) / Math.Log(2.0);
+#endif
+            }
+        }
+
+        /// <summary>Element-wise square root using AVX.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Sqrt(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, Avx.Sqrt(ReadVector256(input, i)));
+                }
+            }
+            else if (Sse.IsSupported && length >= 4)
+            {
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector128(output, i, Sse.Sqrt(ReadVector128(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Sqrt(input[i]);
+#else
+                output[i] = (float)Math.Sqrt(input[i]);
+#endif
+            }
+        }
+
+        /// <summary>Element-wise square root for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Sqrt(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(output, i, Avx.Sqrt(ReadVector256Double(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = Math.Sqrt(input[i]);
+            }
+        }
+
+        /// <summary>Element-wise absolute value using AVX bitwise AND with sign mask.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Abs(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                // Clear sign bit: AND with 0x7FFFFFFF
+                var signMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, Avx.And(ReadVector256(input, i), signMask));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = Math.Abs(input[i]);
+            }
+        }
+
+        /// <summary>Element-wise absolute value for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Abs(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var signMask = Vector256.Create(0x7FFFFFFFFFFFFFFFL).AsDouble();
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(output, i, Avx.And(ReadVector256Double(input, i), signMask));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = Math.Abs(input[i]);
+            }
+        }
+
+        /// <summary>Element-wise negation using AVX XOR with sign bit.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Negate(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, Avx.Subtract(vzero, ReadVector256(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = -input[i];
+            }
+        }
+
+        /// <summary>Element-wise negation for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Negate(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var vzero = Vector256<double>.Zero;
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(output, i, Avx.Subtract(vzero, ReadVector256Double(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = -input[i];
+            }
+        }
+
+        /// <summary>Element-wise clamp to [min, max] range.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Clamp(ReadOnlySpan<float> input, float min, float max, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var vmin = Vector256.Create(min);
+                var vmax = Vector256.Create(max);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256(input, i))));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
+            }
+        }
+
+        /// <summary>Element-wise power: result[i] = base[i] ^ exp[i].</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Pow(ReadOnlySpan<float> baseValues, ReadOnlySpan<float> exponents, Span<float> output)
+        {
+            if (baseValues.Length != exponents.Length || baseValues.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < baseValues.Length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Pow(baseValues[i], exponents[i]);
+#else
+                output[i] = (float)Math.Pow(baseValues[i], exponents[i]);
+#endif
+            }
+        }
+
+        /// <summary>Element-wise power with scalar exponent: result[i] = base[i] ^ exp.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Pow(ReadOnlySpan<float> baseValues, float exponent, Span<float> output)
+        {
+            if (baseValues.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < baseValues.Length; i++)
+            {
+#if NET5_0_OR_GREATER
+                output[i] = MathF.Pow(baseValues[i], exponent);
+#else
+                output[i] = (float)Math.Pow(baseValues[i], exponent);
+#endif
+            }
+        }
+
+        /// <summary>
+        /// Computes SoftMax: output[i] = exp(x[i] - max(x)) / sum(exp(x - max(x))).
+        /// Numerically stable via max subtraction.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void SoftMax(ReadOnlySpan<float> input, Span<float> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            // Step 1: Find max for numerical stability
+            float maxVal = Max(input);
+            // Step 2: Compute exp(x - max)
+            int length = input.Length;
+            for (int i = 0; i < length; i++)
+            {
+                output[i] = input[i] - maxVal;
+            }
+            Exp(output, output);
+            // Step 3: Divide by sum
+            float sum = Sum(output);
+            if (sum > 0)
+            {
+                MultiplyScalar(output, 1.0f / sum, output);
+            }
+        }
+
+        /// <summary>Returns the maximum value in the span with 4-way accumulation.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Max(ReadOnlySpan<float> data)
+        {
+            if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+
+            int length = data.Length;
+            int i = 0;
+            float max = float.NegativeInfinity;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmax0 = Vector256.Create(float.NegativeInfinity);
+                var vmax1 = vmax0;
+                var vmax2 = vmax0;
+                var vmax3 = vmax0;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vmax0 = Avx.Max(vmax0, ReadVector256(data, i));
+                    vmax1 = Avx.Max(vmax1, ReadVector256(data, i + 8));
+                    vmax2 = Avx.Max(vmax2, ReadVector256(data, i + 16));
+                    vmax3 = Avx.Max(vmax3, ReadVector256(data, i + 24));
+                }
+                vmax0 = Avx.Max(Avx.Max(vmax0, vmax1), Avx.Max(vmax2, vmax3));
+                max = HorizontalMax(vmax0);
+            }
+
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vmax = Vector256.Create(max);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    vmax = Avx.Max(vmax, ReadVector256(data, i));
+                }
+                max = HorizontalMax(vmax);
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                if (data[i] > max) max = data[i];
+            }
+
+            return max;
+        }
+
+        /// <summary>Returns the minimum value in the span with 4-way accumulation.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Min(ReadOnlySpan<float> data)
+        {
+            if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+
+            int length = data.Length;
+            int i = 0;
+            float min = float.PositiveInfinity;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmin0 = Vector256.Create(float.PositiveInfinity);
+                var vmin1 = vmin0;
+                var vmin2 = vmin0;
+                var vmin3 = vmin0;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vmin0 = Avx.Min(vmin0, ReadVector256(data, i));
+                    vmin1 = Avx.Min(vmin1, ReadVector256(data, i + 8));
+                    vmin2 = Avx.Min(vmin2, ReadVector256(data, i + 16));
+                    vmin3 = Avx.Min(vmin3, ReadVector256(data, i + 24));
+                }
+                vmin0 = Avx.Min(Avx.Min(vmin0, vmin1), Avx.Min(vmin2, vmin3));
+                min = HorizontalMin(vmin0);
+            }
+
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vmin = Vector256.Create(min);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    vmin = Avx.Min(vmin, ReadVector256(data, i));
+                }
+                min = HorizontalMin(vmin);
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                if (data[i] < min) min = data[i];
+            }
+
+            return min;
+        }
+
+        /// <summary>Cosine similarity: dot(a,b) / (||a|| * ||b||).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float CosineSimilarity(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+        {
+            if (a.Length != b.Length)
+                throw new ArgumentException("Input spans must have the same length.");
+
+            float dot = DotProduct(a, b);
+            float normA = DotProduct(a, a);
+            float normB = DotProduct(b, b);
+
+#if NET5_0_OR_GREATER
+            float denominator = MathF.Sqrt(normA) * MathF.Sqrt(normB);
+#else
+            float denominator = (float)(Math.Sqrt(normA) * Math.Sqrt(normB));
+#endif
+            return denominator > 0 ? dot / denominator : 0f;
+        }
+
+        #endregion
+
+        #region Double Precision Arithmetic
+
+        /// <summary>Element-wise addition for double precision with 4x unrolling.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorAdd(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                    WriteVector256Double(result, i + 4, Avx.Add(ReadVector256Double(a, i + 4), ReadVector256Double(b, i + 4)));
+                    WriteVector256Double(result, i + 8, Avx.Add(ReadVector256Double(a, i + 8), ReadVector256Double(b, i + 8)));
+                    WriteVector256Double(result, i + 12, Avx.Add(ReadVector256Double(a, i + 12), ReadVector256Double(b, i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] + b[i];
+            }
+        }
+
+        /// <summary>Element-wise subtraction for double precision with 4x unrolling.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorSubtract(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Subtract(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                    WriteVector256Double(result, i + 4, Avx.Subtract(ReadVector256Double(a, i + 4), ReadVector256Double(b, i + 4)));
+                    WriteVector256Double(result, i + 8, Avx.Subtract(ReadVector256Double(a, i + 8), ReadVector256Double(b, i + 8)));
+                    WriteVector256Double(result, i + 12, Avx.Subtract(ReadVector256Double(a, i + 12), ReadVector256Double(b, i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Subtract(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] - b[i];
+            }
+        }
+
+        /// <summary>Element-wise multiplication for double precision with 4x unrolling.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorMultiply(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                    WriteVector256Double(result, i + 4, Avx.Multiply(ReadVector256Double(a, i + 4), ReadVector256Double(b, i + 4)));
+                    WriteVector256Double(result, i + 8, Avx.Multiply(ReadVector256Double(a, i + 8), ReadVector256Double(b, i + 8)));
+                    WriteVector256Double(result, i + 12, Avx.Multiply(ReadVector256Double(a, i + 12), ReadVector256Double(b, i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * b[i];
+            }
+        }
+
+        /// <summary>Element-wise division for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void VectorDivide(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
+        {
+            if (a.Length != b.Length || a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Divide(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] / b[i];
+            }
+        }
+
+        /// <summary>Adds a scalar to each double element.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void AddScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
+        {
+            if (a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), vs));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] + scalar;
+            }
+        }
+
+        /// <summary>Multiplies each double element by a scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void MultiplyScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
+        {
+            if (a.Length != result.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = result.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * scalar;
+            }
+        }
+
+        /// <summary>Sum for double precision with 4-way parallel accumulation.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Sum(ReadOnlySpan<double> data)
+        {
+            int length = data.Length;
+            int i = 0;
+            double sum = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                var vsum0 = Vector256<double>.Zero;
+                var vsum1 = Vector256<double>.Zero;
+                var vsum2 = Vector256<double>.Zero;
+                var vsum3 = Vector256<double>.Zero;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    vsum0 = Avx.Add(vsum0, ReadVector256Double(data, i));
+                    vsum1 = Avx.Add(vsum1, ReadVector256Double(data, i + 4));
+                    vsum2 = Avx.Add(vsum2, ReadVector256Double(data, i + 8));
+                    vsum3 = Avx.Add(vsum3, ReadVector256Double(data, i + 12));
+                }
+                sum += HorizontalSum(Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3)));
+            }
+
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                var vsum = Vector256<double>.Zero;
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    vsum = Avx.Add(vsum, ReadVector256Double(data, i));
+                }
+                sum += HorizontalSum(vsum);
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                sum += data[i];
+            }
+
+            return sum;
+        }
+
+        /// <summary>Dot product for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double DotProduct(ReadOnlySpan<double> a, ReadOnlySpan<double> b)
+        {
+            if (a.Length != b.Length)
+                throw new ArgumentException("Input spans must have the same length.");
+
+            int length = a.Length;
+            int i = 0;
+            double sum = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                var vsum0 = Vector256<double>.Zero;
+                var vsum1 = Vector256<double>.Zero;
+                var vsum2 = Vector256<double>.Zero;
+                var vsum3 = Vector256<double>.Zero;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    var va0 = ReadVector256Double(a, i);
+                    var vb0 = ReadVector256Double(b, i);
+                    var va1 = ReadVector256Double(a, i + 4);
+                    var vb1 = ReadVector256Double(b, i + 4);
+                    var va2 = ReadVector256Double(a, i + 8);
+                    var vb2 = ReadVector256Double(b, i + 8);
+                    var va3 = ReadVector256Double(a, i + 12);
+                    var vb3 = ReadVector256Double(b, i + 12);
+                    vsum0 = Fma.IsSupported ? Fma.MultiplyAdd(va0, vb0, vsum0) : Avx.Add(vsum0, Avx.Multiply(va0, vb0));
+                    vsum1 = Fma.IsSupported ? Fma.MultiplyAdd(va1, vb1, vsum1) : Avx.Add(vsum1, Avx.Multiply(va1, vb1));
+                    vsum2 = Fma.IsSupported ? Fma.MultiplyAdd(va2, vb2, vsum2) : Avx.Add(vsum2, Avx.Multiply(va2, vb2));
+                    vsum3 = Fma.IsSupported ? Fma.MultiplyAdd(va3, vb3, vsum3) : Avx.Add(vsum3, Avx.Multiply(va3, vb3));
+                }
+                sum += HorizontalSum(Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3)));
+            }
+
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                var vsum = Vector256<double>.Zero;
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    var va = ReadVector256Double(a, i);
+                    var vb = ReadVector256Double(b, i);
+                    vsum = Fma.IsSupported ? Fma.MultiplyAdd(va, vb, vsum) : Avx.Add(vsum, Avx.Multiply(va, vb));
+                }
+                sum += HorizontalSum(vsum);
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                sum += a[i] * b[i];
+            }
+
+            return sum;
+        }
+
+        /// <summary>Max for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Max(ReadOnlySpan<double> data)
+        {
+            if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+            double max = double.NegativeInfinity;
+            for (int i = 0; i < data.Length; i++)
+            {
+                if (data[i] > max) max = data[i];
+            }
+            return max;
+        }
+
+        /// <summary>Min for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Min(ReadOnlySpan<double> data)
+        {
+            if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
+            double min = double.PositiveInfinity;
+            for (int i = 0; i < data.Length; i++)
+            {
+                if (data[i] < min) min = data[i];
+            }
+            return min;
+        }
+
+        /// <summary>Cosine similarity for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double CosineSimilarity(ReadOnlySpan<double> a, ReadOnlySpan<double> b)
+        {
+            if (a.Length != b.Length)
+                throw new ArgumentException("Input spans must have the same length.");
+
+            double dot = DotProduct(a, b);
+            double normA = DotProduct(a, a);
+            double normB = DotProduct(b, b);
+            double denominator = Math.Sqrt(normA) * Math.Sqrt(normB);
+            return denominator > 0 ? dot / denominator : 0;
+        }
+
+        /// <summary>SoftMax for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void SoftMax(ReadOnlySpan<double> input, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            double maxVal = Max(input);
+            for (int i = 0; i < input.Length; i++)
+            {
+                output[i] = Math.Exp(input[i] - maxVal);
+            }
+            double sum = Sum(output);
+            if (sum > 0)
+            {
+                MultiplyScalar(output, 1.0 / sum, output);
+            }
+        }
+
+        #endregion
+
         #region Double Activation Functions
 
         /// <summary>
@@ -1693,6 +2716,33 @@ namespace AiDotNet.Tensors.Engines.Simd
             var hi = Avx.ExtractVector128(v, 1);
             var sum128 = Sse.Add(lo, hi);
             return HorizontalSum(sum128);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float HorizontalMax(Vector256<float> v)
+        {
+            var lo = v.GetLower();
+            var hi = Avx.ExtractVector128(v, 1);
+            var max128 = Sse.Max(lo, hi);
+            // [a, b, c, d] -> shuffle to get [c, d, a, b], then max
+            var shuf = Sse.Shuffle(max128, max128, 0b_01_00_11_10); // swap hi/lo pairs
+            max128 = Sse.Max(max128, shuf);
+            shuf = Sse.Shuffle(max128, max128, 0b_10_11_00_01); // swap adjacent
+            max128 = Sse.Max(max128, shuf);
+            return max128.ToScalar();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float HorizontalMin(Vector256<float> v)
+        {
+            var lo = v.GetLower();
+            var hi = Avx.ExtractVector128(v, 1);
+            var min128 = Sse.Min(lo, hi);
+            var shuf = Sse.Shuffle(min128, min128, 0b_01_00_11_10);
+            min128 = Sse.Min(min128, shuf);
+            shuf = Sse.Shuffle(min128, min128, 0b_10_11_00_01);
+            min128 = Sse.Min(min128, shuf);
+            return min128.ToScalar();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
