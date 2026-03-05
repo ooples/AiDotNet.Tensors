@@ -1,3 +1,4 @@
+using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using AiDotNet.Tensors.Benchmarks;
 
@@ -5,6 +6,10 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 class Program
 {
+    // TensorFlow.Binding NuGet is not built in Release mode, so we must disable the validator
+    private static readonly IConfig BenchConfig = DefaultConfig.Instance
+        .WithOptions(ConfigOptions.DisableOptimizationsValidator);
+
     static void Main(string[] args)
     {
         // Run quick performance test first for immediate feedback
@@ -124,44 +129,44 @@ class Program
         // Run competitive benchmarks vs TorchSharp (GPU)
         if (args[0] == "--vs-torchsharp-gpu")
         {
-            BenchmarkRunner.Run<TorchSharpComparisonBenchmarks>();
+            BenchmarkRunner.Run<TorchSharpComparisonBenchmarks>(BenchConfig);
             return;
         }
 
         // Run competitive benchmarks vs TorchSharp (CPU)
         if (args[0] == "--vs-torchsharp-cpu")
         {
-            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);
             return;
         }
 
         // Run competitive benchmarks vs TensorFlow (GPU)
         if (args[0] == "--vs-tensorflow-gpu")
         {
-            BenchmarkRunner.Run<TensorFlowComparisonBenchmarks>();
+            BenchmarkRunner.Run<TensorFlowComparisonBenchmarks>(BenchConfig);
             return;
         }
 
         // Run competitive benchmarks vs TensorFlow (CPU)
         if (args[0] == "--vs-tensorflow-cpu")
         {
-            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(BenchConfig);
             return;
         }
 
         // Run competitive benchmarks vs ML.NET (CPU)
         if (args[0] == "--vs-mlnet-cpu")
         {
-            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(BenchConfig);
             return;
         }
 
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
-            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>();
-            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>();
-            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>();
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(BenchConfig);
             return;
         }
 

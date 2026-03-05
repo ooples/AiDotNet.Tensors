@@ -1883,43 +1883,8 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        int length = a.Length;
-
-        // Use parallel TensorPrimitives for large float/double tensors
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            if (typeof(T) == typeof(float))
-            {
-                var aData = a.Data;
-                var bData = b.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Add(
-                        ((Memory<float>)(object)bData).Span.Slice(start, count),
-                        ((Memory<float>)(object)aData).Span.Slice(start, count),
-                        ((Memory<float>)(object)aData).Span.Slice(start, count));
-                });
-                return;
-            }
-
-#if NET5_0_OR_GREATER
-            if (typeof(T) == typeof(double))
-            {
-                var aData = a.Data;
-                var bData = b.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Add(
-                        ((Memory<double>)(object)bData).Span.Slice(start, count),
-                        ((Memory<double>)(object)aData).Span.Slice(start, count),
-                        ((Memory<double>)(object)aData).Span.Slice(start, count));
-                });
-                return;
-            }
-#endif
-        }
-
-        // Fallback for small tensors or non-float/double types
+        // Element-wise add is memory-bandwidth-bound; parallelization adds overhead
+        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }
@@ -2071,43 +2036,8 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        int length = a.Length;
-
-        // Use parallel TensorPrimitives for large float/double tensors
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            if (typeof(T) == typeof(float))
-            {
-                var aData = a.Data;
-                var bData = b.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Multiply(
-                        ((Memory<float>)(object)bData).Span.Slice(start, count),
-                        ((Memory<float>)(object)aData).Span.Slice(start, count),
-                        ((Memory<float>)(object)aData).Span.Slice(start, count));
-                });
-                return;
-            }
-
-#if NET5_0_OR_GREATER
-            if (typeof(T) == typeof(double))
-            {
-                var aData = a.Data;
-                var bData = b.Data;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Multiply(
-                        ((Memory<double>)(object)bData).Span.Slice(start, count),
-                        ((Memory<double>)(object)aData).Span.Slice(start, count),
-                        ((Memory<double>)(object)aData).Span.Slice(start, count));
-                });
-                return;
-            }
-#endif
-        }
-
-        // Fallback for small tensors or non-float/double types
+        // Element-wise multiply is memory-bandwidth-bound; parallelization adds overhead
+        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }

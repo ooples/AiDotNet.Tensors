@@ -1072,53 +1072,10 @@ public class FloatOperations : INumericOperations<float>
     /// </remarks>
     public float Sum(ReadOnlySpan<float> x)
     {
-        int length = x.Length;
+        // Sum is a pure reduction - single-threaded SIMD already saturates memory bandwidth.
+        // Parallelization adds thread scheduling overhead without throughput benefit.
 #if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
-        {
-            // Lock-free parallel reduction: compute partial sums in array, then combine sequentially
-            int maxDegree = MaxDegreeOfParallelism;
-            int numChunks = Math.Min(maxDegree, (length + MinChunkSize - 1) / MinChunkSize);
-            if (numChunks <= 1)
-            {
-                return TensorPrimitives.Sum(x);
-            }
-
-            // Pad partial sums to cache line boundaries (64 bytes / 4 bytes per float = 16 floats)
-            // to prevent false sharing between threads writing to adjacent slots
-            const int CacheLinePadding = 16; // 64 bytes / sizeof(float)
-            var partialSums = new float[numChunks * CacheLinePadding];
-            int chunkSize = (length + numChunks - 1) / numChunks;
-
-            unsafe
-            {
-                fixed (float* xPtr = x)
-                {
-                    var xp = xPtr;
-                    Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
-                    {
-                        int start = i * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            partialSums[i * CacheLinePadding] = TensorPrimitives.Sum(new ReadOnlySpan<float>(xp + start, count));
-                        }
-                    });
-                }
-            }
-
-            // Combine partial sums sequentially (no lock contention)
-            float totalSum = 0;
-            for (int i = 0; i < numChunks; i++)
-            {
-                totalSum += partialSums[i * CacheLinePadding];
-            }
-            return totalSum;
-        }
-        else
-        {
-            return TensorPrimitives.Sum(x);
-        }
+        return TensorPrimitives.Sum(x);
 #else
         return VectorizedOperationsFallback.Sum(_instance, x);
 #endif
