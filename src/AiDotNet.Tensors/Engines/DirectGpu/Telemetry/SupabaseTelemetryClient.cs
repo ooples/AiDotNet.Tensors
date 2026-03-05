@@ -1,7 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -59,18 +61,19 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     /// <list type="number">
     /// <item>Constructor parameters (explicit override)</item>
     /// <item>Environment variables (<see cref="SupabaseUrlEnvVar"/> / <see cref="SupabaseKeyEnvVar"/>)</item>
+    /// <item>Assembly metadata embedded at build time by CI/CD</item>
     /// </list>
     /// </remarks>
     /// <param name="enabled">Whether telemetry is enabled (default: true).</param>
-    /// <param name="supabaseUrl">Supabase project URL (optional, resolved via <see cref="SupabaseUrlEnvVar"/> if omitted).</param>
-    /// <param name="supabaseKey">Supabase anon key (optional, resolved via <see cref="SupabaseKeyEnvVar"/> if omitted).</param>
+    /// <param name="supabaseUrl">Supabase project URL (optional, resolved via <see cref="SupabaseUrlEnvVar"/> or assembly metadata if omitted).</param>
+    /// <param name="supabaseKey">Supabase anon key (optional, resolved via <see cref="SupabaseKeyEnvVar"/> or assembly metadata if omitted).</param>
     public SupabaseTelemetryClient(
         bool enabled = true,
         string? supabaseUrl = null,
         string? supabaseKey = null)
     {
-        _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar);
-        _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar);
+        _supabaseUrl = ResolveCredential(supabaseUrl, SupabaseUrlEnvVar, "TelemetryUrl");
+        _supabaseKey = ResolveCredential(supabaseKey, SupabaseKeyEnvVar, "TelemetryKey");
 
         // Disable telemetry if credentials are missing or URL is not a valid HTTPS URI
         _isEnabled = enabled
@@ -98,9 +101,9 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
     }
 
     /// <summary>
-    /// Resolves a credential value: constructor param > env var.
+    /// Resolves a credential value: constructor param > env var > assembly metadata.
     /// </summary>
-    private static string ResolveCredential(string? explicitValue, string envVarName)
+    private static string ResolveCredential(string? explicitValue, string envVarName, string metadataKey)
     {
         if (explicitValue is not null && !string.IsNullOrWhiteSpace(explicitValue))
         {
@@ -113,7 +116,26 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
             return envValue;
         }
 
-        return string.Empty;
+        return GetAssemblyMetadata(metadataKey);
+    }
+
+    /// <summary>
+    /// Reads a value from AssemblyMetadata attributes embedded at build time.
+    /// </summary>
+    private static string GetAssemblyMetadata(string key)
+    {
+        try
+        {
+            var assembly = typeof(SupabaseTelemetryClient).Assembly;
+            var attribute = assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(a => string.Equals(a.Key, key, StringComparison.Ordinal));
+            return attribute?.Value ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     /// <inheritdoc/>
