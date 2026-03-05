@@ -3401,8 +3401,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Blocked matrix multiplication for float: C = A @ B
-    /// Uses cache-friendly access pattern with SIMD vectorization.
+    /// High-performance matrix multiplication for float: C = A @ B.
+    /// Delegates to SimdGemm which uses tiled BLIS-style architecture with FMA micro-kernel,
+    /// panel packing, and cache-level blocking for maximum throughput.
     /// </summary>
     private static void MultiplyMatrixBlockedFloat(
         ReadOnlySpan<float> a,
@@ -3412,120 +3413,7 @@ public class CpuEngine : ITensorLevelEngine
         int k,
         int n)
     {
-        const int BlockSize = 64;
-
-        // Initialize output to zero
-        c.Clear();
-
-        // Use parallel processing for large matrices
-        bool useParallel = m * n >= 16384 && Environment.ProcessorCount > 1;
-
-        if (useParallel)
-        {
-            // Copy to arrays for parallel access (Span cannot be captured in lambdas)
-            float[] aArray = a.ToArray();
-            float[] bArray = b.ToArray();
-            float[] cArray = c.ToArray();
-
-            int numRowBlocks = (m + BlockSize - 1) / BlockSize;
-            System.Threading.Tasks.Parallel.For(0, numRowBlocks, iiBlock =>
-            {
-                int ii = iiBlock * BlockSize;
-                int iEnd = Math.Min(ii + BlockSize, m);
-                ProcessBlockRowArray(aArray, bArray, cArray, k, n, BlockSize, ii, iEnd);
-            });
-
-            // Copy back
-            cArray.AsSpan().CopyTo(c);
-        }
-        else
-        {
-            for (int ii = 0; ii < m; ii += BlockSize)
-            {
-                int iEnd = Math.Min(ii + BlockSize, m);
-                ProcessBlockRowSpan(a, b, c, k, n, BlockSize, ii, iEnd);
-            }
-        }
-    }
-
-    private static void ProcessBlockRowArray(
-        float[] a,
-        float[] b,
-        float[] c,
-        int k,
-        int n,
-        int blockSize,
-        int ii,
-        int iEnd)
-    {
-        for (int kk = 0; kk < k; kk += blockSize)
-        {
-            int kEnd = Math.Min(kk + blockSize, k);
-
-            for (int jj = 0; jj < n; jj += blockSize)
-            {
-                int jEnd = Math.Min(jj + blockSize, n);
-
-                // Process block
-                for (int i = ii; i < iEnd; i++)
-                {
-                    int aRowOffset = i * k + kk;
-                    int cRowOffset = i * n + jj;
-
-                    for (int kIdx = kk; kIdx < kEnd; kIdx++)
-                    {
-                        float aik = a[aRowOffset + kIdx - kk];
-                        int bRowOffset = kIdx * n + jj;
-                        int jLen = jEnd - jj;
-
-                        for (int j = 0; j < jLen; j++)
-                        {
-                            c[cRowOffset + j] += aik * b[bRowOffset + j];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private static void ProcessBlockRowSpan(
-        ReadOnlySpan<float> a,
-        ReadOnlySpan<float> b,
-        Span<float> c,
-        int k,
-        int n,
-        int blockSize,
-        int ii,
-        int iEnd)
-    {
-        for (int kk = 0; kk < k; kk += blockSize)
-        {
-            int kEnd = Math.Min(kk + blockSize, k);
-
-            for (int jj = 0; jj < n; jj += blockSize)
-            {
-                int jEnd = Math.Min(jj + blockSize, n);
-
-                // Process block
-                for (int i = ii; i < iEnd; i++)
-                {
-                    int aRowOffset = i * k + kk;
-                    int cRowOffset = i * n + jj;
-
-                    for (int kIdx = kk; kIdx < kEnd; kIdx++)
-                    {
-                        float aik = a[aRowOffset + kIdx - kk];
-                        int bRowOffset = kIdx * n + jj;
-                        int jLen = jEnd - jj;
-
-                        for (int j = 0; j < jLen; j++)
-                        {
-                            c[cRowOffset + j] += aik * b[bRowOffset + j];
-                        }
-                    }
-                }
-            }
-        }
+        Simd.SimdGemm.Sgemm(a, b, c, m, k, n);
     }
 
     /// <summary>
