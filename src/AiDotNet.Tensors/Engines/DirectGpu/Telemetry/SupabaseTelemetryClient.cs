@@ -93,10 +93,11 @@ public sealed class SupabaseTelemetryClient : ITelemetryClient
         // Always configure auth headers when enabled so the client is ready for use.
         // Headers are set once at construction; callers who need to toggle enablement
         // should create a new client instance.
+        // Use TryAddWithoutValidation to avoid FormatException on malformed key values.
         if (_isEnabled)
         {
-            _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
-            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("apikey", _supabaseKey);
+            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {_supabaseKey}");
         }
     }
 
