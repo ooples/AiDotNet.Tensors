@@ -432,8 +432,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException($"NVRTC get {(useCubin ? "CUBIN" : "PTX")} failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
         }
 
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out IntPtr module, binary), $"cuModuleLoadData({moduleName})");
-        Marshal.FreeHGlobal(binary);
+        IntPtr module;
+        try
+        {
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuModuleLoadData(out module, binary), $"cuModuleLoadData({moduleName})");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(binary);
+        }
 
         foreach (var kernelName in kernelNames)
         {
@@ -1799,6 +1806,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
         int byteSize = data.Length * sizeof(float);
@@ -1838,6 +1847,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
         int byteSize = data.Length * sizeof(float);
@@ -1872,6 +1883,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
+        if (destination.Length > buffer.Size)
+            throw new ArgumentException($"Destination ({destination.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
         int byteSize = destination.Length * sizeof(float);

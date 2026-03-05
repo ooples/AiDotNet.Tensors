@@ -151,7 +151,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Gets or sets the maximum number of activation cache entries.
     /// Larger values use more GPU memory but reduce re-uploads for deep networks.
-    /// Default is 16.
+    /// Default is 256, sized for typical DNN layer chains.
     /// </summary>
     public int MaxActivationCacheSize
     {

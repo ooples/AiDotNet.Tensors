@@ -155,7 +155,8 @@ public static class CuBlasNative
         {
             foreach (var candidate in candidates)
             {
-                var fullPath = System.IO.Path.Combine(dir, candidate + ".dll");
+                var ext = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows) ? ".dll" : ".so";
+                var fullPath = System.IO.Path.Combine(dir, candidate + ext);
                 if (NativeLibrary.TryLoad(fullPath, out var handle))
                     return handle;
             }
@@ -189,13 +190,26 @@ public static class CuBlasNative
 
         if (!string.IsNullOrEmpty(cudaPath))
         {
-            // CUDA 13+ uses bin\x64; older versions use bin
-            var binX64 = System.IO.Path.Combine(cudaPath, "bin", "x64");
-            if (System.IO.Directory.Exists(binX64))
-                dirs.Add(binX64);
-            var bin = System.IO.Path.Combine(cudaPath, "bin");
-            if (System.IO.Directory.Exists(bin))
-                dirs.Add(bin);
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            {
+                // Windows: CUDA 13+ uses bin\x64; older versions use bin
+                var binX64 = System.IO.Path.Combine(cudaPath, "bin", "x64");
+                if (System.IO.Directory.Exists(binX64))
+                    dirs.Add(binX64);
+                var bin = System.IO.Path.Combine(cudaPath, "bin");
+                if (System.IO.Directory.Exists(bin))
+                    dirs.Add(bin);
+            }
+            else
+            {
+                // Linux: lib64 (standard), lib (fallback)
+                var lib64 = System.IO.Path.Combine(cudaPath, "lib64");
+                if (System.IO.Directory.Exists(lib64))
+                    dirs.Add(lib64);
+                var lib = System.IO.Path.Combine(cudaPath, "lib");
+                if (System.IO.Directory.Exists(lib))
+                    dirs.Add(lib);
+            }
         }
 
         return dirs.ToArray();

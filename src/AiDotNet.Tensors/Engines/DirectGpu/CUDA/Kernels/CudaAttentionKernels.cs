@@ -420,10 +420,12 @@ extern ""C"" __global__ void grouped_query_attention(
 
     if (bqh >= batch * numQHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
+    if (queriesPerKV <= 0 || numKVHeads <= 0) return;
 
     int b = bqh / numQHeads;
     int qh = bqh % numQHeads;
     int kvh = qh / queriesPerKV;
+    if (kvh >= numKVHeads) return;
 
     extern __shared__ float smem[];
     float* Ks = smem;                        // [ATTN_BC * headDim]
@@ -542,10 +544,12 @@ extern ""C"" __global__ void grouped_query_attention_backward(
 
     if (bqh >= batch * numQHeads) return;
     if (headDim > MAX_HEAD_DIM) return;
+    if (queriesPerKV <= 0 || numKVHeads <= 0) return;
 
     int b_idx = bqh / numQHeads;
     int qh = bqh % numQHeads;
     int kvh = qh / queriesPerKV;
+    if (kvh >= numKVHeads) return;
 
     extern __shared__ float smem[];
     float* Ks = smem;                        // [ATTN_BC * headDim]
@@ -668,6 +672,7 @@ extern ""C"" __global__ void flash_attention_forward(
     int bh = blockIdx.y;
 
     if (bh >= batch * numHeads) return;
+    if (headDim > MAX_HEAD_DIM) return;
 
     extern __shared__ float smem[];
     float* Ks = smem;                        // [ATTN_BC * headDim]

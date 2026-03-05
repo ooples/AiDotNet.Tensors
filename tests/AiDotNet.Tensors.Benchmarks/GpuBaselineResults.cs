@@ -157,9 +157,9 @@ public static class GpuBaselineResults
         double flops = 2.0 * M * N * K;
         double gflops = flops / (avgMs * 1e6);
 
-        // Correctness: compute CPU reference for small sizes
+        // Correctness: compute CPU reference for small sizes (gated by total FLOPs to avoid slow CPU compute)
         double maxError = 0, avgError = 0;
-        if (M * N <= 1048576)
+        if ((long)M * N * K <= 256L * 1024 * 1024) // ~256M multiply-adds
         {
             var gpuResult = new float[M * N];
             backend.DownloadBuffer(bufC, gpuResult);
@@ -241,7 +241,13 @@ public static class GpuBaselineResults
 
             double avgMs = sw.Elapsed.TotalMilliseconds / runs;
             double gflops = totalSize * 5.0 / (avgMs * 1e6);
-            return new BenchmarkResult(phase, $"batchnorm_B{batch}_C{channels}_S{spatial}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+
+            var gpuResult = new float[totalSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            var cpuResult = ComputeBatchNormCpu(input, gamma, beta, batch, channels, spatial);
+            var (maxError, avgError) = CompareArrays(cpuResult, gpuResult);
+
+            return new BenchmarkResult(phase, $"batchnorm_B{batch}_C{channels}_S{spatial}", totalSize, gflops, maxError, avgError, avgMs, DateTime.UtcNow);
         }
 
         if (op == "layernorm")
@@ -269,7 +275,13 @@ public static class GpuBaselineResults
 
             double avgMs = sw.Elapsed.TotalMilliseconds / runs;
             double gflops = totalSize * 5.0 / (avgMs * 1e6);
-            return new BenchmarkResult(phase, $"layernorm_B{batch}_N{normalizedSize}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+
+            var gpuResult = new float[totalSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            var cpuResult = ComputeLayerNormCpu(input, lnGamma, lnBeta, batch, normalizedSize);
+            var (maxError, avgError) = CompareArrays(cpuResult, gpuResult);
+
+            return new BenchmarkResult(phase, $"layernorm_B{batch}_N{normalizedSize}", totalSize, gflops, maxError, avgError, avgMs, DateTime.UtcNow);
         }
 
         if (op == "groupnorm")
@@ -294,7 +306,21 @@ public static class GpuBaselineResults
 
             double avgMs = sw.Elapsed.TotalMilliseconds / runs;
             double gflops = totalSize * 5.0 / (avgMs * 1e6);
-            return new BenchmarkResult(phase, $"groupnorm_B{batch}_C{channels}_G{numGroups}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+
+            // GroupNorm CPU reference is complex; use sanity check instead
+            var gpuResult = new float[totalSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            double maxError = 0, avgError2 = 0;
+            int nanCount = 0;
+            for (int i = 0; i < gpuResult.Length; i++)
+            {
+                if (float.IsNaN(gpuResult[i]) || float.IsInfinity(gpuResult[i]))
+                    nanCount++;
+            }
+            if (nanCount > 0)
+                (maxError, avgError2) = (double.PositiveInfinity, double.PositiveInfinity);
+
+            return new BenchmarkResult(phase, $"groupnorm_B{batch}_C{channels}_G{numGroups}", totalSize, gflops, maxError, avgError2, avgMs, DateTime.UtcNow);
         }
 
         if (op == "instancenorm")
@@ -318,7 +344,21 @@ public static class GpuBaselineResults
 
             double avgMs = sw.Elapsed.TotalMilliseconds / runs;
             double gflops = totalSize * 5.0 / (avgMs * 1e6);
-            return new BenchmarkResult(phase, $"instancenorm_B{batch}_C{channels}_S{spatial}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+
+            // InstanceNorm CPU reference: sanity check for NaN/Inf
+            var gpuResult = new float[totalSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            double maxError = 0, avgError2 = 0;
+            for (int i = 0; i < gpuResult.Length; i++)
+            {
+                if (float.IsNaN(gpuResult[i]) || float.IsInfinity(gpuResult[i]))
+                {
+                    (maxError, avgError2) = (double.PositiveInfinity, double.PositiveInfinity);
+                    break;
+                }
+            }
+
+            return new BenchmarkResult(phase, $"instancenorm_B{batch}_C{channels}_S{spatial}", totalSize, gflops, maxError, avgError2, avgMs, DateTime.UtcNow);
         }
 
         // rmsnorm (default)
@@ -341,7 +381,13 @@ public static class GpuBaselineResults
 
             double avgMs = sw.Elapsed.TotalMilliseconds / runs;
             double gflops = totalSize * 4.0 / (avgMs * 1e6);
-            return new BenchmarkResult(phase, $"rmsnorm_B{batch}_N{normalizedSize}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+
+            var gpuResult = new float[totalSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            var cpuResult = ComputeRmsNormCpu(input, rmsGamma, batch, normalizedSize);
+            var (maxError, avgError) = CompareArrays(cpuResult, gpuResult);
+
+            return new BenchmarkResult(phase, $"rmsnorm_B{batch}_N{normalizedSize}", totalSize, gflops, maxError, avgError, avgMs, DateTime.UtcNow);
         }
     }
 
@@ -377,7 +423,31 @@ public static class GpuBaselineResults
         double flops = 4.0 * batch * numHeads * seqLen * seqLen * headDim;
         double gflops = flops / (avgMs * 1e6);
 
-        return new BenchmarkResult(phase, $"flashattn_seq{seqLen}_h{numHeads}_d{headDim}", seqLen, gflops, 0, 0, avgMs, DateTime.UtcNow);
+        // Correctness: CPU reference for small sequence lengths
+        double maxError = 0, avgError = 0;
+        if (seqLen <= 256)
+        {
+            var gpuResult = new float[qkvSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            var cpuResult = ComputeScaledDotProductAttentionCpu(query, key, value, batch, numHeads, seqLen, headDim, scale);
+            (maxError, avgError) = CompareArrays(cpuResult, gpuResult);
+        }
+        else
+        {
+            // For large sequences, just sanity-check for NaN/Inf
+            var gpuResult = new float[qkvSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            for (int i = 0; i < gpuResult.Length; i++)
+            {
+                if (float.IsNaN(gpuResult[i]) || float.IsInfinity(gpuResult[i]))
+                {
+                    (maxError, avgError) = (double.PositiveInfinity, double.PositiveInfinity);
+                    break;
+                }
+            }
+        }
+
+        return new BenchmarkResult(phase, $"flashattn_seq{seqLen}_h{numHeads}_d{headDim}", seqLen, gflops, maxError, avgError, avgMs, DateTime.UtcNow);
     }
 
     private static BenchmarkResult BenchmarkConv2D(IDirectGpuBackend backend, string phase)
@@ -414,7 +484,17 @@ public static class GpuBaselineResults
         double flops = 2.0 * N * outC * outH * outW * C * kH * kW;
         double gflops = flops / (avgMs * 1e6);
 
-        return new BenchmarkResult(phase, $"conv2d_N{N}_C{C}_H{H}_K{kH}", inputSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+        // Correctness: CPU reference (gated by output size to avoid long CPU compute)
+        double maxError = 0, avgError = 0;
+        if ((long)outputSize * C * kH * kW <= 512L * 1024 * 1024)
+        {
+            var gpuResult = new float[outputSize];
+            backend.DownloadBuffer(bufOut, gpuResult);
+            var cpuResult = ComputeConv2DCpu(input, kernel, N, C, H, W, outC, outH, outW, kH, kW);
+            (maxError, avgError) = CompareArrays(cpuResult, gpuResult);
+        }
+
+        return new BenchmarkResult(phase, $"conv2d_N{N}_C{C}_H{H}_K{kH}", inputSize, gflops, maxError, avgError, avgMs, DateTime.UtcNow);
     }
 
     #region Helpers
@@ -516,6 +596,153 @@ public static class GpuBaselineResults
             count++;
         }
         return (maxError, count > 0 ? sumError / count : 0);
+    }
+
+    private static float[] ComputeBatchNormCpu(float[] input, float[] gamma, float[] beta, int batch, int channels, int spatial)
+    {
+        int totalSize = batch * channels * spatial;
+        var output = new float[totalSize];
+        int batchSpatial = batch * spatial;
+
+        for (int c = 0; c < channels; c++)
+        {
+            double mean = 0;
+            for (int b = 0; b < batch; b++)
+                for (int s = 0; s < spatial; s++)
+                    mean += input[(b * channels + c) * spatial + s];
+            mean /= batchSpatial;
+
+            double variance = 0;
+            for (int b = 0; b < batch; b++)
+                for (int s = 0; s < spatial; s++)
+                {
+                    double diff = input[(b * channels + c) * spatial + s] - mean;
+                    variance += diff * diff;
+                }
+            variance /= batchSpatial;
+
+            double invStd = 1.0 / Math.Sqrt(variance + 1e-5);
+            for (int b = 0; b < batch; b++)
+                for (int s = 0; s < spatial; s++)
+                {
+                    int idx = (b * channels + c) * spatial + s;
+                    output[idx] = (float)(gamma[c] * ((input[idx] - mean) * invStd) + beta[c]);
+                }
+        }
+        return output;
+    }
+
+    private static float[] ComputeLayerNormCpu(float[] input, float[] gamma, float[] beta, int batch, int normalizedSize)
+    {
+        var output = new float[batch * normalizedSize];
+        for (int b = 0; b < batch; b++)
+        {
+            int baseIdx = b * normalizedSize;
+            double mean = 0;
+            for (int i = 0; i < normalizedSize; i++)
+                mean += input[baseIdx + i];
+            mean /= normalizedSize;
+
+            double variance = 0;
+            for (int i = 0; i < normalizedSize; i++)
+            {
+                double diff = input[baseIdx + i] - mean;
+                variance += diff * diff;
+            }
+            variance /= normalizedSize;
+
+            double invStd = 1.0 / Math.Sqrt(variance + 1e-5);
+            for (int i = 0; i < normalizedSize; i++)
+                output[baseIdx + i] = (float)(gamma[i] * ((input[baseIdx + i] - mean) * invStd) + beta[i]);
+        }
+        return output;
+    }
+
+    private static float[] ComputeRmsNormCpu(float[] input, float[] gamma, int batch, int normalizedSize)
+    {
+        var output = new float[batch * normalizedSize];
+        for (int b = 0; b < batch; b++)
+        {
+            int baseIdx = b * normalizedSize;
+            double sumSq = 0;
+            for (int i = 0; i < normalizedSize; i++)
+                sumSq += (double)input[baseIdx + i] * input[baseIdx + i];
+            double rms = Math.Sqrt(sumSq / normalizedSize + 1e-5);
+            double invRms = 1.0 / rms;
+            for (int i = 0; i < normalizedSize; i++)
+                output[baseIdx + i] = (float)(gamma[i] * input[baseIdx + i] * invRms);
+        }
+        return output;
+    }
+
+    private static float[] ComputeScaledDotProductAttentionCpu(float[] query, float[] key, float[] value, int batch, int numHeads, int seqLen, int headDim, float scale)
+    {
+        var output = new float[batch * numHeads * seqLen * headDim];
+        for (int b = 0; b < batch; b++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                int qkvOffset = ((b * numHeads) + h) * seqLen * headDim;
+
+                // Compute attention scores: Q * K^T * scale, then softmax, then * V
+                for (int i = 0; i < seqLen; i++)
+                {
+                    // Compute scores for row i
+                    var scores = new double[seqLen];
+                    double maxScore = double.NegativeInfinity;
+                    for (int j = 0; j < seqLen; j++)
+                    {
+                        double dot = 0;
+                        for (int d = 0; d < headDim; d++)
+                            dot += (double)query[qkvOffset + i * headDim + d] * key[qkvOffset + j * headDim + d];
+                        scores[j] = dot * scale;
+                        if (scores[j] > maxScore) maxScore = scores[j];
+                    }
+
+                    // Softmax
+                    double sumExp = 0;
+                    for (int j = 0; j < seqLen; j++)
+                    {
+                        scores[j] = Math.Exp(scores[j] - maxScore);
+                        sumExp += scores[j];
+                    }
+                    for (int j = 0; j < seqLen; j++)
+                        scores[j] /= sumExp;
+
+                    // Output = scores * V
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        double val = 0;
+                        for (int j = 0; j < seqLen; j++)
+                            val += scores[j] * value[qkvOffset + j * headDim + d];
+                        output[qkvOffset + i * headDim + d] = (float)val;
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    private static float[] ComputeConv2DCpu(float[] input, float[] kernel, int N, int C, int H, int W, int outC, int outH, int outW, int kH, int kW)
+    {
+        var output = new float[N * outC * outH * outW];
+        for (int n = 0; n < N; n++)
+            for (int oc = 0; oc < outC; oc++)
+                for (int oh = 0; oh < outH; oh++)
+                    for (int ow = 0; ow < outW; ow++)
+                    {
+                        double sum = 0;
+                        for (int ic = 0; ic < C; ic++)
+                            for (int kh = 0; kh < kH; kh++)
+                                for (int kw = 0; kw < kW; kw++)
+                                {
+                                    int ih = oh + kh, iw = ow + kw;
+                                    sum += (double)input[((n * C + ic) * H + ih) * W + iw]
+                                         * kernel[((oc * C + ic) * kH + kh) * kW + kw];
+                                }
+                        output[((n * outC + oc) * outH + oh) * outW + ow] = (float)sum;
+                    }
+        return output;
     }
 
     private static void WriteCsv(List<BenchmarkResult> results, string csvPath, bool appendIfExists)

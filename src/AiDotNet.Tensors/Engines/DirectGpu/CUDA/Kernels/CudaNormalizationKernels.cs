@@ -129,20 +129,22 @@ extern ""C"" __global__ void batchnorm_backward(
     float invVar = saveInvVar[c];
     float g = gamma[c];
 
-    // Parallel reduction for dGamma, dBeta, sumDyXmu
-    float locDGamma = 0.0f, locDBeta = 0.0f, locDyXmu = 0.0f;
+    // Parallel reduction for dGamma, dBeta, and gamma-scaled sums
+    float locDGamma = 0.0f, locDBeta = 0.0f, locSumDxhat = 0.0f, locSumDxhatXhat = 0.0f;
     for (int i = tid; i < batchSpatial; i += blockDim.x) {
         int b = i / spatialSize;
         int s = i % spatialSize;
         int idx = (b * channels + c) * spatialSize + s;
-        float normalized = (input[idx] - mean) * invVar;
-        locDGamma += gradOutput[idx] * normalized;
+        float xhat = (input[idx] - mean) * invVar;
+        float dxhat = gradOutput[idx] * g;
+        locDGamma += gradOutput[idx] * xhat;
         locDBeta += gradOutput[idx];
-        locDyXmu += gradOutput[idx] * (input[idx] - mean);
+        locSumDxhat += dxhat;
+        locSumDxhatXhat += dxhat * xhat;
     }
     smem[tid] = locDGamma;
     smem2[tid] = locDBeta;
-    smem3[tid] = locDyXmu;
+    smem3[tid] = locSumDxhat;
     BLOCK_REDUCE(smem, tid);
     BLOCK_REDUCE(smem2, tid);
     BLOCK_REDUCE(smem3, tid);
@@ -151,17 +153,23 @@ extern ""C"" __global__ void batchnorm_backward(
         gradGamma[c] = smem[0];
         gradBeta[c] = smem2[0];
     }
-    float sumDy = smem2[0];
-    float sumDyXmu = smem3[0];
+    float sumDxhat = smem3[0];
+    __syncthreads();
+
+    // Second reduction for sum(dxhat * xhat)
+    smem[tid] = locSumDxhatXhat;
+    BLOCK_REDUCE(smem, tid);
+    float sumDxhatXhat = smem[0];
 
     // Parallel gradInput computation
+    float invN = 1.0f / (float)batchSpatial;
     for (int i = tid; i < batchSpatial; i += blockDim.x) {
         int b = i / spatialSize;
         int s = i % spatialSize;
         int idx = (b * channels + c) * spatialSize + s;
-        float xmu = input[idx] - mean;
+        float xhat = (input[idx] - mean) * invVar;
         float dxhat = gradOutput[idx] * g;
-        gradInput[idx] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)batchSpatial);
+        gradInput[idx] = invVar * (dxhat - invN * (sumDxhat + xhat * sumDxhatXhat));
     }
 }
 

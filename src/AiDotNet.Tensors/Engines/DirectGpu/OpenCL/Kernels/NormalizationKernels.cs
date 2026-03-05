@@ -132,16 +132,21 @@ __kernel void batchnorm_backward(
     float invVar = saveInvVar[c];
     float g = gamma[c];
 
-    // Phase 1: Parallel reduction for gradGamma and gradBeta
+    // Phase 1: Parallel reduction for gradGamma, gradBeta, and gamma-scaled sums
     float tDGamma = 0.0f;
     float tDBeta = 0.0f;
+    float tSumDxhat = 0.0f;
+    float tSumDxhatXhat = 0.0f;
     for (int i = lid; i < batchSpatial; i += localSize) {
         int b = i / spatialSize;
         int s = i % spatialSize;
         int idx = (b * channels + c) * spatialSize + s;
-        float normalized = (input[idx] - mean) * invVar;
-        tDGamma += gradOutput[idx] * normalized;
+        float xhat = (input[idx] - mean) * invVar;
+        float dxhat = gradOutput[idx] * g;
+        tDGamma += gradOutput[idx] * xhat;
         tDBeta += gradOutput[idx];
+        tSumDxhat += dxhat;
+        tSumDxhatXhat += dxhat * xhat;
     }
     localBuf[lid] = tDGamma;
     localBuf2[lid] = tDBeta;
@@ -153,39 +158,36 @@ __kernel void batchnorm_backward(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    float dGamma = localBuf[0];
-    float dBeta = localBuf2[0];
     if (lid == 0) {
-        gradGamma[c] = dGamma;
-        gradBeta[c] = dBeta;
+        gradGamma[c] = localBuf[0];
+        gradBeta[c] = localBuf2[0];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Phase 2: Parallel reduction for sumDyXmu
-    float tSumDyXmu = 0.0f;
-    for (int i = lid; i < batchSpatial; i += localSize) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        int idx = (b * channels + c) * spatialSize + s;
-        tSumDyXmu += gradOutput[idx] * (input[idx] - mean);
-    }
-    localBuf[lid] = tSumDyXmu;
+    // Phase 2: Reduce sum(dxhat) and sum(dxhat * xhat)
+    localBuf[lid] = tSumDxhat;
+    localBuf2[lid] = tSumDxhatXhat;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        if (lid < stride) {
+            localBuf[lid] += localBuf[lid + stride];
+            localBuf2[lid] += localBuf2[lid + stride];
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    float sumDyXmu = localBuf[0];
+    float sumDxhat = localBuf[0];
+    float sumDxhatXhat = localBuf2[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Phase 3: Compute gradInput
+    float invN = 1.0f / (float)batchSpatial;
     for (int i = lid; i < batchSpatial; i += localSize) {
         int b = i / spatialSize;
         int s = i % spatialSize;
         int idx = (b * channels + c) * spatialSize + s;
-        float xmu = input[idx] - mean;
+        float xhat = (input[idx] - mean) * invVar;
         float dxhat = gradOutput[idx] * g;
-        gradInput[idx] = invVar * (dxhat - (dBeta + xmu * invVar * invVar * sumDyXmu) / (float)batchSpatial);
+        gradInput[idx] = invVar * (dxhat - invN * (sumDxhat + xhat * sumDxhatXhat));
     }
 }
 

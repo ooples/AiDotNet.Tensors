@@ -62,7 +62,8 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             // with a larger request (e.g., 8192 → bucket 8192).
             if (candidate.Size < size)
             {
-                // Return the too-small buffer and fall through to fresh allocation
+                // Return the too-small buffer to the pool (count stays consistent since
+                // we took one out and are putting the same one back)
                 bucket.Buffers.Add(candidate);
                 return false;
             }

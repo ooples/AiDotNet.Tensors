@@ -105,14 +105,15 @@ extern ""C"" __global__ void swish_backward(const float* gradOutput, const float
 }
 
 // Warp-level reduction helpers using HIP shuffle intrinsics
+// Use warpSize/2 as initial offset to handle both 32-wide and 64-wide wavefronts
 __device__ __forceinline__ float warpReduceMax(float val) {
-    for (int offset = 32; offset > 0; offset >>= 1)
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         val = fmaxf(val, __shfl_down(val, offset));
     return val;
 }
 
 __device__ __forceinline__ float warpReduceSum(float val) {
-    for (int offset = 32; offset > 0; offset >>= 1)
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         val += __shfl_down(val, offset);
     return val;
 }

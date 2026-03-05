@@ -99,6 +99,21 @@ internal static class NvrtcNativeBindings
                 currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
             }
         }
+
+        // On Linux, also set LD_LIBRARY_PATH for native library resolution
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var ldPath = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? "";
+            foreach (var sub in subdirs)
+            {
+                var dir = Path.Combine(cudaPath, sub);
+                if (Directory.Exists(dir) && !ldPath.Contains(dir, StringComparison.OrdinalIgnoreCase))
+                {
+                    ldPath = dir + Path.PathSeparator + ldPath;
+                }
+            }
+            Environment.SetEnvironmentVariable("LD_LIBRARY_PATH", ldPath);
+        }
     }
 
     private static INvrtcApi? ResolveApi()
