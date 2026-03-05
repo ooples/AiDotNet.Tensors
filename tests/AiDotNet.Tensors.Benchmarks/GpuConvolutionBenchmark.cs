@@ -26,66 +26,63 @@ public static class GpuConvolutionBenchmark
                 Console.WriteLine("[SKIP] DirectGpu not available.");
                 return;
             }
+
+            Console.WriteLine($"Backend: {engine.BackendName}");
+            Console.WriteLine($"Device:  {engine.DeviceName}");
+            Console.WriteLine();
+
+            var backend = engine.Backend;
+            if (backend == null)
+            {
+                Console.WriteLine("[ERROR] Could not access backend.");
+                return;
+            }
+
+            Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
+            Console.WriteLine(new string('-', 67));
+
+            var configs = new (int N, int C, int H, int W, int outC, int kH, int kW, int stride, int pad, string desc)[]
+            {
+                (4, 64, 56, 56, 64, 3, 3, 1, 1, "ResNet conv3x3 s1p1"),
+                (4, 64, 56, 56, 64, 3, 3, 1, 0, "Conv3x3 no-pad"),
+                (4, 64, 56, 56, 128, 1, 1, 1, 0, "1x1 projection"),
+                (4, 128, 28, 28, 128, 3, 3, 1, 1, "ResNet stage2"),
+                (4, 256, 14, 14, 256, 3, 3, 1, 1, "ResNet stage3"),
+                (4, 512, 7, 7, 512, 3, 3, 1, 1, "ResNet stage4"),
+                (16, 64, 56, 56, 64, 3, 3, 1, 1, "Batch=16 conv3x3"),
+            };
+
+            foreach (var (N, C, H, W, outC, kH, kW, stride, pad, desc) in configs)
+            {
+                BenchmarkConv2DForward(backend, N, C, H, W, outC, kH, kW, stride, pad, desc);
+            }
+
+            Console.WriteLine();
+
+            Console.WriteLine("--- Conv2D Backward ---");
+            Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
+            Console.WriteLine(new string('-', 67));
+
+            BenchmarkConv2DBackward(backend, 4, 64, 56, 56, 64, 3, 3, 1, 1, "Backward input");
+            BenchmarkConv2DBackwardKernel(backend, 4, 64, 56, 56, 64, 3, 3, 1, 1, "Backward kernel");
+
+            Console.WriteLine();
+
+            Console.WriteLine("--- Depthwise Conv2D ---");
+            Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
+            Console.WriteLine(new string('-', 67));
+
+            BenchmarkDepthwiseConv2D(backend, 4, 64, 56, 56, 3, 3, 1, 1, "DW conv3x3");
+            BenchmarkDepthwiseConv2D(backend, 4, 128, 28, 28, 3, 3, 1, 1, "DW conv3x3 stage2");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] {ex.Message}");
-            return;
         }
-
-        Console.WriteLine($"Backend: {engine.BackendName}");
-        Console.WriteLine($"Device:  {engine.DeviceName}");
-        Console.WriteLine();
-
-        var backend = engine.Backend;
-        if (backend == null)
+        finally
         {
-            Console.WriteLine("[ERROR] Could not access backend.");
-            engine.Dispose();
-            return;
+            engine?.Dispose();
         }
-
-        Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
-        Console.WriteLine(new string('-', 67));
-
-        // Standard Conv2D configurations
-        var configs = new (int N, int C, int H, int W, int outC, int kH, int kW, int stride, int pad, string desc)[]
-        {
-            (4, 64, 56, 56, 64, 3, 3, 1, 1, "ResNet conv3x3 s1p1"),
-            (4, 64, 56, 56, 64, 3, 3, 1, 0, "Conv3x3 no-pad"),
-            (4, 64, 56, 56, 128, 1, 1, 1, 0, "1x1 projection"),
-            (4, 128, 28, 28, 128, 3, 3, 1, 1, "ResNet stage2"),
-            (4, 256, 14, 14, 256, 3, 3, 1, 1, "ResNet stage3"),
-            (4, 512, 7, 7, 512, 3, 3, 1, 1, "ResNet stage4"),
-            (16, 64, 56, 56, 64, 3, 3, 1, 1, "Batch=16 conv3x3"),
-        };
-
-        foreach (var (N, C, H, W, outC, kH, kW, stride, pad, desc) in configs)
-        {
-            BenchmarkConv2DForward(backend, N, C, H, W, outC, kH, kW, stride, pad, desc);
-        }
-
-        Console.WriteLine();
-
-        // Conv2D backward benchmarks
-        Console.WriteLine("--- Conv2D Backward ---");
-        Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
-        Console.WriteLine(new string('-', 67));
-
-        BenchmarkConv2DBackward(backend, 4, 64, 56, 56, 64, 3, 3, 1, 1, "Backward input");
-        BenchmarkConv2DBackwardKernel(backend, 4, 64, 56, 56, 64, 3, 3, 1, 1, "Backward kernel");
-
-        Console.WriteLine();
-
-        // Depthwise convolution
-        Console.WriteLine("--- Depthwise Conv2D ---");
-        Console.WriteLine($"{"Config",-45} {"Time(ms)",10} {"GFLOPS",10}");
-        Console.WriteLine(new string('-', 67));
-
-        BenchmarkDepthwiseConv2D(backend, 4, 64, 56, 56, 3, 3, 1, 1, "DW conv3x3");
-        BenchmarkDepthwiseConv2D(backend, 4, 128, 28, 28, 3, 3, 1, 1, "DW conv3x3 stage2");
-
-        engine.Dispose();
     }
 
     private static void BenchmarkConv2DForward(IDirectGpuBackend backend, int N, int C, int H, int W,

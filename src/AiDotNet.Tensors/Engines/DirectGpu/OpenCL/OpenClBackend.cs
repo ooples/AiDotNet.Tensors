@@ -5001,7 +5001,7 @@ KERNEL VARIANTS (A/B testing):
                                && dilationH == 1 && dilationW == 1;
             bool useTiled = !useWinograd && kernelH <= 7 && kernelW <= 7;
 
-            if (useWinograd)
+            if (useWinograd && _kernelCache.ContainsKey("conv2d_winograd_f2x2_3x3"))
             {
                 var k = _kernelCache["conv2d_winograd_f2x2_3x3"];
                 uint arg = 0;

@@ -58,39 +58,44 @@ extern ""C"" __global__ void batchnorm_forward(
     int tid = threadIdx.x;
     int batchSpatial = batch * spatialSize;
 
-    // Parallel mean reduction
-    float localSum = 0.0f;
-    for (int i = tid; i < batchSpatial; i += blockDim.x) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        localSum += input[(b * channels + c) * spatialSize + s];
-    }
-    smem[tid] = localSum;
-    BLOCK_REDUCE(smem, tid);
-    float mean = smem[0] / (float)batchSpatial;
-    __syncthreads();
+    float mean, invVar;
 
-    // Parallel variance reduction
-    float localVar = 0.0f;
-    for (int i = tid; i < batchSpatial; i += blockDim.x) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        float diff = input[(b * channels + c) * spatialSize + s] - mean;
-        localVar += diff * diff;
-    }
-    smem[tid] = localVar;
-    BLOCK_REDUCE(smem, tid);
-    float var = smem[0] / (float)batchSpatial;
+    if (training) {
+        // Training: compute mean/var from batch data
+        float localSum = 0.0f;
+        for (int i = tid; i < batchSpatial; i += blockDim.x) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            localSum += input[(b * channels + c) * spatialSize + s];
+        }
+        smem[tid] = localSum;
+        BLOCK_REDUCE(smem, tid);
+        mean = smem[0] / (float)batchSpatial;
+        __syncthreads();
 
-    float invVar = rsqrtf(var + epsilon);
+        float localVar = 0.0f;
+        for (int i = tid; i < batchSpatial; i += blockDim.x) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            float diff = input[(b * channels + c) * spatialSize + s] - mean;
+            localVar += diff * diff;
+        }
+        smem[tid] = localVar;
+        BLOCK_REDUCE(smem, tid);
+        float var = smem[0] / (float)batchSpatial;
 
-    if (tid == 0) {
-        saveMean[c] = mean;
-        saveInvVar[c] = invVar;
-        if (training) {
+        invVar = rsqrtf(var + epsilon);
+
+        if (tid == 0) {
+            saveMean[c] = mean;
+            saveInvVar[c] = invVar;
             runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
             runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
         }
+    } else {
+        // Inference: use running statistics
+        mean = runningMean[c];
+        invVar = rsqrtf(runningVar[c] + epsilon);
     }
 
     // Parallel normalize + scale + shift

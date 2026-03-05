@@ -62,7 +62,7 @@ internal sealed class ActivationCacheEntry : IDisposable
 /// When active, output buffers from GPU operations are cached in the activation cache,
 /// allowing chained operations to reuse GPU buffers without re-uploading.
 /// </summary>
-public readonly struct GpuScope : IDisposable
+public sealed class GpuScope : IDisposable
 {
     [ThreadStatic]
     private static int _depth;
@@ -72,7 +72,7 @@ public readonly struct GpuScope : IDisposable
     /// </summary>
     internal static bool IsActive => _depth > 0;
 
-    internal GpuScope(bool _)
+    internal GpuScope()
     {
         _depth++;
     }
@@ -170,7 +170,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Within this scope, GPU output buffers are retained in the activation cache,
     /// so chained operations (e.g., GEMM + Bias + ReLU) avoid redundant CPU-GPU transfers.
     /// </summary>
-    public GpuScope BeginGpuScope() => new GpuScope(true);
+    public GpuScope BeginGpuScope() => new GpuScope();
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
     {
@@ -712,16 +712,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
         var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
 
-        if (GpuScope.IsActive)
-            CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-        else
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
             bufferB.Dispose();
-
-        return result;
+            throw;
+        }
     }
 
     private T[]? TryRunBinary<T>(T[] left, T[] right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
@@ -734,16 +742,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
         var bufferC = AllocateOutputBuffer(backend, left.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
 
-        if (GpuScope.IsActive)
-            CacheActivation(result, bufferC.Buffer, [left.Length], backend);
-        else
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
+            else
+                bufferC.Dispose();
+
+            return result;
+        }
+        catch
+        {
             bufferC.Dispose();
-
-        return result;
+            throw;
+        }
     }
 
     private T[]? TryRunScalar<T>(T[] input, T scalar, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, float, int> op)
@@ -753,16 +769,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var bufferA = GetOrAllocateBuffer(backend, input);
         var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
 
-        if (GpuScope.IsActive)
-            CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-        else
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
             bufferB.Dispose();
-
-        return result;
+            throw;
+        }
     }
 
     /// <summary>
@@ -778,16 +802,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufferA = AllocateBufferFromSpan(backend, left);
         using var bufferB = AllocateBufferFromSpan(backend, right);
         var bufferC = AllocateOutputBuffer(backend, left.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
 
-        if (GpuScope.IsActive)
-            CacheActivation(result, bufferC.Buffer, [left.Length], backend);
-        else
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
+            else
+                bufferC.Dispose();
+
+            return result;
+        }
+        catch
+        {
             bufferC.Dispose();
-
-        return result;
+            throw;
+        }
     }
 
     /// <summary>
@@ -800,16 +832,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var bufferA = AllocateBufferFromSpan(backend, input);
         var bufferB = AllocateOutputBuffer(backend, input.Length);
-        op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-        float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
+            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
 
-        if (GpuScope.IsActive)
-            CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-        else
+            if (GpuScope.IsActive)
+                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
+            else
+                bufferB.Dispose();
+
+            return result;
+        }
+        catch
+        {
             bufferB.Dispose();
-
-        return result;
+            throw;
+        }
     }
 
     private static bool ShapesMatch(int[] left, int[] right)

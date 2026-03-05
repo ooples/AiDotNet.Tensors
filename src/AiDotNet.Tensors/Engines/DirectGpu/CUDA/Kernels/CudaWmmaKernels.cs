@@ -27,9 +27,8 @@ using namespace nvcuda;
 // ===========================================================================
 // WMMA PARAMETERS
 // CTA tile: 64x64, split into 4x4 = 16 warp tiles of 16x16 each
-// Thread block: 256 threads = 8 warps (only 16 warps needed for 4x4)
-// Actually: 4 warps in 2x2 arrangement, each warp handles one 16x16 tile
-// Block: 128 threads = 4 warps
+// Thread block: 128 threads = 4 warps in 2x2 arrangement
+// Each warp handles one 16x16 WMMA tile within a 32x32 CTA tile
 // ===========================================================================
 #define WMMA_M 16
 #define WMMA_N 16

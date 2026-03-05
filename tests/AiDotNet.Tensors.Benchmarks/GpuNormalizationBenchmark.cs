@@ -26,47 +26,46 @@ public static class GpuNormalizationBenchmark
                 Console.WriteLine("[SKIP] DirectGpu not available.");
                 return;
             }
+
+            Console.WriteLine($"Backend: {engine.BackendName}");
+            Console.WriteLine($"Device:  {engine.DeviceName}");
+            Console.WriteLine();
+
+            var backend = engine.Backend;
+            if (backend == null)
+            {
+                Console.WriteLine("[ERROR] Could not access backend.");
+                return;
+            }
+
+            Console.WriteLine($"{"Operation",-20} {"Config",-30} {"Time(ms)",10} {"GFLOPS",10} {"Elements",12}");
+            Console.WriteLine(new string('-', 84));
+
+            var configs = new (int batch, int channels, int spatial)[]
+            {
+                (32, 512, 49),   // Standard ResNet-like
+                (16, 256, 196),  // Larger spatial
+                (64, 128, 49),   // Larger batch
+            };
+
+            foreach (var (batch, channels, spatial) in configs)
+            {
+                BenchmarkBatchNorm(backend, batch, channels, spatial);
+                BenchmarkLayerNorm(backend, batch, channels, spatial);
+                BenchmarkGroupNorm(backend, batch, channels, spatial, numGroups: 32);
+                BenchmarkInstanceNorm(backend, batch, channels, spatial);
+                BenchmarkRmsNorm(backend, batch, channels, spatial);
+                Console.WriteLine();
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] {ex.Message}");
-            return;
         }
-
-        Console.WriteLine($"Backend: {engine.BackendName}");
-        Console.WriteLine($"Device:  {engine.DeviceName}");
-        Console.WriteLine();
-
-        var backend = engine.Backend;
-        if (backend == null)
+        finally
         {
-            Console.WriteLine("[ERROR] Could not access backend.");
-            engine.Dispose();
-            return;
+            engine?.Dispose();
         }
-
-        Console.WriteLine($"{"Operation",-20} {"Config",-30} {"Time(ms)",10} {"GFLOPS",10} {"Elements",12}");
-        Console.WriteLine(new string('-', 84));
-
-        // Test configurations
-        var configs = new (int batch, int channels, int spatial)[]
-        {
-            (32, 512, 49),   // Standard ResNet-like
-            (16, 256, 196),  // Larger spatial
-            (64, 128, 49),   // Larger batch
-        };
-
-        foreach (var (batch, channels, spatial) in configs)
-        {
-            BenchmarkBatchNorm(backend, batch, channels, spatial);
-            BenchmarkLayerNorm(backend, batch, channels, spatial);
-            BenchmarkGroupNorm(backend, batch, channels, spatial, numGroups: 32);
-            BenchmarkInstanceNorm(backend, batch, channels, spatial);
-            BenchmarkRmsNorm(backend, batch, channels, spatial);
-            Console.WriteLine();
-        }
-
-        engine.Dispose();
     }
 
     private static void BenchmarkBatchNorm(IDirectGpuBackend backend, int batch, int channels, int spatial)

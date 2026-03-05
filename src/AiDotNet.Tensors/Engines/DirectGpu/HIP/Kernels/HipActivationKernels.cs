@@ -127,8 +127,8 @@ extern ""C"" __global__ void softmax(const float* input, float* output, int batc
     extern __shared__ float smem[];
     int tid = threadIdx.x;
     int baseIdx = batch * features;
-    int warpId = tid / 64;
-    int lane = tid % 64;
+    int warpId = tid / warpSize;
+    int lane = tid % warpSize;
 
     // Phase 1: Find max (parallel reduction with warp shuffles)
     float localMax = -INFINITY;
@@ -136,7 +136,7 @@ extern ""C"" __global__ void softmax(const float* input, float* output, int batc
         localMax = fmaxf(localMax, input[baseIdx + f]);
     }
     localMax = warpReduceMax(localMax);
-    int numWarps = (blockDim.x + 63) / 64;
+    int numWarps = (blockDim.x + warpSize - 1) / warpSize;
     if (lane == 0) smem[warpId] = localMax;
     __syncthreads();
     if (warpId == 0) {

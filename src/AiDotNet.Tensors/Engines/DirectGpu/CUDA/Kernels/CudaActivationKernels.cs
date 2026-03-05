@@ -799,12 +799,10 @@ extern ""C"" __global__ void gelu_vec4(const float* input, float* output, int si
     const float coeff = 0.044715f;
     float4 v = reinterpret_cast<const float4*>(input)[idx];
     float4 r;
-    #define GELU_OP(val) { float x3 = (val)*(val)*(val); float inner = sqrt2OverPi * ((val) + coeff * x3); r.val = 0.5f * (val) * (1.0f + tanhf(inner)); }
     { float x = v.x; float x3 = x*x*x; float inner = sqrt2OverPi * (x + coeff * x3); r.x = 0.5f * x * (1.0f + tanhf(inner)); }
     { float x = v.y; float x3 = x*x*x; float inner = sqrt2OverPi * (x + coeff * x3); r.y = 0.5f * x * (1.0f + tanhf(inner)); }
     { float x = v.z; float x3 = x*x*x; float inner = sqrt2OverPi * (x + coeff * x3); r.z = 0.5f * x * (1.0f + tanhf(inner)); }
     { float x = v.w; float x3 = x*x*x; float inner = sqrt2OverPi * (x + coeff * x3); r.w = 0.5f * x * (1.0f + tanhf(inner)); }
-    #undef GELU_OP
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 

@@ -47,6 +47,7 @@ extern ""C"" __global__ void scaled_dot_product_attention(
     int bh = blockIdx.y;
 
     if (bh >= batch * numHeads) return;
+    if (headDim > MAX_HEAD_DIM) return; // Prevent silent truncation for unsupported head dims
 
     extern __shared__ float smem[];
     float* Ks = smem;                        // [ATTN_BC * headDim]
@@ -59,7 +60,7 @@ extern ""C"" __global__ void scaled_dot_product_attention(
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
     float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+    for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
     // Also need to store weights if requested: use a second pass
     // For storeWeights, we need logsumexp = rowMax + log(rowSum)
@@ -103,7 +104,7 @@ extern ""C"" __global__ void scaled_dot_product_attention(
                 float expScore = expf(score - newMax);
                 rowSum = rowSum * rescale + expScore;
 
-                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                for (int d = 0; d < headDim; d++) {
                     outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
                 }
                 rowMax = newMax;
@@ -116,7 +117,7 @@ extern ""C"" __global__ void scaled_dot_product_attention(
     if (qi < seqQ) {
         int oOffset = bh * seqQ * headDim + qi * headDim;
         float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
-        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+        for (int d = 0; d < headDim; d++) {
             output[oOffset + d] = outAcc[d] * invSum;
         }
 
@@ -172,6 +173,7 @@ extern ""C"" __global__ void flash_attention_v2(
     int bh = blockIdx.y;
 
     if (bh >= batch * numHeads) return;
+    if (headDim > MAX_HEAD_DIM) return;
 
     extern __shared__ float smem[];
     float* Ks = smem;                        // [ATTN_BC * headDim]
@@ -192,7 +194,7 @@ extern ""C"" __global__ void flash_attention_v2(
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
     float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+    for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
@@ -236,7 +238,7 @@ extern ""C"" __global__ void flash_attention_v2(
                 rowSum = rowSum * rescale + expScore;
 
                 // Accumulate weighted V (V from shared memory)
-                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                for (int d = 0; d < headDim; d++) {
                     outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
                 }
                 rowMax = newMax;
@@ -251,7 +253,7 @@ extern ""C"" __global__ void flash_attention_v2(
         int sOffset = bh * seqQ + qi;
 
         float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
-        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+        for (int d = 0; d < headDim; d++) {
             output[oOffset + d] = outAcc[d] * invSum;
         }
         softmaxStats[sOffset] = rowMax + logf(fmaxf(rowSum, 1e-20f));
@@ -417,6 +419,7 @@ extern ""C"" __global__ void grouped_query_attention(
     int bqh = blockIdx.y;
 
     if (bqh >= batch * numQHeads) return;
+    if (headDim > MAX_HEAD_DIM) return;
 
     int b = bqh / numQHeads;
     int qh = bqh % numQHeads;
@@ -433,7 +436,7 @@ extern ""C"" __global__ void grouped_query_attention(
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
     float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+    for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
@@ -471,7 +474,7 @@ extern ""C"" __global__ void grouped_query_attention(
                 float expScore = expf(score - newMax);
                 rowSum = rowSum * rescale + expScore;
 
-                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                for (int d = 0; d < headDim; d++) {
                     outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
                 }
                 rowMax = newMax;
@@ -483,7 +486,7 @@ extern ""C"" __global__ void grouped_query_attention(
     if (qi < seqQ) {
         int oOffset = bqh * seqQ * headDim + qi * headDim;
         float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
-        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+        for (int d = 0; d < headDim; d++) {
             output[oOffset + d] = outAcc[d] * invSum;
         }
 
@@ -538,6 +541,7 @@ extern ""C"" __global__ void grouped_query_attention_backward(
     int bqh = blockIdx.y;
 
     if (bqh >= batch * numQHeads) return;
+    if (headDim > MAX_HEAD_DIM) return;
 
     int b_idx = bqh / numQHeads;
     int qh = bqh % numQHeads;
@@ -559,32 +563,33 @@ extern ""C"" __global__ void grouped_query_attention_backward(
         qOffset = bqh * seqQ * headDim + qi * headDim;
         gOffset = bqh * seqQ * headDim + qi * headDim;
         wOffset = bqh * seqQ * seqK + qi * seqK;
+    }
 
-        // First pass: compute dot(weights, gradWeights) using tiles
-        for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
-            int tileSize = min(ATTN_BC, seqK - kvStart);
+    // First pass: compute dot(weights, gradWeights) using tiles
+    // All threads participate in cooperative loads and barriers
+    for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
+        int tileSize = min(ATTN_BC, seqK - kvStart);
 
-            // Load V tile for gradWeight computation
-            for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
-                int row = i / headDim;
-                int col = i % headDim;
-                Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
-            }
-            __syncthreads();
-
-            if (qi < seqQ) {
-                for (int t = 0; t < tileSize; t++) {
-                    int ki = kvStart + t;
-                    float weight = attentionWeights[wOffset + ki];
-                    float gw = 0.0f;
-                    for (int d = 0; d < headDim; d++) {
-                        gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
-                    }
-                    dotWgW += weight * gw;
-                }
-            }
-            __syncthreads();
+        // Load V tile for gradWeight computation (all threads cooperate)
+        for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
+            int row = i / headDim;
+            int col = i % headDim;
+            Vs[row * headDim + col] = value[vBase + (kvStart + row) * headDim + col];
         }
+        __syncthreads();
+
+        if (qi < seqQ) {
+            for (int t = 0; t < tileSize; t++) {
+                int ki = kvStart + t;
+                float weight = attentionWeights[wOffset + ki];
+                float gw = 0.0f;
+                for (int d = 0; d < headDim; d++) {
+                    gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                }
+                dotWgW += weight * gw;
+            }
+        }
+        __syncthreads();
     }
 
     // Second pass: compute actual gradients using tiles
@@ -674,7 +679,7 @@ extern ""C"" __global__ void flash_attention_forward(
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
     float outAcc[MAX_HEAD_DIM];
-    for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) outAcc[d] = 0.0f;
+    for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
     for (int kvStart = 0; kvStart < seqLen; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqLen - kvStart);
@@ -712,7 +717,7 @@ extern ""C"" __global__ void flash_attention_forward(
                 float expScore = expf(score - newMax);  // Single expf, cached
                 rowSum = rowSum * rescale + expScore;
 
-                for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+                for (int d = 0; d < headDim; d++) {
                     outAcc[d] = outAcc[d] * rescale + expScore * Vs[t * headDim + d];
                 }
                 rowMax = newMax;
@@ -724,7 +729,7 @@ extern ""C"" __global__ void flash_attention_forward(
     if (qi < seqLen) {
         int oOffset = bh * seqLen * headDim + qi * headDim;
         float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
-        for (int d = 0; d < headDim && d < MAX_HEAD_DIM; d++) {
+        for (int d = 0; d < headDim; d++) {
             output[oOffset + d] = outAcc[d] * invSum;
         }
     }

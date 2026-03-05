@@ -219,7 +219,7 @@ class Program
         Console.WriteLine("  --opencl   : Run OpenCL GEMM benchmark (AMD/Intel GPUs)");
         Console.WriteLine("  --clblast  : Run CLBlast vs AiDotNet OpenCL comparison (AMD/Intel)");
         Console.WriteLine("  --directgpu: Run DirectGpu comprehensive benchmark (all 10 optimizations)");
-        Console.WriteLine("  --activation: Run GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU)");
+        Console.WriteLine("  --activation: Run GPU activation benchmarks (ReLU, Sigmoid, Tanh, GELU, Softmax)");
         Console.WriteLine("  --norm      : Run GPU normalization benchmarks (BN, LN, GN, IN, RmsNorm)");
         Console.WriteLine("  --attn      : Run GPU attention benchmarks (FlashAttention, SDPA)");
         Console.WriteLine("  --conv      : Run GPU convolution benchmarks (Conv2D, Depthwise)");

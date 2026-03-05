@@ -213,7 +213,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
         public void Dispose()
         {
             if (_needsPop)
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
+            {
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out var prev), "cuCtxPopCurrent");
+                _threadCurrentContext = prev;
+            }
         }
     }
 

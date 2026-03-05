@@ -26,41 +26,41 @@ public static class GpuActivationBenchmark
                 Console.WriteLine("[SKIP] DirectGpu not available.");
                 return;
             }
+
+            Console.WriteLine($"Backend: {engine.BackendName}");
+            Console.WriteLine($"Device:  {engine.DeviceName}");
+            Console.WriteLine();
+
+            var backend = engine.Backend;
+            if (backend == null)
+            {
+                Console.WriteLine("[ERROR] Could not access backend.");
+                return;
+            }
+
+            int[] sizes = [1024, 4096, 16384, 65536, 262144, 1048576];
+            string[] ops = ["relu", "sigmoid", "tanh", "gelu", "softmax"];
+
+            Console.WriteLine($"{"Operation",-12} {"Size",-10} {"Time(ms)",10} {"GB/s",8} {"GFLOPS",10} {"MaxErr",12} {"Status",10}");
+            Console.WriteLine(new string('-', 74));
+
+            foreach (var op in ops)
+            {
+                foreach (var size in sizes)
+                {
+                    RunSingle(backend, op, size);
+                }
+                Console.WriteLine();
+            }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] {ex.Message}");
-            return;
         }
-
-        Console.WriteLine($"Backend: {engine.BackendName}");
-        Console.WriteLine($"Device:  {engine.DeviceName}");
-        Console.WriteLine();
-
-        var backend = engine.Backend;
-        if (backend == null)
+        finally
         {
-            Console.WriteLine("[ERROR] Could not access backend.");
-            engine.Dispose();
-            return;
+            engine?.Dispose();
         }
-
-        int[] sizes = [1024, 4096, 16384, 65536, 262144, 1048576];
-        string[] ops = ["relu", "sigmoid", "tanh", "gelu", "softmax"];
-
-        Console.WriteLine($"{"Operation",-12} {"Size",-10} {"Time(ms)",10} {"GB/s",8} {"GFLOPS",10} {"MaxErr",12} {"Status",10}");
-        Console.WriteLine(new string('-', 74));
-
-        foreach (var op in ops)
-        {
-            foreach (var size in sizes)
-            {
-                RunSingle(backend, op, size);
-            }
-            Console.WriteLine();
-        }
-
-        engine.Dispose();
     }
 
     private static void RunSingle(IDirectGpuBackend backend, string op, int size)
@@ -98,12 +98,19 @@ public static class GpuActivationBenchmark
         double maxError = 0;
         for (int i = 0; i < size; i++)
         {
-            if (float.IsNaN(gpuResult[i]) || float.IsInfinity(gpuResult[i])) continue;
+            if (float.IsNaN(gpuResult[i]) || float.IsInfinity(gpuResult[i]))
+            {
+                maxError = double.PositiveInfinity;
+                break;
+            }
             double error = Math.Abs(cpuResult[i] - gpuResult[i]);
             if (error > maxError) maxError = error;
         }
 
-        string status = maxError <= 1e-5 ? "PASS" : maxError <= 1e-3 ? "WARN" : "FAIL";
+        string status = double.IsPositiveInfinity(maxError) ? "FAIL"
+            : maxError <= 1e-5 ? "PASS"
+            : maxError <= 1e-3 ? "WARN"
+            : "FAIL";
         Console.WriteLine($"{op,-12} {size,-10} {avgMs,10:F4} {gbps,8:F2} {gflops,10:F2} {maxError,12:E2} {status,10}");
     }
 

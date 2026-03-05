@@ -44,51 +44,55 @@ __kernel void batchnorm_forward(
     if (c >= channels) return;
 
     int batchSpatial = batch * spatialSize;
+    float mean, invVar;
 
-    // Phase 1: Parallel sum for mean
-    float threadSum = 0.0f;
-    for (int i = lid; i < batchSpatial; i += localSize) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        threadSum += input[(b * channels + c) * spatialSize + s];
-    }
-    localBuf[lid] = threadSum;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+    if (training) {
+        // Training: compute mean/var from batch data
+        float threadSum = 0.0f;
+        for (int i = lid; i < batchSpatial; i += localSize) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            threadSum += input[(b * channels + c) * spatialSize + s];
+        }
+        localBuf[lid] = threadSum;
         barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    float mean = localBuf[0] / (float)batchSpatial;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Phase 2: Parallel sum for variance
-    float threadVar = 0.0f;
-    for (int i = lid; i < batchSpatial; i += localSize) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        float diff = input[(b * channels + c) * spatialSize + s] - mean;
-        threadVar += diff * diff;
-    }
-    localBuf[lid] = threadVar;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+        for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        mean = localBuf[0] / (float)batchSpatial;
         barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    float var = localBuf[0] / (float)batchSpatial;
-    float invVar = 1.0f / sqrt(var + epsilon);
 
-    if (lid == 0) {
-        saveMean[c] = mean;
-        saveInvVar[c] = invVar;
-        if (training) {
+        float threadVar = 0.0f;
+        for (int i = lid; i < batchSpatial; i += localSize) {
+            int b = i / spatialSize;
+            int s = i % spatialSize;
+            float diff = input[(b * channels + c) * spatialSize + s] - mean;
+            threadVar += diff * diff;
+        }
+        localBuf[lid] = threadVar;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) localBuf[lid] += localBuf[lid + stride];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float var = localBuf[0] / (float)batchSpatial;
+        invVar = 1.0f / sqrt(var + epsilon);
+
+        if (lid == 0) {
+            saveMean[c] = mean;
+            saveInvVar[c] = invVar;
             runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
             runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * var;
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    } else {
+        // Inference: use running statistics
+        mean = runningMean[c];
+        invVar = 1.0f / sqrt(runningVar[c] + epsilon);
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Phase 3: Normalize and apply affine transform
+    // Normalize and apply affine transform
     float g = gamma[c];
     float b_val = beta[c];
     for (int i = lid; i < batchSpatial; i += localSize) {

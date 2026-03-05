@@ -26,63 +26,63 @@ public static class GpuAttentionBenchmark
                 Console.WriteLine("[SKIP] DirectGpu not available.");
                 return;
             }
+
+            Console.WriteLine($"Backend: {engine.BackendName}");
+            Console.WriteLine($"Device:  {engine.DeviceName}");
+            Console.WriteLine();
+
+            var backend = engine.Backend;
+            if (backend == null)
+            {
+                Console.WriteLine("[ERROR] Could not access backend.");
+                return;
+            }
+
+            int[] seqLens = [128, 256, 512, 1024];
+            int batch = 2, numHeads = 8, headDim = 64;
+
+            Console.WriteLine($"Config: batch={batch}, heads={numHeads}, headDim={headDim}");
+            Console.WriteLine();
+
+            // FlashAttention benchmarks
+            Console.WriteLine("--- FlashAttention ---");
+            Console.WriteLine($"{"SeqLen",-10} {"Time(ms)",10} {"GFLOPS",10} {"TFLOPS",8} {"Bandwidth",10}");
+            Console.WriteLine(new string('-', 50));
+
+            foreach (var seqLen in seqLens)
+            {
+                BenchmarkFlashAttention(backend, batch, numHeads, seqLen, headDim);
+            }
+
+            Console.WriteLine();
+
+            // ScaledDotProduct benchmarks
+            Console.WriteLine("--- ScaledDotProductAttention ---");
+            Console.WriteLine($"{"SeqLen",-10} {"Time(ms)",10} {"GFLOPS",10} {"TFLOPS",8} {"Bandwidth",10}");
+            Console.WriteLine(new string('-', 50));
+
+            foreach (var seqLen in seqLens)
+            {
+                BenchmarkScaledDotProduct(backend, batch, numHeads, seqLen, headDim);
+            }
+
+            Console.WriteLine();
+
+            // Causal vs non-causal comparison
+            Console.WriteLine("--- Causal vs Non-Causal FlashAttention (seq=512) ---");
+            Console.WriteLine($"{"Mode",-15} {"Time(ms)",10} {"GFLOPS",10} {"TFLOPS",8} {"Bandwidth",10}");
+            Console.WriteLine(new string('-', 58));
+            BenchmarkFlashAttention(backend, batch, numHeads, 512, headDim, isCausal: false, label: "Non-causal");
+            BenchmarkFlashAttention(backend, batch, numHeads, 512, headDim, isCausal: true, label: "Causal");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] {ex.Message}");
-            return;
         }
-
-        Console.WriteLine($"Backend: {engine.BackendName}");
-        Console.WriteLine($"Device:  {engine.DeviceName}");
-        Console.WriteLine();
-
-        var backend = engine.Backend;
-        if (backend == null)
+        finally
         {
-            Console.WriteLine("[ERROR] Could not access backend.");
-            engine.Dispose();
-            return;
+            engine?.Dispose();
         }
-
-        int[] seqLens = [128, 256, 512, 1024];
-        int batch = 2, numHeads = 8, headDim = 64;
-
-        Console.WriteLine($"Config: batch={batch}, heads={numHeads}, headDim={headDim}");
-        Console.WriteLine();
-
-        // FlashAttention benchmarks
-        Console.WriteLine("--- FlashAttention ---");
-        Console.WriteLine($"{"SeqLen",-10} {"Time(ms)",10} {"GFLOPS",10} {"TFLOPS",8} {"Bandwidth",10}");
-        Console.WriteLine(new string('-', 50));
-
-        foreach (var seqLen in seqLens)
-        {
-            BenchmarkFlashAttention(backend, batch, numHeads, seqLen, headDim);
-        }
-
-        Console.WriteLine();
-
-        // ScaledDotProduct benchmarks
-        Console.WriteLine("--- ScaledDotProductAttention ---");
-        Console.WriteLine($"{"SeqLen",-10} {"Time(ms)",10} {"GFLOPS",10} {"TFLOPS",8} {"Bandwidth",10}");
-        Console.WriteLine(new string('-', 50));
-
-        foreach (var seqLen in seqLens)
-        {
-            BenchmarkScaledDotProduct(backend, batch, numHeads, seqLen, headDim);
-        }
-
-        Console.WriteLine();
-
-        // Causal vs non-causal comparison
-        Console.WriteLine("--- Causal vs Non-Causal FlashAttention (seq=512) ---");
-        Console.WriteLine($"{"Mode",-15} {"Time(ms)",10} {"GFLOPS",10}");
-        Console.WriteLine(new string('-', 37));
-        BenchmarkFlashAttention(backend, batch, numHeads, 512, headDim, isCausal: false, label: "Non-causal");
-        BenchmarkFlashAttention(backend, batch, numHeads, 512, headDim, isCausal: true, label: "Causal");
-
-        engine.Dispose();
     }
 
     private static void BenchmarkFlashAttention(IDirectGpuBackend backend, int batch, int numHeads, int seqLen, int headDim,

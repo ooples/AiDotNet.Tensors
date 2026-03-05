@@ -50,84 +50,84 @@ public static class GpuBaselineResults
                 Console.WriteLine("[SKIP] DirectGpu not available.");
                 return;
             }
+
+            Console.WriteLine($"Backend: {engine.BackendName}");
+            Console.WriteLine($"Device:  {engine.DeviceName}");
+            Console.WriteLine($"CUs:     {engine.ComputeUnits}");
+            Console.WriteLine($"VRAM:    {engine.GlobalMemoryGB:F1} GB");
+            Console.WriteLine();
+
+            var backend = engine.Backend;
+            if (backend == null)
+            {
+                Console.WriteLine("[ERROR] Could not access backend for GPU-resident benchmarks.");
+                return;
+            }
+
+            // === GEMM benchmarks ===
+            Console.WriteLine("--- GEMM ---");
+            int[] gemmSizes = [256, 512, 1024, 2048, 4096];
+            foreach (var size in gemmSizes)
+            {
+                var r = BenchmarkGemm(backend, size, size, size, phase);
+                results.Add(r);
+                Console.WriteLine($"  GEMM {size}x{size}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F2} ms, maxErr={r.MaxError:E2}");
+            }
+
+            // === Activation benchmarks ===
+            Console.WriteLine("--- Activations ---");
+            int[] actSizes = [1024, 16384, 262144, 1048576];
+            string[] actOps = ["relu", "sigmoid", "tanh", "gelu", "softmax"];
+            foreach (var actOp in actOps)
+            {
+                foreach (var size in actSizes)
+                {
+                    var r = BenchmarkActivation(backend, actOp, size, phase);
+                    results.Add(r);
+                    Console.WriteLine($"  {actOp} N={size}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F4} ms, maxErr={r.MaxError:E2}");
+                }
+            }
+
+            // === Normalization benchmarks ===
+            Console.WriteLine("--- Normalization ---");
+            string[] normOps = ["batchnorm", "layernorm", "groupnorm", "instancenorm", "rmsnorm"];
+            foreach (var normOp in normOps)
+            {
+                var r = BenchmarkNormalization(backend, normOp, phase);
+                results.Add(r);
+                Console.WriteLine($"  {normOp}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F4} ms, maxErr={r.MaxError:E2}");
+            }
+
+            // === Attention benchmarks ===
+            Console.WriteLine("--- Attention ---");
+            int[] seqLens = [128, 256, 512];
+            foreach (var seqLen in seqLens)
+            {
+                var r = BenchmarkAttention(backend, seqLen, phase);
+                results.Add(r);
+                Console.WriteLine($"  FlashAttn seq={seqLen}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F2} ms, maxErr={r.MaxError:E2}");
+            }
+
+            // === Conv2D benchmarks ===
+            Console.WriteLine("--- Conv2D ---");
+            var r2 = BenchmarkConv2D(backend, phase);
+            results.Add(r2);
+            Console.WriteLine($"  Conv2D N=4,C=64,H=56,K=3: {r2.GFlops:F1} GFLOPS, {r2.TimeMs:F2} ms, maxErr={r2.MaxError:E2}");
+
+            // Write CSV (overwrite to avoid ambiguous multi-run baselines)
+            WriteCsv(results, csvPath, appendIfExists: false);
+            Console.WriteLine();
+            Console.WriteLine($"Results written to: {Path.GetFullPath(csvPath)}");
+            Console.WriteLine($"Total measurements: {results.Count}");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[ERROR] {ex.Message}");
-            return;
         }
-
-        Console.WriteLine($"Backend: {engine.BackendName}");
-        Console.WriteLine($"Device:  {engine.DeviceName}");
-        Console.WriteLine($"CUs:     {engine.ComputeUnits}");
-        Console.WriteLine($"VRAM:    {engine.GlobalMemoryGB:F1} GB");
-        Console.WriteLine();
-
-        var backend = engine.Backend;
-        if (backend == null)
+        finally
         {
-            Console.WriteLine("[ERROR] Could not access backend for GPU-resident benchmarks.");
-            engine.Dispose();
-            return;
+            engine?.Dispose();
         }
-
-        // === GEMM benchmarks ===
-        Console.WriteLine("--- GEMM ---");
-        int[] gemmSizes = [256, 512, 1024, 2048, 4096];
-        foreach (var size in gemmSizes)
-        {
-            var r = BenchmarkGemm(backend, size, size, size, phase);
-            results.Add(r);
-            Console.WriteLine($"  GEMM {size}x{size}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F2} ms, maxErr={r.MaxError:E2}");
-        }
-
-        // === Activation benchmarks ===
-        Console.WriteLine("--- Activations ---");
-        int[] actSizes = [1024, 16384, 262144, 1048576];
-        string[] actOps = ["relu", "sigmoid", "tanh", "gelu", "softmax"];
-        foreach (var actOp in actOps)
-        {
-            foreach (var size in actSizes)
-            {
-                var r = BenchmarkActivation(backend, actOp, size, phase);
-                results.Add(r);
-                Console.WriteLine($"  {actOp} N={size}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F4} ms, maxErr={r.MaxError:E2}");
-            }
-        }
-
-        // === Normalization benchmarks ===
-        Console.WriteLine("--- Normalization ---");
-        string[] normOps = ["batchnorm", "layernorm", "rmsnorm"];
-        foreach (var normOp in normOps)
-        {
-            var r = BenchmarkNormalization(backend, normOp, phase);
-            results.Add(r);
-            Console.WriteLine($"  {normOp}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F4} ms, maxErr={r.MaxError:E2}");
-        }
-
-        // === Attention benchmarks ===
-        Console.WriteLine("--- Attention ---");
-        int[] seqLens = [128, 256, 512];
-        foreach (var seqLen in seqLens)
-        {
-            var r = BenchmarkAttention(backend, seqLen, phase);
-            results.Add(r);
-            Console.WriteLine($"  FlashAttn seq={seqLen}: {r.GFlops:F1} GFLOPS, {r.TimeMs:F2} ms, maxErr={r.MaxError:E2}");
-        }
-
-        // === Conv2D benchmarks ===
-        Console.WriteLine("--- Conv2D ---");
-        var r2 = BenchmarkConv2D(backend, phase);
-        results.Add(r2);
-        Console.WriteLine($"  Conv2D N=4,C=64,H=56,K=3: {r2.GFlops:F1} GFLOPS, {r2.TimeMs:F2} ms, maxErr={r2.MaxError:E2}");
-
-        // Write CSV
-        WriteCsv(results, csvPath, appendIfExists: true);
-        Console.WriteLine();
-        Console.WriteLine($"Results written to: {Path.GetFullPath(csvPath)}");
-        Console.WriteLine($"Total measurements: {results.Count}");
-
-        engine.Dispose();
     }
 
     private static BenchmarkResult BenchmarkGemm(IDirectGpuBackend backend, int M, int N, int K, string phase)
@@ -272,7 +272,56 @@ public static class GpuBaselineResults
             return new BenchmarkResult(phase, $"layernorm_B{batch}_N{normalizedSize}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
         }
 
-        // rmsnorm
+        if (op == "groupnorm")
+        {
+            int numGroups = 32;
+            int statSize = batch * numGroups;
+            using var bufMean = backend.AllocateBuffer(statSize);
+            using var bufVar = backend.AllocateBuffer(statSize);
+
+            for (int i = 0; i < 3; i++)
+                backend.GroupNorm(bufIn, bufOut, bufGamma, bufBeta, bufMean, bufVar,
+                    batch, numGroups, channels, spatial, 1e-5f);
+            backend.Synchronize();
+
+            int runs = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < runs; i++)
+                backend.GroupNorm(bufIn, bufOut, bufGamma, bufBeta, bufMean, bufVar,
+                    batch, numGroups, channels, spatial, 1e-5f);
+            backend.Synchronize();
+            sw.Stop();
+
+            double avgMs = sw.Elapsed.TotalMilliseconds / runs;
+            double gflops = totalSize * 5.0 / (avgMs * 1e6);
+            return new BenchmarkResult(phase, $"groupnorm_B{batch}_C{channels}_G{numGroups}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+        }
+
+        if (op == "instancenorm")
+        {
+            int statSize = batch * channels;
+            using var bufMean = backend.AllocateBuffer(statSize);
+            using var bufVar = backend.AllocateBuffer(statSize);
+
+            for (int i = 0; i < 3; i++)
+                backend.InstanceNorm(bufIn, bufOut, bufGamma, bufBeta, bufMean, bufVar,
+                    batch, channels, spatial, 1e-5f);
+            backend.Synchronize();
+
+            int runs = 20;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < runs; i++)
+                backend.InstanceNorm(bufIn, bufOut, bufGamma, bufBeta, bufMean, bufVar,
+                    batch, channels, spatial, 1e-5f);
+            backend.Synchronize();
+            sw.Stop();
+
+            double avgMs = sw.Elapsed.TotalMilliseconds / runs;
+            double gflops = totalSize * 5.0 / (avgMs * 1e6);
+            return new BenchmarkResult(phase, $"instancenorm_B{batch}_C{channels}_S{spatial}", totalSize, gflops, 0, 0, avgMs, DateTime.UtcNow);
+        }
+
+        // rmsnorm (default)
         {
             int normalizedSize = channels * spatial;
             var rmsGamma = CreateOnesArray(normalizedSize);
@@ -459,7 +508,8 @@ public static class GpuBaselineResults
         int count = 0;
         for (int i = 0; i < expected.Length; i++)
         {
-            if (float.IsNaN(actual[i]) || float.IsInfinity(actual[i])) continue;
+            if (float.IsNaN(actual[i]) || float.IsInfinity(actual[i]))
+                return (double.PositiveInfinity, double.PositiveInfinity);
             double error = Math.Abs(expected[i] - actual[i]);
             if (error > maxError) maxError = error;
             sumError += error;
@@ -531,7 +581,7 @@ public static class GpuBaselineResults
         for (int i = 1; i < lines.Length; i++)
         {
             var parts = lines[i].Split(',');
-            if (parts.Length < 7) continue;
+            if (parts.Length < 8) continue;
 
             var r = new BenchmarkResult(
                 parts[0],
@@ -541,7 +591,7 @@ public static class GpuBaselineResults
                 double.TryParse(parts[4], NumberStyles.Float, CultureInfo.InvariantCulture, out var me) ? me : 0,
                 double.TryParse(parts[5], NumberStyles.Float, CultureInfo.InvariantCulture, out var ae) ? ae : 0,
                 double.TryParse(parts[6], NumberStyles.Float, CultureInfo.InvariantCulture, out var tm) ? tm : 0,
-                DateTime.UtcNow);
+                DateTime.TryParse(parts[7], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var ts) ? ts : DateTime.UtcNow);
 
             results[r.Operation] = r;
         }
