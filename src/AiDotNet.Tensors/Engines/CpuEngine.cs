@@ -6,7 +6,6 @@ using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Operators;
 using static AiDotNet.Tensors.Helpers.CpuParallelSettings;
-using TensorPrimitives = System.Numerics.Tensors.TensorPrimitives;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -1609,7 +1608,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var rowData = new float[bFloat.Length];
                 // SIMD vectorized: multiply vector b by scalar a[i]
-                TensorPrimitives.Multiply(bFloat, aFloat[i], rowData);
+                Simd.SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowData.AsSpan());
 
                 // Copy result to matrix
                 for (int j = 0; j < bFloat.Length; j++)

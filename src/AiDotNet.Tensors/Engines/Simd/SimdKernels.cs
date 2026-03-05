@@ -320,6 +320,13 @@ namespace AiDotNet.Tensors.Engines.Simd
             MultiplyScalar(a, 1.0f / scalar, result);
         }
 
+        /// <summary>Subtracts a scalar from each element: result[i] = a[i] - scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void SubtractScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
+        {
+            AddScalar(a, -scalar, result);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float DotProduct(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
         {
@@ -1942,6 +1949,48 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>Element-wise clamp to [min, max] range for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Clamp(ReadOnlySpan<double> input, double min, double max, Span<double> output)
+        {
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var vmin = Vector256.Create(min);
+                var vmax = Vector256.Create(max);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    WriteVector256Double(output, i, Avx.Max(vmin, Avx.Min(vmax, ReadVector256Double(input, i))));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
+            {
+                output[i] = input[i] < min ? min : (input[i] > max ? max : input[i]);
+            }
+        }
+
+        /// <summary>Element-wise power with scalar exponent for double precision.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Pow(ReadOnlySpan<double> baseValues, double exponent, Span<double> output)
+        {
+            if (baseValues.Length != output.Length)
+                throw new ArgumentException("Input and output spans must have the same length.");
+
+            for (int i = 0; i < baseValues.Length; i++)
+            {
+                output[i] = Math.Pow(baseValues[i], exponent);
+            }
+        }
+
         /// <summary>
         /// Computes SoftMax: output[i] = exp(x[i] - max(x)) / sum(exp(x - max(x))).
         /// Numerically stable via max subtraction.
@@ -2285,6 +2334,20 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 result[i] = a[i] * scalar;
             }
+        }
+
+        /// <summary>Divides each double element by a scalar.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void DivideScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
+        {
+            MultiplyScalar(a, 1.0 / scalar, result);
+        }
+
+        /// <summary>Subtracts a scalar from each double element.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void SubtractScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
+        {
+            AddScalar(a, -scalar, result);
         }
 
         /// <summary>Sum for double precision with 4-way parallel accumulation.</summary>

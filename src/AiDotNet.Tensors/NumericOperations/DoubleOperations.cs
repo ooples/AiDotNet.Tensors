@@ -1,7 +1,4 @@
 using System;
-#if NET8_0_OR_GREATER
-using System.Numerics.Tensors;
-#endif
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.Operators;
@@ -811,18 +808,14 @@ public class DoubleOperations : INumericOperations<double>
     /// <inheritdoc/>
     public bool SupportsGpuAcceleration => true;
 
-    #region IVectorizedOperations<double> Implementation - SIMD via TensorPrimitives
+    #region IVectorizedOperations<double> Implementation - SIMD via SimdKernels
 
     /// <summary>
-    /// Performs element-wise addition using SIMD-optimized TensorPrimitives.
+    /// Performs element-wise addition using SIMD-optimized SimdKernels.
     /// </summary>
-    /// <remarks>
-    /// Uses AVX-512/AVX2/SSE for hardware acceleration on .NET 8+, with fallback on pre-.NET 8 targets.
-    /// </remarks>
     public unsafe void Add(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             y.Length >= length && destination.Length >= length)
         {
@@ -835,7 +828,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Add(
+                    Engines.Simd.SimdKernels.VectorAdd(
                         new ReadOnlySpan<double>(xp + start, count),
                         new ReadOnlySpan<double>(yp + start, count),
                         new Span<double>(dp + start, count));
@@ -843,19 +836,15 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        TensorPrimitives.Add(x, y, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanSpanIntoSpan<AddOperatorDouble>(x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorAdd(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise subtraction using SIMD-optimized TensorPrimitives.
+    /// Performs element-wise subtraction using SIMD-optimized SimdKernels.
     /// </summary>
     public unsafe void Subtract(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             y.Length >= length && destination.Length >= length)
         {
@@ -868,7 +857,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Subtract(
+                    Engines.Simd.SimdKernels.VectorSubtract(
                         new ReadOnlySpan<double>(xp + start, count),
                         new ReadOnlySpan<double>(yp + start, count),
                         new Span<double>(dp + start, count));
@@ -876,19 +865,15 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        TensorPrimitives.Subtract(x, y, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanSpanIntoSpan<SubtractOperatorDouble>(x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorSubtract(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise multiplication using SIMD-optimized TensorPrimitives.
+    /// Performs element-wise multiplication using SIMD-optimized SimdKernels.
     /// </summary>
     public unsafe void Multiply(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             y.Length >= length && destination.Length >= length)
         {
@@ -901,7 +886,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Multiply(
+                    Engines.Simd.SimdKernels.VectorMultiply(
                         new ReadOnlySpan<double>(xp + start, count),
                         new ReadOnlySpan<double>(yp + start, count),
                         new Span<double>(dp + start, count));
@@ -909,19 +894,15 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        TensorPrimitives.Multiply(x, y, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanSpanIntoSpan<MultiplyOperatorDouble>(x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorMultiply(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise division using SIMD-optimized TensorPrimitives.
+    /// Performs element-wise division using SIMD-optimized SimdKernels.
     /// </summary>
     public unsafe void Divide(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             y.Length >= length && destination.Length >= length)
         {
@@ -934,7 +915,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Divide(
+                    Engines.Simd.SimdKernels.VectorDivide(
                         new ReadOnlySpan<double>(xp + start, count),
                         new ReadOnlySpan<double>(yp + start, count),
                         new Span<double>(dp + start, count));
@@ -942,41 +923,32 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        TensorPrimitives.Divide(x, y, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanSpanIntoSpan<DivideOperatorDouble>(x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorDivide(x, y, destination);
     }
 
     /// <summary>
-    /// Computes dot product using SIMD-optimized TensorPrimitives.
+    /// Computes dot product using SIMD-optimized SimdKernels.
     /// </summary>
     public double Dot(ReadOnlySpan<double> x, ReadOnlySpan<double> y)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Dot(x, y);
-#else
-        return TensorPrimitivesCore.Dot(x, y);
-#endif
+        return Engines.Simd.SimdKernels.DotProduct(x, y);
     }
 
     /// <summary>
-    /// Computes sum using SIMD-optimized TensorPrimitives.
+    /// Computes sum using SIMD-optimized SimdKernels.
     /// </summary>
     public double Sum(ReadOnlySpan<double> x)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
             int maxDegree = MaxDegreeOfParallelism;
             int numChunks = Math.Min(maxDegree, (length + MinChunkSize - 1) / MinChunkSize);
             if (numChunks <= 1)
             {
-                return TensorPrimitives.Sum(x);
+                return Engines.Simd.SimdKernels.Sum(x);
             }
 
-            // Pad to cache line boundaries (64 bytes / 8 bytes per double = 8 doubles)
             const int CacheLinePadding = 8;
             var partialSums = new double[numChunks * CacheLinePadding];
             int chunkSize = (length + numChunks - 1) / numChunks;
@@ -992,7 +964,7 @@ public class DoubleOperations : INumericOperations<double>
                         int count = Math.Min(chunkSize, length - start);
                         if (count > 0)
                         {
-                            partialSums[i * CacheLinePadding] = TensorPrimitives.Sum(new ReadOnlySpan<double>(xp + start, count));
+                            partialSums[i * CacheLinePadding] = Engines.Simd.SimdKernels.Sum(new ReadOnlySpan<double>(xp + start, count));
                         }
                     });
                 }
@@ -1005,43 +977,31 @@ public class DoubleOperations : INumericOperations<double>
             }
             return totalSum;
         }
-        return TensorPrimitives.Sum(x);
-#else
-        return TensorPrimitivesCore.Sum(x);
-#endif
+        return Engines.Simd.SimdKernels.Sum(x);
     }
 
     /// <summary>
-    /// Finds maximum using SIMD-optimized TensorPrimitives.
+    /// Finds maximum using SIMD-optimized SimdKernels.
     /// </summary>
     public double Max(ReadOnlySpan<double> x)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Max(x);
-#else
-        return TensorPrimitivesCore.Max(x);
-#endif
+        return Engines.Simd.SimdKernels.Max(x);
     }
 
     /// <summary>
-    /// Finds minimum using SIMD-optimized TensorPrimitives.
+    /// Finds minimum using SIMD-optimized SimdKernels.
     /// </summary>
     public double Min(ReadOnlySpan<double> x)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Min(x);
-#else
-        return TensorPrimitivesCore.Min(x);
-#endif
+        return Engines.Simd.SimdKernels.Min(x);
     }
 
     /// <summary>
-    /// Computes exponential using SIMD-optimized TensorPrimitives.
+    /// Computes exponential using SIMD-optimized SimdKernels.
     /// </summary>
     public unsafe void Exp(ReadOnlySpan<double> x, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             destination.Length >= length)
         {
@@ -1052,17 +1012,14 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Exp(
+                    Engines.Simd.SimdKernels.Exp(
                         new ReadOnlySpan<double>(xp + start, count),
                         new Span<double>(dp + start, count));
                 });
             }
             return;
         }
-        TensorPrimitives.Exp(x, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanIntoSpan<ExpOperatorDouble>(x, destination);
-#endif
+        Engines.Simd.SimdKernels.Exp(x, destination);
     }
 
     /// <summary>
@@ -1071,7 +1028,6 @@ public class DoubleOperations : INumericOperations<double>
     public unsafe void Log(ReadOnlySpan<double> x, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             destination.Length >= length)
         {
@@ -1082,17 +1038,14 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Log(
+                    Engines.Simd.SimdKernels.Log(
                         new ReadOnlySpan<double>(xp + start, count),
                         new Span<double>(dp + start, count));
                 });
             }
             return;
         }
-        TensorPrimitives.Log(x, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanIntoSpan<LogOperatorDouble>(x, destination);
-#endif
+        Engines.Simd.SimdKernels.Log(x, destination);
     }
 
     /// <summary>
@@ -1101,7 +1054,6 @@ public class DoubleOperations : INumericOperations<double>
     public unsafe void Tanh(ReadOnlySpan<double> x, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             destination.Length >= length)
         {
@@ -1112,26 +1064,22 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Tanh(
+                    Engines.Simd.SimdKernels.Tanh(
                         new ReadOnlySpan<double>(xp + start, count),
                         new Span<double>(dp + start, count));
                 });
             }
             return;
         }
-        TensorPrimitives.Tanh(x, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanIntoSpan<TanhOperatorDouble>(x, destination);
-#endif
+        Engines.Simd.SimdKernels.Tanh(x, destination);
     }
 
     /// <summary>
-    /// Computes sigmoid using SIMD-optimized TensorPrimitives.
+    /// Computes sigmoid using SIMD-optimized SimdKernels.
     /// </summary>
     public unsafe void Sigmoid(ReadOnlySpan<double> x, Span<double> destination)
     {
         int length = x.Length;
-#if NET8_0_OR_GREATER
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
             destination.Length >= length)
         {
@@ -1142,53 +1090,38 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    TensorPrimitives.Sigmoid(
+                    Engines.Simd.SimdKernels.Sigmoid(
                         new ReadOnlySpan<double>(xp + start, count),
                         new Span<double>(dp + start, count));
                 });
             }
             return;
         }
-        TensorPrimitives.Sigmoid(x, destination);
-#else
-        VectorizedOperationsFallback.Sigmoid(this, x, destination);
-#endif
+        Engines.Simd.SimdKernels.Sigmoid(x, destination);
     }
 
     /// <summary>
-    /// Computes base-2 logarithm using SIMD-optimized TensorPrimitives.
+    /// Computes base-2 logarithm using SIMD-optimized SimdKernels.
     /// </summary>
     public void Log2(ReadOnlySpan<double> x, Span<double> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Log2(x, destination);
-#else
-        TensorPrimitivesCore.InvokeSpanIntoSpan<Log2OperatorDouble>(x, destination);
-#endif
+        Engines.Simd.SimdKernels.Log2(x, destination);
     }
 
     /// <summary>
-    /// Computes softmax using SIMD-optimized TensorPrimitives.
+    /// Computes softmax using SIMD-optimized SimdKernels.
     /// </summary>
     public void SoftMax(ReadOnlySpan<double> x, Span<double> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.SoftMax(x, destination);
-#else
-        VectorizedOperationsFallback.SoftMax(this, x, destination);
-#endif
+        Engines.Simd.SimdKernels.SoftMax(x, destination);
     }
 
     /// <summary>
-    /// Computes cosine similarity using SIMD-optimized TensorPrimitives.
+    /// Computes cosine similarity using SIMD-optimized SimdKernels.
     /// </summary>
     public double CosineSimilarity(ReadOnlySpan<double> x, ReadOnlySpan<double> y)
     {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.CosineSimilarity(x, y);
-#else
-        return VectorizedOperationsFallback.CosineSimilarity(this, x, y);
-#endif
+        return Engines.Simd.SimdKernels.CosineSimilarity(x, y);
     }
 
     /// <summary>
@@ -1200,104 +1133,60 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Multiplies each element by a scalar using SIMD-optimized TensorPrimitivesCore.
+    /// Multiplies each element by a scalar using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Multiply(x, scalar, destination);
-#else
-    public void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => VectorizedOperationsFallback.MultiplyScalar(this, x, scalar, destination);
-#endif
+        => Engines.Simd.SimdKernels.MultiplyScalar(x, scalar, destination);
 
     /// <summary>
-    /// Divides each element by a scalar using SIMD-optimized TensorPrimitivesCore.
+    /// Divides each element by a scalar using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void DivideScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Divide(x, scalar, destination);
-#else
-    public void DivideScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => VectorizedOperationsFallback.DivideScalar(this, x, scalar, destination);
-#endif
+        => Engines.Simd.SimdKernels.DivideScalar(x, scalar, destination);
 
     /// <summary>
-    /// Adds a scalar to each element using SIMD-optimized TensorPrimitivesCore.
+    /// Adds a scalar to each element using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void AddScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Add(x, scalar, destination);
-#else
-    public void AddScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => VectorizedOperationsFallback.AddScalar(this, x, scalar, destination);
-#endif
+        => Engines.Simd.SimdKernels.AddScalar(x, scalar, destination);
 
     /// <summary>
-    /// Subtracts a scalar from each element using SIMD-optimized TensorPrimitivesCore.
+    /// Subtracts a scalar from each element using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void SubtractScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Subtract(x, scalar, destination);
-#else
-    public void SubtractScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => VectorizedOperationsFallback.SubtractScalar(this, x, scalar, destination);
-#endif
+        => Engines.Simd.SimdKernels.SubtractScalar(x, scalar, destination);
 
     /// <summary>
-    /// Computes square root using SIMD-optimized TensorPrimitivesCore.
+    /// Computes square root using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Sqrt(ReadOnlySpan<double> x, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Sqrt<double>(x, destination);
-#else
-    public void Sqrt(ReadOnlySpan<double> x, Span<double> destination)
-        => VectorizedOperationsFallback.Sqrt(this, x, destination);
-#endif
+        => Engines.Simd.SimdKernels.Sqrt(x, destination);
 
     /// <summary>
-    /// Computes absolute value using SIMD-optimized TensorPrimitivesCore.
+    /// Computes absolute value using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Abs(ReadOnlySpan<double> x, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Abs<double>(x, destination);
-#else
-    public void Abs(ReadOnlySpan<double> x, Span<double> destination)
-        => VectorizedOperationsFallback.Abs(this, x, destination);
-#endif
+        => Engines.Simd.SimdKernels.Abs(x, destination);
 
     /// <summary>
-    /// Negates each element using SIMD-optimized TensorPrimitivesCore.
+    /// Negates each element using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Negate(ReadOnlySpan<double> x, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Negate<double>(x, destination);
-#else
-    public void Negate(ReadOnlySpan<double> x, Span<double> destination)
-        => VectorizedOperationsFallback.Negate(this, x, destination);
-#endif
+        => Engines.Simd.SimdKernels.Negate(x, destination);
 
     /// <summary>
     /// Clips each element to a range.
     /// </summary>
     public void Clip(ReadOnlySpan<double> x, double min, double max, Span<double> destination)
     {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Clamp(x, min, max, destination);
-#else
-        VectorizedOperationsFallback.Clip(this, x, min, max, destination);
-#endif
+        Engines.Simd.SimdKernels.Clamp(x, min, max, destination);
     }
 
     /// <summary>
-    /// Computes the power of each element using SIMD-optimized TensorPrimitivesCore.
+    /// Computes the power of each element using SIMD-optimized SimdKernels.
     /// </summary>
-#if NET8_0_OR_GREATER
     public void Pow(ReadOnlySpan<double> x, double power, Span<double> destination)
-        => System.Numerics.Tensors.TensorPrimitives.Pow<double>(x, power, destination);
-#else
-    public void Pow(ReadOnlySpan<double> x, double power, Span<double> destination)
-        => VectorizedOperationsFallback.Pow(this, x, power, destination);
-#endif
+        => Engines.Simd.SimdKernels.Pow(x, power, destination);
 
     /// <summary>
     /// Copies elements from source to destination.
@@ -1357,16 +1246,14 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Converts double span to float span.
-    /// Uses TensorPrimitives.ConvertTruncating on .NET 8+ for SIMD acceleration.
+    /// Converts double span to float span via narrowing cast.
     /// </summary>
     public void ToFloatSpan(ReadOnlySpan<double> source, Span<float> destination)
     {
-#if NET8_0_OR_GREATER
-        System.Numerics.Tensors.TensorPrimitives.ConvertTruncating(source, destination);
-#else
-        VectorizedOperationsFallback.ToFloatSpan(this, source, destination);
-#endif
+        for (int i = 0; i < source.Length; i++)
+        {
+            destination[i] = (float)source[i];
+        }
     }
 
     /// <summary>

@@ -1,9 +1,6 @@
 using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
-#if NET8_0_OR_GREATER
-using System.Numerics.Tensors;
-#endif
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -918,20 +915,17 @@ public class FloatOperations : INumericOperations<float>
     /// </summary>
     public bool SupportsGpuAcceleration => true;
 
-    #region IVectorizedOperations<float> Implementation - SIMD via TensorPrimitives
+    #region IVectorizedOperations<float> Implementation - SIMD via SimdKernels
 
     private static readonly FloatOperations _instance = new();
 
     /// <summary>
-    /// Performs element-wise addition using oneDNN when available, falling back to TensorPrimitives.
-    /// Uses multi-threading for large arrays to maximize memory bandwidth.
+    /// Performs element-wise addition using oneDNN when available, falling back to SimdKernels.
     /// </summary>
     public void Add(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
-        int length = x.Length;
 #if NET8_0_OR_GREATER
-        // Try oneDNN first for large arrays - it has highly optimized multi-threaded implementation
-        // Validate all spans have sufficient length before unsafe operations
+        int length = x.Length;
         if (length >= ParallelThreshold && OneDnnProvider.IsAvailable &&
             y.Length >= length && destination.Length >= length)
         {
@@ -944,58 +938,25 @@ public class FloatOperations : INumericOperations<float>
                 }
             }
         }
-
-        // Fallback to TensorPrimitives (handles length validation internally)
-        TensorPrimitives.Add(x, y, destination);
-#else
-        VectorizedOperationsFallback.Add(_instance, x, y, destination);
 #endif
+        Engines.Simd.SimdKernels.VectorAdd(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise subtraction using SIMD-optimized TensorPrimitives.
-    /// Memory-bound operation - single-threaded SIMD saturates memory bandwidth.
+    /// Performs element-wise subtraction using SIMD-optimized SimdKernels.
     /// </summary>
-    public unsafe void Subtract(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
+    public void Subtract(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
-        int length = x.Length;
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            y.Length >= length && destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* yPtr = y)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* yp = yPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Subtract(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new ReadOnlySpan<float>(yp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-        TensorPrimitives.Subtract(x, y, destination);
-#else
-        VectorizedOperationsFallback.Subtract(_instance, x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorSubtract(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise multiplication using oneDNN when available, falling back to TensorPrimitives.
-    /// Uses multi-threading for large arrays to maximize memory bandwidth.
+    /// Performs element-wise multiplication using oneDNN when available, falling back to SimdKernels.
     /// </summary>
     public void Multiply(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
-        int length = x.Length;
 #if NET8_0_OR_GREATER
-        // Try oneDNN first for large arrays - it has highly optimized multi-threaded implementation
-        // Validate all spans have sufficient length before unsafe operations
+        int length = x.Length;
         if (length >= ParallelThreshold && OneDnnProvider.IsAvailable &&
             y.Length >= length && destination.Length >= length)
         {
@@ -1008,243 +969,83 @@ public class FloatOperations : INumericOperations<float>
                 }
             }
         }
-
-        // Fallback to TensorPrimitives (handles length validation internally)
-        TensorPrimitives.Multiply(x, y, destination);
-#else
-        VectorizedOperationsFallback.Multiply(_instance, x, y, destination);
 #endif
+        Engines.Simd.SimdKernels.VectorMultiply(x, y, destination);
     }
 
     /// <summary>
-    /// Performs element-wise division using SIMD-optimized TensorPrimitives.
-    /// Memory-bound operation - single-threaded SIMD saturates memory bandwidth.
+    /// Performs element-wise division using SIMD-optimized SimdKernels.
     /// </summary>
-    public unsafe void Divide(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
+    public void Divide(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
-        int length = x.Length;
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            y.Length >= length && destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* yPtr = y)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* yp = yPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Divide(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new ReadOnlySpan<float>(yp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-        TensorPrimitives.Divide(x, y, destination);
-#else
-        VectorizedOperationsFallback.Divide(_instance, x, y, destination);
-#endif
+        Engines.Simd.SimdKernels.VectorDivide(x, y, destination);
     }
 
     /// <summary>
-    /// Computes dot product using SIMD-optimized TensorPrimitives.
+    /// Computes dot product using SIMD-optimized SimdKernels with FMA.
     /// </summary>
     public float Dot(ReadOnlySpan<float> x, ReadOnlySpan<float> y)
-    {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Dot(x, y);
-#else
-        return VectorizedOperationsFallback.Dot(_instance, x, y);
-#endif
-    }
+        => Engines.Simd.SimdKernels.DotProduct(x, y);
 
     /// <summary>
-    /// Computes sum using SIMD-optimized TensorPrimitives with multi-threading for large arrays.
+    /// Computes sum using SIMD-optimized SimdKernels with 4-way accumulation.
     /// </summary>
-    /// <remarks>
-    /// Note: Due to floating-point non-associativity, parallel execution may produce slightly
-    /// different results across runs depending on thread execution order. This is generally
-    /// acceptable for neural network computations where exact bit-reproducibility is not required.
-    /// </remarks>
     public float Sum(ReadOnlySpan<float> x)
-    {
-        // Sum is a pure reduction - single-threaded SIMD already saturates memory bandwidth.
-        // Parallelization adds thread scheduling overhead without throughput benefit.
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Sum(x);
-#else
-        return VectorizedOperationsFallback.Sum(_instance, x);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Sum(x);
 
     /// <summary>
-    /// Finds maximum using SIMD-optimized TensorPrimitives.
+    /// Finds maximum using SIMD-optimized SimdKernels.
     /// </summary>
     public float Max(ReadOnlySpan<float> x)
-    {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Max(x);
-#else
-        return VectorizedOperationsFallback.Max(_instance, x);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Max(x);
 
     /// <summary>
-    /// Finds minimum using SIMD-optimized TensorPrimitives.
+    /// Finds minimum using SIMD-optimized SimdKernels.
     /// </summary>
     public float Min(ReadOnlySpan<float> x)
-    {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.Min(x);
-#else
-        return VectorizedOperationsFallback.Min(_instance, x);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Min(x);
 
     /// <summary>
-    /// Computes exponential using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
+    /// Computes exponential using fast vectorized Cephes polynomial approximation.
     /// </summary>
-    public unsafe void Exp(ReadOnlySpan<float> x, Span<float> destination)
-    {
-        int length = x.Length;
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Exp(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-        TensorPrimitives.Exp(x, destination);
-#else
-        VectorizedOperationsFallback.Exp(_instance, x, destination);
-#endif
-    }
+    public void Exp(ReadOnlySpan<float> x, Span<float> destination)
+        => Engines.Simd.SimdKernels.Exp(x, destination);
 
     /// <summary>
-    /// Computes natural logarithm using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
+    /// Computes natural logarithm using SimdKernels.
     /// </summary>
-    public unsafe void Log(ReadOnlySpan<float> x, Span<float> destination)
-    {
-        int length = x.Length;
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Log(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-        TensorPrimitives.Log(x, destination);
-#else
-        VectorizedOperationsFallback.Log(_instance, x, destination);
-#endif
-    }
+    public void Log(ReadOnlySpan<float> x, Span<float> destination)
+        => Engines.Simd.SimdKernels.Log(x, destination);
 
     /// <summary>
-    /// Computes hyperbolic tangent using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
+    /// Computes hyperbolic tangent using fast vectorized SimdKernels.
     /// </summary>
-    public unsafe void Tanh(ReadOnlySpan<float> x, Span<float> destination)
-    {
-        int length = x.Length;
-#if NET8_0_OR_GREATER
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (float* xPtr = x)
-            fixed (float* destPtr = destination)
-            {
-                float* xp = xPtr;
-                float* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    TensorPrimitives.Tanh(
-                        new ReadOnlySpan<float>(xp + start, count),
-                        new Span<float>(dp + start, count));
-                });
-            }
-            return;
-        }
-        TensorPrimitives.Tanh(x, destination);
-#else
-        VectorizedOperationsFallback.Tanh(_instance, x, destination);
-#endif
-    }
+    public void Tanh(ReadOnlySpan<float> x, Span<float> destination)
+        => Engines.Simd.SimdKernels.Tanh(x, destination);
 
     /// <summary>
-    /// Computes sigmoid using SIMD-optimized TensorPrimitives with parallel processing for large arrays.
-    /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
+    /// Computes sigmoid using fast vectorized SimdKernels.
     /// </summary>
     public void Sigmoid(ReadOnlySpan<float> x, Span<float> destination)
-    {
-        // Sigmoid is compute-bound (Exp per element). Single-threaded SIMD already
-        // maximizes ALU throughput; thread parallelism adds overhead without benefit.
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Sigmoid(x, destination);
-#else
-        VectorizedOperationsFallback.Sigmoid(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Sigmoid(x, destination);
 
     /// <summary>
-    /// Computes base-2 logarithm using SIMD-optimized TensorPrimitives.
+    /// Computes base-2 logarithm using SimdKernels.
     /// </summary>
     public void Log2(ReadOnlySpan<float> x, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Log2(x, destination);
-#else
-        VectorizedOperationsFallback.Log2(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Log2(x, destination);
 
     /// <summary>
-    /// Computes softmax using SIMD-optimized TensorPrimitives.
+    /// Computes softmax using SimdKernels (vectorized Max/Exp/Sum pipeline).
     /// </summary>
     public void SoftMax(ReadOnlySpan<float> x, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.SoftMax(x, destination);
-#else
-        VectorizedOperationsFallback.SoftMax(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.SoftMax(x, destination);
 
     /// <summary>
-    /// Computes cosine similarity using SIMD-optimized TensorPrimitives.
+    /// Computes cosine similarity using SimdKernels.
     /// </summary>
     public float CosineSimilarity(ReadOnlySpan<float> x, ReadOnlySpan<float> y)
-    {
-#if NET8_0_OR_GREATER
-        return TensorPrimitives.CosineSimilarity(x, y);
-#else
-        return VectorizedOperationsFallback.CosineSimilarity(_instance, x, y);
-#endif
-    }
+        => Engines.Simd.SimdKernels.CosineSimilarity(x, y);
 
     /// <summary>
     /// Fills the destination span with a constant value.
@@ -1255,112 +1056,58 @@ public class FloatOperations : INumericOperations<float>
     }
 
     /// <summary>
-    /// Multiplies each element by a scalar using SIMD-optimized TensorPrimitives.
+    /// Multiplies each element by a scalar using SIMD-optimized SimdKernels.
     /// </summary>
     public void MultiplyScalar(ReadOnlySpan<float> x, float scalar, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Multiply(x, scalar, destination);
-#else
-        VectorizedOperationsFallback.MultiplyScalar(_instance, x, scalar, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.MultiplyScalar(x, scalar, destination);
 
     /// <summary>
-    /// Divides each element by a scalar using SIMD-optimized TensorPrimitives.
+    /// Divides each element by a scalar using SIMD-optimized SimdKernels.
     /// </summary>
     public void DivideScalar(ReadOnlySpan<float> x, float scalar, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Divide(x, scalar, destination);
-#else
-        VectorizedOperationsFallback.DivideScalar(_instance, x, scalar, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.DivideScalar(x, scalar, destination);
 
     /// <summary>
-    /// Adds a scalar to each element using SIMD-optimized TensorPrimitives.
+    /// Adds a scalar to each element using SIMD-optimized SimdKernels.
     /// </summary>
     public void AddScalar(ReadOnlySpan<float> x, float scalar, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Add(x, scalar, destination);
-#else
-        VectorizedOperationsFallback.AddScalar(_instance, x, scalar, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.AddScalar(x, scalar, destination);
 
     /// <summary>
-    /// Subtracts a scalar from each element using SIMD-optimized TensorPrimitives.
+    /// Subtracts a scalar from each element.
     /// </summary>
     public void SubtractScalar(ReadOnlySpan<float> x, float scalar, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Subtract(x, scalar, destination);
-#else
-        VectorizedOperationsFallback.SubtractScalar(_instance, x, scalar, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.AddScalar(x, -scalar, destination);
 
     /// <summary>
-    /// Computes square root using SIMD-optimized TensorPrimitives.
+    /// Computes square root using SIMD-optimized SimdKernels.
     /// </summary>
     public void Sqrt(ReadOnlySpan<float> x, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Sqrt(x, destination);
-#else
-        VectorizedOperationsFallback.Sqrt(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Sqrt(x, destination);
 
     /// <summary>
-    /// Computes absolute value using SIMD-optimized TensorPrimitives.
+    /// Computes absolute value using SIMD-optimized SimdKernels.
     /// </summary>
     public void Abs(ReadOnlySpan<float> x, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Abs(x, destination);
-#else
-        VectorizedOperationsFallback.Abs(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Abs(x, destination);
 
     /// <summary>
-    /// Negates each element using SIMD-optimized TensorPrimitives.
+    /// Negates each element using SIMD-optimized SimdKernels.
     /// </summary>
     public void Negate(ReadOnlySpan<float> x, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Negate(x, destination);
-#else
-        VectorizedOperationsFallback.Negate(_instance, x, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Negate(x, destination);
 
     /// <summary>
-    /// Clips each element to a range.
+    /// Clips each element to a range using SIMD-optimized SimdKernels.
     /// </summary>
     public void Clip(ReadOnlySpan<float> x, float min, float max, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Clamp(x, min, max, destination);
-#else
-        VectorizedOperationsFallback.Clip(_instance, x, min, max, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Clamp(x, min, max, destination);
 
     /// <summary>
     /// Computes the power of each element.
     /// </summary>
     public void Pow(ReadOnlySpan<float> x, float power, Span<float> destination)
-    {
-#if NET8_0_OR_GREATER
-        TensorPrimitives.Pow(x, power, destination);
-#else
-        VectorizedOperationsFallback.Pow(_instance, x, power, destination);
-#endif
-    }
+        => Engines.Simd.SimdKernels.Pow(x, power, destination);
 
     /// <summary>
     /// Copies elements from source to destination.
@@ -1441,42 +1188,26 @@ public class FloatOperations : INumericOperations<float>
 
     /// <summary>
     /// Converts float span to Half (FP16) span.
-    /// SIMD-optimized on .NET 8+ using TensorPrimitives.ConvertToHalf.
-    /// Critical for mixed-precision GPU operations (FP16 loads with FP32 accumulation).
     /// </summary>
     public void ToHalfSpan(ReadOnlySpan<float> source, Span<Half> destination)
     {
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
-#if NET8_0_OR_GREATER
-        // SIMD-optimized conversion on .NET 8+
-        System.Numerics.Tensors.TensorPrimitives.ConvertToHalf(source, destination);
-#else
-        // Sequential fallback for .NET Framework
         for (int i = 0; i < source.Length; i++)
             destination[i] = (Half)source[i];
-#endif
     }
 
     /// <summary>
     /// Converts Half (FP16) span to float span.
-    /// SIMD-optimized on .NET 8+ using TensorPrimitives.ConvertToSingle.
-    /// Used when retrieving results from GPU operations using half precision.
     /// </summary>
     public void FromHalfSpan(ReadOnlySpan<Half> source, Span<float> destination)
     {
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
-#if NET8_0_OR_GREATER
-        // SIMD-optimized conversion on .NET 8+
-        System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(source, destination);
-#else
-        // Sequential fallback for .NET Framework
         for (int i = 0; i < source.Length; i++)
             destination[i] = (float)source[i];
-#endif
     }
 
     #region Vectorized Activation Functions
