@@ -3,11 +3,13 @@ using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Engines;
+using BenchmarkDotNet.Jobs;
 using TorchSharp;
 using TorchTensor = TorchSharp.torch.Tensor;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
 [MemoryDiagnoser]
 public class TorchSharpCpuComparisonBenchmarks
 {

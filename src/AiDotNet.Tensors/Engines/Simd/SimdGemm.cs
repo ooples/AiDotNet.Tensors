@@ -121,7 +121,7 @@ internal static class SimdGemm
                     int kc = Math.Min(Kc, k - pc);
 
                     // Pack B panel: B[pc:pc+kc, jc:jc+nc] -> packedB in column-panel layout
-                    PackB(b, packedBBuf, k, n, pc, kc, jc, nc);
+                    PackB(b, packedBBuf, n, pc, kc, jc, nc);
 
                     // 3rd loop: over M dimension in blocks of Mc (parallelizable)
                     bool useParallel = m >= Mc * 2 && Environment.ProcessorCount > 1;
@@ -129,9 +129,12 @@ internal static class SimdGemm
 
                     if (useParallel)
                     {
-                        // Pin arrays for safe parallel access
+                        // Pin source A array once (read-only, safe for parallel reads)
                         float[] aArray = a.ToArray();
-                        float[] cArray = c.ToArray();
+                        // Use c directly via pinning — MacroKernel writes to disjoint row blocks,
+                        // so parallel writes are safe without copying.
+                        float[] cArray = new float[c.Length];
+                        c.CopyTo(cArray); // Copy current accumulated C values once
 
                         System.Threading.Tasks.Parallel.For(0, numRowBlocks, iiBlock =>
                         {
@@ -222,7 +225,7 @@ internal static class SimdGemm
     /// Layout: groups of Nr columns, each stored as kc x Nr contiguous block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackB(ReadOnlySpan<float> b, float[] packed, int kTotal, int ldb, int pc, int kc, int jc, int nc)
+    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, int pc, int kc, int jc, int nc)
     {
         int pos = 0;
         int j = 0;

@@ -2901,5 +2901,80 @@ namespace AiDotNet.Tensors.Engines.Simd
             return v.GetElement(0) + v.GetElement(1);
         }
 #endif
+
+    #region Type Conversion
+
+    /// <summary>
+    /// Converts float span to Half span. Uses unrolled loop for better throughput.
+    /// </summary>
+    public static void ConvertToHalf(ReadOnlySpan<float> source, Span<Half> destination)
+    {
+        int i = 0;
+        int length = source.Length;
+
+        // 4x unrolled scalar conversion (Half has no native SIMD on most hardware)
+        for (; i + 4 <= length; i += 4)
+        {
+            destination[i] = (Half)source[i];
+            destination[i + 1] = (Half)source[i + 1];
+            destination[i + 2] = (Half)source[i + 2];
+            destination[i + 3] = (Half)source[i + 3];
+        }
+
+        for (; i < length; i++)
+            destination[i] = (Half)source[i];
+    }
+
+    /// <summary>
+    /// Converts Half span to float span. Uses unrolled loop for better throughput.
+    /// </summary>
+    public static void ConvertToSingle(ReadOnlySpan<Half> source, Span<float> destination)
+    {
+        int i = 0;
+        int length = source.Length;
+
+        // 4x unrolled scalar conversion
+        for (; i + 4 <= length; i += 4)
+        {
+            destination[i] = (float)source[i];
+            destination[i + 1] = (float)source[i + 1];
+            destination[i + 2] = (float)source[i + 2];
+            destination[i + 3] = (float)source[i + 3];
+        }
+
+        for (; i < length; i++)
+            destination[i] = (float)source[i];
+    }
+
+    /// <summary>
+    /// Converts double span to float span using AVX narrowing conversion.
+    /// </summary>
+    public static void ConvertDoubleToFloat(ReadOnlySpan<double> source, Span<float> destination)
+    {
+        int i = 0;
+        int length = source.Length;
+
+#if NET8_0_OR_GREATER
+        if (Avx.IsSupported)
+        {
+            ref double srcRef = ref MemoryMarshal.GetReference(source);
+            ref float dstRef = ref MemoryMarshal.GetReference(destination);
+
+            // Process 4 doubles -> 4 floats per iteration using VCVTPD2PS
+            for (; i + 4 <= length; i += 4)
+            {
+                var doubleVec = Vector256.LoadUnsafe(ref srcRef, (nuint)i);
+                var floatVec = Avx.ConvertToVector128Single(doubleVec);
+                floatVec.StoreUnsafe(ref dstRef, (nuint)i);
+            }
+        }
+#endif
+
+        // Scalar tail
+        for (; i < length; i++)
+            destination[i] = (float)source[i];
+    }
+
+    #endregion
     }
 }

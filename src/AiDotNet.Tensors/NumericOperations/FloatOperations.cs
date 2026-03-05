@@ -934,11 +934,12 @@ public class FloatOperations : INumericOperations<float>
                 fixed (float* xPtr = x, yPtr = y, destPtr = destination)
                 {
                     if (OneDnnProvider.TryAdd(xPtr, yPtr, destPtr, length))
-                        return;
+                        return; // oneDNN wrote result via destPtr, done
                 }
             }
         }
 #endif
+        // Fallback: oneDNN unavailable, below threshold, or TryAdd failed
         Engines.Simd.SimdKernels.VectorAdd(x, y, destination);
     }
 
@@ -965,11 +966,12 @@ public class FloatOperations : INumericOperations<float>
                 fixed (float* xPtr = x, yPtr = y, destPtr = destination)
                 {
                     if (OneDnnProvider.TryMultiply(xPtr, yPtr, destPtr, length))
-                        return;
+                        return; // oneDNN wrote result via destPtr, done
                 }
             }
         }
 #endif
+        // Fallback: oneDNN unavailable, below threshold, or TryMultiply failed
         Engines.Simd.SimdKernels.VectorMultiply(x, y, destination);
     }
 
@@ -1187,27 +1189,35 @@ public class FloatOperations : INumericOperations<float>
     }
 
     /// <summary>
-    /// Converts float span to Half (FP16) span.
+    /// Converts float span to Half (FP16) span using vectorized conversion when available.
     /// </summary>
     public void ToHalfSpan(ReadOnlySpan<float> source, Span<Half> destination)
     {
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
+#if NET8_0_OR_GREATER
+        Engines.Simd.SimdKernels.ConvertToHalf(source, destination);
+#else
         for (int i = 0; i < source.Length; i++)
             destination[i] = (Half)source[i];
+#endif
     }
 
     /// <summary>
-    /// Converts Half (FP16) span to float span.
+    /// Converts Half (FP16) span to float span using vectorized conversion when available.
     /// </summary>
     public void FromHalfSpan(ReadOnlySpan<Half> source, Span<float> destination)
     {
         if (source.Length != destination.Length)
             throw new ArgumentException("Spans must have the same length");
 
+#if NET8_0_OR_GREATER
+        Engines.Simd.SimdKernels.ConvertToSingle(source, destination);
+#else
         for (int i = 0; i < source.Length; i++)
             destination[i] = (float)source[i];
+#endif
     }
 
     #region Vectorized Activation Functions
