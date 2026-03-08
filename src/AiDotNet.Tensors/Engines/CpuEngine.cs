@@ -1414,21 +1414,19 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Matrix<T>(a.Rows, b.Columns);
+        int m = a.Rows;
+        int k = a.Columns;
+        int n = b.Columns;
+        var result = new Matrix<T>(m, n);
 
-        // Standard O(nÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³) matrix multiplication
-        for (int i = 0; i < a.Rows; i++)
+        // Try BLAS/SimdGemm-accelerated path for float/double
+        if (MatrixMultiplyHelper.TryGemm(a.AsMemory(), 0, b.AsMemory(), 0, result.AsWritableMemory(), 0, m, k, n))
         {
-            for (int j = 0; j < b.Columns; j++)
-            {
-                T sum = numOps.Zero;
-                for (int k = 0; k < a.Columns; k++)
-                {
-                    sum = numOps.Add(sum, numOps.Multiply(a[i, k], b[k, j]));
-                }
-                result[i, j] = sum;
-            }
+            return result;
         }
+
+        // Fallback for non-float/double types: blocked multiplication using numOps
+        MatrixMultiplyHelper.MultiplyBlocked(numOps, a.AsMemory(), b.AsMemory(), result.AsWritableMemory(), m, k, n, k, n, n);
 
         return result;
     }
