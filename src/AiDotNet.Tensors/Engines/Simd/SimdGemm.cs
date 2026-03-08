@@ -124,24 +124,24 @@ internal static class SimdGemm
                     PackB(b, packedBBuf, n, pc, kc, jc, nc);
 
                     // 3rd loop: over M dimension in blocks of Mc (parallelizable)
-                    bool useParallel = m >= Mc * 2 && Environment.ProcessorCount > 1;
+                    // Parallel overhead is huge: 2x array copies + Parallel.For scheduling.
+                    // Only worth it for very large matrices (4+ tiles = m >= 1024).
                     int numRowBlocks = (m + Mc - 1) / Mc;
+                    bool useParallel = numRowBlocks >= 4 && Environment.ProcessorCount > 1;
 
                     if (useParallel)
                     {
-                        // Pin source A array once (read-only, safe for parallel reads)
+                        // Span can't be captured in lambdas — copy to arrays for parallel access.
+                        // Only triggers for large matrices (m >= 1024) where copy cost is amortized.
                         float[] aArray = a.ToArray();
-                        // Use c directly via pinning — MacroKernel writes to disjoint row blocks,
-                        // so parallel writes are safe without copying.
                         float[] cArray = new float[c.Length];
-                        c.CopyTo(cArray); // Copy current accumulated C values once
+                        c.CopyTo(cArray);
 
                         System.Threading.Tasks.Parallel.For(0, numRowBlocks, iiBlock =>
                         {
                             int ic = iiBlock * Mc;
                             int mc = Math.Min(Mc, m - ic);
 
-                            // Each thread gets its own packed A buffer
                             float[] localPackedA = ArrayPool<float>.Shared.Rent(mc * kc);
                             try
                             {
