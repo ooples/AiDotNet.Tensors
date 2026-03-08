@@ -829,15 +829,54 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Fast vectorized sigmoid using the same approach as FastExp256 but with
-        /// a fused exp(-x) + reciprocal that avoids redundant clamp/negate operations.
+        /// Fast vectorized sigmoid using a reduced 4th-order exp polynomial.
+        /// Trades ~0.1% accuracy for ~33% fewer FMA operations vs 6th-order.
+        /// Uses the identity sigmoid(x) = 1/(1+exp(-x)) with fast exp(-|x|)
+        /// and blending based on sign for numerical stability.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
+            // Use exp(-|x|) for numerical stability, then blend result based on sign
+            var vzero = Vector256<float>.Zero;
             var vone = Vector256.Create(1.0f);
-            var neg = Avx.Subtract(Vector256<float>.Zero, x);
-            return Avx.Divide(vone, Avx.Add(vone, FastExp256(neg)));
+            var negMask = Avx.CompareLessThan(x, vzero);
+
+            // Compute exp(-|x|) with reduced 4th-order polynomial (faster than 6th-order FastExp256)
+            var ax = Avx.Max(Avx.Subtract(vzero, x), x); // |x| without AndNot (no sign bit mask needed)
+            var negAx = Avx.Subtract(vzero, ax);
+
+            // Clamp to avoid underflow
+            negAx = Avx.Max(negAx, Vector256.Create(-87.3365f));
+
+            // Range reduction: n = round(-|x| / ln2), r = -|x| - n*ln2
+            var log2e = Vector256.Create(1.44269504088896341f);
+            var ln2hi = Vector256.Create(0.693359375f);
+            var ln2lo = Vector256.Create(-2.12194440e-4f);
+
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(negAx, log2e));
+            var r = Fma.MultiplyAddNegated(n, ln2hi, negAx);
+            r = Fma.MultiplyAddNegated(n, ln2lo, r);
+
+            // 4th-order Horner: exp(r) ≈ ((c4*r + c3)*r + c2)*r + c1)*r + c0
+            var poly = Fma.MultiplyAdd(Vector256.Create(0.041666666666f), r, Vector256.Create(0.166666666666f));
+            poly = Fma.MultiplyAdd(poly, r, Vector256.Create(0.5f));
+            poly = Fma.MultiplyAdd(poly, r, vone);
+            poly = Fma.MultiplyAdd(poly, r, vone);
+
+            // Reconstruct: 2^n * exp(r)
+            var nInt = Avx.ConvertToVector256Int32(n);
+            var pow2n = Avx2.Add(nInt, Vector256.Create(127));
+            pow2n = Avx2.ShiftLeftLogical(pow2n, 23);
+            var expNegAx = Avx.Multiply(poly, pow2n.AsSingle());
+
+            // sigmoid(-|x|) = exp(-|x|) / (1 + exp(-|x|)) = 1 / (1 + exp(|x|))
+            var denom = Avx.Add(vone, expNegAx);
+            var sigNeg = Avx.Divide(expNegAx, denom); // sigmoid for x < 0
+            var sigPos = Avx.Divide(vone, denom);      // sigmoid for x >= 0
+
+            // Blend based on sign of x
+            return Avx.BlendVariable(sigPos, sigNeg, negMask);
         }
 
         /// <summary>
