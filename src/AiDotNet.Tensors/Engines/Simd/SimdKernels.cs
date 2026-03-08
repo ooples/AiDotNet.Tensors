@@ -1236,18 +1236,36 @@ namespace AiDotNet.Tensors.Engines.Simd
             float sum = 0f;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
+            {
+                // 4-way parallel accumulation to hide add latency (3 cycles on Zen2)
+                var vsum0 = Vector256<float>.Zero;
+                var vsum1 = Vector256<float>.Zero;
+                var vsum2 = Vector256<float>.Zero;
+                var vsum3 = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vsum0 = Avx.Add(vsum0, ReadVector256(data, i));
+                    vsum1 = Avx.Add(vsum1, ReadVector256(data, i + 8));
+                    vsum2 = Avx.Add(vsum2, ReadVector256(data, i + 16));
+                    vsum3 = Avx.Add(vsum3, ReadVector256(data, i + 24));
+                }
+                // Reduce 4 accumulators
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                sum += HorizontalSum(vsum0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
             {
                 var vsum = Vector256<float>.Zero;
-                int simdLength = length & ~7;
+                int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
                     vsum = Avx.Add(vsum, ReadVector256(data, i));
                 }
-
                 sum += HorizontalSum(vsum);
             }
-            else if (Sse.IsSupported && length >= 4)
+            else if (Sse.IsSupported && length - i >= 4)
             {
                 var vsum = Vector128<float>.Zero;
                 int simdLength = length & ~3;
