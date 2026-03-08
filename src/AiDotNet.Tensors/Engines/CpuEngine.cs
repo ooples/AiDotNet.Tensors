@@ -1965,12 +1965,43 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Single-threaded: bandwidth-bound ops are limited by memory bus,
-            // not compute. Parallel.For overhead (allocation + scheduling) is wasted.
-            fixed (float* ptrA = aFloat)
-            fixed (float* ptrB = bFloat)
+            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
+            // Pin once with GCHandle, divide into ProcessorCount chunks.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            if (numChunks >= 2)
             {
-                SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
+                var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
+                var handleB = System.Runtime.InteropServices.GCHandle.Alloc(bFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    float* pA = (float*)handleA.AddrOfPinnedObject();
+                    float* pB = (float*)handleB.AddrOfPinnedObject();
+                    int chunkSize = (length + numChunks - 1) / numChunks;
+                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+
+                    Parallel.For(0, numChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
+                        }
+                    });
+                }
+                finally
+                {
+                    handleB.Free();
+                    handleA.Free();
+                }
+            }
+            else
+            {
+                fixed (float* ptrA = aFloat)
+                fixed (float* ptrB = bFloat)
+                {
+                    SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
+                }
             }
             return;
         }
@@ -2133,12 +2164,43 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Single-threaded: bandwidth-bound ops are limited by memory bus,
-            // not compute. Parallel.For overhead (allocation + scheduling) is wasted.
-            fixed (float* ptrA = aFloat)
-            fixed (float* ptrB = bFloat)
+            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
+            // Pin once with GCHandle, divide into ProcessorCount chunks.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            if (numChunks >= 2)
             {
-                SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
+                var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
+                var handleB = System.Runtime.InteropServices.GCHandle.Alloc(bFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    float* pA = (float*)handleA.AddrOfPinnedObject();
+                    float* pB = (float*)handleB.AddrOfPinnedObject();
+                    int chunkSize = (length + numChunks - 1) / numChunks;
+                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+
+                    Parallel.For(0, numChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
+                        }
+                    });
+                }
+                finally
+                {
+                    handleB.Free();
+                    handleA.Free();
+                }
+            }
+            else
+            {
+                fixed (float* ptrA = aFloat)
+                fixed (float* ptrB = bFloat)
+                {
+                    SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
+                }
             }
             return;
         }
@@ -3875,11 +3937,39 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            // Bandwidth-bound: single-threaded saturates memory bus.
-            // Parallel.For overhead negates any benefit at these sizes.
-            fixed (float* ptr = floatArr)
+            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
+            // Pin once with GCHandle, divide into ProcessorCount chunks.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            if (numChunks >= 2)
             {
-                SimdKernels.ReLUUnsafe(ptr, ptr, length);
+                var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    float* p = (float*)handle.AddrOfPinnedObject();
+                    int chunkSize = (length + numChunks - 1) / numChunks;
+                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+
+                    Parallel.For(0, numChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.ReLUUnsafe(p + start, p + start, count);
+                        }
+                    });
+                }
+                finally
+                {
+                    handle.Free();
+                }
+            }
+            else
+            {
+                fixed (float* ptr = floatArr)
+                {
+                    SimdKernels.ReLUUnsafe(ptr, ptr, length);
+                }
             }
             return;
         }
