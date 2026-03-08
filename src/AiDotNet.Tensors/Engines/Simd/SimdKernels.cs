@@ -83,12 +83,32 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
+                // For large arrays (>L2 cache), use software prefetch to hide memory latency
+                if (Sse.IsSupported && length >= 131072) // 512KB threshold
                 {
-                    Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
-                    Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
-                    Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
-                    Avx.Store(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    const int prefetchDistance = 256; // 256 floats = 1KB ahead
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(a + i + prefetchDistance);
+                            Sse.Prefetch0(b + i + prefetchDistance);
+                        }
+                        Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
+                }
+                else
+                {
+                    for (; i < simdLength; i += 32)
+                    {
+                        Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
                 }
             }
             if (Avx.IsSupported && length - i >= 8)
@@ -117,12 +137,31 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
-                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
-                    Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
-                    Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(a + i + prefetchDistance);
+                            Sse.Prefetch0(b + i + prefetchDistance);
+                        }
+                        Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
+                }
+                else
+                {
+                    for (; i < simdLength; i += 32)
+                    {
+                        Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
                 }
             }
             if (Avx.IsSupported && length - i >= 8)

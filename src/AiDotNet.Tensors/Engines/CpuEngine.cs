@@ -1965,37 +1965,12 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            int addIPChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
-            if (addIPChunks >= 2)
+            // Single-threaded: bandwidth-bound ops are limited by memory bus,
+            // not compute. Parallel.For overhead (allocation + scheduling) is wasted.
+            fixed (float* ptrA = aFloat)
+            fixed (float* ptrB = bFloat)
             {
-                // Parallel path needs Memory.Pin() since fixed can't cross lambda boundary
-                var aMem = (Memory<float>)(object)a.Data;
-                var bMem = (Memory<float>)(object)b.Data;
-                using var pinA = aMem.Pin();
-                using var pinB = bMem.Pin();
-                float* pA = (float*)pinA.Pointer;
-                float* pB = (float*)pinB.Pointer;
-                int chunkSize = (length + addIPChunks - 1) / addIPChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, addIPChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorAddUnsafe(pA + start, pB + start, pA + start, count);
-                    }
-                });
-            }
-            else
-            {
-                // Single-threaded: use cheap fixed pinning
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
-                }
+                SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
             }
             return;
         }
@@ -2158,35 +2133,12 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
-            if (mulChunks >= 2)
+            // Single-threaded: bandwidth-bound ops are limited by memory bus,
+            // not compute. Parallel.For overhead (allocation + scheduling) is wasted.
+            fixed (float* ptrA = aFloat)
+            fixed (float* ptrB = bFloat)
             {
-                var aMem = (Memory<float>)(object)a.Data;
-                var bMem = (Memory<float>)(object)b.Data;
-                using var pinA = aMem.Pin();
-                using var pinB = bMem.Pin();
-                float* pA = (float*)pinA.Pointer;
-                float* pB = (float*)pinB.Pointer;
-                int chunkSize = (length + mulChunks - 1) / mulChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, mulChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorMultiplyUnsafe(pA + start, pB + start, pA + start, count);
-                    }
-                });
-            }
-            else
-            {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
-                }
+                SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
             }
             return;
         }
@@ -3806,24 +3758,31 @@ public class CpuEngine : ITensorLevelEngine
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
             // Sigmoid is compute-bound (~25 SIMD instructions per 8 elements).
-            // Lower threshold than bandwidth-bound ops since each element needs more work.
+            // Parallelism genuinely helps here unlike bandwidth-bound ops.
             int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
             if (sigChunks >= 2)
             {
-                var floatMem = (Memory<float>)(object)tensor.Data;
-                using var pin = floatMem.Pin();
-                float* p = (float*)pin.Pointer;
-                int chunkSize = (length + sigChunks - 1) / sigChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-                Parallel.For(0, sigChunks, chunk =>
+                // Use GCHandle instead of Memory.Pin() to avoid boxing allocation
+                var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
                 {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
+                    float* p = (float*)handle.AddrOfPinnedObject();
+                    int chunkSize = (length + sigChunks - 1) / sigChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+                    Parallel.For(0, sigChunks, chunk =>
                     {
-                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
-                    }
-                });
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.SigmoidUnsafe(p + start, p + start, count);
+                        }
+                    });
+                }
+                finally
+                {
+                    handle.Free();
+                }
             }
             else
             {
@@ -3916,33 +3875,11 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            // ReLU is bandwidth-bound; L3 bandwidth is shared across cores.
-            // Only parallelize when array is large enough that chunks fit in separate L2 caches.
-            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
-            if (reluChunks >= 2)
+            // Bandwidth-bound: single-threaded saturates memory bus.
+            // Parallel.For overhead negates any benefit at these sizes.
+            fixed (float* ptr = floatArr)
             {
-                var floatMem = (Memory<float>)(object)tensor.Data;
-                using var pin = floatMem.Pin();
-                float* p = (float*)pin.Pointer;
-                int chunkSize = (length + reluChunks - 1) / reluChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, reluChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.ReLUUnsafe(p + start, p + start, count);
-                    }
-                });
-            }
-            else
-            {
-                fixed (float* ptr = floatArr)
-                {
-                    SimdKernels.ReLUUnsafe(ptr, ptr, length);
-                }
+                SimdKernels.ReLUUnsafe(ptr, ptr, length);
             }
             return;
         }
