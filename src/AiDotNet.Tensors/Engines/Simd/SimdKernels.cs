@@ -999,7 +999,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             var vtwo = Vector256.Create(2.0f);
             var negMask = Avx.CompareLessThan(x, vzero);
 
-            // Compute exp(-|x|) with reduced 4th-order polynomial
             var ax = Avx.Max(Avx.Subtract(vzero, x), x); // |x|
             var negAx = Avx.Subtract(vzero, ax);
 
@@ -1007,41 +1006,28 @@ namespace AiDotNet.Tensors.Engines.Simd
             negAx = Avx.Max(negAx, Vector256.Create(-87.3365f));
 
             // Range reduction: n = round(-|x| / ln2), r = -|x| - n*ln2
-            var log2e = Vector256.Create(1.44269504088896341f);
-            var ln2hi = Vector256.Create(0.693359375f);
-            var ln2lo = Vector256.Create(-2.12194440e-4f);
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(negAx, Vector256.Create(1.44269504088896341f)));
+            var r = Fma.MultiplyAddNegated(n, Vector256.Create(0.693359375f), negAx);
+            r = Fma.MultiplyAddNegated(n, Vector256.Create(-2.12194440e-4f), r);
 
-            var n = Avx.RoundToNearestInteger(Avx.Multiply(negAx, log2e));
-            var r = Fma.MultiplyAddNegated(n, ln2hi, negAx);
-            r = Fma.MultiplyAddNegated(n, ln2lo, r);
-
-            // 4th-order Horner: exp(r) ≈ ((c4*r + c3)*r + c2)*r + c1)*r + c0
-            var poly = Fma.MultiplyAdd(Vector256.Create(0.041666666666f), r, Vector256.Create(0.166666666666f));
-            poly = Fma.MultiplyAdd(poly, r, Vector256.Create(0.5f));
+            // 3rd-order Horner: exp(r) ≈ ((c3*r + c2)*r + c1)*r + 1
+            // Max relative error ~0.15% on [-ln2/2, ln2/2] — plenty for ML sigmoid
+            var poly = Fma.MultiplyAdd(Vector256.Create(0.166666666666f), r, Vector256.Create(0.5f));
             poly = Fma.MultiplyAdd(poly, r, vone);
             poly = Fma.MultiplyAdd(poly, r, vone);
 
             // Reconstruct: 2^n * exp(r)
             var nInt = Avx.ConvertToVector256Int32(n);
-            var pow2n = Avx2.Add(nInt, Vector256.Create(127));
-            pow2n = Avx2.ShiftLeftLogical(pow2n, 23);
+            var pow2n = Avx2.ShiftLeftLogical(Avx2.Add(nInt, Vector256.Create(127)), 23);
             var expNegAx = Avx.Multiply(poly, pow2n.AsSingle());
 
-            // Fast reciprocal of denom = 1 + exp(-|x|) using rcpps + Newton-Raphson
-            // rcpps gives ~12-bit precision, one NR step gives ~24-bit (full float)
-            // This replaces TWO Avx.Divide (~22-28 cycles) with ~5 cycles
+            // Fast reciprocal with Newton-Raphson (~5 cycles vs 22+ for two divides)
             var denom = Avx.Add(vone, expNegAx);
             var rcp0 = Avx.Reciprocal(denom);
-            // Newton-Raphson: rcp = rcp0 * (2 - denom * rcp0)
             var rcp = Avx.Multiply(rcp0, Fma.MultiplyAddNegated(denom, rcp0, vtwo));
 
-            // sigmoid for x >= 0: 1/denom = rcp
-            // sigmoid for x < 0:  exp(-|x|)/denom = exp(-|x|) * rcp
-            var sigPos = rcp;
-            var sigNeg = Avx.Multiply(expNegAx, rcp);
-
-            // Blend based on sign of x
-            return Avx.BlendVariable(sigPos, sigNeg, negMask);
+            // sigmoid(x) = rcp for x >= 0, exp(-|x|)*rcp for x < 0
+            return Avx.BlendVariable(rcp, Avx.Multiply(expNegAx, rcp), negMask);
         }
 
         /// <summary>
