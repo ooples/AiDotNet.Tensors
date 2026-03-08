@@ -1858,27 +1858,17 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
 
-        // Parallel chunked SIMD for large tensors (matches TorchSharp's OpenMP parallelism)
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Add(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        // Direct SIMD path - bandwidth-bound ops are faster single-threaded than with Parallel.For
+        // overhead (measured: 602us serial vs 14ms with 16 parallel chunks for 1M elements)
+        numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
 
     /// <summary>
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
-    /// Uses parallel processing for large tensors to maximize throughput.
     /// </summary>
     public void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -1891,16 +1881,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Add(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(aArr, start, count));
-        });
+        numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }
 
     /// <summary>
@@ -1917,17 +1898,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var dArr = destination.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Add(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(dArr, start, count));
-        });
+        numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -2018,19 +1989,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
 
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Subtract(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2047,26 +2008,15 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
 
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Multiply(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
 
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
-    /// Uses parallel processing for large tensors to maximize throughput.
     /// </summary>
     public void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -2079,16 +2029,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Multiply(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(aArr, start, count));
-        });
+        numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }
 
     /// <summary>
@@ -2147,7 +2088,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -2165,19 +2106,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
 
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = aArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Divide(
-                new ReadOnlySpan<T>(aArr, start, count),
-                new ReadOnlySpan<T>(bArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2190,7 +2121,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2212,7 +2143,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2229,7 +2160,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2251,7 +2182,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2274,7 +2205,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2291,7 +2222,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2313,7 +2244,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2330,7 +2261,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2350,7 +2281,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2362,16 +2293,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
-        var sArr = tensor.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = sArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Exp(
-                new ReadOnlySpan<T>(sArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2382,16 +2305,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
-        var sArr = tensor.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = sArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Sqrt(
-                new ReadOnlySpan<T>(sArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2402,16 +2317,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
-        var sArr = tensor.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = sArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Abs(
-                new ReadOnlySpan<T>(sArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2422,16 +2329,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
-        var sArr = tensor.GetDataArray();
-        var rArr = result.GetDataArray();
-        int len = sArr.Length;
-        ParallelForChunks(len, MinChunkSize, (start, count) =>
-        {
-            numOps.Negate(
-                new ReadOnlySpan<T>(sArr, start, count),
-                new Span<T>(rArr, start, count));
-        });
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -2442,7 +2341,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2478,7 +2377,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2494,7 +2393,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2510,7 +2409,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2526,7 +2425,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2538,7 +2437,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2733,7 +2632,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2752,7 +2651,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2773,7 +2672,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2795,7 +2694,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2816,7 +2715,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2835,7 +2734,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3648,7 +3547,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Tanh - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3662,7 +3561,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Sigmoid: 1 / (1 + exp(-x)) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3735,7 +3634,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized ReLU: max(0, x) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3839,7 +3738,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized GELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3853,7 +3752,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Mish - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3867,7 +3766,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Swish (SiLU) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3881,7 +3780,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized ELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
@@ -3896,7 +3795,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized LeakyReLU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
 
@@ -13325,7 +13224,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         // Normalize axis
         if (axis < 0) axis = tensor.Shape.Length + axis;
@@ -13545,7 +13444,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
@@ -13681,7 +13580,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -13693,7 +13592,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -13705,7 +13604,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -14594,7 +14493,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -15261,7 +15160,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -15278,7 +15177,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -17578,7 +17477,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();

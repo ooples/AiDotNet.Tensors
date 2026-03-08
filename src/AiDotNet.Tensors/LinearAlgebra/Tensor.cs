@@ -24,6 +24,25 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 {
     /// <summary>
+    /// If this tensor was created from a pooled array, holds a reference to it for return.
+    /// Null for non-pooled tensors.
+    /// </summary>
+    private T[]? _pooledArray;
+
+    /// <summary>
+    /// Gets the pooled array backing this tensor, or null if not pooled.
+    /// </summary>
+    internal T[]? PooledArray => _pooledArray;
+
+    /// <summary>
+    /// Detaches the pooled array reference so it can be safely returned to the pool.
+    /// After calling this, the tensor still works but the array won't be returned again.
+    /// </summary>
+    internal void DetachPooledArray()
+    {
+        _pooledArray = null;
+    }
+    /// <summary>
     /// Creates a new tensor with the specified dimensions, initialized with default values.
     /// </summary>
     /// <param name="dimensions">An array specifying the size of each dimension.</param>
@@ -94,6 +113,21 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         var vector = Vector<T>.FromMemory(memory);
         return new Tensor<T>(vector, dimensions);
+    }
+
+    /// <summary>
+    /// Creates a tensor from pooled memory. The pooled array is tracked for return to the pool.
+    /// </summary>
+    /// <param name="memory">The sliced memory (exact size) to use as backing store.</param>
+    /// <param name="dimensions">The tensor shape.</param>
+    /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
+    /// <returns>A tensor backed by pooled memory.</returns>
+    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
+    {
+        var vector = Vector<T>.FromMemory(memory);
+        var tensor = new Tensor<T>(vector, dimensions);
+        tensor._pooledArray = pooledArray;
+        return tensor;
     }
 
     /// <summary>
@@ -583,7 +617,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!Shape.SequenceEqual(other.Shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
-        var result = new Tensor<T>(Shape);
+        var result = TensorPool.Rent<T>(Shape);
         // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
 
@@ -609,7 +643,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (this.Shape[1] != vector.Length)
                 throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this.Shape[1]}).");
 
-            var result = new Tensor<T>(this.Shape);
+            var result = TensorPool.Rent<T>(this.Shape);
             int rowLength = this.Shape[1];
             // Use vectorized Add for each row (5-15x faster with AVX2)
             var srcSpan = _data.AsSpan();
@@ -628,7 +662,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (this.Shape[2] != vector.Length)
                 throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this.Shape[2]}).");
 
-            var result = new Tensor<T>(this.Shape);
+            var result = TensorPool.Rent<T>(this.Shape);
             int lastDimLength = this.Shape[2];
             int sliceSize = this.Shape[1] * this.Shape[2];
             // Use vectorized Add for each row in the last dimension (5-15x faster with AVX2)
@@ -807,7 +841,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Scale(T factor)
     {
-        var result = new Tensor<T>(this.Shape);
+        var result = TensorPool.Rent<T>(this.Shape);
         _numOps.MultiplyScalar(_data.AsSpan(), factor, result._data.AsWritableSpan());
         return result;
     }
@@ -988,7 +1022,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!Shape.SequenceEqual(other.Shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
-        var result = new Tensor<T>(Shape);
+        var result = TensorPool.Rent<T>(Shape);
         // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
 
@@ -1249,7 +1283,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Divide(T scalar)
     {
-        var result = new Tensor<T>(Shape);
+        var result = TensorPool.Rent<T>(Shape);
         _numOps.DivideScalar(_data.AsSpan(), scalar, result._data.AsWritableSpan());
         return result;
     }
@@ -1493,7 +1527,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (this.Shape.SequenceEqual(other.Shape))
         {
             // Simple case: tensors have the same shape
-            var result = new Tensor<T>(this.Shape);
+            var result = TensorPool.Rent<T>(this.Shape);
             // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
             _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
             return result;
@@ -2540,7 +2574,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         // TensorValidator.ValidateShape(this, other.Shape);
 
-        var result = new Tensor<T>(Shape);
+        var result = TensorPool.Rent<T>(Shape);
         // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
         _numOps.Add(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
         return result;
@@ -2724,7 +2758,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (Shape.SequenceEqual(other.Shape))
         {
             // Element-wise multiplication, not matrix multiplication
-            var fastResult = new Tensor<T>(Shape);
+            var fastResult = TensorPool.Rent<T>(Shape);
             var srcSpan = _data.AsSpan();
             var otherSpan = other._data.AsSpan();
             var destSpan = fastResult._data.AsWritableSpan();
@@ -2801,7 +2835,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Check if shapes are already identical - use fast path (element-wise divide)
         if (Shape.SequenceEqual(other.Shape))
         {
-            var fastResult = new Tensor<T>(Shape);
+            var fastResult = TensorPool.Rent<T>(Shape);
             var srcSpan = _data.AsSpan();
             var otherSpan = other._data.AsSpan();
             var destSpan = fastResult._data.AsWritableSpan();
