@@ -1862,8 +1862,18 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
 
-        // Use SIMD-optimized span-based addition (5-15x faster than element-by-element)
-        numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+        // Parallel chunked SIMD for large tensors (matches TorchSharp's OpenMP parallelism)
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Add(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -1882,10 +1892,17 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        // Element-wise add is memory-bandwidth-bound; parallelization adds overhead
-        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Add(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(aArr, start, count));
+        });
     }
 
     /// <summary>
@@ -1902,7 +1919,17 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var dArr = destination.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Add(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(dArr, start, count));
+        });
     }
 
     /// <inheritdoc/>
@@ -1995,8 +2022,17 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
 
-        // Use SIMD-optimized span-based subtraction (5-15x faster than element-by-element)
-        numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Subtract(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2015,8 +2051,17 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
 
-        // Use SIMD-optimized span-based multiplication (5-15x faster than element-by-element)
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Multiply(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2035,10 +2080,17 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        // Element-wise multiply is memory-bandwidth-bound; parallelization adds overhead
-        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Multiply(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(aArr, start, count));
+        });
     }
 
     /// <summary>
@@ -2116,7 +2168,18 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a.Shape);
-        numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+
+        var aArr = a.GetDataArray();
+        var bArr = b.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = aArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Divide(
+                new ReadOnlySpan<T>(aArr, start, count),
+                new ReadOnlySpan<T>(bArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2302,7 +2365,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
+        var sArr = tensor.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = sArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Exp(
+                new ReadOnlySpan<T>(sArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2314,7 +2385,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
+        var sArr = tensor.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = sArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Sqrt(
+                new ReadOnlySpan<T>(sArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2326,7 +2405,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
+        var sArr = tensor.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = sArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Abs(
+                new ReadOnlySpan<T>(sArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
@@ -2338,7 +2425,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(tensor.Shape);
-        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
+        var sArr = tensor.GetDataArray();
+        var rArr = result.GetDataArray();
+        int len = sArr.Length;
+        ParallelForChunks(len, MinChunkSize, (start, count) =>
+        {
+            numOps.Negate(
+                new ReadOnlySpan<T>(sArr, start, count),
+                new Span<T>(rArr, start, count));
+        });
 
         return result;
     }
