@@ -824,6 +824,79 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             return Avx.Multiply(poly, scale);
         }
+
+        /// <summary>
+        /// Fast vectorized natural logarithm using Cephes-style polynomial.
+        /// Decomposes x = 2^n * m (1 &lt;= m &lt; 2), then log(x) = n*ln(2) + log(m).
+        /// Uses a minimax polynomial to approximate log(m) on [1, 2].
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FastLog256(Vector256<float> x)
+        {
+            // Extract exponent: n = floor(log2(x))
+            // IEEE 754 float: [sign:1][exponent:8][mantissa:23], bias = 127
+            var vone = Vector256.Create(1.0f);
+            var minNormPos = Vector256.Create(1.17549435e-38f); // smallest normal float
+            var negInf = Vector256.Create(float.NegativeInfinity);
+
+            // Clamp to minimum normal positive to avoid log(0) = -inf edge cases in mantissa extraction
+            x = Avx.Max(x, minNormPos);
+
+            // Extract exponent as integer
+            var xi = x.AsInt32();
+            var exponent = Avx2.ShiftRightArithmetic(xi, 23);
+            exponent = Avx2.Subtract(exponent, Vector256.Create(127));
+            var e = Avx.ConvertToVector256Single(exponent);
+
+            // Extract mantissa and set exponent to 0 (result in [1, 2))
+            var mantissaMask = Vector256.Create(0x007FFFFF);
+            var m = Avx2.Or(Avx2.And(xi, mantissaMask), Vector256.Create(0x3F800000)).AsSingle();
+
+            // Adjust range to [0.5, 1) for better polynomial conditioning
+            // If m > sqrt(2), divide by 2 and increment exponent
+            var sqrt2 = Vector256.Create(1.4142135623730951f);
+            var needAdjust = Avx.CompareGreaterThan(m, sqrt2);
+            // Conditionally halve m and add 1 to e
+            m = Avx.BlendVariable(m, Avx.Multiply(m, Vector256.Create(0.5f)), needAdjust);
+            e = Avx.BlendVariable(e, Avx.Add(e, vone), needAdjust);
+
+            // Now m is in [sqrt(2)/2, sqrt(2)] ~= [0.707, 1.414]
+            // Compute f = m - 1 (so f is near 0)
+            var f = Avx.Subtract(m, vone);
+
+            // Polynomial approximation of log(1+f) using Horner's form
+            // Coefficients from Cephes library (minimax on [0, 0.5])
+            var p0 = Vector256.Create(7.0376836292e-2f);
+            var p1 = Vector256.Create(-1.1514610310e-1f);
+            var p2 = Vector256.Create(1.1676998740e-1f);
+            var p3 = Vector256.Create(-1.2420140846e-1f);
+            var p4 = Vector256.Create(1.4249322787e-1f);
+            var p5 = Vector256.Create(-1.6668057665e-1f);
+            var p6 = Vector256.Create(2.0000714765e-1f);
+            var p7 = Vector256.Create(-2.4999993993e-1f);
+            var p8 = Vector256.Create(3.3333331174e-1f);
+
+            var f2 = Avx.Multiply(f, f);
+
+            var poly = Fma.MultiplyAdd(p0, f, p1);
+            poly = Fma.MultiplyAdd(poly, f, p2);
+            poly = Fma.MultiplyAdd(poly, f, p3);
+            poly = Fma.MultiplyAdd(poly, f, p4);
+            poly = Fma.MultiplyAdd(poly, f, p5);
+            poly = Fma.MultiplyAdd(poly, f, p6);
+            poly = Fma.MultiplyAdd(poly, f, p7);
+            poly = Fma.MultiplyAdd(poly, f, p8);
+            poly = Avx.Multiply(poly, Avx.Multiply(f2, f)); // poly * f^3
+
+            // log(x) = e * ln(2) + f + poly - 0.5 * f^2
+            var ln2 = Vector256.Create(0.6931471805599453f);
+            var halfF2 = Avx.Multiply(Vector256.Create(0.5f), f2);
+            var result = Fma.MultiplyAdd(e, ln2, f);
+            result = Avx.Add(result, poly);
+            result = Avx.Subtract(result, halfF2);
+
+            return result;
+        }
 #endif
 
         /// <summary>
@@ -1643,14 +1716,40 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         #region Missing Math Kernels (Log, Sqrt, Abs, Negate, Clamp, Pow, SoftMax, Max, Min)
 
-        /// <summary>Element-wise natural log using SIMD.</summary>
+        /// <summary>Element-wise natural log using SIMD with Cephes-style polynomial approximation.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Log(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(output, i, FastLog256(ReadVector256(input, i)));
+                    WriteVector256(output, i + 8, FastLog256(ReadVector256(input, i + 8)));
+                    WriteVector256(output, i + 16, FastLog256(ReadVector256(input, i + 16)));
+                    WriteVector256(output, i + 24, FastLog256(ReadVector256(input, i + 24)));
+                }
+            }
+
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, FastLog256(ReadVector256(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Log(input[i]);
@@ -1673,14 +1772,42 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        /// <summary>Element-wise log base 2.</summary>
+        /// <summary>Element-wise log base 2 using SIMD: log2(x) = log(x) / ln(2).</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Log2(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var log2e = Vector256.Create(1.44269504088896341f); // 1/ln(2) = log2(e)
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(output, i, Avx.Multiply(FastLog256(ReadVector256(input, i)), log2e));
+                    WriteVector256(output, i + 8, Avx.Multiply(FastLog256(ReadVector256(input, i + 8)), log2e));
+                    WriteVector256(output, i + 16, Avx.Multiply(FastLog256(ReadVector256(input, i + 16)), log2e));
+                    WriteVector256(output, i + 24, Avx.Multiply(FastLog256(ReadVector256(input, i + 24)), log2e));
+                }
+            }
+
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var log2e = Vector256.Create(1.44269504088896341f);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, Avx.Multiply(FastLog256(ReadVector256(input, i)), log2e));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Log2(input[i]);
