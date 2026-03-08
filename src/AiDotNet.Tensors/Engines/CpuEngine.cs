@@ -1849,7 +1849,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -1859,9 +1859,42 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
+        // Parallel SIMD for large float tensors
+        if (typeof(T) == typeof(float) && length >= 100_000)
+        {
+            var aMem = (ReadOnlyMemory<float>)(Memory<float>)(object)a.Data;
+            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* ptrA = (float*)pinA.Pointer;
+            float* ptrB = (float*)pinB.Pointer;
+            float* ptrR = (float*)pinR.Pointer;
+
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    SimdKernels.VectorAdd(
+                        new ReadOnlySpan<float>(ptrA + start, count),
+                        new ReadOnlySpan<float>(ptrB + start, count),
+                        new Span<float>(ptrR + start, count));
+                }
+            });
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -1869,8 +1902,9 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
+    /// Uses parallel SIMD for large float tensors.
     /// </summary>
-    public void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -1878,6 +1912,37 @@ public class CpuEngine : ITensorLevelEngine
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        }
+
+        int length = a.Length;
+
+        // Parallel SIMD for large float tensors
+        if (typeof(T) == typeof(float) && length >= 100_000)
+        {
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* ptrA = (float*)pinA.Pointer;
+            float* ptrB = (float*)pinB.Pointer;
+
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    SimdKernels.VectorAdd(
+                        new ReadOnlySpan<float>(ptrA + start, count),
+                        new ReadOnlySpan<float>(ptrB + start, count),
+                        new Span<float>(ptrA + start, count));
+                }
+            });
+            return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -2018,7 +2083,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
     /// </summary>
-    public void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2026,6 +2091,37 @@ public class CpuEngine : ITensorLevelEngine
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        }
+
+        int length = a.Length;
+
+        // Parallel SIMD for large float tensors
+        if (typeof(T) == typeof(float) && length >= 100_000)
+        {
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* ptrA = (float*)pinA.Pointer;
+            float* ptrB = (float*)pinB.Pointer;
+
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    SimdKernels.VectorMultiply(
+                        new ReadOnlySpan<float>(ptrA + start, count),
+                        new ReadOnlySpan<float>(ptrB + start, count),
+                        new Span<float>(ptrA + start, count));
+                }
+            });
+            return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3673,7 +3769,7 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Applies ReLU activation in-place: x = max(0, x). Zero allocation.
-    /// Uses oneDNN for float tensors when available, otherwise falls back to SIMD.
+    /// Uses parallel SIMD for large float tensors, oneDNN when available.
     /// </summary>
 #if !NETFRAMEWORK
     public unsafe void ReLUInPlace<T>(Tensor<T> tensor)
@@ -3696,9 +3792,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fallback to existing implementation
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
+        ReLUParallel(tensor);
     }
 #else
     public void ReLUInPlace<T>(Tensor<T> tensor)
@@ -3706,12 +3800,43 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // ReLU is a simple comparison per element - memory-bandwidth-bound.
-        // Parallelization with Memory<T> boxing overhead is counterproductive.
+        ReLUParallel(tensor);
+    }
+#endif
+
+    private unsafe void ReLUParallel<T>(Tensor<T> tensor)
+    {
+        int length = tensor.Length;
+
+        // For large float tensors, use parallel SIMD via pinned memory
+        if (typeof(T) == typeof(float) && length >= 100_000)
+        {
+            var memory = tensor.Data;
+            var floatMem = (Memory<float>)(object)memory;
+            using var pin = floatMem.Pin();
+            float* ptr = (float*)pin.Pointer;
+
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31; // Align to 32 for AVX
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    SimdKernels.ReLU(
+                        new ReadOnlySpan<float>(ptr + start, count),
+                        new Span<float>(ptr + start, count));
+                }
+            });
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
-#endif
 
     /// <summary>
     /// Applies ReLU activation to input, storing in destination. Zero allocation.
@@ -4383,7 +4508,7 @@ public class CpuEngine : ITensorLevelEngine
         if (n != b.Shape[0])
             throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
 
-        var result = new Tensor<T>([m, p]);
+        var result = TensorPool.Rent<T>(new[] { m, p });
 
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
@@ -4444,7 +4569,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[aRank - 2] = m;
         outputShape[aRank - 1] = p;
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorPool.Rent<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;

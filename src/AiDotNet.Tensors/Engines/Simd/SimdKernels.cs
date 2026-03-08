@@ -513,10 +513,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
             {
                 var vzero = Vector256<float>.Zero;
-                int simdLength = length & ~7;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    WriteVector256(output, i, Avx.Max(ReadVector256(input, i), vzero));
+                    WriteVector256(output, i + 8, Avx.Max(ReadVector256(input, i + 8), vzero));
+                    WriteVector256(output, i + 16, Avx.Max(ReadVector256(input, i + 16), vzero));
+                    WriteVector256(output, i + 24, Avx.Max(ReadVector256(input, i + 24), vzero));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
                     WriteVector256(output, i, Avx.Max(ReadVector256(input, i), vzero));
