@@ -1862,12 +1862,11 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorPool.Rent<T>(a.Shape);
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
-        int addChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
-        if (addChunks >= 2)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
         {
-            var aMem = (ReadOnlyMemory<float>)(Memory<float>)(object)a.Data;
-            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
             var rMem = (Memory<float>)(object)result.Data;
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -1876,21 +1875,27 @@ public class CpuEngine : ITensorLevelEngine
             float* ptrB = (float*)pinB.Pointer;
             float* ptrR = (float*)pinR.Pointer;
 
-            int chunkSize = (length + addChunks - 1) / addChunks;
-            chunkSize = (chunkSize + 31) & ~31;
-
-            Parallel.For(0, addChunks, chunk =>
+            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            if (addChunks >= 2)
             {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
+                int chunkSize = (length + addChunks - 1) / addChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, addChunks, chunk =>
                 {
-                    SimdKernels.VectorAdd(
-                        new ReadOnlySpan<float>(ptrA + start, count),
-                        new ReadOnlySpan<float>(ptrB + start, count),
-                        new Span<float>(ptrR + start, count));
-                }
-            });
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorAddUnsafe(ptrA + start, ptrB + start, ptrR + start, count);
+                    }
+                });
+            }
+            else
+            {
+                // Direct pointer SIMD — no generic dispatch, no Span overhead
+                SimdKernels.VectorAddUnsafe(ptrA, ptrB, ptrR, length);
+            }
             return result;
         }
 
@@ -1916,32 +1921,37 @@ public class CpuEngine : ITensorLevelEngine
 
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
-        int addIPChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
-        if (addIPChunks >= 2)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
         {
             var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            var bMem = (Memory<float>)(object)b.Data;
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* ptrA = (float*)pinA.Pointer;
             float* ptrB = (float*)pinB.Pointer;
 
-            int chunkSize = (length + addIPChunks - 1) / addIPChunks;
-            chunkSize = (chunkSize + 31) & ~31;
-
-            Parallel.For(0, addIPChunks, chunk =>
+            int addIPChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            if (addIPChunks >= 2)
             {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
+                int chunkSize = (length + addIPChunks - 1) / addIPChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, addIPChunks, chunk =>
                 {
-                    SimdKernels.VectorAdd(
-                        new ReadOnlySpan<float>(ptrA + start, count),
-                        new ReadOnlySpan<float>(ptrB + start, count),
-                        new Span<float>(ptrA + start, count));
-                }
-            });
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorAddUnsafe(ptrA + start, ptrB + start, ptrA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                // Direct pointer SIMD — no generic dispatch, no Span overhead
+                SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
+            }
             return;
         }
 
@@ -2095,32 +2105,37 @@ public class CpuEngine : ITensorLevelEngine
 
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
-        int mulChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
-        if (mulChunks >= 2)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
         {
             var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
+            var bMem = (Memory<float>)(object)b.Data;
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* ptrA = (float*)pinA.Pointer;
             float* ptrB = (float*)pinB.Pointer;
 
-            int chunkSize = (length + mulChunks - 1) / mulChunks;
-            chunkSize = (chunkSize + 31) & ~31;
-
-            Parallel.For(0, mulChunks, chunk =>
+            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            if (mulChunks >= 2)
             {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
+                int chunkSize = (length + mulChunks - 1) / mulChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, mulChunks, chunk =>
                 {
-                    SimdKernels.VectorMultiply(
-                        new ReadOnlySpan<float>(ptrA + start, count),
-                        new ReadOnlySpan<float>(ptrB + start, count),
-                        new Span<float>(ptrA + start, count));
-                }
-            });
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorMultiplyUnsafe(ptrA + start, ptrB + start, ptrA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                // Direct pointer SIMD — no generic dispatch, no Span overhead
+                SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
+            }
             return;
         }
 
@@ -3704,36 +3719,41 @@ public class CpuEngine : ITensorLevelEngine
 
     private unsafe void SigmoidParallel<T>(Tensor<T> tensor)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
         int length = tensor.Length;
 
-        // Sigmoid is compute-bound (~25 SIMD instructions per 8 elements).
-        // Use parallel execution with pinned memory for large float tensors.
-        // Use fewer threads (max 4-8) to balance parallelism vs cache thrashing.
-        if (typeof(T) == typeof(float) && length >= 100_000)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
         {
-            var memory = tensor.Data;
-            var floatMem = (Memory<float>)(object)memory;
+            var floatMem = (Memory<float>)(object)tensor.Data;
             using var pin = floatMem.Pin();
             float* ptr = (float*)pin.Pointer;
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
-            int chunkSize = (length + numChunks - 1) / numChunks;
-            // Align chunk size to 32 (4x AVX2 vectors) for SIMD efficiency
-            chunkSize = (chunkSize + 31) & ~31;
-            Parallel.For(0, numChunks, chunk =>
+
+            // Sigmoid is compute-bound (~25 SIMD instructions per 8 elements).
+            // Lower threshold than bandwidth-bound ops since each element needs more work.
+            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            if (sigChunks >= 2)
             {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, sigChunks, chunk =>
                 {
-                    SimdKernels.Sigmoid(
-                        new ReadOnlySpan<float>(ptr + start, count),
-                        new Span<float>(ptr + start, count));
-                }
-            });
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(ptr + start, ptr + start, count);
+                    }
+                });
+            }
+            else
+            {
+                // Direct pointer SIMD — no generic dispatch, no Span overhead
+                SimdKernels.SigmoidUnsafe(ptr, ptr, length);
+            }
             return;
         }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
 
@@ -3808,30 +3828,34 @@ public class CpuEngine : ITensorLevelEngine
     {
         int length = tensor.Length;
 
-        // For large float tensors, use parallel SIMD via pinned memory
-        // ReLU is bandwidth-bound: need 200K+ per chunk to amortize overhead
-        int reluChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
-        if (reluChunks >= 2)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
         {
-            var memory = tensor.Data;
-            var floatMem = (Memory<float>)(object)memory;
+            var floatMem = (Memory<float>)(object)tensor.Data;
             using var pin = floatMem.Pin();
             float* ptr = (float*)pin.Pointer;
 
-            int chunkSize = (length + reluChunks - 1) / reluChunks;
-            chunkSize = (chunkSize + 31) & ~31; // Align to 32 for AVX
-
-            Parallel.For(0, reluChunks, chunk =>
+            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            if (reluChunks >= 2)
             {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
+                int chunkSize = (length + reluChunks - 1) / reluChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, reluChunks, chunk =>
                 {
-                    SimdKernels.ReLU(
-                        new ReadOnlySpan<float>(ptr + start, count),
-                        new Span<float>(ptr + start, count));
-                }
-            });
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.ReLUUnsafe(ptr + start, ptr + start, count);
+                    }
+                });
+            }
+            else
+            {
+                // Direct pointer SIMD — no generic dispatch, no Span overhead
+                SimdKernels.ReLUUnsafe(ptr, ptr, length);
+            }
             return;
         }
 

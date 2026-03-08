@@ -71,6 +71,145 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>
+        /// Pointer-based VectorAdd — zero bounds-checking overhead for hot paths.
+        /// Caller must ensure pointers are valid and length is correct.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorAddUnsafe(float* a, float* b, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                    Avx.Store(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] + b[i];
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based VectorMultiply — zero bounds-checking overhead for hot paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorMultiplyUnsafe(float* a, float* b, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                    Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * b[i];
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based ReLU — zero bounds-checking overhead for hot paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void ReLUUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                    Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
+                    Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
+                    Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = input[i] > 0 ? input[i] : 0;
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Sigmoid — zero bounds-checking overhead for hot paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void SigmoidUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, FastSigmoid256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, FastSigmoid256(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = 1.0f / (1.0f + MathF.Exp(-input[i]));
+            }
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void VectorSubtract(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {
