@@ -1,6 +1,8 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -3604,9 +3606,38 @@ public class CpuEngine : ITensorLevelEngine
     }
 #endif
 
-    private void SigmoidParallel<T>(Tensor<T> tensor)
+    private unsafe void SigmoidParallel<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
+        int length = tensor.Length;
+
+        // Sigmoid is compute-bound (~25 SIMD instructions per 8 elements).
+        // Use parallel execution with pinned memory for large float tensors.
+        // Use fewer threads (max 4-8) to balance parallelism vs cache thrashing.
+        if (typeof(T) == typeof(float) && length >= 100_000)
+        {
+            var memory = tensor.Data;
+            var floatMem = (Memory<float>)(object)memory;
+            using var pin = floatMem.Pin();
+            float* ptr = (float*)pin.Pointer;
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            // Align chunk size to 32 (4x AVX2 vectors) for SIMD efficiency
+            chunkSize = (chunkSize + 31) & ~31;
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    SimdKernels.Sigmoid(
+                        new ReadOnlySpan<float>(ptr + start, count),
+                        new Span<float>(ptr + start, count));
+                }
+            });
+            return;
+        }
+
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
 
