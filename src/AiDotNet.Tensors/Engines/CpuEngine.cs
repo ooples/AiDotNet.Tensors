@@ -1860,8 +1860,6 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorPool.Rent<T>(a.Shape);
 
-        // Direct SIMD path - bandwidth-bound ops are faster single-threaded than with Parallel.For
-        // overhead (measured: 602us serial vs 14ms with 16 parallel chunks for 1M elements)
         numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
