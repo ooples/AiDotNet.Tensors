@@ -1872,7 +1872,7 @@ public class CpuEngine : ITensorLevelEngine
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
             float[] rFloat = Unsafe.As<T[], float[]>(ref rArr);
 
-            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
             if (addChunks >= 2)
             {
                 var aMem = (Memory<float>)(object)a.Data;
@@ -1939,7 +1939,7 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            int addIPChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            int addIPChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
             if (addIPChunks >= 2)
             {
                 // Parallel path needs Memory.Pin() since fixed can't cross lambda boundary
@@ -2132,7 +2132,7 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
             if (mulChunks >= 2)
             {
                 var aMem = (Memory<float>)(object)a.Data;
@@ -3864,7 +3864,9 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000));
+            // ReLU is bandwidth-bound; L3 bandwidth is shared across cores.
+            // Only parallelize when array is large enough that chunks fit in separate L2 caches.
+            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
             if (reluChunks >= 2)
             {
                 var floatMem = (Memory<float>)(object)tensor.Data;
