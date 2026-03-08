@@ -340,17 +340,34 @@ namespace AiDotNet.Tensors.Engines.Simd
             float sum = 0f;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                // 4-way parallel accumulation to hide FMA latency (5 cycles on Zen2)
+                var vsum0 = Vector256<float>.Zero;
+                var vsum1 = Vector256<float>.Zero;
+                var vsum2 = Vector256<float>.Zero;
+                var vsum3 = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vsum0 = Fma.MultiplyAdd(ReadVector256(a, i), ReadVector256(b, i), vsum0);
+                    vsum1 = Fma.MultiplyAdd(ReadVector256(a, i + 8), ReadVector256(b, i + 8), vsum1);
+                    vsum2 = Fma.MultiplyAdd(ReadVector256(a, i + 16), ReadVector256(b, i + 16), vsum2);
+                    vsum3 = Fma.MultiplyAdd(ReadVector256(a, i + 24), ReadVector256(b, i + 24), vsum3);
+                }
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                sum += HorizontalSum(vsum0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
             {
                 var vsum = Vector256<float>.Zero;
-                int simdLength = length & ~7;
+                int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
                     var va = ReadVector256(a, i);
                     var vb = ReadVector256(b, i);
                     vsum = Fma.IsSupported ? Fma.MultiplyAdd(va, vb, vsum) : Avx.Add(vsum, Avx.Multiply(va, vb));
                 }
-
                 sum += HorizontalSum(vsum);
             }
             else if (Sse.IsSupported && length >= 4)
