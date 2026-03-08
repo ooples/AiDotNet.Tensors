@@ -3151,7 +3151,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Ensure stride={stride}, padding={padding}, dilation={dilation} are compatible with input size {height}x{width} and kernel size {kernelHeight}x{kernelWidth}.");
         }
 
-        var result = new Tensor<T>(new[] { batch, outChannels, outputHeight, outputWidth });
+        var result = TensorPool.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
         // Use im2col + GEMM for float (significantly faster)
         if (typeof(T) == typeof(float))
