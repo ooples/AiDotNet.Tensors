@@ -996,10 +996,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             // Use exp(-|x|) for numerical stability, then blend result based on sign
             var vzero = Vector256<float>.Zero;
             var vone = Vector256.Create(1.0f);
+            var vtwo = Vector256.Create(2.0f);
             var negMask = Avx.CompareLessThan(x, vzero);
 
-            // Compute exp(-|x|) with reduced 4th-order polynomial (faster than 6th-order FastExp256)
-            var ax = Avx.Max(Avx.Subtract(vzero, x), x); // |x| without AndNot (no sign bit mask needed)
+            // Compute exp(-|x|) with reduced 4th-order polynomial
+            var ax = Avx.Max(Avx.Subtract(vzero, x), x); // |x|
             var negAx = Avx.Subtract(vzero, ax);
 
             // Clamp to avoid underflow
@@ -1026,10 +1027,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             pow2n = Avx2.ShiftLeftLogical(pow2n, 23);
             var expNegAx = Avx.Multiply(poly, pow2n.AsSingle());
 
-            // sigmoid(-|x|) = exp(-|x|) / (1 + exp(-|x|)) = 1 / (1 + exp(|x|))
+            // Fast reciprocal of denom = 1 + exp(-|x|) using rcpps + Newton-Raphson
+            // rcpps gives ~12-bit precision, one NR step gives ~24-bit (full float)
+            // This replaces TWO Avx.Divide (~22-28 cycles) with ~5 cycles
             var denom = Avx.Add(vone, expNegAx);
-            var sigNeg = Avx.Divide(expNegAx, denom); // sigmoid for x < 0
-            var sigPos = Avx.Divide(vone, denom);      // sigmoid for x >= 0
+            var rcp0 = Avx.Reciprocal(denom);
+            // Newton-Raphson: rcp = rcp0 * (2 - denom * rcp0)
+            var rcp = Avx.Multiply(rcp0, Fma.MultiplyAddNegated(denom, rcp0, vtwo));
+
+            // sigmoid for x >= 0: 1/denom = rcp
+            // sigmoid for x < 0:  exp(-|x|)/denom = exp(-|x|) * rcp
+            var sigPos = rcp;
+            var sigNeg = Avx.Multiply(expNegAx, rcp);
 
             // Blend based on sign of x
             return Avx.BlendVariable(sigPos, sigNeg, negMask);
