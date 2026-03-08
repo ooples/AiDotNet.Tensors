@@ -1862,8 +1862,9 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorPool.Rent<T>(a.Shape);
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors
-        if (typeof(T) == typeof(float) && length >= 100_000)
+        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
+        int addChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
+        if (addChunks >= 2)
         {
             var aMem = (ReadOnlyMemory<float>)(Memory<float>)(object)a.Data;
             var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
@@ -1875,11 +1876,10 @@ public class CpuEngine : ITensorLevelEngine
             float* ptrB = (float*)pinB.Pointer;
             float* ptrR = (float*)pinR.Pointer;
 
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
-            int chunkSize = (length + numChunks - 1) / numChunks;
+            int chunkSize = (length + addChunks - 1) / addChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
-            Parallel.For(0, numChunks, chunk =>
+            Parallel.For(0, addChunks, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
@@ -1916,8 +1916,9 @@ public class CpuEngine : ITensorLevelEngine
 
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors
-        if (typeof(T) == typeof(float) && length >= 100_000)
+        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
+        int addIPChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
+        if (addIPChunks >= 2)
         {
             var aMem = (Memory<float>)(object)a.Data;
             var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
@@ -1926,11 +1927,10 @@ public class CpuEngine : ITensorLevelEngine
             float* ptrA = (float*)pinA.Pointer;
             float* ptrB = (float*)pinB.Pointer;
 
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
-            int chunkSize = (length + numChunks - 1) / numChunks;
+            int chunkSize = (length + addIPChunks - 1) / addIPChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
-            Parallel.For(0, numChunks, chunk =>
+            Parallel.For(0, addIPChunks, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
@@ -2095,8 +2095,9 @@ public class CpuEngine : ITensorLevelEngine
 
         int length = a.Length;
 
-        // Parallel SIMD for large float tensors
-        if (typeof(T) == typeof(float) && length >= 100_000)
+        // Parallel SIMD for large float tensors (need 200K+ per chunk to amortize overhead)
+        int mulChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
+        if (mulChunks >= 2)
         {
             var aMem = (Memory<float>)(object)a.Data;
             var bMem = (ReadOnlyMemory<float>)(Memory<float>)(object)b.Data;
@@ -2105,11 +2106,10 @@ public class CpuEngine : ITensorLevelEngine
             float* ptrA = (float*)pinA.Pointer;
             float* ptrB = (float*)pinB.Pointer;
 
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
-            int chunkSize = (length + numChunks - 1) / numChunks;
+            int chunkSize = (length + mulChunks - 1) / mulChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
-            Parallel.For(0, numChunks, chunk =>
+            Parallel.For(0, mulChunks, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
@@ -3809,18 +3809,19 @@ public class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
 
         // For large float tensors, use parallel SIMD via pinned memory
-        if (typeof(T) == typeof(float) && length >= 100_000)
+        // ReLU is bandwidth-bound: need 200K+ per chunk to amortize overhead
+        int reluChunks = typeof(T) == typeof(float) ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 200_000)) : 0;
+        if (reluChunks >= 2)
         {
             var memory = tensor.Data;
             var floatMem = (Memory<float>)(object)memory;
             using var pin = floatMem.Pin();
             float* ptr = (float*)pin.Pointer;
 
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
-            int chunkSize = (length + numChunks - 1) / numChunks;
+            int chunkSize = (length + reluChunks - 1) / reluChunks;
             chunkSize = (chunkSize + 31) & ~31; // Align to 32 for AVX
 
-            Parallel.For(0, numChunks, chunk =>
+            Parallel.For(0, reluChunks, chunk =>
             {
                 int start = chunk * chunkSize;
                 int count = Math.Min(chunkSize, length - start);
