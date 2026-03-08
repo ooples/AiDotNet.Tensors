@@ -3591,9 +3591,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fallback to existing implementation
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
+        // Fallback: Sigmoid is compute-bound, so parallel chunking helps for large arrays
+        SigmoidParallel(tensor);
     }
 #else
     public void SigmoidInPlace<T>(Tensor<T> tensor)
@@ -3601,13 +3600,15 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Sigmoid is compute-bound (Exp per element). SIMD vectorization within
-        // TensorPrimitives already maximizes throughput; parallelization with
-        // Memory<T> boxing overhead is counterproductive.
+        SigmoidParallel(tensor);
+    }
+#endif
+
+    private void SigmoidParallel<T>(Tensor<T> tensor)
+    {
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
-#endif
 
     /// <summary>
     /// Applies Sigmoid activation to input, storing in destination. Zero allocation.

@@ -645,29 +645,22 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                var vone = Vector256.Create(1.0f);
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    var neg0 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i));
-                    var neg1 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 8));
-                    var neg2 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 16));
-                    var neg3 = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i + 24));
-                    WriteVector256(output, i, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg0))));
-                    WriteVector256(output, i + 8, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg1))));
-                    WriteVector256(output, i + 16, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg2))));
-                    WriteVector256(output, i + 24, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg3))));
+                    WriteVector256(output, i, FastSigmoid256(ReadVector256(input, i)));
+                    WriteVector256(output, i + 8, FastSigmoid256(ReadVector256(input, i + 8)));
+                    WriteVector256(output, i + 16, FastSigmoid256(ReadVector256(input, i + 16)));
+                    WriteVector256(output, i + 24, FastSigmoid256(ReadVector256(input, i + 24)));
                 }
             }
 
             if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
             {
-                var vone = Vector256.Create(1.0f);
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var neg = Avx.Subtract(Vector256<float>.Zero, ReadVector256(input, i));
-                    WriteVector256(output, i, Avx.Divide(vone, Avx.Add(vone, FastExp256(neg))));
+                    WriteVector256(output, i, FastSigmoid256(ReadVector256(input, i)));
                 }
             }
 #endif
@@ -723,22 +716,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 32)
                 {
                     // tanh(x) = 2*sigmoid(2x) - 1
-                    var x0 = Avx.Multiply(vtwo, ReadVector256(input, i));
-                    var x1 = Avx.Multiply(vtwo, ReadVector256(input, i + 8));
-                    var x2 = Avx.Multiply(vtwo, ReadVector256(input, i + 16));
-                    var x3 = Avx.Multiply(vtwo, ReadVector256(input, i + 24));
-                    var negx0 = Avx.Subtract(Vector256<float>.Zero, x0);
-                    var negx1 = Avx.Subtract(Vector256<float>.Zero, x1);
-                    var negx2 = Avx.Subtract(Vector256<float>.Zero, x2);
-                    var negx3 = Avx.Subtract(Vector256<float>.Zero, x3);
-                    var sig0 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx0)));
-                    var sig1 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx1)));
-                    var sig2 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx2)));
-                    var sig3 = Avx.Divide(vone, Avx.Add(vone, FastExp256(negx3)));
-                    WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, sig0), vone));
-                    WriteVector256(output, i + 8, Avx.Subtract(Avx.Multiply(vtwo, sig1), vone));
-                    WriteVector256(output, i + 16, Avx.Subtract(Avx.Multiply(vtwo, sig2), vone));
-                    WriteVector256(output, i + 24, Avx.Subtract(Avx.Multiply(vtwo, sig3), vone));
+                    WriteVector256(output, i, Avx.Subtract(Fma.MultiplyAdd(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i))), Vector256<float>.Zero), vone));
+                    WriteVector256(output, i + 8, Avx.Subtract(Fma.MultiplyAdd(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i + 8))), Vector256<float>.Zero), vone));
+                    WriteVector256(output, i + 16, Avx.Subtract(Fma.MultiplyAdd(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i + 16))), Vector256<float>.Zero), vone));
+                    WriteVector256(output, i + 24, Avx.Subtract(Fma.MultiplyAdd(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i + 24))), Vector256<float>.Zero), vone));
                 }
             }
 
@@ -749,10 +730,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var x = Avx.Multiply(vtwo, ReadVector256(input, i));
-                    var neg = Avx.Subtract(Vector256<float>.Zero, x);
-                    var sig = Avx.Divide(vone, Avx.Add(vone, FastExp256(neg)));
-                    WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, sig), vone));
+                    WriteVector256(output, i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, ReadVector256(input, i)))), vone));
                 }
             }
 #endif
@@ -836,6 +814,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             var scale = pow2n.AsSingle();
 
             return Avx.Multiply(poly, scale);
+        }
+
+        /// <summary>
+        /// Fast vectorized sigmoid using the same approach as FastExp256 but with
+        /// a fused exp(-x) + reciprocal that avoids redundant clamp/negate operations.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FastSigmoid256(Vector256<float> x)
+        {
+            var vone = Vector256.Create(1.0f);
+            var neg = Avx.Subtract(Vector256<float>.Zero, x);
+            return Avx.Divide(vone, Avx.Add(vone, FastExp256(neg)));
         }
 
         /// <summary>
