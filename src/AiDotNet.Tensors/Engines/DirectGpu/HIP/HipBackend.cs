@@ -1052,45 +1052,110 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_relu", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Relu(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_gelu", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Gelu(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_sigmoid", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Sigmoid(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_tanh", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Tanh(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        // GEMM + bias without activation
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias", A, B, bias, output, M, N, K);
+        // Use optimized GEMM (hipBLAS/tiled) + separate bias add
+        var output = MatMul(A, B, M, N, K);
+        BiasAdd(output, bias, output, M, N);
         return output;
     }
 
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_swish", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Silu(temp, output, M * N);
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)

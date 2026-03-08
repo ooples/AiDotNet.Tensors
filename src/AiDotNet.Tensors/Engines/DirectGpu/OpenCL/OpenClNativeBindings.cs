@@ -305,6 +305,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         [DllImport(OpenClLibrary, EntryPoint = "clReleaseProgram")]
         public static extern int ReleaseProgram(IntPtr program);
 
+        [DllImport(OpenClLibrary, EntryPoint = "clGetProgramInfo")]
+        public static extern int GetProgramInfo(
+            IntPtr program,
+            uint paramName,
+            UIntPtr paramValueSize,
+            IntPtr paramValue,
+            out UIntPtr paramValueSizeRet);
+
+        [DllImport(OpenClLibrary, EntryPoint = "clCreateProgramWithBinary")]
+        public static extern IntPtr CreateProgramWithBinary(
+            IntPtr context,
+            uint numDevices,
+            [In] IntPtr[] deviceList,
+            [In] UIntPtr[] lengths,
+            [In] IntPtr[] binaries,
+            [In, Out] int[] binaryStatus,
+            out int errcode);
+
+        // Program info constants
+        public const uint CL_PROGRAM_BINARY_SIZES = 0x1165;
+        public const uint CL_PROGRAM_BINARIES = 0x1166;
+
         // Build info constants
         public const uint CL_PROGRAM_BUILD_LOG = 0x1183;
 

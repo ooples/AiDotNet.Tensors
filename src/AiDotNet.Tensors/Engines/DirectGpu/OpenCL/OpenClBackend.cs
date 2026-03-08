@@ -187,6 +187,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        private DirectOpenClProgram CompileOrLoadCached(string source, string buildOptions, string label)
+        {
+            if (_context == null) throw new InvalidOperationException("Context not available");
+
+            // Try loading from binary cache first
+            var cached = DirectOpenClProgram.TryCreateFromCache(_context, source, buildOptions);
+            if (cached != null)
+            {
+                Console.WriteLine($"[OpenClBackend] {label}: loaded from cache");
+                return cached;
+            }
+
+            // Compile from source
+            var program = new DirectOpenClProgram(_context, source);
+            program.Build(buildOptions);
+            Console.WriteLine($"[OpenClBackend] {label}: compiled from source");
+            return program;
+        }
+
         private void CompileKernels()
         {
             if (_context == null) return;
@@ -203,8 +222,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 // Compile GEMM kernels with aggressive optimizations
                 Console.WriteLine("[OpenClBackend] Compiling GEMM kernels...");
-                var gemmProgram = new DirectOpenClProgram(_context, GemmKernel.GetSource());
-                gemmProgram.Build(optimizationFlags);
+                var gemmProgram = CompileOrLoadCached(GemmKernel.GetSource(), optimizationFlags, "GEMM kernels");
                 _programs.Add(gemmProgram);
                 foreach (var name in GemmKernel.GetKernelNames())
                 {
@@ -213,125 +231,92 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 Console.WriteLine($"[OpenClBackend] GEMM kernels: {string.Join(", ", GemmKernel.GetKernelNames())}");
 
                 // Compile activation kernels
-                Console.WriteLine("[OpenClBackend] Compiling activation kernels...");
-                var activationProgram = new DirectOpenClProgram(_context, ActivationKernels.GetSource());
-                activationProgram.Build(optimizationFlags);
+                var activationProgram = CompileOrLoadCached(ActivationKernels.GetSource(), optimizationFlags, "Activation kernels");
                 _programs.Add(activationProgram);
                 foreach (var name in ActivationKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, activationProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Activation kernels: {string.Join(", ", ActivationKernels.GetKernelNames())}");
 
                 // Compile fused kernels
-                Console.WriteLine("[OpenClBackend] Compiling fused kernels...");
-                var fusedProgram = new DirectOpenClProgram(_context, FusedKernels.GetSource());
-                fusedProgram.Build(optimizationFlags);
+                var fusedProgram = CompileOrLoadCached(FusedKernels.GetSource(), optimizationFlags, "Fused kernels");
                 _programs.Add(fusedProgram);
                 foreach (var name in FusedKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Fused kernels: {string.Join(", ", FusedKernels.GetKernelNames())}");
 
                 // Compile reduction kernels
-                Console.WriteLine("[OpenClBackend] Compiling reduction kernels...");
-                var reductionProgram = new DirectOpenClProgram(_context, ReductionKernels.GetSource());
-                reductionProgram.Build(optimizationFlags);
+                var reductionProgram = CompileOrLoadCached(ReductionKernels.GetSource(), optimizationFlags, "Reduction kernels");
                 _programs.Add(reductionProgram);
                 foreach (var name in ReductionKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, reductionProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Reduction kernels: {string.Join(", ", ReductionKernels.GetKernelNames())}");
 
                 // Compile packing/pad-copy kernels
-                Console.WriteLine("[OpenClBackend] Compiling packing kernels...");
-                var packingProgram = new DirectOpenClProgram(_context, PackingKernels.GetSource());
-                packingProgram.Build(optimizationFlags);
+                var packingProgram = CompileOrLoadCached(PackingKernels.GetSource(), optimizationFlags, "Packing kernels");
                 _programs.Add(packingProgram);
                 foreach (var name in PackingKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, packingProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Packing kernels: {string.Join(", ", PackingKernels.GetKernelNames())}");
 
                 // Compile sparse GEMM kernels (2:4 structured sparsity)
-                Console.WriteLine("[OpenClBackend] Compiling sparse GEMM kernels...");
-                var sparseProgram = new DirectOpenClProgram(_context, SparseGemmKernels.GetSource());
-                sparseProgram.Build(optimizationFlags);
+                var sparseProgram = CompileOrLoadCached(SparseGemmKernels.GetSource(), optimizationFlags, "Sparse GEMM kernels");
                 _programs.Add(sparseProgram);
                 foreach (var name in SparseGemmKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, sparseProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Sparse GEMM kernels: {string.Join(", ", SparseGemmKernels.GetKernelNames())}");
 
                 // Compile CSR sparse kernels (general sparsity for GNN)
-                Console.WriteLine("[OpenClBackend] Compiling CSR sparse kernels...");
-                var csrSparseProgram = new DirectOpenClProgram(_context, CsrSparseKernels.GetSource());
-                csrSparseProgram.Build(optimizationFlags);
+                var csrSparseProgram = CompileOrLoadCached(CsrSparseKernels.GetSource(), optimizationFlags, "CSR sparse kernels");
                 _programs.Add(csrSparseProgram);
                 foreach (var name in CsrSparseKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, csrSparseProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] CSR sparse kernels: {string.Join(", ", CsrSparseKernels.GetKernelNames())}");
 
                 // Compile convolution kernels
-                Console.WriteLine("[OpenClBackend] Compiling convolution kernels...");
-                var convProgram = new DirectOpenClProgram(_context, ConvolutionKernels.GetSource());
-                convProgram.Build(optimizationFlags);
+                var convProgram = CompileOrLoadCached(ConvolutionKernels.GetSource(), optimizationFlags, "Convolution kernels");
                 _programs.Add(convProgram);
                 foreach (var name in ConvolutionKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, convProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Convolution kernels: {string.Join(", ", ConvolutionKernels.GetKernelNames())}");
 
                 // Compile fused convolution kernels
-                Console.WriteLine("[OpenClBackend] Compiling fused convolution kernels...");
-                var fusedConvProgram = new DirectOpenClProgram(_context, FusedConvolutionKernels.GetSource());
-                fusedConvProgram.Build(optimizationFlags);
+                var fusedConvProgram = CompileOrLoadCached(FusedConvolutionKernels.GetSource(), optimizationFlags, "Fused convolution kernels");
                 _programs.Add(fusedConvProgram);
                 foreach (var name in FusedConvolutionKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedConvProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Fused convolution kernels: {string.Join(", ", FusedConvolutionKernels.GetKernelNames())}");
 
                 // Compile pooling kernels
-                Console.WriteLine("[OpenClBackend] Compiling pooling kernels...");
-                var poolProgram = new DirectOpenClProgram(_context, PoolingKernels.GetSource());
-                poolProgram.Build(optimizationFlags);
+                var poolProgram = CompileOrLoadCached(PoolingKernels.GetSource(), optimizationFlags, "Pooling kernels");
                 _programs.Add(poolProgram);
                 foreach (var name in PoolingKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, poolProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Pooling kernels: {string.Join(", ", PoolingKernels.GetKernelNames())}");
 
                 // Compile normalization kernels
-                Console.WriteLine("[OpenClBackend] Compiling normalization kernels...");
-                var normProgram = new DirectOpenClProgram(_context, NormalizationKernels.GetSource());
-                normProgram.Build(optimizationFlags);
+                var normProgram = CompileOrLoadCached(NormalizationKernels.GetSource(), optimizationFlags, "Normalization kernels");
                 _programs.Add(normProgram);
                 foreach (var name in NormalizationKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, normProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Normalization kernels: {string.Join(", ", NormalizationKernels.GetKernelNames())}");
 
                 // Compile neural network kernels (activation gradients, loss, optimizers)
-                Console.WriteLine("[OpenClBackend] Compiling neural network kernels...");
-                var nnProgram = new DirectOpenClProgram(_context, NeuralNetKernels.GetSource());
-                nnProgram.Build(optimizationFlags);
+                var nnProgram = CompileOrLoadCached(NeuralNetKernels.GetSource(), optimizationFlags, "Neural network kernels");
                 _programs.Add(nnProgram);
                 foreach (var name in NeuralNetKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, nnProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Neural network kernels compiled: {NeuralNetKernels.GetKernelNames().Length} kernels");
 
                 // Compile mixed precision kernels only if device actually supports FP16
                 // This is non-fatal - if compilation fails, we fall back to no FP16 support
@@ -340,15 +325,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     try
                     {
-                        Console.WriteLine("[OpenClBackend] Compiling mixed precision kernels...");
                         var mixedPrecisionSource = string.Join("\n\n",
                             MixedPrecisionKernels.ConvertFp32ToFp16,
                             MixedPrecisionKernels.ConvertFp16ToFp32,
                             MixedPrecisionKernels.MixedPrecisionForward,
                             MixedPrecisionKernels.MixedPrecisionBackward,
                             MixedPrecisionKernels.AccumulateGradientFp32);
-                        var mpProgram = new DirectOpenClProgram(_context, mixedPrecisionSource);
-                        mpProgram.Build(optimizationFlags);
+                        var mpProgram = CompileOrLoadCached(mixedPrecisionSource, optimizationFlags, "Mixed precision kernels");
                         _programs.Add(mpProgram);
                         _kernelCache["convert_fp32_to_fp16"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp32_to_fp16");
                         _kernelCache["convert_fp16_to_fp32"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp16_to_fp32");
@@ -372,31 +355,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 // Compile attention kernels (FlashAttention, GQA, ScaledDotProduct)
-                Console.WriteLine("[OpenClBackend] Compiling attention kernels...");
-                var attnProgram = new DirectOpenClProgram(_context, AttentionKernels.GetSource());
-                attnProgram.Build(optimizationFlags);
+                var attnProgram = CompileOrLoadCached(AttentionKernels.GetSource(), optimizationFlags, "Attention kernels");
                 _programs.Add(attnProgram);
                 foreach (var name in AttentionKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, attnProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Attention kernels compiled: {AttentionKernels.GetKernelNames().Length} kernels");
 
                 // Compile FFT kernels
-                Console.WriteLine("[OpenClBackend] Compiling FFT kernels...");
-                var fftProgram = new DirectOpenClProgram(_context, FFTKernels.GetSource());
-                fftProgram.Build(optimizationFlags);
+                var fftProgram = CompileOrLoadCached(FFTKernels.GetSource(), optimizationFlags, "FFT kernels");
                 _programs.Add(fftProgram);
                 foreach (var name in FFTKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, fftProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] FFT kernels compiled: {FFTKernels.GetKernelNames().Length} kernels");
 
                 // Compile spatial transformer kernels (TopK, AffineGrid, GridSample)
-                Console.WriteLine("[OpenClBackend] Compiling spatial transformer kernels...");
-                var stProgram = new DirectOpenClProgram(_context, SpatialTransformerKernels.GetSource());
-                stProgram.Build(optimizationFlags);
+                var stProgram = CompileOrLoadCached(SpatialTransformerKernels.GetSource(), optimizationFlags, "Spatial transformer kernels");
                 _programs.Add(stProgram);
                 foreach (var name in new[] { "topk", "affine_grid", "grid_sample", "grid_sample_backward" })
                 {
@@ -405,92 +380,68 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 Console.WriteLine("[OpenClBackend] Spatial transformer kernels compiled: 4 kernels");
 
                 // Compile locally connected convolution kernels
-                Console.WriteLine("[OpenClBackend] Compiling locally connected kernels...");
-                var locallyConnectedProgram = new DirectOpenClProgram(_context, LocallyConnectedKernels.GetSource());
-                locallyConnectedProgram.Build(optimizationFlags);
+                var locallyConnectedProgram = CompileOrLoadCached(LocallyConnectedKernels.GetSource(), optimizationFlags, "Locally connected kernels");
                 _programs.Add(locallyConnectedProgram);
                 foreach (var name in LocallyConnectedKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, locallyConnectedProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Locally connected kernels compiled: {LocallyConnectedKernels.GetKernelNames().Length} kernels");
 
                 // Compile deformable convolution kernels
-                Console.WriteLine("[OpenClBackend] Compiling deformable convolution kernels...");
-                var deformableProgram = new DirectOpenClProgram(_context, DeformableConvolutionKernels.GetSource());
-                deformableProgram.Build(optimizationFlags);
+                var deformableProgram = CompileOrLoadCached(DeformableConvolutionKernels.GetSource(), optimizationFlags, "Deformable conv kernels");
                 _programs.Add(deformableProgram);
                 foreach (var name in DeformableConvolutionKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, deformableProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Deformable convolution kernels compiled: {DeformableConvolutionKernels.GetKernelNames().Length} kernels");
 
                 // Compile random number generation kernels
-                Console.WriteLine("[OpenClBackend] Compiling random number kernels...");
-                var randomProgram = new DirectOpenClProgram(_context, RandomKernels.GetKernels());
-                randomProgram.Build(optimizationFlags);
+                var randomProgram = CompileOrLoadCached(RandomKernels.GetKernels(), optimizationFlags, "Random number kernels");
                 _programs.Add(randomProgram);
                 foreach (var name in new[] { "GenerateRandomUniform", "GenerateRandomNormal" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, randomProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Random number kernels compiled: 2 kernels");
 
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
-                Console.WriteLine("[OpenClBackend] Compiling specialized kernels...");
-                var specializedProgram = new DirectOpenClProgram(_context, SpecializedKernels.GetSource());
-                specializedProgram.Build(optimizationFlags);
+                var specializedProgram = CompileOrLoadCached(SpecializedKernels.GetSource(), optimizationFlags, "Specialized kernels");
                 _programs.Add(specializedProgram);
                 foreach (var name in SpecializedKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, specializedProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Specialized kernels compiled: {SpecializedKernels.GetKernelNames().Length} kernels");
 
                 // Compile FP16 conversion kernels (half-precision float conversion)
-                Console.WriteLine("[OpenClBackend] Compiling FP16 conversion kernels...");
-                var fp16Program = new DirectOpenClProgram(_context, Fp16Kernels.GetSource());
-                fp16Program.Build(optimizationFlags);
+                var fp16Program = CompileOrLoadCached(Fp16Kernels.GetSource(), optimizationFlags, "FP16 conversion kernels");
                 _programs.Add(fp16Program);
                 foreach (var name in Fp16Kernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, fp16Program, name);
                 }
-                Console.WriteLine($"[OpenClBackend] FP16 conversion kernels compiled: {Fp16Kernels.GetKernelNames().Length} kernels");
 
                 // Compile loss function kernels (MSE, BCE, CE, Huber, Focal, Triplet, etc.)
-                Console.WriteLine("[OpenClBackend] Compiling loss function kernels...");
-                var lossProgram = new DirectOpenClProgram(_context, LossKernels.GetSource());
-                lossProgram.Build(optimizationFlags);
+                var lossProgram = CompileOrLoadCached(LossKernels.GetSource(), optimizationFlags, "Loss function kernels");
                 _programs.Add(lossProgram);
                 foreach (var name in LossKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, lossProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] Loss function kernels compiled: {LossKernels.GetKernelNames().Length} kernels");
 
                 // Compile LSTM sequence kernels (forward/backward for BPTT training)
-                Console.WriteLine("[OpenClBackend] Compiling LSTM sequence kernels...");
-                var lstmProgram = new DirectOpenClProgram(_context, LstmKernels.GetSource());
-                lstmProgram.Build(optimizationFlags);
+                var lstmProgram = CompileOrLoadCached(LstmKernels.GetSource(), optimizationFlags, "LSTM sequence kernels");
                 _programs.Add(lstmProgram);
                 foreach (var name in LstmKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, lstmProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] LSTM sequence kernels compiled: {LstmKernels.GetKernelNames().Length} kernels");
 
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
-                Console.WriteLine("[OpenClBackend] Compiling GRU sequence kernels...");
-                var gruProgram = new DirectOpenClProgram(_context, GruKernels.GetSource());
-                gruProgram.Build(optimizationFlags);
+                var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
                 _programs.Add(gruProgram);
                 foreach (var name in GruKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, gruProgram, name);
                 }
-                Console.WriteLine($"[OpenClBackend] GRU sequence kernels compiled: {GruKernels.GetKernelNames().Length} kernels");
             }
             catch (Exception ex)
             {
@@ -1088,8 +1039,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _clblastPadTransposeParams,
                     _clblastCopyParams,
                     _clblastTransposeParams);
-                var program = new DirectOpenClProgram(_context, source);
-                program.Build(OpenClBuildOptions.OptimizationFlags);
+                var program = CompileOrLoadCached(source, OpenClBuildOptions.OptimizationFlags, "CLBlast packing kernels");
                 _programs.Add(program);
 
                 foreach (var name in ClBlastPackingKernels.GetKernelNames())
@@ -1122,8 +1072,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 var source = ClBlastXgemmDirectKernel.BuildSource(_clblastDirectParams);
-                var program = new DirectOpenClProgram(_context, source);
-                program.Build(OpenClBuildOptions.OptimizationFlags);
+                var program = CompileOrLoadCached(source, OpenClBuildOptions.OptimizationFlags, "CLBlast direct kernels");
                 _programs.Add(program);
 
                 foreach (var name in ClBlastXgemmDirectKernel.GetKernelNames())
@@ -2124,27 +2073,100 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
-            return ExecuteFusedGemm("gemm_bias_relu", A, B, bias, M, N, K);
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                Relu(temp, output, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
         }
 
         public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
-            return ExecuteFusedGemm("gemm_bias_gelu", A, B, bias, M, N, K);
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                Gelu(temp, output, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
         }
 
         public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
-            return ExecuteFusedGemm("gemm_bias_sigmoid", A, B, bias, M, N, K);
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                Sigmoid(temp, output, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
         }
 
         public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
-            return ExecuteFusedGemm("gemm_bias_tanh", A, B, bias, M, N, K);
+            IGpuBuffer? temp = null;
+            IGpuBuffer? output = null;
+            try
+            {
+                temp = GemmBias(A, B, bias, M, N, K);
+                output = AllocateBuffer(M * N);
+                Tanh(temp, output, M * N);
+                temp.Dispose();
+                return output;
+            }
+            catch
+            {
+                output?.Dispose();
+                temp?.Dispose();
+                throw;
+            }
         }
 
         public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
-            return ExecuteFusedGemm("gemm_bias", A, B, bias, M, N, K);
+            // Use optimized GEMM path (CLBlast/DynamicGemm) + separate bias add
+            // instead of the slow 16x16 fused kernel
+            var C = AllocateBuffer(M * N);
+            try
+            {
+                Gemm(A, B, C, M, N, K);
+                BiasAdd(C, bias, C, M, N);
+                return C;
+            }
+            catch
+            {
+                C.Dispose();
+                throw;
+            }
         }
 
         public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
