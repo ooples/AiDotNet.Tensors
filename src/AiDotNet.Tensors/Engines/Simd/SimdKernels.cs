@@ -210,6 +210,50 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>
+        /// Unsafe pointer-based sum with 4-way accumulation. Eliminates Span bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe float SumUnsafe(float* data, int length)
+        {
+            int i = 0;
+            float sum = 0f;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vsum0 = Vector256<float>.Zero;
+                var vsum1 = Vector256<float>.Zero;
+                var vsum2 = Vector256<float>.Zero;
+                var vsum3 = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
+                    vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
+                    vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
+                    vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                }
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                sum += HorizontalSum(vsum0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vsum = Vector256<float>.Zero;
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    vsum = Avx.Add(vsum, Avx.LoadVector256(data + i));
+                }
+                sum += HorizontalSum(vsum);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                sum += data[i];
+            }
+            return sum;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void VectorSubtract(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {

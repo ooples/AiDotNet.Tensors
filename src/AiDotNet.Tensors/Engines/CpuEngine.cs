@@ -345,9 +345,22 @@ public class CpuEngine : ITensorLevelEngine
     #region Reduction Operations
 
     /// <inheritdoc/>
-    public T Sum<T>(Vector<T> vector)
+    public unsafe T Sum<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = vector.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, vector.Length);
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
@@ -382,10 +395,23 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T Mean<T>(Vector<T> vector)
+    public unsafe T Mean<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
         if (vector.Length == 0) throw new ArgumentException("Cannot compute mean of empty vector.");
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = vector.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, vector.Length) / vector.Length;
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = Sum(vector);
@@ -2887,9 +2913,22 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorSum<T>(Tensor<T> tensor)
+    public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = tensor.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, tensor.Length);
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         // Use SIMD-optimized sum via IVectorizedOperations
@@ -2970,10 +3009,23 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorMean<T>(Tensor<T> tensor)
+    public unsafe T TensorMean<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute mean of empty tensor.", nameof(tensor));
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = tensor.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, tensor.Length) / tensor.Length;
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = TensorSum(tensor);
