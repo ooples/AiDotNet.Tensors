@@ -564,7 +564,20 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
+#if NET8_0_OR_GREATER
+            // On .NET 8+, the JIT auto-vectorizes MathF.Exp using SVML (vexpps),
+            // which is faster than our polynomial approximation. Use unrolled scalar
+            // loop and let the JIT handle vectorization.
+            int unrolled = length & ~3;
+            for (; i < unrolled; i += 4)
+            {
+                output[i] = MathF.Exp(input[i]);
+                output[i + 1] = MathF.Exp(input[i + 1]);
+                output[i + 2] = MathF.Exp(input[i + 2]);
+                output[i + 3] = MathF.Exp(input[i + 3]);
+            }
+#elif NET5_0_OR_GREATER
+            // On .NET 5-7, use our FastExp256 polynomial since SVML is not available
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -1726,7 +1739,19 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
+#if NET8_0_OR_GREATER
+            // On .NET 8+, the JIT auto-vectorizes MathF.Log using SVML (vlogps),
+            // which is faster than our polynomial approximation.
+            int unrolled = length & ~3;
+            for (; i < unrolled; i += 4)
+            {
+                output[i] = MathF.Log(input[i]);
+                output[i + 1] = MathF.Log(input[i + 1]);
+                output[i + 2] = MathF.Log(input[i + 2]);
+                output[i + 3] = MathF.Log(input[i + 3]);
+            }
+#elif NET5_0_OR_GREATER
+            // On .NET 5-7, use our FastLog256 polynomial since SVML is not available
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -1782,7 +1807,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
+#if NET8_0_OR_GREATER
+            // On .NET 8+, the JIT auto-vectorizes MathF.Log2 using SVML
+            int unrolled = length & ~3;
+            for (; i < unrolled; i += 4)
+            {
+                output[i] = MathF.Log2(input[i]);
+                output[i + 1] = MathF.Log2(input[i + 1]);
+                output[i + 2] = MathF.Log2(input[i + 2]);
+                output[i + 3] = MathF.Log2(input[i + 3]);
+            }
+#elif NET5_0_OR_GREATER
+            // On .NET 5-7, use our FastLog256 polynomial
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 var log2e = Vector256.Create(1.44269504088896341f); // 1/ln(2) = log2(e)
