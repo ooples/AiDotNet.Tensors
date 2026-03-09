@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -94,5 +95,45 @@ public static class CpuParallelSettings
                 action(start, count);
             }
         });
+    }
+
+    /// <summary>
+    /// Lightweight parallel chunked execution using ThreadPool directly.
+    /// Avoids Parallel.For overhead (~4KB allocation, scheduler state, ParallelOptions).
+    /// Uses CountdownEvent for synchronization — ~10x less allocation than Parallel.For.
+    /// </summary>
+    /// <param name="numChunks">Number of chunks to process in parallel.</param>
+    /// <param name="action">Action receiving chunk index (0..numChunks-1).</param>
+    public static void LightweightParallel(int numChunks, Action<int> action)
+    {
+        if (numChunks <= 1)
+        {
+            action(0);
+            return;
+        }
+
+        // Execute (numChunks - 1) chunks on ThreadPool, run one chunk on current thread
+        using var cde = new CountdownEvent(numChunks - 1);
+        for (int c = 1; c < numChunks; c++)
+        {
+            int chunkIdx = c;
+            ThreadPool.UnsafeQueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    action(chunkIdx);
+                }
+                finally
+                {
+                    cde.Signal();
+                }
+            }, null);
+        }
+
+        // Run chunk 0 on the current thread (no scheduling overhead)
+        action(0);
+
+        // Wait for all other chunks to complete
+        cde.Wait();
     }
 }

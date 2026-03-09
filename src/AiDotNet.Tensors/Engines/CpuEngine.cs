@@ -1979,7 +1979,7 @@ public class CpuEngine : ITensorLevelEngine
                     int chunkSize = (length + numChunks - 1) / numChunks;
                     chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
 
-                    Parallel.For(0, numChunks, chunk =>
+                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -2178,7 +2178,7 @@ public class CpuEngine : ITensorLevelEngine
                     int chunkSize = (length + numChunks - 1) / numChunks;
                     chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
 
-                    Parallel.For(0, numChunks, chunk =>
+                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -2951,7 +2951,7 @@ public class CpuEngine : ITensorLevelEngine
                     chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
                     float[] partials = new float[numChunks];
 
-                    Parallel.For(0, numChunks, chunk =>
+                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -3867,7 +3867,7 @@ public class CpuEngine : ITensorLevelEngine
                     float* p = (float*)handle.AddrOfPinnedObject();
                     int chunkSize = (length + sigChunks - 1) / sigChunks;
                     chunkSize = (chunkSize + 31) & ~31;
-                    Parallel.For(0, sigChunks, chunk =>
+                    CpuParallelSettings.LightweightParallel(sigChunks, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
@@ -3985,7 +3985,7 @@ public class CpuEngine : ITensorLevelEngine
                     int chunkSize = (length + numChunks - 1) / numChunks;
                     chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
 
-                    Parallel.For(0, numChunks, chunk =>
+                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                     {
                         int start = chunk * chunkSize;
                         int count = Math.Min(chunkSize, length - start);
