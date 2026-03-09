@@ -2939,8 +2939,8 @@ public class CpuEngine : ITensorLevelEngine
             int length = tensor.Length;
             float result;
 
-            // Bandwidth-bound: fewer, larger chunks minimize scheduling overhead.
-            int numChunks = length >= 500_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 250_000)) : 1;
+            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
@@ -3064,21 +3064,16 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute mean of empty tensor.", nameof(tensor));
 
-        // Float fast path: bypass generic dispatch + Span overhead
+        // Route through TensorSum which has the parallel fast path
+        T sum = TensorSum(tensor);
         if (typeof(T) == typeof(float))
         {
-            T[] arr = tensor.GetDataArray();
-            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
-            float result;
-            fixed (float* ptr = fArr)
-            {
-                result = SimdKernels.SumUnsafe(ptr, tensor.Length) / tensor.Length;
-            }
+            float fSum = Unsafe.As<T, float>(ref sum);
+            float result = fSum / tensor.Length;
             return Unsafe.As<float, T>(ref result);
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        T sum = TensorSum(tensor);
         return numOps.Divide(sum, numOps.FromDouble(tensor.Length));
     }
 
