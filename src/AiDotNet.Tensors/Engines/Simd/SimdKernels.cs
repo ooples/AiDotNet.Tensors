@@ -322,12 +322,28 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vsum2 = Vector256<float>.Zero;
                 var vsum3 = Vector256<float>.Zero;
                 int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
-                    vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
-                    vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
-                    vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                            Sse.Prefetch0(data + i + prefetchDistance);
+                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
+                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
+                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
+                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                    }
+                }
+                else
+                {
+                    for (; i < simdLength; i += 32)
+                    {
+                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
+                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
+                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
+                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                    }
                 }
                 vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
                 sum += HorizontalSum(vsum0);
