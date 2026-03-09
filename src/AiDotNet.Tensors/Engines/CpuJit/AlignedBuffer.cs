@@ -95,6 +95,20 @@ internal sealed class AlignedBuffer : IDisposable
     }
 
     /// <summary>
+    /// Copies count elements from a managed array starting at offset into this aligned buffer.
+    /// </summary>
+    public unsafe void CopyFrom(float[] source, int offset, int count)
+    {
+        if (count > FloatCount)
+            throw new ArgumentException($"Count ({count}) exceeds buffer capacity ({FloatCount}).");
+
+        fixed (float* srcPtr = source)
+        {
+            Buffer.MemoryCopy(srcPtr + offset, (void*)_aligned, _sizeBytes, count * sizeof(float));
+        }
+    }
+
+    /// <summary>
     /// Copies data from this aligned buffer into a managed span.
     /// </summary>
     public unsafe void CopyTo(Span<float> destination)
@@ -105,6 +119,20 @@ internal sealed class AlignedBuffer : IDisposable
         fixed (float* dstPtr = destination)
         {
             Buffer.MemoryCopy((void*)_aligned, dstPtr, destination.Length * sizeof(float), _sizeBytes);
+        }
+    }
+
+    /// <summary>
+    /// Copies count elements from this aligned buffer into a managed array starting at offset.
+    /// </summary>
+    public unsafe void CopyTo(float[] destination, int offset, int count)
+    {
+        if (count > FloatCount)
+            throw new ArgumentException($"Count ({count}) exceeds buffer capacity ({FloatCount}).");
+
+        fixed (float* dstPtr = destination)
+        {
+            Buffer.MemoryCopy((void*)_aligned, dstPtr + offset, (destination.Length - offset) * sizeof(float), count * sizeof(float));
         }
     }
 
