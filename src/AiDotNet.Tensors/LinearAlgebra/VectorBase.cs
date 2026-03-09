@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -25,6 +27,13 @@ public abstract class VectorBase<T>
     /// and integration with memory pooling.</para>
     /// </remarks>
     protected readonly Memory<T> _memory;
+
+    /// <summary>
+    /// Cached direct reference to the backing array for SIMD fast paths.
+    /// Eliminates Memory&lt;T&gt;.Span property overhead (~30ns per access).
+    /// May be null if Memory&lt;T&gt; is not backed by a simple array.
+    /// </summary>
+    internal readonly T[]? _cachedArray;
 
     /// <summary>
     /// Optional memory owner for pooled memory management.
@@ -71,21 +80,24 @@ public abstract class VectorBase<T>
         if (length < 0)
             throw new ArgumentException("Length must be non-negative", nameof(length));
 
+        T[] arr;
 #if NET5_0_OR_GREATER
         if (skipZeroInit)
         {
             // Use uninitialized allocation for performance - avoids zeroing memory
             // that will be immediately overwritten. ~30-50% faster for large arrays.
             // Caller MUST initialize all elements before exposing to consumers.
-            _memory = GC.AllocateUninitializedArray<T>(length);
+            arr = GC.AllocateUninitializedArray<T>(length);
         }
         else
         {
-            _memory = new T[length];
+            arr = new T[length];
         }
 #else
-        _memory = new T[length];
+        arr = new T[length];
 #endif
+        _memory = arr;
+        _cachedArray = arr;
     }
 
     /// <summary>
@@ -99,6 +111,12 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
+        // Try to extract backing array for SIMD fast paths
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
+            && segment.Array is not null && segment.Offset == 0 && segment.Count == segment.Array.Length)
+        {
+            _cachedArray = segment.Array;
+        }
     }
 
     /// <summary>
@@ -115,6 +133,7 @@ public abstract class VectorBase<T>
     {
         _memoryOwner = memoryOwner;
         _memory = memoryOwner.Memory.Slice(0, length);
+        // Sliced memory — can't cache array (offset != 0 or count != array.Length)
     }
 
     /// <summary>
@@ -127,7 +146,9 @@ public abstract class VectorBase<T>
     /// </remarks>
     protected VectorBase(IEnumerable<T> values)
     {
-        _memory = values.ToArray();
+        var arr = values.ToArray();
+        _memory = arr;
+        _cachedArray = arr;
     }
 
     /// <summary>
@@ -645,6 +666,27 @@ public abstract class VectorBase<T>
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+                SimdKernels.VectorAdd((ReadOnlySpan<double>)dOther, (ReadOnlySpan<double>)dArr, dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                var fOther = Unsafe.As<T[], float[]>(ref otherArr);
+                SimdKernels.VectorAdd((ReadOnlySpan<float>)fOther, (ReadOnlySpan<float>)fArr, fArr);
+                return;
+            }
+        }
+#endif
         _numOps.Add(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -666,6 +708,31 @@ public abstract class VectorBase<T>
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorAdd(
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorAdd(
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                return;
+            }
+        }
+#endif
         _numOps.Add(_memory.Span, other._memory.Span, destination);
     }
 
@@ -708,6 +775,27 @@ public abstract class VectorBase<T>
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+                SimdKernels.VectorSubtract((ReadOnlySpan<double>)dArr, (ReadOnlySpan<double>)dOther, dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                var fOther = Unsafe.As<T[], float[]>(ref otherArr);
+                SimdKernels.VectorSubtract((ReadOnlySpan<float>)fArr, (ReadOnlySpan<float>)fOther, fArr);
+                return;
+            }
+        }
+#endif
         _numOps.Subtract(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -727,6 +815,31 @@ public abstract class VectorBase<T>
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorSubtract(
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorSubtract(
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                return;
+            }
+        }
+#endif
         _numOps.Subtract(_memory.Span, other._memory.Span, destination);
     }
 
@@ -760,6 +873,24 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void MultiplyInPlace(T scalar)
     {
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        if (arr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                SimdKernels.MultiplyScalar((ReadOnlySpan<double>)dArr, Unsafe.As<T, double>(ref scalar), dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                SimdKernels.MultiplyScalar((ReadOnlySpan<float>)fArr, Unsafe.As<T, float>(ref scalar), fArr);
+                return;
+            }
+        }
+#endif
         _numOps.MultiplyScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -777,6 +908,32 @@ public abstract class VectorBase<T>
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        if (arr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                ref T dstart = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.MultiplyScalar(
+                    (ReadOnlySpan<double>)dArr,
+                    Unsafe.As<T, double>(ref scalar),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref dstart), destination.Length));
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                ref T dstart = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.MultiplyScalar(
+                    (ReadOnlySpan<float>)fArr,
+                    Unsafe.As<T, float>(ref scalar),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref dstart), destination.Length));
+                return;
+            }
+        }
+#endif
         _numOps.MultiplyScalar(_memory.Span, scalar, destination);
     }
 

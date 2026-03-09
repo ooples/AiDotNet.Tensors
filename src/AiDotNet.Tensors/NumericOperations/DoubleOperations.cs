@@ -833,13 +833,8 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        // Use unsafe pointer path for zero bounds-checking overhead
-        fixed (double* xPtr = x)
-        fixed (double* yPtr = y)
-        fixed (double* destPtr = destination)
-        {
-            Engines.Simd.SimdKernels.VectorAddUnsafe(xPtr, yPtr, destPtr, length);
-        }
+        // Use span-based path — ref-based Unsafe.ReadUnaligned avoids fixed pinning overhead
+        Engines.Simd.SimdKernels.VectorAdd(x, y, destination);
     }
 
     /// <summary>
@@ -865,12 +860,7 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        fixed (double* xPtr = x)
-        fixed (double* yPtr = y)
-        fixed (double* destPtr = destination)
-        {
-            Engines.Simd.SimdKernels.VectorSubtractUnsafe(xPtr, yPtr, destPtr, length);
-        }
+        Engines.Simd.SimdKernels.VectorSubtract(x, y, destination);
     }
 
     /// <summary>
@@ -896,12 +886,7 @@ public class DoubleOperations : INumericOperations<double>
             }
             return;
         }
-        fixed (double* xPtr = x)
-        fixed (double* yPtr = y)
-        fixed (double* destPtr = destination)
-        {
-            Engines.Simd.SimdKernels.VectorMultiplyUnsafe(xPtr, yPtr, destPtr, length);
-        }
+        Engines.Simd.SimdKernels.VectorMultiply(x, y, destination);
     }
 
     /// <summary>
@@ -1142,13 +1127,9 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Multiplies each element by a scalar using unsafe pointer-based SIMD for zero overhead.
     /// </summary>
-    public unsafe void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
+    public void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
     {
-        fixed (double* xPtr = x)
-        fixed (double* destPtr = destination)
-        {
-            Engines.Simd.SimdKernels.MultiplyScalarUnsafe(xPtr, scalar, destPtr, x.Length);
-        }
+        Engines.Simd.SimdKernels.MultiplyScalar(x, scalar, destination);
     }
 
     /// <summary>
