@@ -1903,15 +1903,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, length);
-                kernel(pA, pB, pR, length);
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
                 return result;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (addChunks >= 2)
             {
@@ -1977,15 +1976,14 @@ public class CpuEngine : ITensorLevelEngine
             }
 #endif
 
-            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled)
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, length);
-                kernel(pA, pB, pA, length);
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
                 return;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
@@ -2134,15 +2132,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Subtract, length);
-                kernel(pA, pB, pR, length);
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
                 return result;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (subChunks >= 2)
             {
@@ -2200,15 +2197,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, length);
-                kernel(pA, pB, pR, length);
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
                 return result;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (mulChunks >= 2)
             {
@@ -2274,15 +2270,14 @@ public class CpuEngine : ITensorLevelEngine
             }
 #endif
 
-            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled)
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, length);
-                kernel(pA, pB, pA, length);
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
                 return;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
@@ -2399,8 +2394,7 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Divide, length);
-            kernel(pA, pB, pR, length);
+            JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
             return result;
         }
 
@@ -4071,15 +4065,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
 
-            // Try JIT-compiled kernel first (size-specialized, 4x unrolled)
+            // JIT-compiled kernels: size-specialized, 4x unrolled
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                var kernel = CpuJitKernels.GetReLUKernel(length);
-                kernel(pSrc, pDst, length);
+                JitUnaryDispatch(pSrc, pDst, length);
                 return result;
             }
 
-            // Bandwidth-bound: parallel only helps above ~2M elements (16MB+ total data)
+            // Fallback: SimdKernels with parallel chunking for large arrays
             int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (reluChunks >= 2)
             {
@@ -17835,6 +17828,72 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         return result;
+    }
+
+    #endregion
+
+    #region JIT Dispatch Helpers
+
+    /// <summary>
+    /// Dispatches a JIT-compiled binary operation with multi-threaded parallelism for large arrays.
+    /// For arrays >= 2M elements, splits work across threads with per-chunk JIT kernels.
+    /// For smaller arrays, runs single-threaded JIT kernel.
+    /// </summary>
+    private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
+    {
+        // For large arrays, parallelize across threads
+        int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+        if (numChunks >= 2)
+        {
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            // Align to 32-float boundary for SIMD
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    var kernel = CpuJitKernels.GetBinaryKernel(op, count);
+                    kernel(pA + start, pB + start, pR + start, count);
+                }
+            });
+        }
+        else
+        {
+            var kernel = CpuJitKernels.GetBinaryKernel(op, length);
+            kernel(pA, pB, pR, length);
+        }
+    }
+
+    /// <summary>
+    /// Dispatches a JIT-compiled ReLU with multi-threaded parallelism for large arrays.
+    /// </summary>
+    private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
+    {
+        int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+        if (numChunks >= 2)
+        {
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    var kernel = CpuJitKernels.GetReLUKernel(count);
+                    kernel(pSrc + start, pDst + start, count);
+                }
+            });
+        }
+        else
+        {
+            var kernel = CpuJitKernels.GetReLUKernel(length);
+            kernel(pSrc, pDst, length);
+        }
     }
 
     #endregion
