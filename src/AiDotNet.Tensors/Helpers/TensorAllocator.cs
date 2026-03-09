@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Helpers;
 /// Uses GC.AllocateUninitializedArray on .NET 5+ for small-medium tensors, and
 /// ArrayPool for large tensors to reduce GC pressure from frequent allocations.
 /// </summary>
-internal static class TensorPool
+internal static class TensorAllocator
 {
     /// <summary>
     /// Whether fast tensor allocation is enabled. Defaults to true.

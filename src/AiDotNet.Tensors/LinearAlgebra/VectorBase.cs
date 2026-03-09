@@ -127,7 +127,7 @@ public abstract class VectorBase<T>
     /// <remarks>
     /// <para><b>For Beginners:</b> This creates a vector that uses memory from a pool.
     /// Memory pooling reduces garbage collection overhead by reusing memory buffers.</para>
-    /// <para><b>Issue #693:</b> Supports integration with TensorPool for efficient memory reuse.</para>
+    /// <para><b>Issue #693:</b> Supports integration with TensorAllocator for efficient memory reuse.</para>
     /// </remarks>
     protected VectorBase(IMemoryOwner<T> memoryOwner, int length)
     {
