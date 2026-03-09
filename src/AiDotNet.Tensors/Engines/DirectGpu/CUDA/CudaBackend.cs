@@ -193,30 +193,23 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private readonly struct CudaContextScope : IDisposable
     {
-        private readonly bool _needsPop;
-
         public CudaContextScope(IntPtr context)
         {
-            // Skip push/pop if this thread already has the right context set
+            // Push only if this thread doesn't already have the right context.
+            // We intentionally do NOT pop on Dispose — the context stays on the
+            // CUDA stack so subsequent calls on the same thread skip the push entirely.
+            // This eliminates ~244 cuCtxPushCurrent/cuCtxPopCurrent API calls per operation.
+            // The context is cleaned up by cuCtxDestroy in CudaBackend.Dispose().
             if (context != IntPtr.Zero && _threadCurrentContext != context)
             {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
                 _threadCurrentContext = context;
-                _needsPop = true;
-            }
-            else
-            {
-                _needsPop = false;
             }
         }
 
         public void Dispose()
         {
-            if (_needsPop)
-            {
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out var prev), "cuCtxPopCurrent");
-                _threadCurrentContext = prev;
-            }
+            // No-op: context stays on CUDA stack for reuse by next call on this thread
         }
     }
 
