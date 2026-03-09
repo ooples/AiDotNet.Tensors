@@ -62,8 +62,12 @@ extern ""C"" __global__ void scaled_dot_product_attention(
     float outAcc[MAX_HEAD_DIM];
     for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
-    // Also need to store weights if requested: use a second pass
-    // For storeWeights, we need logsumexp = rowMax + log(rowSum)
+    // Cache Q row in registers — avoids repeated global memory reads in KV-tile loop
+    float qRow[MAX_HEAD_DIM];
+    int qOffset = bh * seqQ * headDim + qi * headDim;
+    if (qi < seqQ) {
+        for (int d = 0; d < headDim; d++) qRow[d] = query[qOffset + d];
+    }
 
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
@@ -86,15 +90,14 @@ extern ""C"" __global__ void scaled_dot_product_attention(
         __syncthreads();
 
         if (qi < seqQ) {
-            int qOffset = bh * seqQ * headDim + qi * headDim;
-
             for (int t = 0; t < tileSize; t++) {
                 int ki = kvStart + t;
                 if (isCausal && ki > qi) continue;
 
+                // Q dot K — Q from registers, K from shared memory
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
+                    score += qRow[d] * Ks[t * headDim + d];
                 }
                 score *= scale;
 
@@ -196,6 +199,13 @@ extern ""C"" __global__ void flash_attention_v2(
     float outAcc[MAX_HEAD_DIM];
     for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
+    // Cache Q row in registers — avoids repeated global memory reads in KV-tile loop
+    float qRow[MAX_HEAD_DIM];
+    int qOffset = bh * seqQ * headDim + qi * headDim;
+    if (qi < seqQ) {
+        for (int d = 0; d < headDim; d++) qRow[d] = query[qOffset + d];
+    }
+
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
 
@@ -217,16 +227,14 @@ extern ""C"" __global__ void flash_attention_v2(
         __syncthreads();
 
         if (qi < seqQ) {
-            int qOffset = bh * seqQ * headDim + qi * headDim;
-
             for (int t = 0; t < tileSize; t++) {
                 int ki = kvStart + t;
                 if (isCausal && ki > qi) continue;
 
-                // Compute Q dot K (K from shared memory)
+                // Q dot K — Q from registers, K from shared memory
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
+                    score += qRow[d] * Ks[t * headDim + d];
                 }
                 score *= scale;
                 if (hasBias) score += attentionBias[biasBase + ki];
@@ -308,6 +316,10 @@ extern ""C"" __global__ void flash_attention_backward(
     int qOffset = 0, gOffset = 0;
     int biasBase = 0;
 
+    // Cache Q row and gradOutput row in registers to avoid repeated global reads
+    float qRow[MAX_HEAD_DIM];
+    float goRow[MAX_HEAD_DIM];
+
     if (qi < seqQ) {
         qOffset = bh * seqQ * headDim + qi * headDim;
         gOffset = bh * seqQ * headDim + qi * headDim;
@@ -320,9 +332,11 @@ extern ""C"" __global__ void flash_attention_backward(
             biasBase = b * biasBatchStride + h * seqQ * seqK + qi * seqK;
         }
 
-        // Compute dO dot O
+        // Load Q and gradOutput into registers, compute dO dot O
         for (int d = 0; d < headDim; d++) {
-            doO += gradOutput[gOffset + d] * output[qOffset + d];
+            qRow[d] = query[qOffset + d];
+            goRow[d] = gradOutput[gOffset + d];
+            doO += goRow[d] * output[qOffset + d];
         }
     }
 
@@ -350,26 +364,26 @@ extern ""C"" __global__ void flash_attention_backward(
                 int ki = kvStart + t;
                 if (isCausal && ki > qi) continue;
 
-                // Recompute attention score from shared memory K
+                // Recompute attention score: Q from registers, K from shared memory
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
+                    score += qRow[d] * Ks[t * headDim + d];
                 }
                 score *= scale;
                 if (hasBias) score += attentionBias[biasBase + ki];
 
                 float attnWeight = expf(score - logsumexp);
 
-                // Gradient w.r.t. V
+                // Gradient w.r.t. V: gradOutput from registers
                 for (int d = 0; d < headDim; d++) {
                     atomicAdd(&gradValue[vBase + ki * headDim + d],
-                              attnWeight * gradOutput[gOffset + d]);
+                              attnWeight * goRow[d]);
                 }
 
-                // Compute dO dot V from shared memory
+                // Compute dO dot V from shared memory, gradOutput from registers
                 float doV = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    doV += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                    doV += goRow[d] * Vs[t * headDim + d];
                 }
 
                 float dS = attnWeight * (doV - doO) * scale;
@@ -379,10 +393,10 @@ extern ""C"" __global__ void flash_attention_backward(
                     gradQuery[qOffset + d] += dS * Ks[t * headDim + d];
                 }
 
-                // Gradient w.r.t. K
+                // Gradient w.r.t. K: Q from registers
                 for (int d = 0; d < headDim; d++) {
                     atomicAdd(&gradKey[kBase + ki * headDim + d],
-                              dS * query[qOffset + d]);
+                              dS * qRow[d]);
                 }
             }
         }
@@ -440,6 +454,13 @@ extern ""C"" __global__ void grouped_query_attention(
     float outAcc[MAX_HEAD_DIM];
     for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
+    // Cache Q row in registers — avoids repeated global memory reads
+    float qRow[MAX_HEAD_DIM];
+    int qOffset = bqh * seqQ * headDim + qi * headDim;
+    if (qi < seqQ) {
+        for (int d = 0; d < headDim; d++) qRow[d] = query[qOffset + d];
+    }
+
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
 
@@ -459,15 +480,14 @@ extern ""C"" __global__ void grouped_query_attention(
         __syncthreads();
 
         if (qi < seqQ) {
-            int qOffset = bqh * seqQ * headDim + qi * headDim;
-
             for (int t = 0; t < tileSize; t++) {
                 int ki = kvStart + t;
                 if (isCausal && ki > qi) continue;
 
+                // Q dot K — Q from registers, K from shared memory
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
+                    score += qRow[d] * Ks[t * headDim + d];
                 }
                 score *= scale;
 
@@ -559,14 +579,21 @@ extern ""C"" __global__ void grouped_query_attention_backward(
     int vBase = (b_idx * numKVHeads + kvh) * seqK * headDim;
 
     // Pre-compute per-thread dot(weights, gradWeights) over ALL seqK
-    // This requires a full pass, but we use tiled approach
     float dotWgW = 0.0f;
     int qOffset = 0, gOffset = 0, wOffset = 0;
+
+    // Cache Q row and gradOutput row in registers
+    float qRow[MAX_HEAD_DIM];
+    float goRow[MAX_HEAD_DIM];
 
     if (qi < seqQ) {
         qOffset = bqh * seqQ * headDim + qi * headDim;
         gOffset = bqh * seqQ * headDim + qi * headDim;
         wOffset = bqh * seqQ * seqK + qi * seqK;
+        for (int d = 0; d < headDim; d++) {
+            qRow[d] = query[qOffset + d];
+            goRow[d] = gradOutput[gOffset + d];
+        }
     }
 
     // First pass: compute dot(weights, gradWeights) using tiles
@@ -588,7 +615,7 @@ extern ""C"" __global__ void grouped_query_attention_backward(
                 float weight = attentionWeights[wOffset + ki];
                 float gw = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                    gw += goRow[d] * Vs[t * headDim + d];
                 }
                 dotWgW += weight * gw;
             }
@@ -618,18 +645,18 @@ extern ""C"" __global__ void grouped_query_attention_backward(
                 int ki = kvStart + t;
                 float weight = attentionWeights[wOffset + ki];
 
-                // Compute gradWeight for this position
+                // Compute gradWeight: gradOutput from registers, V from shared memory
                 float gw = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    gw += gradOutput[gOffset + d] * Vs[t * headDim + d];
+                    gw += goRow[d] * Vs[t * headDim + d];
                 }
 
                 float gradScore = weight * (gw - dotWgW) * scale;
 
-                // Gradient w.r.t. V
+                // Gradient w.r.t. V: gradOutput from registers
                 for (int d = 0; d < headDim; d++) {
                     atomicAdd(&gradValue[vBase + ki * headDim + d],
-                              weight * gradOutput[gOffset + d]);
+                              weight * goRow[d]);
                 }
 
                 // Gradient w.r.t. Q (K from shared memory)
@@ -637,10 +664,10 @@ extern ""C"" __global__ void grouped_query_attention_backward(
                     gradQuery[qOffset + d] += gradScore * Ks[t * headDim + d];
                 }
 
-                // Gradient w.r.t. K
+                // Gradient w.r.t. K: Q from registers
                 for (int d = 0; d < headDim; d++) {
                     atomicAdd(&gradKey[kBase + ki * headDim + d],
-                              gradScore * query[qOffset + d]);
+                              gradScore * qRow[d]);
                 }
             }
         }
@@ -686,6 +713,13 @@ extern ""C"" __global__ void flash_attention_forward(
     float outAcc[MAX_HEAD_DIM];
     for (int d = 0; d < headDim; d++) outAcc[d] = 0.0f;
 
+    // Cache Q row in registers — avoids repeated global memory reads
+    float qRow[MAX_HEAD_DIM];
+    int qOffset = bh * seqLen * headDim + qi * headDim;
+    if (qi < seqLen) {
+        for (int d = 0; d < headDim; d++) qRow[d] = query[qOffset + d];
+    }
+
     for (int kvStart = 0; kvStart < seqLen; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqLen - kvStart);
 
@@ -705,21 +739,20 @@ extern ""C"" __global__ void flash_attention_forward(
         __syncthreads();
 
         if (qi < seqLen) {
-            int qOffset = bh * seqLen * headDim + qi * headDim;
-
             for (int t = 0; t < tileSize; t++) {
                 int ki = kvStart + t;
                 if (isCausal && ki > qi) continue;
 
+                // Q dot K — Q from registers, K from shared memory
                 float score = 0.0f;
                 for (int d = 0; d < headDim; d++) {
-                    score += query[qOffset + d] * Ks[t * headDim + d];
+                    score += qRow[d] * Ks[t * headDim + d];
                 }
                 score *= scale;
 
                 float newMax = fmaxf(rowMax, score);
                 float rescale = expf(rowMax - newMax);
-                float expScore = expf(score - newMax);  // Single expf, cached
+                float expScore = expf(score - newMax);
                 rowSum = rowSum * rescale + expScore;
 
                 for (int d = 0; d < headDim; d++) {
