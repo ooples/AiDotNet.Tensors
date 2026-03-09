@@ -83,37 +83,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                // For large arrays, use non-temporal stores to avoid cache pollution.
-                // Align output to 32 bytes first (process prefix with regular stores).
-                if (length >= 32768)
+                // 4x unrolled AVX2 with software prefetch for large arrays
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    // Process unaligned prefix to reach 32-byte alignment on result
-                    int misalign = (int)((nint)(result) & 31) / sizeof(float); // 0-7 floats
-                    if (misalign > 0)
-                    {
-                        int alignCount = 8 - misalign; // floats needed to reach next 32-byte boundary
-                        int alignEnd = Math.Min(alignCount, length);
-                        for (; i < alignEnd; i++)
-                        {
-                            result[i] = a[i] + b[i];
-                        }
-                    }
-                    // Now result+i is 32-byte aligned, use NT stores for the bulk
-                    int ntSimdLength = i + ((length - i) & ~31);
                     const int prefetchDistance = 256;
-                    for (; i < ntSimdLength; i += 32)
+                    for (; i < simdLength; i += 32)
                     {
                         if (i + prefetchDistance < length)
                         {
                             Sse.Prefetch0(a + i + prefetchDistance);
                             Sse.Prefetch0(b + i + prefetchDistance);
                         }
-                        Avx.StoreAlignedNonTemporal(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
-                        Avx.StoreAlignedNonTemporal(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
-                        Avx.StoreAlignedNonTemporal(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
-                        Avx.StoreAlignedNonTemporal(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                        Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
                     }
-                    Sse2.MemoryFence();
                 }
                 else
                 {
@@ -152,34 +137,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                // Non-temporal stores for large arrays — align output then use NT for bulk
-                if (length >= 32768)
+                // 4x unrolled AVX2 with software prefetch for large arrays
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    int misalign = (int)((nint)(result) & 31) / sizeof(float);
-                    if (misalign > 0)
-                    {
-                        int alignCount = 8 - misalign;
-                        int alignEnd = Math.Min(alignCount, length);
-                        for (; i < alignEnd; i++)
-                        {
-                            result[i] = a[i] * b[i];
-                        }
-                    }
-                    int ntSimdLength = i + ((length - i) & ~31);
                     const int prefetchDistance = 256;
-                    for (; i < ntSimdLength; i += 32)
+                    for (; i < simdLength; i += 32)
                     {
                         if (i + prefetchDistance < length)
                         {
                             Sse.Prefetch0(a + i + prefetchDistance);
                             Sse.Prefetch0(b + i + prefetchDistance);
                         }
-                        Avx.StoreAlignedNonTemporal(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
-                        Avx.StoreAlignedNonTemporal(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
-                        Avx.StoreAlignedNonTemporal(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
-                        Avx.StoreAlignedNonTemporal(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                        Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
                     }
-                    Sse2.MemoryFence();
                 }
                 else
                 {
@@ -218,39 +191,25 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 var vzero = Vector256<float>.Zero;
-                // Non-temporal stores for large arrays with alignment prefix
-                if (length >= 32768)
+                int simdLength = length & ~31;
+                // 4x unrolled AVX2 with software prefetch for large arrays
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    // Process unaligned prefix to reach 32-byte alignment on output
-                    int misalign = (int)((nint)(output) & 31) / sizeof(float); // 0-7 floats
-                    if (misalign > 0)
-                    {
-                        int alignCount = 8 - misalign;
-                        int alignEnd = Math.Min(alignCount, length);
-                        for (; i < alignEnd; i++)
-                        {
-                            output[i] = input[i] > 0 ? input[i] : 0;
-                        }
-                    }
-                    // Now output+i is 32-byte aligned, use NT stores for the bulk
-                    int ntSimdLength = i + ((length - i) & ~31);
                     const int prefetchDistance = 256;
-                    for (; i < ntSimdLength; i += 32)
+                    for (; i < simdLength; i += 32)
                     {
                         if (i + prefetchDistance < length)
                         {
                             Sse.Prefetch0(input + i + prefetchDistance);
                         }
-                        Avx.StoreAlignedNonTemporal(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
-                        Avx.StoreAlignedNonTemporal(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
-                        Avx.StoreAlignedNonTemporal(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
-                        Avx.StoreAlignedNonTemporal(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                        Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                        Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
+                        Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
+                        Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
                     }
-                    Sse2.MemoryFence();
                 }
                 else
                 {
-                    int simdLength = length & ~31;
                     for (; i < simdLength; i += 32)
                     {
                         Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
