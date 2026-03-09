@@ -1889,28 +1889,23 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            T[] aArr = a.GetDataArray();
-            T[] bArr = b.GetDataArray();
-            T[] rArr = result.GetDataArray();
-            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
-            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
-            float[] rFloat = Unsafe.As<T[], float[]>(ref rArr);
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
 
-            // Parallel SIMD for medium-large arrays
-            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
+            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (addChunks >= 2)
             {
-                var aMem = (Memory<float>)(object)a.Data;
-                var bMem = (Memory<float>)(object)b.Data;
-                var rMem = (Memory<float>)(object)result.Data;
-                using var pinA = aMem.Pin();
-                using var pinB = bMem.Pin();
-                using var pinR = rMem.Pin();
-                float* pA = (float*)pinA.Pointer;
-                float* pB = (float*)pinB.Pointer;
-                float* pR = (float*)pinR.Pointer;
                 int chunkSize = (length + addChunks - 1) / addChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
@@ -1926,13 +1921,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Strategy 3: Single-thread SIMD for small arrays
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                fixed (float* ptrR = rFloat)
-                {
-                    SimdKernels.VectorAddUnsafe(ptrA, ptrB, ptrR, length);
-                }
+                SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
             }
             return result;
         }
@@ -1960,62 +1949,45 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            T[] aArr = a.GetDataArray();
-            T[] bArr = b.GetDataArray();
-            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
-            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
 
 #if !NET471
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    if (OneDnnProvider.TryAdd(ptrB, ptrA, ptrA, length))
-                        return;
-                }
+                if (OneDnnProvider.TryAdd(pB, pA, pA, length))
+                    return;
             }
 #endif
 
-            // Strategy 2: Parallel SIMD for large arrays
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            // Bandwidth-bound: parallel only helps above ~2M elements
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
-                var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
-                var handleB = System.Runtime.InteropServices.GCHandle.Alloc(bFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
-                try
-                {
-                    float* pA = (float*)handleA.AddrOfPinnedObject();
-                    float* pB = (float*)handleB.AddrOfPinnedObject();
-                    int chunkSize = (length + numChunks - 1) / numChunks;
-                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
 
-                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
-                        }
-                    });
-                }
-                finally
+                Parallel.For(0, numChunks, chunk =>
                 {
-                    handleB.Free();
-                    handleA.Free();
-                }
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
+                    }
+                });
             }
             else
             {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    SimdKernels.VectorAddUnsafe(ptrB, ptrA, ptrA, length);
-                }
+                SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
             }
             return;
         }
@@ -2132,28 +2104,23 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            T[] aArr = a.GetDataArray();
-            T[] bArr = b.GetDataArray();
-            T[] rArr = result.GetDataArray();
-            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
-            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
-            float[] rFloat = Unsafe.As<T[], float[]>(ref rArr);
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
 
-            // Parallel SIMD for medium-large arrays
-            int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
+            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (subChunks >= 2)
             {
-                var aMem = (Memory<float>)(object)a.Data;
-                var bMem = (Memory<float>)(object)b.Data;
-                var rMem = (Memory<float>)(object)result.Data;
-                using var pinA = aMem.Pin();
-                using var pinB = bMem.Pin();
-                using var pinR = rMem.Pin();
-                float* pA = (float*)pinA.Pointer;
-                float* pB = (float*)pinB.Pointer;
-                float* pR = (float*)pinR.Pointer;
                 int chunkSize = (length + subChunks - 1) / subChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
@@ -2169,12 +2136,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                fixed (float* ptrR = rFloat)
-                {
-                    SimdKernels.VectorSubtractUnsafe(ptrA, ptrB, ptrR, length);
-                }
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pR, length);
             }
             return result;
         }
@@ -2200,28 +2162,23 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            T[] aArr = a.GetDataArray();
-            T[] bArr = b.GetDataArray();
-            T[] rArr = result.GetDataArray();
-            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
-            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
-            float[] rFloat = Unsafe.As<T[], float[]>(ref rArr);
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
 
-            // Parallel SIMD for medium-large arrays
-            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
+            // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
+            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (mulChunks >= 2)
             {
-                var aMem = (Memory<float>)(object)a.Data;
-                var bMem = (Memory<float>)(object)b.Data;
-                var rMem = (Memory<float>)(object)result.Data;
-                using var pinA = aMem.Pin();
-                using var pinB = bMem.Pin();
-                using var pinR = rMem.Pin();
-                float* pA = (float*)pinA.Pointer;
-                float* pB = (float*)pinB.Pointer;
-                float* pR = (float*)pinR.Pointer;
                 int chunkSize = (length + mulChunks - 1) / mulChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
@@ -2237,13 +2194,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Strategy 3: Single-thread SIMD for small arrays
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                fixed (float* ptrR = rFloat)
-                {
-                    SimdKernels.VectorMultiplyUnsafe(ptrA, ptrB, ptrR, length);
-                }
+                SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, length);
             }
             return result;
         }
@@ -2270,62 +2221,46 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            T[] aArr = a.GetDataArray();
-            T[] bArr = b.GetDataArray();
-            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
-            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
 
 #if !NET471
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    if (OneDnnProvider.TryMultiply(ptrB, ptrA, ptrA, length))
-                        return;
-                }
+                if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
+                    return;
             }
 #endif
 
-            // Strategy 2: Parallel SIMD for large arrays
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            // Bandwidth-bound: parallel only helps above ~2M elements
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
-                var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
-                var handleB = System.Runtime.InteropServices.GCHandle.Alloc(bFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
-                try
-                {
-                    float* pA = (float*)handleA.AddrOfPinnedObject();
-                    float* pB = (float*)handleB.AddrOfPinnedObject();
-                    int chunkSize = (length + numChunks - 1) / numChunks;
-                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
 
-                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
-                        }
-                    });
-                }
-                finally
+                Parallel.For(0, numChunks, chunk =>
                 {
-                    handleB.Free();
-                    handleA.Free();
-                }
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
+                    }
+                });
             }
             else
             {
-                fixed (float* ptrA = aFloat)
-                fixed (float* ptrB = bFloat)
-                {
-                    SimdKernels.VectorMultiplyUnsafe(ptrB, ptrA, ptrA, length);
-                }
+                SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
             }
             return;
         }
@@ -3922,23 +3857,20 @@ public class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy
         if (typeof(T) == typeof(float))
         {
-            T[] srcArr = tensor.GetDataArray();
-            T[] dstArr = result.GetDataArray();
-            float[] srcFloat = Unsafe.As<T[], float[]>(ref srcArr);
-            float[] dstFloat = Unsafe.As<T[], float[]>(ref dstArr);
+            var srcMem = (Memory<float>)(object)tensor.Data;
+            var dstMem = (Memory<float>)(object)result.Data;
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
 
             // Sigmoid is compute-bound — parallelism helps even at smaller sizes
             int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
             if (sigChunks >= 2)
             {
-                var srcMem = (Memory<float>)(object)tensor.Data;
-                var dstMem = (Memory<float>)(object)result.Data;
-                using var pinSrc = srcMem.Pin();
-                using var pinDst = dstMem.Pin();
-                float* pSrc = (float*)pinSrc.Pointer;
-                float* pDst = (float*)pinDst.Pointer;
                 int chunkSize = (length + sigChunks - 1) / sigChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
@@ -3954,11 +3886,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                fixed (float* ptrSrc = srcFloat)
-                fixed (float* ptrDst = dstFloat)
-                {
-                    SimdKernels.SigmoidUnsafe(ptrSrc, ptrDst, length);
-                }
+                SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
             return result;
         }
@@ -4013,44 +3941,33 @@ public class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            T[] arr = tensor.GetDataArray();
-            float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
+            var mem = (Memory<float>)(object)tensor.Data;
+            using var pin = mem.Pin();
+            float* p = (float*)pin.Pointer;
 
-            // Sigmoid is compute-bound (~10 SIMD instructions per 8 elements).
-            // Parallelism genuinely helps — use all available cores.
-            int sigChunks = length >= 100_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            // Sigmoid is compute-bound — parallelism helps even at smaller sizes
+            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
             if (sigChunks >= 2)
             {
-                // Use GCHandle instead of Memory.Pin() to avoid boxing allocation
-                var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
-                try
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, sigChunks, chunk =>
                 {
-                    float* p = (float*)handle.AddrOfPinnedObject();
-                    int chunkSize = (length + sigChunks - 1) / sigChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-                    CpuParallelSettings.LightweightParallel(sigChunks, chunk =>
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
                     {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.SigmoidUnsafe(p + start, p + start, count);
-                        }
-                    });
-                }
-                finally
-                {
-                    handle.Free();
-                }
+                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
+                    }
+                });
             }
             else
             {
-                fixed (float* ptr = floatArr)
-                {
-                    SimdKernels.SigmoidUnsafe(ptr, ptr, length);
-                }
+                SimdKernels.SigmoidUnsafe(p, p, length);
             }
             return;
         }
@@ -4084,23 +4001,20 @@ public class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            T[] srcArr = tensor.GetDataArray();
-            T[] dstArr = result.GetDataArray();
-            float[] srcFloat = Unsafe.As<T[], float[]>(ref srcArr);
-            float[] dstFloat = Unsafe.As<T[], float[]>(ref dstArr);
+            var srcMem = (Memory<float>)(object)tensor.Data;
+            var dstMem = (Memory<float>)(object)result.Data;
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
 
-            // Parallel SIMD for medium-large arrays
-            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
+            // Bandwidth-bound: parallel only helps above ~2M elements (16MB+ total data)
+            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (reluChunks >= 2)
             {
-                var srcMem = (Memory<float>)(object)tensor.Data;
-                var dstMem = (Memory<float>)(object)result.Data;
-                using var pinSrc = srcMem.Pin();
-                using var pinDst = dstMem.Pin();
-                float* pSrc = (float*)pinSrc.Pointer;
-                float* pDst = (float*)pinDst.Pointer;
                 int chunkSize = (length + reluChunks - 1) / reluChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
@@ -4116,12 +4030,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Strategy 3: Single-thread SIMD for small arrays
-                fixed (float* ptrSrc = srcFloat)
-                fixed (float* ptrDst = dstFloat)
-                {
-                    SimdKernels.ReLUUnsafe(ptrSrc, ptrDst, length);
-                }
+                SimdKernels.ReLUUnsafe(pSrc, pDst, length);
             }
             return result;
         }
@@ -4175,44 +4084,33 @@ public class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            T[] arr = tensor.GetDataArray();
-            float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
+            var mem = (Memory<float>)(object)tensor.Data;
+            using var pin = mem.Pin();
+            float* p = (float*)pin.Pointer;
 
-            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
-            // Each chunk ~62K floats = 250KB, well within L2 per core.
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            // Bandwidth-bound: parallel only helps above ~2M elements
+            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
-                var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
-                try
-                {
-                    float* p = (float*)handle.AddrOfPinnedObject();
-                    int chunkSize = (length + numChunks - 1) / numChunks;
-                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
 
-                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.ReLUUnsafe(p + start, p + start, count);
-                        }
-                    });
-                }
-                finally
+                Parallel.For(0, numChunks, chunk =>
                 {
-                    handle.Free();
-                }
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.ReLUUnsafe(p + start, p + start, count);
+                    }
+                });
             }
             else
             {
-                fixed (float* ptr = floatArr)
-                {
-                    SimdKernels.ReLUUnsafe(ptr, ptr, length);
-                }
+                SimdKernels.ReLUUnsafe(p, p, length);
             }
             return;
         }
