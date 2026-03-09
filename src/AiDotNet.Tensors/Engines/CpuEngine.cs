@@ -1965,8 +1965,20 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
-            // Each chunk ~62K floats = 250KB, well within L2 per core.
+#if !NET471
+            // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
+            if (OneDnnProvider.IsAvailable)
+            {
+                fixed (float* ptrA = aFloat)
+                fixed (float* ptrB = bFloat)
+                {
+                    if (OneDnnProvider.TryAdd(ptrB, ptrA, ptrA, length))
+                        return;
+                }
+            }
+#endif
+
+            // Strategy 2: Parallel SIMD for large arrays
             int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
@@ -2164,8 +2176,20 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
-            // Each chunk ~62K floats = 250KB, well within L2 per core.
+#if !NET471
+            // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
+            if (OneDnnProvider.IsAvailable)
+            {
+                fixed (float* ptrA = aFloat)
+                fixed (float* ptrB = bFloat)
+                {
+                    if (OneDnnProvider.TryMultiply(ptrB, ptrA, ptrA, length))
+                        return;
+                }
+            }
+#endif
+
+            // Strategy 2: Parallel SIMD for large arrays
             int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
