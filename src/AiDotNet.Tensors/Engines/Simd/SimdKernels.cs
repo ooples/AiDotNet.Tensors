@@ -83,8 +83,27 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                // For large arrays (>L2 cache), use software prefetch to hide memory latency
-                if (Sse.IsSupported && length >= 131072) // 512KB threshold
+                // For very large arrays (> L3 cache), use non-temporal stores when aligned
+                // to avoid cache pollution (saves ~40% DRAM traffic by eliminating RFO)
+                if (length >= 524288 && ((nint)result & 31) == 0) // 2MB threshold, 32-byte aligned
+                {
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(a + i + prefetchDistance);
+                            Sse.Prefetch0(b + i + prefetchDistance);
+                        }
+                        Avx.StoreAlignedNonTemporal(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.StoreAlignedNonTemporal(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.StoreAlignedNonTemporal(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.StoreAlignedNonTemporal(result + i + 24, Avx.Add(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
+                    Sse2.MemoryFence(); // Ensure non-temporal stores are visible
+                }
+                // For large arrays (>L2 cache), use software prefetch with regular stores
+                else if (Sse.IsSupported && length >= 131072) // 512KB threshold
                 {
                     const int prefetchDistance = 256; // 256 floats = 1KB ahead
                     for (; i < simdLength; i += 32)
@@ -137,7 +156,25 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                if (Sse.IsSupported && length >= 131072)
+                // Non-temporal stores for very large arrays (>= 2MB) when output is 32-byte aligned
+                if (length >= 524288 && ((nint)result & 31) == 0)
+                {
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(a + i + prefetchDistance);
+                            Sse.Prefetch0(b + i + prefetchDistance);
+                        }
+                        Avx.StoreAlignedNonTemporal(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                        Avx.StoreAlignedNonTemporal(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                        Avx.StoreAlignedNonTemporal(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                        Avx.StoreAlignedNonTemporal(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                    }
+                    Sse2.MemoryFence();
+                }
+                else if (Sse.IsSupported && length >= 131072)
                 {
                     const int prefetchDistance = 256;
                     for (; i < simdLength; i += 32)
@@ -191,7 +228,24 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 var vzero = Vector256<float>.Zero;
                 int simdLength = length & ~31;
-                if (Sse.IsSupported && length >= 131072)
+                // Non-temporal stores for very large arrays when output is 32-byte aligned
+                if (length >= 524288 && ((nint)output & 31) == 0)
+                {
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(input + i + prefetchDistance);
+                        }
+                        Avx.StoreAlignedNonTemporal(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                        Avx.StoreAlignedNonTemporal(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
+                        Avx.StoreAlignedNonTemporal(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
+                        Avx.StoreAlignedNonTemporal(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                    }
+                    Sse2.MemoryFence();
+                }
+                else if (Sse.IsSupported && length >= 131072)
                 {
                     const int prefetchDistance = 256;
                     for (; i < simdLength; i += 32)
