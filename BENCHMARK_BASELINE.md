@@ -1,4 +1,4 @@
-# CPU Benchmark Baseline
+# Benchmark Baseline (CPU + GPU)
 
 Date: 2026-03-09
 Hardware: AMD Ryzen 9 3950X, DDR4, Windows 11 Pro
@@ -80,3 +80,92 @@ Many operations allocate full copies (4MB for 1M floats):
 - Softmax: 6MB
 
 Root cause: These ops go through non-in-place paths that call `.ToArray()` or create new Tensor<T>.
+
+---
+
+## GPU Benchmark Baseline
+
+Date: 2026-03-09
+Hardware: AMD gfx1012 (RDNA1), 11 CUs, 4GB VRAM, OpenCL backend
+Runtime: .NET 10.0, Stopwatch-based (100 runs, 10 warmup)
+
+### GPU Activation Performance (1M floats)
+
+| Operation | Bandwidth (GB/s) | Status |
+|-----------|------------------|--------|
+| ReLU | 176 | OK |
+| Sigmoid | 168 | OK |
+| Tanh | 178 | OK |
+| GELU | 128 | OK |
+| **Softmax** | **1.67** | **P0 — serial, 105x slower than ReLU** |
+
+### GPU Normalization Performance
+
+| Operation | Config | GFLOPS | Status |
+|-----------|--------|--------|--------|
+| BatchNorm | 64ch 32x32 | 78-94 | OK |
+| LayerNorm | 512x1024 | 19-48 | GAP |
+| **GroupNorm** | 32groups | **6-12** | **P0 — no parallel reduction** |
+| **InstanceNorm** | 64ch | **3-9** | **P0 — no parallel reduction** |
+| RmsNorm | 512x1024 | ~48 | OK |
+
+### GPU GEMM Performance
+
+| Size | Time (ms) | GFLOPS | Status |
+|------|-----------|--------|--------|
+| 256x256 | 0.10 | 338 | NEEDS WORK |
+| 512x512 | 0.15 | 1,786 | MODERATE |
+| 1024x1024 | 0.86 | 2,506 | MODERATE |
+| 2048x2048 | 5.61 | 3,061 | MODERATE |
+| 4096x4096 | 60.74 | 2,263 | MODERATE |
+
+Peak theoretical: ~5,000 GFLOPS (gfx1012 FP32). Achieving 50-60%.
+
+### GPU Fused Operations (256x1024 * 1024x4096)
+
+| Fusion | Time (ms) | GFLOPS | Status |
+|--------|-----------|--------|--------|
+| GEMM only | 6.60 | 326 | OK |
+| GEMM+ReLU | 6.66 | 323 | OK |
+| GEMM+GELU | 6.81 | 316 | OK |
+| GEMM+Sigmoid | 6.73 | 319 | OK |
+| GEMM+Tanh | 6.96 | 308 | OK |
+
+### GPU Attention (batch=2, heads=8, headDim=64)
+
+| SeqLen | FlashAttn (ms) | GFLOPS | Status |
+|--------|----------------|--------|--------|
+| 128 | 3.39 | 19.8 | OK |
+| 256 | 12.28 | 21.9 | OK |
+| 512 | 51.41 | 20.9 | OK |
+| 1024 | 212.86 | 20.2 | OK |
+| ScaledDotProduct | ERROR (-52) | - | BROKEN |
+
+### GPU Convolution
+
+| Config | GFLOPS | Status |
+|--------|--------|--------|
+| ResNet conv3x3 (64ch 56x56) | 559 | OK |
+| 1x1 projection (256→64) | 50 | GAP |
+| Backward input | 81 | GAP |
+| Backward kernel | ERROR | BROKEN (missing key) |
+
+### GPU Memory Transfer
+
+| Metric | Value |
+|--------|-------|
+| Min operation overhead | 0.38 ms |
+| Max operations/sec | 2,639 ops/s |
+| 2048x2048 MatMul | 17.86 ms (984 GFLOPS) |
+| Compute-bound ratio | 98% |
+
+### GPU P0 Gaps
+
+| Operation | Issue | Root Cause |
+|-----------|-------|------------|
+| Softmax | 105x slower than ReLU bandwidth | Serial reduction, no block-level parallelism |
+| GroupNorm | 6-12 GFLOPS | No warp-shuffle parallel reduction |
+| InstanceNorm | 3-9 GFLOPS | No warp-shuffle parallel reduction |
+| ScaledDotProduct | ERROR -52 | Kernel enqueue failure |
+| Conv backward kernel | ERROR | Missing dictionary key |
+| 1x1 projection conv | 50 GFLOPS (11x below conv3x3) | Suboptimal kernel selection |
