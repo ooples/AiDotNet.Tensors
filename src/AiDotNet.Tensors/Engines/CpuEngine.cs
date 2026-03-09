@@ -4848,13 +4848,18 @@ public class CpuEngine : ITensorLevelEngine
 
         int rows = tensor.Shape[0];
         int cols = tensor.Shape[1];
-        var result = new Tensor<T>([cols, rows]);
+        var result = TensorAllocator.Rent<T>(new[] { cols, rows });
 
+        var srcData = tensor.GetDataArray();
+        var dstData = result.GetDataArray();
+
+        // Direct array transpose avoids indexer overhead
         for (int i = 0; i < rows; i++)
         {
+            int srcRow = i * cols;
             for (int j = 0; j < cols; j++)
             {
-                result[j, i] = tensor[i, j];
+                dstData[j * rows + i] = srcData[srcRow + j];
             }
         }
 
@@ -17383,24 +17388,66 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        var result = new T[gradData.Length];
         int length = gradData.Length;
 
-        if (gradData is float[] gF && outData is float[] oF && result is float[] rF)
+        // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
+        if (gradData is float[] gF && outData is float[] oF)
         {
-            Parallel.For(0, length, i => { rF[i] = gF[i] * oF[i] * (1f - oF[i]); });
+#if NET5_0_OR_GREATER
+            var resultArr = GC.AllocateUninitializedArray<float>(length);
+#else
+            var resultArr = new float[length];
+#endif
+            SigmoidBackwardFloat(gF, oF, resultArr);
+            return (Tensor<T>)(object)new Tensor<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
-        else
+
+        var result = new T[length];
+
+        for (int i = 0; i < length; i++)
         {
-            for (int i = 0; i < length; i++)
-            {
-                double s = numOps.ToDouble(outData[i]);
-                double grad = numOps.ToDouble(gradData[i]);
-                result[i] = numOps.FromDouble(grad * s * (1.0 - s));
-            }
+            double s = numOps.ToDouble(outData[i]);
+            double grad = numOps.ToDouble(gradData[i]);
+            result[i] = numOps.FromDouble(grad * s * (1.0 - s));
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+    }
+
+    private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
+    {
+        int length = grad.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)
+        {
+            fixed (float* gp = grad, sp = sigmoid, rp = result)
+            {
+                var one = System.Runtime.Intrinsics.Vector256.Create(1.0f);
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i);
+                    var s0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sp + i);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i, System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g0, s0), System.Runtime.Intrinsics.X86.Avx.Subtract(one, s0)));
+
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 8);
+                    var s1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sp + i + 8);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 8, System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g1, s1), System.Runtime.Intrinsics.X86.Avx.Subtract(one, s1)));
+
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 16);
+                    var s2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sp + i + 16);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 16, System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g2, s2), System.Runtime.Intrinsics.X86.Avx.Subtract(one, s2)));
+
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 24);
+                    var s3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(sp + i + 24);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 24, System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(g3, s3), System.Runtime.Intrinsics.X86.Avx.Subtract(one, s3)));
+                }
+            }
+        }
+#endif
+        for (; i < length; i++)
+            result[i] = grad[i] * sigmoid[i] * (1f - sigmoid[i]);
     }
 
     /// <inheritdoc/>
@@ -17409,24 +17456,66 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        var result = new T[gradData.Length];
         int length = gradData.Length;
 
-        if (gradData is float[] gF && outData is float[] oF && result is float[] rF)
+        // Float fast path: SIMD grad * (1 - tanh^2)
+        if (gradData is float[] gF && outData is float[] oF)
         {
-            Parallel.For(0, length, i => { rF[i] = gF[i] * (1f - oF[i] * oF[i]); });
+#if NET5_0_OR_GREATER
+            var resultArr = GC.AllocateUninitializedArray<float>(length);
+#else
+            var resultArr = new float[length];
+#endif
+            TanhBackwardFloat(gF, oF, resultArr);
+            return (Tensor<T>)(object)new Tensor<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
-        else
+
+        var result = new T[length];
+
+        for (int i = 0; i < length; i++)
         {
-            for (int i = 0; i < length; i++)
-            {
-                double t = numOps.ToDouble(outData[i]);
-                double grad = numOps.ToDouble(gradData[i]);
-                result[i] = numOps.FromDouble(grad * (1.0 - t * t));
-            }
+            double t = numOps.ToDouble(outData[i]);
+            double grad = numOps.ToDouble(gradData[i]);
+            result[i] = numOps.FromDouble(grad * (1.0 - t * t));
         }
 
         return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+    }
+
+    private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
+    {
+        int length = grad.Length;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && length >= 32)
+        {
+            fixed (float* gp = grad, tp = tanh, rp = result)
+            {
+                var one = System.Runtime.Intrinsics.Vector256.Create(1.0f);
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    var g0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i);
+                    var t0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(tp + i);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i, System.Runtime.Intrinsics.X86.Avx.Multiply(g0, System.Runtime.Intrinsics.X86.Avx.Subtract(one, System.Runtime.Intrinsics.X86.Avx.Multiply(t0, t0))));
+
+                    var g1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 8);
+                    var t1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(tp + i + 8);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 8, System.Runtime.Intrinsics.X86.Avx.Multiply(g1, System.Runtime.Intrinsics.X86.Avx.Subtract(one, System.Runtime.Intrinsics.X86.Avx.Multiply(t1, t1))));
+
+                    var g2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 16);
+                    var t2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(tp + i + 16);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 16, System.Runtime.Intrinsics.X86.Avx.Multiply(g2, System.Runtime.Intrinsics.X86.Avx.Subtract(one, System.Runtime.Intrinsics.X86.Avx.Multiply(t2, t2))));
+
+                    var g3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(gp + i + 24);
+                    var t3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(tp + i + 24);
+                    System.Runtime.Intrinsics.X86.Avx.Store(rp + i + 24, System.Runtime.Intrinsics.X86.Avx.Multiply(g3, System.Runtime.Intrinsics.X86.Avx.Subtract(one, System.Runtime.Intrinsics.X86.Avx.Multiply(t3, t3))));
+                }
+            }
+        }
+#endif
+        for (; i < length; i++)
+            result[i] = grad[i] * (1f - tanh[i] * tanh[i]);
     }
 
     /// <inheritdoc/>

@@ -2053,19 +2053,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET8_0_OR_GREATER
-            // On .NET 8+, the JIT auto-vectorizes MathF.Log using SVML (vlogps),
-            // which is faster than our polynomial approximation.
-            int unrolled = length & ~3;
-            for (; i < unrolled; i += 4)
-            {
-                output[i] = MathF.Log(input[i]);
-                output[i + 1] = MathF.Log(input[i + 1]);
-                output[i + 2] = MathF.Log(input[i + 2]);
-                output[i + 3] = MathF.Log(input[i + 3]);
-            }
-#elif NET5_0_OR_GREATER
-            // On .NET 5-7, use our FastLog256 polynomial since SVML is not available
+#if NET5_0_OR_GREATER
+            // Use FastLog256 on ALL .NET versions — benchmarks prove SVML auto-vectorization
+            // does NOT work through Span indexing, so our polynomial is 5-20x faster.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
