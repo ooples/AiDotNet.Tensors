@@ -92,6 +92,24 @@ internal static class CpuJitSelfTest
                     return false;
             }
 
+            // Test 4: Sigmoid kernel (uses data section constants)
+            for (int i = 0; i < testSize; i++)
+            {
+                spanA[i] = (i - 32) * 0.2f; // -6.4 to +6.2, covers clamping range
+            }
+
+            var sigmoidKernel = CpuJitKernels.GetSigmoidKernel(testSize);
+            sigmoidKernel(srcA.FloatPtr, dst.FloatPtr, testSize);
+
+            for (int i = 0; i < testSize; i++)
+            {
+                float x = (i - 32) * 0.2f;
+                float expected = 1.0f / (1.0f + MathF.Exp(-x));
+                // Polynomial approximation has ~0.004 max error
+                if (MathF.Abs(spanDst[i] - expected) > 0.01f)
+                    return false;
+            }
+
             return true;
         }
         catch

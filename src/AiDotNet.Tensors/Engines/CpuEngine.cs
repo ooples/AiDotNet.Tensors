@@ -3921,14 +3921,42 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
 
-            // Sigmoid is compute-bound — parallelism helps even at smaller sizes
-            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
-            if (sigChunks >= 2)
+            // JIT-compiled sigmoid: constants baked in data section, 4x unrolled
+            if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+                if (sigChunks >= 2)
+                {
+                    int chunkSize = (length + sigChunks - 1) / sigChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, sigChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
+                            kernel(pSrc + start, pDst + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
+                    kernel(pSrc, pDst, length);
+                }
+                return result;
+            }
+
+            // SIMD fallback
+            int fallbackChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+            if (fallbackChunks >= 2)
+            {
+                int chunkSize = (length + fallbackChunks - 1) / fallbackChunks;
                 chunkSize = (chunkSize + 31) & ~31;
 
-                Parallel.For(0, sigChunks, chunk =>
+                Parallel.For(0, fallbackChunks, chunk =>
                 {
                     int start = chunk * chunkSize;
                     int count = Math.Min(chunkSize, length - start);
@@ -4002,7 +4030,35 @@ public class CpuEngine : ITensorLevelEngine
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
-            // Sigmoid is compute-bound — parallelism helps even at smaller sizes
+            // JIT-compiled sigmoid in-place: constants baked in data section
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                int jitChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+                if (jitChunks >= 2)
+                {
+                    int chunkSize = (length + jitChunks - 1) / jitChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, jitChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
+                            kernel(p + start, p + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
+                    kernel(p, p, length);
+                }
+                return;
+            }
+
+            // SIMD fallback
             int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
             if (sigChunks >= 2)
             {

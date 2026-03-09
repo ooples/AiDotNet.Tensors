@@ -23,6 +23,12 @@ internal sealed class X86Emitter
     private readonly Dictionary<int, int> _labels = new();
     private int _nextLabel;
 
+    // Data section: float constants embedded after code, loaded via MOV R11 + VBROADCASTSS [R11]
+    // Each constant is 4 bytes (float), appended after code in the ExecutableBuffer.
+    // At Build() time, we know the absolute address and patch MOV R11, imm64 instructions.
+    private readonly List<float> _dataConstants = new();
+    private readonly List<(int codeOffset, int constIndex)> _dataFixups = new(); // codeOffset points to the imm64 of MOV R11
+
     /// <summary>Current code size in bytes.</summary>
     public int Size => _code.Count;
 
@@ -489,6 +495,49 @@ internal sealed class X86Emitter
         Emit(0xC3);
     }
 
+    // ==================== Data Section Constants ====================
+
+    /// <summary>
+    /// Registers a float constant in the data section. Returns the constant index.
+    /// Reuses existing constants with the same value.
+    /// </summary>
+    public int EmitDataConstant(float value)
+    {
+        // Check for existing constant with same bit pattern
+        int bits = BitConverter.SingleToInt32Bits(value);
+        for (int i = 0; i < _dataConstants.Count; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(_dataConstants[i]) == bits)
+                return i;
+        }
+        _dataConstants.Add(value);
+        return _dataConstants.Count - 1;
+    }
+
+    /// <summary>
+    /// VBROADCASTSS ymm, [data_constant] — Broadcast a data section float constant to all 8 lanes.
+    /// Emits: MOV R11, imm64 (patched at Build time) + VBROADCASTSS ymm, [R11]
+    /// R11 is caller-saved (volatile) in Windows x64 ABI, safe to use as scratch.
+    /// </summary>
+    public void VbroadcastssConst(int dst, int constIndex)
+    {
+        // MOV R11, imm64  (REX.WB + B8+3 for R11)
+        // R11 = register 11, so REX.B is needed: 0x49, opcode B8+3=BB
+        Emit(0x49, 0xBB);
+        _dataFixups.Add((_code.Count, constIndex)); // record where the imm64 starts
+        EmitImm64(0); // placeholder — patched by Build() with actual address
+
+        // VBROADCASTSS ymm_dst, [R11]
+        // VEX.256.66.0F38.W0 18 /r with base=R11
+        Vbroadcastss(dst, R11, 0);
+    }
+
+    /// <summary>
+    /// VMOVAPS ymm, [data_constant] — Load 32 bytes from a data section address (8 copies of same float, pre-broadcasted).
+    /// Only use this when you've stored a pre-broadcasted vector constant (8 identical floats) in the data section.
+    /// For single float constants, use VbroadcastssConst instead.
+    /// </summary>
+
     // ==================== Finalize and Build ====================
 
     /// <summary>
@@ -510,13 +559,50 @@ internal sealed class X86Emitter
             _code[offset + 3] = (byte)((relOffset >> 24) & 0xFF);
         }
 
-        var buffer = new ExecutableBuffer(_code.Count);
+        // Calculate data section size: 4 bytes per float constant, 32-byte aligned start
+        int codeSize = _code.Count;
+        int dataOffset = (codeSize + 31) & ~31; // align data section to 32 bytes
+        int totalSize = _dataConstants.Count > 0 ? dataOffset + (_dataConstants.Count * 4) : codeSize;
+
+        var buffer = new ExecutableBuffer(totalSize);
         unsafe
         {
             var dst = (byte*)buffer.Pointer;
-            for (int i = 0; i < _code.Count; i++)
+
+            // Copy code
+            for (int i = 0; i < codeSize; i++)
             {
                 dst[i] = _code[i];
+            }
+
+            // Zero padding between code and data
+            for (int i = codeSize; i < dataOffset; i++)
+            {
+                dst[i] = 0xCC; // INT3 padding (trap if executed)
+            }
+
+            // Write data constants
+            for (int i = 0; i < _dataConstants.Count; i++)
+            {
+                int constAddr = dataOffset + (i * 4);
+                int bits = BitConverter.SingleToInt32Bits(_dataConstants[i]);
+                dst[constAddr] = (byte)(bits & 0xFF);
+                dst[constAddr + 1] = (byte)((bits >> 8) & 0xFF);
+                dst[constAddr + 2] = (byte)((bits >> 16) & 0xFF);
+                dst[constAddr + 3] = (byte)((bits >> 24) & 0xFF);
+            }
+
+            // Patch data fixups: each fixup points to an imm64 in a MOV R11 instruction
+            // The imm64 needs to be the absolute address of the constant in the buffer
+            long bufferBase = (long)(IntPtr)buffer.Pointer;
+            foreach (var (fixupOffset, constIndex) in _dataFixups)
+            {
+                long constAbsAddr = bufferBase + dataOffset + (constIndex * 4);
+                // Write 8 bytes (imm64) at the fixup offset
+                for (int b = 0; b < 8; b++)
+                {
+                    dst[fixupOffset + b] = (byte)((constAbsAddr >> (b * 8)) & 0xFF);
+                }
             }
         }
 
