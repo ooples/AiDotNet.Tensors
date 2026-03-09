@@ -9,7 +9,7 @@ using TorchTensor = TorchSharp.torch.Tensor;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 5, iterationCount: 15)]
 [MemoryDiagnoser]
 public class TorchSharpCpuComparisonBenchmarks
 {
@@ -56,7 +56,7 @@ public class TorchSharpCpuComparisonBenchmarks
 
         torch.set_grad_enabled(false);
         _torchDevice = torch.CPU;
-        Console.WriteLine("TorchSharp device: CPU (forced)");
+        Console.WriteLine($"TorchSharp device: CPU (forced), threads: {torch.get_num_threads()}");
         Console.WriteLine("AiDotNet BLAS: OpenBLAS package referenced (runtime load required)");
 
         foreach (var size in MatrixSizes)
@@ -252,6 +252,17 @@ public class TorchSharpCpuComparisonBenchmarks
     public void TorchSharp_Add(int size)
     {
         torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
+        ConsumeTorchResult(_torchVectorsA[size]);
+    }
+
+    [Benchmark]
+    [Arguments(1_000_000)]
+    public void TorchSharp_Add_1Thread(int size)
+    {
+        int prev = (int)torch.get_num_threads();
+        torch.set_num_threads(1);
+        torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
+        torch.set_num_threads(prev);
         ConsumeTorchResult(_torchVectorsA[size]);
     }
 
