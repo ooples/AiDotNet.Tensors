@@ -229,22 +229,19 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vc1 = Vector256.Create(2.1562920e-1f);
                 var vhalf = Vector256.Create(0.5f);
 
+                // 5th-order odd polynomial: sigmoid(x) ≈ 0.5 + x * (c1 + x² * (c3 + x² * c5))
+                // 4x unrolled: 12 FMA + 4 mul + 8 min/max per 32 floats
+                // No prefetch (branch in hot loop costs more than it saves)
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    // Prefetch for large arrays
-                    if (length >= 131072 && Sse.IsSupported && i + 256 < length)
-                    {
-                        Sse.Prefetch0(input + i + 256);
-                    }
-
-                    // Load 4 vectors and clamp all at once (ILP-friendly)
+                    // Load 4 vectors and clamp (ILP-friendly — all loads independent)
                     var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vmin), vmax);
                     var x1 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), vmin), vmax);
                     var x2 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 16), vmin), vmax);
                     var x3 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 24), vmin), vmax);
 
-                    // x² for all 4 — independent, can execute in parallel
+                    // x² for all 4 — independent, can execute in parallel on multiple ports
                     var sq0 = Avx.Multiply(x0, x0);
                     var sq1 = Avx.Multiply(x1, x1);
                     var sq2 = Avx.Multiply(x2, x2);
