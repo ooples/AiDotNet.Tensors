@@ -163,8 +163,9 @@ internal static class SimdGemm
     /// N-dimension parallel GEMM: splits columns across workers.
     /// Ideal for small M, large N (e.g. Conv2D im2col where M=outChannels, N=outputSize).
     /// Each worker packs its own B slice and processes all M rows for that column range.
+    /// Uses unsafe pinned pointers to avoid array copies for closure capture.
     /// </summary>
-    private static void SgemmTiledParallelN(
+    private static unsafe void SgemmTiledParallelN(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
         Span<float> c,
@@ -177,11 +178,10 @@ internal static class SimdGemm
         int nrPerWorker = (numNrBlocks + numWorkers - 1) / numWorkers;
 
         // Pre-pack A (shared across all workers, m is small so only 1 Mc block)
-        // For m > Mc each worker will re-pack A for additional blocks
         int firstMc = Math.Min(Mc, m);
         PackA(a, packedABuf, k, 0, firstMc, pc, kc);
 
-        // Pre-pack B slices for each worker (sequential, uses B span directly)
+        // Pre-pack B slices for each worker
         var packedBSlices = new float[numWorkers][];
         var sliceNcs = new int[numWorkers];
         var sliceJStarts = new int[numWorkers];
@@ -202,17 +202,16 @@ internal static class SimdGemm
             PackB(b, packedBSlices[w], n, pc, kc, jc + jStart, localNc);
         }
 
-        // Copy C to array for closure capture (workers write to non-overlapping columns)
-        int cLen = c.Length;
-        float[] cArr = ArrayPool<float>.Shared.Rent(cLen);
-        c.CopyTo(cArr.AsSpan(0, cLen));
-
-        // Copy A to array for closure capture (only if m > Mc, otherwise packedABuf is shared read-only)
+        // Pin A (only needed if m > Mc for additional blocks)
         float[]? aArr = null;
+        GCHandle aHandle = default;
+        float* aPtr = null;
         if (m > Mc)
         {
             aArr = ArrayPool<float>.Shared.Rent(a.Length);
             a.CopyTo(aArr);
+            aHandle = GCHandle.Alloc(aArr, GCHandleType.Pinned);
+            aPtr = (float*)aHandle.AddrOfPinnedObject();
         }
 
         try
@@ -222,43 +221,52 @@ internal static class SimdGemm
             var localPackedBSlices = packedBSlices;
             var localSliceNcs = sliceNcs;
             var localSliceJStarts = sliceJStarts;
-            var localAArr = aArr;
+            var localAPtr = aPtr;
+            int localALen = a.Length;
             int localM = m, localK = k, localN = n;
             int localJc = jc, localPc = pc, localKc = kc;
             int localFirstMc = firstMc;
+            int cLen = c.Length;
 
-            Helpers.CpuParallelSettings.LightweightParallel(actualWorkers, workerId =>
+            // Pin C for direct pointer access (workers write to non-overlapping columns)
+            fixed (float* cPtr = c)
             {
-                int localNc = localSliceNcs[workerId];
-                int jStart = localSliceJStarts[workerId];
+                var localCPtr = cPtr;
+                var localCLen = cLen;
 
-                // First Mc block: use shared pre-packed A
-                MacroKernel(localPackedABuf, localPackedBSlices[workerId],
-                    cArr.AsSpan(), localFirstMc, localNc, localKc, localN, 0, localJc + jStart);
-
-                // Additional Mc blocks (if m > Mc)
-                for (int ic = Mc; ic < localM; ic += Mc)
+                Helpers.CpuParallelSettings.LightweightParallel(actualWorkers, workerId =>
                 {
-                    int mc = Math.Min(Mc, localM - ic);
-                    float[] workerPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
-                    try
-                    {
-                        PackA(localAArr.AsSpan(), workerPackedA, localK, ic, mc, localPc, localKc);
-                        MacroKernel(workerPackedA, localPackedBSlices[workerId],
-                            cArr.AsSpan(), mc, localNc, localKc, localN, ic, localJc + jStart);
-                    }
-                    finally
-                    {
-                        ArrayPool<float>.Shared.Return(workerPackedA);
-                    }
-                }
-            });
+                    int workerNc = localSliceNcs[workerId];
+                    int jStart = localSliceJStarts[workerId];
+                    var cSpan = new Span<float>(localCPtr, localCLen);
 
-            cArr.AsSpan(0, cLen).CopyTo(c);
+                    // First Mc block: use shared pre-packed A
+                    MacroKernel(localPackedABuf, localPackedBSlices[workerId],
+                        cSpan, localFirstMc, workerNc, localKc, localN, 0, localJc + jStart);
+
+                    // Additional Mc blocks (if m > Mc)
+                    for (int ic = Mc; ic < localM; ic += Mc)
+                    {
+                        int mc = Math.Min(Mc, localM - ic);
+                        float[] workerPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
+                        try
+                        {
+                            var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                            PackA(aSpan, workerPackedA, localK, ic, mc, localPc, localKc);
+                            MacroKernel(workerPackedA, localPackedBSlices[workerId],
+                                cSpan, mc, workerNc, localKc, localN, ic, localJc + jStart);
+                        }
+                        finally
+                        {
+                            ArrayPool<float>.Shared.Return(workerPackedA);
+                        }
+                    }
+                });
+            }
         }
         finally
         {
-            ArrayPool<float>.Shared.Return(cArr);
+            if (aHandle.IsAllocated) aHandle.Free();
             if (aArr is not null) ArrayPool<float>.Shared.Return(aArr);
             for (int w = 0; w < actualWorkers; w++)
             {
@@ -269,10 +277,9 @@ internal static class SimdGemm
 
     /// <summary>
     /// M-dimension parallel GEMM: splits rows across workers.
-    /// Ideal for tall matrices (m >= 512). Uses ArrayPool and LightweightParallel
-    /// for reduced allocation and dispatch overhead.
+    /// Ideal for tall matrices (m >= 512). Uses pinned pointers to avoid array copies.
     /// </summary>
-    private static void SgemmTiledParallelM(
+    private static unsafe void SgemmTiledParallelM(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
         Span<float> c,
@@ -283,43 +290,50 @@ internal static class SimdGemm
         // Pack B once (shared across all M workers, read-only)
         PackB(b, packedBBuf, n, pc, kc, jc, nc);
 
-        // Copy A and C to arrays for closure capture
-        int aLen = a.Length;
-        int cLen = c.Length;
-        float[] aArr = ArrayPool<float>.Shared.Rent(aLen);
-        float[] cArr = ArrayPool<float>.Shared.Rent(cLen);
+        // Pin A for closure capture (workers read non-overlapping rows)
+        float[] aArr = ArrayPool<float>.Shared.Rent(a.Length);
         a.CopyTo(aArr);
-        c.CopyTo(cArr.AsSpan(0, cLen));
+        var aHandle = GCHandle.Alloc(aArr, GCHandleType.Pinned);
 
         try
         {
             var localPackedBBuf = packedBBuf;
             int localM = m, localK = k, localN = n;
             int localJc = jc, localNc = nc, localPc = pc, localKc = kc;
+            float* localAPtr = (float*)aHandle.AddrOfPinnedObject();
+            int localALen = a.Length;
+            int cLen = c.Length;
 
-            Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks, iiBlock =>
+            // Pin C for direct pointer access (workers write to non-overlapping rows)
+            fixed (float* cPtr = c)
             {
-                int ic = iiBlock * Mc;
-                int mc = Math.Min(Mc, localM - ic);
+                var localCPtr = cPtr;
+                var localCLen = cLen;
 
-                float[] localPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
-                try
+                Helpers.CpuParallelSettings.LightweightParallel(numRowBlocks, iiBlock =>
                 {
-                    PackA(aArr.AsSpan(), localPackedA, localK, ic, mc, localPc, localKc);
-                    MacroKernel(localPackedA, localPackedBBuf, cArr.AsSpan(), mc, localNc, localKc, localN, ic, localJc);
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(localPackedA);
-                }
-            });
+                    int ic = iiBlock * Mc;
+                    int mc = Math.Min(Mc, localM - ic);
 
-            cArr.AsSpan(0, cLen).CopyTo(c);
+                    float[] localPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
+                    try
+                    {
+                        var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
+                        var cSpan = new Span<float>(localCPtr, localCLen);
+                        PackA(aSpan, localPackedA, localK, ic, mc, localPc, localKc);
+                        MacroKernel(localPackedA, localPackedBBuf, cSpan, mc, localNc, localKc, localN, ic, localJc);
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(localPackedA);
+                    }
+                });
+            }
         }
         finally
         {
+            aHandle.Free();
             ArrayPool<float>.Shared.Return(aArr);
-            ArrayPool<float>.Shared.Return(cArr);
         }
     }
 
