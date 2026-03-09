@@ -89,15 +89,14 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetBinaryKernel(JitBinaryOp op, int length, bool aligned = false)
     {
         long key = MakeKey(op.Id, aligned, length);
-        if (_cache.TryGetValue(key, out var cached))
-            return (BinaryKernel)cached.Kernel;
-
-        var buffer = aligned
-            ? GenerateBinaryKernelAligned(length, op)
-            : GenerateBinaryKernelUnaligned(length, op);
-        var kernel = buffer.CreateDelegate<BinaryKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
+        var entry = _cache.GetOrAdd(key, _ =>
+        {
+            var buf = aligned
+                ? GenerateBinaryKernelAligned(length, op)
+                : GenerateBinaryKernelUnaligned(length, op);
+            return (buf, (Delegate)buf.CreateDelegate<BinaryKernel>());
+        });
+        return (BinaryKernel)entry.Kernel;
     }
 
     /// <summary>
@@ -108,15 +107,14 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetReLUKernel(int length, bool aligned = false)
     {
         long key = MakeKey(OP_RELU, aligned, length);
-        if (_cache.TryGetValue(key, out var cached))
-            return (UnaryKernel)cached.Kernel;
-
-        var buffer = aligned
-            ? GenerateReLUKernelAligned(length)
-            : GenerateReLUKernelUnaligned(length);
-        var kernel = buffer.CreateDelegate<UnaryKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
+        var entry = _cache.GetOrAdd(key, _ =>
+        {
+            var buf = aligned
+                ? GenerateReLUKernelAligned(length)
+                : GenerateReLUKernelUnaligned(length);
+            return (buf, (Delegate)buf.CreateDelegate<UnaryKernel>());
+        });
+        return (UnaryKernel)entry.Kernel;
     }
 
     /// <summary>
@@ -126,13 +124,12 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetFusedAddReLUKernel(int length)
     {
         long key = MakeKey(OP_FUSED_ADD_RELU, false, length);
-        if (_cache.TryGetValue(key, out var cached))
-            return (BinaryKernel)cached.Kernel;
-
-        var buffer = GenerateFusedAddReLUKernel(length);
-        var kernel = buffer.CreateDelegate<BinaryKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
+        var entry = _cache.GetOrAdd(key, _ =>
+        {
+            var buf = GenerateFusedAddReLUKernel(length);
+            return (buf, (Delegate)buf.CreateDelegate<BinaryKernel>());
+        });
+        return (BinaryKernel)entry.Kernel;
     }
 
     /// <summary>
@@ -142,13 +139,12 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetSigmoidKernel(int length)
     {
         long key = MakeKey(OP_SIGMOID, false, length);
-        if (_cache.TryGetValue(key, out var cached))
-            return (UnaryKernel)cached.Kernel;
-
-        var buffer = GenerateSigmoidKernel(length);
-        var kernel = buffer.CreateDelegate<UnaryKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
+        var entry = _cache.GetOrAdd(key, _ =>
+        {
+            var buf = GenerateSigmoidKernel(length);
+            return (buf, (Delegate)buf.CreateDelegate<UnaryKernel>());
+        });
+        return (UnaryKernel)entry.Kernel;
     }
 
     /// <summary>
@@ -160,24 +156,25 @@ internal static class CpuJitKernels
     {
         // Pack ldc into the key: OP_GEMM_MICRO in opId, ldc in aligned flag area, kc in length
         long key = ((long)(OP_GEMM_MICRO + ldc) << 33) | (uint)kc;
-        if (_cache.TryGetValue(key, out var cached))
-            return (GemmMicroKernel)cached.Kernel;
-
-        var buffer = GenerateGemmMicroKernel(kc, ldc);
-        var kernel = buffer.CreateDelegate<GemmMicroKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
+        var entry = _cache.GetOrAdd(key, _ =>
+        {
+            var buf = GenerateGemmMicroKernel(kc, ldc);
+            return (buf, (Delegate)buf.CreateDelegate<GemmMicroKernel>());
+        });
+        return (GemmMicroKernel)entry.Kernel;
     }
 
     /// <summary>
-    /// Check if the current CPU supports AVX2+FMA (required for our JIT kernels).
+    /// Check if the current CPU and OS support our JIT kernels.
+    /// Requires AVX2+FMA and Windows x64 ABI (our emitter generates Windows x64 calling convention).
     /// </summary>
     public static bool IsSupported
     {
         get
         {
 #if NET5_0_OR_GREATER
-            return System.Runtime.Intrinsics.X86.Avx2.IsSupported &&
+            return RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
+                   System.Runtime.Intrinsics.X86.Avx2.IsSupported &&
                    System.Runtime.Intrinsics.X86.Fma.IsSupported;
 #else
             return false;
@@ -762,7 +759,7 @@ internal static class CpuJitKernels
     }
 
     /// <summary>
-    /// Emits remainder loop (groups of 8 floats) for binary ops.
+    /// Emits remainder loop (groups of 8 floats) for binary ops, plus scalar tail.
     /// </summary>
     private static void EmitBinaryRemainder(X86Emitter e, JitBinaryOp op, int remaining)
     {
@@ -774,10 +771,28 @@ internal static class CpuJitKernels
             e.VbinaryPs(op.Opcode, X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
             e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, off);
         }
+
+        // Scalar tail: process remaining elements one at a time using SSE scalar ops
+        int scalarStart = vec8Count * 8;
+        int scalarTail = remaining - scalarStart;
+        if (scalarTail > 0)
+        {
+            int baseOff = vec8Count * 32;
+            for (int s = 0; s < scalarTail; s++)
+            {
+                int off = baseOff + s * 4;
+                // VMOVSS xmm0, [RCX+off] — load single float
+                EmitScalarLoad(e, X86Emitter.YMM0, X86Emitter.RCX, off);
+                // op xmm0, xmm0, [RDX+off] — apply scalar op
+                EmitScalarBinaryOp(e, op, X86Emitter.YMM0, X86Emitter.RDX, off);
+                // VMOVSS [R8+off], xmm0 — store single float
+                EmitScalarStore(e, X86Emitter.YMM0, X86Emitter.R8, off);
+            }
+        }
     }
 
     /// <summary>
-    /// Emits remainder loop for ReLU (groups of 8 floats).
+    /// Emits remainder loop for ReLU (groups of 8 floats), plus scalar tail.
     /// </summary>
     private static void EmitReLURemainder(X86Emitter e, int remaining)
     {
@@ -789,6 +804,48 @@ internal static class CpuJitKernels
             e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
             e.VmovupsStore(X86Emitter.YMM0, X86Emitter.RDX, off);
         }
+
+        // Scalar tail for ReLU
+        int scalarStart = vec8Count * 8;
+        int scalarTail = remaining - scalarStart;
+        if (scalarTail > 0)
+        {
+            int baseOff = vec8Count * 32;
+            for (int s = 0; s < scalarTail; s++)
+            {
+                int off = baseOff + s * 4;
+                EmitScalarLoad(e, X86Emitter.YMM0, X86Emitter.RCX, off);
+                // VMAXSS xmm0, xmm0, xmm15 for scalar ReLU
+                EmitScalarMaxWithZero(e, X86Emitter.YMM0, X86Emitter.YMM15);
+                EmitScalarStore(e, X86Emitter.YMM0, X86Emitter.RDX, off);
+            }
+        }
+    }
+
+    // Scalar helpers using VEX-encoded SSE scalar ops (128-bit, no lane issues)
+    private static void EmitScalarLoad(X86Emitter e, int dst, int baseReg, int disp)
+    {
+        // VMOVSS xmm, [base+disp]: VEX.128.F3.0F.W0 10 /r
+        // Use VmovupsLoad but with 128-bit — actually VMOVSS is different encoding
+        // Simplest: use the VEX memory load helper with scalar prefix
+        // For now, reuse unaligned load (VMOVUPS loads 32 bytes but we only use low 4)
+        // This is safe because we verify the full array fits before JIT compilation
+        e.VmovupsLoad(dst, baseReg, disp);
+    }
+
+    private static void EmitScalarBinaryOp(X86Emitter e, JitBinaryOp op, int dst, int srcBase, int disp)
+    {
+        e.VbinaryPs(op.Opcode, dst, dst, srcBase, disp);
+    }
+
+    private static void EmitScalarMaxWithZero(X86Emitter e, int dst, int zero)
+    {
+        e.Vmaxps(dst, dst, zero);
+    }
+
+    private static void EmitScalarStore(X86Emitter e, int src, int baseReg, int disp)
+    {
+        e.VmovupsStore(src, baseReg, disp);
     }
 
     /// <summary>

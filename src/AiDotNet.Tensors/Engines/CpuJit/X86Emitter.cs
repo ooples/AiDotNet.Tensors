@@ -324,14 +324,14 @@ internal sealed class X86Emitter
     /// <summary>PREFETCHT0 [base+disp] — Prefetch to L1 cache</summary>
     public void Prefetcht0(int baseReg, int disp)
     {
-        // 0F 18 /1  (reg=1 in ModR/M)
-        Emit(0x0F, 0x18);
+        // REX prefix needed for R8-R15 base registers
         if (baseReg >= 8)
         {
-            // Need REX prefix for R8-R15 — actually we need to handle this differently
-            // For simplicity, we encode it without REX for base < 8
+            Emit((byte)(0x41)); // REX.B
         }
-        if (disp == 0 && baseReg != RBP)
+        // 0F 18 /1  (reg=1 in ModR/M)
+        Emit(0x0F, 0x18);
+        if (disp == 0 && (baseReg & 7) != RBP)
         {
             EmitModRM(0, 1, baseReg & 7);
         }
@@ -623,6 +623,8 @@ internal sealed class X86Emitter
             }
         }
 
+        // Switch from writable to executable (W^X compliance)
+        buffer.MakeExecutable();
         return buffer;
     }
 

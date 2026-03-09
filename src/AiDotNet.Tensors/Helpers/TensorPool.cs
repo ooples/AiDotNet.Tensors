@@ -32,7 +32,7 @@ internal static class TensorPool
     {
         int totalSize = 1;
         for (int i = 0; i < shape.Length; i++)
-            totalSize *= shape[i];
+            totalSize = checked(totalSize * shape[i]);
 
         if (!Enabled || totalSize == 0)
         {

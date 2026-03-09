@@ -104,8 +104,11 @@ internal static class SimdGemm
         int k,
         int n)
     {
-        int packedASize = Mc * Kc;
-        int packedBSize = Kc * Nc;
+        // Round up to micro-tile dimensions to avoid buffer overruns in PackA/PackB padding
+        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
+        int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
+        int packedASize = mcRounded * Kc;
+        int packedBSize = Kc * ncRounded;
         float[] packedABuf = ArrayPool<float>.Shared.Rent(packedASize);
         float[] packedBBuf = ArrayPool<float>.Shared.Rent(packedBSize);
 

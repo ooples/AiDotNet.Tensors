@@ -101,6 +101,8 @@ internal sealed class AlignedBuffer : IDisposable
     {
         if (count > FloatCount)
             throw new ArgumentException($"Count ({count}) exceeds buffer capacity ({FloatCount}).");
+        if (offset < 0 || offset + count > source.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset), $"Offset ({offset}) + count ({count}) exceeds source length ({source.Length}).");
 
         fixed (float* srcPtr = source)
         {
@@ -129,6 +131,8 @@ internal sealed class AlignedBuffer : IDisposable
     {
         if (count > FloatCount)
             throw new ArgumentException($"Count ({count}) exceeds buffer capacity ({FloatCount}).");
+        if (offset < 0 || offset + count > destination.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset), $"Offset ({offset}) + count ({count}) exceeds destination length ({destination.Length}).");
 
         fixed (float* dstPtr = destination)
         {
@@ -140,6 +144,7 @@ internal sealed class AlignedBuffer : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
 
         if (_raw != IntPtr.Zero)
         {

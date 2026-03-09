@@ -1147,10 +1147,14 @@ namespace AiDotNet.Tensors.Engines.Simd
             // Extract exponent: n = floor(log2(x))
             // IEEE 754 float: [sign:1][exponent:8][mantissa:23], bias = 127
             var vone = Vector256.Create(1.0f);
-            var minNormPos = Vector256.Create(1.17549435e-38f); // smallest normal float
-            var negInf = Vector256.Create(float.NegativeInfinity);
+            var vzero = Vector256<float>.Zero;
 
-            // Clamp to minimum normal positive to avoid log(0) = -inf edge cases in mantissa extraction
+            // Preserve special values: log(0)=-inf, log(negative)=NaN
+            var zeroMask = Avx.CompareEqual(x, vzero);
+            var negativeMask = Avx.CompareLessThan(x, vzero);
+            var minNormPos = Vector256.Create(1.17549435e-38f); // smallest normal float
+
+            // Clamp denormals to minimum normal positive for mantissa extraction
             x = Avx.Max(x, minNormPos);
 
             // Extract exponent as integer
@@ -1205,6 +1209,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             var result = Fma.MultiplyAdd(e, ln2, f);
             result = Avx.Add(result, poly);
             result = Avx.Subtract(result, halfF2);
+
+            // Restore special values: log(0) = -inf, log(negative) = NaN
+            result = Avx.BlendVariable(result, Vector256.Create(float.NegativeInfinity), zeroMask);
+            result = Avx.BlendVariable(result, Vector256.Create(float.NaN), negativeMask);
 
             return result;
         }

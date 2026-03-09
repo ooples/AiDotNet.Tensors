@@ -54,6 +54,9 @@ internal sealed class PersistentParallelExecutor
         }
     }
 
+    // Captured worker exception (first one wins)
+    private volatile Exception? _workerException;
+
     private void WorkerLoop(int slot)
     {
         while (true)
@@ -62,19 +65,21 @@ internal sealed class PersistentParallelExecutor
             _workReady[slot].Wait();
             _workReady[slot].Reset();
 
-            // Execute assigned chunk (slot + 1 because main thread does chunk 0)
+            // Execute all assigned chunks for this worker slot.
+            // Chunks are assigned round-robin: slot gets chunks (slot+1), (slot+1+_numWorkers), etc.
             int chunkId = slot + 1;
-            if (chunkId < _numChunks)
+            while (chunkId < _numChunks)
             {
                 try
                 {
                     _action!(chunkId);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Swallow exceptions in workers to prevent thread death.
-                    // In production, we'd log these.
+                    // Capture first exception — will be re-thrown on the caller thread
+                    Interlocked.CompareExchange(ref _workerException, ex, null);
                 }
+                chunkId += _numWorkers;
             }
 
             // Signal completion
@@ -106,6 +111,7 @@ internal sealed class PersistentParallelExecutor
             _action = action;
             _numChunks = numChunks;
             _remaining = workersNeeded;
+            _workerException = null;
             _allDone.Reset();
 
             // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
@@ -114,8 +120,22 @@ internal sealed class PersistentParallelExecutor
                 _workReady[i].Set();
             }
 
-            // Main thread does chunk 0 (no scheduling overhead)
-            action(0);
+            // Main thread does chunk 0 and any overflow chunks beyond worker count
+            // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
+            Exception? mainException = null;
+            int mainChunk = 0;
+            while (mainChunk < numChunks)
+            {
+                try
+                {
+                    action(mainChunk);
+                }
+                catch (Exception ex)
+                {
+                    mainException ??= ex;
+                }
+                mainChunk += _numWorkers + 1;
+            }
 
             // Wait for all workers to finish
             if (Volatile.Read(ref _remaining) > 0)
@@ -124,6 +144,13 @@ internal sealed class PersistentParallelExecutor
             }
 
             _action = null;
+
+            // Re-throw first captured exception (worker or main thread)
+            var workerEx = _workerException;
+            if (mainException is not null)
+                throw mainException;
+            if (workerEx is not null)
+                throw workerEx;
         }
     }
 }

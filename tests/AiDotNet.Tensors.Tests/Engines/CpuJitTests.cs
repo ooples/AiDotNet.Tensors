@@ -5,23 +5,18 @@ namespace AiDotNet.Tensors.Tests.Engines;
 
 public class CpuJitTests
 {
-    [Fact]
+    [SkippableFact]
     public void JitSelfTest_PassesOnSupportedHardware()
     {
-        if (!CpuJitKernels.IsSupported)
-        {
-            // Skip on non-AVX2 hardware
-            return;
-        }
+        Skip.IfNot(CpuJitKernels.IsSupported, "Requires AVX2+FMA on Windows");
 
         Assert.True(CpuJitSelfTest.IsVerified, "JIT self-test should pass on AVX2+FMA hardware");
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void JitAddKernel_ProducesCorrectResults()
     {
-        if (!CpuJitKernels.IsSupported)
-            return;
+        Skip.IfNot(CpuJitKernels.IsSupported, "Requires AVX2+FMA on Windows");
 
         const int size = 256;
         using var a = new AlignedBuffer(size);
@@ -46,11 +41,10 @@ public class CpuJitTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void JitMultiplyKernel_ProducesCorrectResults()
     {
-        if (!CpuJitKernels.IsSupported)
-            return;
+        Skip.IfNot(CpuJitKernels.IsSupported, "Requires AVX2+FMA on Windows");
 
         const int size = 256;
         using var a = new AlignedBuffer(size);
@@ -75,11 +69,10 @@ public class CpuJitTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void JitReLUKernel_ProducesCorrectResults()
     {
-        if (!CpuJitKernels.IsSupported)
-            return;
+        Skip.IfNot(CpuJitKernels.IsSupported, "Requires AVX2+FMA on Windows");
 
         const int size = 256;
         using var src = new AlignedBuffer(size);
@@ -102,11 +95,10 @@ public class CpuJitTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void JitSigmoidKernel_ProducesCorrectResults()
     {
-        if (!CpuJitKernels.IsSupported)
-            return;
+        Skip.IfNot(CpuJitKernels.IsSupported, "Requires AVX2+FMA on Windows");
 
         const int size = 256;
         using var src = new AlignedBuffer(size);

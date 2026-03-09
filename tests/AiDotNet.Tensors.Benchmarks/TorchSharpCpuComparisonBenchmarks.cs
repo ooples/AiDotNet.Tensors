@@ -261,8 +261,14 @@ public class TorchSharpCpuComparisonBenchmarks
     {
         int prev = (int)torch.get_num_threads();
         torch.set_num_threads(1);
-        torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
-        torch.set_num_threads(prev);
+        try
+        {
+            torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
+        }
+        finally
+        {
+            torch.set_num_threads(prev);
+        }
         ConsumeTorchResult(_torchVectorsA[size]);
     }
 
