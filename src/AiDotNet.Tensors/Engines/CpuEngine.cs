@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
@@ -1902,6 +1903,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
+            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, length);
+                kernel(pA, pB, pR, length);
+                return result;
+            }
+
             // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
             int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (addChunks >= 2)
@@ -1967,6 +1976,14 @@ public class CpuEngine : ITensorLevelEngine
                     return;
             }
 #endif
+
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, length);
+                kernel(pA, pB, pA, length);
+                return;
+            }
 
             // Bandwidth-bound: parallel only helps above ~2M elements
             int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
@@ -2117,6 +2134,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
+            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Subtract, length);
+                kernel(pA, pB, pR, length);
+                return result;
+            }
+
             // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
             int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
             if (subChunks >= 2)
@@ -2174,6 +2199,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
+
+            // Try JIT-compiled kernel first (size-specialized, 4x unrolled, NT stores)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, length);
+                kernel(pA, pB, pR, length);
+                return result;
+            }
 
             // Bandwidth-bound: parallel only helps above ~2M elements (24MB+ total data)
             int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
@@ -2240,6 +2273,14 @@ public class CpuEngine : ITensorLevelEngine
                     return;
             }
 #endif
+
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, length);
+                kernel(pA, pB, pA, length);
+                return;
+            }
 
             // Bandwidth-bound: parallel only helps above ~2M elements
             int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
@@ -2332,7 +2373,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2342,9 +2383,28 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
+        // Fast path for float tensors with JIT kernel
+        if (typeof(T) == typeof(float) && CpuJitSelfTest.IsVerified && length >= 64)
+        {
+            var aMem = (Memory<float>)(object)a.Data;
+            var bMem = (Memory<float>)(object)b.Data;
+            var rMem = (Memory<float>)(object)result.Data;
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+
+            var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Divide, length);
+            kernel(pA, pB, pR, length);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -4010,6 +4070,14 @@ public class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
+
+            // Try JIT-compiled kernel first (size-specialized, 4x unrolled)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                var kernel = CpuJitKernels.GetReLUKernel(length);
+                kernel(pSrc, pDst, length);
+                return result;
+            }
 
             // Bandwidth-bound: parallel only helps above ~2M elements (16MB+ total data)
             int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
