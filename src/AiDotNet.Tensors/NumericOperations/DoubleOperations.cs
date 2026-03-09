@@ -828,14 +828,12 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    Engines.Simd.SimdKernels.VectorAdd(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new ReadOnlySpan<double>(yp + start, count),
-                        new Span<double>(dp + start, count));
+                    Engines.Simd.SimdKernels.VectorAddUnsafe(xp + start, yp + start, dp + start, count);
                 });
             }
             return;
         }
+        // Use span-based path — ref-based Unsafe.ReadUnaligned avoids fixed pinning overhead
         Engines.Simd.SimdKernels.VectorAdd(x, y, destination);
     }
 
@@ -857,10 +855,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    Engines.Simd.SimdKernels.VectorSubtract(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new ReadOnlySpan<double>(yp + start, count),
-                        new Span<double>(dp + start, count));
+                    Engines.Simd.SimdKernels.VectorSubtractUnsafe(xp + start, yp + start, dp + start, count);
                 });
             }
             return;
@@ -886,10 +881,7 @@ public class DoubleOperations : INumericOperations<double>
                 double* dp = destPtr;
                 ParallelForChunks(length, MinChunkSize, (start, count) =>
                 {
-                    Engines.Simd.SimdKernels.VectorMultiply(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new ReadOnlySpan<double>(yp + start, count),
-                        new Span<double>(dp + start, count));
+                    Engines.Simd.SimdKernels.VectorMultiplyUnsafe(xp + start, yp + start, dp + start, count);
                 });
             }
             return;
@@ -1133,10 +1125,12 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Multiplies each element by a scalar using SIMD-optimized SimdKernels.
+    /// Multiplies each element by a scalar using unsafe pointer-based SIMD for zero overhead.
     /// </summary>
     public void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
-        => Engines.Simd.SimdKernels.MultiplyScalar(x, scalar, destination);
+    {
+        Engines.Simd.SimdKernels.MultiplyScalar(x, scalar, destination);
+    }
 
     /// <summary>
     /// Divides each element by a scalar using SIMD-optimized SimdKernels.

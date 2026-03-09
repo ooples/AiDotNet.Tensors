@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -94,5 +95,17 @@ public static class CpuParallelSettings
                 action(start, count);
             }
         });
+    }
+
+    /// <summary>
+    /// High-performance parallel execution using pre-spawned worker threads.
+    /// Near-zero dispatch overhead — threads are already idle and wake instantly.
+    /// Mimics libtorch's OpenMP thread pool pattern for maximum throughput.
+    /// </summary>
+    /// <param name="numChunks">Number of chunks to process in parallel.</param>
+    /// <param name="action">Action receiving chunk index (0..numChunks-1).</param>
+    public static void LightweightParallel(int numChunks, Action<int> action)
+    {
+        PersistentParallelExecutor.Instance.Execute(numChunks, action);
     }
 }

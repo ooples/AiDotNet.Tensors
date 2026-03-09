@@ -1,6 +1,9 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.CpuJit;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -343,9 +346,22 @@ public class CpuEngine : ITensorLevelEngine
     #region Reduction Operations
 
     /// <inheritdoc/>
-    public T Sum<T>(Vector<T> vector)
+    public unsafe T Sum<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = vector.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, vector.Length);
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
@@ -380,10 +396,23 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T Mean<T>(Vector<T> vector)
+    public unsafe T Mean<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
         if (vector.Length == 0) throw new ArgumentException("Cannot compute mean of empty vector.");
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = vector.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            float result;
+            fixed (float* ptr = fArr)
+            {
+                result = SimdKernels.SumUnsafe(ptr, vector.Length) / vector.Length;
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = Sum(vector);
@@ -1414,21 +1443,19 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Matrix<T>(a.Rows, b.Columns);
+        int m = a.Rows;
+        int k = a.Columns;
+        int n = b.Columns;
+        var result = new Matrix<T>(m, n);
 
-        // Standard O(nÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³) matrix multiplication
-        for (int i = 0; i < a.Rows; i++)
+        // Try BLAS/SimdGemm-accelerated path for float/double
+        if (MatrixMultiplyHelper.TryGemm(a.AsMemory(), 0, b.AsMemory(), 0, result.AsWritableMemory(), 0, m, k, n))
         {
-            for (int j = 0; j < b.Columns; j++)
-            {
-                T sum = numOps.Zero;
-                for (int k = 0; k < a.Columns; k++)
-                {
-                    sum = numOps.Add(sum, numOps.Multiply(a[i, k], b[k, j]));
-                }
-                result[i, j] = sum;
-            }
+            return result;
         }
+
+        // Fallback for non-float/double types: blocked multiplication using numOps
+        MatrixMultiplyHelper.MultiplyBlocked(numOps, a.AsMemory(), b.AsMemory(), result.AsWritableMemory(), m, k, n, k, n, n);
 
         return result;
     }
@@ -1849,7 +1876,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -1859,10 +1886,55 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
-        // Use SIMD-optimized span-based addition (5-15x faster than element-by-element)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
+                return result;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (addChunks >= 2)
+            {
+                int chunkSize = (length + addChunks - 1) / addChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, addChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorAddUnsafe(pA + start, pB + start, pR + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+            }
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -1870,9 +1942,9 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
-    /// Uses parallel processing for large tensors to maximize throughput.
+    /// Uses parallel SIMD for large float tensors.
     /// </summary>
-    public void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -1882,8 +1954,59 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        // Element-wise add is memory-bandwidth-bound; parallelization adds overhead
-        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
+        int length = a.Length;
+
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+
+#if !NET471
+            // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
+            if (OneDnnProvider.IsAvailable)
+            {
+                if (OneDnnProvider.TryAdd(pB, pA, pA, length))
+                    return;
+            }
+#endif
+
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
+                return;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }
@@ -1982,7 +2105,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -1992,17 +2115,62 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
-        // Use SIMD-optimized span-based subtraction (5-15x faster than element-by-element)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
+                return result;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (subChunks >= 2)
+            {
+                int chunkSize = (length + subChunks - 1) / subChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, subChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pR + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pR, length);
+            }
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2012,10 +2180,55 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
-        // Use SIMD-optimized span-based multiplication (5-15x faster than element-by-element)
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+
+            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
+                return result;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (mulChunks >= 2)
+            {
+                int chunkSize = (length + mulChunks - 1) / mulChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, mulChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorMultiplyUnsafe(pA + start, pB + start, pR + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, length);
+            }
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2023,9 +2236,8 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
-    /// Uses parallel processing for large tensors to maximize throughput.
     /// </summary>
-    public void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2035,8 +2247,60 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        // Element-wise multiply is memory-bandwidth-bound; parallelization adds overhead
-        // without benefit. Delegate to numOps which uses SIMD-optimized TensorPrimitives.
+        int length = a.Length;
+
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+
+#if !NET471
+            // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
+            if (OneDnnProvider.IsAvailable)
+            {
+                if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
+                    return;
+            }
+#endif
+
+            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
+                return;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
     }
@@ -2097,14 +2361,14 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2114,8 +2378,27 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
+        var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
+
+        // Fast path for float tensors with JIT kernel
+        if (typeof(T) == typeof(float) && CpuJitSelfTest.IsVerified && length >= 64)
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+
+            JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
+            return result;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
         numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2129,7 +2412,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2151,7 +2434,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2168,7 +2451,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2190,7 +2473,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2213,7 +2496,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2230,7 +2513,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2252,7 +2535,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2269,7 +2552,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2289,7 +2572,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2301,7 +2584,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2313,7 +2596,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2325,7 +2608,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2337,7 +2620,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2349,7 +2632,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2385,7 +2668,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2401,7 +2684,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2417,7 +2700,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2433,7 +2716,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2445,7 +2728,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2548,7 +2831,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradGrid = new Tensor<T>(grid.Shape);
 
         // Use thread-local gradients to avoid contention, then combine
-        int numThreads = Environment.ProcessorCount;
+        int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
         var threadLocalGrads = new double[numThreads][];
         for (int t = 0; t < numThreads; t++)
         {
@@ -2640,7 +2923,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2659,7 +2942,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2680,7 +2963,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2702,7 +2985,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2723,7 +3006,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2742,7 +3025,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2758,9 +3041,58 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorSum<T>(Tensor<T> tensor)
+    public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Float fast path: bypass generic dispatch + Span overhead
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = tensor.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            int length = tensor.Length;
+            float result;
+
+            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
+            int numChunks = length >= 200_000 ? Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(2, length / 50_000)) : 1;
+            if (numChunks >= 2)
+            {
+                var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    float* p = (float*)handle.AddrOfPinnedObject();
+                    int chunkSize = (length + numChunks - 1) / numChunks;
+                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+                    float[] partials = new float[numChunks];
+
+                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
+                        }
+                    });
+
+                    result = 0f;
+                    for (int c = 0; c < numChunks; c++)
+                        result += partials[c];
+                }
+                finally
+                {
+                    handle.Free();
+                }
+            }
+            else
+            {
+                fixed (float* ptr = fArr)
+                {
+                    result = SimdKernels.SumUnsafe(ptr, length);
+                }
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         // Use SIMD-optimized sum via IVectorizedOperations
@@ -2841,13 +3173,21 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorMean<T>(Tensor<T> tensor)
+    public unsafe T TensorMean<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute mean of empty tensor.", nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        // Route through TensorSum which has the parallel fast path
         T sum = TensorSum(tensor);
+        if (typeof(T) == typeof(float))
+        {
+            float fSum = Unsafe.As<T, float>(ref sum);
+            float result = fSum / tensor.Length;
+            return Unsafe.As<float, T>(ref result);
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Divide(sum, numOps.FromDouble(tensor.Length));
     }
 
@@ -3063,7 +3403,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Ensure stride={stride}, padding={padding}, dilation={dilation} are compatible with input size {height}x{width} and kernel size {kernelHeight}x{kernelWidth}.");
         }
 
-        var result = new Tensor<T>(new[] { batch, outChannels, outputHeight, outputWidth });
+        var result = TensorPool.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
         // Use im2col + GEMM for float (significantly faster)
         if (typeof(T) == typeof(float))
@@ -3437,7 +3777,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth)
     {
         // Use parallel processing for batch and output channels
-        bool useParallel = batch * outChannels >= 4 && Environment.ProcessorCount > 1;
+        bool useParallel = batch * outChannels >= 4 && CpuParallelSettings.MaxDegreeOfParallelism > 1;
 
         if (useParallel)
         {
@@ -3555,22 +3895,86 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Tanh - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
 
-    public Tensor<T> Sigmoid<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> Sigmoid<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized Sigmoid: 1 / (1 + exp(-x)) - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
 
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+
+            // JIT-compiled sigmoid: constants baked in data section, 4x unrolled
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                if (sigChunks >= 2)
+                {
+                    int chunkSize = (length + sigChunks - 1) / sigChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, sigChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
+                            kernel(pSrc + start, pDst + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
+                    kernel(pSrc, pDst, length);
+                }
+                return result;
+            }
+
+            // SIMD fallback
+            int fallbackChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            if (fallbackChunks >= 2)
+            {
+                int chunkSize = (length + fallbackChunks - 1) / fallbackChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, fallbackChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(pSrc + start, pDst + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
+            }
+            return result;
+        }
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3589,7 +3993,7 @@ public class CpuEngine : ITensorLevelEngine
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
-            var floatMem = (Memory<float>)(object)tensor.Data;
+            var floatMem = AsFloatMemory(tensor.Data);
             if (MemoryMarshal.TryGetArray((ReadOnlyMemory<float>)floatMem, out var segment) &&
                 segment.Array is not null && segment.Offset == 0)
             {
@@ -3601,9 +4005,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fallback to existing implementation
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
+        // Fallback: Sigmoid is compute-bound, so parallel chunking helps for large arrays
+        SigmoidParallel(tensor);
     }
 #else
     public void SigmoidInPlace<T>(Tensor<T> tensor)
@@ -3611,13 +4014,77 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Sigmoid is compute-bound (Exp per element). SIMD vectorization within
-        // TensorPrimitives already maximizes throughput; parallelization with
-        // Memory<T> boxing overhead is counterproductive.
+        SigmoidParallel(tensor);
+    }
+#endif
+
+    private unsafe void SigmoidParallel<T>(Tensor<T> tensor)
+    {
+        int length = tensor.Length;
+
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
+        if (typeof(T) == typeof(float))
+        {
+            var mem = AsFloatMemory(tensor.Data);
+            using var pin = mem.Pin();
+            float* p = (float*)pin.Pointer;
+
+            // JIT-compiled sigmoid in-place: constants baked in data section
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                int jitChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                if (jitChunks >= 2)
+                {
+                    int chunkSize = (length + jitChunks - 1) / jitChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, jitChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
+                            kernel(p + start, p + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
+                    kernel(p, p, length);
+                }
+                return;
+            }
+
+            // SIMD fallback
+            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            if (sigChunks >= 2)
+            {
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, sigChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.SigmoidUnsafe(p, p, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
     }
-#endif
 
     /// <summary>
     /// Applies Sigmoid activation to input, storing in destination. Zero allocation.
@@ -3635,15 +4102,58 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    public Tensor<T> ReLU<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized ReLU: max(0, x) - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
 
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+
+            // JIT-compiled kernels: size-specialized, 4x unrolled
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitUnaryDispatch(pSrc, pDst, length);
+                return result;
+            }
+
+            // Fallback: SimdKernels with parallel chunking for large arrays
+            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (reluChunks >= 2)
+            {
+                int chunkSize = (length + reluChunks - 1) / reluChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, reluChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+            }
+            return result;
+        }
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3651,7 +4161,7 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Applies ReLU activation in-place: x = max(0, x). Zero allocation.
-    /// Uses oneDNN for float tensors when available, otherwise falls back to SIMD.
+    /// Uses parallel SIMD for large float tensors, oneDNN when available.
     /// </summary>
 #if !NETFRAMEWORK
     public unsafe void ReLUInPlace<T>(Tensor<T> tensor)
@@ -3662,7 +4172,7 @@ public class CpuEngine : ITensorLevelEngine
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
-            var floatMem = (Memory<float>)(object)tensor.Data;
+            var floatMem = AsFloatMemory(tensor.Data);
             if (MemoryMarshal.TryGetArray((ReadOnlyMemory<float>)floatMem, out var segment) &&
                 segment.Array is not null && segment.Offset == 0)
             {
@@ -3674,9 +4184,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fallback to existing implementation
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
+        ReLUParallel(tensor);
     }
 #else
     public void ReLUInPlace<T>(Tensor<T> tensor)
@@ -3684,12 +4192,49 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // ReLU is a simple comparison per element - memory-bandwidth-bound.
-        // Parallelization with Memory<T> boxing overhead is counterproductive.
+        ReLUParallel(tensor);
+    }
+#endif
+
+    private unsafe void ReLUParallel<T>(Tensor<T> tensor)
+    {
+        int length = tensor.Length;
+
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
+        if (typeof(T) == typeof(float))
+        {
+            var mem = AsFloatMemory(tensor.Data);
+            using var pin = mem.Pin();
+            float* p = (float*)pin.Pointer;
+
+            // Bandwidth-bound: parallel only helps above ~2M elements
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.ReLUUnsafe(p + start, p + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.ReLUUnsafe(p, p, length);
+            }
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
-#endif
 
     /// <summary>
     /// Applies ReLU activation to input, storing in destination. Zero allocation.
@@ -3746,7 +4291,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized GELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3760,7 +4305,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Mish - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3774,7 +4319,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Swish (SiLU) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3788,7 +4333,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized ELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
@@ -3803,7 +4348,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized LeakyReLU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
 
@@ -4361,7 +4906,7 @@ public class CpuEngine : ITensorLevelEngine
         if (n != b.Shape[0])
             throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
 
-        var result = new Tensor<T>([m, p]);
+        var result = TensorPool.Rent<T>(new[] { m, p });
 
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
@@ -4422,7 +4967,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[aRank - 2] = m;
         outputShape[aRank - 1] = p;
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorPool.Rent<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
@@ -13232,7 +13777,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         // Normalize axis
         if (axis < 0) axis = tensor.Shape.Length + axis;
@@ -13363,7 +13908,7 @@ public class CpuEngine : ITensorLevelEngine
             if (seed.HasValue)
             {
                 var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[Environment.ProcessorCount];
+                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
                 for (int i = 0; i < seeds.Length; i++)
                     seeds[i] = baseRandom.Next();
 
@@ -13415,7 +13960,7 @@ public class CpuEngine : ITensorLevelEngine
             if (seed.HasValue)
             {
                 var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[Environment.ProcessorCount];
+                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
                 for (int i = 0; i < seeds.Length; i++)
                     seeds[i] = baseRandom.Next();
 
@@ -13452,7 +13997,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
@@ -13588,7 +14133,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -13600,7 +14145,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -13612,7 +14157,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -14501,14 +15046,22 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
-        var result = new Tensor<T>(tensor.Shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        var result = TensorPool.Rent<T>(tensor.Shape);
+        try
+        {
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
 
-        for (int i = 0; i < src.Length; i++)
-            dest[i] = func(src[i]);
+            for (int i = 0; i < src.Length; i++)
+                dest[i] = func(src[i]);
 
-        return result;
+            return result;
+        }
+        catch
+        {
+            TensorPool.Return(result);
+            throw;
+        }
     }
 
     /// <inheritdoc/>
@@ -15168,7 +15721,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -15185,7 +15738,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tensor.Shape);
+        var result = TensorPool.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -15288,7 +15841,8 @@ public class CpuEngine : ITensorLevelEngine
             fallbackResult = TensorBroadcastAdd(fallbackResult, bias);
         }
 
-        fallbackResult = ApplyFusedActivation(fallbackResult, activation);
+        // Apply activation in-place (fallbackResult is a fresh tensor)
+        ApplyFusedActivationInPlace(fallbackResult, activation);
 
         return fallbackResult;
     }
@@ -15373,8 +15927,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, bias);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15403,8 +15957,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15433,8 +15987,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15464,8 +16018,8 @@ public class CpuEngine : ITensorLevelEngine
         // This CPU implementation just does the batch normalization
         var result = BatchNorm(input, gamma, beta, epsilon, out saveMean, out saveVar);
 
-        // Step 2: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 2: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15475,18 +16029,22 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> ApplyFusedActivation<T>(Tensor<T> input, FusedActivationType activation)
     {
-        return activation switch
-        {
-            FusedActivationType.None => input,
-            FusedActivationType.ReLU => ReLU(input),
-            FusedActivationType.GELU => GELU(input),
-            FusedActivationType.Sigmoid => Sigmoid(input),
-            FusedActivationType.Tanh => Tanh(input),
-            FusedActivationType.LeakyReLU => LeakyReLU(input, MathHelper.GetNumericOperations<T>().FromDouble(0.01)),
-            FusedActivationType.Swish => Swish(input),
-            FusedActivationType.Softmax => Softmax(input, -1),
-            _ => throw new ArgumentException($"Unknown activation type: {activation}")
-        };
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return input; // None
+        return handler.Apply(this, input);
+    }
+
+    /// <summary>
+    /// Applies activation in-place on a tensor that was just allocated.
+    /// Eliminates one tensor allocation compared to ApplyFusedActivation.
+    /// Handlers with true in-place support (ReLU, Sigmoid) override ApplyInPlace.
+    /// Others fall back to allocate + copy.
+    /// </summary>
+    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
+    {
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return; // None
+        handler.ApplyInPlace(this, tensor);
     }
 
     /// <summary>
@@ -17338,6 +17896,72 @@ public class CpuEngine : ITensorLevelEngine
 
     #endregion
 
+    #region JIT Dispatch Helpers
+
+    /// <summary>
+    /// Dispatches a JIT-compiled binary operation with multi-threaded parallelism for large arrays.
+    /// For arrays >= 2M elements, splits work across threads with per-chunk JIT kernels.
+    /// For smaller arrays, runs single-threaded JIT kernel.
+    /// </summary>
+    private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
+    {
+        // For large arrays, parallelize across threads
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+        if (numChunks >= 2)
+        {
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            // Align to 32-float boundary for SIMD
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    var kernel = CpuJitKernels.GetBinaryKernel(op, count);
+                    kernel(pA + start, pB + start, pR + start, count);
+                }
+            });
+        }
+        else
+        {
+            var kernel = CpuJitKernels.GetBinaryKernel(op, length);
+            kernel(pA, pB, pR, length);
+        }
+    }
+
+    /// <summary>
+    /// Dispatches a JIT-compiled ReLU with multi-threaded parallelism for large arrays.
+    /// </summary>
+    private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
+    {
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+        if (numChunks >= 2)
+        {
+            int chunkSize = (length + numChunks - 1) / numChunks;
+            chunkSize = (chunkSize + 31) & ~31;
+
+            Parallel.For(0, numChunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, length - start);
+                if (count > 0)
+                {
+                    var kernel = CpuJitKernels.GetReLUKernel(count);
+                    kernel(pSrc + start, pDst + start, count);
+                }
+            });
+        }
+        else
+        {
+            var kernel = CpuJitKernels.GetReLUKernel(length);
+            kernel(pSrc, pDst, length);
+        }
+    }
+
+    #endregion
+
     #region Helper Methods
 
     /// <summary>
@@ -17485,7 +18109,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(a.Shape);
+        var result = TensorPool.Rent<T>(a.Shape);
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
@@ -17520,4 +18144,14 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     #endregion
+
+    /// <summary>
+    /// Reinterprets Memory&lt;T&gt; as Memory&lt;float&gt; without boxing through object.
+    /// Only valid when typeof(T) == typeof(float).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Memory<float> AsFloatMemory<T>(Memory<T> data)
+    {
+        return Unsafe.As<Memory<T>, Memory<float>>(ref data);
+    }
 }

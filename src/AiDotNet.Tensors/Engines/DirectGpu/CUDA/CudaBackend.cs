@@ -193,30 +193,23 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private readonly struct CudaContextScope : IDisposable
     {
-        private readonly bool _needsPop;
-
         public CudaContextScope(IntPtr context)
         {
-            // Skip push/pop if this thread already has the right context set
+            // Push only if this thread doesn't already have the right context.
+            // We intentionally do NOT pop on Dispose — the context stays on the
+            // CUDA stack so subsequent calls on the same thread skip the push entirely.
+            // This eliminates ~244 cuCtxPushCurrent/cuCtxPopCurrent API calls per operation.
+            // The context is cleaned up by cuCtxDestroy in CudaBackend.Dispose().
             if (context != IntPtr.Zero && _threadCurrentContext != context)
             {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
                 _threadCurrentContext = context;
-                _needsPop = true;
-            }
-            else
-            {
-                _needsPop = false;
             }
         }
 
         public void Dispose()
         {
-            if (_needsPop)
-            {
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out var prev), "cuCtxPopCurrent");
-                _threadCurrentContext = prev;
-            }
+            // No-op: context stays on CUDA stack for reuse by next call on this thread
         }
     }
 
@@ -725,33 +718,89 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public IGpuBuffer GemmBiasRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_relu", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Relu(temp, output, M * N);
+            Synchronize(); // Ensure all stream work completes before returning buffer
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_gelu", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Gelu(temp, output, M * N);
+            Synchronize();
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_sigmoid", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Sigmoid(temp, output, M * N);
+            Synchronize();
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBiasTanh(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_tanh", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Tanh(temp, output, M * N);
+            Synchronize();
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
@@ -765,9 +814,23 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public IGpuBuffer GemmBiasSwish(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
         ValidateBiasBuffer(bias, N);
-        var output = AllocateBuffer(M * N);
-        ExecuteFusedGemm("gemm_bias_swish", A, B, bias, output, M, N, K);
-        return output;
+        IGpuBuffer? temp = null;
+        IGpuBuffer? output = null;
+        try
+        {
+            temp = GemmBias(A, B, bias, M, N, K);
+            output = AllocateBuffer(M * N);
+            Silu(temp, output, M * N);
+            Synchronize();
+            temp.Dispose();
+            return output;
+        }
+        catch
+        {
+            output?.Dispose();
+            temp?.Dispose();
+            throw;
+        }
     }
 
     public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)

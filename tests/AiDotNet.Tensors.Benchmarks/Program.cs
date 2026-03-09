@@ -29,8 +29,8 @@ class Program
         // Run linear algebra benchmarks
         if (args[0] == "--linalg")
         {
-            BenchmarkRunner.Run<LinearAlgebraBenchmarks>();
-            BenchmarkRunner.Run<SmallMatrixBenchmarks>();
+            BenchmarkRunner.Run<LinearAlgebraBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<SmallMatrixBenchmarks>(BenchConfig);
             return;
         }
 

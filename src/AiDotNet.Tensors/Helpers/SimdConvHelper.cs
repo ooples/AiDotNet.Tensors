@@ -61,7 +61,7 @@ internal static class SimdConvHelper
 
             if (useParallel)
             {
-                Parallel.For(0, outChannels, oc =>
+                CpuParallelSettings.LightweightParallel(outChannels, oc =>
                 {
                     Conv3x3Stride1SingleChannel(
                         inputBatch, kernel + oc * inChannels * 9,

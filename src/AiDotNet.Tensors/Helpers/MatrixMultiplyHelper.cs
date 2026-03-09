@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Interfaces;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -222,7 +223,19 @@ internal static class MatrixMultiplyHelper
     {
         if (typeof(T) == typeof(float) && a is float[] af && b is float[] bf && c is float[] cf)
         {
-            return BlasProvider.TryGemm(m, n, k, af, aOffset, k, bf, bOffset, n, cf, cOffset, n);
+            if (BlasProvider.TryGemm(m, n, k, af, aOffset, k, bf, bOffset, n, cf, cOffset, n))
+            {
+                return true;
+            }
+
+            // BLAS unavailable - fall back to our SIMD GEMM (BLIS-style tiled FMA kernel)
+            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] BLAS unavailable, using SimdGemm.Sgemm fallback");
+            SimdGemm.Sgemm(
+                af.AsSpan(aOffset, m * k),
+                bf.AsSpan(bOffset, k * n),
+                cf.AsSpan(cOffset, m * n),
+                m, k, n);
+            return true;
         }
         else if (typeof(T) == typeof(double) && a is double[] ad && b is double[] bd && c is double[] cd)
         {

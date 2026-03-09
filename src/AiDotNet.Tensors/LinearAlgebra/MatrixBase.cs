@@ -1,8 +1,10 @@
 global using System.Text;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -26,6 +28,7 @@ public abstract class MatrixBase<T>
     /// Memory&lt;T&gt; provides zero-copy slicing, better Span&lt;T&gt; interop, and integration with memory pooling.</para>
     /// </remarks>
     protected readonly Memory<T> _memory;
+    internal readonly T[]? _cachedArray;
     private long _version;
 
 
@@ -58,6 +61,21 @@ public abstract class MatrixBase<T>
     }
 
     /// <summary>
+    /// Gets a reference to the underlying array without copying when possible.
+    /// </summary>
+    internal T[] GetDataArray()
+    {
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
+        {
+            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            {
+                return segment.Array;
+            }
+        }
+        return _memory.ToArray();
+    }
+
+    /// <summary>
     /// Gets the global execution engine for vector operations.
     /// </summary>
     protected IEngine Engine => AiDotNetEngine.Current;
@@ -83,7 +101,33 @@ public abstract class MatrixBase<T>
 
         this._rows = rows;
         this._cols = cols;
-        this._memory = new T[rows * cols];
+        var arr = new T[rows * cols];
+        this._memory = arr;
+        this._cachedArray = arr;
+    }
+
+    /// <summary>
+    /// Creates a new matrix with the specified dimensions, optionally skipping zero-initialization.
+    /// Only use skipZeroInit when the caller will immediately overwrite all elements.
+    /// </summary>
+    protected MatrixBase(int rows, int cols, bool skipZeroInit)
+    {
+        if (rows < 0) throw new ArgumentException("Rows must be non-negative", nameof(rows));
+        if (cols < 0) throw new ArgumentException("Columns must be non-negative", nameof(cols));
+
+        this._rows = rows;
+        this._cols = cols;
+        T[] arr;
+#if NET5_0_OR_GREATER
+        if (skipZeroInit)
+            arr = GC.AllocateUninitializedArray<T>(rows * cols);
+        else
+            arr = new T[rows * cols];
+#else
+        arr = new T[rows * cols];
+#endif
+        this._memory = arr;
+        this._cachedArray = arr;
     }
 
     /// <summary>
@@ -104,6 +148,11 @@ public abstract class MatrixBase<T>
         this._rows = rows;
         this._cols = cols;
         this._memory = memory;
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
+            && segment.Array is not null && segment.Offset == 0 && segment.Count == segment.Array.Length)
+        {
+            this._cachedArray = segment.Array;
+        }
     }
 
     /// <summary>
@@ -138,7 +187,9 @@ public abstract class MatrixBase<T>
             throw new ArgumentException("All rows must have at least one column.", nameof(values));
         }
 
-        this._memory = new T[_rows * _cols];
+        var arr = new T[_rows * _cols];
+        this._memory = arr;
+        this._cachedArray = arr;
 
         for (int i = 0; i < _rows; i++)
         {
@@ -178,7 +229,9 @@ public abstract class MatrixBase<T>
             throw new ArgumentException("Data array cannot have zero rows or columns.", nameof(data));
         }
 
-        this._memory = new T[_rows * _cols];
+        var arr2d = new T[_rows * _cols];
+        this._memory = arr2d;
+        this._cachedArray = arr2d;
 
         // Reuse a single buffer to avoid allocating a new array per row
         var sourceRow = new T[_cols];
@@ -593,6 +646,27 @@ public abstract class MatrixBase<T>
             throw new ArgumentException("Matrix dimensions must match for addition.");
 
         MarkDirty();
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+                SimdKernels.VectorAdd((ReadOnlySpan<double>)dOther, (ReadOnlySpan<double>)dArr, dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                var fOther = Unsafe.As<T[], float[]>(ref otherArr);
+                SimdKernels.VectorAdd((ReadOnlySpan<float>)fOther, (ReadOnlySpan<float>)fArr, fArr);
+                return;
+            }
+        }
+#endif
         _numOps.Add(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -612,6 +686,31 @@ public abstract class MatrixBase<T>
         if (destination.Length < _rows * _cols)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorAdd(
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorAdd(
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                return;
+            }
+        }
+#endif
         _numOps.Add(_memory.Span, other._memory.Span, destination);
     }
 
@@ -652,6 +751,27 @@ public abstract class MatrixBase<T>
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
 
         MarkDirty();
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+                SimdKernels.VectorSubtract((ReadOnlySpan<double>)dArr, (ReadOnlySpan<double>)dOther, dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                var fOther = Unsafe.As<T[], float[]>(ref otherArr);
+                SimdKernels.VectorSubtract((ReadOnlySpan<float>)fArr, (ReadOnlySpan<float>)fOther, fArr);
+                return;
+            }
+        }
+#endif
         _numOps.Subtract(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -671,6 +791,31 @@ public abstract class MatrixBase<T>
         if (destination.Length < _rows * _cols)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorSubtract(
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
+                    (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                ref T sd = ref MemoryMarshal.GetReference(destination);
+                SimdKernels.VectorSubtract(
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
+                    (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                return;
+            }
+        }
+#endif
         _numOps.Subtract(_memory.Span, other._memory.Span, destination);
     }
 
@@ -895,6 +1040,24 @@ public abstract class MatrixBase<T>
     public virtual void MultiplyInPlace(T scalar)
     {
         MarkDirty();
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        if (arr is not null)
+        {
+            if (typeof(T) == typeof(double))
+            {
+                var dArr = Unsafe.As<T[], double[]>(ref arr);
+                SimdKernels.MultiplyScalar((ReadOnlySpan<double>)dArr, Unsafe.As<T, double>(ref scalar), dArr);
+                return;
+            }
+            if (typeof(T) == typeof(float))
+            {
+                var fArr = Unsafe.As<T[], float[]>(ref arr);
+                SimdKernels.MultiplyScalar((ReadOnlySpan<float>)fArr, Unsafe.As<T, float>(ref scalar), fArr);
+                return;
+            }
+        }
+#endif
         _numOps.MultiplyScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -951,9 +1114,9 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get arrays for parallel processing (Memory<T>.Span can't be used across threads)
-        var resultData = result._memory.ToArray();
-        var srcData = _memory.ToArray();
+        // Get backing arrays directly (no copy) for parallel processing
+        var resultData = result.GetDataArray();
+        var srcData = GetDataArray();
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384; // 128x128 or larger
@@ -1069,8 +1232,8 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get array for parallel processing (Memory<T>.Span can't be used across threads)
-        var data = _memory.ToArray();
+        // Get backing array directly (no copy) for parallel processing
+        var data = GetDataArray();
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384;

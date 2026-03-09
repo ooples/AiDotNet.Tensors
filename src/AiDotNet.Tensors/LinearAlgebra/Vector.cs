@@ -1,6 +1,8 @@
 global using System.Collections;
 
-#if NET6_0_OR_GREATER
+using System.Runtime.CompilerServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics.Arm;
 #endif
@@ -136,6 +138,14 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor that optionally skips zero-initialization for performance.
+    /// Only use when the caller will immediately overwrite all elements.
+    /// </summary>
+    internal Vector(int length, bool skipZeroInit) : base(length, skipZeroInit)
+    {
+    }
+
+    /// <summary>
     /// Initializes a new instance of the Vector class with the specified values.
     /// </summary>
     /// <param name="values">The collection of values to initialize the vector with.</param>
@@ -175,6 +185,193 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     {
         return new Vector<T>(memory, false);
     }
+
+    #region Sealed SIMD-Inlined Overrides
+
+    /// <summary>
+    /// Multiplies each element by a scalar in-place using inline SIMD.
+    /// Sealed override eliminates virtual dispatch; inline AVX2 eliminates method call overhead.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public sealed override void MultiplyInPlace(T scalar)
+    {
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        if (arr is not null && typeof(T) == typeof(double) && Avx.IsSupported)
+        {
+            var dArr = Unsafe.As<T[], double[]>(ref arr);
+            int length = dArr.Length;
+            int i = 0;
+            var vs = Vector256.Create(Unsafe.As<T, double>(ref scalar));
+            int simdLength = length & ~15;
+            for (; i < simdLength; i += 16)
+            {
+                ref double r = ref dArr[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)), vs));
+                ref double r4 = ref dArr[i + 4];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r4),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r4)), vs));
+                ref double r8 = ref dArr[i + 8];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r8),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r8)), vs));
+                ref double r12 = ref dArr[i + 12];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r12),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r12)), vs));
+            }
+            for (; i + 4 <= length; i += 4)
+            {
+                ref double r = ref dArr[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)), vs));
+            }
+            for (; i < length; i++)
+                dArr[i] *= Unsafe.As<T, double>(ref scalar);
+            return;
+        }
+        if (arr is not null && typeof(T) == typeof(float) && Avx.IsSupported)
+        {
+            var fArr = Unsafe.As<T[], float[]>(ref arr);
+            int length = fArr.Length;
+            int i = 0;
+            var vs = Vector256.Create(Unsafe.As<T, float>(ref scalar));
+            int simdLength = length & ~31;
+            for (; i < simdLength; i += 32)
+            {
+                ref float r = ref fArr[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref r),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref r)), vs));
+                ref float r8 = ref fArr[i + 8];
+                Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref r8),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref r8)), vs));
+                ref float r16 = ref fArr[i + 16];
+                Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref r16),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref r16)), vs));
+                ref float r24 = ref fArr[i + 24];
+                Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref r24),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref r24)), vs));
+            }
+            for (; i + 8 <= length; i += 8)
+            {
+                ref float r = ref fArr[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref r),
+                    Avx.Multiply(Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref r)), vs));
+            }
+            for (; i < length; i++)
+                fArr[i] *= Unsafe.As<T, float>(ref scalar);
+            return;
+        }
+#endif
+        base.MultiplyInPlace(scalar);
+    }
+
+    /// <summary>
+    /// Adds another vector in-place using inline SIMD.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public sealed override void AddInPlace(VectorBase<T> other)
+    {
+        if (Length != other.Length)
+            throw new ArgumentException("Vectors must have the same length");
+
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null && typeof(T) == typeof(double) && Avx.IsSupported)
+        {
+            var dArr = Unsafe.As<T[], double[]>(ref arr);
+            var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+            int length = dArr.Length;
+            int i = 0;
+            int simdLength = length & ~15;
+            for (; i < simdLength; i += 16)
+            {
+                ref double r = ref dArr[i]; ref double o = ref dOther[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Add(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)),
+                            Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o))));
+                ref double r4 = ref dArr[i+4]; ref double o4 = ref dOther[i+4];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r4),
+                    Avx.Add(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r4)),
+                            Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o4))));
+                ref double r8 = ref dArr[i+8]; ref double o8 = ref dOther[i+8];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r8),
+                    Avx.Add(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r8)),
+                            Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o8))));
+                ref double r12 = ref dArr[i+12]; ref double o12 = ref dOther[i+12];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r12),
+                    Avx.Add(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r12)),
+                            Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o12))));
+            }
+            for (; i + 4 <= length; i += 4)
+            {
+                ref double r = ref dArr[i]; ref double o = ref dOther[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Add(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)),
+                            Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o))));
+            }
+            for (; i < length; i++)
+                dArr[i] += dOther[i];
+            return;
+        }
+#endif
+        base.AddInPlace(other);
+    }
+
+    /// <summary>
+    /// Subtracts another vector in-place using inline SIMD.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public sealed override void SubtractInPlace(VectorBase<T> other)
+    {
+        if (Length != other.Length)
+            throw new ArgumentException("Vectors must have the same length");
+
+#if NET5_0_OR_GREATER
+        var arr = _cachedArray;
+        var otherArr = other._cachedArray;
+        if (arr is not null && otherArr is not null && typeof(T) == typeof(double) && Avx.IsSupported)
+        {
+            var dArr = Unsafe.As<T[], double[]>(ref arr);
+            var dOther = Unsafe.As<T[], double[]>(ref otherArr);
+            int length = dArr.Length;
+            int i = 0;
+            int simdLength = length & ~15;
+            for (; i < simdLength; i += 16)
+            {
+                ref double r = ref dArr[i]; ref double o = ref dOther[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Subtract(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)),
+                                 Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o))));
+                ref double r4 = ref dArr[i+4]; ref double o4 = ref dOther[i+4];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r4),
+                    Avx.Subtract(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r4)),
+                                 Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o4))));
+                ref double r8 = ref dArr[i+8]; ref double o8 = ref dOther[i+8];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r8),
+                    Avx.Subtract(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r8)),
+                                 Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o8))));
+                ref double r12 = ref dArr[i+12]; ref double o12 = ref dOther[i+12];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r12),
+                    Avx.Subtract(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r12)),
+                                 Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o12))));
+            }
+            for (; i + 4 <= length; i += 4)
+            {
+                ref double r = ref dArr[i]; ref double o = ref dOther[i];
+                Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref r),
+                    Avx.Subtract(Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref r)),
+                                 Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref o))));
+            }
+            for (; i < length; i++)
+                dArr[i] -= dOther[i];
+            return;
+        }
+#endif
+        base.SubtractInPlace(other);
+    }
+
+    #endregion
 
     /// <summary>
     /// Returns an enumerator that iterates through the vector.
@@ -521,7 +718,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     protected override VectorBase<T> CreateInstance(int size)
     {
-        return new Vector<T>(size);
+        // Skip zero-init since callers always overwrite all elements (Add, Subtract, Multiply, etc.)
+        return new Vector<T>(size, skipZeroInit: true);
     }
 
     /// <summary>

@@ -33,14 +33,13 @@ internal static class FusedConvHelper
     {
         if (!UseAvx2) return false;
 
-        // Use fused conv for medium-to-large convolutions where cache efficiency matters
-        int outputSize = outputH * outputW;
-        int kernelElements = kernelH * kernelW * inChannels;
-
-        // Fused conv is beneficial when:
-        // 1. Output is large enough to benefit from tiling
-        // 2. Kernel is not too small (overhead of index computation)
-        return outputSize >= 1024 && kernelElements >= 9;
+        // Fused conv uses on-the-fly im2col index computation per element,
+        // which is slower than explicit im2col + GEMM for most sizes.
+        // Only use for very large convolutions where the im2col buffer would
+        // exceed L3 cache and cause excessive memory traffic.
+        long im2colBytes = (long)inChannels * kernelH * kernelW * outputH * outputW * sizeof(float);
+        const long L3Threshold = 16 * 1024 * 1024; // 16MB
+        return im2colBytes > L3Threshold;
     }
 
     /// <summary>

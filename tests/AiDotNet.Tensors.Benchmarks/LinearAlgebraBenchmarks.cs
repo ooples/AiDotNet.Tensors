@@ -15,10 +15,9 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// - NumSharp (NumPy-like library for .NET)
 /// - System.Numerics.Tensors (built-in .NET SIMD primitives)
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net80)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
-[RPlotExporter]
 public class LinearAlgebraBenchmarks
 {
     // Raw arrays for all libraries
@@ -215,6 +214,31 @@ public class LinearAlgebraBenchmarks
 
     #endregion
 
+    #region Vector Subtract In-Place (Zero Allocation)
+
+    [Benchmark(Description = "Vector SubtractInPlace - AiDotNet")]
+    [BenchmarkCategory("VectorSubtractInPlace")]
+    public void VectorSubtractInPlaceAiDotNet()
+    {
+        _aiVector1.SubtractInPlace(_aiVector2);
+    }
+
+    [Benchmark(Description = "Vector Subtract to Span - AiDotNet")]
+    [BenchmarkCategory("VectorSubtractInPlace")]
+    public void VectorSubtractToSpanAiDotNet()
+    {
+        _aiVector1.Subtract(_aiVector2, _result.AsSpan());
+    }
+
+    [Benchmark(Description = "Vector Subtract - TensorPrimitives")]
+    [BenchmarkCategory("VectorSubtractInPlace")]
+    public void VectorSubtractInPlaceTensorPrimitives()
+    {
+        TensorPrimitives.Subtract<double>(_data1, _data2, _result);
+    }
+
+    #endregion
+
     #region Vector Scalar Multiply
 
     [Benchmark(Description = "Vector Scalar Multiply - AiDotNet")]
@@ -234,6 +258,31 @@ public class LinearAlgebraBenchmarks
     [Benchmark(Description = "Vector Scalar Multiply - TensorPrimitives")]
     [BenchmarkCategory("VectorScalarMul")]
     public void VectorScalarMultiplyTensorPrimitives()
+    {
+        TensorPrimitives.Multiply<double>(_data1, 2.5, _result);
+    }
+
+    #endregion
+
+    #region Vector Scalar Multiply In-Place (Zero Allocation)
+
+    [Benchmark(Description = "Vector ScalarMulInPlace - AiDotNet")]
+    [BenchmarkCategory("VectorScalarMulInPlace")]
+    public void VectorScalarMultiplyInPlaceAiDotNet()
+    {
+        _aiVector1.MultiplyInPlace((double)2.5);
+    }
+
+    [Benchmark(Description = "Vector ScalarMul to Span - AiDotNet")]
+    [BenchmarkCategory("VectorScalarMulInPlace")]
+    public void VectorScalarMultiplyToSpanAiDotNet()
+    {
+        _aiVector1.Multiply((double)2.5, _result.AsSpan());
+    }
+
+    [Benchmark(Description = "Vector ScalarMul - TensorPrimitives")]
+    [BenchmarkCategory("VectorScalarMulInPlace")]
+    public void VectorScalarMultiplyInPlaceTensorPrimitives()
     {
         TensorPrimitives.Multiply<double>(_data1, 2.5, _result);
     }
@@ -344,6 +393,17 @@ public class LinearAlgebraBenchmarks
 
     #endregion
 
+    #region Matrix Subtract In-Place (Zero Allocation)
+
+    [Benchmark(Description = "Matrix SubtractInPlace - AiDotNet")]
+    [BenchmarkCategory("MatrixSubtractInPlace")]
+    public void MatrixSubtractInPlaceAiDotNet()
+    {
+        _aiMatrix1.SubtractInPlace(_aiMatrix2);
+    }
+
+    #endregion
+
     #region Matrix Scalar Multiply
 
     [Benchmark(Description = "Matrix Scalar Multiply - AiDotNet")]
@@ -358,6 +418,17 @@ public class LinearAlgebraBenchmarks
     public MathNet.Numerics.LinearAlgebra.Matrix<double> MatrixScalarMultiplyMathNet()
     {
         return _mnMatrix1.Multiply(2.5);
+    }
+
+    #endregion
+
+    #region Matrix Scalar Multiply In-Place (Zero Allocation)
+
+    [Benchmark(Description = "Matrix ScalarMulInPlace - AiDotNet")]
+    [BenchmarkCategory("MatrixScalarMulInPlace")]
+    public void MatrixScalarMultiplyInPlaceAiDotNet()
+    {
+        _aiMatrix1.MultiplyInPlace(2.5);
     }
 
     #endregion
@@ -403,7 +474,7 @@ public class LinearAlgebraBenchmarks
 /// Benchmarks for small matrix operations where overhead matters more.
 /// These sizes are typical for neural network layer computations.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net80)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class SmallMatrixBenchmarks
@@ -550,7 +621,7 @@ public class SmallMatrixBenchmarks
 /// <summary>
 /// Benchmarks for element-wise operations using TensorPrimitives
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net80)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class ElementWiseBenchmarks
