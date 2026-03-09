@@ -136,6 +136,14 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor that optionally skips zero-initialization for performance.
+    /// Only use when the caller will immediately overwrite all elements.
+    /// </summary>
+    internal Vector(int length, bool skipZeroInit) : base(length, skipZeroInit)
+    {
+    }
+
+    /// <summary>
     /// Initializes a new instance of the Vector class with the specified values.
     /// </summary>
     /// <param name="values">The collection of values to initialize the vector with.</param>
@@ -521,7 +529,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     protected override VectorBase<T> CreateInstance(int size)
     {
-        return new Vector<T>(size);
+        // Skip zero-init since callers always overwrite all elements (Add, Subtract, Multiply, etc.)
+        return new Vector<T>(size, skipZeroInit: true);
     }
 
     /// <summary>

@@ -2743,9 +2743,20 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 4)
+            if (Avx.IsSupported && length >= 16)
             {
-                int simdLength = length & ~3;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Divide(ReadVector256Double(a, i), ReadVector256Double(b, i)));
+                    WriteVector256Double(result, i + 4, Avx.Divide(ReadVector256Double(a, i + 4), ReadVector256Double(b, i + 4)));
+                    WriteVector256Double(result, i + 8, Avx.Divide(ReadVector256Double(a, i + 8), ReadVector256Double(b, i + 8)));
+                    WriteVector256Double(result, i + 12, Avx.Divide(ReadVector256Double(a, i + 12), ReadVector256Double(b, i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
                     WriteVector256Double(result, i, Avx.Divide(ReadVector256Double(a, i), ReadVector256Double(b, i)));
@@ -2770,10 +2781,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 4)
+            if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
-                int simdLength = length & ~3;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), vs));
+                    WriteVector256Double(result, i + 4, Avx.Add(ReadVector256Double(a, i + 4), vs));
+                    WriteVector256Double(result, i + 8, Avx.Add(ReadVector256Double(a, i + 8), vs));
+                    WriteVector256Double(result, i + 12, Avx.Add(ReadVector256Double(a, i + 12), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
                     WriteVector256Double(result, i, Avx.Add(ReadVector256Double(a, i), vs));
@@ -2798,10 +2821,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 4)
+            if (Avx.IsSupported && length >= 16)
             {
                 var vs = Vector256.Create(scalar);
-                int simdLength = length & ~3;
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
+                    WriteVector256Double(result, i + 4, Avx.Multiply(ReadVector256Double(a, i + 4), vs));
+                    WriteVector256Double(result, i + 8, Avx.Multiply(ReadVector256Double(a, i + 8), vs));
+                    WriteVector256Double(result, i + 12, Avx.Multiply(ReadVector256Double(a, i + 12), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
                     WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
@@ -2812,6 +2847,136 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
                 result[i] = a[i] * scalar;
+            }
+        }
+
+        /// <summary>Pointer-based MultiplyScalar for double — zero bounds-checking overhead.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void MultiplyScalarUnsafe(double* a, double scalar, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                    Avx.Store(result + i + 4, Avx.Multiply(Avx.LoadVector256(a + i + 4), vs));
+                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), vs));
+                    Avx.Store(result + i + 12, Avx.Multiply(Avx.LoadVector256(a + i + 12), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * scalar;
+            }
+        }
+
+        /// <summary>Pointer-based VectorAdd for double — zero bounds-checking overhead.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorAddUnsafe(double* a, double* b, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 4, Avx.Add(Avx.LoadVector256(a + i + 4), Avx.LoadVector256(b + i + 4)));
+                    Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 12, Avx.Add(Avx.LoadVector256(a + i + 12), Avx.LoadVector256(b + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] + b[i];
+            }
+        }
+
+        /// <summary>Pointer-based VectorSubtract for double — zero bounds-checking overhead.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorSubtractUnsafe(double* a, double* b, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 4, Avx.Subtract(Avx.LoadVector256(a + i + 4), Avx.LoadVector256(b + i + 4)));
+                    Avx.Store(result + i + 8, Avx.Subtract(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 12, Avx.Subtract(Avx.LoadVector256(a + i + 12), Avx.LoadVector256(b + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    Avx.Store(result + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] - b[i];
+            }
+        }
+
+        /// <summary>Pointer-based VectorMultiply for double — zero bounds-checking overhead.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorMultiplyUnsafe(double* a, double* b, double* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 16)
+            {
+                int simdLength = length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 4, Avx.Multiply(Avx.LoadVector256(a + i + 4), Avx.LoadVector256(b + i + 4)));
+                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 12, Avx.Multiply(Avx.LoadVector256(a + i + 12), Avx.LoadVector256(b + i + 12)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 4)
+            {
+                int simdLength = i + ((length - i) & ~3);
+                for (; i < simdLength; i += 4)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * b[i];
             }
         }
 

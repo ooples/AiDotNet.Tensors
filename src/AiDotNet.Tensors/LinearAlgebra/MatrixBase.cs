@@ -58,6 +58,21 @@ public abstract class MatrixBase<T>
     }
 
     /// <summary>
+    /// Gets a reference to the underlying array without copying when possible.
+    /// </summary>
+    internal T[] GetDataArray()
+    {
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
+        {
+            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            {
+                return segment.Array;
+            }
+        }
+        return _memory.ToArray();
+    }
+
+    /// <summary>
     /// Gets the global execution engine for vector operations.
     /// </summary>
     protected IEngine Engine => AiDotNetEngine.Current;
@@ -84,6 +99,27 @@ public abstract class MatrixBase<T>
         this._rows = rows;
         this._cols = cols;
         this._memory = new T[rows * cols];
+    }
+
+    /// <summary>
+    /// Creates a new matrix with the specified dimensions, optionally skipping zero-initialization.
+    /// Only use skipZeroInit when the caller will immediately overwrite all elements.
+    /// </summary>
+    protected MatrixBase(int rows, int cols, bool skipZeroInit)
+    {
+        if (rows < 0) throw new ArgumentException("Rows must be non-negative", nameof(rows));
+        if (cols < 0) throw new ArgumentException("Columns must be non-negative", nameof(cols));
+
+        this._rows = rows;
+        this._cols = cols;
+#if NET5_0_OR_GREATER
+        if (skipZeroInit)
+            this._memory = GC.AllocateUninitializedArray<T>(rows * cols);
+        else
+            this._memory = new T[rows * cols];
+#else
+        this._memory = new T[rows * cols];
+#endif
     }
 
     /// <summary>
@@ -951,9 +987,9 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get arrays for parallel processing (Memory<T>.Span can't be used across threads)
-        var resultData = result._memory.ToArray();
-        var srcData = _memory.ToArray();
+        // Get backing arrays directly (no copy) for parallel processing
+        var resultData = result.GetDataArray();
+        var srcData = GetDataArray();
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384; // 128x128 or larger
@@ -1069,8 +1105,8 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get array for parallel processing (Memory<T>.Span can't be used across threads)
-        var data = _memory.ToArray();
+        // Get backing array directly (no copy) for parallel processing
+        var data = GetDataArray();
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384;

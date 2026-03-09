@@ -26,6 +26,13 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor that optionally skips zero-initialization for performance.
+    /// </summary>
+    internal Matrix(int rows, int columns, bool skipZeroInit) : base(rows, columns, skipZeroInit)
+    {
+    }
+
+    /// <summary>
     /// Initializes a new matrix from a collection of collections, where each inner collection represents a row.
     /// </summary>
     /// <param name="values">A collection of collections, where each inner collection represents a row of the matrix.</param>
@@ -56,7 +63,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <returns>A new matrix instance.</returns>
     protected override MatrixBase<T> CreateInstance(int rows, int cols)
     {
-        return new Matrix<T>(rows, cols);
+        // Skip zero-init since callers always overwrite all elements (Add, Subtract, Multiply, Transpose, etc.)
+        return new Matrix<T>(rows, cols, skipZeroInit: true);
     }
 
     /// <summary>
