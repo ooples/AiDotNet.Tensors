@@ -5,8 +5,8 @@ namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
 /// High-performance tensor allocation helper that eliminates zero-initialization overhead.
-/// Uses GC.AllocateUninitializedArray on .NET 5+ to skip zeroing memory that will be
-/// immediately overwritten by SIMD operations.
+/// Uses GC.AllocateUninitializedArray on .NET 5+ for small-medium tensors, and
+/// ArrayPool for large tensors to reduce GC pressure from frequent allocations.
 /// </summary>
 internal static class TensorPool
 {
@@ -17,7 +17,14 @@ internal static class TensorPool
     public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
 
     /// <summary>
-    /// Creates a tensor with the given shape using uninitialized memory.
+    /// Threshold above which ArrayPool is used instead of GC.AllocateUninitializedArray.
+    /// ArrayPool avoids GC pressure for repeated large allocations (e.g., GEMM temporaries).
+    /// 256K elements = 1MB for float, 2MB for double.
+    /// </summary>
+    private const int ArrayPoolThreshold = 256 * 1024;
+
+    /// <summary>
+    /// Creates a tensor with the given shape using uninitialized or pooled memory.
     /// The tensor's data is NOT zero-initialized for performance.
     /// Caller MUST overwrite all elements before exposing to consumers.
     /// </summary>
@@ -33,9 +40,19 @@ internal static class TensorPool
         }
 
 #if NET5_0_OR_GREATER
+        // Large tensors: use ArrayPool to avoid GC pressure from repeated allocations
+        if (totalSize >= ArrayPoolThreshold)
+        {
+            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
+            // Slice to exact size (pooled array may be larger)
+            var memory = new Memory<T>(pooled, 0, totalSize);
+            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
+        }
+
+        // Small-medium tensors: skip zero-initialization
         T[] array = GC.AllocateUninitializedArray<T>(totalSize);
-        var memory = new Memory<T>(array);
-        return Tensor<T>.FromMemory(memory, shape);
+        var mem = new Memory<T>(array);
+        return Tensor<T>.FromMemory(mem, shape);
 #else
         return new Tensor<T>(shape);
 #endif
@@ -43,8 +60,7 @@ internal static class TensorPool
 
     /// <summary>
     /// Returns a tensor's backing array to the pool if it was pooled.
-    /// Currently a no-op since we use GC.AllocateUninitializedArray instead of ArrayPool.
-    /// Kept for future ArrayPool integration.
+    /// Call this when a tensor from Rent() is no longer needed.
     /// </summary>
     public static void Return<T>(Tensor<T>? tensor)
     {
