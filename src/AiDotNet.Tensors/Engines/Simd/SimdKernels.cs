@@ -85,7 +85,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = length & ~31;
                 // For very large arrays (> L3 cache), use non-temporal stores when aligned
                 // to avoid cache pollution (saves ~40% DRAM traffic by eliminating RFO)
-                if (length >= 524288 && ((nint)result & 31) == 0) // 2MB threshold, 32-byte aligned
+                if (length >= 32768 && ((nint)result & 31) == 0) // 128KB threshold, 32-byte aligned
                 {
                     const int prefetchDistance = 256;
                     for (; i < simdLength; i += 32)
@@ -157,7 +157,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 int simdLength = length & ~31;
                 // Non-temporal stores for very large arrays (>= 2MB) when output is 32-byte aligned
-                if (length >= 524288 && ((nint)result & 31) == 0)
+                if (length >= 32768 && ((nint)result & 31) == 0)
                 {
                     const int prefetchDistance = 256;
                     for (; i < simdLength; i += 32)
@@ -229,7 +229,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vzero = Vector256<float>.Zero;
                 int simdLength = length & ~31;
                 // Non-temporal stores for very large arrays when output is 32-byte aligned
-                if (length >= 524288 && ((nint)output & 31) == 0)
+                if (length >= 32768 && ((nint)output & 31) == 0)
                 {
                     const int prefetchDistance = 256;
                     for (; i < simdLength; i += 32)
