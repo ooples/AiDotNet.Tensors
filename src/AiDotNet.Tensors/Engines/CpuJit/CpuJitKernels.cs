@@ -6,12 +6,39 @@ using System.Runtime.InteropServices;
 namespace AiDotNet.Tensors.Engines.CpuJit;
 
 /// <summary>
+/// Describes a binary SIMD operation by its x86 opcode.
+/// Adding a new operation (Divide, Min, Max) is a one-liner — no switch statements
+/// or existing code modifications needed (Open/Closed Principle).
+/// </summary>
+internal sealed class JitBinaryOp
+{
+    /// <summary>The x86 opcode for this packed single-precision operation.</summary>
+    public byte Opcode { get; }
+
+    /// <summary>Unique ID for cache key generation.</summary>
+    public int Id { get; }
+
+    private JitBinaryOp(byte opcode, int id)
+    {
+        Opcode = opcode;
+        Id = id;
+    }
+
+    // To add a new op: define a new static field here. That's it — no switch changes needed.
+    public static readonly JitBinaryOp Add = new(0x58, 1);       // VADDPS
+    public static readonly JitBinaryOp Multiply = new(0x59, 2);  // VMULPS
+    public static readonly JitBinaryOp Subtract = new(0x5C, 3);  // VSUBPS
+    public static readonly JitBinaryOp Divide = new(0x5E, 4);    // VDIVPS
+    public static readonly JitBinaryOp Min = new(0x5D, 5);       // VMINPS
+    public static readonly JitBinaryOp Max = new(0x5F, 6);       // VMAXPS
+}
+
+/// <summary>
 /// Generates JIT-compiled x86-64 machine code for hot tensor operations.
 /// Kernels are specialized for exact problem dimensions with:
 /// - Constants baked as immediates (no register pressure for loop bounds)
 /// - Optimal unroll factors chosen per size
 /// - Non-temporal stores on aligned output (AlignedBuffer guarantees 64-byte alignment)
-/// - Software prefetch tuned for the data size
 ///
 /// This is the same approach oneDNN/Xbyak and libtorch use — raw machine code
 /// generation specialized per problem size — but written entirely in C#.
@@ -29,58 +56,74 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void UnaryKernel(float* src, float* dst, int length);
 
-    // Cache compiled kernels by operation + length
+    // Ternary: (float* a, float* b, float* c, float* dst, int length)
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    internal unsafe delegate void TernaryKernel(float* a, float* b, float* c, float* dst, int length);
+
+    // Cache compiled kernels by (opId, aligned, length)
     private static readonly ConcurrentDictionary<long, (ExecutableBuffer Buffer, Delegate Kernel)> _cache = new();
 
-    private static long MakeKey(int op, int length) => ((long)op << 32) | (uint)length;
+    // Pack (opId, aligned, length) into a single long key
+    private static long MakeKey(int opId, bool aligned, int length)
+        => ((long)opId << 33) | ((aligned ? 1L : 0L) << 32) | (uint)length;
 
-    private const int OP_ADD = 1;
-    private const int OP_MULTIPLY = 2;
-    private const int OP_RELU = 3;
+    // Separate key space for unary/fused ops (opId > 100 to avoid collisions)
+    private const int OP_RELU = 101;
+    private const int OP_FUSED_ADD_RELU = 102;
 
     /// <summary>
-    /// Gets or compiles a JIT kernel for vector addition with non-temporal stores.
-    /// Uses aligned loads/stores since AlignedBuffer guarantees 64-byte alignment.
+    /// Gets or compiles a JIT binary kernel for any operation (Add, Multiply, Subtract, etc.).
+    /// The operation is defined by <see cref="JitBinaryOp"/> — adding new ops requires
+    /// no changes to this method (Open/Closed Principle).
     /// </summary>
-    public static unsafe BinaryKernel GetAddKernel(int length)
+    /// <param name="op">The binary operation to compile.</param>
+    /// <param name="length">Number of floats to process.</param>
+    /// <param name="aligned">True for aligned NT stores (AlignedBuffer), false for VMOVUPS (GC arrays).</param>
+    public static unsafe BinaryKernel GetBinaryKernel(JitBinaryOp op, int length, bool aligned = false)
     {
-        long key = MakeKey(OP_ADD, length);
+        long key = MakeKey(op.Id, aligned, length);
         if (_cache.TryGetValue(key, out var cached))
             return (BinaryKernel)cached.Kernel;
 
-        var buffer = GenerateBinaryKernel(length, BinaryOp.Add);
+        var buffer = aligned
+            ? GenerateBinaryKernelAligned(length, op)
+            : GenerateBinaryKernelUnaligned(length, op);
         var kernel = buffer.CreateDelegate<BinaryKernel>();
         _cache.TryAdd(key, (buffer, kernel));
         return kernel;
     }
 
     /// <summary>
-    /// Gets or compiles a JIT kernel for vector multiply with non-temporal stores.
+    /// Gets or compiles a JIT kernel for ReLU: dst[i] = max(src[i], 0).
     /// </summary>
-    public static unsafe BinaryKernel GetMultiplyKernel(int length)
+    /// <param name="length">Number of floats to process.</param>
+    /// <param name="aligned">True for aligned NT stores, false for VMOVUPS.</param>
+    public static unsafe UnaryKernel GetReLUKernel(int length, bool aligned = false)
     {
-        long key = MakeKey(OP_MULTIPLY, length);
-        if (_cache.TryGetValue(key, out var cached))
-            return (BinaryKernel)cached.Kernel;
-
-        var buffer = GenerateBinaryKernel(length, BinaryOp.Multiply);
-        var kernel = buffer.CreateDelegate<BinaryKernel>();
-        _cache.TryAdd(key, (buffer, kernel));
-        return kernel;
-    }
-
-    /// <summary>
-    /// Gets or compiles a JIT kernel for ReLU with non-temporal stores.
-    /// Input and output may be the same pointer (in-place).
-    /// </summary>
-    public static unsafe UnaryKernel GetReLUKernel(int length)
-    {
-        long key = MakeKey(OP_RELU, length);
+        long key = MakeKey(OP_RELU, aligned, length);
         if (_cache.TryGetValue(key, out var cached))
             return (UnaryKernel)cached.Kernel;
 
-        var buffer = GenerateReLUKernel(length);
+        var buffer = aligned
+            ? GenerateReLUKernelAligned(length)
+            : GenerateReLUKernelUnaligned(length);
         var kernel = buffer.CreateDelegate<UnaryKernel>();
+        _cache.TryAdd(key, (buffer, kernel));
+        return kernel;
+    }
+
+    /// <summary>
+    /// Gets or compiles a fused Add+ReLU kernel: dst[i] = max(a[i] + b[i], 0).
+    /// Eliminates one full array pass compared to separate Add then ReLU.
+    /// </summary>
+    public static unsafe BinaryKernel GetFusedAddReLUKernel(int length)
+    {
+        long key = MakeKey(OP_FUSED_ADD_RELU, false, length);
+        if (_cache.TryGetValue(key, out var cached))
+            return (BinaryKernel)cached.Kernel;
+
+        var buffer = GenerateFusedAddReLUKernel(length);
+        var kernel = buffer.CreateDelegate<BinaryKernel>();
         _cache.TryAdd(key, (buffer, kernel));
         return kernel;
     }
@@ -101,92 +144,39 @@ internal static class CpuJitKernels
         }
     }
 
-    private enum BinaryOp { Add, Multiply }
+    // ==================== Kernel generators ====================
+    // All binary ops use the same structure — only the x86 opcode differs.
+    // The opcode is carried by JitBinaryOp, so no switch statements needed.
 
     /// <summary>
-    /// Generates a JIT-compiled binary kernel (add or multiply) with:
-    /// - 4x unrolled AVX2 main loop (32 floats per iteration)
-    /// - Non-temporal stores (aligned output assumed)
-    /// - Software prefetch
-    /// - Baked-in loop bound as immediate constant
-    /// - Scalar cleanup for remainder
+    /// Generates a binary kernel with non-temporal (aligned) stores.
+    /// Requires 32-byte aligned output (AlignedBuffer).
     /// </summary>
-    private static ExecutableBuffer GenerateBinaryKernel(int length, BinaryOp op)
+    private static ExecutableBuffer GenerateBinaryKernelAligned(int length, JitBinaryOp op)
     {
         var e = new X86Emitter();
-
-        // Windows x64 ABI: RCX=src0*, RDX=src1*, R8=dst*, R9=length (ignored, baked in)
         e.Prologue();
 
-        // We bake the length as a constant — the loop counter is in RBX
-        // RCX = src0, RDX = src1, R8 = dst
-        // RBX = loop index (byte offset)
-
-        // XOR RBX, RBX (zero the loop counter — byte offset)
-        e.Vxorps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM15); // zero for later use
-
-        // Calculate SIMD loop end: (length / 32) * 32 * 4 bytes = floor to 32-float boundary
         int simdCount = (length / 32) * 32;
         int simdEndBytes = simdCount * sizeof(float);
-        int totalBytes = length * sizeof(float);
-        int remainStart = simdCount;
-        // Future: add prefetch instructions for large arrays
-        // const int prefetchBytes = 256 * sizeof(float);
 
         if (simdCount > 0)
         {
-            // MOV RBX, 0 (byte offset counter)
             e.MovImm32(X86Emitter.RBX, 0);
 
             int loopLabel = e.NewLabel();
-            int loopEnd = e.NewLabel();
-
             e.BindLabel(loopLabel);
 
-            // Prefetch: PREFETCHT0 [src0 + RBX + prefetchBytes]
-            // (Simplified: we don't emit prefetch with RBX offset for now — use static offset)
-
-            // 4x unrolled: process 32 floats (128 bytes) per iteration
-            byte avxOp = op == BinaryOp.Add ? (byte)0x58 : (byte)0x59; // VADDPS or VMULPS
-
-            // Load 4 vectors from src0 (RCX + RBX)
-            // Load 4 vectors from src1 (RDX + RBX)
-            // Op and store to dst (R8 + RBX)
-            // Since we can't easily encode [base + index] in our simple emitter,
-            // we use a pointer-advancing approach instead:
-
-            // Actually, let's use a simpler approach: advance pointers
-            // We'll use RCX, RDX, R8 as advancing pointers and RBX as remaining count
-
-            // Reset: use R9 as end pointer (dst + simdEndBytes)
-            // Actually, simplest: use RBX as byte counter, compare to baked-in end
-
-            // For the unrolled loop body, we emit loads/ops/stores at fixed offsets from current position
-            // Then advance all three pointers by 128 bytes
-
-            // VMOVUPS ymm0, [RCX]       ; load src0[0..7]
+            // Load 4 vectors from src0 (RCX)
             e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
             e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
             e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
             e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
 
-            // VADDPS/VMULPS ymm0, ymm0, [RDX]
-            if (op == BinaryOp.Add)
-            {
-                e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, 0);
-                e.Vaddps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.RDX, 32);
-                e.Vaddps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.RDX, 64);
-                e.Vaddps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.RDX, 96);
-            }
-            else
-            {
-                e.Vmulps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, 0);
-                e.Vmulps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.RDX, 32);
-                e.Vmulps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.RDX, 64);
-                e.Vmulps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.RDX, 96);
-            }
+            // Apply op with src1 (RDX) — no switch, just use the opcode directly
+            EmitBinaryOp4Wide(e, op, X86Emitter.RDX);
 
-            // Non-temporal stores: VMOVNTPS [R8], ymm0 (output is 64-byte aligned)
+            // Non-temporal stores to dst (R8) — requires alignment
             e.VmovntpsStore(X86Emitter.YMM0, X86Emitter.R8, 0);
             e.VmovntpsStore(X86Emitter.YMM1, X86Emitter.R8, 32);
             e.VmovntpsStore(X86Emitter.YMM2, X86Emitter.R8, 64);
@@ -197,63 +187,28 @@ internal static class CpuJitKernels
             e.AddImm32(X86Emitter.RDX, 128);
             e.AddImm32(X86Emitter.R8, 128);
 
-            // Increment counter and compare
             e.AddImm32(X86Emitter.RBX, 128);
             e.CmpImm32(X86Emitter.RBX, simdEndBytes);
             e.Jl(loopLabel);
 
-            e.BindLabel(loopEnd);
-
-            // SFENCE after non-temporal stores
             e.Sfence();
         }
 
-        // Scalar cleanup for remaining elements
-        int remaining = length - simdCount;
-        if (remaining > 0)
-        {
-            // At this point RCX, RDX, R8 point to the scalar tail
-            // Process remaining elements one at a time using scalar SSE
-            // For simplicity, use VMOVSS (scalar load/store) or just regular loads
-            // Actually, process 8 at a time if possible, then truly scalar
-
-            int vec8Count = remaining / 8;
-            for (int v = 0; v < vec8Count; v++)
-            {
-                int off = v * 32;
-                e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, off);
-                if (op == BinaryOp.Add)
-                    e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
-                else
-                    e.Vmulps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
-                e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, off);
-            }
-
-            // Truly scalar remainder (< 8 elements) — emit individual MOVSS + op
-            // For simplicity we skip the last < 8 elements in the JIT kernel
-            // and let the caller handle them. This is fine since we round down.
-            // Actually, for correctness, let's handle all remaining via 8-wide + scalar:
-            // The vec8 loop above handles groups of 8. Any remaining < 8 we skip.
-            // The caller must ensure length is a multiple of 8, or handle the tail.
-        }
+        // Remainder in groups of 8
+        EmitBinaryRemainder(e, op, length - simdCount);
 
         e.Epilogue();
-
         return e.Build();
     }
 
     /// <summary>
-    /// Generates a JIT-compiled ReLU kernel: dst[i] = max(src[i], 0).
-    /// Uses VMAXPS with a zeroed register — extremely simple and fast.
+    /// Generates a ReLU kernel with non-temporal (aligned) stores.
     /// </summary>
-    private static ExecutableBuffer GenerateReLUKernel(int length)
+    private static ExecutableBuffer GenerateReLUKernelAligned(int length)
     {
         var e = new X86Emitter();
-
-        // Windows x64: RCX=src*, RDX=dst*, R8=length (ignored, baked in)
         e.Prologue();
 
-        // VXORPS YMM15, YMM15, YMM15 — zero register for max(x, 0)
         e.Vxorps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM15);
 
         int simdCount = (length / 32) * 32;
@@ -266,25 +221,21 @@ internal static class CpuJitKernels
             int loopLabel = e.NewLabel();
             e.BindLabel(loopLabel);
 
-            // Load 4 vectors from src (RCX)
             e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
             e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
             e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
             e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
 
-            // VMAXPS ymm, ymm, zero — ReLU
             e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
             e.Vmaxps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM15);
             e.Vmaxps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM15);
             e.Vmaxps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM15);
 
-            // Non-temporal stores (output is aligned)
             e.VmovntpsStore(X86Emitter.YMM0, X86Emitter.RDX, 0);
             e.VmovntpsStore(X86Emitter.YMM1, X86Emitter.RDX, 32);
             e.VmovntpsStore(X86Emitter.YMM2, X86Emitter.RDX, 64);
             e.VmovntpsStore(X86Emitter.YMM3, X86Emitter.RDX, 96);
 
-            // Advance pointers
             e.AddImm32(X86Emitter.RCX, 128);
             e.AddImm32(X86Emitter.RDX, 128);
 
@@ -295,8 +246,215 @@ internal static class CpuJitKernels
             e.Sfence();
         }
 
-        // Handle remaining elements in groups of 8
+        EmitReLURemainder(e, length - simdCount);
+
+        e.Epilogue();
+        return e.Build();
+    }
+
+    /// <summary>
+    /// Generates a binary kernel using VMOVUPS stores (safe for GC arrays).
+    /// Same 4x unrolled structure as aligned kernels but no alignment requirement.
+    /// </summary>
+    private static ExecutableBuffer GenerateBinaryKernelUnaligned(int length, JitBinaryOp op)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        int simdCount = (length / 32) * 32;
+        int simdEndBytes = simdCount * sizeof(float);
+
+        if (simdCount > 0)
+        {
+            e.MovImm32(X86Emitter.RBX, 0);
+
+            int loopLabel = e.NewLabel();
+            e.BindLabel(loopLabel);
+
+            // Load 4 vectors from src0 (RCX)
+            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
+            e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
+            e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
+            e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
+
+            // Apply op with src1 (RDX) — uses JitBinaryOp.Opcode, no switch needed
+            EmitBinaryOp4Wide(e, op, X86Emitter.RDX);
+
+            // Unaligned stores to dst (R8)
+            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, 0);
+            e.VmovupsStore(X86Emitter.YMM1, X86Emitter.R8, 32);
+            e.VmovupsStore(X86Emitter.YMM2, X86Emitter.R8, 64);
+            e.VmovupsStore(X86Emitter.YMM3, X86Emitter.R8, 96);
+
+            // Advance pointers by 128 bytes (32 floats)
+            e.AddImm32(X86Emitter.RCX, 128);
+            e.AddImm32(X86Emitter.RDX, 128);
+            e.AddImm32(X86Emitter.R8, 128);
+
+            e.AddImm32(X86Emitter.RBX, 128);
+            e.CmpImm32(X86Emitter.RBX, simdEndBytes);
+            e.Jl(loopLabel);
+        }
+
+        // Remainder in groups of 8
+        EmitBinaryRemainder(e, op, length - simdCount);
+
+        e.Epilogue();
+        return e.Build();
+    }
+
+    /// <summary>
+    /// Generates a ReLU kernel using VMOVUPS stores (safe for GC arrays).
+    /// </summary>
+    private static ExecutableBuffer GenerateReLUKernelUnaligned(int length)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        e.Vxorps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM15);
+
+        int simdCount = (length / 32) * 32;
+        int simdEndBytes = simdCount * sizeof(float);
+
+        if (simdCount > 0)
+        {
+            e.MovImm32(X86Emitter.RBX, 0);
+
+            int loopLabel = e.NewLabel();
+            e.BindLabel(loopLabel);
+
+            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
+            e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
+            e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
+            e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
+
+            e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM15);
+
+            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.RDX, 0);
+            e.VmovupsStore(X86Emitter.YMM1, X86Emitter.RDX, 32);
+            e.VmovupsStore(X86Emitter.YMM2, X86Emitter.RDX, 64);
+            e.VmovupsStore(X86Emitter.YMM3, X86Emitter.RDX, 96);
+
+            e.AddImm32(X86Emitter.RCX, 128);
+            e.AddImm32(X86Emitter.RDX, 128);
+
+            e.AddImm32(X86Emitter.RBX, 128);
+            e.CmpImm32(X86Emitter.RBX, simdEndBytes);
+            e.Jl(loopLabel);
+        }
+
+        EmitReLURemainder(e, length - simdCount);
+
+        e.Epilogue();
+        return e.Build();
+    }
+
+    /// <summary>
+    /// Generates a fused Add+ReLU kernel: dst[i] = max(a[i] + b[i], 0).
+    /// Eliminates one full array traversal compared to Add then ReLU.
+    /// </summary>
+    private static ExecutableBuffer GenerateFusedAddReLUKernel(int length)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        e.Vxorps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM15);
+
+        int simdCount = (length / 32) * 32;
+        int simdEndBytes = simdCount * sizeof(float);
+
+        if (simdCount > 0)
+        {
+            e.MovImm32(X86Emitter.RBX, 0);
+
+            int loopLabel = e.NewLabel();
+            e.BindLabel(loopLabel);
+
+            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
+            e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
+            e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
+            e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
+
+            // Add b (RDX)
+            e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, 0);
+            e.Vaddps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.RDX, 32);
+            e.Vaddps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.RDX, 64);
+            e.Vaddps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.RDX, 96);
+
+            // ReLU: max(result, 0)
+            e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM15);
+            e.Vmaxps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM15);
+
+            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, 0);
+            e.VmovupsStore(X86Emitter.YMM1, X86Emitter.R8, 32);
+            e.VmovupsStore(X86Emitter.YMM2, X86Emitter.R8, 64);
+            e.VmovupsStore(X86Emitter.YMM3, X86Emitter.R8, 96);
+
+            e.AddImm32(X86Emitter.RCX, 128);
+            e.AddImm32(X86Emitter.RDX, 128);
+            e.AddImm32(X86Emitter.R8, 128);
+
+            e.AddImm32(X86Emitter.RBX, 128);
+            e.CmpImm32(X86Emitter.RBX, simdEndBytes);
+            e.Jl(loopLabel);
+        }
+
+        // Remainder in groups of 8
         int remaining = length - simdCount;
+        int vec8Count = remaining / 8;
+        for (int v = 0; v < vec8Count; v++)
+        {
+            int off = v * 32;
+            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, off);
+            e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
+            e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
+            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, off);
+        }
+
+        e.Epilogue();
+        return e.Build();
+    }
+
+    // ==================== Shared emit helpers (no switch statements) ====================
+
+    /// <summary>
+    /// Emits 4-wide binary op (YMM0-YMM3) with memory operand.
+    /// Uses JitBinaryOp.Opcode directly via the generic VbinaryPs emitter —
+    /// no switch/case needed. New operations are automatically supported.
+    /// </summary>
+    private static void EmitBinaryOp4Wide(X86Emitter e, JitBinaryOp op, int srcBaseReg)
+    {
+        e.VbinaryPs(op.Opcode, X86Emitter.YMM0, X86Emitter.YMM0, srcBaseReg, 0);
+        e.VbinaryPs(op.Opcode, X86Emitter.YMM1, X86Emitter.YMM1, srcBaseReg, 32);
+        e.VbinaryPs(op.Opcode, X86Emitter.YMM2, X86Emitter.YMM2, srcBaseReg, 64);
+        e.VbinaryPs(op.Opcode, X86Emitter.YMM3, X86Emitter.YMM3, srcBaseReg, 96);
+    }
+
+    /// <summary>
+    /// Emits remainder loop (groups of 8 floats) for binary ops.
+    /// </summary>
+    private static void EmitBinaryRemainder(X86Emitter e, JitBinaryOp op, int remaining)
+    {
+        int vec8Count = remaining / 8;
+        for (int v = 0; v < vec8Count; v++)
+        {
+            int off = v * 32;
+            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, off);
+            e.VbinaryPs(op.Opcode, X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
+            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, off);
+        }
+    }
+
+    /// <summary>
+    /// Emits remainder loop for ReLU (groups of 8 floats).
+    /// </summary>
+    private static void EmitReLURemainder(X86Emitter e, int remaining)
+    {
         int vec8Count = remaining / 8;
         for (int v = 0; v < vec8Count; v++)
         {
@@ -305,10 +463,6 @@ internal static class CpuJitKernels
             e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
             e.VmovupsStore(X86Emitter.YMM0, X86Emitter.RDX, off);
         }
-
-        e.Epilogue();
-
-        return e.Build();
     }
 
     /// <summary>

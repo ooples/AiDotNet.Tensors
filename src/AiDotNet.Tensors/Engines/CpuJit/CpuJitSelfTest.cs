@@ -53,8 +53,8 @@ internal static class CpuJitSelfTest
                 spanB[i] = i * 2.0f;
             }
 
-            // Run JIT Add kernel
-            var addKernel = CpuJitKernels.GetAddKernel(testSize);
+            // Run JIT Add kernel (aligned=true since we're using AlignedBuffer)
+            var addKernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, testSize, aligned: true);
             addKernel(srcA.FloatPtr, srcB.FloatPtr, dst.FloatPtr, testSize);
 
             // Verify
@@ -66,7 +66,7 @@ internal static class CpuJitSelfTest
             }
 
             // Test 2: Binary Multiply kernel
-            var mulKernel = CpuJitKernels.GetMultiplyKernel(testSize);
+            var mulKernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, testSize, aligned: true);
             mulKernel(srcA.FloatPtr, srcB.FloatPtr, dst.FloatPtr, testSize);
 
             for (int i = 0; i < testSize; i++)
@@ -82,7 +82,7 @@ internal static class CpuJitSelfTest
                 spanA[i] = i - 32; // -32 to +31
             }
 
-            var reluKernel = CpuJitKernels.GetReLUKernel(testSize);
+            var reluKernel = CpuJitKernels.GetReLUKernel(testSize, aligned: true);
             reluKernel(srcA.FloatPtr, dst.FloatPtr, testSize);
 
             for (int i = 0; i < testSize; i++)

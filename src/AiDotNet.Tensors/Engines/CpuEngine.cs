@@ -2118,7 +2118,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+    public unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2128,9 +2128,58 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorPool.Rent<T>(a.Shape);
+        int length = a.Length;
 
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
+        {
+            T[] aArr = a.GetDataArray();
+            T[] bArr = b.GetDataArray();
+            T[] rArr = result.GetDataArray();
+            float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
+            float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
+            float[] rFloat = Unsafe.As<T[], float[]>(ref rArr);
+
+            // Parallel SIMD for medium-large arrays
+            int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 500_000));
+            if (subChunks >= 2)
+            {
+                var aMem = (Memory<float>)(object)a.Data;
+                var bMem = (Memory<float>)(object)b.Data;
+                var rMem = (Memory<float>)(object)result.Data;
+                using var pinA = aMem.Pin();
+                using var pinB = bMem.Pin();
+                using var pinR = rMem.Pin();
+                float* pA = (float*)pinA.Pointer;
+                float* pB = (float*)pinB.Pointer;
+                float* pR = (float*)pinR.Pointer;
+                int chunkSize = (length + subChunks - 1) / subChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, subChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pR + start, count);
+                    }
+                });
+            }
+            else
+            {
+                fixed (float* ptrA = aFloat)
+                fixed (float* ptrB = bFloat)
+                fixed (float* ptrR = rFloat)
+                {
+                    SimdKernels.VectorSubtractUnsafe(ptrA, ptrB, ptrR, length);
+                }
+            }
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3864,15 +3913,58 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> Sigmoid<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> Sigmoid<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized Sigmoid: 1 / (1 + exp(-x)) - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorPool.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
 
+        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+        if (typeof(T) == typeof(float))
+        {
+            T[] srcArr = tensor.GetDataArray();
+            T[] dstArr = result.GetDataArray();
+            float[] srcFloat = Unsafe.As<T[], float[]>(ref srcArr);
+            float[] dstFloat = Unsafe.As<T[], float[]>(ref dstArr);
+
+            // Sigmoid is compute-bound — parallelism helps even at smaller sizes
+            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+            if (sigChunks >= 2)
+            {
+                var srcMem = (Memory<float>)(object)tensor.Data;
+                var dstMem = (Memory<float>)(object)result.Data;
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                float* pSrc = (float*)pinSrc.Pointer;
+                float* pDst = (float*)pinDst.Pointer;
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, sigChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.SigmoidUnsafe(pSrc + start, pDst + start, count);
+                    }
+                });
+            }
+            else
+            {
+                fixed (float* ptrSrc = srcFloat)
+                fixed (float* ptrDst = dstFloat)
+                {
+                    SimdKernels.SigmoidUnsafe(ptrSrc, ptrDst, length);
+                }
+            }
+            return result;
+        }
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;

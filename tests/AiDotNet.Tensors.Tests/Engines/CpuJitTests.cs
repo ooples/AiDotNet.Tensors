@@ -36,7 +36,7 @@ public class CpuJitTests
             spanB[i] = i * 1.5f;
         }
 
-        var kernel = CpuJitKernels.GetAddKernel(size);
+        var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Add, size, aligned: true);
         kernel(a.FloatPtr, b.FloatPtr, c.FloatPtr, size);
 
         var spanC = c.AsSpan();
@@ -65,7 +65,7 @@ public class CpuJitTests
             spanB[i] = i * 0.5f;
         }
 
-        var kernel = CpuJitKernels.GetMultiplyKernel(size);
+        var kernel = CpuJitKernels.GetBinaryKernel(JitBinaryOp.Multiply, size, aligned: true);
         kernel(a.FloatPtr, b.FloatPtr, c.FloatPtr, size);
 
         var spanC = c.AsSpan();
@@ -91,7 +91,7 @@ public class CpuJitTests
             spanSrc[i] = i - 128; // -128 to +127
         }
 
-        var kernel = CpuJitKernels.GetReLUKernel(size);
+        var kernel = CpuJitKernels.GetReLUKernel(size, aligned: true);
         kernel(src.FloatPtr, dst.FloatPtr, size);
 
         var spanDst = dst.AsSpan();

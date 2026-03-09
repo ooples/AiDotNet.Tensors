@@ -142,6 +142,40 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Pointer-based VectorSubtract — zero bounds-checking overhead for hot paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorSubtractUnsafe(float* a, float* b, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 8, Avx.Subtract(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 16, Avx.Subtract(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                    Avx.Store(result + i + 24, Avx.Subtract(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] - b[i];
+            }
+        }
+
+        /// <summary>
         /// Pointer-based ReLU — zero bounds-checking overhead for hot paths.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -232,6 +232,10 @@ internal sealed class X86Emitter
     public void Vsubps(int dst, int src1, int src2)
         => EmitVexRR(1, 0, 0, 0x5C, dst, src1, src2);
 
+    /// <summary>VSUBPS ymm, ymm, [base+disp] — Packed float subtract from memory</summary>
+    public void Vsubps(int dst, int src1, int baseReg, int disp)
+        => EmitVexRM(1, 0, 0, 0x5C, dst, src1, baseReg, disp);
+
     /// <summary>VMAXPS ymm, ymm, ymm — Packed float maximum (used for ReLU)</summary>
     public void Vmaxps(int dst, int src1, int src2)
         => EmitVexRR(1, 0, 0, 0x5F, dst, src1, src2);
@@ -243,6 +247,20 @@ internal sealed class X86Emitter
     /// <summary>VXORPS ymm, ymm, ymm — Packed float XOR (used to zero registers)</summary>
     public void Vxorps(int dst, int src1, int src2)
         => EmitVexRR(1, 0, 0, 0x57, dst, src1, src2);
+
+    /// <summary>
+    /// Generic packed single-precision op: op ymm_dst, ymm_src1, ymm_src2 (register-register).
+    /// Opcode examples: 0x58=VADDPS, 0x59=VMULPS, 0x5C=VSUBPS, 0x5E=VDIVPS, 0x5D=VMINPS, 0x5F=VMAXPS.
+    /// Open for extension: new ops require only a new opcode constant, no emitter changes.
+    /// </summary>
+    public void VbinaryPs(byte opcode, int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, opcode, dst, src1, src2);
+
+    /// <summary>
+    /// Generic packed single-precision op: op ymm_dst, ymm_src1, [base+disp] (register-memory).
+    /// </summary>
+    public void VbinaryPs(byte opcode, int dst, int src1, int baseReg, int disp)
+        => EmitVexRM(1, 0, 0, opcode, dst, src1, baseReg, disp);
 
     // ==================== AVX2 Memory Operations ====================
 
