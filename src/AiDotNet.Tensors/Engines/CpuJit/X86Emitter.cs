@@ -32,6 +32,13 @@ internal sealed class X86Emitter
     /// <summary>Current code size in bytes.</summary>
     public int Size => _code.Count;
 
+    /// <summary>Reinterpret float bits as int32 (portable across all TFMs including net471).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe int FloatToInt32Bits(float value)
+    {
+        return *(int*)&value;
+    }
+
     /// <summary>Allocate a new label ID for forward/backward jumps.</summary>
     public int NewLabel() => _nextLabel++;
 
@@ -348,6 +355,16 @@ internal sealed class X86Emitter
 
     // ==================== Scalar / Integer Instructions ====================
 
+    /// <summary>MOV reg64, reg64 — Register-to-register move</summary>
+    public void MovRR(int dst, int src)
+    {
+        // REX.W + 89 /r  (MOV r/m64, r64)
+        int rex = 0x48 | ((src >> 3) << 2) | ((dst >> 3) & 1);
+        Emit((byte)rex);
+        Emit(0x89);
+        EmitModRM(3, src, dst);
+    }
+
     /// <summary>MOV reg64, imm64 — Load 64-bit immediate into register</summary>
     public void MovImm64(int reg, long imm)
     {
@@ -504,10 +521,10 @@ internal sealed class X86Emitter
     public int EmitDataConstant(float value)
     {
         // Check for existing constant with same bit pattern
-        int bits = BitConverter.SingleToInt32Bits(value);
+        int bits = FloatToInt32Bits(value);
         for (int i = 0; i < _dataConstants.Count; i++)
         {
-            if (BitConverter.SingleToInt32Bits(_dataConstants[i]) == bits)
+            if (FloatToInt32Bits(_dataConstants[i]) == bits)
                 return i;
         }
         _dataConstants.Add(value);
@@ -585,7 +602,7 @@ internal sealed class X86Emitter
             for (int i = 0; i < _dataConstants.Count; i++)
             {
                 int constAddr = dataOffset + (i * 4);
-                int bits = BitConverter.SingleToInt32Bits(_dataConstants[i]);
+                int bits = FloatToInt32Bits(_dataConstants[i]);
                 dst[constAddr] = (byte)(bits & 0xFF);
                 dst[constAddr + 1] = (byte)((bits >> 8) & 0xFF);
                 dst[constAddr + 2] = (byte)((bits >> 16) & 0xFF);

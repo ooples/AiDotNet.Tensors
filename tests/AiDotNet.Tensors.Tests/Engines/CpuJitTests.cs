@@ -103,6 +103,42 @@ public class CpuJitTests
     }
 
     [Fact]
+    public unsafe void JitSigmoidKernel_ProducesCorrectResults()
+    {
+        if (!CpuJitKernels.IsSupported)
+            return;
+
+        const int size = 256;
+        using var src = new AlignedBuffer(size);
+        using var jitDst = new AlignedBuffer(size);
+        using var simdDst = new AlignedBuffer(size);
+
+        var spanSrc = src.AsSpan();
+        // Full range including clamp boundaries
+        for (int i = 0; i < size; i++)
+        {
+            spanSrc[i] = (i - 128) * 0.1f; // -12.8 to +12.7
+        }
+
+        // Run JIT kernel
+        var kernel = CpuJitKernels.GetSigmoidKernel(size);
+        kernel(src.FloatPtr, jitDst.FloatPtr, size);
+
+        // Run SimdKernels reference (same polynomial)
+        AiDotNet.Tensors.Engines.Simd.SimdKernels.SigmoidUnsafe(src.FloatPtr, simdDst.FloatPtr, size);
+
+        var spanJit = jitDst.AsSpan();
+        var spanSimd = simdDst.AsSpan();
+        for (int i = 0; i < size; i++)
+        {
+            float x = (i - 128) * 0.1f;
+            // Compare JIT vs SIMD (same polynomial, allow small FP rounding from VMULPS+VADDPS vs FMA)
+            Assert.True(MathF.Abs(spanJit[i] - spanSimd[i]) <= 0.002f,
+                $"JIT vs SIMD mismatch at i={i}, x={x:F2}: jit={spanJit[i]:F6}, simd={spanSimd[i]:F6}, diff={MathF.Abs(spanJit[i] - spanSimd[i]):F6}");
+        }
+    }
+
+    [Fact]
     public void AlignedBuffer_Is64ByteAligned()
     {
         using var buf = new AlignedBuffer(1024);

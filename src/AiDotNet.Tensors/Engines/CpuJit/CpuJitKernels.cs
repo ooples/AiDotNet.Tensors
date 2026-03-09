@@ -60,6 +60,11 @@ internal static class CpuJitKernels
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     internal unsafe delegate void TernaryKernel(float* a, float* b, float* c, float* dst, int length);
 
+    // GEMM micro-kernel: (float* packedA, float* packedB, float* c, int kc)
+    // ldc is baked into the kernel at JIT time
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
+
     // Cache compiled kernels by (opId, aligned, length)
     private static readonly ConcurrentDictionary<long, (ExecutableBuffer Buffer, Delegate Kernel)> _cache = new();
 
@@ -71,6 +76,7 @@ internal static class CpuJitKernels
     private const int OP_RELU = 101;
     private const int OP_FUSED_ADD_RELU = 102;
     private const int OP_SIGMOID = 103;
+    private const int OP_GEMM_MICRO = 200; // key space: (OP_GEMM_MICRO + ldc) to differentiate by ldc
 
     /// <summary>
     /// Gets or compiles a JIT binary kernel for any operation (Add, Multiply, Subtract, etc.).
@@ -141,6 +147,24 @@ internal static class CpuJitKernels
 
         var buffer = GenerateSigmoidKernel(length);
         var kernel = buffer.CreateDelegate<UnaryKernel>();
+        _cache.TryAdd(key, (buffer, kernel));
+        return kernel;
+    }
+
+    /// <summary>
+    /// Gets or compiles a JIT 6x16 GEMM micro-kernel with ldc baked as immediate.
+    /// Computes C[6,16] += packedA[6,kc] * packedB[kc,16] using 12 FMA accumulators.
+    /// ldc is the leading dimension of C (in floats, not bytes).
+    /// </summary>
+    public static unsafe GemmMicroKernel GetGemmMicroKernel(int kc, int ldc)
+    {
+        // Pack ldc into the key: OP_GEMM_MICRO in opId, ldc in aligned flag area, kc in length
+        long key = ((long)(OP_GEMM_MICRO + ldc) << 33) | (uint)kc;
+        if (_cache.TryGetValue(key, out var cached))
+            return (GemmMicroKernel)cached.Kernel;
+
+        var buffer = GenerateGemmMicroKernel(kc, ldc);
+        var kernel = buffer.CreateDelegate<GemmMicroKernel>();
         _cache.TryAdd(key, (buffer, kernel));
         return kernel;
     }
@@ -435,6 +459,125 @@ internal static class CpuJitKernels
 
         e.Epilogue();
         return e.Build();
+    }
+
+    /// <summary>
+    /// Generates a JIT 6x16 GEMM micro-kernel.
+    /// Register allocation:
+    ///   YMM0-YMM11: 12 accumulators (6 rows x 2 vectors of 8 = 16 columns)
+    ///   YMM12-YMM13: B row loads (2 vectors)
+    ///   YMM14: A element broadcast (reused per row)
+    ///   YMM15: (spare)
+    ///
+    /// Windows x64 ABI: RCX=packedA*, RDX=packedB*, R8=C*, R9=kc
+    /// ldc is baked as immediate displacement for C row access.
+    ///
+    /// Mr=6 (A panel height), Nr=16 (B panel width)
+    /// A packed layout: kc groups of Mr=6 contiguous floats (stride = 24 bytes)
+    /// B packed layout: kc groups of Nr=16 contiguous floats (stride = 64 bytes)
+    /// </summary>
+    private static ExecutableBuffer GenerateGemmMicroKernel(int kc, int ldc)
+    {
+        var e = new X86Emitter();
+        e.Prologue();
+
+        int ldcBytes = ldc * sizeof(float);
+
+        // Zero all 12 accumulators (YMM0-YMM11)
+        for (int r = 0; r < 12; r++)
+        {
+            e.Vxorps(r, r, r);
+        }
+
+        if (kc > 0)
+        {
+            // Save R8 (C pointer) into R10 — we'll need R8 pristine for C stores later
+            e.MovRR(X86Emitter.R10, X86Emitter.R8);
+
+            // Loop counter: R9 = kc (counts down to 0)
+            int loopLabel = e.NewLabel();
+            e.BindLabel(loopLabel);
+
+            // Load B row: 2 vectors of 8 floats from packedB (RDX)
+            e.VmovupsLoad(X86Emitter.YMM12, X86Emitter.RDX, 0);   // B[p, 0:7]
+            e.VmovupsLoad(X86Emitter.YMM13, X86Emitter.RDX, 32);  // B[p, 8:15]
+
+            // Row 0: broadcast A[p*6+0], FMA with B
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 0);
+            e.Vfmadd231ps(X86Emitter.YMM0, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM1, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Row 1
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 4);
+            e.Vfmadd231ps(X86Emitter.YMM2, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM3, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Row 2
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 8);
+            e.Vfmadd231ps(X86Emitter.YMM4, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM5, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Row 3
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 12);
+            e.Vfmadd231ps(X86Emitter.YMM6, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM7, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Row 4
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 16);
+            e.Vfmadd231ps(X86Emitter.YMM8, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM9, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Row 5
+            e.Vbroadcastss(X86Emitter.YMM14, X86Emitter.RCX, 20);
+            e.Vfmadd231ps(X86Emitter.YMM10, X86Emitter.YMM14, X86Emitter.YMM12);
+            e.Vfmadd231ps(X86Emitter.YMM11, X86Emitter.YMM14, X86Emitter.YMM13);
+
+            // Advance A by Mr*4=24 bytes, B by Nr*4=64 bytes
+            e.AddImm32(X86Emitter.RCX, 24);
+            e.AddImm32(X86Emitter.RDX, 64);
+
+            // Decrement kc and loop
+            e.SubImm32(X86Emitter.R9, 1);
+            e.Jne(loopLabel);
+
+            // === Store accumulated results back to C (load-add-store) ===
+            // R10 = C pointer, ldc baked as displacement
+            // Row 0: C[0, 0:15]
+            EmitGemmStoreRow(e, X86Emitter.R10, 0, X86Emitter.YMM0, X86Emitter.YMM1);
+            // Row 1: C[1, 0:15] = R10 + ldcBytes
+            EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes, X86Emitter.YMM2, X86Emitter.YMM3);
+            // Row 2
+            EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 2, X86Emitter.YMM4, X86Emitter.YMM5);
+            // Row 3
+            EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 3, X86Emitter.YMM6, X86Emitter.YMM7);
+            // Row 4
+            EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 4, X86Emitter.YMM8, X86Emitter.YMM9);
+            // Row 5
+            EmitGemmStoreRow(e, X86Emitter.R10, ldcBytes * 5, X86Emitter.YMM10, X86Emitter.YMM11);
+        }
+
+        e.Epilogue();
+        return e.Build();
+    }
+
+    /// <summary>
+    /// Emits load-add-store for one row of the 6x16 GEMM tile.
+    /// Loads existing C[row], adds accumulator, stores back.
+    /// </summary>
+    private static void EmitGemmStoreRow(X86Emitter e, int baseReg, int disp,
+        int accumLo, int accumHi)
+    {
+        // Load existing C values
+        e.VmovupsLoad(X86Emitter.YMM14, baseReg, disp);
+        e.VmovupsLoad(X86Emitter.YMM15, baseReg, disp + 32);
+
+        // Add accumulators
+        e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, accumLo);
+        e.Vaddps(X86Emitter.YMM15, X86Emitter.YMM15, accumHi);
+
+        // Store back
+        e.VmovupsStore(X86Emitter.YMM14, baseReg, disp);
+        e.VmovupsStore(X86Emitter.YMM15, baseReg, disp + 32);
     }
 
     /// <summary>

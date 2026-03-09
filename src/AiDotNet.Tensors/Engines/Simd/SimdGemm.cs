@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.CpuJit;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -422,9 +423,10 @@ internal static class SimdGemm
 
     /// <summary>
     /// Macro-kernel: iterate over packed panels with Mr x Nr micro-kernel tiles.
+    /// Uses JIT-compiled micro-kernel when available for guaranteed optimal register allocation.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void MacroKernel(
+    private static unsafe void MacroKernel(
         float[] packedA,
         float[] packedB,
         Span<float> c,
@@ -433,6 +435,10 @@ internal static class SimdGemm
     {
         int nrBlocks = (nc + Nr - 1) / Nr;
         int mrBlocks = (mc + Mr - 1) / Mr;
+
+        // Try JIT micro-kernel: bakes ldc as immediate, guarantees 12 YMM accumulators in registers
+        CpuJitKernels.GemmMicroKernel? jitKernel =
+            CpuJitSelfTest.IsVerified ? CpuJitKernels.GetGemmMicroKernel(kc, ldc) : null;
 
         for (int jr = 0; jr < nrBlocks; jr++)
         {
@@ -448,13 +454,27 @@ internal static class SimdGemm
 
                 if (mc_actual == Mr && nc_actual == Nr)
                 {
-                    // Full micro-kernel
-                    MicroKernel6x16(
-                        packedA, aPanelOffset,
-                        packedB, bPanelOffset,
-                        c, ldc,
-                        icOffset + iLocal, jcOffset + jLocal,
-                        kc);
+                    if (jitKernel is not null)
+                    {
+                        // JIT micro-kernel: pass pointers directly
+                        fixed (float* pA = &packedA[aPanelOffset])
+                        fixed (float* pB = &packedB[bPanelOffset])
+                        fixed (float* pC = c)
+                        {
+                            int cOffset = (icOffset + iLocal) * ldc + (jcOffset + jLocal);
+                            jitKernel(pA, pB, pC + cOffset, kc);
+                        }
+                    }
+                    else
+                    {
+                        // C# intrinsics micro-kernel fallback
+                        MicroKernel6x16(
+                            packedA, aPanelOffset,
+                            packedB, bPanelOffset,
+                            c, ldc,
+                            icOffset + iLocal, jcOffset + jLocal,
+                            kc);
+                    }
                 }
                 else
                 {

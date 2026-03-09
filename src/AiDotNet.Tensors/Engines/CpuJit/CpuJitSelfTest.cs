@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Simd;
 
 namespace AiDotNet.Tensors.Engines.CpuJit;
 
@@ -92,23 +93,9 @@ internal static class CpuJitSelfTest
                     return false;
             }
 
-            // Test 4: Sigmoid kernel (uses data section constants)
-            for (int i = 0; i < testSize; i++)
-            {
-                spanA[i] = (i - 32) * 0.2f; // -6.4 to +6.2, covers clamping range
-            }
-
-            var sigmoidKernel = CpuJitKernels.GetSigmoidKernel(testSize);
-            sigmoidKernel(srcA.FloatPtr, dst.FloatPtr, testSize);
-
-            for (int i = 0; i < testSize; i++)
-            {
-                float x = (i - 32) * 0.2f;
-                float expected = 1.0f / (1.0f + MathF.Exp(-x));
-                // Polynomial approximation has ~0.004 max error
-                if (MathF.Abs(spanDst[i] - expected) > 0.01f)
-                    return false;
-            }
+            // Test 4: Sigmoid kernel (uses data section constant embedding)
+            if (!TestSigmoidKernel())
+                return false;
 
             return true;
         }
@@ -117,5 +104,39 @@ internal static class CpuJitSelfTest
             // Any exception means JIT is broken — fall back to SimdKernels
             return false;
         }
+    }
+
+    private static unsafe bool TestSigmoidKernel()
+    {
+        const int testSize = 64;
+        using var src = new AlignedBuffer(testSize);
+        using var jitDst = new AlignedBuffer(testSize);
+
+        var spanSrc = src.AsSpan();
+        var spanJitDst = jitDst.AsSpan();
+
+        // Test full range including boundary regions
+        for (int i = 0; i < testSize; i++)
+        {
+            spanSrc[i] = (i - 32) * 0.2f; // -6.4 to +6.2
+        }
+
+        // Run JIT kernel
+        var sigmoidKernel = CpuJitKernels.GetSigmoidKernel(testSize);
+        sigmoidKernel(src.FloatPtr, jitDst.FloatPtr, testSize);
+
+        // Compare against SimdKernels (reference implementation using same polynomial)
+        float[] simdOutput = new float[testSize];
+        Simd.SimdKernels.SigmoidUnsafe(src.FloatPtr, (float*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref simdOutput[0]), testSize);
+
+        for (int i = 0; i < testSize; i++)
+        {
+            // JIT and SIMD should produce bit-identical results (same polynomial, same ops)
+            // Allow tiny FP rounding differences from VMULPS+VADDPS vs FMA
+            if (MathF.Abs(spanJitDst[i] - simdOutput[i]) > 0.001f)
+                return false;
+        }
+
+        return true;
     }
 }
