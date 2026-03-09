@@ -15716,7 +15716,8 @@ public class CpuEngine : ITensorLevelEngine
             fallbackResult = TensorBroadcastAdd(fallbackResult, bias);
         }
 
-        fallbackResult = ApplyFusedActivation(fallbackResult, activation);
+        // Apply activation in-place (fallbackResult is a fresh tensor)
+        ApplyFusedActivationInPlace(fallbackResult, activation);
 
         return fallbackResult;
     }
@@ -15801,8 +15802,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, bias);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor, no need to allocate another)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15831,8 +15832,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15861,8 +15862,8 @@ public class CpuEngine : ITensorLevelEngine
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
-        // Step 3: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 3: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15892,8 +15893,8 @@ public class CpuEngine : ITensorLevelEngine
         // This CPU implementation just does the batch normalization
         var result = BatchNorm(input, gamma, beta, epsilon, out saveMean, out saveVar);
 
-        // Step 2: Apply activation
-        result = ApplyFusedActivation(result, activation);
+        // Step 2: Apply activation in-place (result is a fresh tensor)
+        ApplyFusedActivationInPlace(result, activation);
 
         return result;
     }
@@ -15915,6 +15916,32 @@ public class CpuEngine : ITensorLevelEngine
             FusedActivationType.Softmax => Softmax(input, -1),
             _ => throw new ArgumentException($"Unknown activation type: {activation}")
         };
+    }
+
+    /// <summary>
+    /// Applies activation in-place on a tensor that was just allocated.
+    /// Eliminates one tensor allocation compared to ApplyFusedActivation.
+    /// For activations without InPlace variants, falls back to allocating.
+    /// </summary>
+    private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
+    {
+        switch (activation)
+        {
+            case FusedActivationType.None:
+                break;
+            case FusedActivationType.ReLU:
+                ReLUInPlace(tensor);
+                break;
+            case FusedActivationType.Sigmoid:
+                SigmoidInPlace(tensor);
+                break;
+            default:
+                // For activations without InPlace variants, compute out-of-place
+                // and copy back. This is still correct, just not as fast.
+                var activated = ApplyFusedActivation(tensor, activation);
+                activated.AsSpan().CopyTo(tensor.AsWritableSpan());
+                break;
+        }
     }
 
     /// <summary>
