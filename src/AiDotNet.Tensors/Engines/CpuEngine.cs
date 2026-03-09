@@ -15904,44 +15904,22 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> ApplyFusedActivation<T>(Tensor<T> input, FusedActivationType activation)
     {
-        return activation switch
-        {
-            FusedActivationType.None => input,
-            FusedActivationType.ReLU => ReLU(input),
-            FusedActivationType.GELU => GELU(input),
-            FusedActivationType.Sigmoid => Sigmoid(input),
-            FusedActivationType.Tanh => Tanh(input),
-            FusedActivationType.LeakyReLU => LeakyReLU(input, MathHelper.GetNumericOperations<T>().FromDouble(0.01)),
-            FusedActivationType.Swish => Swish(input),
-            FusedActivationType.Softmax => Softmax(input, -1),
-            _ => throw new ArgumentException($"Unknown activation type: {activation}")
-        };
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return input; // None
+        return handler.Apply(this, input);
     }
 
     /// <summary>
     /// Applies activation in-place on a tensor that was just allocated.
     /// Eliminates one tensor allocation compared to ApplyFusedActivation.
-    /// For activations without InPlace variants, falls back to allocating.
+    /// Handlers with true in-place support (ReLU, Sigmoid) override ApplyInPlace.
+    /// Others fall back to allocate + copy.
     /// </summary>
     private void ApplyFusedActivationInPlace<T>(Tensor<T> tensor, FusedActivationType activation)
     {
-        switch (activation)
-        {
-            case FusedActivationType.None:
-                break;
-            case FusedActivationType.ReLU:
-                ReLUInPlace(tensor);
-                break;
-            case FusedActivationType.Sigmoid:
-                SigmoidInPlace(tensor);
-                break;
-            default:
-                // For activations without InPlace variants, compute out-of-place
-                // and copy back. This is still correct, just not as fast.
-                var activated = ApplyFusedActivation(tensor, activation);
-                activated.AsSpan().CopyTo(tensor.AsWritableSpan());
-                break;
-        }
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return; // None
+        handler.ApplyInPlace(this, tensor);
     }
 
     /// <summary>
