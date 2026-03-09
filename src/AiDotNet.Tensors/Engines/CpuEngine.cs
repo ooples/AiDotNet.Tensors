@@ -1893,9 +1893,9 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
-            var rMem = (Memory<float>)(object)result.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -1911,7 +1911,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int addChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (addChunks >= 2)
             {
                 int chunkSize = (length + addChunks - 1) / addChunks;
@@ -1960,8 +1960,8 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -1984,7 +1984,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -2122,9 +2122,9 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
-            var rMem = (Memory<float>)(object)result.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -2140,7 +2140,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int subChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (subChunks >= 2)
             {
                 int chunkSize = (length + subChunks - 1) / subChunks;
@@ -2187,9 +2187,9 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
-            var rMem = (Memory<float>)(object)result.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -2205,7 +2205,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int mulChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (mulChunks >= 2)
             {
                 int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -2254,8 +2254,8 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -2278,7 +2278,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -2384,9 +2384,9 @@ public class CpuEngine : ITensorLevelEngine
         // Fast path for float tensors with JIT kernel
         if (typeof(T) == typeof(float) && CpuJitSelfTest.IsVerified && length >= 64)
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
-            var rMem = (Memory<float>)(object)result.Data;
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(result.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -2831,7 +2831,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradGrid = new Tensor<T>(grid.Shape);
 
         // Use thread-local gradients to avoid contention, then combine
-        int numThreads = Environment.ProcessorCount;
+        int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
         var threadLocalGrads = new double[numThreads][];
         for (int t = 0; t < numThreads; t++)
         {
@@ -3054,7 +3054,7 @@ public class CpuEngine : ITensorLevelEngine
             float result;
 
             // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            int numChunks = length >= 200_000 ? Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
@@ -3777,7 +3777,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth)
     {
         // Use parallel processing for batch and output channels
-        bool useParallel = batch * outChannels >= 4 && Environment.ProcessorCount > 1;
+        bool useParallel = batch * outChannels >= 4 && CpuParallelSettings.MaxDegreeOfParallelism > 1;
 
         if (useParallel)
         {
@@ -3914,8 +3914,8 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy
         if (typeof(T) == typeof(float))
         {
-            var srcMem = (Memory<float>)(object)tensor.Data;
-            var dstMem = (Memory<float>)(object)result.Data;
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -3924,7 +3924,7 @@ public class CpuEngine : ITensorLevelEngine
             // JIT-compiled sigmoid: constants baked in data section, 4x unrolled
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+                int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (sigChunks >= 2)
                 {
                     int chunkSize = (length + sigChunks - 1) / sigChunks;
@@ -3950,7 +3950,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // SIMD fallback
-            int fallbackChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+            int fallbackChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
             if (fallbackChunks >= 2)
             {
                 int chunkSize = (length + fallbackChunks - 1) / fallbackChunks;
@@ -3993,7 +3993,7 @@ public class CpuEngine : ITensorLevelEngine
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
-            var floatMem = (Memory<float>)(object)tensor.Data;
+            var floatMem = AsFloatMemory(tensor.Data);
             if (MemoryMarshal.TryGetArray((ReadOnlyMemory<float>)floatMem, out var segment) &&
                 segment.Array is not null && segment.Offset == 0)
             {
@@ -4026,14 +4026,14 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = (Memory<float>)(object)tensor.Data;
+            var mem = AsFloatMemory(tensor.Data);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
             // JIT-compiled sigmoid in-place: constants baked in data section
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
-                int jitChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+                int jitChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (jitChunks >= 2)
                 {
                     int chunkSize = (length + jitChunks - 1) / jitChunks;
@@ -4059,7 +4059,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // SIMD fallback
-            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 250_000));
+            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
             if (sigChunks >= 2)
             {
                 int chunkSize = (length + sigChunks - 1) / sigChunks;
@@ -4114,8 +4114,8 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
-            var srcMem = (Memory<float>)(object)tensor.Data;
-            var dstMem = (Memory<float>)(object)result.Data;
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -4129,7 +4129,7 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int reluChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (reluChunks >= 2)
             {
                 int chunkSize = (length + reluChunks - 1) / reluChunks;
@@ -4172,7 +4172,7 @@ public class CpuEngine : ITensorLevelEngine
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
-            var floatMem = (Memory<float>)(object)tensor.Data;
+            var floatMem = AsFloatMemory(tensor.Data);
             if (MemoryMarshal.TryGetArray((ReadOnlyMemory<float>)floatMem, out var segment) &&
                 segment.Array is not null && segment.Offset == 0)
             {
@@ -4204,12 +4204,12 @@ public class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = (Memory<float>)(object)tensor.Data;
+            var mem = AsFloatMemory(tensor.Data);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
             // Bandwidth-bound: parallel only helps above ~2M elements
-            int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -13908,7 +13908,7 @@ public class CpuEngine : ITensorLevelEngine
             if (seed.HasValue)
             {
                 var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[Environment.ProcessorCount];
+                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
                 for (int i = 0; i < seeds.Length; i++)
                     seeds[i] = baseRandom.Next();
 
@@ -13960,7 +13960,7 @@ public class CpuEngine : ITensorLevelEngine
             if (seed.HasValue)
             {
                 var baseRandom = RandomHelper.CreateSeededRandom(seed.Value);
-                var seeds = new int[Environment.ProcessorCount];
+                var seeds = new int[CpuParallelSettings.MaxDegreeOfParallelism];
                 for (int i = 0; i < seeds.Length; i++)
                     seeds[i] = baseRandom.Next();
 
@@ -15047,13 +15047,21 @@ public class CpuEngine : ITensorLevelEngine
         if (func == null) throw new ArgumentNullException(nameof(func));
 
         var result = TensorPool.Rent<T>(tensor.Shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        try
+        {
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
 
-        for (int i = 0; i < src.Length; i++)
-            dest[i] = func(src[i]);
+            for (int i = 0; i < src.Length; i++)
+                dest[i] = func(src[i]);
 
-        return result;
+            return result;
+        }
+        catch
+        {
+            TensorPool.Return(result);
+            throw;
+        }
     }
 
     /// <inheritdoc/>
@@ -17898,7 +17906,7 @@ public class CpuEngine : ITensorLevelEngine
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
         // For large arrays, parallelize across threads
-        int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
@@ -17928,7 +17936,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
-        int numChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 2_000_000));
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
@@ -18136,4 +18144,14 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     #endregion
+
+    /// <summary>
+    /// Reinterprets Memory&lt;T&gt; as Memory&lt;float&gt; without boxing through object.
+    /// Only valid when typeof(T) == typeof(float).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Memory<float> AsFloatMemory<T>(Memory<T> data)
+    {
+        return Unsafe.As<Memory<T>, Memory<float>>(ref data);
+    }
 }

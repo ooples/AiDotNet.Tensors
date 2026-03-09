@@ -725,6 +725,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Relu(temp, output, M * N);
+            Synchronize(); // Ensure all stream work completes before returning buffer
             temp.Dispose();
             return output;
         }
@@ -746,6 +747,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Gelu(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -767,6 +769,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Sigmoid(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -788,6 +791,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Tanh(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -817,6 +821,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Silu(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }

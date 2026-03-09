@@ -1059,6 +1059,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Relu(temp, output, M * N);
+            Synchronize(); // Ensure stream completes before returning buffer
             temp.Dispose();
             return output;
         }
@@ -1079,6 +1080,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Gelu(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -1099,6 +1101,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Sigmoid(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -1119,6 +1122,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Tanh(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -1132,9 +1136,9 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public IGpuBuffer GemmBias(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        // Use optimized GEMM (hipBLAS/tiled) + separate bias add
+        // Use optimized GEMM (hipBLAS/tiled) + in-place bias add (no self-copy since A==C is handled)
         var output = MatMul(A, B, M, N, K);
-        BiasAdd(output, bias, output, M, N);
+        BiasAddInPlace(output, bias, M, N);
         return output;
     }
 
@@ -1147,6 +1151,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Silu(temp, output, M * N);
+            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -1196,15 +1201,49 @@ public sealed class HipBackend : IAsyncGpuBackend
         return output;
     }
 
+    /// <summary>
+    /// In-place bias add — skips the D2D copy when the output buffer already contains the data.
+    /// </summary>
+    private unsafe void BiasAddInPlace(IGpuBuffer output, IGpuBuffer bias, int M, int N)
+    {
+        if (!_kernelCache.TryGetValue("bias_add", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: bias_add");
+
+        var handles = new GCHandle[4];
+        try
+        {
+            handles[0] = GCHandle.Alloc(output.Handle, GCHandleType.Pinned);
+            handles[1] = GCHandle.Alloc(bias.Handle, GCHandleType.Pinned);
+            handles[2] = GCHandle.Alloc(M, GCHandleType.Pinned);
+            handles[3] = GCHandle.Alloc(N, GCHandleType.Pinned);
+
+            var args = new IntPtr[4];
+            for (int i = 0; i < 4; i++) args[i] = handles[i].AddrOfPinnedObject();
+
+            uint totalElements = (uint)(M * N);
+            uint grid = (totalElements + DefaultBlockSize - 1) / DefaultBlockSize;
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            Synchronize();
+        }
+        finally
+        {
+            for (int i = 0; i < handles.Length; i++)
+                if (handles[i].IsAllocated) handles[i].Free();
+        }
+    }
+
     public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: bias_add");
 
-        // First copy A to C (bias_add is in-place)
-        var size = (UIntPtr)(M * N * sizeof(float));
-        var result = HipNativeBindings.hipMemcpy(C.Handle, A.Handle, size, HipMemcpyKind.DeviceToDevice);
-        HipNativeBindings.CheckError(result, "hipMemcpy D2D");
+        // Copy A to C only when they are different buffers (bias_add is in-place)
+        if (A.Handle != C.Handle)
+        {
+            var size = (UIntPtr)(M * N * sizeof(float));
+            var result = HipNativeBindings.hipMemcpy(C.Handle, A.Handle, size, HipMemcpyKind.DeviceToDevice);
+            HipNativeBindings.CheckError(result, "hipMemcpy D2D");
+        }
 
         var handles = new GCHandle[4];
         try

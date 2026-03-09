@@ -201,9 +201,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             // Compile from source
             var program = new DirectOpenClProgram(_context, source);
-            program.Build(buildOptions);
-            Console.WriteLine($"[OpenClBackend] {label}: compiled from source");
-            return program;
+            try
+            {
+                program.Build(buildOptions);
+                Console.WriteLine($"[OpenClBackend] {label}: compiled from source");
+                return program;
+            }
+            catch
+            {
+                program.Dispose();
+                throw;
+            }
         }
 
         private void CompileKernels()
@@ -2064,7 +2072,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int globalSizeY = localSizeY;
 
             kernel.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
-            _context.Finish();  // Sync for batched - ensures all batches complete
+            _context?.Finish();  // Sync for batched - ensures all batches complete
         }
 
         #endregion
@@ -2080,6 +2088,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Relu(temp, output, M * N);
+                _context?.Finish(); // Ensure GPU work completes before returning buffer
                 temp.Dispose();
                 return output;
             }
@@ -2100,6 +2109,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Gelu(temp, output, M * N);
+                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -2120,6 +2130,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Sigmoid(temp, output, M * N);
+                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -2140,6 +2151,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Tanh(temp, output, M * N);
+                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -2178,6 +2190,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Silu(temp, output, M * N);
+                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -2198,6 +2211,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 LeakyRelu(temp, output, alpha, M * N);
+                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -2250,7 +2264,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int globalSizeY = ((N + localSizeY - 1) / localSizeY) * localSizeY;
 
             kernel.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
-            _context.Finish();  // Sync when returning buffer for immediate use
+            _context?.Finish();  // Sync when returning buffer for immediate use
 
             return C;
         }
@@ -2756,7 +2770,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(3, size);
 
             kernel.Execute1D(size, localSize);
-            _context.Finish();
+            _context?.Finish();
 
             var partials = DownloadBuffer(partialBuffer);
             float sum = 0.0f;
@@ -2785,7 +2799,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(3, size);
 
             kernel.Execute1D(size, localSize);
-            _context.Finish();
+            _context?.Finish();
 
             var partials = DownloadBuffer(partialBuffer);
             float max = float.MinValue;
@@ -2940,7 +2954,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
             kernel.Execute2D(M, N, localSizeX, localSizeY);
-            _context.Finish();  // Sync when returning buffer for immediate use
+            _context?.Finish();  // Sync when returning buffer for immediate use
 
             return C;
         }
@@ -3038,7 +3052,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             zeroKernel.SetArg(0, bufferOutput.Handle);
             zeroKernel.SetArg(1, outputSize);
             zeroKernel.Execute1D(outputSize, 256);
-            _context.Finish();
+            _context?.Finish();
 
             // Then scatter-add
             var kernel = _kernelCache["scatter_add_edges"];
@@ -3659,7 +3673,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 else
                 {
                     // Fallback to wall clock timing
-                    _context.Finish();
+                    _context?.Finish();
                     diagnostics.WallClockMs = sw.Elapsed.TotalMilliseconds;
                     if (diagnostics.WallClockMs > 0)
                     {
@@ -8135,7 +8149,7 @@ KERNEL VARIANTS (A/B testing):
                 varKernel.Execute1D(size, localSize);
 
                 if (_context != null)
-                    _context.Finish();
+                    _context?.Finish();
 
                 var partials = DownloadBuffer(partialBuffer);
                 float varianceSum = 0.0f;

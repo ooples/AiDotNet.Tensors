@@ -104,7 +104,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!EnableBinaryCache) return null;
 
             string hash = ComputeHash(source);
-            string cachePath = GetCachePath(hash, buildOptions);
+            string deviceKey = GetDeviceCacheKey(context);
+            string cachePath = GetCachePath(hash, buildOptions, deviceKey);
 
             if (!File.Exists(cachePath)) return null;
 
@@ -157,15 +158,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private void SaveBinaryToCache(string hash, string buildOptions)
         {
-            string cachePath = GetCachePath(hash, buildOptions);
+            string deviceKey = GetDeviceCacheKey(_context);
+            string cachePath = GetCachePath(hash, buildOptions, deviceKey);
 
-            // Get binary size
+            // Get binary size — pass paramValueSize=0 when paramValue is null (OpenCL spec requirement)
             int err = OpenClNativeBindings.GetProgramInfo(
                 _program,
                 OpenClNativeBindings.CL_PROGRAM_BINARY_SIZES,
-                (UIntPtr)UIntPtr.Size,
+                UIntPtr.Zero,
                 IntPtr.Zero,
                 out UIntPtr sizeNeeded);
+
+            if (err != OpenClNativeBindings.CL_SUCCESS) return;
 
             // Allocate for binary sizes array (one per device)
             IntPtr sizesPtr = Marshal.AllocHGlobal((int)sizeNeeded);
@@ -245,11 +249,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        private static string GetCachePath(string sourceHash, string buildOptions)
+        private static string GetCachePath(string sourceHash, string buildOptions, string deviceKey = "")
         {
-            // Include build options in cache key since same source with different flags produces different binaries
+            // Include build options and device info in cache key since binaries are not portable across devices/drivers
             string optionsHash = string.IsNullOrEmpty(buildOptions) ? "default" : ComputeHash(buildOptions).Substring(0, 8);
-            return Path.Combine(CacheDirectory, $"{sourceHash.Substring(0, 16)}_{optionsHash}.clbin");
+            string deviceSuffix = string.IsNullOrEmpty(deviceKey) ? "" : $"_{ComputeHash(deviceKey).Substring(0, 8)}";
+            return Path.Combine(CacheDirectory, $"{sourceHash.Substring(0, 16)}_{optionsHash}{deviceSuffix}.clbin");
+        }
+
+        private static string GetDeviceCacheKey(DirectOpenClContext context)
+        {
+            return $"{context.DeviceName}|{context.DriverVersion}";
         }
 
         private static string GetCacheDirectory()
