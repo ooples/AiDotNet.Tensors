@@ -191,12 +191,30 @@ namespace AiDotNet.Tensors.Engines.Simd
             {
                 var vzero = Vector256<float>.Zero;
                 int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
-                    Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
-                    Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
-                    Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(input + i + prefetchDistance);
+                        }
+                        Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                        Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
+                        Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
+                        Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                    }
+                }
+                else
+                {
+                    for (; i < simdLength; i += 32)
+                    {
+                        Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
+                        Avx.Store(output + i + 8, Avx.Max(Avx.LoadVector256(input + i + 8), vzero));
+                        Avx.Store(output + i + 16, Avx.Max(Avx.LoadVector256(input + i + 16), vzero));
+                        Avx.Store(output + i + 24, Avx.Max(Avx.LoadVector256(input + i + 24), vzero));
+                    }
                 }
             }
             if (Avx.IsSupported && length - i >= 8)
@@ -226,12 +244,30 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Fma.IsSupported && Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
+                if (Sse.IsSupported && length >= 131072)
                 {
-                    Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
-                    Avx.Store(output + i + 8, FastSigmoid256(Avx.LoadVector256(input + i + 8)));
-                    Avx.Store(output + i + 16, FastSigmoid256(Avx.LoadVector256(input + i + 16)));
-                    Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
+                    const int prefetchDistance = 256;
+                    for (; i < simdLength; i += 32)
+                    {
+                        if (i + prefetchDistance < length)
+                        {
+                            Sse.Prefetch0(input + i + prefetchDistance);
+                        }
+                        Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
+                        Avx.Store(output + i + 8, FastSigmoid256(Avx.LoadVector256(input + i + 8)));
+                        Avx.Store(output + i + 16, FastSigmoid256(Avx.LoadVector256(input + i + 16)));
+                        Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
+                    }
+                }
+                else
+                {
+                    for (; i < simdLength; i += 32)
+                    {
+                        Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
+                        Avx.Store(output + i + 8, FastSigmoid256(Avx.LoadVector256(input + i + 8)));
+                        Avx.Store(output + i + 16, FastSigmoid256(Avx.LoadVector256(input + i + 16)));
+                        Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
+                    }
                 }
             }
             if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)

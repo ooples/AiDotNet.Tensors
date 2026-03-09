@@ -2936,10 +2936,46 @@ public class CpuEngine : ITensorLevelEngine
         {
             T[] arr = tensor.GetDataArray();
             float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            int length = tensor.Length;
             float result;
-            fixed (float* ptr = fArr)
+
+            // Use all cores for large arrays — reduction parallelizes well
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            if (numChunks >= 2)
             {
-                result = SimdKernels.SumUnsafe(ptr, tensor.Length);
+                var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+                try
+                {
+                    float* p = (float*)handle.AddrOfPinnedObject();
+                    int chunkSize = (length + numChunks - 1) / numChunks;
+                    chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
+                    float[] partials = new float[numChunks];
+
+                    Parallel.For(0, numChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
+                        }
+                    });
+
+                    result = 0f;
+                    for (int c = 0; c < numChunks; c++)
+                        result += partials[c];
+                }
+                finally
+                {
+                    handle.Free();
+                }
+            }
+            else
+            {
+                fixed (float* ptr = fArr)
+                {
+                    result = SimdKernels.SumUnsafe(ptr, length);
+                }
             }
             return Unsafe.As<float, T>(ref result);
         }
@@ -3819,9 +3855,9 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            // Sigmoid is compute-bound (~25 SIMD instructions per 8 elements).
-            // Parallelism genuinely helps here unlike bandwidth-bound ops.
-            int sigChunks = Math.Min(Environment.ProcessorCount, Math.Max(1, length / 100_000));
+            // Sigmoid is compute-bound (~10 SIMD instructions per 8 elements).
+            // Parallelism genuinely helps — use all available cores.
+            int sigChunks = length >= 100_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (sigChunks >= 2)
             {
                 // Use GCHandle instead of Memory.Pin() to avoid boxing allocation
@@ -3937,9 +3973,9 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
-            // Pin once with GCHandle, divide into ProcessorCount chunks.
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            // ReLU is bandwidth-bound — use fewer chunks than compute-bound ops
+            // to minimize Parallel.For scheduling overhead relative to work per chunk.
+            int numChunks = length >= 500_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 250_000)) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
