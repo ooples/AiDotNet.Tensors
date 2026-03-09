@@ -1886,7 +1886,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2115,7 +2115,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2180,7 +2180,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2361,7 +2361,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -2378,7 +2378,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
         }
 
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         int length = a.Length;
 
         // Fast path for float tensors with JIT kernel
@@ -2412,7 +2412,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2434,7 +2434,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2451,7 +2451,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2473,7 +2473,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2496,7 +2496,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2513,7 +2513,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2535,7 +2535,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2552,7 +2552,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2572,7 +2572,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2584,7 +2584,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2596,7 +2596,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2608,7 +2608,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2620,7 +2620,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2632,7 +2632,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2668,7 +2668,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2684,7 +2684,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2700,7 +2700,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2716,7 +2716,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2728,7 +2728,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -2923,7 +2923,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2942,7 +2942,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2963,7 +2963,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2985,7 +2985,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3006,7 +3006,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3025,7 +3025,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3403,7 +3403,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Ensure stride={stride}, padding={padding}, dilation={dilation} are compatible with input size {height}x{width} and kernel size {kernelHeight}x{kernelWidth}.");
         }
 
-        var result = TensorPool.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
+        var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
         // Use im2col + GEMM for float (significantly faster)
         if (typeof(T) == typeof(float))
@@ -3895,7 +3895,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Tanh - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -3907,7 +3907,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -4107,7 +4107,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -4291,7 +4291,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized GELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -4305,7 +4305,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Mish - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -4319,7 +4319,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Swish (SiLU) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -4333,7 +4333,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized ELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
@@ -4348,7 +4348,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized LeakyReLU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
 
@@ -4906,7 +4906,7 @@ public class CpuEngine : ITensorLevelEngine
         if (n != b.Shape[0])
             throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
 
-        var result = TensorPool.Rent<T>(new[] { m, p });
+        var result = TensorAllocator.Rent<T>(new[] { m, p });
 
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
@@ -4967,7 +4967,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[aRank - 2] = m;
         outputShape[aRank - 1] = p;
 
-        var result = TensorPool.Rent<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
@@ -8363,19 +8363,33 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
-        var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length];
-
         // Compute outer and inner sizes
         int outerSize = 1, axisSize = input.Shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+
+        // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
+        if (typeof(T) == typeof(float) && innerSize == 1)
+        {
+            var inputFloats = (float[])(object)input.GetDataArray();
+#if NET5_0_OR_GREATER
+            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
+#else
+            var outputFloats = new float[inputFloats.Length];
+#endif
+            SoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
+            return (Tensor<T>)(object)new Tensor<float>(input.Shape, Vector<float>.FromMemory(outputFloats));
+        }
+
+        // Generic scalar fallback for non-float types or non-last-axis
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var inputData = input.GetDataArray();
+        var outputDataGeneric = new T[inputData.Length];
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
@@ -8405,11 +8419,158 @@ public class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < axisSize; i++)
             {
                 int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                outputData[flatIdx] = numOps.Divide(expVals[i], sumExp);
+                outputDataGeneric[flatIdx] = numOps.Divide(expVals[i], sumExp);
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        return new Tensor<T>(input.Shape, new Vector<T>(outputDataGeneric));
+    }
+
+    /// <summary>
+    /// Fast SIMD softmax for float arrays.
+    /// Uses 3-pass approach: (1) per-row max, (2) flat subtract+exp, (3) per-row sum+divide.
+    /// This minimizes per-row overhead by doing exp as a single flat pass.
+    /// </summary>
+    private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    {
+        fixed (float* pIn = inputFloats)
+        fixed (float* pOut = outputFloats)
+        {
+            int totalLen = outerSize * axisSize;
+
+            // Pass 1+2: per-row max and subtract (fused to reduce memory passes)
+            for (int row = 0; row < outerSize; row++)
+            {
+                float* rowIn = pIn + row * axisSize;
+                float* rowOut = pOut + row * axisSize;
+
+                // Find max
+                float maxVal = float.NegativeInfinity;
+                int j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                {
+                    var vmax0 = System.Runtime.Intrinsics.Vector256.Create(float.NegativeInfinity);
+                    var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
+                    int simdLen = axisSize & ~31;
+                    for (; j < simdLen; j += 32)
+                    {
+                        vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(vmax0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j));
+                        vmax1 = System.Runtime.Intrinsics.X86.Avx.Max(vmax1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 8));
+                        vmax2 = System.Runtime.Intrinsics.X86.Avx.Max(vmax2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 16));
+                        vmax3 = System.Runtime.Intrinsics.X86.Avx.Max(vmax3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 24));
+                    }
+                    vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(
+                        System.Runtime.Intrinsics.X86.Avx.Max(vmax0, vmax1),
+                        System.Runtime.Intrinsics.X86.Avx.Max(vmax2, vmax3));
+                    // Horizontal max
+                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 1);
+                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 0);
+                    var max128 = System.Runtime.Intrinsics.X86.Sse.Max(lo, hi);
+                    var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_01_00_11_10);
+                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+                    shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_10_11_00_01);
+                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+                    float maxTmp;
+                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&maxTmp, max128);
+                    maxVal = maxTmp;
+                }
+#endif
+                for (; j < axisSize; j++)
+                    if (rowIn[j] > maxVal) maxVal = rowIn[j];
+
+                // Subtract max
+                j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+                {
+                    var vmaxBcast = System.Runtime.Intrinsics.Vector256.Create(maxVal);
+                    int simdLen = axisSize & ~7;
+                    for (; j < simdLen; j += 8)
+                    {
+                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                            System.Runtime.Intrinsics.X86.Avx.Subtract(
+                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j), vmaxBcast));
+                    }
+                }
+#endif
+                for (; j < axisSize; j++)
+                    rowOut[j] = rowIn[j] - maxVal;
+            }
+
+            // Pass 3: exp on entire flat array at once
+            SimdKernels.Exp(new ReadOnlySpan<float>(pOut, totalLen), new Span<float>(pOut, totalLen));
+
+            // Pass 4: per-row sum and divide
+            for (int row = 0; row < outerSize; row++)
+            {
+                float* rowOut = pOut + row * axisSize;
+                float sumExp = 0f;
+                int j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                {
+                    var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+                    int simdLen = axisSize & ~31;
+                    for (; j < simdLen; j += 32)
+                    {
+                        vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j));
+                        vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 8));
+                        vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 16));
+                        vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 24));
+                    }
+                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                        System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                        System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                    // Horizontal sum
+                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
+                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
+                    var sum128 = System.Runtime.Intrinsics.X86.Sse.Add(lo, hi);
+                    if (System.Runtime.Intrinsics.X86.Sse3.IsSupported)
+                    {
+                        var shuf = System.Runtime.Intrinsics.X86.Sse3.MoveHighAndDuplicate(sum128);
+                        var sums = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
+                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sums,
+                            System.Runtime.Intrinsics.X86.Sse.MoveHighToLow(sums, sums));
+                    }
+                    else
+                    {
+                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_01_00_11_10);
+                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
+                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_10_11_00_01);
+                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
+                    }
+                    float sumTmp;
+                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&sumTmp, sum128);
+                    sumExp = sumTmp;
+                }
+#endif
+                for (; j < axisSize; j++)
+                    sumExp += rowOut[j];
+
+                if (sumExp > 0f)
+                {
+                    float invSum = 1f / sumExp;
+                    j = 0;
+#if NET5_0_OR_GREATER
+                    if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+                    {
+                        var vInvSum = System.Runtime.Intrinsics.Vector256.Create(invSum);
+                        int simdLen = axisSize & ~7;
+                        for (; j < simdLen; j += 8)
+                        {
+                            System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                                System.Runtime.Intrinsics.X86.Avx.Multiply(
+                                    System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vInvSum));
+                        }
+                    }
+#endif
+                    for (; j < axisSize; j++)
+                        rowOut[j] *= invSum;
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -13777,7 +13938,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         // Normalize axis
         if (axis < 0) axis = tensor.Shape.Length + axis;
@@ -13997,7 +14158,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
@@ -14133,7 +14294,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -14145,7 +14306,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -14157,7 +14318,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -15046,7 +15207,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         try
         {
             var src = tensor.AsSpan();
@@ -15059,7 +15220,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         catch
         {
-            TensorPool.Return(result);
+            TensorAllocator.Return(result);
             throw;
         }
     }
@@ -15721,7 +15882,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -15738,7 +15899,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor.Shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -18109,7 +18270,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorPool.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a.Shape);
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();

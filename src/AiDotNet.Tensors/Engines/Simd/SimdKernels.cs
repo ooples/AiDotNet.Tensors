@@ -863,20 +863,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET8_0_OR_GREATER
-            // On .NET 8+, the JIT auto-vectorizes MathF.Exp using SVML (vexpps),
-            // which is faster than our polynomial approximation. Use unrolled scalar
-            // loop and let the JIT handle vectorization.
-            int unrolled = length & ~3;
-            for (; i < unrolled; i += 4)
-            {
-                output[i] = MathF.Exp(input[i]);
-                output[i + 1] = MathF.Exp(input[i + 1]);
-                output[i + 2] = MathF.Exp(input[i + 2]);
-                output[i + 3] = MathF.Exp(input[i + 3]);
-            }
-#elif NET5_0_OR_GREATER
-            // On .NET 5-7, use our FastExp256 polynomial since SVML is not available
+#if NET5_0_OR_GREATER
+            // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
+            // This is ~8x faster than scalar MathF.Exp loop for large arrays.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -908,6 +897,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
             }
         }
+
 
         /// <summary>
         /// Computes element-wise exp(x) for double precision using scalar Math.Exp fallback.
@@ -3626,6 +3616,163 @@ namespace AiDotNet.Tensors.Engines.Simd
         for (; i < length; i++)
             destination[i] = (float)source[i];
     }
+
+    #endregion
+
+    #region Softmax
+
+        /// <summary>
+        /// Computes softmax over rows of a 2D float array laid out contiguously.
+        /// Each row of length <paramref name="axisSize"/> is processed independently.
+        /// Uses unsafe pointers for maximum throughput.
+        /// </summary>
+        public static unsafe void Softmax(ReadOnlySpan<float> input, Span<float> output, int outerSize, int axisSize)
+        {
+            fixed (float* pIn = input)
+            fixed (float* pOut = output)
+            {
+                for (int row = 0; row < outerSize; row++)
+                {
+                    float* rowIn = pIn + row * axisSize;
+                    float* rowOut = pOut + row * axisSize;
+                    SoftmaxRowUnsafe(rowIn, rowOut, axisSize);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Computes softmax for a single contiguous row using unsafe pointers.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void SoftmaxRowUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+
+            // Step 1: Find max for numerical stability
+            float maxVal = float.NegativeInfinity;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmax0 = Vector256.Create(float.NegativeInfinity);
+                var vmax1 = vmax0;
+                var vmax2 = vmax0;
+                var vmax3 = vmax0;
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    vmax0 = Avx.Max(vmax0, Avx.LoadVector256(input + i));
+                    vmax1 = Avx.Max(vmax1, Avx.LoadVector256(input + i + 8));
+                    vmax2 = Avx.Max(vmax2, Avx.LoadVector256(input + i + 16));
+                    vmax3 = Avx.Max(vmax3, Avx.LoadVector256(input + i + 24));
+                }
+                vmax0 = Avx.Max(Avx.Max(vmax0, vmax1), Avx.Max(vmax2, vmax3));
+                maxVal = HorizontalMax(vmax0);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                if (input[i] > maxVal) maxVal = input[i];
+            }
+
+            // Step 2: output[i] = input[i] - maxVal
+            i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmaxBcast = Vector256.Create(maxVal);
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Subtract(Avx.LoadVector256(input + i), vmaxBcast));
+                    Avx.Store(output + i + 8, Avx.Subtract(Avx.LoadVector256(input + i + 8), vmaxBcast));
+                    Avx.Store(output + i + 16, Avx.Subtract(Avx.LoadVector256(input + i + 16), vmaxBcast));
+                    Avx.Store(output + i + 24, Avx.Subtract(Avx.LoadVector256(input + i + 24), vmaxBcast));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = input[i] - maxVal;
+            }
+
+            // Step 3: Exp in-place on output using FastExp256
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                int simdLen = length & ~31;
+                for (i = 0; i < simdLen; i += 32)
+                {
+                    Avx.Store(output + i, FastExp256(Avx.LoadVector256(output + i)));
+                    Avx.Store(output + i + 8, FastExp256(Avx.LoadVector256(output + i + 8)));
+                    Avx.Store(output + i + 16, FastExp256(Avx.LoadVector256(output + i + 16)));
+                    Avx.Store(output + i + 24, FastExp256(Avx.LoadVector256(output + i + 24)));
+                }
+                for (; i < length; i++)
+                    output[i] = MathF.Exp(output[i]);
+            }
+            else
+#endif
+            {
+                for (i = 0; i < length; i++)
+                {
+#if NET5_0_OR_GREATER
+                    output[i] = MathF.Exp(output[i]);
+#else
+                    output[i] = (float)Math.Exp(output[i]);
+#endif
+                }
+            }
+
+            // Step 4: Sum
+            float sumExp = 0f;
+            i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vsum0 = Vector256<float>.Zero;
+                var vsum1 = Vector256<float>.Zero;
+                var vsum2 = Vector256<float>.Zero;
+                var vsum3 = Vector256<float>.Zero;
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    vsum0 = Avx.Add(vsum0, Avx.LoadVector256(output + i));
+                    vsum1 = Avx.Add(vsum1, Avx.LoadVector256(output + i + 8));
+                    vsum2 = Avx.Add(vsum2, Avx.LoadVector256(output + i + 16));
+                    vsum3 = Avx.Add(vsum3, Avx.LoadVector256(output + i + 24));
+                }
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                sumExp = HorizontalSum(vsum0);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                sumExp += output[i];
+            }
+
+            // Step 5: Divide by sum
+            if (sumExp == 0f) return;
+            float invSum = 1f / sumExp;
+            i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vInvSum = Vector256.Create(invSum);
+                int simdLen = length & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Multiply(Avx.LoadVector256(output + i), vInvSum));
+                    Avx.Store(output + i + 8, Avx.Multiply(Avx.LoadVector256(output + i + 8), vInvSum));
+                    Avx.Store(output + i + 16, Avx.Multiply(Avx.LoadVector256(output + i + 16), vInvSum));
+                    Avx.Store(output + i + 24, Avx.Multiply(Avx.LoadVector256(output + i + 24), vInvSum));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] *= invSum;
+            }
+        }
 
     #endregion
     }
