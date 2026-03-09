@@ -1965,9 +1965,9 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
-            // Pin once with GCHandle, divide into ProcessorCount chunks.
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
+            // Each chunk ~62K floats = 250KB, well within L2 per core.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
                 var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
@@ -2164,9 +2164,9 @@ public class CpuEngine : ITensorLevelEngine
             float[] aFloat = Unsafe.As<T[], float[]>(ref aArr);
             float[] bFloat = Unsafe.As<T[], float[]>(ref bArr);
 
-            // Use all cores for large arrays — TorchSharp uses 16 OpenMP threads.
-            // Pin once with GCHandle, divide into ProcessorCount chunks.
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(1, length / 50_000)) : 1;
+            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
+            // Each chunk ~62K floats = 250KB, well within L2 per core.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
                 var handleA = System.Runtime.InteropServices.GCHandle.Alloc(aFloat, System.Runtime.InteropServices.GCHandleType.Pinned);
@@ -2939,8 +2939,8 @@ public class CpuEngine : ITensorLevelEngine
             int length = tensor.Length;
             float result;
 
-            // Use all cores for large arrays — reduction parallelizes well
-            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
+            // Bandwidth-bound: fewer, larger chunks minimize scheduling overhead.
+            int numChunks = length >= 500_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 250_000)) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
@@ -3973,9 +3973,9 @@ public class CpuEngine : ITensorLevelEngine
             T[] arr = tensor.GetDataArray();
             float[] floatArr = Unsafe.As<T[], float[]>(ref arr);
 
-            // ReLU is bandwidth-bound — use fewer chunks than compute-bound ops
-            // to minimize Parallel.For scheduling overhead relative to work per chunk.
-            int numChunks = length >= 500_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 250_000)) : 1;
+            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
+            // Each chunk ~62K floats = 250KB, well within L2 per core.
+            int numChunks = length >= 200_000 ? Math.Min(Environment.ProcessorCount, Math.Max(2, length / 50_000)) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(floatArr, System.Runtime.InteropServices.GCHandleType.Pinned);
