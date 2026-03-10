@@ -4278,15 +4278,15 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Double fast path: parallel SIMD Sigmoid via DoubleOperations
+        // Double fast path: parallel SIMD Sigmoid via SimdKernels directly
+        // (Don't go through DoubleOperations.Sigmoid which has its own parallelism)
         if (typeof(T) == typeof(double))
         {
-            var numOpsD = MathHelper.GetNumericOperations<double>();
+            var srcArr = (double[])(object)tensor.GetDataArray();
+            var dstArr = (double[])(object)result.GetDataArray();
             int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 256_000));
             if (subChunks >= 2)
             {
-                var srcArr = (double[])(object)tensor.GetDataArray();
-                var dstArr = (double[])(object)result.GetDataArray();
                 int chunkSize = (length + subChunks - 1) / subChunks;
                 Parallel.For(0, subChunks, chunk =>
                 {
@@ -4296,11 +4296,15 @@ public class CpuEngine : ITensorLevelEngine
                     {
                         var srcSpan = new ReadOnlySpan<double>(srcArr, start, count);
                         var dstSpan = new Span<double>(dstArr, start, count);
-                        numOpsD.Sigmoid(srcSpan, dstSpan);
+                        SimdKernels.Sigmoid(srcSpan, dstSpan);
                     }
                 });
-                return result;
             }
+            else
+            {
+                SimdKernels.Sigmoid(new ReadOnlySpan<double>(srcArr), new Span<double>(dstArr));
+            }
+            return result;
         }
 
         // Generic fallback
