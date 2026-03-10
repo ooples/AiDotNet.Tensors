@@ -68,6 +68,9 @@ internal sealed class PersistentParallelExecutor
             // Execute all assigned chunks for this worker slot.
             // Chunks are assigned round-robin across all participants (workers + main thread).
             // Total participants = _numWorkers + 1 (main). Worker slot N gets chunks (slot+1), (slot+1+stride), etc.
+            // Set reentrancy guard on worker thread so nested Execute() from
+            // callbacks falls back to sequential instead of deadlocking on _executeLock.
+            _isExecuting = true;
             int stride = _numWorkers + 1;
             int chunkId = slot + 1;
             while (chunkId < _numChunks)

@@ -6495,8 +6495,8 @@ KERNEL VARIANTS (A/B testing):
             // 2D dispatch: global_id(0)=col, global_id(1)=row
             if (rows <= 0 || cols <= 0) return false;
             int maxLocal = (int)Math.Min(_maxWorkGroupSize, 256);
-            int localSizeX = Math.Min(16, cols);
-            int localSizeY = Math.Min(maxLocal / localSizeX, rows);
+            int localSizeX = Math.Min(Math.Min(16, cols), maxLocal);
+            int localSizeY = Math.Min(maxLocal / Math.Max(localSizeX, 1), rows);
             if (localSizeX <= 0) localSizeX = 1;
             if (localSizeY <= 0) localSizeY = 1;
             int globalSizeX = ((cols + localSizeX - 1) / localSizeX) * localSizeX;

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -73,7 +74,8 @@ internal static class TensorAllocator
         if (pooledArray != null)
         {
             tensor.DetachPooledArray();
-            ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
+            ArrayPool<T>.Shared.Return(pooledArray,
+                clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
         }
     }
 
