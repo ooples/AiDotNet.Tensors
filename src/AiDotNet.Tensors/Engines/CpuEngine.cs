@@ -3566,7 +3566,52 @@ public class CpuEngine : ITensorLevelEngine
                 $"Ensure poolSize={poolSize}, stride={stride}, padding={padding} are compatible with input size {height}x{width}.");
         }
 
-        var result = new Tensor<T>(new[] { batch, channels, outputHeight, outputWidth });
+        var outputShape = new[] { batch, channels, outputHeight, outputWidth };
+        var result = TensorAllocator.Rent<T>(outputShape);
+
+        // Float fast path: direct array access, no virtual dispatch
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+
+            Parallel.For(0, bc, idx =>
+            {
+                int inputBase = idx * h * w;
+                int outputBase = idx * oH * oW;
+
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        float sum = 0f;
+                        int count = 0;
+
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = Math.Min(ps, h - ihStart);
+                        int kwEnd = Math.Min(ps, w - iwStart);
+
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                sum += inArr[rowOff + kw];
+                                count++;
+                            }
+                        }
+
+                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
+                    }
+                }
+            });
+            return result;
+        }
+
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
