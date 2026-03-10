@@ -3272,15 +3272,15 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
 
-        if (typeof(T) == typeof(float))
+        if (typeof(T) == typeof(float) && tensor.GetDataArray() is float[] arr)
         {
-            var mem = AsFloatMemory(tensor.Data);
-            using var pin = mem.Pin();
-            float* ptr = (float*)pin.Pointer;
             int length = tensor.Length;
-            float result = ParallelReduceFloat(ptr, length, float.NegativeInfinity,
-                SimdKernels.MaxUnsafe, Math.Max);
-            return Unsafe.As<float, T>(ref result);
+            fixed (float* ptr = arr)
+            {
+                float result = ParallelReduceFloat(ptr, length, float.NegativeInfinity,
+                    SimdKernels.MaxUnsafe, Math.Max);
+                return Unsafe.As<float, T>(ref result);
+            }
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3293,15 +3293,15 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
 
-        if (typeof(T) == typeof(float))
+        if (typeof(T) == typeof(float) && tensor.GetDataArray() is float[] arr)
         {
-            var mem = AsFloatMemory(tensor.Data);
-            using var pin = mem.Pin();
-            float* ptr = (float*)pin.Pointer;
             int length = tensor.Length;
-            float result = ParallelReduceFloat(ptr, length, float.PositiveInfinity,
-                SimdKernels.MinUnsafe, Math.Min);
-            return Unsafe.As<float, T>(ref result);
+            fixed (float* ptr = arr)
+            {
+                float result = ParallelReduceFloat(ptr, length, float.PositiveInfinity,
+                    SimdKernels.MinUnsafe, Math.Min);
+                return Unsafe.As<float, T>(ref result);
+            }
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
