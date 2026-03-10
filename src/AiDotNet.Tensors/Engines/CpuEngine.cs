@@ -4428,53 +4428,39 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Double fast path: parallel SIMD Sigmoid via SimdKernels directly
-        // (Don't go through DoubleOperations.Sigmoid which has its own parallelism)
+        // Double fast path: pointer-based SIMD Sigmoid with polynomial approximation
         if (typeof(T) == typeof(double))
         {
-            var srcArr = (double[])(object)tensor.GetDataArray();
-            var dstArr = (double[])(object)result.GetDataArray();
-            // Use unsafe pointer path for parallelism (same as float path)
-            int fallbackChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 64_000));
-            var hSrc = System.Runtime.InteropServices.GCHandle.Alloc(srcArr, System.Runtime.InteropServices.GCHandleType.Pinned);
-            var hDst = System.Runtime.InteropServices.GCHandle.Alloc(dstArr, System.Runtime.InteropServices.GCHandleType.Pinned);
-            try
+            var srcMem = AsDoubleMemory(tensor.Data);
+            var dstMem = AsDoubleMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            double* pSrc = (double*)pinSrc.Pointer;
+            double* pDst = (double*)pinDst.Pointer;
+
+            // Parallel chunking for compute-bound sigmoid (lower threshold than bandwidth-bound)
+            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 64_000));
+            if (sigChunks >= 2)
             {
-                unsafe
+                int chunkSize = (length + sigChunks - 1) / sigChunks;
+                chunkSize = (chunkSize + 15) & ~15;
+                IntPtr ipSrc = (IntPtr)pSrc;
+                IntPtr ipDst = (IntPtr)pDst;
+                int len = length;
+
+                Parallel.For(0, sigChunks, chunk =>
                 {
-                    double* pSrc = (double*)hSrc.AddrOfPinnedObject();
-                    double* pDst = (double*)hDst.AddrOfPinnedObject();
-
-                    if (fallbackChunks >= 2)
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, len - start);
+                    if (count > 0)
                     {
-                        int chunkSize = (length + fallbackChunks - 1) / fallbackChunks;
-                        chunkSize = (chunkSize + 15) & ~15; // align to 16 doubles
-                        IntPtr ipSrc = (IntPtr)pSrc;
-                        IntPtr ipDst = (IntPtr)pDst;
-                        int len = length;
-
-                        Parallel.For(0, fallbackChunks, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = Math.Min(chunkSize, len - start);
-                            if (count > 0)
-                            {
-                                var srcSpan = new ReadOnlySpan<double>((double*)ipSrc + start, count);
-                                var dstSpan = new Span<double>((double*)ipDst + start, count);
-                                SimdKernels.Sigmoid(srcSpan, dstSpan);
-                            }
-                        });
+                        SimdKernels.SigmoidUnsafe((double*)ipSrc + start, (double*)ipDst + start, count);
                     }
-                    else
-                    {
-                        SimdKernels.Sigmoid(new ReadOnlySpan<double>(pSrc, length), new Span<double>(pDst, length));
-                    }
-                }
+                });
             }
-            finally
+            else
             {
-                hDst.Free();
-                hSrc.Free();
+                SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
             return result;
         }
