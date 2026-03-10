@@ -1008,9 +1008,10 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     int numWarps = (blockDim.x + 31) >> 5;
     if (tid < numWarps) {
         sum = sdata[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum += __shfl_down_sync(warp_mask, sum, offset);
         if (tid == 0)
             atomicAdd(output, sum);
     }
@@ -1046,12 +1047,13 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
     __syncthreads();
 
     // Final reduction across warps (only first warp)
-    int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps) {
+    int numWarps2 = (blockDim.x + 31) >> 5;
+    if (tid < numWarps2) {
         sum = sdata[tid];
+        unsigned int warp_mask2 = (numWarps2 >= 32) ? 0xFFFFFFFF : ((1u << numWarps2) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum += __shfl_down_sync(warp_mask2, sum, offset);
         if (tid == 0)
             atomicAdd(output, sum);
     }

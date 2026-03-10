@@ -4391,15 +4391,32 @@ public class CpuEngine : ITensorLevelEngine
                         int count = Math.Min(chunkSize, length - start);
                         if (count > 0)
                         {
-                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
-                            kernel(pSrc + start, pDst + start, count);
+                            int jitCount = count & ~7;
+                            if (jitCount > 0)
+                            {
+                                var kernel = CpuJitKernels.GetSigmoidKernel(jitCount);
+                                kernel(pSrc + start, pDst + start, jitCount);
+                            }
+                            for (int ti = jitCount; ti < count; ti++)
+                            {
+                                pDst[start + ti] = 1.0f / (1.0f + MathF.Exp(-pSrc[start + ti]));
+                            }
                         }
                     });
                 }
                 else
                 {
-                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
-                    kernel(pSrc, pDst, length);
+                    // JIT kernel processes 8-wide SIMD chunks; handle tail with scalar fallback
+                    int jitLen = length & ~7;
+                    if (jitLen > 0)
+                    {
+                        var kernel = CpuJitKernels.GetSigmoidKernel(jitLen);
+                        kernel(pSrc, pDst, jitLen);
+                    }
+                    for (int i = jitLen; i < length; i++)
+                    {
+                        pDst[i] = 1.0f / (1.0f + MathF.Exp(-pSrc[i]));
+                    }
                 }
                 return result;
             }
@@ -4537,15 +4554,32 @@ public class CpuEngine : ITensorLevelEngine
                         int count = Math.Min(chunkSize, length - start);
                         if (count > 0)
                         {
-                            var kernel = CpuJitKernels.GetSigmoidKernel(count);
-                            kernel(p + start, p + start, count);
+                            int jitCount = count & ~7;
+                            if (jitCount > 0)
+                            {
+                                var kernel = CpuJitKernels.GetSigmoidKernel(jitCount);
+                                kernel(p + start, p + start, jitCount);
+                            }
+                            for (int ti = jitCount; ti < count; ti++)
+                            {
+                                float* ptr = p + start + ti;
+                                *ptr = 1.0f / (1.0f + MathF.Exp(-*ptr));
+                            }
                         }
                     });
                 }
                 else
                 {
-                    var kernel = CpuJitKernels.GetSigmoidKernel(length);
-                    kernel(p, p, length);
+                    int jitLen = length & ~7;
+                    if (jitLen > 0)
+                    {
+                        var kernel = CpuJitKernels.GetSigmoidKernel(jitLen);
+                        kernel(p, p, jitLen);
+                    }
+                    for (int i = jitLen; i < length; i++)
+                    {
+                        p[i] = 1.0f / (1.0f + MathF.Exp(-p[i]));
+                    }
                 }
                 return;
             }

@@ -56,7 +56,7 @@ __device__ __forceinline__ float tanh_derivative(float tanh_output) {
 // bias: [4 * hiddenSize]
 // output newH, newC: [batch, hiddenSize]
 // gateF, gateI, gateC, gateO: [batch, hiddenSize] (cached for backward)
-extern ""C"" __global__ __launch_bounds__(256) void lstm_cell_forward(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_forward(
     const float* __restrict__ input,
     const float* __restrict__ prevH,
     const float* __restrict__ prevC,
@@ -142,7 +142,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_cell_forward(
 // h_states: [timeSteps, batch, hiddenSize] (cached for backward)
 // c_states: [timeSteps, batch, hiddenSize] (cached for backward)
 // gates: [timeSteps, batch, 4*hiddenSize] (F,I,C,O cached for backward)
-extern ""C"" __global__ __launch_bounds__(256) void lstm_forward_sequence(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
     const float* input,
     const float* h_init,
     const float* c_init,
@@ -264,7 +264,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_forward_sequence(
 // dH: gradient from output [batch, hiddenSize]
 // dC_next: gradient from next cell state [batch, hiddenSize]
 // Returns: dInput, dPrevH, dPrevC, and accumulated weight/bias gradients
-extern ""C"" __global__ __launch_bounds__(256) void lstm_cell_backward(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward(
     const float* dH,          // [batch, hidden]
     const float* dC_next,     // [batch, hidden] gradient from next timestep
     const float* gateF,       // [batch, hidden]
@@ -358,7 +358,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_cell_backward(
 // ===========================================================================
 
 // Computes gradient with respect to input
-extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_input(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_input(
     const float* dGates,      // [batch, 4*hidden] - dF, dI, dC, dO concatenated
     const float* Wi,          // [4*hidden, input]
     float* dInput,            // [batch, input]
@@ -397,7 +397,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_input(
 // ===========================================================================
 
 // Computes gradient with respect to previous hidden state
-extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_prevh(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_prevh(
     const float* dGates,      // [batch, 4*hidden]
     const float* Wh,          // [4*hidden, hidden]
     float* dPrevH,            // [batch, hidden]
@@ -436,7 +436,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_prevh(
 
 // LSTM backward pass for entire sequence (BPTT)
 // Processes timesteps in reverse order
-extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_sequence(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     const float* gradOutput,  // [batch, timeSteps, hidden]
     const float* h_states,    // [timeSteps, batch, hidden]
     const float* c_states,    // [timeSteps, batch, hidden]
@@ -616,7 +616,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_sequence(
 // ===========================================================================
 
 // Accumulates weight gradients across batch dimension
-extern ""C"" __global__ __launch_bounds__(256) void lstm_accumulate_weight_gradients(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients(
     const float* input,       // [batch, inputSize]
     const float* prevH,       // [batch, hiddenSize]
     const float* dGates,      // [batch, 4*hiddenSize]
@@ -670,7 +670,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lstm_accumulate_weight_gradi
 // ===========================================================================
 
 // Computes gate gradients from hidden and cell gradients
-extern ""C"" __global__ __launch_bounds__(256) void lstm_compute_gate_gradients(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients(
     const float* dH,          // [batch, hidden]
     const float* dC_next,     // [batch, hidden]
     const float* gateF,       // [batch, hidden]

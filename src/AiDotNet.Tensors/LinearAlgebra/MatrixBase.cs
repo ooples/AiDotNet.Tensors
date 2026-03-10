@@ -72,7 +72,31 @@ public abstract class MatrixBase<T>
                 return segment.Array;
             }
         }
+
+        // Cannot get backing array — this means mutations would be lost.
+        // Fall back to ToArray() for read-only scenarios; callers that mutate
+        // must use Span-based paths instead.
         return _memory.ToArray();
+    }
+
+    /// <summary>
+    /// Tries to get the backing array of this matrix's memory. Returns false if
+    /// the memory is not backed by a full array (sliced, pinned, etc.), in which
+    /// case mutating callers must use alternative paths to avoid detached copies.
+    /// </summary>
+    internal bool TryGetBackingArray(out T[] array)
+    {
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
+        {
+            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            {
+                array = segment.Array;
+                return true;
+            }
+        }
+
+        array = Array.Empty<T>();
+        return false;
     }
 
     /// <summary>
@@ -1114,9 +1138,21 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get backing arrays directly (no copy) for parallel processing
-        var resultData = result.GetDataArray();
-        var srcData = GetDataArray();
+        // Get backing arrays directly (no copy) for parallel processing.
+        // Both result (freshly allocated) and source should always have backing arrays.
+        if (!result.TryGetBackingArray(out var resultData) || !TryGetBackingArray(out var srcData))
+        {
+            // Fallback: span-based blocked transpose if backing arrays unavailable
+            for (int i = 0; i < rows; i++)
+            {
+                int srcOffset = i * cols;
+                for (int j = 0; j < cols; j++)
+                {
+                    resultSpan[j * rows + i] = srcSpan[srcOffset + j];
+                }
+            }
+            return result;
+        }
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384; // 128x128 or larger
@@ -1232,8 +1268,21 @@ public abstract class MatrixBase<T>
         }
 
         // For larger matrices, use cache-blocked transpose with parallel execution
-        // Get backing array directly (no copy) for parallel processing
-        var data = GetDataArray();
+        // Get backing array directly — must be the actual backing array to mutate in-place.
+        if (!TryGetBackingArray(out var data))
+        {
+            // Fallback: span-based in-place transpose
+            for (int i = 0; i < n; i++)
+            {
+                for (int j = i + 1; j < n; j++)
+                {
+                    int idx1 = i * n + j;
+                    int idx2 = j * n + i;
+                    (span[idx1], span[idx2]) = (span[idx2], span[idx1]);
+                }
+            }
+            return;
+        }
 
         const int BlockSize = 32;
         const int ParallelThreshold = 16384;

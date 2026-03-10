@@ -540,9 +540,10 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __re
     if (tid < numWarps)
     {
         val = scratch[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            val += __shfl_down_sync(mask, val, offset);
+            val += __shfl_down_sync(warp_mask, val, offset);
 
         if (tid == 0)
             output[blockIdx.x] = val;
@@ -577,10 +578,11 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     if (tid < numWarps)
     {
         val = scratch[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = __shfl_down_sync(mask, val, offset);
+            float other = __shfl_down_sync(warp_mask, val, offset);
             val = fmaxf(val, other);
         }
 

@@ -1000,16 +1000,14 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Final reduction across warps (only first warp)
+    // Final reduction across warps — all first-warp lanes participate
     int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps) {
-        sum = sdata[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
-        if (tid == 0)
-            atomicAdd(output, sum);
-    }
+    sum = (tid < numWarps) ? sdata[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0)
+        atomicAdd(output, sum);
 }
 
 // Compute variance given a known mean, using parallel reduction
@@ -1041,16 +1039,14 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
     if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Final reduction across warps (only first warp)
-    int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps) {
-        sum = sdata[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
-        if (tid == 0)
-            atomicAdd(output, sum);
-    }
+    // Final reduction across warps — all first-warp lanes participate
+    int numWarps2 = (blockDim.x + 31) >> 5;
+    sum = (tid < numWarps2) ? sdata[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0)
+        atomicAdd(output, sum);
 }
 ";
     }

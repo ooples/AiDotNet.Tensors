@@ -85,30 +85,47 @@ internal sealed class DeferredDownloadEntry
 public sealed class GpuScope : IDisposable
 {
     [ThreadStatic]
-    private static int _depth;
+    private static Dictionary<int, int>? _depthPerEngine;
 
     private readonly DirectGpuTensorEngine? _engine;
+    private readonly int _engineId;
 
     /// <summary>
-    /// Returns true if a GpuScope is currently active on this thread.
+    /// Returns true if any GpuScope is currently active on this thread.
     /// </summary>
-    internal static bool IsActive => _depth > 0;
+    internal static bool IsActive
+    {
+        get
+        {
+            if (_depthPerEngine is null) return false;
+            foreach (var kvp in _depthPerEngine)
+            {
+                if (kvp.Value > 0) return true;
+            }
+            return false;
+        }
+    }
 
     internal GpuScope(DirectGpuTensorEngine? engine = null)
     {
         _engine = engine;
-        _depth++;
+        _engineId = engine?.GetHashCode() ?? 0;
+        _depthPerEngine ??= new Dictionary<int, int>();
+        _depthPerEngine.TryGetValue(_engineId, out int depth);
+        _depthPerEngine[_engineId] = depth + 1;
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
-        if (_depth > 0)
+        if (_depthPerEngine is null) return;
+        _depthPerEngine.TryGetValue(_engineId, out int depth);
+        if (depth > 0)
         {
-            _depth--;
-            // When the outermost scope exits, materialize all deferred downloads
-            // so that any CPU arrays returned from GPU ops have valid data
-            if (_depth == 0)
+            depth--;
+            _depthPerEngine[_engineId] = depth;
+            // When the outermost scope for this engine exits, materialize its deferred downloads
+            if (depth == 0)
             {
                 _engine?.MaterializeAllDeferred();
             }
@@ -796,13 +813,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (GpuScope.IsActive)
         {
-            // Defer the download — allocate an empty result array and track it.
-            // The GPU buffer is cached in the activation cache so the next GPU op
-            // can reuse it directly without re-uploading. The CPU array is only
-            // populated if/when MaterializeIfDeferred is called.
-            var result = new T[elementCount];
+            // Scope is active: download the data now so the CPU array has valid values,
+            // but also cache the GPU buffer so the next GPU op can reuse it without re-uploading.
+            float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(floatData);
             CacheActivation(result, outputBuffer.Buffer, [elementCount], backend);
-            _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer.Buffer, backend, elementCount));
             return result;
         }
         else

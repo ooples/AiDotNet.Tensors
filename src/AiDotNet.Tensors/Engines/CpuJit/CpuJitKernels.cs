@@ -840,15 +840,11 @@ internal static class CpuJitKernels
         }
     }
 
-    // Scalar helpers using VEX-encoded SSE scalar ops (128-bit, no lane issues)
+    // Scalar helpers using VEX-encoded VMOVSS (4-byte load/store, no out-of-bounds reads)
     private static void EmitScalarLoad(X86Emitter e, int dst, int baseReg, int disp)
     {
-        // VMOVSS xmm, [base+disp]: VEX.128.F3.0F.W0 10 /r
-        // Use VmovupsLoad but with 128-bit — actually VMOVSS is different encoding
-        // Simplest: use the VEX memory load helper with scalar prefix
-        // For now, reuse unaligned load (VMOVUPS loads 32 bytes but we only use low 4)
-        // This is safe because we verify the full array fits before JIT compilation
-        e.VmovupsLoad(dst, baseReg, disp);
+        // VMOVSS xmm, [base+disp]: loads exactly 4 bytes (1 float)
+        e.VmovssLoad(dst, baseReg, disp);
     }
 
     private static void EmitScalarBinaryOp(X86Emitter e, JitBinaryOp op, int dst, int srcBase, int disp)
@@ -863,7 +859,8 @@ internal static class CpuJitKernels
 
     private static void EmitScalarStore(X86Emitter e, int src, int baseReg, int disp)
     {
-        e.VmovupsStore(src, baseReg, disp);
+        // VMOVSS [base+disp], xmm: stores exactly 4 bytes (1 float)
+        e.VmovssStore(src, baseReg, disp);
     }
 
     /// <summary>

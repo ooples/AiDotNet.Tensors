@@ -320,9 +320,10 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum(
     unsigned int numWarps = (blockDim.x + 31) >> 5;
     if (tid < numWarps) {
         val = scratch[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            val += __shfl_down_sync(mask, val, offset);
+            val += __shfl_down_sync(warp_mask, val, offset);
         if (tid == 0) atomicAdd(&output[0], val);
     }
 }

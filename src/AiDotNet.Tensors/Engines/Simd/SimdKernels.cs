@@ -1519,8 +1519,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// Pointer-based double Sigmoid — zero bounds-checking overhead, 4x unrolled AVX2+FMA.
-        /// Uses direct 7th-order odd polynomial: sigmoid(x) ≈ 0.5 + x*(c1 + x²*(c3 + x²*(c5 + x²*c7)))
-        /// Much faster than exp(-x) route (3 FMA vs 12 FMA + division).
+        /// Uses FastExpDouble256: sigmoid(x) = 1/(1+exp(-x)) for full double precision accuracy.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void SigmoidUnsafe(double* input, double* output, int length)
@@ -1529,74 +1528,33 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Fma.IsSupported && Avx.IsSupported && length >= 16)
             {
-                // 7th-order odd polynomial for double precision
-                // sigmoid(x) ≈ 0.5 + x*(c1 + x²*(c3 + x²*(c5 + x²*c7))) for |x| ≤ 6
-                // Coefficients fitted via minimax on [-6,6], max abs error ~0.0002
-                var vmin = Vector256.Create(-6.0);
-                var vmax = Vector256.Create(6.0);
-                var vc7 = Vector256.Create(1.1574074074074074e-5);    // ~1/86400
-                var vc5 = Vector256.Create(-1.3888888888888889e-3);   // ~-1/720
-                var vc3 = Vector256.Create(4.1666666666666664e-2);    // ~1/24
-                var vc1 = Vector256.Create(2.5e-1);                   // 1/4
-                var vhalf = Vector256.Create(0.5);
+                var one = Vector256.Create(1.0);
+                var negOne = Vector256.Create(-1.0);
 
                 int simdLength = length & ~15;
                 for (; i < simdLength; i += 16)
                 {
-                    var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vmin), vmax);
-                    var x1 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 4), vmin), vmax);
-                    var x2 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), vmin), vmax);
-                    var x3 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 12), vmin), vmax);
+                    var x0 = Avx.Multiply(negOne, Avx.LoadVector256(input + i));
+                    var x1 = Avx.Multiply(negOne, Avx.LoadVector256(input + i + 4));
+                    var x2 = Avx.Multiply(negOne, Avx.LoadVector256(input + i + 8));
+                    var x3 = Avx.Multiply(negOne, Avx.LoadVector256(input + i + 12));
 
-                    var sq0 = Avx.Multiply(x0, x0);
-                    var sq1 = Avx.Multiply(x1, x1);
-                    var sq2 = Avx.Multiply(x2, x2);
-                    var sq3 = Avx.Multiply(x3, x3);
-
-                    // p = c7*x² + c5
-                    var p0 = Fma.MultiplyAdd(sq0, vc7, vc5);
-                    var p1 = Fma.MultiplyAdd(sq1, vc7, vc5);
-                    var p2 = Fma.MultiplyAdd(sq2, vc7, vc5);
-                    var p3 = Fma.MultiplyAdd(sq3, vc7, vc5);
-
-                    // p = p*x² + c3
-                    p0 = Fma.MultiplyAdd(sq0, p0, vc3);
-                    p1 = Fma.MultiplyAdd(sq1, p1, vc3);
-                    p2 = Fma.MultiplyAdd(sq2, p2, vc3);
-                    p3 = Fma.MultiplyAdd(sq3, p3, vc3);
-
-                    // p = p*x² + c1
-                    p0 = Fma.MultiplyAdd(sq0, p0, vc1);
-                    p1 = Fma.MultiplyAdd(sq1, p1, vc1);
-                    p2 = Fma.MultiplyAdd(sq2, p2, vc1);
-                    p3 = Fma.MultiplyAdd(sq3, p3, vc1);
-
-                    // result = 0.5 + x*p
-                    Avx.Store(output + i, Fma.MultiplyAdd(x0, p0, vhalf));
-                    Avx.Store(output + i + 4, Fma.MultiplyAdd(x1, p1, vhalf));
-                    Avx.Store(output + i + 8, Fma.MultiplyAdd(x2, p2, vhalf));
-                    Avx.Store(output + i + 12, Fma.MultiplyAdd(x3, p3, vhalf));
+                    Avx.Store(output + i, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x0))));
+                    Avx.Store(output + i + 4, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x1))));
+                    Avx.Store(output + i + 8, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x2))));
+                    Avx.Store(output + i + 12, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x3))));
                 }
             }
             if (Fma.IsSupported && Avx.IsSupported && length - i >= 4)
             {
-                var vmin = Vector256.Create(-6.0);
-                var vmax = Vector256.Create(6.0);
-                var vc7 = Vector256.Create(1.1574074074074074e-5);
-                var vc5 = Vector256.Create(-1.3888888888888889e-3);
-                var vc3 = Vector256.Create(4.1666666666666664e-2);
-                var vc1 = Vector256.Create(2.5e-1);
-                var vhalf = Vector256.Create(0.5);
+                var one = Vector256.Create(1.0);
+                var negOne = Vector256.Create(-1.0);
 
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vmin), vmax);
-                    var sq0 = Avx.Multiply(x0, x0);
-                    var p0 = Fma.MultiplyAdd(sq0, vc7, vc5);
-                    p0 = Fma.MultiplyAdd(sq0, p0, vc3);
-                    p0 = Fma.MultiplyAdd(sq0, p0, vc1);
-                    Avx.Store(output + i, Fma.MultiplyAdd(x0, p0, vhalf));
+                    var x0 = Avx.Multiply(negOne, Avx.LoadVector256(input + i));
+                    Avx.Store(output + i, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x0))));
                 }
             }
 #endif

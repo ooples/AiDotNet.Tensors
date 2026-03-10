@@ -308,13 +308,12 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum(
     __syncthreads();
 
     unsigned int numWarps = (blockDim.x + 31) >> 5;
-    if (tid < numWarps) {
-        val = scratch[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            val += __shfl_down_sync(mask, val, offset);
-        if (tid == 0) atomicAdd(&output[0], val);
-    }
+    val = (tid < numWarps) ? scratch[tid] : 0.0f;
+    unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(warp_mask, val, offset);
+    if (tid == 0) atomicAdd(&output[0], val);
 }
 
 // ============================================================================
@@ -343,11 +342,13 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         maxVal = fmaxf(maxVal, __shfl_down_sync(mask, maxVal, offset));
     if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = maxVal;
     __syncthreads();
-    if (threadIdx.x < ((blockDim.x + 31) >> 5)) {
-        maxVal = smem[threadIdx.x];
+    {
+        unsigned int nw = (blockDim.x + 31) >> 5;
+        maxVal = (threadIdx.x < nw) ? smem[threadIdx.x] : -1e30f;
+        unsigned int wmask = (nw >= 32) ? 0xFFFFFFFF : ((1u << nw) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            maxVal = fmaxf(maxVal, __shfl_down_sync(mask, maxVal, offset));
+            maxVal = fmaxf(maxVal, __shfl_down_sync(wmask, maxVal, offset));
         if (threadIdx.x == 0) smem[0] = maxVal;
     }
     __syncthreads();
@@ -363,11 +364,13 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         sumVal += __shfl_down_sync(mask, sumVal, offset);
     if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = sumVal;
     __syncthreads();
-    if (threadIdx.x < ((blockDim.x + 31) >> 5)) {
-        sumVal = smem[threadIdx.x];
+    {
+        unsigned int nw2 = (blockDim.x + 31) >> 5;
+        sumVal = (threadIdx.x < nw2) ? smem[threadIdx.x] : 0.0f;
+        unsigned int wmask2 = (nw2 >= 32) ? 0xFFFFFFFF : ((1u << nw2) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            sumVal += __shfl_down_sync(mask, sumVal, offset);
+            sumVal += __shfl_down_sync(wmask2, sumVal, offset);
         if (threadIdx.x == 0) smem[0] = sumVal;
     }
     __syncthreads();

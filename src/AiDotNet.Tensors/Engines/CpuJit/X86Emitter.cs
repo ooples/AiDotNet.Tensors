@@ -160,7 +160,7 @@ internal sealed class X86Emitter
     /// <summary>
     /// Emits a VEX-encoded instruction: op ymm_dst, ymm_src1, [base + disp32].
     /// </summary>
-    private void EmitVexRM(int map, int pp, int w, byte opcode, int dst, int src1, int baseReg, int disp)
+    private void EmitVexRM(int map, int pp, int w, byte opcode, int dst, int src1, int baseReg, int disp, int l = 1)
     {
         int rBit = (dst >> 3) ^ 1;
         int bBit = (baseReg >> 3) ^ 1;
@@ -168,11 +168,11 @@ internal sealed class X86Emitter
 
         if (map == 1 && bBit == 1 && w == 0)
         {
-            EmitVex2(rBit, vvvv, 1, pp);
+            EmitVex2(rBit, vvvv, l, pp);
         }
         else
         {
-            EmitVex3(rBit, 1, bBit, map, w, vvvv, 1, pp);
+            EmitVex3(rBit, 1, bBit, map, w, vvvv, l, pp);
         }
         Emit(opcode);
 
@@ -292,6 +292,17 @@ internal sealed class X86Emitter
     /// <summary>VMOVUPS [base+disp], ymm — Unaligned store</summary>
     public void VmovupsStore(int src, int baseReg, int disp)
         => EmitVexStore(1, 0, 0, 0x11, src, baseReg, disp);
+
+    /// <summary>VMOVSS xmm, [base+disp] — Scalar float load (4 bytes only)</summary>
+    public void VmovssLoad(int dst, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x10, dst, 0, baseReg, disp, l: 0);
+
+    /// <summary>VMOVSS [base+disp], xmm — Scalar float store (4 bytes only)</summary>
+    public void VmovssStore(int src, int baseReg, int disp)
+    {
+        // VEX.LIG.F3.0F.WIG 11 /r
+        EmitVexRM(1, 2 /*F3*/, 0, 0x11, src, 0, baseReg, disp, l: 0);
+    }
 
     /// <summary>VMOVNTPS [base+disp], ymm — Non-temporal store (requires 32-byte alignment, bypasses cache)</summary>
     public void VmovntpsStore(int src, int baseReg, int disp)
@@ -592,10 +603,13 @@ internal sealed class X86Emitter
                 dst[i] = _code[i];
             }
 
-            // Zero padding between code and data
-            for (int i = codeSize; i < dataOffset; i++)
+            // Zero padding between code and data (only if there is a data section)
+            if (_dataConstants.Count > 0)
             {
-                dst[i] = 0xCC; // INT3 padding (trap if executed)
+                for (int i = codeSize; i < dataOffset; i++)
+                {
+                    dst[i] = 0xCC; // INT3 padding (trap if executed)
+                }
             }
 
             // Write data constants
