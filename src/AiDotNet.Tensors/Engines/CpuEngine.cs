@@ -3324,11 +3324,80 @@ public class CpuEngine : ITensorLevelEngine
                 $"Ensure poolSize={poolSize}, stride={stride}, padding={padding} are compatible with input size {height}x{width}.");
         }
 
-        var result = new Tensor<T>(new[] { batch, channels, outputHeight, outputWidth });
+        var outputShape = new[] { batch, channels, outputHeight, outputWidth };
+        var result = TensorAllocator.Rent<T>(outputShape);
+
+        // Float fast path: direct array access, no virtual dispatch
+        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
+        {
+            int bc = batch * channels;
+            if (bc >= 4 && padding == 0)
+            {
+                // Parallel over batch*channels, no padding (hot path)
+                Parallel.For(0, bc, idx =>
+                {
+                    int inputBase = idx * height * width;
+                    int outputBase = idx * outputHeight * outputWidth;
+
+                    for (int oh = 0; oh < outputHeight; oh++)
+                    {
+                        int ihStart = oh * stride;
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            int iwStart = ow * stride;
+                            float maxVal = float.NegativeInfinity;
+
+                            for (int kh = 0; kh < poolSize; kh++)
+                            {
+                                int rowOff = inputBase + (ihStart + kh) * width + iwStart;
+                                for (int kw = 0; kw < poolSize; kw++)
+                                {
+                                    float v = inArr[rowOff + kw];
+                                    if (v > maxVal) maxVal = v;
+                                }
+                            }
+                            outArr[outputBase + oh * outputWidth + ow] = maxVal;
+                        }
+                    }
+                });
+            }
+            else
+            {
+                // General float path with padding support
+                for (int idx = 0; idx < bc; idx++)
+                {
+                    int inputBase = idx * height * width;
+                    int outputBase = idx * outputHeight * outputWidth;
+
+                    for (int oh = 0; oh < outputHeight; oh++)
+                    {
+                        for (int ow = 0; ow < outputWidth; ow++)
+                        {
+                            float maxVal = float.NegativeInfinity;
+                            for (int kh = 0; kh < poolSize; kh++)
+                            {
+                                int ih = oh * stride + kh - padding;
+                                if (ih < 0 || ih >= height) continue;
+                                for (int kw = 0; kw < poolSize; kw++)
+                                {
+                                    int iw = ow * stride + kw - padding;
+                                    if (iw < 0 || iw >= width) continue;
+                                    float v = inArr[inputBase + ih * width + iw];
+                                    if (v > maxVal) maxVal = v;
+                                }
+                            }
+                            outArr[outputBase + oh * outputWidth + ow] = maxVal;
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
+        // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
-        // Parallelize over batch * channels
         Parallel.For(0, batch * channels, idx =>
         {
             int b = idx / channels;
