@@ -3393,6 +3393,204 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float MaxPool3x3Padded(float* data, int h, int w, int ihStart, int iwStart)
+    {
+        float m = float.NegativeInfinity;
+        int khStart = ihStart < 0 ? -ihStart : 0;
+        int kwStart = iwStart < 0 ? -iwStart : 0;
+        int khEnd = 3 < (h - ihStart) ? 3 : (h - ihStart);
+        int kwEnd = 3 < (w - iwStart) ? 3 : (w - iwStart);
+
+        for (int kh = khStart; kh < khEnd; kh++)
+        {
+            float* row = data + (ihStart + kh) * w + iwStart;
+            for (int kw = kwStart; kw < kwEnd; kw++)
+            {
+                float v = row[kw];
+                if (v > m) m = v;
+            }
+        }
+        return m;
+    }
+
+    private static unsafe void MaxPool2DFloat3x3NoPad(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st)
+    {
+        fixed (float* pIn = inArr)
+        fixed (float* pOut = outArr)
+        {
+            for (int idx = 0; idx < bc; idx++)
+            {
+                float* inBase = pIn + idx * h * w;
+                float* outBase = pOut + idx * oH * oW;
+
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int ihStart = oh * st;
+                    float* r0 = inBase + ihStart * w;
+                    float* r1 = r0 + w;
+                    float* r2 = r1 + w;
+                    float* dst = outBase + oh * oW;
+
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int iw = ow * st;
+                        float m = r0[iw];
+                        float v = r0[iw + 1]; if (v > m) m = v;
+                        v = r0[iw + 2]; if (v > m) m = v;
+                        v = r1[iw]; if (v > m) m = v;
+                        v = r1[iw + 1]; if (v > m) m = v;
+                        v = r1[iw + 2]; if (v > m) m = v;
+                        v = r2[iw]; if (v > m) m = v;
+                        v = r2[iw + 1]; if (v > m) m = v;
+                        v = r2[iw + 2]; if (v > m) m = v;
+                        dst[ow] = m;
+                    }
+                }
+            }
+        }
+    }
+
+    private static unsafe void MaxPool2DFloat2x2NoPad(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st)
+    {
+        fixed (float* pIn = inArr)
+        fixed (float* pOut = outArr)
+        {
+            for (int idx = 0; idx < bc; idx++)
+            {
+                float* inBase = pIn + idx * h * w;
+                float* outBase = pOut + idx * oH * oW;
+
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    int ihStart = oh * st;
+                    float* r0 = inBase + ihStart * w;
+                    float* r1 = r0 + w;
+                    float* dst = outBase + oh * oW;
+
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        int iw = ow * st;
+                        float m = r0[iw];
+                        float v = r0[iw + 1]; if (v > m) m = v;
+                        v = r1[iw]; if (v > m) m = v;
+                        v = r1[iw + 1]; if (v > m) m = v;
+                        dst[ow] = m;
+                    }
+                }
+            }
+        }
+    }
+
+    private static unsafe void MaxPool2DFloat3x3Padded(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st, int pd)
+    {
+        // Compute interior bounds where all 9 kernel elements are valid
+        int ohInteriorStart = (pd + st - 1) / st;
+        int ohInteriorEnd = (h + pd - 3) / st + 1;
+        int owInteriorStart = (pd + st - 1) / st;
+        int owInteriorEnd = (w + pd - 3) / st + 1;
+        if (ohInteriorEnd > oH) ohInteriorEnd = oH;
+        if (owInteriorEnd > oW) owInteriorEnd = oW;
+
+        fixed (float* pIn = inArr)
+        fixed (float* pOut = outArr)
+        {
+            for (int idx = 0; idx < bc; idx++)
+            {
+                float* inBase = pIn + idx * h * w;
+                float* outBase = pOut + idx * oH * oW;
+
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    float* dst = outBase + oh * oW;
+
+                    if (oh >= ohInteriorStart && oh < ohInteriorEnd)
+                    {
+                        int ihStart = oh * st - pd;
+                        float* r0 = inBase + ihStart * w;
+                        float* r1 = r0 + w;
+                        float* r2 = r1 + w;
+
+                        // Left border columns
+                        for (int ow = 0; ow < owInteriorStart && ow < oW; ow++)
+                        {
+                            dst[ow] = MaxPool3x3Padded(inBase, h, w, oh * st - pd, ow * st - pd);
+                        }
+
+                        // Interior columns: full unrolled 3x3
+                        for (int ow = owInteriorStart; ow < owInteriorEnd; ow++)
+                        {
+                            int iw = ow * st - pd;
+                            float m = r0[iw];
+                            float v = r0[iw + 1]; if (v > m) m = v;
+                            v = r0[iw + 2]; if (v > m) m = v;
+                            v = r1[iw]; if (v > m) m = v;
+                            v = r1[iw + 1]; if (v > m) m = v;
+                            v = r1[iw + 2]; if (v > m) m = v;
+                            v = r2[iw]; if (v > m) m = v;
+                            v = r2[iw + 1]; if (v > m) m = v;
+                            v = r2[iw + 2]; if (v > m) m = v;
+                            dst[ow] = m;
+                        }
+
+                        // Right border columns
+                        for (int ow = owInteriorEnd; ow < oW; ow++)
+                        {
+                            dst[ow] = MaxPool3x3Padded(inBase, h, w, oh * st - pd, ow * st - pd);
+                        }
+                    }
+                    else
+                    {
+                        // Border rows
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            dst[ow] = MaxPool3x3Padded(inBase, h, w, oh * st - pd, ow * st - pd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static unsafe void MaxPool2DFloatGeneric(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int ps, int st, int pd)
+    {
+        fixed (float* pIn = inArr)
+        fixed (float* pOut = outArr)
+        {
+            for (int idx = 0; idx < bc; idx++)
+            {
+                float* inBase = pIn + idx * h * w;
+                float* outBase = pOut + idx * oH * oW;
+
+                for (int oh = 0; oh < oH; oh++)
+                {
+                    float* dst = outBase + oh * oW;
+                    for (int ow = 0; ow < oW; ow++)
+                    {
+                        float maxVal = float.NegativeInfinity;
+                        int ihStart = oh * st - pd;
+                        int iwStart = ow * st - pd;
+                        int khStart = ihStart < 0 ? -ihStart : 0;
+                        int kwStart = iwStart < 0 ? -iwStart : 0;
+                        int khEnd = ps < (h - ihStart) ? ps : (h - ihStart);
+                        int kwEnd = ps < (w - iwStart) ? ps : (w - iwStart);
+
+                        for (int kh = khStart; kh < khEnd; kh++)
+                        {
+                            float* row = inBase + (ihStart + kh) * w + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++)
+                            {
+                                float v = row[kw];
+                                if (v > maxVal) maxVal = v;
+                            }
+                        }
+                        dst[ow] = maxVal;
+                    }
+                }
+            }
+        }
+    }
+
     public Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -3423,78 +3621,28 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
         var result = TensorAllocator.Rent<T>(outputShape);
 
-        // Float fast path: direct array access, no virtual dispatch
+        // Float fast path: direct array access with specialized inner loops
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
             int ps = poolSize, st = stride, pd = padding;
 
-            if (padding == 0)
+            if (pd == 0 && ps == 3)
             {
-                // No padding: skip bounds checks in inner loop
-                Parallel.For(0, bc, idx =>
-                {
-                    int inputBase = idx * h * w;
-                    int outputBase = idx * oH * oW;
-
-                    for (int oh = 0; oh < oH; oh++)
-                    {
-                        int ihStart = oh * st;
-                        for (int ow = 0; ow < oW; ow++)
-                        {
-                            int iwStart = ow * st;
-                            float maxVal = float.NegativeInfinity;
-
-                            for (int kh = 0; kh < ps; kh++)
-                            {
-                                int rowOff = inputBase + (ihStart + kh) * w + iwStart;
-                                for (int kw = 0; kw < ps; kw++)
-                                {
-                                    float v = inArr[rowOff + kw];
-                                    if (v > maxVal) maxVal = v;
-                                }
-                            }
-                            outArr[outputBase + oh * oW + ow] = maxVal;
-                        }
-                    }
-                });
+                MaxPool2DFloat3x3NoPad(inArr, outArr, bc, h, w, oH, oW, st);
+            }
+            else if (pd == 0 && ps == 2)
+            {
+                MaxPool2DFloat2x2NoPad(inArr, outArr, bc, h, w, oH, oW, st);
+            }
+            else if (ps == 3)
+            {
+                MaxPool2DFloat3x3Padded(inArr, outArr, bc, h, w, oH, oW, st, pd);
             }
             else
             {
-                // With padding: parallelize across batch*channels, inline bounds checks
-                Parallel.For(0, bc, idx =>
-                {
-                    int inputBase = idx * h * w;
-                    int outputBase = idx * oH * oW;
-
-                    for (int oh = 0; oh < oH; oh++)
-                    {
-                        for (int ow = 0; ow < oW; ow++)
-                        {
-                            float maxVal = float.NegativeInfinity;
-
-                            // Clamp kernel bounds to valid input region
-                            int ihStart = oh * st - pd;
-                            int iwStart = ow * st - pd;
-                            int khStart = ihStart < 0 ? -ihStart : 0;
-                            int kwStart = iwStart < 0 ? -iwStart : 0;
-                            int khEnd = Math.Min(ps, h - ihStart);
-                            int kwEnd = Math.Min(ps, w - iwStart);
-
-                            for (int kh = khStart; kh < khEnd; kh++)
-                            {
-                                int rowOff = inputBase + (ihStart + kh) * w + iwStart;
-                                for (int kw = kwStart; kw < kwEnd; kw++)
-                                {
-                                    float v = inArr[rowOff + kw];
-                                    if (v > maxVal) maxVal = v;
-                                }
-                            }
-                            outArr[outputBase + oh * oW + ow] = maxVal;
-                        }
-                    }
-                });
+                MaxPool2DFloatGeneric(inArr, outArr, bc, h, w, oH, oW, ps, st, pd);
             }
             return result;
         }
