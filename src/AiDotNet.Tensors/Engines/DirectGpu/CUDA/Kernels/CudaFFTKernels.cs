@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 #define PI 3.14159265358979323846f
 
 // Bit reversal permutation for in-place FFT
-extern ""C"" __global__ void bit_reverse_permutation(
+extern ""C"" __global__ __launch_bounds__(256) void bit_reverse_permutation(
     float* real, float* imag, int n, int log2n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -36,7 +36,7 @@ extern ""C"" __global__ void bit_reverse_permutation(
 }
 
 // Butterfly operation for Cooley-Tukey FFT
-extern ""C"" __global__ void fft_butterfly(
+extern ""C"" __global__ __launch_bounds__(256) void fft_butterfly(
     float* real, float* imag, int n, int stride, int inverse)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,7 +73,7 @@ extern ""C"" __global__ void fft_butterfly(
 }
 
 // Post-process RFFT output to extract positive frequencies
-extern ""C"" __global__ void rfft_postprocess(
+extern ""C"" __global__ __launch_bounds__(256) void rfft_postprocess(
     const float* fullReal, const float* fullImag,
     float* outReal, float* outImag, int n)
 {
@@ -86,7 +86,7 @@ extern ""C"" __global__ void rfft_postprocess(
 }
 
 // Pre-process for IRFFT (reconstruct negative frequencies)
-extern ""C"" __global__ void irfft_preprocess(
+extern ""C"" __global__ __launch_bounds__(256) void irfft_preprocess(
     const float* inReal, const float* inImag,
     float* fullReal, float* fullImag, int n)
 {
@@ -105,7 +105,7 @@ extern ""C"" __global__ void irfft_preprocess(
 }
 
 // Compute magnitude from complex numbers
-extern ""C"" __global__ void complex_magnitude(
+extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude(
     const float* real, const float* imag, float* magnitude, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -117,7 +117,7 @@ extern ""C"" __global__ void complex_magnitude(
 }
 
 // Compute phase from complex numbers
-extern ""C"" __global__ void complex_phase(
+extern ""C"" __global__ __launch_bounds__(256) void complex_phase(
     const float* real, const float* imag, float* phase, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -127,7 +127,7 @@ extern ""C"" __global__ void complex_phase(
 }
 
 // Convert polar to complex
-extern ""C"" __global__ void polar_to_complex(
+extern ""C"" __global__ __launch_bounds__(256) void polar_to_complex(
     const float* magnitude, const float* phase,
     float* real, float* imag, int n)
 {
@@ -141,7 +141,7 @@ extern ""C"" __global__ void polar_to_complex(
 }
 
 // Apply Mel filterbank to power spectrum
-extern ""C"" __global__ void apply_mel_filterbank(
+extern ""C"" __global__ __launch_bounds__(256) void apply_mel_filterbank(
     const float* powerSpec, const float* filterbank, float* melSpec,
     int numFrames, int numFreqs, int nMels)
 {
@@ -158,7 +158,7 @@ extern ""C"" __global__ void apply_mel_filterbank(
 }
 
 // Power to dB conversion
-extern ""C"" __global__ void power_to_db(
+extern ""C"" __global__ __launch_bounds__(256) void power_to_db(
     const float* power, float* db, int n, float refValue, float minDb)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -171,7 +171,7 @@ extern ""C"" __global__ void power_to_db(
 }
 
 // dB to power conversion
-extern ""C"" __global__ void db_to_power(
+extern ""C"" __global__ __launch_bounds__(256) void db_to_power(
     const float* db, float* power, int n, float refValue)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -182,7 +182,7 @@ extern ""C"" __global__ void db_to_power(
 }
 
 // Overlap-add for ISTFT
-extern ""C"" __global__ void overlap_add(
+extern ""C"" __global__ __launch_bounds__(256) void overlap_add(
     const float* frames, float* output, const float* window,
     int numFrames, int nFft, int hopLength, int outputLength)
 {
@@ -202,7 +202,7 @@ extern ""C"" __global__ void overlap_add(
 }
 
 // Window normalization for ISTFT
-extern ""C"" __global__ void window_sum_squares(
+extern ""C"" __global__ __launch_bounds__(256) void window_sum_squares(
     float* winSqSum, const float* window, int nFft, int hopLength, int outputLength)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -222,7 +222,7 @@ extern ""C"" __global__ void window_sum_squares(
 }
 
 // Apply window function
-extern ""C"" __global__ void apply_window(
+extern ""C"" __global__ __launch_bounds__(256) void apply_window(
     const float* input, const float* window, float* output, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -231,7 +231,7 @@ extern ""C"" __global__ void apply_window(
 }
 
 // 2D FFT row-wise butterfly
-extern ""C"" __global__ void fft_rows_butterfly(
+extern ""C"" __global__ __launch_bounds__(256) void fft_rows_butterfly(
     float* real, float* imag, int height, int width, int stride, int inverse)
 {
     int row = blockIdx.y;
@@ -265,7 +265,7 @@ extern ""C"" __global__ void fft_rows_butterfly(
 }
 
 // 2D FFT column-wise butterfly
-extern ""C"" __global__ void fft_cols_butterfly(
+extern ""C"" __global__ __launch_bounds__(256) void fft_cols_butterfly(
     float* real, float* imag, int height, int width, int stride, int inverse)
 {
     int col = blockIdx.y;
@@ -299,7 +299,7 @@ extern ""C"" __global__ void fft_cols_butterfly(
 }
 
 // Scale by 1/N for inverse FFT
-extern ""C"" __global__ void scale_inverse(float* real, float* imag, int n)
+extern ""C"" __global__ __launch_bounds__(256) void scale_inverse(float* real, float* imag, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -310,7 +310,7 @@ extern ""C"" __global__ void scale_inverse(float* real, float* imag, int n)
 }
 
 // Batched FFT bit reversal
-extern ""C"" __global__ void batched_bit_reverse(
+extern ""C"" __global__ __launch_bounds__(256) void batched_bit_reverse(
     float* real, float* imag, int batch, int n, int log2n)
 {
     int b = blockIdx.y;
@@ -336,7 +336,7 @@ extern ""C"" __global__ void batched_bit_reverse(
 }
 
 // Batched FFT butterfly
-extern ""C"" __global__ void batched_fft_butterfly(
+extern ""C"" __global__ __launch_bounds__(256) void batched_fft_butterfly(
     float* real, float* imag, int batch, int n, int stride, int inverse)
 {
     int b = blockIdx.z;

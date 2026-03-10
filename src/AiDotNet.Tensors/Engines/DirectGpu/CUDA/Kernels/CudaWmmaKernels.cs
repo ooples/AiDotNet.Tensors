@@ -112,7 +112,7 @@ using namespace nvcuda;
 // Each kernel uses tensor cores for the GEMM and applies activation inline.
 // ===========================================================================
 
-extern ""C"" __global__ void gemm_bias_relu_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_relu_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -122,7 +122,7 @@ extern ""C"" __global__ void gemm_bias_relu_wmma(
     WMMA_GEMM_BODY(val = fmaxf(0.0f, val);)
 }
 
-extern ""C"" __global__ void gemm_bias_gelu_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_gelu_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -136,7 +136,7 @@ extern ""C"" __global__ void gemm_bias_gelu_wmma(
     )
 }
 
-extern ""C"" __global__ void gemm_bias_sigmoid_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_sigmoid_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -146,7 +146,7 @@ extern ""C"" __global__ void gemm_bias_sigmoid_wmma(
     WMMA_GEMM_BODY(val = 1.0f / (1.0f + expf(-val));)
 }
 
-extern ""C"" __global__ void gemm_bias_tanh_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_tanh_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -156,7 +156,7 @@ extern ""C"" __global__ void gemm_bias_tanh_wmma(
     WMMA_GEMM_BODY(val = tanhf(val);)
 }
 
-extern ""C"" __global__ void gemm_bias_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -166,7 +166,7 @@ extern ""C"" __global__ void gemm_bias_wmma(
     WMMA_GEMM_BODY(/* no activation */;)
 }
 
-extern ""C"" __global__ void gemm_bias_swish_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_swish_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -179,7 +179,7 @@ extern ""C"" __global__ void gemm_bias_swish_wmma(
     )
 }
 
-extern ""C"" __global__ void gemm_bias_leaky_relu_wmma(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_leaky_relu_wmma(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,

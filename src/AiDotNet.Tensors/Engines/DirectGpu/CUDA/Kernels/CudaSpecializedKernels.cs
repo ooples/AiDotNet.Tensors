@@ -35,7 +35,7 @@ __device__ float squared_norm(const float* x, int dim) {
 
 // Poincare ball projection: project point to be inside the ball
 // Formula: if ||x|| >= 1-eps, x = x * (1-eps) / ||x||
-extern ""C"" __global__ void poincare_project(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_project(
     const float* input, float* output,
     int batchSize, int dim, float curvature, float epsilon)
 {
@@ -67,7 +67,7 @@ extern ""C"" __global__ void poincare_project(
 
 // Mobius addition: x (+) y in Poincare ball
 // Formula: ((1 + 2c<x,y> + c||y||^2)x + (1 - c||x||^2)y) / (1 + 2c<x,y> + c^2||x||^2||y||^2)
-extern ""C"" __global__ void mobius_add(
+extern ""C"" __global__ __launch_bounds__(256) void mobius_add(
     const float* x, const float* y, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -101,7 +101,7 @@ extern ""C"" __global__ void mobius_add(
 
 // Poincare exponential map: exp_x(v) maps tangent vector v at point x to manifold
 // Formula: x (+) (tanh(sqrt(c) * ||v|| / 2 * (1 - c||x||^2)) * v / (sqrt(c) * ||v||))
-extern ""C"" __global__ void poincare_exp_map(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_exp_map(
     const float* basePoint, const float* tangentVec, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -159,7 +159,7 @@ extern ""C"" __global__ void poincare_exp_map(
 }
 
 // Poincare distance: d(x, y) = (2/sqrt(c)) * arctanh(sqrt(c) * ||(-x) (+) y||)
-extern ""C"" __global__ void poincare_distance(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_distance(
     const float* x, const float* y, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -209,7 +209,7 @@ extern ""C"" __global__ void poincare_distance(
 
 // Hyperbolic linear forward: batch processing
 // For each output feature: distance(origin, MobiusAdd(MobiusAdd(PoincareExp(origin, weight), projectedInput), projectedBias))
-extern ""C"" __global__ void hyperbolic_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_forward(
     const float* input,        // [batchSize, inputFeatures]
     const float* weights,      // [outputFeatures, inputFeatures]
     const float* biases,       // [outputFeatures, inputFeatures]
@@ -326,7 +326,7 @@ extern ""C"" __global__ void hyperbolic_linear_forward(
 
 // Octonion multiplication: a * b where a, b are 8-component octonions
 // Uses Cayley-Dickson construction multiplication rules
-extern ""C"" __global__ void octonion_multiply(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_multiply(
     const float* a, const float* b, float* output,
     int count)
 {
@@ -355,7 +355,7 @@ extern ""C"" __global__ void octonion_multiply(
 }
 
 // Octonion addition: a + b
-extern ""C"" __global__ void octonion_add(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_add(
     const float* a, const float* b, float* output,
     int count)
 {
@@ -367,7 +367,7 @@ extern ""C"" __global__ void octonion_add(
 
 // Octonion linear forward: output[o] = sum_i(weights[o,i] * input[i]) + biases[o]
 // where * is octonion multiplication
-extern ""C"" __global__ void octonion_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_forward(
     const float* input,        // [batchSize, inputFeatures * 8]
     const float* weights,      // [outputFeatures, inputFeatures, 8]
     const float* biases,       // [outputFeatures, 8]
@@ -421,7 +421,7 @@ extern ""C"" __global__ void octonion_linear_forward(
 
 // Quantum measurement: compute probabilities from complex amplitudes
 // probability[i] = |amplitude[i]|^2 = real[i]^2 + imag[i]^2, then normalize
-extern ""C"" __global__ void quantum_measurement(
+extern ""C"" __global__ __launch_bounds__(256) void quantum_measurement(
     const float* realPart, const float* imagPart, float* probabilities,
     int batchSize, int stateSize)
 {
@@ -438,7 +438,7 @@ extern ""C"" __global__ void quantum_measurement(
 }
 
 // Normalize probabilities (sum to 1) - uses shared memory for reduction
-extern ""C"" __global__ void normalize_probabilities(
+extern ""C"" __global__ __launch_bounds__(256) void normalize_probabilities(
     float* probabilities, int batchSize, int stateSize)
 {
     extern __shared__ float sdata[];
@@ -476,7 +476,7 @@ extern ""C"" __global__ void normalize_probabilities(
 
 // Complex matrix-vector multiply for quantum circuit: y = A * x
 // Where A is [dim, dim] complex matrix and x is [dim] complex vector
-extern ""C"" __global__ void complex_matvec(
+extern ""C"" __global__ __launch_bounds__(256) void complex_matvec(
     const float* matReal, const float* matImag,
     const float* vecReal, const float* vecImag,
     float* outReal, float* outImag,
@@ -512,7 +512,7 @@ extern ""C"" __global__ void complex_matvec(
 
 // Quantum rotation gate application (Ry rotation)
 // Applies rotation by angle theta to qubit state
-extern ""C"" __global__ void quantum_rotation(
+extern ""C"" __global__ __launch_bounds__(256) void quantum_rotation(
     const float* stateReal, const float* stateImag,
     float* outReal, float* outImag,
     const float* angles, int numQubits, int batchSize)
@@ -563,7 +563,7 @@ extern ""C"" __global__ void quantum_rotation(
 }
 
 // Combined measurement layer forward: |z|^2 and normalize
-extern ""C"" __global__ void measurement_forward(
+extern ""C"" __global__ __launch_bounds__(256) void measurement_forward(
     const float* input,  // [batchSize, stateSize * 2] interleaved real/imag
     float* output,       // [batchSize, stateSize]
     int batchSize, int stateSize)

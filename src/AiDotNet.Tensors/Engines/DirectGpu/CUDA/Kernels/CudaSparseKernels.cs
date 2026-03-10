@@ -34,7 +34,7 @@ internal static class CudaSparseKernels
 // CSR SpMM: C[M,N] = A[M,K] * B[K,N] where A is sparse (CSR format)
 // Each thread computes one element of the output matrix.
 // Row parallelism: each thread block handles a row of the output.
-extern ""C"" __global__ void csr_spmm(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm(
     const float* __restrict__ csrValues,       // [nnz] - non-zero values of A
     const int* __restrict__ csrColIndices,     // [nnz] - column indices
     const int* __restrict__ csrRowPointers,    // [M+1] - row pointers
@@ -65,7 +65,7 @@ extern ""C"" __global__ void csr_spmm(
 
 // Warp-based CSR SpMM for better memory coalescing
 // Each warp processes one row, with threads collaborating on the reduction
-extern ""C"" __global__ void csr_spmm_warp(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_warp(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -97,7 +97,7 @@ extern ""C"" __global__ void csr_spmm_warp(
 }
 
 // CSR SpMM with fused bias addition: C[M,N] = A[M,K] * B[K,N] + bias[N]
-extern ""C"" __global__ void csr_spmm_bias(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -126,7 +126,7 @@ extern ""C"" __global__ void csr_spmm_bias(
 }
 
 // CSR SpMM with fused bias and ReLU: C = ReLU(A * B + bias)
-extern ""C"" __global__ void csr_spmm_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias_relu(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -161,7 +161,7 @@ extern ""C"" __global__ void csr_spmm_bias_relu(
 // Scatter-add for edge-based message passing (GCN, GAT aggregation)
 // For each edge (src -> tgt), adds input[src, :] * edgeValue to output[tgt, :]
 // This implements the aggregation: output[tgt] = sum_{src in neighbors(tgt)} input[src] * edge_weight
-extern ""C"" __global__ void scatter_add_edges(
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_edges(
     const float* __restrict__ input,           // [numNodes, features]
     const int* __restrict__ sourceIndices,     // [numEdges] - source node for each edge
     const int* __restrict__ targetIndices,     // [numEdges] - target node for each edge
@@ -189,7 +189,7 @@ extern ""C"" __global__ void scatter_add_edges(
 
 // Message passing: gather features from source nodes for each edge
 // output[edge, :] = input[source[edge], :]
-extern ""C"" __global__ void gather_source_features(
+extern ""C"" __global__ __launch_bounds__(256) void gather_source_features(
     const float* __restrict__ input,           // [numNodes, features]
     const int* __restrict__ sourceIndices,     // [numEdges]
     float* __restrict__ output,                // [numEdges, features]
@@ -206,7 +206,7 @@ extern ""C"" __global__ void gather_source_features(
 
 // Message passing: gather features from target nodes for each edge
 // output[edge, :] = input[target[edge], :]
-extern ""C"" __global__ void gather_target_features(
+extern ""C"" __global__ __launch_bounds__(256) void gather_target_features(
     const float* __restrict__ input,           // [numNodes, features]
     const int* __restrict__ targetIndices,     // [numEdges]
     float* __restrict__ output,                // [numEdges, features]
@@ -224,7 +224,7 @@ extern ""C"" __global__ void gather_target_features(
 // Segment sum: sum features within each segment (node)
 // Used for aggregating edge messages back to nodes
 // output[node, :] = sum_{edge in edges_to_node} input[edge, :]
-extern ""C"" __global__ void segment_sum(
+extern ""C"" __global__ __launch_bounds__(256) void segment_sum(
     const float* __restrict__ input,           // [numItems, features]
     const int* __restrict__ segmentIds,        // [numItems] - segment ID for each item
     float* __restrict__ output,                // [numSegments, features]
@@ -241,7 +241,7 @@ extern ""C"" __global__ void segment_sum(
 
 // Segment mean: compute mean features within each segment
 // Requires segment sizes as input
-extern ""C"" __global__ void segment_mean(
+extern ""C"" __global__ __launch_bounds__(256) void segment_mean(
     const float* __restrict__ input,           // [numItems, features]
     const int* __restrict__ segmentIds,        // [numItems]
     const int* __restrict__ segmentSizes,      // [numSegments]
@@ -262,7 +262,7 @@ extern ""C"" __global__ void segment_mean(
 }
 
 // Segment max: compute max features within each segment
-extern ""C"" __global__ void segment_max(
+extern ""C"" __global__ __launch_bounds__(256) void segment_max(
     const float* __restrict__ input,           // [numItems, features]
     const int* __restrict__ segmentIds,        // [numItems]
     float* __restrict__ output,                // [numSegments, features] - initialized to -FLT_MAX
@@ -295,7 +295,7 @@ extern ""C"" __global__ void segment_max(
 // CSR SpMM backward for gradient w.r.t. dense matrix B
 // Given dL/dC, compute dL/dB = A^T * dL/dC (A is sparse CSR)
 // This is also SpMM but with transposed access pattern
-extern ""C"" __global__ void csr_spmm_backward_b(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_b(
     const float* __restrict__ csrValues,       // [nnz] - values of A
     const int* __restrict__ csrColIndices,     // [nnz] - column indices
     const int* __restrict__ csrRowPointers,    // [M+1] - row pointers
@@ -329,7 +329,7 @@ extern ""C"" __global__ void csr_spmm_backward_b(
 
 // CSR SpMM backward for gradient w.r.t. sparse values (for trainable adjacency)
 // Given dL/dC, compute dL/d(csrValues)
-extern ""C"" __global__ void csr_spmm_backward_values(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_values(
     const float* __restrict__ csrColIndices_float,  // Use float for column indices
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -369,21 +369,21 @@ extern ""C"" __global__ void csr_spmm_backward_values(
 // ===========================================================================
 
 // Zero initialize buffer
-extern ""C"" __global__ void zero_buffer(float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void zero_buffer(float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] = 0.0f;
 }
 
 // Initialize buffer to negative infinity (for max operations)
-extern ""C"" __global__ void init_neg_inf(float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void init_neg_inf(float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] = -3.402823466e+38f;  // -FLT_MAX
 }
 
 // Degree normalization for GCN: out[i] = in[i] / sqrt(degree[i])
-extern ""C"" __global__ void degree_normalize(
+extern ""C"" __global__ __launch_bounds__(256) void degree_normalize(
     const float* __restrict__ input,
     const float* __restrict__ degrees,         // [numNodes]
     float* __restrict__ output,
@@ -401,7 +401,7 @@ extern ""C"" __global__ void degree_normalize(
 
 // Symmetric degree normalization: out[i] = in[i] / (sqrt(degree[src]) * sqrt(degree[tgt]))
 // Applied per-edge
-extern ""C"" __global__ void symmetric_degree_normalize(
+extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
     const float* __restrict__ edgeValues,
     const int* __restrict__ sourceIndices,
     const int* __restrict__ targetIndices,

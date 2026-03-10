@@ -56,7 +56,7 @@ __device__ __forceinline__ float tanh_derivative(float tanh_output) {
 // bz, br, bh: [hiddenSize]
 // output newH: [batch, hiddenSize]
 // gateZ, gateR, gateH: [batch, hiddenSize] (cached for backward)
-extern ""C"" __global__ void gru_cell_forward(
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_forward(
     const float* input,
     const float* prevH,
     const float* Wz, const float* Wr, const float* Wh,
@@ -154,7 +154,7 @@ extern ""C"" __global__ void gru_cell_forward(
 // output: [batch, timeSteps, hiddenSize]
 // h_states: [timeSteps, batch, hiddenSize] (cached for backward)
 // gates: [timeSteps, batch, 3*hiddenSize] (Z,R,H cached for backward)
-extern ""C"" __global__ void gru_forward_sequence(
+extern ""C"" __global__ __launch_bounds__(256) void gru_forward_sequence(
     const float* input,
     const float* h_init,
     const float* Wz, const float* Wr, const float* Wh,
@@ -293,7 +293,7 @@ extern ""C"" __global__ void gru_forward_sequence(
 //
 // The reset gate is applied element-wise in forward: candidate uses r[j] * prevH[j]
 // So the backward must compute dR[j] as a reduction over all output positions h.
-extern ""C"" __global__ void gru_cell_backward(
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward(
     const float* dH,          // [batch, hidden]
     const float* gateZ,       // [batch, hidden]
     const float* gateR,       // [batch, hidden]
@@ -435,7 +435,7 @@ extern ""C"" __global__ void gru_cell_backward(
 // ===========================================================================
 
 // Computes gradient with respect to input
-extern ""C"" __global__ void gru_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_input(
     const float* dGates,      // [batch, 3*hidden] - dZ, dR, dH concatenated
     const float* Wz, const float* Wr, const float* Wh,
     float* dInput,            // [batch, input]
@@ -472,7 +472,7 @@ extern ""C"" __global__ void gru_backward_input(
 // ===========================================================================
 
 // Computes gradient with respect to previous hidden state
-extern ""C"" __global__ void gru_backward_prevh(
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_prevh(
     const float* dH,          // [batch, hidden] - total gradient to h_t
     const float* dGates,      // [batch, 3*hidden]
     const float* gateZ,       // [batch, hidden]
@@ -517,7 +517,7 @@ extern ""C"" __global__ void gru_backward_prevh(
 // GRU backward pass for entire sequence with full BPTT
 // Uses shared memory to store accumulated hidden gradients so all threads
 // can access each other's dH values for proper reset-gate gradient computation.
-extern ""C"" __global__ void gru_backward_sequence(
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_sequence(
     const float* gradOutput,  // [batch, timeSteps, hidden]
     const float* h_states,    // [timeSteps, batch, hidden]
     const float* gates,       // [timeSteps, batch, 3*hidden]
@@ -742,7 +742,7 @@ extern ""C"" __global__ void gru_backward_sequence(
 // Computes gate gradients from hidden gradient
 // dR[h] is computed correctly as: sum_k(dHCand_k * Uh[k,h]) * prevH[h] * sigmoid'(r[h])
 // This is because r[h] is used to gate prevH[h] for all output positions k in the candidate computation
-extern ""C"" __global__ void gru_compute_gate_gradients(
+extern ""C"" __global__ __launch_bounds__(256) void gru_compute_gate_gradients(
     const float* dH,          // [batch, hidden]
     const float* gateZ,       // [batch, hidden]
     const float* gateR,       // [batch, hidden]
@@ -802,7 +802,7 @@ extern ""C"" __global__ void gru_compute_gate_gradients(
 // ===========================================================================
 
 // Accumulates weight gradients across batch dimension
-extern ""C"" __global__ void gru_accumulate_weight_gradients(
+extern ""C"" __global__ __launch_bounds__(256) void gru_accumulate_weight_gradients(
     const float* input,       // [batch, inputSize]
     const float* prevH,       // [batch, hiddenSize]
     const float* gateR,       // [batch, hiddenSize]
@@ -879,7 +879,7 @@ extern ""C"" __global__ void gru_accumulate_weight_gradients(
 // Computes gate gradients and partial prevH (direct path only).
 // Must be followed by gru_backward_prevh_unified for full BPTT gradient.
 
-extern ""C"" __global__ void gru_cell_backward_unified(
+extern ""C"" __global__ __launch_bounds__(256) void gru_cell_backward_unified(
     const float* gradH,       // [batch, hiddenSize] - gradient from next layer
     const float* gateR,       // [batch, hiddenSize] - reset gate values
     const float* gateZ,       // [batch, hiddenSize] - update gate values
@@ -944,7 +944,7 @@ extern ""C"" __global__ void gru_cell_backward_unified(
 // from all hidden positions through the gate weight matrices.
 // Must be called AFTER gru_cell_backward_unified which computes gate gradients.
 
-extern ""C"" __global__ void gru_backward_prevh_unified(
+extern ""C"" __global__ __launch_bounds__(256) void gru_backward_prevh_unified(
     const float* gradGateR,   // [batch, hiddenSize] - from gru_cell_backward_unified
     const float* gradGateZ,   // [batch, hiddenSize] - from gru_cell_backward_unified
     const float* gradGateN,   // [batch, hiddenSize] - from gru_cell_backward_unified

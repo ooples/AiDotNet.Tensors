@@ -40,7 +40,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 
 // Fused GEMM + Bias + ReLU
 // output = ReLU(A * B + bias)
-extern ""C"" __global__ void gemm_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_relu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -118,7 +118,7 @@ extern ""C"" __global__ void gemm_bias_relu(
 
 // Fused GEMM + Bias + GELU (for Transformer FFN)
 // output = GELU(A * B + bias)
-extern ""C"" __global__ void gemm_bias_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_gelu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -196,7 +196,7 @@ extern ""C"" __global__ void gemm_bias_gelu(
 
 // Fused GEMM + Bias + Sigmoid
 // output = Sigmoid(A * B + bias)
-extern ""C"" __global__ void gemm_bias_sigmoid(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_sigmoid(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -270,7 +270,7 @@ extern ""C"" __global__ void gemm_bias_sigmoid(
 
 // Fused GEMM + Bias + Tanh
 // output = Tanh(A * B + bias)
-extern ""C"" __global__ void gemm_bias_tanh(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_tanh(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -344,7 +344,7 @@ extern ""C"" __global__ void gemm_bias_tanh(
 
 // Fused GEMM + Bias (no activation)
 // output = A * B + bias
-extern ""C"" __global__ void gemm_bias(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -416,7 +416,7 @@ extern ""C"" __global__ void gemm_bias(
 
 // Fused GEMM + Bias + Swish (SiLU)
 // output = Swish(A * B + bias) = x * sigmoid(x)
-extern ""C"" __global__ void gemm_bias_swish(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_swish(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -491,7 +491,7 @@ extern ""C"" __global__ void gemm_bias_swish(
 
 // Fused GEMM + Bias + LeakyReLU
 // output = LeakyReLU(A * B + bias, alpha)
-extern ""C"" __global__ void gemm_bias_leaky_relu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_leaky_relu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -570,7 +570,7 @@ extern ""C"" __global__ void gemm_bias_leaky_relu(
 
 // Fused LayerNorm + ReLU
 // output = ReLU(gamma * (x - mean) / sqrt(var + eps) + beta)
-extern ""C"" __global__ void layernorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_relu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -625,7 +625,7 @@ extern ""C"" __global__ void layernorm_relu(
 }
 
 // Fused LayerNorm + GELU (critical for Transformers)
-extern ""C"" __global__ void layernorm_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_gelu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -689,7 +689,7 @@ extern ""C"" __global__ void layernorm_gelu(
 
 // Fused Residual Add + LayerNorm
 // output = LayerNorm(x + residual)
-extern ""C"" __global__ void residual_layernorm(
+extern ""C"" __global__ __launch_bounds__(256) void residual_layernorm(
     const float* __restrict__ input,
     const float* __restrict__ residual,
     float* __restrict__ output,
@@ -750,7 +750,7 @@ extern ""C"" __global__ void residual_layernorm(
 // ===========================================================================
 
 // Fused Scale + Softmax (for attention: softmax(Q*K^T / sqrt(d)))
-extern ""C"" __global__ void scaled_softmax(
+extern ""C"" __global__ __launch_bounds__(256) void scaled_softmax(
     const float* __restrict__ input,
     float* __restrict__ output,
     int batchSize, int seqLen, float scale)
@@ -809,7 +809,7 @@ extern ""C"" __global__ void scaled_softmax(
 // ===========================================================================
 
 // Fused Bias + Dropout (for training)
-extern ""C"" __global__ void bias_dropout(
+extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ bias,
@@ -833,7 +833,7 @@ extern ""C"" __global__ void bias_dropout(
 // ===========================================================================
 
 // Fused BatchNorm + ReLU (Inference)
-extern ""C"" __global__ void batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_relu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -859,7 +859,7 @@ extern ""C"" __global__ void batchnorm_relu(
 }
 
 // Fused BatchNorm + GELU (Inference)
-extern ""C"" __global__ void batchnorm_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_gelu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -890,7 +890,7 @@ extern ""C"" __global__ void batchnorm_gelu(
 }
 
 // Fused BatchNorm + Sigmoid (Inference)
-extern ""C"" __global__ void batchnorm_sigmoid(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_sigmoid(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -916,7 +916,7 @@ extern ""C"" __global__ void batchnorm_sigmoid(
 }
 
 // Fused BatchNorm + Tanh (Inference)
-extern ""C"" __global__ void batchnorm_tanh(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_tanh(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -942,7 +942,7 @@ extern ""C"" __global__ void batchnorm_tanh(
 }
 
 // Fused Residual + BatchNorm + ReLU
-extern ""C"" __global__ void residual_batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void residual_batchnorm_relu(
     const float* __restrict__ input,
     const float* __restrict__ residual,
     float* __restrict__ output,
@@ -975,7 +975,7 @@ extern ""C"" __global__ void residual_batchnorm_relu(
 
 // Fused linear interpolation: output = (1-t)*a + t*b = a + t*(b-a)
 // Uses fused multiply-add (fmaf) for maximum precision and throughput
-extern ""C"" __global__ void lerp_fused(
+extern ""C"" __global__ __launch_bounds__(256) void lerp_fused(
     const float* __restrict__ a,
     const float* __restrict__ b,
     float* __restrict__ output,
@@ -992,7 +992,7 @@ extern ""C"" __global__ void lerp_fused(
 // Fused scaled addition: output = scaleA * a + scaleB * b
 // Common in diffusion models: alpha * signal + sigma * noise
 // Uses fmaf for precision: fmaf(scaleA, a, scaleB * b)
-extern ""C"" __global__ void add_scaled(
+extern ""C"" __global__ __launch_bounds__(256) void add_scaled(
     const float* __restrict__ a,
     const float* __restrict__ b,
     float* __restrict__ output,
@@ -1013,7 +1013,7 @@ extern ""C"" __global__ void add_scaled(
 // Two-pass variance reduction using shared memory
 // Pass 1: compute mean, Pass 2: compute variance
 // This kernel computes the mean using parallel reduction
-extern ""C"" __global__ void reduce_mean_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     int size)
@@ -1044,7 +1044,7 @@ extern ""C"" __global__ void reduce_mean_kernel(
 }
 
 // Compute variance given a known mean, using parallel reduction
-extern ""C"" __global__ void reduce_variance_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     float mean,

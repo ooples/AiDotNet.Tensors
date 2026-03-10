@@ -16,7 +16,7 @@ public static class CudaFp16Kernels
 // FP16 CONVERSION KERNELS
 // ============================================================================
 
-extern ""C"" __global__ void convert_fp32_to_fp16(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16(
     const float* input, unsigned short* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -26,7 +26,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16(
     output[idx] = *reinterpret_cast<unsigned short*>(&h);
 }
 
-extern ""C"" __global__ void convert_fp16_to_fp32(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32(
     const unsigned short* input, float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -36,7 +36,7 @@ extern ""C"" __global__ void convert_fp16_to_fp32(
     output[idx] = __half2float(h);
 }
 
-extern ""C"" __global__ void convert_fp32_to_fp16_rounding(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16_rounding(
     const float* input, unsigned short* output, int size, int roundMode)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -52,7 +52,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16_rounding(
     output[idx] = *reinterpret_cast<unsigned short*>(&h);
 }
 
-extern ""C"" __global__ void convert_fp32_to_fp16_vec2(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16_vec2(
     const float2* input, uint* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -64,7 +64,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16_vec2(
     output[idx] = *reinterpret_cast<uint*>(&h2);
 }
 
-extern ""C"" __global__ void convert_fp16_to_fp32_vec2(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32_vec2(
     const uint* input, float2* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
