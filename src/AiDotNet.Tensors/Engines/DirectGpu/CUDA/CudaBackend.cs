@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -18,7 +19,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 {
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
-    private readonly Dictionary<string, IntPtr> _kernelCache;
+    private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
@@ -129,7 +130,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public CudaBackend(int deviceIndex)
     {
-        _kernelCache = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
+        _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -4099,6 +4100,51 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &trainingInt;
         // 1 block per channel, 256 threads, 1 shared array for parallel reduction
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
+    }
+
+    public unsafe bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation)
+    {
+        // Fused kernels only support inference mode (use running stats, no save mean/var)
+        if (training || activation == FusedActivationType.None)
+            return false;
+
+        string kernelName = activation switch
+        {
+            FusedActivationType.ReLU => "batchnorm_relu",
+            FusedActivationType.GELU => "batchnorm_gelu",
+            FusedActivationType.Sigmoid => "batchnorm_sigmoid",
+            FusedActivationType.Tanh => "batchnorm_tanh",
+            _ => ""
+        };
+
+        if (string.IsNullOrEmpty(kernelName) || !_kernelCache.TryGetValue(kernelName, out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        int totalSize = batch * channels * spatialSize;
+        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr gammaPtr = gamma.Handle;
+        IntPtr betaPtr = beta.Handle;
+        IntPtr runMeanPtr = runningMean.Handle;
+        IntPtr runVarPtr = runningVar.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &gammaPtr;
+        args[3] = &betaPtr;
+        args[4] = &runMeanPtr;
+        args[5] = &runVarPtr;
+        args[6] = &batch;
+        args[7] = &channels;
+        args[8] = &spatialSize;
+        args[9] = &epsilon;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return true;
     }
 
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,

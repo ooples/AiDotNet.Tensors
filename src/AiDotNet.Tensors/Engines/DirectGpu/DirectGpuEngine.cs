@@ -340,15 +340,33 @@ public sealed class DirectGpuEngine : IDisposable
     /// <summary>
     /// Converts a generic array to float array for GPU processing.
     /// Uses vectorized span-based conversion via IVectorizedOperations.ToFloatSpan.
+    /// Caches the result keyed by the source array so repeated conversions of the
+    /// same double[]/half[] data don't re-allocate and re-convert.
     /// </summary>
+    private static readonly ConditionalWeakTable<object, float[]> _floatConversionCache = new();
+
     public static float[] ToFloatArray<T>(T[] data)
     {
         if (data is float[] floatData)
             return floatData;
 
+        // Check cache for previously converted arrays (avoids re-converting same double[] etc.)
+        if (_floatConversionCache.TryGetValue(data, out var cached) && cached.Length == data.Length)
+            return cached;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new float[data.Length];
         numOps.ToFloatSpan(new ReadOnlySpan<T>(data), new Span<float>(result));
+
+        // Cache using ConditionalWeakTable — entry is removed when source array is GC'd
+#if NET5_0_OR_GREATER
+        _floatConversionCache.AddOrUpdate(data, result);
+#else
+        // On .NET Framework, GetOrCreateValue + remove isn't available, so just try adding
+        try { _floatConversionCache.Add(data, result); }
+        catch (ArgumentException) { /* Already exists — race condition, ignore */ }
+#endif
+
         return result;
     }
 

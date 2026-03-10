@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
@@ -682,6 +683,14 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
         => Inner.BatchNorm(input, output, gamma, beta, runningMean, runningVar, saveMean, saveInvVar,
             batch, channels, spatialSize, epsilon, momentum, training);
+
+    /// <inheritdoc/>
+    public virtual bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation)
+        => Inner.TryFusedBatchNormActivation(input, output, gamma, beta, runningMean, runningVar, saveMean, saveInvVar,
+            batch, channels, spatialSize, epsilon, momentum, training, activation);
 
     /// <inheritdoc/>
     public virtual void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,

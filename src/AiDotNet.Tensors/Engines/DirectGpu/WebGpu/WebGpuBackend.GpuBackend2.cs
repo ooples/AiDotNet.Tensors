@@ -3,6 +3,7 @@
 
 #if NET7_0_OR_GREATER
 using System;
+using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
@@ -748,6 +749,11 @@ public sealed partial class WebGpuBackend
             gpuMean, gpuVar, runningMean, runningVar, saveMean, saveInvVar,
             emaUniforms, channels).GetAwaiter().GetResult();
     }
+
+    public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation) => false;
 
     public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,

@@ -4151,15 +4151,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Execute batch norm (spatialSize=1 for 2D tensors)
-            backend.BatchNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
+            // Try single-pass fused BatchNorm+Activation kernel first
+            bool fused = backend.TryFusedBatchNormActivation(
+                inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
                 runningMeanBuffer.Buffer, runningVarBuffer.Buffer, saveMeanBuffer.Buffer, saveVarBuffer.Buffer,
-                batchSize, features, 1, (float)epsilon, (float)momentum, training);
+                batchSize, features, 1, (float)epsilon, (float)momentum, training, activation);
 
-            // Apply activation if needed
-            if (activation != FusedActivationType.None)
+            if (!fused)
             {
-                ApplyGpuActivation(backend, outputBuffer.Buffer, batchSize * features, activation);
+                // Fall back to separate BatchNorm + Activation
+                backend.BatchNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
+                    runningMeanBuffer.Buffer, runningVarBuffer.Buffer, saveMeanBuffer.Buffer, saveVarBuffer.Buffer,
+                    batchSize, features, 1, (float)epsilon, (float)momentum, training);
+
+                if (activation != FusedActivationType.None)
+                {
+                    ApplyGpuActivation(backend, outputBuffer.Buffer, batchSize * features, activation);
+                }
             }
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance

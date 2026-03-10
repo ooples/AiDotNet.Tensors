@@ -1,6 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Metal GPU backend - Normalization, Dropout, and Embedding operations.
 
+using AiDotNet.Tensors.Engines;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
@@ -94,6 +96,11 @@ public sealed partial class MetalBackend
             UploadToBuffer(saveInvVar, saveInvVarData);
         }
     }
+
+    public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation) => false;
 
     /// <summary>
     /// Batch normalization backward pass.

@@ -3748,6 +3748,50 @@ public sealed class HipBackend : IAsyncGpuBackend
             }
     }
 
+    public unsafe bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation)
+    {
+        if (training || activation == FusedActivationType.None)
+            return false;
+
+        string kernelName = activation switch
+        {
+            FusedActivationType.ReLU => "batchnorm_relu",
+            FusedActivationType.GELU => "batchnorm_gelu",
+            FusedActivationType.Sigmoid => "batchnorm_sigmoid",
+            FusedActivationType.Tanh => "batchnorm_tanh",
+            _ => ""
+        };
+
+        if (string.IsNullOrEmpty(kernelName) || !_kernelCache.TryGetValue(kernelName, out var krnl))
+            return false;
+
+        int totalSize = batch * channels * spatialSize;
+        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr _p0 = input.Handle;
+        IntPtr _p1 = output.Handle;
+        IntPtr _p2 = gamma.Handle;
+        IntPtr _p3 = beta.Handle;
+        IntPtr _p4 = runningMean.Handle;
+        IntPtr _p5 = runningVar.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &_p0;
+        args[1] = &_p1;
+        args[2] = &_p2;
+        args[3] = &_p3;
+        args[4] = &_p4;
+        args[5] = &_p5;
+        args[6] = &batch;
+        args[7] = &channels;
+        args[8] = &spatialSize;
+        args[9] = &epsilon;
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
+        return true;
+    }
+
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)

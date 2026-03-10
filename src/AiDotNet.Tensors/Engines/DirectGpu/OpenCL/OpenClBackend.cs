@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -6088,6 +6089,48 @@ KERNEL VARIANTS (A/B testing):
             bnLocalSize = Math.Max(1, bnLocalSize);
             k.SetLocalArg(arg++, bnLocalSize * sizeof(float));
             k.Execute1D(channels * bnLocalSize, bnLocalSize);
+        }
+
+        public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+            IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+            int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+            FusedActivationType activation)
+        {
+            if (training || activation == FusedActivationType.None)
+                return false;
+
+            string kernelName = activation switch
+            {
+                FusedActivationType.ReLU => "batchnorm_relu",
+                FusedActivationType.GELU => "batchnorm_gelu",
+                FusedActivationType.Sigmoid => "batchnorm_sigmoid",
+                FusedActivationType.Tanh => "batchnorm_tanh",
+                _ => ""
+            };
+
+            if (string.IsNullOrEmpty(kernelName) || !_kernelCache.ContainsKey(kernelName))
+                return false;
+
+            var k = _kernelCache[kernelName];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)runningMean).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)runningVar).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, spatialSize);
+            k.SetArg(arg++, epsilon);
+
+            int totalSize = batch * channels * spatialSize;
+            int localSize = Math.Min(256, totalSize);
+            localSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, localSize), 2)));
+            localSize = Math.Max(1, localSize);
+            int globalSize = ((totalSize + localSize - 1) / localSize) * localSize;
+            k.Execute1D(globalSize, localSize);
+            return true;
         }
 
         public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
