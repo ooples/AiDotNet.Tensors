@@ -201,7 +201,7 @@ __device__ void octonion_multiply_jacobian_b(const float* a, float* jac) {
 // weights: [outputFeatures, inputFeatures, 8] - octonion weight matrix
 // biases: [outputFeatures, 8] - octonion bias vector
 // output: [batch, outputFeatures, 8] - output octonion vectors
-extern ""C"" __global__ void octonion_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_forward(
     const float* input,
     const float* weights,
     const float* biases,
@@ -259,7 +259,7 @@ extern ""C"" __global__ void octonion_linear_forward(
 // gradOutput: [batch, outputFeatures, 8]
 // weights: [outputFeatures, inputFeatures, 8]
 // gradInput: [batch, inputFeatures, 8]
-extern ""C"" __global__ void octonion_linear_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_backward_input(
     const float* gradOutput,
     const float* input,
     const float* weights,
@@ -318,7 +318,7 @@ extern ""C"" __global__ void octonion_linear_backward_input(
 // gradOutput: [batch, outputFeatures, 8]
 // input: [batch, inputFeatures, 8]
 // gradWeights: [outputFeatures, inputFeatures, 8]
-extern ""C"" __global__ void octonion_linear_backward_weights(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_backward_weights(
     const float* gradOutput,
     const float* input,
     float* gradWeights,
@@ -373,7 +373,7 @@ extern ""C"" __global__ void octonion_linear_backward_weights(
 // Backward pass - computes bias gradients
 // gradOutput: [batch, outputFeatures, 8]
 // gradBiases: [outputFeatures, 8]
-extern ""C"" __global__ void octonion_linear_backward_biases(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_backward_biases(
     const float* gradOutput,
     float* gradBiases,
     int batch, int outputFeatures)
@@ -405,7 +405,7 @@ extern ""C"" __global__ void octonion_linear_backward_biases(
 
 // Backward pass for standalone octonion multiplication: r = a * b
 // Computes gradients for both inputs
-extern ""C"" __global__ void octonion_multiply_backward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_multiply_backward(
     const float* gradOutput,
     const float* a,
     const float* b,
@@ -459,7 +459,7 @@ extern ""C"" __global__ void octonion_multiply_backward(
 // OCTONION CONJUGATE BACKWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void octonion_conjugate_backward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_conjugate_backward(
     const float* gradOutput,
     float* gradInput,
     int count)
@@ -481,7 +481,7 @@ extern ""C"" __global__ void octonion_conjugate_backward(
 // OCTONION NORM BACKWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void octonion_norm_backward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_norm_backward(
     const float* gradOutput,
     const float* input,
     float* gradInput,
@@ -517,7 +517,7 @@ extern ""C"" __global__ void octonion_norm_backward(
 // ===========================================================================
 
 // Split activation: apply real-valued activation to each component
-extern ""C"" __global__ void octonion_split_relu_forward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_split_relu_forward(
     const float* input,
     float* output,
     int count)
@@ -531,7 +531,7 @@ extern ""C"" __global__ void octonion_split_relu_forward(
     output[gid] = fmaxf(0.0f, val);
 }
 
-extern ""C"" __global__ void octonion_split_relu_backward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_split_relu_backward(
     const float* gradOutput,
     const float* input,
     float* gradInput,
@@ -550,7 +550,7 @@ extern ""C"" __global__ void octonion_split_relu_backward(
 // output = relu(||input|| - threshold) * input / ||input||
 // When norm <= threshold, output is zero (dead zone)
 // When norm > threshold, output preserves direction but scales magnitude
-extern ""C"" __global__ void octonion_modulus_relu_forward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_modulus_relu_forward(
     const float* input,
     float* output,
     int count,
@@ -584,7 +584,7 @@ extern ""C"" __global__ void octonion_modulus_relu_forward(
     }
 }
 
-extern ""C"" __global__ void octonion_modulus_relu_backward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_modulus_relu_backward(
     const float* gradOutput,
     const float* input,
     float* gradInput,

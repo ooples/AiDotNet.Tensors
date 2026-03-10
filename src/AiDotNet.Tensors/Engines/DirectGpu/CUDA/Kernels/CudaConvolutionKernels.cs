@@ -18,8 +18,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 // ===========================================================================
 
 // Im2Col transformation for efficient convolution via GEMM
-extern ""C"" __global__ void im2col(
-    const float* input, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void im2col(
+    const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int height, int width,
     int kernelH, int kernelW, int strideH, int strideW,
     int padH, int padW, int dilationH, int dilationW, int outH, int outW)
@@ -55,8 +55,8 @@ extern ""C"" __global__ void im2col(
 }
 
 // Col2Im transformation for convolution backward pass
-extern ""C"" __global__ void col2im(
-    const float* input, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void col2im(
+    const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int height, int width,
     int kernelH, int kernelW, int strideH, int strideW,
     int padH, int padW, int dilationH, int dilationW, int outH, int outW)
@@ -97,8 +97,8 @@ extern ""C"" __global__ void col2im(
 }
 
 // Direct Conv2D kernel
-extern ""C"" __global__ void conv2d_direct(
-    const float* input, const float* kernel, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
@@ -132,8 +132,8 @@ extern ""C"" __global__ void conv2d_direct(
 }
 
 // Conv2D backward pass for input gradients
-extern ""C"" __global__ void conv2d_backward_input(
-    const float* gradOutput, const float* kernel, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_input(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ gradInput,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
@@ -172,8 +172,8 @@ extern ""C"" __global__ void conv2d_backward_input(
 }
 
 // Conv2D backward pass for kernel gradients
-extern ""C"" __global__ void conv2d_backward_kernel(
-    const float* input, const float* gradOutput, float* gradKernel,
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ gradKernel,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
@@ -207,8 +207,8 @@ extern ""C"" __global__ void conv2d_backward_kernel(
 }
 
 // Depthwise Conv2D
-extern ""C"" __global__ void depthwise_conv2d(
-    const float* input, const float* kernel, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
     int strideH, int strideW, int padH, int padW)
@@ -239,8 +239,8 @@ extern ""C"" __global__ void depthwise_conv2d(
 }
 
 // Transposed Conv2D (deconvolution) with output padding support
-extern ""C"" __global__ void conv_transpose2d(
-    const float* input, const float* kernel, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
@@ -282,8 +282,8 @@ extern ""C"" __global__ void conv_transpose2d(
 
 // Transposed Conv2D backward pass for input gradients
 // dL/dX = conv2d(dL/dY, W) - essentially a regular convolution
-extern ""C"" __global__ void conv_transpose2d_backward_input(
-    const float* gradOutput, const float* kernel, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d_backward_input(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ gradInput,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
@@ -329,8 +329,8 @@ extern ""C"" __global__ void conv_transpose2d_backward_input(
 
 // Transposed Conv2D backward pass for kernel gradients
 // dL/dW[ic,oc,kh,kw] = sum over batch and positions of input[b,ic,ih,iw] * gradOutput[b,oc,oh,ow]
-extern ""C"" __global__ void conv_transpose2d_backward_kernel(
-    const float* input, const float* gradOutput, float* gradKernel,
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d_backward_kernel(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ gradKernel,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
@@ -380,7 +380,7 @@ extern ""C"" __global__ void conv_transpose2d_backward_kernel(
 // ===========================================================================
 #define TILE_OUT 16
 
-extern ""C"" __global__ void conv2d_tiled(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
     const float* input, const float* weight, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -519,7 +519,7 @@ __device__ __forceinline__ void winograd_output_transform(const float m[4][4], f
 
 // Winograd F(2x2, 3x3) convolution kernel
 // Each thread handles one 2x2 output tile for one (batch, outChannel) pair.
-extern ""C"" __global__ void conv2d_winograd_f2x2_3x3(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_winograd_f2x2_3x3(
     const float* input, const float* weight, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -598,8 +598,8 @@ extern ""C"" __global__ void conv2d_winograd_f2x2_3x3(
 }
 
 // Conv3D for volumetric data
-extern ""C"" __global__ void conv3d_direct(
-    const float* input, const float* kernel, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
     int batch, int inChannels, int inDepth, int inHeight, int inWidth,
     int outChannels, int outDepth, int outHeight, int outWidth,
     int kernelD, int kernelH, int kernelW,

@@ -39,7 +39,7 @@ __device__ __forceinline__ float tanh_derivative(float tanh_output) {
 // LSTM CELL FORWARD KERNEL (Single Timestep)
 // ===========================================================================
 
-extern ""C"" __global__ void lstm_cell_forward(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_forward(
     const float* input,
     const float* prevH,
     const float* prevC,
@@ -106,7 +106,7 @@ extern ""C"" __global__ void lstm_cell_forward(
 // LSTM SEQUENCE FORWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void lstm_forward_sequence(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
     const float* input,
     const float* h_init,
     const float* c_init,
@@ -200,7 +200,7 @@ extern ""C"" __global__ void lstm_forward_sequence(
 // LSTM BACKWARD KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void lstm_backward_input(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_input(
     const float* dGates,
     const float* Wi,
     float* dInput,
@@ -233,7 +233,7 @@ extern ""C"" __global__ void lstm_backward_input(
     dInput[gid] = grad;
 }
 
-extern ""C"" __global__ void lstm_backward_prevh(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_prevh(
     const float* dGates,
     const float* Wh,
     float* dPrevH,
@@ -265,7 +265,7 @@ extern ""C"" __global__ void lstm_backward_prevh(
     dPrevH[gid] = grad;
 }
 
-extern ""C"" __global__ void lstm_compute_gate_gradients(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients(
     const float* dH,
     const float* dC_next,
     const float* gateF,
@@ -314,7 +314,7 @@ extern ""C"" __global__ void lstm_compute_gate_gradients(
     dPrevC[gid] = dC * f;
 }
 
-extern ""C"" __global__ void lstm_accumulate_weight_gradients(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_accumulate_weight_gradients(
     const float* input,
     const float* prevH,
     const float* dGates,
@@ -359,7 +359,7 @@ extern ""C"" __global__ void lstm_accumulate_weight_gradients(
     }
 }
 
-extern ""C"" __global__ void lstm_backward_sequence(
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
     const float* gradOutput,
     const float* h_states,
     const float* c_states,

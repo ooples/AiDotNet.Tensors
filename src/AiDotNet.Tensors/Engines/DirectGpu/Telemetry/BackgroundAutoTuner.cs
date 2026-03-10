@@ -201,9 +201,10 @@ public sealed class BackgroundAutoTuner : IDisposable
 
                 if (result is not null)
                 {
-                    // Cache locally
+                    // Cache locally and make available to backends
                     _cache.SetProfile(gpuVendor, gpuModel, range.MinDim, range.MaxDim,
                         result.ConfigJson, result.MeasuredGflops, result.EfficiencyPercent);
+                    StoreBestConfig(range.MinDim, range.MaxDim, result.ConfigJson);
 
                     _logger?.LogInformation("Tuned {Vendor} {Model} ({Min}-{Max}): {Gflops:F1} GFLOPS ({Efficiency:P1})",
                         gpuVendor, gpuModel, range.MinDim, range.MaxDim,
@@ -370,16 +371,34 @@ public sealed class BackgroundAutoTuner : IDisposable
 
     private void ApplyGemmConfig(GemmTestConfig config)
     {
-        // Store current config for the backend to read
-        // This is passed via a thread-local or cached state that the backend queries
+        // Store current config for the backend to read during benchmarking
         CurrentTestConfig = config;
     }
 
     /// <summary>
     /// Gets the current test configuration being benchmarked.
-    /// Backends can read this to apply experimental tile sizes.
+    /// Set only during active A/B testing runs.
     /// </summary>
     internal static GemmTestConfig? CurrentTestConfig { get; private set; }
+
+    /// <summary>
+    /// Gets the best GEMM configuration found by the auto-tuner for each matrix size range.
+    /// Backends can read this to select optimal tile sizes.
+    /// For CUDA/HIP, tile sizes are compile-time constants in NVRTC/HIPRTC kernels,
+    /// so this is primarily useful for the OpenCL backend's DynamicGemmKernel.
+    /// Key: (minDim, maxDim), Value: best config JSON.
+    /// </summary>
+    internal static System.Collections.Concurrent.ConcurrentDictionary<(int MinDim, int MaxDim), string> BestConfigs { get; }
+        = new System.Collections.Concurrent.ConcurrentDictionary<(int, int), string>();
+
+    /// <summary>
+    /// Stores the best configuration found for a matrix size range.
+    /// Called after A/B testing completes for each range.
+    /// </summary>
+    internal void StoreBestConfig(int minDim, int maxDim, string configJson)
+    {
+        BestConfigs[(minDim, maxDim)] = configJson;
+    }
 
     private GemmTestConfig[] GenerateTestConfigs(int matrixSize)
     {
@@ -418,13 +437,20 @@ public sealed class BackgroundAutoTuner : IDisposable
 
     private double EstimateTheoreticalGflops()
     {
-        // Rough estimates based on vendor
+        // Use the backend's computed theoretical GFLOPS (from clock rate + SM count + cores/SM)
+        double backendGflops = _backend.TheoreticalGflops;
+        if (backendGflops > 0)
+        {
+            return backendGflops;
+        }
+
+        // Fallback: rough estimates based on vendor
         return DirectGpuBackendFactory.DetectedVendor switch
         {
-            GpuVendor.NVIDIA => 15000,   // ~15 TFLOPS for mid-range NVIDIA
-            GpuVendor.AMD => 10000,      // ~10 TFLOPS for mid-range AMD
-            GpuVendor.Intel => 5000,     // ~5 TFLOPS for Intel iGPU
-            _ => 8000                    // Conservative default
+            GpuVendor.NVIDIA => 15000,
+            GpuVendor.AMD => 10000,
+            GpuVendor.Intel => 5000,
+            _ => 8000
         };
     }
 

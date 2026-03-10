@@ -55,6 +55,12 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     long LocalMemoryBytes { get; }
 
+    /// <summary>
+    /// Gets the estimated theoretical peak FP32 GFLOPS for this GPU.
+    /// Computed from clock rate, compute units, and FP32 cores per compute unit.
+    /// </summary>
+    double TheoreticalGflops { get; }
+
     #region Memory Management
 
     /// <summary>
@@ -1134,6 +1140,16 @@ public interface IDirectGpuBackend : IDisposable
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training);
 
+    /// <summary>
+    /// Attempts to execute a fused BatchNorm + Activation kernel in a single pass.
+    /// Returns false if the backend does not support the requested activation fusion,
+    /// in which case the caller should fall back to separate BatchNorm + Activation calls.
+    /// </summary>
+    bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation);
+
     void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon);
@@ -1195,6 +1211,22 @@ public interface IDirectGpuBackend : IDisposable
 
     void Dropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer mask, int size, float dropoutRate, ulong seed, bool training);
     void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate);
+
+    /// <summary>
+    /// Attempts a fused BiasAdd + Dropout in a single kernel launch, eliminating one
+    /// global memory round-trip. Returns false if the backend doesn't support fusion,
+    /// in which case the caller should fall back to separate BiasAdd + Dropout calls.
+    /// </summary>
+    /// <param name="input">Input buffer [rows x cols].</param>
+    /// <param name="output">Output buffer [rows x cols].</param>
+    /// <param name="bias">Bias vector [cols].</param>
+    /// <param name="mask">Dropout mask buffer [rows x cols] (0 = dropped, nonzero = kept).</param>
+    /// <param name="rows">Number of rows (batch * sequence length, etc.).</param>
+    /// <param name="cols">Number of columns (feature dimension).</param>
+    /// <param name="dropoutRate">Probability of dropping each element.</param>
+    /// <param name="scale">Scale factor for kept elements (typically 1/(1-dropoutRate)).</param>
+    bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale);
 
     #endregion
 

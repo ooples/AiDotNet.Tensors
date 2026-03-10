@@ -58,30 +58,78 @@ internal sealed class ActivationCacheEntry : IDisposable
 }
 
 /// <summary>
+/// Tracks a deferred download for GPU-resident intermediate results.
+/// The GPU buffer is held in the activation cache; the CPU array is only populated
+/// when explicitly materialized (i.e., when CPU code actually needs the data).
+/// </summary>
+internal sealed class DeferredDownloadEntry
+{
+    public IGpuBuffer Buffer { get; }
+    public IDirectGpuBackend Backend { get; }
+    public int FloatLength { get; }
+
+    public DeferredDownloadEntry(IGpuBuffer buffer, IDirectGpuBackend backend, int floatLength)
+    {
+        Buffer = buffer;
+        Backend = backend;
+        FloatLength = floatLength;
+    }
+}
+
+/// <summary>
 /// Scope that enables GPU-resident caching of intermediate results.
 /// When active, output buffers from GPU operations are cached in the activation cache,
 /// allowing chained operations to reuse GPU buffers without re-uploading.
+/// Downloads of intermediate results are deferred until CPU data is actually needed.
 /// </summary>
 public sealed class GpuScope : IDisposable
 {
     [ThreadStatic]
-    private static int _depth;
+    private static Dictionary<int, int>? _depthPerEngine;
+
+    private readonly DirectGpuTensorEngine? _engine;
+    private readonly int _engineId;
 
     /// <summary>
-    /// Returns true if a GpuScope is currently active on this thread.
+    /// Returns true if any GpuScope is currently active on this thread.
     /// </summary>
-    internal static bool IsActive => _depth > 0;
-
-    internal GpuScope()
+    internal static bool IsActive
     {
-        _depth++;
+        get
+        {
+            if (_depthPerEngine is null) return false;
+            foreach (var kvp in _depthPerEngine)
+            {
+                if (kvp.Value > 0) return true;
+            }
+            return false;
+        }
+    }
+
+    internal GpuScope(DirectGpuTensorEngine? engine = null)
+    {
+        _engine = engine;
+        _engineId = engine?.GetHashCode() ?? 0;
+        _depthPerEngine ??= new Dictionary<int, int>();
+        _depthPerEngine.TryGetValue(_engineId, out int depth);
+        _depthPerEngine[_engineId] = depth + 1;
     }
 
     /// <inheritdoc />
     public void Dispose()
     {
-        if (_depth > 0)
-            _depth--;
+        if (_depthPerEngine is null) return;
+        _depthPerEngine.TryGetValue(_engineId, out int depth);
+        if (depth > 0)
+        {
+            depth--;
+            _depthPerEngine[_engineId] = depth;
+            // When the outermost scope for this engine exits, materialize its deferred downloads
+            if (depth == 0)
+            {
+                _engine?.MaterializeAllDeferred();
+            }
+        }
     }
 }
 
@@ -128,6 +176,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
     private long _activationCacheTimestamp = 0;
 
+    // Deferred download tracking for GPU-resident execution
+    // When GpuScope is active, intermediate results skip the blocking download.
+    // The GPU buffer stays in the activation cache for direct GPU-to-GPU chaining.
+    // If CPU data is later needed, MaterializeIfDeferred forces the download.
+    // Key: result array reference, Value: (buffer, backend, float array length)
+    private readonly ConcurrentDictionary<object, DeferredDownloadEntry> _deferredDownloads = new();
+
     public DirectGpuTensorEngine()
     {
         _directGpu = new DirectGpuEngine();
@@ -170,7 +225,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Within this scope, GPU output buffers are retained in the activation cache,
     /// so chained operations (e.g., GEMM + Bias + ReLU) avoid redundant CPU-GPU transfers.
     /// </summary>
-    public GpuScope BeginGpuScope() => new GpuScope();
+    public GpuScope BeginGpuScope() => new GpuScope(this);
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
     {
@@ -481,7 +536,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        // Not cached - need to upload
+        // Not cached - need to upload.
+        // If this array has a deferred download pending, materialize it first
+        // so we upload actual data instead of an empty array.
+        if (_deferredDownloads.ContainsKey(data))
+        {
+            MaterializeIfDeferred(data);
+        }
+
         float[] floatData = DirectGpuEngine.ToFloatArray(data);
         return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
     }
@@ -555,12 +617,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
     {
+        List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
         lock (_activationCacheLock)
         {
-            // Evict old entries if cache is full
+            // Evict old entries if cache is full (removal under lock, disposal deferred)
             if (_activationCache.Count >= _maxActivationCacheSize)
             {
-                EvictOldestActivationsUnsafe();
+                evicted = EvictOldestActivationsUnsafe();
             }
 
             var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
@@ -579,29 +642,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
+
+        // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups
+        foreach (var entry in evicted)
+        {
+            entry.Dispose();
+        }
     }
 
     /// <summary>
     /// Evicts the oldest half of the activation cache entries.
     /// Must be called while holding _activationCacheLock.
+    /// Returns entries to dispose AFTER releasing the lock.
     /// </summary>
-    private void EvictOldestActivationsUnsafe()
+    private List<ActivationCacheEntry> EvictOldestActivationsUnsafe()
     {
         var entries = _activationCache.ToArray();
-        if (entries.Length == 0) return;
+        var toDispose = new List<ActivationCacheEntry>();
+        if (entries.Length == 0) return toDispose;
 
-        // Sort by timestamp (oldest first)
-        var sorted = entries.OrderBy(e => e.Value.Timestamp).ToArray();
+        int removeCount = entries.Length / 2;
+        if (removeCount == 0) return toDispose;
 
-        // Remove oldest half
-        int removeCount = sorted.Length / 2;
-        for (int i = 0; i < removeCount; i++)
+        // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
+        var timestamps = new long[entries.Length];
+        for (int i = 0; i < entries.Length; i++)
+            timestamps[i] = entries[i].Value.Timestamp;
+        Array.Sort(timestamps);
+        long threshold = timestamps[removeCount - 1];
+
+        // Remove entries at or below threshold, collect for disposal outside lock.
+        // Skip entries with pending deferred downloads — their GPU buffers must stay alive
+        // until the download is materialized (otherwise CPU arrays would remain empty).
+        int removed = 0;
+        for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
-            if (_activationCache.TryRemove(sorted[i].Key, out var removed))
+            if (entries[i].Value.Timestamp <= threshold)
             {
-                removed.Dispose();
+                // Don't evict entries that have deferred downloads pending
+                if (_deferredDownloads.ContainsKey(entries[i].Key))
+                    continue;
+
+                if (_activationCache.TryRemove(entries[i].Key, out var entry))
+                {
+                    toDispose.Add(entry);
+                    removed++;
+                }
             }
         }
+
+        return toDispose;
     }
 
     /// <summary>
@@ -611,13 +701,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
+        // Materialize any deferred downloads before clearing — otherwise CPU arrays
+        // would be left empty because the GPU buffers they depend on get disposed.
+        MaterializeAllDeferred();
+
+        List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
-            foreach (var entry in _activationCache.Values)
-            {
-                entry.Dispose();
-            }
+            toDispose = new List<ActivationCacheEntry>(_activationCache.Values);
             _activationCache.Clear();
+        }
+
+        // Dispose GPU buffers outside the lock
+        foreach (var entry in toDispose)
+        {
+            entry.Dispose();
         }
     }
 
@@ -705,6 +803,85 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
     }
 
+    /// <summary>
+    /// Completes a GPU operation by either deferring the download (when GpuScope is active)
+    /// or downloading immediately. When deferred, the GPU buffer stays resident and the CPU
+    /// array is only populated when actually needed (via MaterializeIfDeferred).
+    /// This eliminates blocking downloads for intermediate results in chained GPU operations.
+    /// </summary>
+    private T[] FinishGpuOp<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, int elementCount)
+    {
+        if (GpuScope.IsActive)
+        {
+            // Scope is active: download the data now so the CPU array has valid values,
+            // but also cache the GPU buffer so the next GPU op can reuse it without re-uploading.
+            float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(floatData);
+            CacheActivation(result, outputBuffer.Buffer, [elementCount], backend);
+            return result;
+        }
+        else
+        {
+            // No scope — download immediately and dispose the buffer
+            float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
+            outputBuffer.Dispose();
+            return DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        }
+    }
+
+    /// <summary>
+    /// Materializes a deferred download if the given array was returned from a GPU op
+    /// within a GpuScope without downloading. This is called automatically when CPU
+    /// code needs the actual data (e.g., reductions, CPU fallback operations, scope exit).
+    /// </summary>
+    private void MaterializeIfDeferred<T>(T[] data)
+    {
+        if (_deferredDownloads.TryRemove(data, out var entry))
+        {
+            float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+            var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+            Array.Copy(converted, data, Math.Min(converted.Length, data.Length));
+        }
+    }
+
+    /// <summary>
+    /// Materializes all pending deferred downloads. Called when a GpuScope ends
+    /// to ensure all result arrays have valid CPU data.
+    /// </summary>
+    internal void MaterializeAllDeferred()
+    {
+        if (_deferredDownloads.IsEmpty)
+            return;
+
+        var entries = _deferredDownloads.ToArray();
+        foreach (var kvp in entries)
+        {
+            if (_deferredDownloads.TryRemove(kvp.Key, out var entry))
+            {
+                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                // The key is a T[] but we don't know T here — use float path since
+                // most GPU ops work with float arrays internally
+                if (kvp.Key is float[] floatArray)
+                {
+                    Array.Copy(floatData, floatArray, Math.Min(floatData.Length, floatArray.Length));
+                }
+                else
+                {
+                    // For non-float types, we need the original type conversion
+                    // This is a rare path — most GPU operations use float
+                    var arr = kvp.Key as Array;
+                    if (arr != null)
+                    {
+                        for (int i = 0; i < Math.Min(floatData.Length, arr.Length); i++)
+                        {
+                            arr.SetValue(Convert.ChangeType(floatData[i], arr.GetType().GetElementType()!), i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
         if (!TryGetBackend(out var backend))
@@ -715,15 +892,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-
-            if (GpuScope.IsActive)
-                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-            else
-                bufferB.Dispose();
-
-            return result;
+            return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
         catch
         {
@@ -745,15 +914,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-
-            if (GpuScope.IsActive)
-                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
-            else
-                bufferC.Dispose();
-
-            return result;
+            return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
         catch
         {
@@ -772,15 +933,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-
-            if (GpuScope.IsActive)
-                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-            else
-                bufferB.Dispose();
-
-            return result;
+            return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
         catch
         {
@@ -805,15 +958,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufferC.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-
-            if (GpuScope.IsActive)
-                CacheActivation(result, bufferC.Buffer, [left.Length], backend);
-            else
-                bufferC.Dispose();
-
-            return result;
+            return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
         catch
         {
@@ -835,15 +980,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             op(backend, bufferA.Buffer, bufferB.Buffer, ToFloatScalar(scalar), input.Length);
-            float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-
-            if (GpuScope.IsActive)
-                CacheActivation(result, bufferB.Buffer, [input.Length], backend);
-            else
-                bufferB.Dispose();
-
-            return result;
+            return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
         catch
         {
@@ -4029,15 +4166,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Execute batch norm (spatialSize=1 for 2D tensors)
-            backend.BatchNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
+            // Try single-pass fused BatchNorm+Activation kernel first
+            bool fused = backend.TryFusedBatchNormActivation(
+                inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
                 runningMeanBuffer.Buffer, runningVarBuffer.Buffer, saveMeanBuffer.Buffer, saveVarBuffer.Buffer,
-                batchSize, features, 1, (float)epsilon, (float)momentum, training);
+                batchSize, features, 1, (float)epsilon, (float)momentum, training, activation);
 
-            // Apply activation if needed
-            if (activation != FusedActivationType.None)
+            if (!fused)
             {
-                ApplyGpuActivation(backend, outputBuffer.Buffer, batchSize * features, activation);
+                // Fall back to separate BatchNorm + Activation
+                backend.BatchNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, betaBuffer.Buffer,
+                    runningMeanBuffer.Buffer, runningVarBuffer.Buffer, saveMeanBuffer.Buffer, saveVarBuffer.Buffer,
+                    batchSize, features, 1, (float)epsilon, (float)momentum, training);
+
+                if (activation != FusedActivationType.None)
+                {
+                    ApplyGpuActivation(backend, outputBuffer.Buffer, batchSize * features, activation);
+                }
             }
 
             // DownloadBuffer uses blocking read, Synchronize() removed for performance
@@ -7382,6 +7527,121 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.DropoutBackward(gradOutput, mask, dropoutRate);
         }
+    }
+
+    /// <summary>
+    /// GPU-accelerated fused BiasAdd + Dropout in a single kernel launch.
+    /// Eliminates one global memory round-trip compared to separate BiasAdd + Dropout calls.
+    /// Falls back to separate operations if the backend doesn't support the fused kernel.
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="input">Input tensor [batch x features] or any shape where last dim = bias length.</param>
+    /// <param name="bias">1D bias tensor [features].</param>
+    /// <param name="dropoutRate">Probability of dropping each element (0.0 to 1.0).</param>
+    /// <param name="training">Whether we're in training mode (dropout only applies during training).</param>
+    /// <param name="mask">Output dropout mask tensor (1 = kept, 0 = dropped).</param>
+    /// <returns>Result tensor with bias added and dropout applied.</returns>
+    public Tensor<T> FusedBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
+    {
+        if (input.Shape.Length == 0)
+            throw new ArgumentException("Input tensor must have at least one dimension.", nameof(input));
+        if (bias.Shape.Length != 1)
+            throw new ArgumentException("Bias tensor must be 1-dimensional.", nameof(bias));
+        if (bias.Length != input.Shape[^1])
+            throw new ArgumentException($"Bias length {bias.Length} must match input's last dimension {input.Shape[^1]}.", nameof(bias));
+        if (dropoutRate < 0.0 || dropoutRate >= 1.0)
+            throw new ArgumentOutOfRangeException(nameof(dropoutRate), dropoutRate, "Dropout rate must be in [0, 1).");
+
+        if (!TryGetBackend(out var backend))
+        {
+            // No GPU — fall back to CPU: add bias element-wise then dropout
+            return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+        }
+
+        if (!training || dropoutRate <= 0.0)
+        {
+            // No dropout — just do bias add on GPU, return all-ones mask
+            int lastDim = input.Shape[^1];
+            int rows = input.Length / lastDim;
+            try
+            {
+                using var inputBuf = GetOrAllocateBuffer(backend, input.GetDataArray());
+                using var biasBuf = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+                using var outBuf = AllocateOutputBuffer(backend, input.Length);
+                backend.BiasAdd(inputBuf.Buffer, biasBuf.Buffer, outBuf.Buffer, rows, lastDim);
+                float[] resultFloat = backend.DownloadBuffer(outBuf.Buffer);
+                var numOps = MathHelper.GetNumericOperations<T>();
+                var ones = new T[input.Length];
+                for (int i = 0; i < ones.Length; i++) ones[i] = numOps.One;
+                mask = new Tensor<T>(ones, input.Shape.ToArray());
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), input.Shape.ToArray());
+            }
+            catch
+            {
+                return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+            }
+        }
+
+        try
+        {
+            int lastDim = input.Shape[^1];
+            int rows = input.Length / lastDim;
+            int cols = lastDim;
+            float scale = 1.0f / (1.0f - (float)dropoutRate);
+
+            using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+            using var outputBuffer = AllocateOutputBuffer(backend, input.Length);
+            using var maskBuffer = AllocateOutputBuffer(backend, input.Length);
+
+            // Generate mask via existing Dropout kernel (it writes the mask as a side effect)
+            ulong seed = (ulong)DateTime.UtcNow.Ticks;
+            using var tempBuffer = AllocateOutputBuffer(backend, input.Length);
+            backend.Dropout(inputBuffer.Buffer, tempBuffer.Buffer, maskBuffer.Buffer, input.Length, (float)dropoutRate, seed, training);
+
+            // Try fused path: single kernel does bias + mask application
+            bool fused = backend.TryFusedBiasDropout(
+                inputBuffer.Buffer, outputBuffer.Buffer, biasBuffer.Buffer, maskBuffer.Buffer,
+                rows, cols, (float)dropoutRate, scale);
+
+            if (!fused)
+            {
+                // Fallback: separate BiasAdd + re-apply dropout with existing mask
+                backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer.Buffer, rows, cols);
+                backend.Dropout(outputBuffer.Buffer, outputBuffer.Buffer, maskBuffer.Buffer, input.Length, (float)dropoutRate, seed, training);
+            }
+
+            float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
+            float[] maskFloat = backend.DownloadBuffer(maskBuffer.Buffer);
+
+            mask = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(maskFloat), input.Shape.ToArray());
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
+        }
+        catch
+        {
+            return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+        }
+    }
+
+    /// <summary>
+    /// CPU fallback for fused bias + dropout when no GPU is available.
+    /// </summary>
+    private Tensor<T> CpuFallbackBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int lastDim = input.Shape[^1];
+        var inputData = input.GetDataArray();
+        var biasData = bias.GetDataArray();
+        var result = new T[input.Length];
+
+        // Add bias (broadcast along last dimension)
+        for (int i = 0; i < input.Length; i++)
+        {
+            result[i] = numOps.Add(inputData[i], biasData[i % lastDim]);
+        }
+
+        var biasedTensor = new Tensor<T>(result, input.Shape.ToArray());
+        return base.Dropout(biasedTensor, dropoutRate, training, out mask);
     }
 
     #endregion

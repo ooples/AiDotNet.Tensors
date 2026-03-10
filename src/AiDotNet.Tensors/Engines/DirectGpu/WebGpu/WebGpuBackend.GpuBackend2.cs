@@ -3,6 +3,7 @@
 
 #if NET7_0_OR_GREATER
 using System;
+using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
@@ -749,6 +750,11 @@ public sealed partial class WebGpuBackend
             emaUniforms, channels).GetAwaiter().GetResult();
     }
 
+    public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation) => false;
+
     public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
@@ -1024,6 +1030,9 @@ public sealed partial class WebGpuBackend
         Dispatch3BufferAsync("Dropout", WebGpuKernels.DropoutSource, "dropout_backward",
             gradOutput, gradInput, mask, uniforms, size).GetAwaiter().GetResult();
     }
+
+    public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale) => false;
 
     #endregion
 

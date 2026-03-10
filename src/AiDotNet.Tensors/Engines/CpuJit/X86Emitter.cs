@@ -160,7 +160,7 @@ internal sealed class X86Emitter
     /// <summary>
     /// Emits a VEX-encoded instruction: op ymm_dst, ymm_src1, [base + disp32].
     /// </summary>
-    private void EmitVexRM(int map, int pp, int w, byte opcode, int dst, int src1, int baseReg, int disp)
+    private void EmitVexRM(int map, int pp, int w, byte opcode, int dst, int src1, int baseReg, int disp, int l = 1)
     {
         int rBit = (dst >> 3) ^ 1;
         int bBit = (baseReg >> 3) ^ 1;
@@ -168,11 +168,11 @@ internal sealed class X86Emitter
 
         if (map == 1 && bBit == 1 && w == 0)
         {
-            EmitVex2(rBit, vvvv, 1, pp);
+            EmitVex2(rBit, vvvv, l, pp);
         }
         else
         {
-            EmitVex3(rBit, 1, bBit, map, w, vvvv, 1, pp);
+            EmitVex3(rBit, 1, bBit, map, w, vvvv, l, pp);
         }
         Emit(opcode);
 
@@ -261,6 +261,55 @@ internal sealed class X86Emitter
     public void Vxorps(int dst, int src1, int src2)
         => EmitVexRR(1, 0, 0, 0x57, dst, src1, src2);
 
+    /// <summary>VMINPS ymm, ymm, ymm — Packed float minimum</summary>
+    public void Vminps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x5D, dst, src1, src2);
+
+    /// <summary>
+    /// VCMPPS ymm, ymm, ymm, imm8 — Packed float compare.
+    /// Predicate: 1=LT, 2=LE, 6=NLE (GT), 14=GT_OS.
+    /// Result: all-ones mask where condition is true, all-zeros where false.
+    /// </summary>
+    public void Vcmpps(int dst, int src1, int src2, byte predicate)
+    {
+        EmitVexRR(1, 0, 0, 0xC2, dst, src1, src2);
+        Emit(predicate);
+    }
+
+    /// <summary>VANDPS ymm, ymm, ymm — Bitwise AND</summary>
+    public void Vandps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x54, dst, src1, src2);
+
+    /// <summary>VANDNPS ymm, ymm, ymm — Bitwise AND NOT: dst = (~src1) AND src2</summary>
+    public void Vandnps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x55, dst, src1, src2);
+
+    /// <summary>VORPS ymm, ymm, ymm — Bitwise OR</summary>
+    public void Vorps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x56, dst, src1, src2);
+
+    // ==================== Integer SIMD Instructions (for FastExp) ====================
+
+    /// <summary>VCVTPS2DQ ymm, ymm — Convert packed float to int32 (round to nearest)</summary>
+    public void Vcvtps2dq(int dst, int src)
+        => EmitVexRR(1, 1 /*66*/, 0, 0x5B, dst, 0 /*vvvv unused*/, src);
+
+    /// <summary>VCVTDQ2PS ymm, ymm — Convert packed int32 to float</summary>
+    public void Vcvtdq2ps(int dst, int src)
+        => EmitVexRR(1, 0 /*no prefix*/, 0, 0x5B, dst, 0 /*vvvv unused*/, src);
+
+    /// <summary>VPSLLD ymm, ymm, imm8 — Shift packed int32 left by immediate bits</summary>
+    public void VpslldImm(int dst, int src, byte shift)
+    {
+        // VEX.NDD.256.66.0F.WIG 72 /6 ib: reg field = 6, vvvv = dst, rm = src
+        EmitVexRR(1, 1 /*66*/, 0, 0x72, 6 /*reg=/6*/, dst /*vvvv=dest*/, src /*rm=source*/);
+        Emit(shift);
+    }
+
+    /// <summary>VPADDD ymm, ymm, ymm — Add packed int32</summary>
+    public void Vpaddd(int dst, int src1, int src2)
+        => EmitVexRR(1, 1 /*66*/, 0, 0xFE, dst, src1, src2);
+
     /// <summary>
     /// Generic packed single-precision op: op ymm_dst, ymm_src1, ymm_src2 (register-register).
     /// Opcode examples: 0x58=VADDPS, 0x59=VMULPS, 0x5C=VSUBPS, 0x5E=VDIVPS, 0x5D=VMINPS, 0x5F=VMAXPS.
@@ -274,6 +323,13 @@ internal sealed class X86Emitter
     /// </summary>
     public void VbinaryPs(byte opcode, int dst, int src1, int baseReg, int disp)
         => EmitVexRM(1, 0, 0, opcode, dst, src1, baseReg, disp);
+
+    /// <summary>
+    /// Generic scalar single-precision op: op xmm_dst, xmm_src1, [base+disp] (register-memory).
+    /// Uses F3 prefix (pp=2) and L=0 for scalar (VADDSS, VSUBSS, VMULSS, VDIVSS, VMAXSS).
+    /// </summary>
+    public void VbinarySs(byte opcode, int dst, int src1, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, opcode, dst, src1, baseReg, disp, l: 0);
 
     // ==================== AVX2 Memory Operations ====================
 
@@ -292,6 +348,25 @@ internal sealed class X86Emitter
     /// <summary>VMOVUPS [base+disp], ymm — Unaligned store</summary>
     public void VmovupsStore(int src, int baseReg, int disp)
         => EmitVexStore(1, 0, 0, 0x11, src, baseReg, disp);
+
+    /// <summary>VMOVSS xmm, [base+disp] — Scalar float load (4 bytes only)</summary>
+    public void VmovssLoad(int dst, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x10, dst, 0, baseReg, disp, l: 0);
+
+    /// <summary>VMOVSS [base+disp], xmm — Scalar float store (4 bytes only)</summary>
+    public void VmovssStore(int src, int baseReg, int disp)
+    {
+        // VEX.LIG.F3.0F.WIG 11 /r
+        EmitVexRM(1, 2 /*F3*/, 0, 0x11, src, 0, baseReg, disp, l: 0);
+    }
+
+    /// <summary>VMOVDQU xmm, [base+disp] — Unaligned 128-bit load (for saving/restoring callee-saved XMM registers)</summary>
+    public void VmovdquLoad(int dst, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x6F, dst, 0, baseReg, disp, l: 0);
+
+    /// <summary>VMOVDQU [base+disp], xmm — Unaligned 128-bit store (for saving/restoring callee-saved XMM registers)</summary>
+    public void VmovdquStore(int src, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x7F, src, 0, baseReg, disp, l: 0);
 
     /// <summary>VMOVNTPS [base+disp], ymm — Non-temporal store (requires 32-byte alignment, bypasses cache)</summary>
     public void VmovntpsStore(int src, int baseReg, int disp)
@@ -331,18 +406,24 @@ internal sealed class X86Emitter
         }
         // 0F 18 /1  (reg=1 in ModR/M)
         Emit(0x0F, 0x18);
-        if (disp == 0 && (baseReg & 7) != RBP)
+        int rm = baseReg & 7;
+        bool needSib = rm == (RSP & 7); // RSP/R12 require SIB byte
+
+        if (disp == 0 && rm != (RBP & 7))
         {
-            EmitModRM(0, 1, baseReg & 7);
+            EmitModRM(0, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
         }
         else if (disp >= -128 && disp <= 127)
         {
-            EmitModRM(1, 1, baseReg & 7);
+            EmitModRM(1, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
             Emit((byte)(disp & 0xFF));
         }
         else
         {
-            EmitModRM(2, 1, baseReg & 7);
+            EmitModRM(2, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
             EmitImm32(disp);
         }
     }
@@ -483,6 +564,17 @@ internal sealed class X86Emitter
     /// Windows x64 ABI: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
     /// Non-volatile: RBX, RBP, RDI, RSI, R12-R15, XMM6-XMM15
     /// </summary>
+    // Stack alignment: on entry RSP%16==8 (return addr), PUSH RBP -> aligned,
+    // PUSH RBX -> misaligned, SUB RSP,200 (odd multiple of 8) -> aligned again.
+    // Stack layout after prologue (200 bytes below PUSH'd RBX):
+    // [RSP+0..31]   = shadow space (32 bytes)
+    // [RSP+32..47]  = XMM6 save
+    // [RSP+48..63]  = XMM7 save
+    // ...
+    // [RSP+176..191] = XMM15 save
+    // [RSP+192..199] = alignment pad (8 bytes)
+    private const int PrologueStackSize = 200; // 32 shadow + 160 XMM saves + 8 alignment pad
+
     public void Prologue()
     {
         // PUSH RBP
@@ -491,8 +583,13 @@ internal sealed class X86Emitter
         Emit(0x48, 0x89); EmitModRM(3, RSP, RBP);
         // PUSH RBX (non-volatile, we use it as loop counter)
         Emit(0x53);
-        // SUB RSP, 32 — shadow space for potential calls + alignment
-        SubImm32(RSP, 32);
+        // SUB RSP, 192 — shadow space + XMM6-XMM15 saves
+        SubImm32(RSP, PrologueStackSize);
+        // Save non-volatile XMM6-XMM15 (Windows x64 ABI)
+        for (int i = 6; i <= 15; i++)
+        {
+            VmovdquStore(i, RSP, 32 + (i - 6) * 16);
+        }
     }
 
     /// <summary>
@@ -500,10 +597,15 @@ internal sealed class X86Emitter
     /// </summary>
     public void Epilogue()
     {
+        // Restore non-volatile XMM6-XMM15 (Windows x64 ABI)
+        for (int i = 6; i <= 15; i++)
+        {
+            VmovdquLoad(i, RSP, 32 + (i - 6) * 16);
+        }
         // VZEROUPPER — avoid AVX/SSE transition penalty
         Emit(0xC5, 0xF8); Emit(0x77);
-        // ADD RSP, 32
-        AddImm32(RSP, 32);
+        // ADD RSP, 192
+        AddImm32(RSP, PrologueStackSize);
         // POP RBX
         Emit(0x5B);
         // POP RBP
@@ -592,10 +694,13 @@ internal sealed class X86Emitter
                 dst[i] = _code[i];
             }
 
-            // Zero padding between code and data
-            for (int i = codeSize; i < dataOffset; i++)
+            // Zero padding between code and data (only if there is a data section)
+            if (_dataConstants.Count > 0)
             {
-                dst[i] = 0xCC; // INT3 padding (trap if executed)
+                for (int i = codeSize; i < dataOffset; i++)
+                {
+                    dst[i] = 0xCC; // INT3 padding (trap if executed)
+                }
             }
 
             // Write data constants

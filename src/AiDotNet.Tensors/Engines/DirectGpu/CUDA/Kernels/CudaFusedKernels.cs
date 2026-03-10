@@ -32,6 +32,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 #define BLOCK_DIM 16
 
 // ===========================================================================
+// COOPERATIVE TILE LOADING MACROS WITH FLOAT4 VECTORIZATION
+// float4 loads collapse 4 separate 4-byte transactions into 1 x 16-byte
+// transaction per thread, giving ~4x effective bandwidth utilization.
+// ===========================================================================
+
+// Load A tile [BM x BK] into shared memory (column-major layout)
+// A is row-major; strides across rows, so scalar loads are best here
+#define LOAD_A_TILE_SMEM(As, A, tid, bm, bk, blockDim2, blockIdxY, t, M, K) \
+    for (int _i = tid; _i < bm * bk; _i += blockDim2) { \
+        int _smRow = _i % bm; \
+        int _smCol = _i / bm; \
+        int _gRow = blockIdxY * bm + _smRow; \
+        int _gCol = t * bk + _smCol; \
+        As[_smCol][_smRow] = (_gRow < M && _gCol < K) ? __ldg(&A[_gRow * K + _gCol]) : 0.0f; \
+    }
+
+// Load B tile [BK x BN] into shared memory using float4 vectorized loads
+// B is row-major with BN=128 consecutive columns — ideal for float4
+#define LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, bk, bn, blockDim2, blockIdxX, t, K, N) \
+    { \
+        const int _bn4 = bn / 4; \
+        for (int _i = tid; _i < bk * _bn4; _i += blockDim2) { \
+            int _smRow = _i / _bn4; \
+            int _smCol4 = _i % _bn4; \
+            int _gRow = t * bk + _smRow; \
+            int _gCol = blockIdxX * bn + _smCol4 * 4; \
+            if (_gRow < K && _gCol + 3 < N && ((_gRow * N + _gCol) % 4 == 0)) { \
+                float4 _bv = __ldg((const float4*)&B[_gRow * N + _gCol]); \
+                Bs[_smRow][_smCol4 * 4 + 0] = _bv.x; \
+                Bs[_smRow][_smCol4 * 4 + 1] = _bv.y; \
+                Bs[_smRow][_smCol4 * 4 + 2] = _bv.z; \
+                Bs[_smRow][_smCol4 * 4 + 3] = _bv.w; \
+            } else { \
+                Bs[_smRow][_smCol4 * 4 + 0] = (_gRow < K && _gCol < N) ? __ldg(&B[_gRow * N + _gCol]) : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 1] = (_gRow < K && _gCol + 1 < N) ? __ldg(&B[_gRow * N + _gCol + 1]) : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 2] = (_gRow < K && _gCol + 2 < N) ? __ldg(&B[_gRow * N + _gCol + 2]) : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 3] = (_gRow < K && _gCol + 3 < N) ? __ldg(&B[_gRow * N + _gCol + 3]) : 0.0f; \
+            } \
+        } \
+    }
+
+// ===========================================================================
 // FUSED KERNELS: GEMM + BIAS + ACTIVATION
 // Single kernel for entire DenseLayer forward pass.
 // Eliminates memory round-trips between operations.
@@ -40,7 +82,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 
 // Fused GEMM + Bias + ReLU
 // output = ReLU(A * B + bias)
-extern ""C"" __global__ void gemm_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_relu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -65,22 +107,9 @@ extern ""C"" __global__ void gemm_bias_relu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        // Cooperative load of A tile [BM x BK] into shared memory
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        // Cooperative load of B tile [BK x BN] into shared memory
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         // Register-blocked inner product
@@ -118,7 +147,7 @@ extern ""C"" __global__ void gemm_bias_relu(
 
 // Fused GEMM + Bias + GELU (for Transformer FFN)
 // output = GELU(A * B + bias)
-extern ""C"" __global__ void gemm_bias_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_gelu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -143,20 +172,9 @@ extern ""C"" __global__ void gemm_bias_gelu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -196,7 +214,7 @@ extern ""C"" __global__ void gemm_bias_gelu(
 
 // Fused GEMM + Bias + Sigmoid
 // output = Sigmoid(A * B + bias)
-extern ""C"" __global__ void gemm_bias_sigmoid(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_sigmoid(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -221,20 +239,9 @@ extern ""C"" __global__ void gemm_bias_sigmoid(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -270,7 +277,7 @@ extern ""C"" __global__ void gemm_bias_sigmoid(
 
 // Fused GEMM + Bias + Tanh
 // output = Tanh(A * B + bias)
-extern ""C"" __global__ void gemm_bias_tanh(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_tanh(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -295,20 +302,9 @@ extern ""C"" __global__ void gemm_bias_tanh(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -344,7 +340,7 @@ extern ""C"" __global__ void gemm_bias_tanh(
 
 // Fused GEMM + Bias (no activation)
 // output = A * B + bias
-extern ""C"" __global__ void gemm_bias(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -369,20 +365,9 @@ extern ""C"" __global__ void gemm_bias(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -416,7 +401,7 @@ extern ""C"" __global__ void gemm_bias(
 
 // Fused GEMM + Bias + Swish (SiLU)
 // output = Swish(A * B + bias) = x * sigmoid(x)
-extern ""C"" __global__ void gemm_bias_swish(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_swish(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -441,20 +426,9 @@ extern ""C"" __global__ void gemm_bias_swish(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -491,7 +465,7 @@ extern ""C"" __global__ void gemm_bias_swish(
 
 // Fused GEMM + Bias + LeakyReLU
 // output = LeakyReLU(A * B + bias, alpha)
-extern ""C"" __global__ void gemm_bias_leaky_relu(
+extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_leaky_relu(
     const float* __restrict__ A,
     const float* __restrict__ B,
     const float* __restrict__ bias,
@@ -516,20 +490,9 @@ extern ""C"" __global__ void gemm_bias_leaky_relu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with __ldg for A, float4 vectorized loads for B
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -570,7 +533,7 @@ extern ""C"" __global__ void gemm_bias_leaky_relu(
 
 // Fused LayerNorm + ReLU
 // output = ReLU(gamma * (x - mean) / sqrt(var + eps) + beta)
-extern ""C"" __global__ void layernorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_relu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -625,7 +588,7 @@ extern ""C"" __global__ void layernorm_relu(
 }
 
 // Fused LayerNorm + GELU (critical for Transformers)
-extern ""C"" __global__ void layernorm_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_gelu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -689,7 +652,7 @@ extern ""C"" __global__ void layernorm_gelu(
 
 // Fused Residual Add + LayerNorm
 // output = LayerNorm(x + residual)
-extern ""C"" __global__ void residual_layernorm(
+extern ""C"" __global__ __launch_bounds__(256) void residual_layernorm(
     const float* __restrict__ input,
     const float* __restrict__ residual,
     float* __restrict__ output,
@@ -750,7 +713,7 @@ extern ""C"" __global__ void residual_layernorm(
 // ===========================================================================
 
 // Fused Scale + Softmax (for attention: softmax(Q*K^T / sqrt(d)))
-extern ""C"" __global__ void scaled_softmax(
+extern ""C"" __global__ __launch_bounds__(256) void scaled_softmax(
     const float* __restrict__ input,
     float* __restrict__ output,
     int batchSize, int seqLen, float scale)
@@ -809,22 +772,24 @@ extern ""C"" __global__ void scaled_softmax(
 // ===========================================================================
 
 // Fused Bias + Dropout (for training)
-extern ""C"" __global__ void bias_dropout(
+extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ bias,
     const unsigned int* __restrict__ mask,
     int rows, int cols, float dropoutProb, float scale)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = rows * cols;
-    if (idx >= size) return;
+    // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
+    // Eliminates ~20-cycle integer division from idx % cols
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= cols || row >= rows) return;
 
-    int col = idx % cols;
-    float val = input[idx] + bias[col];
+    int idx = row * cols + col;
+    float val = input[idx] + __ldg(&bias[col]);
 
     // Apply dropout using pre-generated mask
-    unsigned int m = mask[idx];
+    unsigned int m = __ldg(&mask[idx]);
     output[idx] = (m != 0) ? val * scale : 0.0f;
 }
 
@@ -833,7 +798,7 @@ extern ""C"" __global__ void bias_dropout(
 // ===========================================================================
 
 // Fused BatchNorm + ReLU (Inference)
-extern ""C"" __global__ void batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_relu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -859,7 +824,7 @@ extern ""C"" __global__ void batchnorm_relu(
 }
 
 // Fused BatchNorm + GELU (Inference)
-extern ""C"" __global__ void batchnorm_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_gelu(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -890,7 +855,7 @@ extern ""C"" __global__ void batchnorm_gelu(
 }
 
 // Fused BatchNorm + Sigmoid (Inference)
-extern ""C"" __global__ void batchnorm_sigmoid(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_sigmoid(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -916,7 +881,7 @@ extern ""C"" __global__ void batchnorm_sigmoid(
 }
 
 // Fused BatchNorm + Tanh (Inference)
-extern ""C"" __global__ void batchnorm_tanh(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_tanh(
     const float* __restrict__ input,
     float* __restrict__ output,
     const float* __restrict__ gamma,
@@ -942,7 +907,7 @@ extern ""C"" __global__ void batchnorm_tanh(
 }
 
 // Fused Residual + BatchNorm + ReLU
-extern ""C"" __global__ void residual_batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void residual_batchnorm_relu(
     const float* __restrict__ input,
     const float* __restrict__ residual,
     float* __restrict__ output,
@@ -975,7 +940,7 @@ extern ""C"" __global__ void residual_batchnorm_relu(
 
 // Fused linear interpolation: output = (1-t)*a + t*b = a + t*(b-a)
 // Uses fused multiply-add (fmaf) for maximum precision and throughput
-extern ""C"" __global__ void lerp_fused(
+extern ""C"" __global__ __launch_bounds__(256) void lerp_fused(
     const float* __restrict__ a,
     const float* __restrict__ b,
     float* __restrict__ output,
@@ -992,7 +957,7 @@ extern ""C"" __global__ void lerp_fused(
 // Fused scaled addition: output = scaleA * a + scaleB * b
 // Common in diffusion models: alpha * signal + sigma * noise
 // Uses fmaf for precision: fmaf(scaleA, a, scaleB * b)
-extern ""C"" __global__ void add_scaled(
+extern ""C"" __global__ __launch_bounds__(256) void add_scaled(
     const float* __restrict__ a,
     const float* __restrict__ b,
     float* __restrict__ output,
@@ -1013,7 +978,7 @@ extern ""C"" __global__ void add_scaled(
 // Two-pass variance reduction using shared memory
 // Pass 1: compute mean, Pass 2: compute variance
 // This kernel computes the mean using parallel reduction
-extern ""C"" __global__ void reduce_mean_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     int size)
@@ -1027,24 +992,33 @@ extern ""C"" __global__ void reduce_mean_kernel(
     for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
         sum += input[i];
     }
-    sdata[tid] = sum;
+
+    // Warp-level reduction first (no __syncthreads needed within a warp)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    // Write warp results to shared memory
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Tree reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        atomicAdd(output, sdata[0]);
+    // Final reduction across warps (only first warp)
+    int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps) {
+        sum = sdata[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(warp_mask, sum, offset);
+        if (tid == 0)
+            atomicAdd(output, sum);
     }
 }
 
 // Compute variance given a known mean, using parallel reduction
-extern ""C"" __global__ void reduce_variance_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     float mean,
@@ -1060,19 +1034,28 @@ extern ""C"" __global__ void reduce_variance_kernel(
         float diff = input[i] - mean;
         sum += diff * diff;
     }
-    sdata[tid] = sum;
+
+    // Warp-level reduction first
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    // Write warp results to shared memory
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Tree reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        atomicAdd(output, sdata[0]);
+    // Final reduction across warps (only first warp)
+    int numWarps2 = (blockDim.x + 31) >> 5;
+    if (tid < numWarps2) {
+        sum = sdata[tid];
+        unsigned int warp_mask2 = (numWarps2 >= 32) ? 0xFFFFFFFF : ((1u << numWarps2) - 1);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(warp_mask2, sum, offset);
+        if (tid == 0)
+            atomicAdd(output, sum);
     }
 }
 ";

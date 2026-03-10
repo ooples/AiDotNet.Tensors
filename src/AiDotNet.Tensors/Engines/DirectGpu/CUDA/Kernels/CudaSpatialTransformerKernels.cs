@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 
 // TopK selection using partial sort (efficient for small K)
 // Each thread block handles one row of the input
-extern ""C"" __global__ void topk(
+extern ""C"" __global__ __launch_bounds__(256) void topk(
     const float* input, float* values, int* indices,
     int outerSize, int reduceSize, int k, int sorted)
 {
@@ -92,7 +92,7 @@ extern ""C"" __global__ void topk(
 }
 
 // Optimized TopK for small K using warp-level operations
-extern ""C"" __global__ void topk_small(
+extern ""C"" __global__ __launch_bounds__(256) void topk_small(
     const float* input, float* values, int* indices,
     int outerSize, int reduceSize, int k)
 {
@@ -186,7 +186,7 @@ extern ""C"" __global__ void topk_small(
 // Generate affine sampling grid
 // theta: [batch, 2, 3] affine transformation matrices
 // grid: [batch, outH, outW, 2] output sampling coordinates
-extern ""C"" __global__ void affine_grid(
+extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
     const float* theta, float* grid,
     int batch, int outHeight, int outWidth)
 {
@@ -223,7 +223,7 @@ extern ""C"" __global__ void affine_grid(
 // input: [batch, channels, inH, inW] NCHW format
 // grid: [batch, outH, outW, 2] sampling coordinates in [-1, 1]
 // output: [batch, channels, outH, outW]
-extern ""C"" __global__ void grid_sample(
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
     const float* input, const float* grid, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int paddingMode, int alignCorners)
@@ -289,7 +289,7 @@ extern ""C"" __global__ void grid_sample(
 // GRID SAMPLE BACKWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void grid_sample_backward(
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
     const float* gradOutput, const float* input, const float* grid,
     float* gradInput, float* gradGrid,
     int batch, int channels, int inHeight, int inWidth,

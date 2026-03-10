@@ -28,7 +28,7 @@ internal static class HipSpecializedKernels
 // ============================================================================
 
 // Poincare ball projection: project point to be inside the ball
-extern ""C"" __global__ void poincare_project(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_project(
     const float* input, float* output,
     int batchSize, int dim, float curvature, float epsilon)
 {
@@ -59,7 +59,7 @@ extern ""C"" __global__ void poincare_project(
 }
 
 // Mobius addition: x (+) y in Poincare ball
-extern ""C"" __global__ void mobius_add(
+extern ""C"" __global__ __launch_bounds__(256) void mobius_add(
     const float* x, const float* y, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -91,7 +91,7 @@ extern ""C"" __global__ void mobius_add(
 }
 
 // Poincare exponential map
-extern ""C"" __global__ void poincare_exp_map(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_exp_map(
     const float* basePoint, const float* tangentVec, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -146,7 +146,7 @@ extern ""C"" __global__ void poincare_exp_map(
 }
 
 // Poincare distance
-extern ""C"" __global__ void poincare_distance(
+extern ""C"" __global__ __launch_bounds__(256) void poincare_distance(
     const float* x, const float* y, float* output,
     int batchSize, int dim, float curvature)
 {
@@ -191,7 +191,7 @@ extern ""C"" __global__ void poincare_distance(
 }
 
 // Hyperbolic linear forward
-extern ""C"" __global__ void hyperbolic_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_forward(
     const float* input, const float* weights, const float* biases, float* output,
     int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
 {
@@ -295,7 +295,7 @@ extern ""C"" __global__ void hyperbolic_linear_forward(
 // OCTONION ALGEBRA KERNELS
 // ============================================================================
 
-extern ""C"" __global__ void octonion_multiply(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_multiply(
     const float* a, const float* b, float* output, int count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -320,7 +320,7 @@ extern ""C"" __global__ void octonion_multiply(
     out[7] = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0;
 }
 
-extern ""C"" __global__ void octonion_add(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_add(
     const float* a, const float* b, float* output, int count)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -328,7 +328,7 @@ extern ""C"" __global__ void octonion_add(
     output[idx] = a[idx] + b[idx];
 }
 
-extern ""C"" __global__ void octonion_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_forward(
     const float* input, const float* weights, const float* biases, float* output,
     int batchSize, int inputFeatures, int outputFeatures)
 {
@@ -373,7 +373,7 @@ extern ""C"" __global__ void octonion_linear_forward(
 // QUANTUM COMPUTING KERNELS
 // ============================================================================
 
-extern ""C"" __global__ void quantum_measurement(
+extern ""C"" __global__ __launch_bounds__(256) void quantum_measurement(
     const float* realPart, const float* imagPart, float* probabilities,
     int batchSize, int stateSize)
 {
@@ -389,7 +389,7 @@ extern ""C"" __global__ void quantum_measurement(
     probabilities[idx] = real * real + imag * imag;
 }
 
-extern ""C"" __global__ void normalize_probabilities(
+extern ""C"" __global__ __launch_bounds__(256) void normalize_probabilities(
     float* probabilities, int batchSize, int stateSize)
 {
     extern __shared__ float sdata[];
@@ -422,7 +422,7 @@ extern ""C"" __global__ void normalize_probabilities(
     }
 }
 
-extern ""C"" __global__ void complex_matvec(
+extern ""C"" __global__ __launch_bounds__(256) void complex_matvec(
     const float* matReal, const float* matImag,
     const float* vecReal, const float* vecImag,
     float* outReal, float* outImag,
@@ -455,7 +455,7 @@ extern ""C"" __global__ void complex_matvec(
     outImag[b * dim + row] = sumImag;
 }
 
-extern ""C"" __global__ void quantum_rotation(
+extern ""C"" __global__ __launch_bounds__(256) void quantum_rotation(
     const float* stateReal, const float* stateImag,
     float* outReal, float* outImag,
     const float* angles, int numQubits, int batchSize)
@@ -502,7 +502,7 @@ extern ""C"" __global__ void quantum_rotation(
     }
 }
 
-extern ""C"" __global__ void measurement_forward(
+extern ""C"" __global__ __launch_bounds__(256) void measurement_forward(
     const float* input, float* output, int batchSize, int stateSize)
 {
     extern __shared__ float sdata[];

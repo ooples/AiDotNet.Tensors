@@ -31,7 +31,7 @@ internal static class HipAttentionKernels
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void scaled_dot_product_attention(
+extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention(
     const float* query,      // [batch * heads * seqQ * headDim]
     const float* key,        // [batch * heads * seqK * headDim]
     const float* value,      // [batch * heads * seqK * headDim]
@@ -144,7 +144,7 @@ extern ""C"" __global__ void scaled_dot_product_attention(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void flash_attention_v2(
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
     const float* query,
     const float* key,
     const float* value,
@@ -251,7 +251,7 @@ extern ""C"" __global__ void flash_attention_v2(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void flash_attention_backward(
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
     const float* gradOutput,
     const float* query,
     const float* key,
@@ -372,7 +372,7 @@ extern ""C"" __global__ void flash_attention_backward(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void grouped_query_attention(
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
     const float* query,
     const float* key,
     const float* value,
@@ -492,7 +492,7 @@ extern ""C"" __global__ void grouped_query_attention(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void grouped_query_attention_backward(
+extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention_backward(
     const float* gradOutput,
     const float* query,
     const float* key,
@@ -619,7 +619,7 @@ extern ""C"" __global__ void grouped_query_attention_backward(
 // Shared mem: 2 * ATTN_BC * headDim floats
 // ===========================================================================
 
-extern ""C"" __global__ void flash_attention_forward(
+extern ""C"" __global__ __launch_bounds__(256) void flash_attention_forward(
     const float* query,
     const float* key,
     const float* value,

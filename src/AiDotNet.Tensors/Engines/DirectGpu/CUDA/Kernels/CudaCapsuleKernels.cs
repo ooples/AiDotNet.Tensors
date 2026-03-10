@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 // Input: [batchSize, inputCapsules, inputDim]
 // Weights: [inputCapsules, outputCapsules, inputDim, outputDim]
 // Output: [batchSize, inputCapsules, outputCapsules, outputDim]
-extern ""C"" __global__ void capsule_predictions(
+extern ""C"" __global__ __launch_bounds__(256) void capsule_predictions(
     const float* input,
     const float* weights,
     float* output,
@@ -59,7 +59,7 @@ extern ""C"" __global__ void capsule_predictions(
 // Input: [batchSize, inputCapsules, inputDim]
 // Weights: [inputCapsules, inputDim, numCapsules, capsuleDim]
 // Output: [batchSize, inputCapsules, numCapsules, capsuleDim]
-extern ""C"" __global__ void capsule_transform(
+extern ""C"" __global__ __launch_bounds__(256) void capsule_transform(
     const float* input,
     const float* weights,
     float* output,
@@ -103,7 +103,7 @@ extern ""C"" __global__ void capsule_transform(
 // Coupling: [batchSize, inputCapsules, outputCapsules]
 // Predictions: [batchSize, inputCapsules, outputCapsules, capsuleDim]
 // Output: [batchSize, outputCapsules, capsuleDim]
-extern ""C"" __global__ void capsule_weighted_sum(
+extern ""C"" __global__ __launch_bounds__(256) void capsule_weighted_sum(
     const float* coupling,
     const float* predictions,
     float* output,
@@ -144,7 +144,7 @@ extern ""C"" __global__ void capsule_weighted_sum(
 // Predictions: [batchSize, inputCapsules, outputCapsules, capsuleDim]
 // Output: [batchSize, outputCapsules, capsuleDim]
 // Agreement: [batchSize, inputCapsules, outputCapsules]
-extern ""C"" __global__ void capsule_agreement(
+extern ""C"" __global__ __launch_bounds__(256) void capsule_agreement(
     const float* predictions,
     const float* output,
     float* agreement,

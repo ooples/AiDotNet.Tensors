@@ -54,8 +54,10 @@ internal static class OneDnnProvider
         if (_resolverRegistered) return;
         _resolverRegistered = true;
 
-        NativeLibrary.SetDllImportResolver(typeof(OneDnnProvider).Assembly, (libraryName, assembly, searchPath) =>
+        try
         {
+            NativeLibrary.SetDllImportResolver(typeof(OneDnnProvider).Assembly, (libraryName, assembly, searchPath) =>
+            {
             if (libraryName != "dnnl")
             {
                 return IntPtr.Zero;
@@ -79,6 +81,12 @@ internal static class OneDnnProvider
 
             return IntPtr.Zero;
         });
+        }
+        catch (InvalidOperationException)
+        {
+            // A DllImportResolver is already registered for this assembly (e.g., by OpenBLAS provider).
+            // This is non-fatal — oneDNN will fall back to default library search.
+        }
     }
 
     private static IntPtr TryLoadFromDirectory(string directory)

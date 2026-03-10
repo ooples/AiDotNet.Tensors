@@ -66,7 +66,12 @@ internal sealed class PersistentParallelExecutor
             _workReady[slot].Reset();
 
             // Execute all assigned chunks for this worker slot.
-            // Chunks are assigned round-robin: slot gets chunks (slot+1), (slot+1+_numWorkers), etc.
+            // Chunks are assigned round-robin across all participants (workers + main thread).
+            // Total participants = _numWorkers + 1 (main). Worker slot N gets chunks (slot+1), (slot+1+stride), etc.
+            // Set reentrancy guard on worker thread so nested Execute() from
+            // callbacks falls back to sequential instead of deadlocking on _executeLock.
+            _isExecuting = true;
+            int stride = _numWorkers + 1;
             int chunkId = slot + 1;
             while (chunkId < _numChunks)
             {
@@ -79,7 +84,7 @@ internal sealed class PersistentParallelExecutor
                     // Capture first exception — will be re-thrown on the caller thread
                     Interlocked.CompareExchange(ref _workerException, ex, null);
                 }
-                chunkId += _numWorkers;
+                chunkId += stride;
             }
 
             // Signal completion
@@ -94,63 +99,81 @@ internal sealed class PersistentParallelExecutor
     /// Execute an action in parallel with near-zero dispatch overhead.
     /// The main thread executes chunk 0, worker threads execute chunks 1..numChunks-1.
     /// </summary>
+    [ThreadStatic]
+    private static bool _isExecuting;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Execute(int numChunks, Action<int> action)
     {
-        if (numChunks <= 1)
+        if (numChunks <= 0)
+            return;
+        if (numChunks == 1)
         {
             action(0);
             return;
         }
 
+        // Detect reentrancy (nested Execute from callback) — fall back to sequential
+        if (_isExecuting)
+        {
+            for (int c = 0; c < numChunks; c++)
+                action(c);
+            return;
+        }
+
         lock (_executeLock)
         {
-            int workersNeeded = Math.Min(numChunks - 1, _numWorkers);
-
-            // Setup shared state
-            _action = action;
-            _numChunks = numChunks;
-            _remaining = workersNeeded;
-            _workerException = null;
-            _allDone.Reset();
-
-            // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
-            for (int i = 0; i < workersNeeded; i++)
+            _isExecuting = true;
+            try
             {
-                _workReady[i].Set();
-            }
+                int workersNeeded = Math.Min(numChunks - 1, _numWorkers);
 
-            // Main thread does chunk 0 and any overflow chunks beyond worker count
-            // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
-            Exception? mainException = null;
-            int mainChunk = 0;
-            while (mainChunk < numChunks)
-            {
-                try
+                // Setup shared state
+                _action = action;
+                _numChunks = numChunks;
+                _remaining = workersNeeded;
+                _workerException = null;
+                _allDone.Reset();
+
+                // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
+                for (int i = 0; i < workersNeeded; i++)
                 {
-                    action(mainChunk);
+                    _workReady[i].Set();
                 }
-                catch (Exception ex)
-                {
-                    mainException ??= ex;
-                }
-                mainChunk += _numWorkers + 1;
-            }
 
-            // Wait for all workers to finish
-            if (Volatile.Read(ref _remaining) > 0)
-            {
+                // Main thread does chunk 0 and any overflow chunks beyond worker count
+                // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
+                Exception? mainException = null;
+                int mainChunk = 0;
+                while (mainChunk < numChunks)
+                {
+                    try
+                    {
+                        action(mainChunk);
+                    }
+                    catch (Exception ex)
+                    {
+                        mainException ??= ex;
+                    }
+                    mainChunk += _numWorkers + 1;
+                }
+
+                // Always wait for workers once dispatched to avoid stale Set() on next round
                 _allDone.Wait();
+
+                _action = null;
+
+                // Re-throw first captured exception (worker or main thread)
+                var workerEx = _workerException;
+                if (mainException is not null)
+                    throw mainException;
+                if (workerEx is not null)
+                    throw workerEx;
             }
-
-            _action = null;
-
-            // Re-throw first captured exception (worker or main thread)
-            var workerEx = _workerException;
-            if (mainException is not null)
-                throw mainException;
-            if (workerEx is not null)
-                throw workerEx;
+            finally
+            {
+                _isExecuting = false;
+            }
         }
     }
 }

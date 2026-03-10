@@ -48,6 +48,8 @@ internal sealed class AlignedBuffer : IDisposable
     {
         if (floatCount <= 0)
             throw new ArgumentOutOfRangeException(nameof(floatCount));
+        if (alignment <= 0 || (alignment & (alignment - 1)) != 0)
+            throw new ArgumentException("Alignment must be a positive power of two.", nameof(alignment));
 
         _sizeBytes = floatCount * sizeof(float);
 

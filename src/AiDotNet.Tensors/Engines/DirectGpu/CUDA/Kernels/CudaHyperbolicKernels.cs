@@ -169,7 +169,7 @@ __device__ void poincare_log_map(const float* x, const float* y, float* result, 
 // HYPERBOLIC LINEAR FORWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void hyperbolic_linear_forward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_forward(
     const float* input,
     const float* weights,
     const float* biases,
@@ -230,7 +230,7 @@ extern ""C"" __global__ void hyperbolic_linear_forward(
 // ===========================================================================
 
 // Backward pass - computes input gradients using Riemannian gradient
-extern ""C"" __global__ void hyperbolic_linear_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_input(
     const float* gradOutput,
     const float* input,
     const float* weights,
@@ -273,7 +273,7 @@ extern ""C"" __global__ void hyperbolic_linear_backward_input(
 }
 
 // Backward pass - computes weight gradients
-extern ""C"" __global__ void hyperbolic_linear_backward_weights(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_weights(
     const float* gradOutput,
     const float* input,
     float* gradWeights,
@@ -314,7 +314,7 @@ extern ""C"" __global__ void hyperbolic_linear_backward_weights(
 }
 
 // Backward pass - computes bias gradients
-extern ""C"" __global__ void hyperbolic_linear_backward_biases(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_linear_backward_biases(
     const float* gradOutput,
     const float* input,
     float* gradBiases,
@@ -360,7 +360,7 @@ extern ""C"" __global__ void hyperbolic_linear_backward_biases(
 // ===========================================================================
 
 // Backward pass for Mobius addition: d(x +_c y)/dx and d(x +_c y)/dy
-extern ""C"" __global__ void hyperbolic_mobius_add_backward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_mobius_add_backward(
     const float* gradOutput,
     const float* x,
     const float* y,
@@ -429,7 +429,7 @@ extern ""C"" __global__ void hyperbolic_mobius_add_backward(
 // EXPONENTIAL MAP BACKWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void hyperbolic_exp_map_backward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_exp_map_backward(
     const float* gradOutput,
     const float* basePoint,
     const float* tangentVec,
@@ -491,7 +491,7 @@ extern ""C"" __global__ void hyperbolic_exp_map_backward(
 // LOGARITHMIC MAP BACKWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void hyperbolic_log_map_backward(
+extern ""C"" __global__ __launch_bounds__(256) void hyperbolic_log_map_backward(
     const float* gradOutput,
     const float* x,
     const float* y,

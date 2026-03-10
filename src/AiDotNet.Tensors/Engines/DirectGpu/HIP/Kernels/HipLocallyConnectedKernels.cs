@@ -43,7 +43,7 @@ internal static class HipLocallyConnectedKernels
 // Weights: [outH, outW, outC, inC, kH, kW]
 // Bias:    [outC] (optional)
 // Output:  [batch, outC, outH, outW]
-extern ""C"" __global__ void locally_connected_conv2d(
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d(
     const float* input,
     const float* weights,
     const float* bias,
@@ -109,7 +109,7 @@ extern ""C"" __global__ void locally_connected_conv2d(
 
 // Backward pass for input gradients
 // Computes gradient with respect to input tensor
-extern ""C"" __global__ void locally_connected_conv2d_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d_backward_input(
     const float* gradOutput,
     const float* weights,
     float* gradInput,
@@ -168,7 +168,7 @@ extern ""C"" __global__ void locally_connected_conv2d_backward_input(
 
 // Backward pass for weight gradients
 // Computes gradient with respect to weights tensor
-extern ""C"" __global__ void locally_connected_conv2d_backward_weights(
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d_backward_weights(
     const float* gradOutput,
     const float* input,
     float* gradWeights,
@@ -221,7 +221,7 @@ extern ""C"" __global__ void locally_connected_conv2d_backward_weights(
 // Backward pass for bias gradients
 // Computes gradient with respect to bias tensor
 // Output shape: [outC] (sum over batch and spatial dims)
-extern ""C"" __global__ void locally_connected_conv2d_backward_bias(
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d_backward_bias(
     const float* gradOutput,
     float* gradBias,
     int batch,
@@ -249,7 +249,7 @@ extern ""C"" __global__ void locally_connected_conv2d_backward_bias(
 
 // Fused locally connected conv2d with activation
 // Supports common activation functions fused into the kernel
-extern ""C"" __global__ void locally_connected_conv2d_fused(
+extern ""C"" __global__ __launch_bounds__(256) void locally_connected_conv2d_fused(
     const float* input,
     const float* weights,
     const float* bias,

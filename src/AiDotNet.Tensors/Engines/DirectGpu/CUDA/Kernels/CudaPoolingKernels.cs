@@ -18,8 +18,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 // ===========================================================================
 
 // Max Pooling 2D with optional indices for backward pass
-extern ""C"" __global__ void maxpool2d(
-    const float* input, float* output, int* indices,
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
+    const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
     int strideH, int strideW, int padH, int padW, int saveIndices)
@@ -58,8 +58,8 @@ extern ""C"" __global__ void maxpool2d(
 }
 
 // Max Pooling 2D backward pass
-extern ""C"" __global__ void maxpool2d_backward(
-    const float* gradOutput, const int* indices, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
@@ -81,8 +81,8 @@ extern ""C"" __global__ void maxpool2d_backward(
 }
 
 // Average Pooling 2D
-extern ""C"" __global__ void avgpool2d(
-    const float* input, float* output,
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
+    const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
     int strideH, int strideW, int padH, int padW, int countIncludePad)
@@ -116,8 +116,8 @@ extern ""C"" __global__ void avgpool2d(
 }
 
 // Average Pooling 2D backward pass
-extern ""C"" __global__ void avgpool2d_backward(
-    const float* gradOutput, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
     int strideH, int strideW, int padH, int padW, int countIncludePad)
@@ -159,8 +159,8 @@ extern ""C"" __global__ void avgpool2d_backward(
 }
 
 // Global Average Pooling 2D
-extern ""C"" __global__ void global_avgpool2d(
-    const float* input, float* output, int batch, int channels, int height, int width)
+extern ""C"" __global__ __launch_bounds__(256) void global_avgpool2d(
+    const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int c = idx % channels;
@@ -181,8 +181,8 @@ extern ""C"" __global__ void global_avgpool2d(
 }
 
 // Global Max Pooling 2D with optional indices for backward pass
-extern ""C"" __global__ void global_maxpool2d(
-    const float* input, float* output, int* indices,
+extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d(
+    const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
     int batch, int channels, int height, int width, int saveIndices)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -213,8 +213,8 @@ extern ""C"" __global__ void global_maxpool2d(
 
 // Global Average Pooling 2D Backward
 // Each thread handles one output element, broadcasting gradient back to all input positions
-extern ""C"" __global__ void global_avgpool2d_backward(
-    const float* gradOutput, float* gradInput, int batch, int channels, int height, int width)
+extern ""C"" __global__ __launch_bounds__(256) void global_avgpool2d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput, int batch, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int spatialSize = height * width;
@@ -234,8 +234,8 @@ extern ""C"" __global__ void global_avgpool2d_backward(
 
 // Global Max Pooling 2D Backward with indices
 // Each thread handles one output gradient, scattering it to the max input position
-extern ""C"" __global__ void global_maxpool2d_backward(
-    const float* gradOutput, const int* indices, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -260,7 +260,7 @@ extern ""C"" __global__ void global_maxpool2d_backward(
 }
 
 // Adaptive Average Pooling 2D
-extern ""C"" __global__ void adaptive_avgpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(
     const float* input, float* output,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
 {
@@ -295,8 +295,8 @@ extern ""C"" __global__ void adaptive_avgpool2d(
 
 // Max Pooling 3D with optional indices for backward pass
 // Input layout: NCDHW (batch, channels, depth, height, width)
-extern ""C"" __global__ void maxpool3d(
-    const float* input, float* output, int* indices,
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d(
+    const float* __restrict__ input, float* __restrict__ output, int* __restrict__ indices,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth,
@@ -356,8 +356,8 @@ extern ""C"" __global__ void maxpool3d(
 }
 
 // Max Pooling 3D backward pass
-extern ""C"" __global__ void maxpool3d_backward(
-    const float* gradOutput, const int* indices, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth)
@@ -391,7 +391,7 @@ extern ""C"" __global__ void maxpool3d_backward(
 
 // Average Pooling 3D
 // Input layout: NCDHW (batch, channels, depth, height, width)
-extern ""C"" __global__ void avgpool3d(
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -440,8 +440,8 @@ extern ""C"" __global__ void avgpool3d(
 }
 
 // Average Pooling 3D backward pass
-extern ""C"" __global__ void avgpool3d_backward(
-    const float* gradOutput, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int outDepth, int outHeight, int outWidth,
@@ -505,7 +505,7 @@ extern ""C"" __global__ void avgpool3d_backward(
 
 // Nearest Neighbor Upsample 2D
 // Each thread handles one output element
-extern ""C"" __global__ void nearest_neighbor_upsample(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample(
     const float* input, float* output,
     int batchChannels, int height, int width,
     int scaleFactor, int totalOutputSize)
@@ -533,8 +533,8 @@ extern ""C"" __global__ void nearest_neighbor_upsample(
 // Nearest Neighbor Upsample 2D backward pass
 // Iterates over INPUT elements to avoid race conditions and atomic contention
 // Each thread accumulates gradients from the scaleFactor x scaleFactor output region
-extern ""C"" __global__ void nearest_neighbor_upsample_backward(
-    const float* gradOutput, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
     int batchChannels, int height, int width,
     int scaleFactor, int totalInputSize)
 {
@@ -576,7 +576,7 @@ extern ""C"" __global__ void nearest_neighbor_upsample_backward(
 
 // Nearest Neighbor Upsample 3D
 // Upsamples each spatial dimension by integer scale factors
-extern ""C"" __global__ void nearest_upsample3d(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -610,8 +610,8 @@ extern ""C"" __global__ void nearest_upsample3d(
 }
 
 // Nearest Neighbor Upsample 3D backward pass
-extern ""C"" __global__ void nearest_upsample3d_backward(
-    const float* gradOutput, float* gradInput,
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
     int scaleD, int scaleH, int scaleW)
@@ -642,6 +642,93 @@ extern ""C"" __global__ void nearest_upsample3d_backward(
 
     atomicAdd(&gradInput[inputIdx], gradOutput[outIdx]);
 }
+
+// ===========================================================================
+// BILINEAR UPSAMPLE 2D
+// ===========================================================================
+
+// Bilinear interpolation upsampling (align_corners=false)
+// Maps output pixel to input coordinate, then does 2x2 bilinear interpolation
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample(
+    const float* __restrict__ input, float* __restrict__ output,
+    int batchChannels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOut = batchChannels * outHeight * outWidth;
+    if (idx >= totalOut) return;
+
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int bc = idx / (outHeight * outWidth);
+
+    // Compute source coordinates (align_corners=false: half-pixel offset)
+    float scaleH = (float)inHeight / (float)outHeight;
+    float scaleW = (float)inWidth / (float)outWidth;
+    float srcH = ((float)oh + 0.5f) * scaleH - 0.5f;
+    float srcW = ((float)ow + 0.5f) * scaleW - 0.5f;
+
+    int h0 = (int)floorf(srcH);
+    int w0 = (int)floorf(srcW);
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    float hLerp = srcH - (float)h0;
+    float wLerp = srcW - (float)w0;
+
+    // Clamp to valid range
+    h0 = max(0, min(h0, inHeight - 1));
+    h1 = max(0, min(h1, inHeight - 1));
+    w0 = max(0, min(w0, inWidth - 1));
+    w1 = max(0, min(w1, inWidth - 1));
+
+    int baseIdx = bc * inHeight * inWidth;
+    float v00 = __ldg(&input[baseIdx + h0 * inWidth + w0]);
+    float v01 = __ldg(&input[baseIdx + h0 * inWidth + w1]);
+    float v10 = __ldg(&input[baseIdx + h1 * inWidth + w0]);
+    float v11 = __ldg(&input[baseIdx + h1 * inWidth + w1]);
+
+    float top = v00 + wLerp * (v01 - v00);
+    float bottom = v10 + wLerp * (v11 - v10);
+    output[idx] = top + hLerp * (bottom - top);
+}
+
+// Bilinear upsampling backward pass
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batchChannels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOut = batchChannels * outHeight * outWidth;
+    if (idx >= totalOut) return;
+
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int bc = idx / (outHeight * outWidth);
+
+    float scaleH = (float)inHeight / (float)outHeight;
+    float scaleW = (float)inWidth / (float)outWidth;
+    float srcH = ((float)oh + 0.5f) * scaleH - 0.5f;
+    float srcW = ((float)ow + 0.5f) * scaleW - 0.5f;
+
+    int h0 = (int)floorf(srcH);
+    int w0 = (int)floorf(srcW);
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    float hLerp = srcH - (float)h0;
+    float wLerp = srcW - (float)w0;
+
+    h0 = max(0, min(h0, inHeight - 1));
+    h1 = max(0, min(h1, inHeight - 1));
+    w0 = max(0, min(w0, inWidth - 1));
+    w1 = max(0, min(w1, inWidth - 1));
+
+    float grad = __ldg(&gradOutput[idx]);
+    int baseIdx = bc * inHeight * inWidth;
+
+    atomicAdd(&gradInput[baseIdx + h0 * inWidth + w0], grad * (1.0f - hLerp) * (1.0f - wLerp));
+    atomicAdd(&gradInput[baseIdx + h0 * inWidth + w1], grad * (1.0f - hLerp) * wLerp);
+    atomicAdd(&gradInput[baseIdx + h1 * inWidth + w0], grad * hLerp * (1.0f - wLerp));
+    atomicAdd(&gradInput[baseIdx + h1 * inWidth + w1], grad * hLerp * wLerp);
+}
 ";
         }
 
@@ -665,7 +752,9 @@ extern ""C"" __global__ void nearest_upsample3d_backward(
                 "nearest_neighbor_upsample",
                 "nearest_neighbor_upsample_backward",
                 "nearest_upsample3d",
-                "nearest_upsample3d_backward"
+                "nearest_upsample3d_backward",
+                "bilinear_upsample",
+                "bilinear_upsample_backward"
             };
         }
     }

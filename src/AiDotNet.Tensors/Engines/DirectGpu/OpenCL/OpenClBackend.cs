@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -76,6 +77,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public int ComputeUnits { get; }
         public long GlobalMemoryBytes { get; }
         public long LocalMemoryBytes { get; }
+        public double TheoreticalGflops { get; private set; }
 
         // IAsyncGpuBackend properties
         public bool SupportsMultiStream => true;
@@ -141,6 +143,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
                 LocalMemoryBytes = (long)_context.LocalMemSize;
+                TheoreticalGflops = EstimateTheoreticalGflops();
 
                 // Store GPU capabilities for dynamic work group sizing
                 _maxWorkGroupSize = _context.MaxWorkGroupSize;
@@ -6089,6 +6092,49 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(channels * bnLocalSize, bnLocalSize);
         }
 
+        public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+            IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+            int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+            FusedActivationType activation)
+        {
+            if (training || activation == FusedActivationType.None)
+                return false;
+
+            string kernelName = activation switch
+            {
+                FusedActivationType.ReLU => "batchnorm_relu",
+                FusedActivationType.GELU => "batchnorm_gelu",
+                FusedActivationType.Sigmoid => "batchnorm_sigmoid",
+                FusedActivationType.Tanh => "batchnorm_tanh",
+                _ => ""
+            };
+
+            if (string.IsNullOrEmpty(kernelName) || !_kernelCache.ContainsKey(kernelName))
+                return false;
+
+            var k = _kernelCache[kernelName];
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)runningMean).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)runningVar).Buffer.Handle);
+            k.SetArg(arg++, batch);
+            k.SetArg(arg++, channels);
+            k.SetArg(arg++, spatialSize);
+            k.SetArg(arg++, epsilon);
+
+            int totalSize = batch * channels * spatialSize;
+            if (totalSize <= 0) return false;
+            int localSize = Math.Min(256, totalSize);
+            localSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, localSize), 2)));
+            localSize = Math.Max(1, localSize);
+            int globalSize = ((totalSize + localSize - 1) / localSize) * localSize;
+            k.Execute1D(globalSize, localSize);
+            return true;
+        }
+
         public void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
             IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
             int batch, int channels, int spatialSize, float epsilon)
@@ -6428,6 +6474,35 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, dropoutRate);
 
             k.Execute1D(size, Math.Min(256, size));
+        }
+
+        public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+            int rows, int cols, float dropoutRate, float scale)
+        {
+            if (!_kernelCache.TryGetValue("bias_dropout", out var k))
+                return false;
+
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
+            k.SetArg(arg++, rows);
+            k.SetArg(arg++, cols);
+            k.SetArg(arg++, dropoutRate);
+            k.SetArg(arg++, scale);
+
+            // 2D dispatch: global_id(0)=col, global_id(1)=row
+            if (rows <= 0 || cols <= 0) return false;
+            int maxLocal = (int)Math.Min(_maxWorkGroupSize, 256);
+            int localSizeX = Math.Min(Math.Min(16, cols), maxLocal);
+            int localSizeY = Math.Min(maxLocal / Math.Max(localSizeX, 1), rows);
+            if (localSizeX <= 0) localSizeX = 1;
+            if (localSizeY <= 0) localSizeY = 1;
+            int globalSizeX = ((cols + localSizeX - 1) / localSizeX) * localSizeX;
+            int globalSizeY = ((rows + localSizeY - 1) / localSizeY) * localSizeY;
+            k.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
+            return true;
         }
 
         #endregion

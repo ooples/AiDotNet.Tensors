@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -17,7 +18,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed class CudaBackend : IAsyncGpuBackend
 {
     private const int DefaultBlockSize = 256;
-    private readonly Dictionary<string, IntPtr> _kernelCache;
+    private const int MaxRnnBlockSize = 1024;
+    private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
     private IntPtr _cublasHandle;
@@ -51,6 +53,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
+    private int _clockRateKHz;
     private bool _hasWmmaSupport;
 
     [ThreadStatic]
@@ -63,6 +66,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public int ComputeUnits { get; }
     public long GlobalMemoryBytes { get; }
     public long LocalMemoryBytes { get; }
+    public double TheoreticalGflops { get; private set; }
 
     // IAsyncGpuBackend properties
     public bool SupportsMultiStream => true;
@@ -126,7 +130,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public CudaBackend(int deviceIndex)
     {
-        _kernelCache = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
+        _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -177,6 +181,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             _ccMajor = cc.Major;
             _ccMinor = cc.Minor;
 
+            // Query clock rate for theoretical GFLOPS calculation
+            if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)
+            {
+                _clockRateKHz = clockKHz;
+            }
+
+            // Compute theoretical peak FP32 GFLOPS from hardware specs
+            TheoreticalGflops = ComputeTheoreticalGflops(_ccMajor, _ccMinor, _multiProcessorCount, _clockRateKHz);
+
             CompileAllKernels(device);
 
             IsAvailable = true;
@@ -193,23 +206,27 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     private readonly struct CudaContextScope : IDisposable
     {
+        private readonly bool _pushed;
+
         public CudaContextScope(IntPtr context)
         {
+            _pushed = false;
             // Push only if this thread doesn't already have the right context.
-            // We intentionally do NOT pop on Dispose — the context stays on the
-            // CUDA stack so subsequent calls on the same thread skip the push entirely.
-            // This eliminates ~244 cuCtxPushCurrent/cuCtxPopCurrent API calls per operation.
-            // The context is cleaned up by cuCtxDestroy in CudaBackend.Dispose().
             if (context != IntPtr.Zero && _threadCurrentContext != context)
             {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(context), "cuCtxPushCurrent");
                 _threadCurrentContext = context;
+                _pushed = true;
             }
         }
 
         public void Dispose()
         {
-            // No-op: context stays on CUDA stack for reuse by next call on this thread
+            if (_pushed)
+            {
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
+                _threadCurrentContext = IntPtr.Zero;
+            }
         }
     }
 
@@ -260,6 +277,36 @@ public sealed class CudaBackend : IAsyncGpuBackend
             return (5, 2);
 
         return (major, minor);
+    }
+
+    /// <summary>
+    /// Computes theoretical peak FP32 GFLOPS from GPU hardware specs.
+    /// Formula: SMs * FP32_cores_per_SM * 2 (FMA) * clock_GHz
+    /// </summary>
+    private static double ComputeTheoreticalGflops(int ccMajor, int ccMinor, int smCount, int clockRateKHz)
+    {
+        if (smCount <= 0 || clockRateKHz <= 0)
+        {
+            // Fallback: conservative estimate
+            return 8000;
+        }
+
+        // FP32 CUDA cores per SM by compute capability
+        int coresPerSm = ccMajor switch
+        {
+            3 => 192,  // Kepler
+            5 => 128,  // Maxwell
+            6 => ccMinor == 0 ? 64 : 128, // Pascal (GP100 vs GP10x)
+            7 => ccMinor == 0 ? 64 : 64,  // Volta/Turing
+            8 => ccMinor == 0 ? 64 : 128,  // Ampere (GA100 vs GA10x)
+            9 => 128,  // Hopper/Ada Lovelace
+            10 => 128, // Blackwell
+            _ => 128   // Future architectures
+        };
+
+        // GFLOPS = cores * 2 (FMA = multiply + add) * clock_GHz
+        double clockGHz = clockRateKHz / 1_000_000.0;
+        return smCount * coresPerSm * 2.0 * clockGHz;
     }
 
     private void CompileActivationKernels(int device)
@@ -321,16 +368,43 @@ public sealed class CudaBackend : IAsyncGpuBackend
         }
     }
 
+    /// <summary>
+    /// Gets the disk cache directory for compiled CUBIN files.
+    /// Returns null if caching is disabled or directory cannot be created.
+    /// </summary>
+    private static string? GetKernelCacheDirectory()
+    {
+        try
+        {
+            string cacheDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AiDotNet", "Tensors", "kernel_cache");
+            Directory.CreateDirectory(cacheDir);
+            return cacheDir;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Computes a hash key for the kernel cache based on source code and compilation options.
+    /// </summary>
+    private static string ComputeCacheKey(string source, string arch)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(source + "|" + arch));
+        return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
+    }
+
     private IntPtr CompileKernelModule(int device, string source, string moduleName, string[] kernelNames)
     {
         // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
-        // CUDA device math functions (expf, sqrtf, tanhf, etc.) are built-in.
-        // We prepend defines for macros normally provided by those headers.
         source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
                        .Replace("#include <float.h>", "// float.h stripped for NVRTC (built-in)")
                        .Replace("#include <stdio.h>", "// stdio.h stripped for NVRTC");
 
-        // Prepend standard macro definitions that NVRTC doesn't provide by default
         const string nvrtcPreamble = @"
 #ifndef INFINITY
 #define INFINITY __int_as_float(0x7f800000)
@@ -354,12 +428,50 @@ public sealed class CudaBackend : IAsyncGpuBackend
         source = nvrtcPreamble + source;
 
         var (major, minor) = GetComputeCapability(device);
-        // Use sm_XX to generate device-native CUBIN (avoids PTX ISA version issues
-        // when the toolkit is newer than the driver's max supported CUDA version).
         string arch = $"--gpu-architecture=sm_{major}{minor}";
-        var optionsList = new List<string> { arch, "--use_fast_math" };
 
-        // Add CUDA include path for headers like cooperative_groups.h, cuda_fp16.h, mma.h
+        // Try loading from disk cache first
+        string? cacheDir = GetKernelCacheDirectory();
+        string cacheKey = ComputeCacheKey(source, arch);
+        string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
+
+        if (cacheFile != null && File.Exists(cacheFile))
+        {
+            try
+            {
+                byte[] cachedBinary = File.ReadAllBytes(cacheFile);
+                IntPtr cachedPtr = Marshal.AllocHGlobal(cachedBinary.Length);
+                try
+                {
+                    Marshal.Copy(cachedBinary, 0, cachedPtr, cachedBinary.Length);
+                    CuBlasNative.CheckCudaResult(
+                        CudaNativeBindings.cuModuleLoadData(out IntPtr cachedModule, cachedPtr),
+                        $"cuModuleLoadData({moduleName} cached)");
+
+                    foreach (var kernelName in kernelNames)
+                    {
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuModuleGetFunction(out IntPtr kernel, cachedModule, kernelName),
+                            $"cuModuleGetFunction({kernelName})");
+                        _kernelCache[kernelName] = kernel;
+                    }
+
+                    return cachedModule;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(cachedPtr);
+                }
+            }
+            catch
+            {
+                // Cache corrupted or incompatible — fall through to recompile
+                try { File.Delete(cacheFile); } catch { }
+            }
+        }
+
+        // Compile with NVRTC
+        var optionsList = new List<string> { arch, "--use_fast_math" };
         var cudaInclude = GetCudaIncludePath();
         if (cudaInclude != null)
             optionsList.Add($"--include-path={cudaInclude}");
@@ -368,12 +480,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
-            ref program,
-            source,
-            moduleName + ".cu",
-            0,
-            IntPtr.Zero,
-            IntPtr.Zero);
+            ref program, source, moduleName + ".cu", 0, IntPtr.Zero, IntPtr.Zero);
         if (result != NvrtcResult.Success)
             throw new InvalidOperationException($"NVRTC program creation failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
 
@@ -385,9 +492,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException($"NVRTC compile failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}\n{log}");
         }
 
-        // sm_XX targets produce CUBIN (native binary) which avoids PTX ISA version
-        // compatibility issues between toolkit and driver versions.
-        // compute_XX targets produce PTX (intermediate) which needs JIT by the driver.
         bool useCubin = arch.Contains("sm_");
         IntPtr binary;
         UIntPtr binarySize;
@@ -400,7 +504,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
                 throw new InvalidOperationException($"NVRTC failed to return CUBIN size for {moduleName}.");
             }
-
             binary = Marshal.AllocHGlobal((int)binarySize);
             result = NvrtcNativeBindings.nvrtcGetCUBIN(program, binary);
         }
@@ -412,7 +515,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
                 throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
             }
-
             binary = Marshal.AllocHGlobal((int)binarySize);
             result = NvrtcNativeBindings.nvrtcGetPTX(program, binary);
         }
@@ -423,6 +525,21 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             Marshal.FreeHGlobal(binary);
             throw new InvalidOperationException($"NVRTC get {(useCubin ? "CUBIN" : "PTX")} failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
+        }
+
+        // Save to disk cache before loading
+        if (cacheFile != null && useCubin)
+        {
+            try
+            {
+                byte[] binaryBytes = new byte[(int)binarySize];
+                Marshal.Copy(binary, binaryBytes, 0, binaryBytes.Length);
+                File.WriteAllBytes(cacheFile, binaryBytes);
+            }
+            catch
+            {
+                // Non-fatal: caching failure doesn't block kernel loading
+            }
         }
 
         IntPtr module;
@@ -725,7 +842,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Relu(temp, output, M * N);
-            Synchronize(); // Ensure all stream work completes before returning buffer
+            // Synchronize removed: kernel serializes on same stream, temp pool return doesn't free memory
             temp.Dispose();
             return output;
         }
@@ -747,7 +864,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Gelu(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -769,7 +885,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Sigmoid(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -791,7 +906,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Tanh(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -821,7 +935,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Silu(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -892,8 +1005,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: bias_add_out");
 
         using var _ = PushContext();
-        int size = M * N;
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridX = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)M;
         IntPtr aPtr = A.Handle;
         IntPtr biasPtr = bias.Handle;
         IntPtr cPtr = C.Handle;
@@ -905,7 +1018,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[2] = &cPtr;
         args[3] = &rows;
         args[4] = &cols;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
@@ -914,8 +1027,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_bias_add");
 
         using var _ = PushContext();
-        int totalSize = batch * channels * spatialSize;
-        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
+        uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)(batch * channels);
         IntPtr outPtr = output.Handle;
         IntPtr biasPtr = bias.Handle;
         void** args = stackalloc void*[5];
@@ -924,7 +1038,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[2] = &batch;
         args[3] = &channels;
         args[4] = &spatialSize;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
@@ -2350,8 +2464,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: bias_add");
 
         using var _ = PushContext();
-        int size = rows * cols;
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)rows;
         IntPtr dataPtr = data.Handle;
         IntPtr biasPtr = bias.Handle;
         int r = rows;
@@ -2361,7 +2475,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[1] = &biasPtr;
         args[2] = &r;
         args[3] = &c;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockX, void** args)
@@ -3992,6 +4106,51 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
     }
 
+    public unsafe bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation)
+    {
+        // Fused kernels only support inference mode (use running stats, no save mean/var)
+        if (training || activation == FusedActivationType.None)
+            return false;
+
+        string kernelName = activation switch
+        {
+            FusedActivationType.ReLU => "batchnorm_relu",
+            FusedActivationType.GELU => "batchnorm_gelu",
+            FusedActivationType.Sigmoid => "batchnorm_sigmoid",
+            FusedActivationType.Tanh => "batchnorm_tanh",
+            _ => ""
+        };
+
+        if (string.IsNullOrEmpty(kernelName) || !_kernelCache.TryGetValue(kernelName, out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        int totalSize = batch * channels * spatialSize;
+        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr gammaPtr = gamma.Handle;
+        IntPtr betaPtr = beta.Handle;
+        IntPtr runMeanPtr = runningMean.Handle;
+        IntPtr runVarPtr = runningVar.Handle;
+        void** args = stackalloc void*[10];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &gammaPtr;
+        args[3] = &betaPtr;
+        args[4] = &runMeanPtr;
+        args[5] = &runVarPtr;
+        args[6] = &batch;
+        args[7] = &channels;
+        args[8] = &spatialSize;
+        args[9] = &epsilon;
+        LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        return true;
+    }
+
     public unsafe void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
@@ -4398,6 +4557,34 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[3] = &size;
         args[4] = &dropoutRate;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale)
+    {
+        if (!_kernelCache.TryGetValue("bias_dropout", out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        // 2D grid: x = columns (threads per row), y = rows
+        uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)rows;
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr maskPtr = mask.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &biasPtr;
+        args[3] = &maskPtr;
+        args[4] = &rows;
+        args[5] = &cols;
+        args[6] = &dropoutRate;
+        args[7] = &scale;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+        return true;
     }
 
     #endregion
@@ -6618,8 +6805,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             args[2] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
             LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
-            Synchronize();
-
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] meanResult = DownloadBuffer(meanBuffer);
             mean = meanResult[0] / size;
         }
@@ -6646,8 +6832,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             args[3] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
             LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
-            Synchronize();
-
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
         }
@@ -8506,10 +8691,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: lstm_forward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -8519,6 +8704,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // Grid = one block per batch sample, block = hiddenSize threads per batch
         // This ensures __syncthreads() correctly synchronizes all threads for the same batch
         uint grid = (uint)batch;
+        uint blockSize = (uint)hiddenSize;
 
         IntPtr inputPtr = input.Handle;
         IntPtr hInitPtr = hInit.Handle;
@@ -8550,7 +8736,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &inputSize;
         args[14] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, blockSize, args);
 
         // Copy the last timestep from allH and allC into hFinal and cFinal
         // allH layout: [(seqLen + 1) * batch * hiddenSize] where index 0 is hInit
@@ -8590,10 +8776,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: lstm_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -8645,7 +8831,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[18] = &inputSize;
         args[19] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, (uint)hiddenSize, args);
     }
 
     public unsafe void GruForwardSequence(
@@ -8658,13 +8844,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: gru_forward_sequence");
 
         // The forward kernel uses __syncthreads() which only synchronizes within a block.
-        // If hiddenSize > DefaultBlockSize, threads within a batch would span multiple blocks,
+        // If hiddenSize > MaxRnnBlockSize, threads within a batch would span multiple blocks,
         // causing a race condition when reading reset gates computed by other threads.
         // Enforce one-block-per-batch constraint for correctness.
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }
@@ -8702,7 +8888,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[12] = &inputSize;
         args[13] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, (uint)hiddenSize, args);
     }
 
     public unsafe void GruBackwardSequence(
@@ -8716,10 +8902,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: gru_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }
@@ -8767,7 +8953,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[16] = &hiddenSize;
 
         // Use cooperative kernel launch for grid-wide synchronization (grid.sync())
-        LaunchCooperativeKernel(kernel, grid, DefaultBlockSize, sharedMemSize, args);
+        LaunchCooperativeKernel(kernel, grid, (uint)hiddenSize, sharedMemSize, args);
     }
 
     public unsafe void GruCellBackward(

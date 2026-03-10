@@ -88,6 +88,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// </summary>
     public long LocalMemoryBytes => (long)(_device?.MaxThreadgroupMemoryLength ?? 32768);
 
+    public double TheoreticalGflops { get; }
+
     #endregion
 
     #region Constructor and Initialization

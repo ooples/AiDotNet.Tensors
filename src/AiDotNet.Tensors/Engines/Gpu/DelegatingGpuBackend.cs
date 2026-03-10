@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
@@ -48,6 +49,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual long LocalMemoryBytes => Inner.LocalMemoryBytes;
+
+    /// <inheritdoc/>
+    public virtual double TheoreticalGflops => Inner.TheoreticalGflops;
 
     #endregion
 
@@ -681,6 +685,14 @@ public class DelegatingGpuBackend : IDirectGpuBackend
             batch, channels, spatialSize, epsilon, momentum, training);
 
     /// <inheritdoc/>
+    public virtual bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
+        FusedActivationType activation)
+        => Inner.TryFusedBatchNormActivation(input, output, gamma, beta, runningMean, runningVar, saveMean, saveInvVar,
+            batch, channels, spatialSize, epsilon, momentum, training, activation);
+
+    /// <inheritdoc/>
     public virtual void BatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
@@ -737,6 +749,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
         => Inner.DropoutBackward(gradOutput, mask, gradInput, size, dropoutRate);
+
+    /// <inheritdoc/>
+    public virtual bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale)
+        => Inner.TryFusedBiasDropout(input, output, bias, mask, rows, cols, dropoutRate, scale);
 
     #endregion
 

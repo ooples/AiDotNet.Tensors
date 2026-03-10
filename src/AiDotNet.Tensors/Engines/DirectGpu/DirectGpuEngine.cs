@@ -340,6 +340,7 @@ public sealed class DirectGpuEngine : IDisposable
     /// <summary>
     /// Converts a generic array to float array for GPU processing.
     /// Uses vectorized span-based conversion via IVectorizedOperations.ToFloatSpan.
+    /// No caching — arrays are mutable, so cached conversions could return stale data.
     /// </summary>
     public static float[] ToFloatArray<T>(T[] data)
     {
@@ -349,6 +350,7 @@ public sealed class DirectGpuEngine : IDisposable
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new float[data.Length];
         numOps.ToFloatSpan(new ReadOnlySpan<T>(data), new Span<float>(result));
+
         return result;
     }
 

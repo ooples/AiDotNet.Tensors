@@ -32,6 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 // ===========================================================================
 
 #define TILE_SIZE 16
+#define PAD 1  // +1 padding to avoid shared memory bank conflicts
 
 // Fused GEMM + Bias + ReLU
 // output = ReLU(A * B + bias)
@@ -45,8 +46,8 @@ __kernel void gemm_bias_relu(
     const int K)
 {
     // Tile-based GEMM with fused bias and ReLU
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float As[TILE_SIZE][TILE_SIZE + PAD];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -93,8 +94,8 @@ __kernel void gemm_bias_gelu(
     const int N,
     const int K)
 {
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float As[TILE_SIZE][TILE_SIZE + PAD];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -145,8 +146,8 @@ __kernel void gemm_bias_sigmoid(
     const int N,
     const int K)
 {
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float As[TILE_SIZE][TILE_SIZE + PAD];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -191,8 +192,8 @@ __kernel void gemm_bias_tanh(
     const int N,
     const int K)
 {
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float As[TILE_SIZE][TILE_SIZE + PAD];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -237,8 +238,8 @@ __kernel void gemm_bias(
     const int N,
     const int K)
 {
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float As[TILE_SIZE][TILE_SIZE + PAD];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -489,11 +490,13 @@ __kernel void bias_dropout(
     __global const uint* mask,
     int rows, int cols, float dropoutProb, float scale)
 {
-    int idx = get_global_id(0);
-    int size = rows * cols;
-    if (idx >= size) return;
+    // 2D dispatch: get_global_id(0) = column, get_global_id(1) = row
+    // Eliminates integer division from idx % cols
+    int col = get_global_id(0);
+    int row = get_global_id(1);
+    if (col >= cols || row >= rows) return;
 
-    int col = idx % cols;
+    int idx = row * cols + col;
     float val = input[idx] + bias[col];
     uint m = mask[idx];
     output[idx] = (m != 0) ? val * scale : 0.0f;

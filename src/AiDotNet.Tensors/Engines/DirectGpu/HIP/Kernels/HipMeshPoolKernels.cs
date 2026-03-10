@@ -22,7 +22,7 @@ internal static class HipMeshPoolKernels
 // MESH POOL FORWARD KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void mesh_pool_compute_scores(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_compute_scores(
     const float* input,
     const float* importanceWeights,
     float* scores,
@@ -41,7 +41,7 @@ extern ""C"" __global__ void mesh_pool_compute_scores(
 }
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
-extern ""C"" __global__ void mesh_pool_gather(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_gather(
     const float* input,
     const int* keptIndices,
     float* output,
@@ -69,7 +69,7 @@ extern ""C"" __global__ void mesh_pool_gather(
 // ===========================================================================
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
-extern ""C"" __global__ void mesh_pool_backward(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_backward(
     const float* gradOutput,
     const int* keptIndices,
     float* gradInput,
@@ -93,7 +93,7 @@ extern ""C"" __global__ void mesh_pool_backward(
 }
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
-extern ""C"" __global__ void mesh_pool_importance_backward(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_importance_backward(
     const float* gradOutput,
     const float* input,
     const int* keptIndices,
@@ -126,7 +126,7 @@ extern ""C"" __global__ void mesh_pool_importance_backward(
 // MESH POOL UTILITY KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void mesh_pool_zero_grad(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_zero_grad(
     float* gradInput,
     int size)
 {
@@ -143,7 +143,7 @@ extern ""C"" __global__ void mesh_pool_zero_grad(
 // ===========================================================================
 
 // Step 1: Parallel reduction to find maximum score
-extern ""C"" __global__ void mesh_pool_softmax_find_max(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_find_max(
     const float* scores,
     float* partialMax,
     int numEdges)
@@ -171,7 +171,7 @@ extern ""C"" __global__ void mesh_pool_softmax_find_max(
 }
 
 // Step 2: Final max reduction (single block)
-extern ""C"" __global__ void mesh_pool_softmax_final_max(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_max(
     const float* partialMax,
     float* globalMax,
     int numPartials)
@@ -198,7 +198,7 @@ extern ""C"" __global__ void mesh_pool_softmax_final_max(
 }
 
 // Step 3: Compute exp values and partial sums
-extern ""C"" __global__ void mesh_pool_softmax_exp_sum(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_exp_sum(
     const float* scores,
     const float* globalMax,
     float* expValues,
@@ -236,7 +236,7 @@ extern ""C"" __global__ void mesh_pool_softmax_exp_sum(
 }
 
 // Step 4: Final sum reduction (single block)
-extern ""C"" __global__ void mesh_pool_softmax_final_sum(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_final_sum(
     const float* partialSum,
     float* globalSum,
     int numPartials)
@@ -263,7 +263,7 @@ extern ""C"" __global__ void mesh_pool_softmax_final_sum(
 }
 
 // Step 5: Normalize exp values by the global sum
-extern ""C"" __global__ void mesh_pool_softmax_normalize(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_normalize(
     const float* expValues,
     const float* globalSum,
     float* softmaxScores,
@@ -278,7 +278,7 @@ extern ""C"" __global__ void mesh_pool_softmax_normalize(
 
 // Legacy wrapper: Single block softmax for small numEdges
 // IMPORTANT: Must be launched with exactly ONE block where blockDim.x >= numEdges
-extern ""C"" __global__ void mesh_pool_softmax_scores(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_softmax_scores(
     const float* scores,
     float* softmaxScores,
     float temperature,
@@ -325,7 +325,7 @@ extern ""C"" __global__ void mesh_pool_softmax_scores(
 }
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
-extern ""C"" __global__ void mesh_pool_weighted_gather(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_weighted_gather(
     const float* input,
     const float* scores,
     const int* keptIndices,
@@ -351,7 +351,7 @@ extern ""C"" __global__ void mesh_pool_weighted_gather(
 }
 
 // keptIndices: [numKept] - must be valid indices in [0, numEdges)
-extern ""C"" __global__ void mesh_pool_weighted_backward(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_weighted_backward(
     const float* gradOutput,
     const float* scores,
     const int* keptIndices,
@@ -376,7 +376,7 @@ extern ""C"" __global__ void mesh_pool_weighted_backward(
     atomicAdd(&gradInput[origIdx * inputChannels + channel], gradVal);
 }
 
-extern ""C"" __global__ void mesh_pool_scores_backward(
+extern ""C"" __global__ __launch_bounds__(256) void mesh_pool_scores_backward(
     const float* gradOutput,
     const float* input,
     const int* keptIndices,

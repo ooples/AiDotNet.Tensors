@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
@@ -29,62 +29,66 @@ jobs:
       run: dotnet restore
 
     - name: Build
-      run: dotnet build --configuration Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+      run: |
+        dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net10.0 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+        dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net10.0
 
     - name: Test with Coverage
-      shell: pwsh
       run: |
-        dotnet test --configuration Release --no-build --verbosity normal --framework net10.0 `
-          --collect:"XPlat Code Coverage" `
-          --results-directory ./coverage `
-          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura `
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ./coverage \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
           DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*"
 
     - name: Install ReportGenerator
-      shell: pwsh
       run: dotnet tool install --global dotnet-reportgenerator-globaltool
 
     - name: Generate Coverage Report
-      shell: pwsh
       run: |
-        reportgenerator `
-          -reports:"./coverage/**/coverage.cobertura.xml" `
-          -targetdir:"./coverage/report" `
+        reportgenerator \
+          -reports:"./coverage/**/coverage.cobertura.xml" \
+          -targetdir:"./coverage/report" \
           -reporttypes:"Html;Cobertura;TextSummary"
 
     - name: Display Coverage Summary
-      shell: pwsh
       run: |
-        $summaryFile = "./coverage/report/Summary.txt"
-        if (Test-Path $summaryFile) {
-          Write-Host "=== Code Coverage Summary ==="
-          Get-Content $summaryFile
-          Write-Host "============================="
-        }
+        if [ -f "./coverage/report/Summary.txt" ]; then
+          echo "=== Code Coverage Summary ==="
+          cat "./coverage/report/Summary.txt"
+          echo "============================="
+        fi
 
     - name: Check Coverage Threshold
-      shell: pwsh
       run: |
-        $coverageFile = Get-ChildItem -Path "./coverage" -Recurse -Filter "coverage.cobertura.xml" | Select-Object -First 1
-        if (-not $coverageFile) {
-          Write-Error "No coverage file found!"
+        COVERAGE_FILE=$(find ./coverage -name "coverage.cobertura.xml" -type f | head -1)
+        if [ -z "$COVERAGE_FILE" ]; then
+          echo "::error::No coverage file found!"
           exit 1
-        }
+        fi
 
-        [xml]$coverage = Get-Content $coverageFile.FullName
-        $lineRate = [double]$coverage.coverage.'line-rate' * 100
-        $branchRate = [double]$coverage.coverage.'branch-rate' * 100
+        LINE_RATE=$(python3 -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('$COVERAGE_FILE')
+        print(float(tree.getroot().get('line-rate', '0')) * 100)
+        ")
+        BRANCH_RATE=$(python3 -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('$COVERAGE_FILE')
+        print(float(tree.getroot().get('branch-rate', '0')) * 100)
+        ")
 
-        Write-Host "Line Coverage: $([math]::Round($lineRate, 2))%"
-        Write-Host "Branch Coverage: $([math]::Round($branchRate, 2))%"
-        Write-Host "Required Threshold: $env:COVERAGE_THRESHOLD%"
+        echo "Line Coverage: ${LINE_RATE}%"
+        echo "Branch Coverage: ${BRANCH_RATE}%"
+        echo "Required Threshold: ${COVERAGE_THRESHOLD}%"
 
-        if ($lineRate -lt $env:COVERAGE_THRESHOLD) {
-          Write-Error "Line coverage ($([math]::Round($lineRate, 2))%) is below the required threshold ($env:COVERAGE_THRESHOLD%)!"
+        PASS=$(python3 -c "print('yes' if $LINE_RATE >= $COVERAGE_THRESHOLD else 'no')")
+        if [ "$PASS" != "yes" ]; then
+          echo "::error::Line coverage (${LINE_RATE}%) is below the required threshold (${COVERAGE_THRESHOLD}%)!"
           exit 1
-        }
+        fi
 
-        Write-Host "Coverage check PASSED!"
+        echo "Coverage check PASSED!"
 
     - name: Upload Coverage Report
       uses: actions/upload-artifact@v4

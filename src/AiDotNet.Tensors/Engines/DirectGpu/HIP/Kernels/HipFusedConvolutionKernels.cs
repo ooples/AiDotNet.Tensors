@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
 // ===========================================================================
 
 // Fused Conv2D + Bias + ReLU
-extern ""C"" __global__ void conv2d_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_relu(
     const float* input, const float* weights, const float* bias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -56,7 +56,7 @@ extern ""C"" __global__ void conv2d_bias_relu(
 }
 
 // Fused Conv2D + Bias + GELU
-extern ""C"" __global__ void conv2d_bias_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_gelu(
     const float* input, const float* weights, const float* bias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -97,7 +97,7 @@ extern ""C"" __global__ void conv2d_bias_gelu(
 }
 
 // Fused Conv2D + Bias + Sigmoid
-extern ""C"" __global__ void conv2d_bias_sigmoid(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_sigmoid(
     const float* input, const float* weights, const float* bias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -134,7 +134,7 @@ extern ""C"" __global__ void conv2d_bias_sigmoid(
 }
 
 // Fused Conv2D + Bias (no activation)
-extern ""C"" __global__ void conv2d_bias(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias(
     const float* input, const float* weights, const float* bias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -174,7 +174,7 @@ extern ""C"" __global__ void conv2d_bias(
 // ===========================================================================
 
 // Fused Conv2D with folded BatchNorm + ReLU
-extern ""C"" __global__ void conv2d_batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_batchnorm_relu(
     const float* input, const float* foldedWeights, const float* foldedBias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -211,7 +211,7 @@ extern ""C"" __global__ void conv2d_batchnorm_relu(
 }
 
 // Fused Conv2D with folded BatchNorm + GELU
-extern ""C"" __global__ void conv2d_batchnorm_gelu(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_batchnorm_gelu(
     const float* input, const float* foldedWeights, const float* foldedBias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -252,7 +252,7 @@ extern ""C"" __global__ void conv2d_batchnorm_gelu(
 }
 
 // Fused Conv2D with folded BatchNorm (no activation)
-extern ""C"" __global__ void conv2d_batchnorm(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_batchnorm(
     const float* input, const float* foldedWeights, const float* foldedBias, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -292,7 +292,7 @@ extern ""C"" __global__ void conv2d_batchnorm(
 // ===========================================================================
 
 // Fused Depthwise Conv2D + Bias + ReLU
-extern ""C"" __global__ void depthwise_conv2d_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_bias_relu(
     const float* input, const float* weights, const float* bias, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
@@ -326,7 +326,7 @@ extern ""C"" __global__ void depthwise_conv2d_bias_relu(
 }
 
 // Fused Depthwise Conv2D + BatchNorm + ReLU
-extern ""C"" __global__ void depthwise_conv2d_batchnorm_relu(
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_batchnorm_relu(
     const float* input, const float* foldedWeights, const float* foldedBias, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,

@@ -46,7 +46,7 @@ __device__ float tanh_derivative(float tanh_output) {
 // weights*h: [hiddenChannels, hiddenChannels, kernelH, kernelW]
 // bias*: [hiddenChannels]
 // output newH, newC: [batch, hiddenChannels, height, width]
-extern ""C"" __global__ void convlstm_cell_forward(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_forward(
     const float* input,
     const float* prevH,
     const float* prevC,
@@ -147,7 +147,7 @@ extern ""C"" __global__ void convlstm_cell_forward(
 // ===========================================================================
 
 // ConvLSTM backward pass - compute gradients for input and previous hidden state
-extern ""C"" __global__ void convlstm_cell_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_input(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,
@@ -219,7 +219,7 @@ extern ""C"" __global__ void convlstm_cell_backward_input(
 }
 
 // ConvLSTM backward pass - compute gradients for previous hidden state
-extern ""C"" __global__ void convlstm_cell_backward_prevh(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_prevh(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,
@@ -291,7 +291,7 @@ extern ""C"" __global__ void convlstm_cell_backward_prevh(
 }
 
 // ConvLSTM backward pass - compute gradient for previous cell state
-extern ""C"" __global__ void convlstm_cell_backward_prevc(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_prevc(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateO,
@@ -321,7 +321,7 @@ extern ""C"" __global__ void convlstm_cell_backward_prevc(
 }
 
 // ConvLSTM backward pass - compute weight gradients (input weights)
-extern ""C"" __global__ void convlstm_cell_backward_weights_input(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_weights_input(
     const float* input,
     const float* gradH,
     const float* gradC,
@@ -394,7 +394,7 @@ extern ""C"" __global__ void convlstm_cell_backward_weights_input(
 }
 
 // ConvLSTM backward pass - compute weight gradients (hidden weights)
-extern ""C"" __global__ void convlstm_cell_backward_weights_hidden(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_weights_hidden(
     const float* prevH,
     const float* gradH,
     const float* gradC,
@@ -467,7 +467,7 @@ extern ""C"" __global__ void convlstm_cell_backward_weights_hidden(
 }
 
 // ConvLSTM backward pass - compute bias gradients
-extern ""C"" __global__ void convlstm_cell_backward_biases(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_biases(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,
