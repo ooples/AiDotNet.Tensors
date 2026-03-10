@@ -211,8 +211,12 @@ extern ""C"" __global__ void mfma_gemm_f32(
     for (int i = 0; i < 16; i++) {
         // Calculate output position based on MFMA output layout
         // MFMA_F32_32x32x8 distributes 32x32 outputs across 64 threads
-        const int localRow = (laneId / 4) + (i / 4) * 8;
-        const int localCol = (laneId % 4) * 2 + (i % 4);
+        // AMD CDNA MFMA_F32_32x32x8 output layout (per ISA manual):
+        // 64 lanes x 16 results = 1024 elements = 32x32 output
+        // row = (result_idx / 4) * 8 + (lane % 8)  [4 groups of 8 rows]
+        // col = (lane / 8) + (result_idx % 4) * 8   [8 base cols x 4 groups]
+        const int localRow = (i / 4) * 8 + (laneId % 8);
+        const int localCol = (laneId / 8) + (i % 4) * 8;
 
         const int globalRow = blockRow + warpRow + localRow;
         const int globalCol = blockCol + warpCol + localCol;
@@ -350,8 +354,12 @@ extern ""C"" __global__ void mfma_gemm_f16(
     // Write results (FP32)
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        const int localRow = (laneId / 4) + (i / 4) * 8;
-        const int localCol = (laneId % 4) * 2 + (i % 4);
+        // AMD CDNA MFMA_F32_32x32x8 output layout (per ISA manual):
+        // 64 lanes x 16 results = 1024 elements = 32x32 output
+        // row = (result_idx / 4) * 8 + (lane % 8)  [4 groups of 8 rows]
+        // col = (lane / 8) + (result_idx % 4) * 8   [8 base cols x 4 groups]
+        const int localRow = (i / 4) * 8 + (laneId % 8);
+        const int localCol = (laneId / 8) + (i % 4) * 8;
         const int globalRow = blockRow + warpRow + localRow;
         const int globalCol = blockCol + warpCol + localCol;
 
