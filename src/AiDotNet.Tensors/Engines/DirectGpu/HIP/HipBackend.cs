@@ -579,6 +579,28 @@ public sealed class HipBackend : IAsyncGpuBackend
         LaunchKernelOnStream(kernel, gridX, blockSize, args, _stream, sharedMem);
     }
 
+    /// <summary>
+    /// Launch kernel with stackalloc void** args (zero GCHandle allocation overhead).
+    /// </summary>
+    private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockSize, void** args, uint sharedMem = 0)
+    {
+        var result = HipNativeBindings.hipModuleLaunchKernel(
+            kernel, gridX, 1, 1, blockSize, 1, 1,
+            sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
+        HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
+    }
+
+    /// <summary>
+    /// Launch 2D kernel with stackalloc void** args (zero GCHandle allocation overhead).
+    /// </summary>
+    private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, void** args, uint sharedMem = 0)
+    {
+        var result = HipNativeBindings.hipModuleLaunchKernel(
+            kernel, gridX, gridY, 1, blockX, blockY, 1,
+            sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
+        HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
+    }
+
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockSize, uint sharedMemBytes, IntPtr[] args)
     {
         LaunchKernelOnStream(kernel, gridX, blockSize, args, _stream, sharedMemBytes);
@@ -803,7 +825,7 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     #region GEMM Operations
 
-    public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    public unsafe void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         if (TryExecuteHipBlasGemm(A, B, C, M, N, K, alpha, beta))
         {
@@ -853,59 +875,29 @@ public sealed class HipBackend : IAsyncGpuBackend
         uint gridDimX = (uint)((M + tileM - 1) / tileM);
         uint gridDimY = (uint)((N + tileN - 1) / tileN);
 
-        // Prepare kernel arguments
-        IntPtr[] kernelArgs = new IntPtr[8];
-        GCHandle[] handles = new GCHandle[8];
+        // Prepare kernel arguments using stackalloc (zero GCHandle overhead)
+        var argA = bufferA.Handle;
+        var argB = bufferB.Handle;
+        var argC = bufferC.Handle;
 
-        try
-        {
-            // Marshal arguments
-            var argA = bufferA.Handle;
-            var argB = bufferB.Handle;
-            var argC = bufferC.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &argA;
+        args[1] = &argB;
+        args[2] = &argC;
+        args[3] = &M;
+        args[4] = &N;
+        args[5] = &K;
+        args[6] = &alpha;
+        args[7] = &beta;
 
-            handles[0] = GCHandle.Alloc(argA, GCHandleType.Pinned);
-            handles[1] = GCHandle.Alloc(argB, GCHandleType.Pinned);
-            handles[2] = GCHandle.Alloc(argC, GCHandleType.Pinned);
-            handles[3] = GCHandle.Alloc(M, GCHandleType.Pinned);
-            handles[4] = GCHandle.Alloc(N, GCHandleType.Pinned);
-            handles[5] = GCHandle.Alloc(K, GCHandleType.Pinned);
-            handles[6] = GCHandle.Alloc(alpha, GCHandleType.Pinned);
-            handles[7] = GCHandle.Alloc(beta, GCHandleType.Pinned);
-
-            for (int i = 0; i < 8; i++)
-            {
-                kernelArgs[i] = handles[i].AddrOfPinnedObject();
-            }
-
-            // Allocate and populate kernel params array
-            GCHandle kernelParamsHandle = GCHandle.Alloc(kernelArgs, GCHandleType.Pinned);
-            try
-            {
-                var result = HipNativeBindings.hipModuleLaunchKernel(
-                    kernel,
-                    gridDimX, gridDimY, 1,
-                    (uint)blockSize, 1, 1,
-                    0, // shared memory
-                    _stream,
-                    kernelParamsHandle.AddrOfPinnedObject(),
-                    IntPtr.Zero);
-
-                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-            }
-            finally
-            {
-                kernelParamsHandle.Free();
-            }
-        }
-        finally
-        {
-            foreach (var handle in handles)
-            {
-                if (handle.IsAllocated)
-                    handle.Free();
-            }
-        }
+        var result = HipNativeBindings.hipModuleLaunchKernel(
+            kernel,
+            gridDimX, gridDimY, 1,
+            (uint)blockSize, 1, 1,
+            0, _stream,
+            (IntPtr)args,
+            IntPtr.Zero);
+        HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
 
         // Synchronize
         var syncResult = HipNativeBindings.hipStreamSynchronize(_stream);

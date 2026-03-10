@@ -1,0 +1,27 @@
+{
+  "enabledMcpjsonServers": [
+    "supabase",
+    "typescript-mcp",
+    "ambiance",
+    "git",
+    "github",
+    "console-automation",
+    "memory",
+    "sequential-thinking",
+    "playwright",
+    "filesystem",
+    "database-postgresql",
+    "puppeteer",
+    "firecrawl",
+    "azure",
+    "vercel",
+    "sentry",
+    "office-word",
+    "figma",
+    "claude-test",
+    "nx-mcp",
+    "eslint",
+    "token-optimizer"
+  ],
+  "enableAllProjectMcpServers": true
+}

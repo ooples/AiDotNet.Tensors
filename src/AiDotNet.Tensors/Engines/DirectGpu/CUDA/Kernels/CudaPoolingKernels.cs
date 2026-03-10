@@ -642,6 +642,93 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
 
     atomicAdd(&gradInput[inputIdx], gradOutput[outIdx]);
 }
+
+// ===========================================================================
+// BILINEAR UPSAMPLE 2D
+// ===========================================================================
+
+// Bilinear interpolation upsampling (align_corners=false)
+// Maps output pixel to input coordinate, then does 2x2 bilinear interpolation
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample(
+    const float* __restrict__ input, float* __restrict__ output,
+    int batchChannels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOut = batchChannels * outHeight * outWidth;
+    if (idx >= totalOut) return;
+
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int bc = idx / (outHeight * outWidth);
+
+    // Compute source coordinates (align_corners=false: half-pixel offset)
+    float scaleH = (float)inHeight / (float)outHeight;
+    float scaleW = (float)inWidth / (float)outWidth;
+    float srcH = ((float)oh + 0.5f) * scaleH - 0.5f;
+    float srcW = ((float)ow + 0.5f) * scaleW - 0.5f;
+
+    int h0 = (int)floorf(srcH);
+    int w0 = (int)floorf(srcW);
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    float hLerp = srcH - (float)h0;
+    float wLerp = srcW - (float)w0;
+
+    // Clamp to valid range
+    h0 = max(0, min(h0, inHeight - 1));
+    h1 = max(0, min(h1, inHeight - 1));
+    w0 = max(0, min(w0, inWidth - 1));
+    w1 = max(0, min(w1, inWidth - 1));
+
+    int baseIdx = bc * inHeight * inWidth;
+    float v00 = __ldg(&input[baseIdx + h0 * inWidth + w0]);
+    float v01 = __ldg(&input[baseIdx + h0 * inWidth + w1]);
+    float v10 = __ldg(&input[baseIdx + h1 * inWidth + w0]);
+    float v11 = __ldg(&input[baseIdx + h1 * inWidth + w1]);
+
+    float top = v00 + wLerp * (v01 - v00);
+    float bottom = v10 + wLerp * (v11 - v10);
+    output[idx] = top + hLerp * (bottom - top);
+}
+
+// Bilinear upsampling backward pass
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample_backward(
+    const float* __restrict__ gradOutput, float* __restrict__ gradInput,
+    int batchChannels, int inHeight, int inWidth, int outHeight, int outWidth)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOut = batchChannels * outHeight * outWidth;
+    if (idx >= totalOut) return;
+
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int bc = idx / (outHeight * outWidth);
+
+    float scaleH = (float)inHeight / (float)outHeight;
+    float scaleW = (float)inWidth / (float)outWidth;
+    float srcH = ((float)oh + 0.5f) * scaleH - 0.5f;
+    float srcW = ((float)ow + 0.5f) * scaleW - 0.5f;
+
+    int h0 = (int)floorf(srcH);
+    int w0 = (int)floorf(srcW);
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    float hLerp = srcH - (float)h0;
+    float wLerp = srcW - (float)w0;
+
+    h0 = max(0, min(h0, inHeight - 1));
+    h1 = max(0, min(h1, inHeight - 1));
+    w0 = max(0, min(w0, inWidth - 1));
+    w1 = max(0, min(w1, inWidth - 1));
+
+    float grad = __ldg(&gradOutput[idx]);
+    int baseIdx = bc * inHeight * inWidth;
+
+    atomicAdd(&gradInput[baseIdx + h0 * inWidth + w0], grad * (1.0f - hLerp) * (1.0f - wLerp));
+    atomicAdd(&gradInput[baseIdx + h0 * inWidth + w1], grad * (1.0f - hLerp) * wLerp);
+    atomicAdd(&gradInput[baseIdx + h1 * inWidth + w0], grad * hLerp * (1.0f - wLerp));
+    atomicAdd(&gradInput[baseIdx + h1 * inWidth + w1], grad * hLerp * wLerp);
+}
 ";
         }
 
@@ -665,7 +752,9 @@ extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
                 "nearest_neighbor_upsample",
                 "nearest_neighbor_upsample_backward",
                 "nearest_upsample3d",
-                "nearest_upsample3d_backward"
+                "nearest_upsample3d_backward",
+                "bilinear_upsample",
+                "bilinear_upsample_backward"
             };
         }
     }
