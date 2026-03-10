@@ -74,8 +74,12 @@ internal static class TensorAllocator
         if (pooledArray != null)
         {
             tensor.DetachPooledArray();
+#if NET5_0_OR_GREATER
             ArrayPool<T>.Shared.Return(pooledArray,
                 clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+#else
+            ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
+#endif
         }
     }
 
