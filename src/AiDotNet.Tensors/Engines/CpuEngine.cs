@@ -1942,7 +1942,29 @@ public class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            double* pA = (double*)pinA.Pointer;
+            double* pB = (double*)pinB.Pointer;
+            double* pR = (double*)pinR.Pointer;
+            // Parallel chunking for large double arrays (8 bytes/element = 2x bandwidth)
+            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            if (subChunks >= 2)
+            {
+                int chunkSize = (length + subChunks - 1) / subChunks;
+                chunkSize = (chunkSize + 15) & ~15; // Align to AVX double boundary (4 doubles)
+                IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
+                int totalLength = length;
+                Parallel.For(0, subChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, totalLength - start);
+                    if (count > 0)
+                        SimdKernels.VectorAddUnsafe((double*)ipA + start, (double*)ipB + start, (double*)ipR + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+            }
             return result;
         }
 
@@ -4156,6 +4178,31 @@ public class CpuEngine : ITensorLevelEngine
                 SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
             return result;
+        }
+
+        // Double fast path: parallel SIMD Sigmoid via DoubleOperations
+        if (typeof(T) == typeof(double))
+        {
+            var numOpsD = MathHelper.GetNumericOperations<double>();
+            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 256_000));
+            if (subChunks >= 2)
+            {
+                var srcArr = (double[])(object)tensor.GetDataArray();
+                var dstArr = (double[])(object)result.GetDataArray();
+                int chunkSize = (length + subChunks - 1) / subChunks;
+                Parallel.For(0, subChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        var srcSpan = new ReadOnlySpan<double>(srcArr, start, count);
+                        var dstSpan = new Span<double>(dstArr, start, count);
+                        numOpsD.Sigmoid(srcSpan, dstSpan);
+                    }
+                });
+                return result;
+            }
         }
 
         // Generic fallback
