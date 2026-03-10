@@ -1125,7 +1125,7 @@ public class DoubleOperations : INumericOperations<double>
     }
 
     /// <summary>
-    /// Multiplies each element by a scalar using SIMD-optimized SimdKernels.
+    /// Multiplies each element by a scalar using unsafe pointer-based SIMD for zero overhead.
     /// </summary>
     public void MultiplyScalar(ReadOnlySpan<double> x, double scalar, Span<double> destination)
     {
