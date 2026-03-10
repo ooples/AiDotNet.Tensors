@@ -611,24 +611,32 @@ internal static class CpuJitKernels
         var e = new X86Emitter();
         e.Prologue();
 
-        // Register data section constants — these get appended after code in the executable buffer
-        int idxNeg5   = e.EmitDataConstant(-5.0f);
-        int idxPos5   = e.EmitDataConstant(5.0f);
-        int idxC5     = e.EmitDataConstant(1.5854344e-4f);
-        int idxC3     = e.EmitDataConstant(-8.9219211e-3f);
-        int idxC1     = e.EmitDataConstant(2.1562920e-1f);
-        int idxHalf   = e.EmitDataConstant(0.5f);
+        // sigmoid(x) = 1 / (1 + exp(-x)) using FastExp approach (Cephes-style)
+        // FastExp: range reduction x = n*ln2 + r, polynomial exp(r), scale by 2^n
 
-        // Load constants into dedicated registers (YMM8-YMM13) — loaded once, used every iteration
-        // These VBROADCASTSS instructions each emit MOV R11,imm64 + VBROADCASTSS ymm,[R11]
-        e.VbroadcastssConst(X86Emitter.YMM8, idxNeg5);    // clamp low
-        e.VbroadcastssConst(X86Emitter.YMM9, idxPos5);    // clamp high
-        e.VbroadcastssConst(X86Emitter.YMM10, idxC5);     // 1.5854344e-4
-        e.VbroadcastssConst(X86Emitter.YMM11, idxC3);     // -8.9219211e-3
-        e.VbroadcastssConst(X86Emitter.YMM12, idxC1);     // 2.1562920e-1
-        e.VbroadcastssConst(X86Emitter.YMM13, idxHalf);   // 0.5
+        // Data section constants
+        int idxClampLo  = e.EmitDataConstant(-87.3365f);
+        int idxClampHi  = e.EmitDataConstant(88.7228f);
+        int idxLog2e    = e.EmitDataConstant(1.44269504f);    // 1/ln2
+        int idxLn2      = e.EmitDataConstant(0.693147181f);   // ln2
+        int idxOne      = e.EmitDataConstant(1.0f);
+        int idxP0       = e.EmitDataConstant(1.0f / 720.0f);  // 1/6! = r^6 coeff
+        int idxP1       = e.EmitDataConstant(1.0f / 120.0f);  // 1/5!
+        int idxP2       = e.EmitDataConstant(1.0f / 24.0f);   // 1/4!
+        int idxP3       = e.EmitDataConstant(1.0f / 6.0f);    // 1/3!
+        int idxHalf     = e.EmitDataConstant(0.5f);            // 1/2!
+        int idx127      = e.EmitDataConstant(127.0f); // 127 as float, converted to int in loop
 
-        int simdCount = (length / 32) * 32;
+        // Load constants into YMM8-YMM15
+        // We process 1 vector at a time (register-pressure limited by FastExp)
+        e.VbroadcastssConst(X86Emitter.YMM8, idxClampLo);
+        e.VbroadcastssConst(X86Emitter.YMM9, idxClampHi);
+        e.VbroadcastssConst(X86Emitter.YMM10, idxLog2e);
+        e.VbroadcastssConst(X86Emitter.YMM11, idxLn2);
+        e.VbroadcastssConst(X86Emitter.YMM12, idxOne);
+        e.VbroadcastssConst(X86Emitter.YMM13, idxHalf);
+
+        int simdCount = (length / 8) * 8;
         int simdEndBytes = simdCount * sizeof(float);
 
         if (simdCount > 0)
@@ -638,123 +646,66 @@ internal static class CpuJitKernels
             int loopLabel = e.NewLabel();
             e.BindLabel(loopLabel);
 
-            // Load 4 vectors from src (RCX)
+            // Load x from src, negate for sigmoid: -x
             e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, 0);
-            e.VmovupsLoad(X86Emitter.YMM1, X86Emitter.RCX, 32);
-            e.VmovupsLoad(X86Emitter.YMM2, X86Emitter.RCX, 64);
-            e.VmovupsLoad(X86Emitter.YMM3, X86Emitter.RCX, 96);
+            e.Vxorps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM1); // zero
+            e.Vsubps(X86Emitter.YMM0, X86Emitter.YMM1, X86Emitter.YMM0); // -x
 
-            // Clamp to [-5, 5]: clamped = min(max(x, -5), 5)
-            // VMAXPS with YMM8 (-5.0) — opcode 0x5F
+            // Clamp -x to [-87.3, 88.7]
             e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM8);
-            e.Vmaxps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM8);
-            e.Vmaxps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM8);
-            e.Vmaxps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM8);
-            // VMINPS with YMM9 (5.0) — opcode 0x5D
-            e.VbinaryPs(0x5D, X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM9);
-            e.VbinaryPs(0x5D, X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM9);
-            e.VbinaryPs(0x5D, X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM9);
-            e.VbinaryPs(0x5D, X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM9);
+            e.Vminps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM9);
 
-            // x² = clamped * clamped → store in YMM4-YMM7
-            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM0, X86Emitter.YMM0);
-            e.Vmulps(X86Emitter.YMM5, X86Emitter.YMM1, X86Emitter.YMM1);
-            e.Vmulps(X86Emitter.YMM6, X86Emitter.YMM2, X86Emitter.YMM2);
-            e.Vmulps(X86Emitter.YMM7, X86Emitter.YMM3, X86Emitter.YMM3);
+            // n = round(-x * log2e) → VCVTPS2DQ rounds to nearest int
+            e.Vmulps(X86Emitter.YMM1, X86Emitter.YMM0, X86Emitter.YMM10); // -x * log2e
+            e.Vcvtps2dq(X86Emitter.YMM2, X86Emitter.YMM1);                // n_int = round(...)
+            e.Vcvtdq2ps(X86Emitter.YMM1, X86Emitter.YMM2);                // n_float = (float)n_int
 
-            // inner = FMA(x², c5, c3) → inner = x²*c5 + c3
-            // VFMADD231PS: dst = src1*src2 + dst, so dst=c3 copy, src1=x², src2=c5
-            // But we can't clobber YMM11 (c3). Use a different approach:
-            // Start with inner = c3 (copy), then FMA inner = x² * c5 + inner
-            // We need to copy c3 to temp first. Use YMM14,YMM15 + reuse after.
-            // Actually: Horner scheme with FMA. inner = x²*c5 + c3
-            // VFMADD231PS dst, src1, src2: dst += src1 * src2 → need dst=c3 copy
-            // But we have 4 lanes to process simultaneously, so we need 4 copies of c3.
-            // Better approach: use VMULPS + VADDPS for the first step, then FMA for the rest.
+            // r = -x - n * ln2 (fractional part in [-ln2/2, ln2/2])
+            e.Vmulps(X86Emitter.YMM3, X86Emitter.YMM1, X86Emitter.YMM11); // n * ln2
+            e.Vsubps(X86Emitter.YMM3, X86Emitter.YMM0, X86Emitter.YMM3);  // r = -x - n*ln2
 
-            // inner = x² * c5 → use YMM14,YMM15 as temps (only need 2 temp registers at a time)
-            // Actually we can process 2 lanes at a time with 2 temp regs:
+            // exp(r) via Horner's method: 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120 + r/720)))))
+            // Load remaining polynomial coefficients from data section into temps
+            // YMM4 = current accumulator
+            e.VbroadcastssConst(X86Emitter.YMM4, idxP0);  // p = 1/720
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // p*r
+            e.VbroadcastssConst(X86Emitter.YMM5, idxP1);
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM5); // + 1/120
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // *r
+            e.VbroadcastssConst(X86Emitter.YMM5, idxP2);
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM5); // + 1/24
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // *r
+            e.VbroadcastssConst(X86Emitter.YMM5, idxP3);
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM5); // + 1/6
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // *r
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM13); // + 0.5
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // *r
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM12); // + 1.0
+            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM3); // *r
+            e.Vaddps(X86Emitter.YMM4, X86Emitter.YMM4, X86Emitter.YMM12); // + 1.0 → exp(r)
 
-            // Lane 0-1: inner0 = x²_0 * c5 + c3
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM4, X86Emitter.YMM10); // x²*c5
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM11); // +c3
-            e.Vmulps(X86Emitter.YMM15, X86Emitter.YMM5, X86Emitter.YMM10);
-            e.Vaddps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM11);
+            // Scale by 2^n: reinterpret (n_int + 127) << 23 as float
+            e.VbroadcastssConst(X86Emitter.YMM5, idx127);
+            e.Vcvtps2dq(X86Emitter.YMM5, X86Emitter.YMM5); // 127 as int32
+            e.Vpaddd(X86Emitter.YMM6, X86Emitter.YMM2, X86Emitter.YMM5); // n_int + 127
+            e.VpslldImm(X86Emitter.YMM6, X86Emitter.YMM6, 23);            // << 23 → 2^n as float bits
+            e.Vmulps(X86Emitter.YMM0, X86Emitter.YMM4, X86Emitter.YMM6); // exp(-x) = exp(r) * 2^n
 
-            // inner0 = FMA(x²_0, inner0, c1) → inner0 = x²*inner0 + c1
-            // VFMADD231PS inner0, x², c1 won't work — need inner0 = x²*inner0 + c1
-            // VFMADD213PS dst, src1, src2: dst = src1*dst + src2
-            // We need VFMADD213PS but don't have it in emitter.
-            // Use VMULPS + VADDPS instead:
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM4, X86Emitter.YMM14); // x²*inner
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM12); // +c1
-            e.Vmulps(X86Emitter.YMM15, X86Emitter.YMM5, X86Emitter.YMM15);
-            e.Vaddps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM12);
+            // sigmoid = 1 / (1 + exp(-x))
+            e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM12); // 1 + exp(-x)
+            // VDIVPS: YMM12(1.0) / YMM0(1+exp(-x)) → opcode 0x5E
+            e.VbinaryPs(0x5E, X86Emitter.YMM0, X86Emitter.YMM12, X86Emitter.YMM0); // 1 / (1+exp(-x))
 
-            // result0 = FMA(clamped, inner, 0.5) → clamped*inner + 0.5
-            // VFMADD231PS: dst += src1 * src2 → but we need dst = clamped*inner + 0.5
-            // Copy 0.5 to YMM0 first, then VFMADD231PS YMM0, clamped_orig, inner
-            // Problem: we clobbered YMM0 with clamped. clamped IS YMM0.
-            // So: result = VFMADD231PS with dst starting as 0.5
-            // Need temp = 0.5 copy. But we already have YMM13 = 0.5 constant.
-            // We need: result = clamped * inner + 0.5
-            // VMULPS result = clamped * inner, then VADDPS result += 0.5
-            e.Vmulps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM14); // clamped*inner
-            e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM13); // +0.5
-            e.Vmulps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM15);
-            e.Vaddps(X86Emitter.YMM1, X86Emitter.YMM1, X86Emitter.YMM13);
-
-            // Lane 2-3: same pattern
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM6, X86Emitter.YMM10); // x²*c5
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM11); // +c3
-            e.Vmulps(X86Emitter.YMM15, X86Emitter.YMM7, X86Emitter.YMM10);
-            e.Vaddps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM11);
-
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM6, X86Emitter.YMM14); // x²*inner
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM12); // +c1
-            e.Vmulps(X86Emitter.YMM15, X86Emitter.YMM7, X86Emitter.YMM15);
-            e.Vaddps(X86Emitter.YMM15, X86Emitter.YMM15, X86Emitter.YMM12);
-
-            e.Vmulps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM14);
-            e.Vaddps(X86Emitter.YMM2, X86Emitter.YMM2, X86Emitter.YMM13);
-            e.Vmulps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM15);
-            e.Vaddps(X86Emitter.YMM3, X86Emitter.YMM3, X86Emitter.YMM13);
-
-            // Store results to dst (RDX)
+            // Store result
             e.VmovupsStore(X86Emitter.YMM0, X86Emitter.RDX, 0);
-            e.VmovupsStore(X86Emitter.YMM1, X86Emitter.RDX, 32);
-            e.VmovupsStore(X86Emitter.YMM2, X86Emitter.RDX, 64);
-            e.VmovupsStore(X86Emitter.YMM3, X86Emitter.RDX, 96);
 
             // Advance pointers
-            e.AddImm32(X86Emitter.RCX, 128);
-            e.AddImm32(X86Emitter.RDX, 128);
+            e.AddImm32(X86Emitter.RCX, 32);
+            e.AddImm32(X86Emitter.RDX, 32);
 
-            e.AddImm32(X86Emitter.RBX, 128);
+            e.AddImm32(X86Emitter.RBX, 32);
             e.CmpImm32(X86Emitter.RBX, simdEndBytes);
             e.Jl(loopLabel);
-        }
-
-        // Remainder in groups of 8
-        int remaining = length - simdCount;
-        int vec8Count = remaining / 8;
-        for (int v = 0; v < vec8Count; v++)
-        {
-            int off = v * 32;
-            // Load, clamp, polynomial, store
-            e.VmovupsLoad(X86Emitter.YMM0, X86Emitter.RCX, off);
-            e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM8);
-            e.VbinaryPs(0x5D, X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM9); // VMINPS
-
-            e.Vmulps(X86Emitter.YMM4, X86Emitter.YMM0, X86Emitter.YMM0); // x²
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM4, X86Emitter.YMM10); // x²*c5
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM11); // +c3
-            e.Vmulps(X86Emitter.YMM14, X86Emitter.YMM4, X86Emitter.YMM14); // x²*inner
-            e.Vaddps(X86Emitter.YMM14, X86Emitter.YMM14, X86Emitter.YMM12); // +c1
-            e.Vmulps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM14); // clamped*inner
-            e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM13); // +0.5
-
-            e.VmovupsStore(X86Emitter.YMM0, X86Emitter.RDX, off);
         }
 
         e.Epilogue();

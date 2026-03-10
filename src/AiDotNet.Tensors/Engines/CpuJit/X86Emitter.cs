@@ -261,6 +261,55 @@ internal sealed class X86Emitter
     public void Vxorps(int dst, int src1, int src2)
         => EmitVexRR(1, 0, 0, 0x57, dst, src1, src2);
 
+    /// <summary>VMINPS ymm, ymm, ymm — Packed float minimum</summary>
+    public void Vminps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x5D, dst, src1, src2);
+
+    /// <summary>
+    /// VCMPPS ymm, ymm, ymm, imm8 — Packed float compare.
+    /// Predicate: 1=LT, 2=LE, 6=NLE (GT), 14=GT_OS.
+    /// Result: all-ones mask where condition is true, all-zeros where false.
+    /// </summary>
+    public void Vcmpps(int dst, int src1, int src2, byte predicate)
+    {
+        EmitVexRR(1, 0, 0, 0xC2, dst, src1, src2);
+        Emit(predicate);
+    }
+
+    /// <summary>VANDPS ymm, ymm, ymm — Bitwise AND</summary>
+    public void Vandps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x54, dst, src1, src2);
+
+    /// <summary>VANDNPS ymm, ymm, ymm — Bitwise AND NOT: dst = (~src1) AND src2</summary>
+    public void Vandnps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x55, dst, src1, src2);
+
+    /// <summary>VORPS ymm, ymm, ymm — Bitwise OR</summary>
+    public void Vorps(int dst, int src1, int src2)
+        => EmitVexRR(1, 0, 0, 0x56, dst, src1, src2);
+
+    // ==================== Integer SIMD Instructions (for FastExp) ====================
+
+    /// <summary>VCVTPS2DQ ymm, ymm — Convert packed float to int32 (round to nearest)</summary>
+    public void Vcvtps2dq(int dst, int src)
+        => EmitVexRR(1, 1 /*66*/, 0, 0x5B, dst, 0 /*vvvv unused*/, src);
+
+    /// <summary>VCVTDQ2PS ymm, ymm — Convert packed int32 to float</summary>
+    public void Vcvtdq2ps(int dst, int src)
+        => EmitVexRR(1, 0 /*no prefix*/, 0, 0x5B, dst, 0 /*vvvv unused*/, src);
+
+    /// <summary>VPSLLD ymm, ymm, imm8 — Shift packed int32 left by immediate bits</summary>
+    public void VpslldImm(int dst, int src, byte shift)
+    {
+        // VEX.NDD.256.66.0F.WIG 72 /6 ib: reg field = 6, vvvv = dst, rm = src
+        EmitVexRR(1, 1 /*66*/, 0, 0x72, 6 /*reg=/6*/, dst /*vvvv=dest*/, src /*rm=source*/);
+        Emit(shift);
+    }
+
+    /// <summary>VPADDD ymm, ymm, ymm — Add packed int32</summary>
+    public void Vpaddd(int dst, int src1, int src2)
+        => EmitVexRR(1, 1 /*66*/, 0, 0xFE, dst, src1, src2);
+
     /// <summary>
     /// Generic packed single-precision op: op ymm_dst, ymm_src1, ymm_src2 (register-register).
     /// Opcode examples: 0x58=VADDPS, 0x59=VMULPS, 0x5C=VSUBPS, 0x5E=VDIVPS, 0x5D=VMINPS, 0x5F=VMAXPS.
