@@ -311,6 +311,14 @@ internal sealed class X86Emitter
         EmitVexRM(1, 2 /*F3*/, 0, 0x11, src, 0, baseReg, disp, l: 0);
     }
 
+    /// <summary>VMOVDQU xmm, [base+disp] — Unaligned 128-bit load (for saving/restoring callee-saved XMM registers)</summary>
+    public void VmovdquLoad(int dst, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x6F, dst, 0, baseReg, disp, l: 0);
+
+    /// <summary>VMOVDQU [base+disp], xmm — Unaligned 128-bit store (for saving/restoring callee-saved XMM registers)</summary>
+    public void VmovdquStore(int src, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, 0x7F, src, 0, baseReg, disp, l: 0);
+
     /// <summary>VMOVNTPS [base+disp], ymm — Non-temporal store (requires 32-byte alignment, bypasses cache)</summary>
     public void VmovntpsStore(int src, int baseReg, int disp)
         => EmitVexStore(1, 0, 0, 0x2B, src, baseReg, disp);
@@ -507,6 +515,14 @@ internal sealed class X86Emitter
     /// Windows x64 ABI: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
     /// Non-volatile: RBX, RBP, RDI, RSI, R12-R15, XMM6-XMM15
     /// </summary>
+    // Stack layout after prologue (192 bytes below PUSH'd RBX):
+    // [RSP+0..31]   = shadow space (32 bytes)
+    // [RSP+32..47]  = XMM6 save
+    // [RSP+48..63]  = XMM7 save
+    // ...
+    // [RSP+176..191] = XMM15 save
+    private const int PrologueStackSize = 192; // 32 shadow + 160 XMM saves
+
     public void Prologue()
     {
         // PUSH RBP
@@ -515,8 +531,13 @@ internal sealed class X86Emitter
         Emit(0x48, 0x89); EmitModRM(3, RSP, RBP);
         // PUSH RBX (non-volatile, we use it as loop counter)
         Emit(0x53);
-        // SUB RSP, 32 — shadow space for potential calls + alignment
-        SubImm32(RSP, 32);
+        // SUB RSP, 192 — shadow space + XMM6-XMM15 saves
+        SubImm32(RSP, PrologueStackSize);
+        // Save non-volatile XMM6-XMM15 (Windows x64 ABI)
+        for (int i = 6; i <= 15; i++)
+        {
+            VmovdquStore(i, RSP, 32 + (i - 6) * 16);
+        }
     }
 
     /// <summary>
@@ -524,10 +545,15 @@ internal sealed class X86Emitter
     /// </summary>
     public void Epilogue()
     {
+        // Restore non-volatile XMM6-XMM15 (Windows x64 ABI)
+        for (int i = 6; i <= 15; i++)
+        {
+            VmovdquLoad(i, RSP, 32 + (i - 6) * 16);
+        }
         // VZEROUPPER — avoid AVX/SSE transition penalty
         Emit(0xC5, 0xF8); Emit(0x77);
-        // ADD RSP, 32
-        AddImm32(RSP, 32);
+        // ADD RSP, 192
+        AddImm32(RSP, PrologueStackSize);
         // POP RBX
         Emit(0x5B);
         // POP RBP

@@ -344,10 +344,9 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     {
         unsigned int nw = (blockDim.x + 31) >> 5;
         maxVal = (threadIdx.x < nw) ? smem[threadIdx.x] : -1e30f;
-        unsigned int wmask = (nw >= 32) ? 0xFFFFFFFF : ((1u << nw) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            maxVal = fmaxf(maxVal, __shfl_down_sync(wmask, maxVal, offset));
+            maxVal = fmaxf(maxVal, __shfl_down_sync(0xFFFFFFFF, maxVal, offset));
         if (threadIdx.x == 0) smem[0] = maxVal;
     }
     __syncthreads();
@@ -366,10 +365,9 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     {
         unsigned int nw2 = (blockDim.x + 31) >> 5;
         sumVal = (threadIdx.x < nw2) ? smem[threadIdx.x] : 0.0f;
-        unsigned int wmask2 = (nw2 >= 32) ? 0xFFFFFFFF : ((1u << nw2) - 1);
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            sumVal += __shfl_down_sync(wmask2, sumVal, offset);
+            sumVal += __shfl_down_sync(0xFFFFFFFF, sumVal, offset);
         if (threadIdx.x == 0) smem[0] = sumVal;
     }
     __syncthreads();

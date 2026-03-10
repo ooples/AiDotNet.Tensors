@@ -219,7 +219,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Fma.IsSupported && Avx.IsSupported && length >= 32)
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 // 4x unrolled FastSigmoid256: consistent approximation across all SIMD paths
                 int simdLength = length & ~31;
@@ -231,7 +231,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
                 }
             }
-            if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
@@ -426,7 +426,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Fma.IsSupported && Avx.IsSupported && length >= 32)
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 var vtwo = Vector256.Create(2.0f);
                 var vone = Vector256.Create(1.0f);
@@ -440,7 +440,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i + 24, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 24)))), vone));
                 }
             }
-            if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
             {
                 var vtwo = Vector256.Create(2.0f);
                 var vone = Vector256.Create(1.0f);

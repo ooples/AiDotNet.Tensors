@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -32,16 +33,17 @@ internal abstract class ActivationHandler
 /// </summary>
 internal static class ActivationRegistry
 {
-    private static readonly Dictionary<FusedActivationType, ActivationHandler> _handlers = new()
-    {
-        { FusedActivationType.ReLU, new ReLUActivationHandler() },
-        { FusedActivationType.GELU, new GELUActivationHandler() },
-        { FusedActivationType.Sigmoid, new SigmoidActivationHandler() },
-        { FusedActivationType.Tanh, new TanhActivationHandler() },
-        { FusedActivationType.LeakyReLU, new LeakyReLUActivationHandler() },
-        { FusedActivationType.Swish, new SwishActivationHandler() },
-        { FusedActivationType.Softmax, new SoftmaxActivationHandler() },
-    };
+    private static readonly ConcurrentDictionary<FusedActivationType, ActivationHandler> _handlers = new(
+        new[]
+        {
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.ReLU, new ReLUActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.GELU, new GELUActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.Sigmoid, new SigmoidActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.Tanh, new TanhActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.LeakyReLU, new LeakyReLUActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.Swish, new SwishActivationHandler()),
+            new KeyValuePair<FusedActivationType, ActivationHandler>(FusedActivationType.Softmax, new SoftmaxActivationHandler()),
+        });
 
     /// <summary>Gets the handler for a given activation type, or null for None.</summary>
     public static ActivationHandler? Get(FusedActivationType activation)

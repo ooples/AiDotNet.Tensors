@@ -219,7 +219,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         if (!Directory.Exists(dir))
                             Directory.CreateDirectory(dir);
 
-                        File.WriteAllBytes(cachePath, binary);
+                        // Write to temp file then rename for atomic cache update
+                        string tempPath = cachePath + ".tmp." + Guid.NewGuid().ToString("N");
+                        try
+                        {
+                            File.WriteAllBytes(tempPath, binary);
+                            File.Move(tempPath, cachePath);
+                        }
+                        catch (IOException)
+                        {
+                            // Another process may have written the cache file concurrently — that's fine
+                            try { File.Delete(tempPath); } catch { /* best effort cleanup */ }
+                        }
                     }
                     finally
                     {

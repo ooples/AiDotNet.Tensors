@@ -96,6 +96,9 @@ internal sealed class PersistentParallelExecutor
     /// Execute an action in parallel with near-zero dispatch overhead.
     /// The main thread executes chunk 0, worker threads execute chunks 1..numChunks-1.
     /// </summary>
+    [ThreadStatic]
+    private static bool _isExecuting;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Execute(int numChunks, Action<int> action)
     {
@@ -107,54 +110,67 @@ internal sealed class PersistentParallelExecutor
             return;
         }
 
+        // Detect reentrancy (nested Execute from callback) — fall back to sequential
+        if (_isExecuting)
+        {
+            for (int c = 0; c < numChunks; c++)
+                action(c);
+            return;
+        }
+
         lock (_executeLock)
         {
-            int workersNeeded = Math.Min(numChunks - 1, _numWorkers);
-
-            // Setup shared state
-            _action = action;
-            _numChunks = numChunks;
-            _remaining = workersNeeded;
-            _workerException = null;
-            _allDone.Reset();
-
-            // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
-            for (int i = 0; i < workersNeeded; i++)
+            _isExecuting = true;
+            try
             {
-                _workReady[i].Set();
-            }
+                int workersNeeded = Math.Min(numChunks - 1, _numWorkers);
 
-            // Main thread does chunk 0 and any overflow chunks beyond worker count
-            // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
-            Exception? mainException = null;
-            int mainChunk = 0;
-            while (mainChunk < numChunks)
-            {
-                try
+                // Setup shared state
+                _action = action;
+                _numChunks = numChunks;
+                _remaining = workersNeeded;
+                _workerException = null;
+                _allDone.Reset();
+
+                // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
+                for (int i = 0; i < workersNeeded; i++)
                 {
-                    action(mainChunk);
+                    _workReady[i].Set();
                 }
-                catch (Exception ex)
-                {
-                    mainException ??= ex;
-                }
-                mainChunk += _numWorkers + 1;
-            }
 
-            // Wait for all workers to finish
-            if (Volatile.Read(ref _remaining) > 0)
-            {
+                // Main thread does chunk 0 and any overflow chunks beyond worker count
+                // (chunks assigned round-robin: main thread gets 0, _numWorkers+1, 2*_numWorkers+1, ...)
+                Exception? mainException = null;
+                int mainChunk = 0;
+                while (mainChunk < numChunks)
+                {
+                    try
+                    {
+                        action(mainChunk);
+                    }
+                    catch (Exception ex)
+                    {
+                        mainException ??= ex;
+                    }
+                    mainChunk += _numWorkers + 1;
+                }
+
+                // Always wait for workers once dispatched to avoid stale Set() on next round
                 _allDone.Wait();
+
+                _action = null;
+
+                // Re-throw first captured exception (worker or main thread)
+                var workerEx = _workerException;
+                if (mainException is not null)
+                    throw mainException;
+                if (workerEx is not null)
+                    throw workerEx;
             }
-
-            _action = null;
-
-            // Re-throw first captured exception (worker or main thread)
-            var workerEx = _workerException;
-            if (mainException is not null)
-                throw mainException;
-            if (workerEx is not null)
-                throw workerEx;
+            finally
+            {
+                _isExecuting = false;
+            }
         }
     }
 }

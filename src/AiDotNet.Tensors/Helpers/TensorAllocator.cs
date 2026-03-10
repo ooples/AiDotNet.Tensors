@@ -60,9 +60,12 @@ internal static class TensorAllocator
 
     /// <summary>
     /// Returns a tensor's backing array to the pool if it was pooled.
-    /// Call this when a tensor from Rent() is no longer needed.
+    /// SAFETY: The caller MUST ensure the tensor is never accessed after this call.
+    /// The tensor's Memory still references the returned array — any access after
+    /// Return is undefined behavior (data corruption from reuse).
+    /// Only call this for internal temporaries that immediately go out of scope.
     /// </summary>
-    public static void Return<T>(Tensor<T>? tensor)
+    internal static void Return<T>(Tensor<T>? tensor)
     {
         if (tensor == null) return;
 
