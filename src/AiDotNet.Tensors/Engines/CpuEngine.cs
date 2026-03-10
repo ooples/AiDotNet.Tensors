@@ -2152,7 +2152,8 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            // 500K threshold matches libtorch's at::parallel_for grain size for bandwidth-bound ops
+            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
             if (subChunks >= 2)
             {
                 int chunkSize = (length + subChunks - 1) / subChunks;
@@ -2411,7 +2412,24 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                // Parallel chunking for large arrays when JIT not available
+                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                if (subChunks >= 2)
+                {
+                    int chunkSize = (length + subChunks - 1) / subChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+                    Parallel.For(0, subChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                            SimdKernels.VectorDivideUnsafe(pA + start, pB + start, pR + start, count);
+                    });
+                }
+                else
+                {
+                    SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                }
             }
             return result;
         }
@@ -4542,7 +4560,31 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, alphaF);
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            int len = tensor.Length;
+            // Parallel for compute-bound LeakyReLU at 256K+ elements
+            const int parallelThreshold = 256 * 1024;
+            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+            int chunks = Math.Min(maxThreads, Math.Max(1, len / parallelThreshold));
+            if (chunks >= 2)
+            {
+                int chunkSize = (len + chunks - 1) / chunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                IntPtr pIn = (IntPtr)pSrc;
+                IntPtr pOut = (IntPtr)pDst;
+                Parallel.For(0, chunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, len - start);
+                    if (count > 0)
+                        SimdKernels.LeakyReLUUnsafe((float*)pIn + start, (float*)pOut + start, count, alphaF);
+                });
+            }
+            else
+            {
+                SimdKernels.LeakyReLUUnsafe(pSrc, pDst, len, alphaF);
+            }
             return result;
         }
 
