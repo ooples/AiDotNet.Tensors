@@ -362,16 +362,43 @@ public sealed class CudaBackend : IAsyncGpuBackend
         }
     }
 
+    /// <summary>
+    /// Gets the disk cache directory for compiled CUBIN files.
+    /// Returns null if caching is disabled or directory cannot be created.
+    /// </summary>
+    private static string? GetKernelCacheDirectory()
+    {
+        try
+        {
+            string cacheDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AiDotNet", "Tensors", "kernel_cache");
+            Directory.CreateDirectory(cacheDir);
+            return cacheDir;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Computes a hash key for the kernel cache based on source code and compilation options.
+    /// </summary>
+    private static string ComputeCacheKey(string source, string arch)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(source + "|" + arch));
+        return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
+    }
+
     private IntPtr CompileKernelModule(int device, string source, string moduleName, string[] kernelNames)
     {
         // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
-        // CUDA device math functions (expf, sqrtf, tanhf, etc.) are built-in.
-        // We prepend defines for macros normally provided by those headers.
         source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
                        .Replace("#include <float.h>", "// float.h stripped for NVRTC (built-in)")
                        .Replace("#include <stdio.h>", "// stdio.h stripped for NVRTC");
 
-        // Prepend standard macro definitions that NVRTC doesn't provide by default
         const string nvrtcPreamble = @"
 #ifndef INFINITY
 #define INFINITY __int_as_float(0x7f800000)
@@ -395,12 +422,50 @@ public sealed class CudaBackend : IAsyncGpuBackend
         source = nvrtcPreamble + source;
 
         var (major, minor) = GetComputeCapability(device);
-        // Use sm_XX to generate device-native CUBIN (avoids PTX ISA version issues
-        // when the toolkit is newer than the driver's max supported CUDA version).
         string arch = $"--gpu-architecture=sm_{major}{minor}";
-        var optionsList = new List<string> { arch, "--use_fast_math" };
 
-        // Add CUDA include path for headers like cooperative_groups.h, cuda_fp16.h, mma.h
+        // Try loading from disk cache first
+        string? cacheDir = GetKernelCacheDirectory();
+        string cacheKey = ComputeCacheKey(source, arch);
+        string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
+
+        if (cacheFile != null && File.Exists(cacheFile))
+        {
+            try
+            {
+                byte[] cachedBinary = File.ReadAllBytes(cacheFile);
+                IntPtr cachedPtr = Marshal.AllocHGlobal(cachedBinary.Length);
+                try
+                {
+                    Marshal.Copy(cachedBinary, 0, cachedPtr, cachedBinary.Length);
+                    CuBlasNative.CheckCudaResult(
+                        CudaNativeBindings.cuModuleLoadData(out IntPtr cachedModule, cachedPtr),
+                        $"cuModuleLoadData({moduleName} cached)");
+
+                    foreach (var kernelName in kernelNames)
+                    {
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuModuleGetFunction(out IntPtr kernel, cachedModule, kernelName),
+                            $"cuModuleGetFunction({kernelName})");
+                        _kernelCache[kernelName] = kernel;
+                    }
+
+                    return cachedModule;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(cachedPtr);
+                }
+            }
+            catch
+            {
+                // Cache corrupted or incompatible — fall through to recompile
+                try { File.Delete(cacheFile); } catch { }
+            }
+        }
+
+        // Compile with NVRTC
+        var optionsList = new List<string> { arch, "--use_fast_math" };
         var cudaInclude = GetCudaIncludePath();
         if (cudaInclude != null)
             optionsList.Add($"--include-path={cudaInclude}");
@@ -409,12 +474,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
-            ref program,
-            source,
-            moduleName + ".cu",
-            0,
-            IntPtr.Zero,
-            IntPtr.Zero);
+            ref program, source, moduleName + ".cu", 0, IntPtr.Zero, IntPtr.Zero);
         if (result != NvrtcResult.Success)
             throw new InvalidOperationException($"NVRTC program creation failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
 
@@ -426,9 +486,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException($"NVRTC compile failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}\n{log}");
         }
 
-        // sm_XX targets produce CUBIN (native binary) which avoids PTX ISA version
-        // compatibility issues between toolkit and driver versions.
-        // compute_XX targets produce PTX (intermediate) which needs JIT by the driver.
         bool useCubin = arch.Contains("sm_");
         IntPtr binary;
         UIntPtr binarySize;
@@ -441,7 +498,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
                 throw new InvalidOperationException($"NVRTC failed to return CUBIN size for {moduleName}.");
             }
-
             binary = Marshal.AllocHGlobal((int)binarySize);
             result = NvrtcNativeBindings.nvrtcGetCUBIN(program, binary);
         }
@@ -453,7 +509,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
                 NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
                 throw new InvalidOperationException($"NVRTC failed to return PTX size for {moduleName}.");
             }
-
             binary = Marshal.AllocHGlobal((int)binarySize);
             result = NvrtcNativeBindings.nvrtcGetPTX(program, binary);
         }
@@ -464,6 +519,21 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             Marshal.FreeHGlobal(binary);
             throw new InvalidOperationException($"NVRTC get {(useCubin ? "CUBIN" : "PTX")} failed for {moduleName}: {NvrtcNativeBindings.GetErrorString(result)}");
+        }
+
+        // Save to disk cache before loading
+        if (cacheFile != null && useCubin)
+        {
+            try
+            {
+                byte[] binaryBytes = new byte[(int)binarySize];
+                Marshal.Copy(binary, binaryBytes, 0, binaryBytes.Length);
+                File.WriteAllBytes(cacheFile, binaryBytes);
+            }
+            catch
+            {
+                // Non-fatal: caching failure doesn't block kernel loading
+            }
         }
 
         IntPtr module;
