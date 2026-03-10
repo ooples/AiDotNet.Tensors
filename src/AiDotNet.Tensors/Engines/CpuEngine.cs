@@ -1911,7 +1911,8 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            // Use 500K threshold for bandwidth-bound ops
+            int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
             if (addChunks >= 2)
             {
                 int chunkSize = (length + addChunks - 1) / addChunks;
@@ -2240,7 +2241,8 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            // Use 500K threshold for bandwidth-bound ops (12MB data = 3× inputs + output)
+            int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
             if (mulChunks >= 2)
             {
                 int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -18757,7 +18759,8 @@ public class CpuEngine : ITensorLevelEngine
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
         // For large arrays, parallelize across threads
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+        // Use 500K threshold for bandwidth-bound binary ops
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
@@ -18787,7 +18790,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
