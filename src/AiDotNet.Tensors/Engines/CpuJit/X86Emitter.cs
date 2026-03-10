@@ -515,13 +515,16 @@ internal sealed class X86Emitter
     /// Windows x64 ABI: RCX=arg0, RDX=arg1, R8=arg2, R9=arg3
     /// Non-volatile: RBX, RBP, RDI, RSI, R12-R15, XMM6-XMM15
     /// </summary>
-    // Stack layout after prologue (192 bytes below PUSH'd RBX):
+    // Stack alignment: on entry RSP%16==8 (return addr), PUSH RBP -> aligned,
+    // PUSH RBX -> misaligned, SUB RSP,200 (odd multiple of 8) -> aligned again.
+    // Stack layout after prologue (200 bytes below PUSH'd RBX):
     // [RSP+0..31]   = shadow space (32 bytes)
     // [RSP+32..47]  = XMM6 save
     // [RSP+48..63]  = XMM7 save
     // ...
     // [RSP+176..191] = XMM15 save
-    private const int PrologueStackSize = 192; // 32 shadow + 160 XMM saves
+    // [RSP+192..199] = alignment pad (8 bytes)
+    private const int PrologueStackSize = 200; // 32 shadow + 160 XMM saves + 8 alignment pad
 
     public void Prologue()
     {
