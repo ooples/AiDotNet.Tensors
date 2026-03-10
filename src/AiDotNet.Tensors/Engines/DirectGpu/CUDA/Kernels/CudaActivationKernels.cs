@@ -620,17 +620,15 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __
 }
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
-// Memory layout: output is [batch, channels, height, width] in row-major order
-// For element at linear index idx:
-//   - spatial_idx = idx % spatialSize (position within H*W)
-//   - channel = (idx / spatialSize) % channels
+// Uses 2D grid to eliminate integer division/modulo:
+//   blockIdx.y = batch * channel index, blockIdx.x * blockDim.x + threadIdx.x = spatial index
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int totalSize = batch * channels * spatialSize;
-    if (idx >= totalSize) return;
-    int channel = (idx / spatialSize) % channels;
-    output[idx] += bias[channel];
+    int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int bc = blockIdx.y;
+    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
+    int channel = bc % channels;
+    output[bc * spatialSize + spatialIdx] += __ldg(&bias[channel]);
 }
 
 // ===========================================================================

@@ -1022,8 +1022,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: conv2d_bias_add");
 
         using var _ = PushContext();
-        int totalSize = batch * channels * spatialSize;
-        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
+        uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)(batch * channels);
         IntPtr outPtr = output.Handle;
         IntPtr biasPtr = bias.Handle;
         void** args = stackalloc void*[5];
@@ -1032,7 +1033,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[2] = &batch;
         args[3] = &channels;
         args[4] = &spatialSize;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

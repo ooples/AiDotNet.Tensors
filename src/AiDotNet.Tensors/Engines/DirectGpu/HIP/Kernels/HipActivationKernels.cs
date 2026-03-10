@@ -705,13 +705,13 @@ extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const floa
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
-extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* output, const float* bias, int batch, int channels, int spatialSize)
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int totalSize = batch * channels * spatialSize;
-    if (idx >= totalSize) return;
-    int channel = (idx / spatialSize) % channels;
-    output[idx] += bias[channel];
+    int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int bc = blockIdx.y;
+    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
+    int channel = bc % channels;
+    output[bc * spatialSize + spatialIdx] += bias[channel];
 }
 
 // ===========================================================================

@@ -1269,7 +1269,6 @@ public sealed class HipBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: conv2d_bias_add");
 
-        int totalSize = batch * channels * spatialSize;
         var handles = new GCHandle[5];
         try
         {
@@ -1282,8 +1281,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[5];
             for (int i = 0; i < 5; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
+            uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint gridY = (uint)(batch * channels);
+            LaunchKernel2D(krnl, gridX, gridY, DefaultBlockSize, 1, args);
             Synchronize();
         }
         finally
