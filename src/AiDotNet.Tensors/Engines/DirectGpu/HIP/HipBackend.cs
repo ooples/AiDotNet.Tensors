@@ -73,6 +73,7 @@ public sealed class HipBackend : IAsyncGpuBackend
     private bool _hipblasAvailable;
 
     private const int DefaultBlockSize = 256;
+    private const int MaxRnnBlockSize = 1024;
     private const string GemmVendorImplEnvVar = "AIDOTNET_GPU_GEMM_IMPL";
     private const string GemmVendorThresholdEnvVar = "AIDOTNET_GPU_GEMM_VENDOR_THRESHOLD";
     private const long DefaultVendorGemmThreshold = 128L * 128L * 128L;
@@ -9651,10 +9652,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             throw new InvalidOperationException("HIP kernel not found: lstm_forward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -9686,7 +9687,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[15];
             for (int i = 0; i < 15; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+            LaunchKernel(kernel, grid, (uint)hiddenSize, args);
             Synchronize();
 
             // Copy the last timestep from allH and allC into hFinal and cFinal
@@ -9732,10 +9733,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             throw new InvalidOperationException("HIP kernel not found: lstm_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -9773,7 +9774,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[20];
             for (int i = 0; i < 20; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+            LaunchKernel(kernel, grid, (uint)hiddenSize, args);
             Synchronize();
         }
         finally
@@ -9792,13 +9793,13 @@ public sealed class HipBackend : IAsyncGpuBackend
             throw new InvalidOperationException("HIP kernel not found: gru_forward_sequence");
 
         // The forward kernel uses __syncthreads() which only synchronizes within a block.
-        // If hiddenSize > DefaultBlockSize, threads within a batch would span multiple blocks,
+        // If hiddenSize > MaxRnnBlockSize, threads within a batch would span multiple blocks,
         // causing a race condition when reading reset gates computed by other threads.
         // Enforce one-block-per-batch constraint for correctness.
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }
@@ -9828,7 +9829,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             var args = new IntPtr[14];
             for (int i = 0; i < 14; i++) args[i] = handles[i].AddrOfPinnedObject();
 
-            LaunchKernel(kernel, grid, DefaultBlockSize, args);
+            LaunchKernel(kernel, grid, (uint)hiddenSize, args);
             Synchronize();
         }
         finally
@@ -9848,10 +9849,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             throw new InvalidOperationException("HIP kernel not found: gru_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }

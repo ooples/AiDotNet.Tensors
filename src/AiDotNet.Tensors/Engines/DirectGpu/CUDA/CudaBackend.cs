@@ -17,6 +17,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed class CudaBackend : IAsyncGpuBackend
 {
     private const int DefaultBlockSize = 256;
+    private const int MaxRnnBlockSize = 1024;
     private readonly Dictionary<string, IntPtr> _kernelCache;
     private IntPtr _cudaContext;
     private IntPtr _stream;
@@ -8611,10 +8612,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: lstm_forward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -8624,6 +8625,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // Grid = one block per batch sample, block = hiddenSize threads per batch
         // This ensures __syncthreads() correctly synchronizes all threads for the same batch
         uint grid = (uint)batch;
+        uint blockSize = (uint)hiddenSize;
 
         IntPtr inputPtr = input.Handle;
         IntPtr hInitPtr = hInit.Handle;
@@ -8655,7 +8657,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[13] = &inputSize;
         args[14] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, blockSize, args);
 
         // Copy the last timestep from allH and allC into hFinal and cFinal
         // allH layout: [(seqLen + 1) * batch * hiddenSize] where index 0 is hInit
@@ -8695,10 +8697,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: lstm_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"LSTM backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
@@ -8750,7 +8752,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[18] = &inputSize;
         args[19] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, (uint)hiddenSize, args);
     }
 
     public unsafe void GruForwardSequence(
@@ -8763,13 +8765,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: gru_forward_sequence");
 
         // The forward kernel uses __syncthreads() which only synchronizes within a block.
-        // If hiddenSize > DefaultBlockSize, threads within a batch would span multiple blocks,
+        // If hiddenSize > MaxRnnBlockSize, threads within a batch would span multiple blocks,
         // causing a race condition when reading reset gates computed by other threads.
         // Enforce one-block-per-batch constraint for correctness.
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU forward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }
@@ -8807,7 +8809,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[12] = &inputSize;
         args[13] = &hiddenSize;
 
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, grid, (uint)hiddenSize, args);
     }
 
     public unsafe void GruBackwardSequence(
@@ -8821,10 +8823,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: gru_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
-        if (hiddenSize > DefaultBlockSize)
+        if (hiddenSize > MaxRnnBlockSize)
         {
             throw new InvalidOperationException(
-                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds block size ({DefaultBlockSize}). " +
+                $"GRU backward sequence hiddenSize ({hiddenSize}) exceeds max block size ({MaxRnnBlockSize}). " +
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level GRU operations.");
         }
@@ -8872,7 +8874,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[16] = &hiddenSize;
 
         // Use cooperative kernel launch for grid-wide synchronization (grid.sync())
-        LaunchCooperativeKernel(kernel, grid, DefaultBlockSize, sharedMemSize, args);
+        LaunchCooperativeKernel(kernel, grid, (uint)hiddenSize, sharedMemSize, args);
     }
 
     public unsafe void GruCellBackward(
