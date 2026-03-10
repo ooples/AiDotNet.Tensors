@@ -3274,7 +3274,10 @@ public class CpuEngine : ITensorLevelEngine
         {
             var mem = AsFloatMemory(tensor.Data);
             using var pin = mem.Pin();
-            float result = SimdKernels.MaxUnsafe((float*)pin.Pointer, tensor.Length);
+            float* ptr = (float*)pin.Pointer;
+            int length = tensor.Length;
+            float result = ParallelReduceFloat(ptr, length, float.NegativeInfinity,
+                SimdKernels.MaxUnsafe, Math.Max);
             return Unsafe.As<float, T>(ref result);
         }
 
@@ -3292,12 +3295,53 @@ public class CpuEngine : ITensorLevelEngine
         {
             var mem = AsFloatMemory(tensor.Data);
             using var pin = mem.Pin();
-            float result = SimdKernels.MinUnsafe((float*)pin.Pointer, tensor.Length);
+            float* ptr = (float*)pin.Pointer;
+            int length = tensor.Length;
+            float result = ParallelReduceFloat(ptr, length, float.PositiveInfinity,
+                SimdKernels.MinUnsafe, Math.Min);
             return Unsafe.As<float, T>(ref result);
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Min(tensor.AsSpan());
+    }
+
+    private unsafe delegate float UnsafeReductionKernel(float* data, int length);
+
+    /// <summary>
+    /// Parallel reduction for float arrays. Splits into chunks, reduces each chunk,
+    /// then combines results. Used for Max, Min, Sum reductions on large arrays.
+    /// </summary>
+    private static unsafe float ParallelReduceFloat(float* data, int length, float identity,
+        UnsafeReductionKernel kernel, Func<float, float, float> combine)
+    {
+        const int parallelThreshold = 256 * 1024;
+        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        int chunks = Math.Min(maxThreads, Math.Max(1, length / parallelThreshold));
+
+        if (chunks < 2)
+            return kernel(data, length);
+
+        int chunkSize = (length + chunks - 1) / chunks;
+        chunkSize = (chunkSize + 31) & ~31; // Align to 32 elements
+        float[] partials = new float[chunks];
+        for (int i = 0; i < chunks; i++) partials[i] = identity;
+
+        IntPtr pData = (IntPtr)data;
+        int totalLength = length;
+
+        Parallel.For(0, chunks, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, totalLength - start);
+            if (count > 0)
+                partials[chunk] = kernel((float*)pData + start, count);
+        });
+
+        float result = partials[0];
+        for (int i = 1; i < chunks; i++)
+            result = combine(result, partials[i]);
+        return result;
     }
 
     /// <inheritdoc/>
@@ -13716,13 +13760,76 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorSumOfSquares<T>(Tensor<T> tensor)
+    public unsafe T TensorSumOfSquares<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float))
+        {
+            T[] arr = tensor.GetDataArray();
+            float[] fArr = Unsafe.As<T[], float[]>(ref arr);
+            int length = tensor.Length;
+            float result;
+
+            fixed (float* ptr = fArr)
+            {
+                result = SumOfSquaresUnsafe(ptr, length);
+            }
+            return Unsafe.As<float, T>(ref result);
+        }
+#endif
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Dot(tensor.AsSpan(), tensor.AsSpan());
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD sum of squares: sum(x[i] * x[i]) with 4x unrolled FMA accumulation.
+    /// </summary>
+    private static unsafe float SumOfSquaresUnsafe(float* data, int length)
+    {
+        int i = 0;
+        float result = 0f;
+
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported && length >= 32)
+        {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = length & ~31;
+            for (; i < simdLen; i += 32)
+            {
+                var v0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i);
+                var v1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 8);
+                var v2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 16);
+                var v3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(data + i + 24);
+                vsum0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, vsum0);
+                vsum1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, vsum1);
+                vsum2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2, v2, vsum2);
+                vsum3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, vsum3);
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            // Horizontal sum
+            var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
+            var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
+            var s128 = System.Runtime.Intrinsics.X86.Sse.Add(lo, hi);
+            var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_01_00_11_10);
+            s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
+            shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_10_11_00_01);
+            s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
+            float tmp;
+            System.Runtime.Intrinsics.X86.Sse.StoreScalar(&tmp, s128);
+            result = tmp;
+        }
+
+        for (; i < length; i++)
+            result += data[i] * data[i];
+        return result;
+    }
+#endif
 
     /// <inheritdoc/>
     public Tensor<TValue> TensorEmbeddingLookup<TValue, TIndex>(Tensor<TValue> embeddings, Tensor<TIndex> indices)

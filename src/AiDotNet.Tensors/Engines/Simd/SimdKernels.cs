@@ -1463,7 +1463,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes element-wise sigmoid for double precision.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Sigmoid(ReadOnlySpan<double> input, Span<double> output)
+        public static unsafe void Sigmoid(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
             {
@@ -1474,36 +1474,36 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // 4x unrolled scalar: SVML auto-vectorizes Math.Exp on NET8+ with individual calls
-            if (length >= 16)
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
             {
-                int unrolled = length & ~15;
-                for (; i < unrolled; i += 16)
+                // Use unsafe pointers to eliminate Span bounds-checking overhead.
+                // Math.Exp will be auto-vectorized by SVML on .NET 8+.
+                if (length >= 8)
                 {
-                    output[i] = 1.0 / (1.0 + Math.Exp(-input[i]));
-                    output[i + 1] = 1.0 / (1.0 + Math.Exp(-input[i + 1]));
-                    output[i + 2] = 1.0 / (1.0 + Math.Exp(-input[i + 2]));
-                    output[i + 3] = 1.0 / (1.0 + Math.Exp(-input[i + 3]));
-                    output[i + 4] = 1.0 / (1.0 + Math.Exp(-input[i + 4]));
-                    output[i + 5] = 1.0 / (1.0 + Math.Exp(-input[i + 5]));
-                    output[i + 6] = 1.0 / (1.0 + Math.Exp(-input[i + 6]));
-                    output[i + 7] = 1.0 / (1.0 + Math.Exp(-input[i + 7]));
-                    output[i + 8] = 1.0 / (1.0 + Math.Exp(-input[i + 8]));
-                    output[i + 9] = 1.0 / (1.0 + Math.Exp(-input[i + 9]));
-                    output[i + 10] = 1.0 / (1.0 + Math.Exp(-input[i + 10]));
-                    output[i + 11] = 1.0 / (1.0 + Math.Exp(-input[i + 11]));
-                    output[i + 12] = 1.0 / (1.0 + Math.Exp(-input[i + 12]));
-                    output[i + 13] = 1.0 / (1.0 + Math.Exp(-input[i + 13]));
-                    output[i + 14] = 1.0 / (1.0 + Math.Exp(-input[i + 14]));
-                    output[i + 15] = 1.0 / (1.0 + Math.Exp(-input[i + 15]));
+                    int unrolled = length & ~7;
+                    for (; i < unrolled; i += 8)
+                    {
+                        pOut[i] = 1.0 / (1.0 + Math.Exp(-pIn[i]));
+                        pOut[i + 1] = 1.0 / (1.0 + Math.Exp(-pIn[i + 1]));
+                        pOut[i + 2] = 1.0 / (1.0 + Math.Exp(-pIn[i + 2]));
+                        pOut[i + 3] = 1.0 / (1.0 + Math.Exp(-pIn[i + 3]));
+                        pOut[i + 4] = 1.0 / (1.0 + Math.Exp(-pIn[i + 4]));
+                        pOut[i + 5] = 1.0 / (1.0 + Math.Exp(-pIn[i + 5]));
+                        pOut[i + 6] = 1.0 / (1.0 + Math.Exp(-pIn[i + 6]));
+                        pOut[i + 7] = 1.0 / (1.0 + Math.Exp(-pIn[i + 7]));
+                    }
                 }
+                for (; i < length; i++)
+                    pOut[i] = 1.0 / (1.0 + Math.Exp(-pIn[i]));
             }
-#endif
-
+            return;
+#else
             for (; i < length; i++)
             {
                 output[i] = 1.0 / (1.0 + Math.Exp(-input[i]));
             }
+#endif
         }
 
         /// <summary>
