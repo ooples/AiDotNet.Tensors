@@ -2598,7 +2598,9 @@ public class CpuEngine : ITensorLevelEngine
             var rMem = AsFloatMemory(result.Data);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
-            SimdKernels.LogUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            ParallelComputeBound(pI, pR, length, SimdKernels.LogUnsafe);
             return result;
         }
 
@@ -2621,7 +2623,9 @@ public class CpuEngine : ITensorLevelEngine
             var rMem = AsFloatMemory(result.Data);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
-            SimdKernels.ExpUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            ParallelComputeBound(pI, pR, length, SimdKernels.ExpUnsafe);
             return result;
         }
 
@@ -2644,7 +2648,9 @@ public class CpuEngine : ITensorLevelEngine
             var rMem = AsFloatMemory(result.Data);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
-            SimdKernels.SqrtUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            ParallelComputeBound(pI, pR, length, SimdKernels.SqrtUnsafe);
             return result;
         }
 
@@ -2667,7 +2673,11 @@ public class CpuEngine : ITensorLevelEngine
             var rMem = AsFloatMemory(result.Data);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
-            SimdKernels.AbsUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            // Abs is bandwidth-bound (just AND mask), use same compute-bound threshold
+            // since the overhead is minimal and parallelism helps at 1M+
+            ParallelComputeBound(pI, pR, length, SimdKernels.AbsUnsafe);
             return result;
         }
 
@@ -4048,7 +4058,9 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
             return result;
         }
 
@@ -4452,7 +4464,9 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
             return result;
         }
 
@@ -4474,7 +4488,9 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(result.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.MishUnsafe);
             return result;
         }
 
@@ -18879,10 +18895,46 @@ public class CpuEngine : ITensorLevelEngine
     #endregion
 
     /// <summary>
-    /// Reinterprets Memory&lt;T&gt; as Memory&lt;float&gt; without boxing through object.
-    /// Only valid when typeof(T) == typeof(float).
+    /// Parallel dispatch for compute-bound unary float ops (Exp, Log, Sqrt, Tanh, etc.).
+    /// Unlike bandwidth-bound ops (Add/Mul), compute-bound ops benefit from multi-threading
+    /// even at smaller sizes because the bottleneck is ALU, not memory bandwidth.
+    /// Threshold: 256K elements (~1MB of floats).
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private unsafe delegate void UnsafeUnaryKernel(float* input, float* output, int length);
+
+    private static unsafe void ParallelComputeBound(float* input, float* output, int length, UnsafeUnaryKernel kernel)
+    {
+        // For compute-bound ops, parallelize at 256K+ elements
+        const int parallelThreshold = 256 * 1024;
+        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        int chunks = Math.Min(maxThreads, Math.Max(1, length / parallelThreshold));
+
+        if (chunks >= 2)
+        {
+            int chunkSize = (length + chunks - 1) / chunks;
+            chunkSize = (chunkSize + 31) & ~31; // Align to AVX boundary
+
+            // Can't capture float* in lambda — use IntPtr
+            IntPtr pIn = (IntPtr)input;
+            IntPtr pOut = (IntPtr)output;
+            int totalLength = length;
+
+            Parallel.For(0, chunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                {
+                    kernel((float*)pIn + start, (float*)pOut + start, count);
+                }
+            });
+        }
+        else
+        {
+            kernel(input, output, length);
+        }
+    }
+
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
     {
         return Unsafe.As<Memory<T>, Memory<float>>(ref data);
