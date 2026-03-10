@@ -282,6 +282,397 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Pointer-based VectorDivide — zero bounds-checking overhead for hot paths.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void VectorDivideUnsafe(float* a, float* b, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Divide(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                    Avx.Store(result + i + 8, Avx.Divide(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
+                    Avx.Store(result + i + 16, Avx.Divide(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
+                    Avx.Store(result + i + 24, Avx.Divide(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Divide(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] / b[i];
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Exp — Cephes FastExp256 with zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void ExpUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, FastExp256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, FastExp256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, FastExp256(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, FastExp256(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, FastExp256(Avx.LoadVector256(input + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = MathF.Exp(input[i]);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Log — FastLog256 with zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void LogUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, FastLog256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, FastLog256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, FastLog256(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, FastLog256(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, FastLog256(Avx.LoadVector256(input + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = MathF.Log(input[i]);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Sqrt — 4x unrolled AVX with zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void SqrtUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Sqrt(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.Sqrt(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.Sqrt(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.Sqrt(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, Avx.Sqrt(Avx.LoadVector256(input + i)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = MathF.Sqrt(input[i]);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Abs — 4x unrolled AVX AND with sign mask, zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void AbsUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var signMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(input + i), signMask));
+                    Avx.Store(output + i + 8, Avx.And(Avx.LoadVector256(input + i + 8), signMask));
+                    Avx.Store(output + i + 16, Avx.And(Avx.LoadVector256(input + i + 16), signMask));
+                    Avx.Store(output + i + 24, Avx.And(Avx.LoadVector256(input + i + 24), signMask));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var signMask = Vector256.Create(0x7FFFFFFF).AsSingle();
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(input + i), signMask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = Math.Abs(input[i]);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void TanhUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && Avx.IsSupported && length >= 32)
+            {
+                var vtwo = Vector256.Create(2.0f);
+                var vone = Vector256.Create(1.0f);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    // tanh(x) = 2*sigmoid(2x) - 1
+                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
+                    Avx.Store(output + i + 8, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 8)))), vone));
+                    Avx.Store(output + i + 16, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 16)))), vone));
+                    Avx.Store(output + i + 24, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i + 24)))), vone));
+                }
+            }
+            if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)
+            {
+                var vtwo = Vector256.Create(2.0f);
+                var vone = Vector256.Create(1.0f);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(output + i, Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, Avx.LoadVector256(input + i)))), vone));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float ex = MathF.Exp(2f * input[i]);
+                output[i] = (ex - 1f) / (ex + 1f);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based LeakyReLU — max(alpha*x, x) with zero bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void LeakyReLUUnsafe(float* input, float* output, int length, float alpha = 0.01f)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var valpha = Vector256.Create(alpha);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var v0 = Avx.LoadVector256(input + i);
+                    var v1 = Avx.LoadVector256(input + i + 8);
+                    var v2 = Avx.LoadVector256(input + i + 16);
+                    var v3 = Avx.LoadVector256(input + i + 24);
+                    Avx.Store(output + i, Avx.Max(v0, Avx.Multiply(v0, valpha)));
+                    Avx.Store(output + i + 8, Avx.Max(v1, Avx.Multiply(v1, valpha)));
+                    Avx.Store(output + i + 16, Avx.Max(v2, Avx.Multiply(v2, valpha)));
+                    Avx.Store(output + i + 24, Avx.Max(v3, Avx.Multiply(v3, valpha)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var valpha = Vector256.Create(alpha);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var v = Avx.LoadVector256(input + i);
+                    Avx.Store(output + i, Avx.Max(v, Avx.Multiply(v, valpha)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                output[i] = input[i] >= 0 ? input[i] : alpha * input[i];
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based GELU — fused single-pass with 4x unrolling, zero bounds-checking.
+        /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void GELUUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                var vCoeff = Vector256.Create(0.044715f);
+                var vHalf = Vector256.Create(0.5f);
+                var vOne = Vector256.Create(1.0f);
+                var vNegOne = Vector256.Create(-1.0f);
+                var v27 = Vector256.Create(27.0f);
+                var v9 = Vector256.Create(9.0f);
+
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    for (int k = 0; k < 32; k += 8)
+                    {
+                        var x = Avx.LoadVector256(input + i + k);
+                        var x_squared = Avx.Multiply(x, x);
+                        var x_cubed = Avx.Multiply(x_squared, x);
+                        var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
+                        var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
+                        var tanh_arg_sq = Avx.Multiply(tanh_arg, tanh_arg);
+                        var numerator = Avx.Add(v27, tanh_arg_sq);
+                        var denominator = Fma.MultiplyAdd(v9, tanh_arg_sq, v27);
+                        var tanh_approx = Avx.Divide(Avx.Multiply(tanh_arg, numerator), denominator);
+                        tanh_approx = Avx.Max(vNegOne, Avx.Min(vOne, tanh_approx));
+                        Avx.Store(output + i + k, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_approx))));
+                    }
+                }
+            }
+            if (Avx.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                var vCoeff = Vector256.Create(0.044715f);
+                var vHalf = Vector256.Create(0.5f);
+                var vOne = Vector256.Create(1.0f);
+                var vNegOne = Vector256.Create(-1.0f);
+                var v27 = Vector256.Create(27.0f);
+                var v9 = Vector256.Create(9.0f);
+
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var x_squared = Avx.Multiply(x, x);
+                    var x_cubed = Avx.Multiply(x_squared, x);
+                    var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
+                    var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
+                    var tanh_arg_sq = Avx.Multiply(tanh_arg, tanh_arg);
+                    var numerator = Avx.Add(v27, tanh_arg_sq);
+                    var denominator = Fma.MultiplyAdd(v9, tanh_arg_sq, v27);
+                    var tanh_approx = Avx.Divide(Avx.Multiply(tanh_arg, numerator), denominator);
+                    tanh_approx = Avx.Max(vNegOne, Avx.Min(vOne, tanh_approx));
+                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_approx))));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float x3 = x * x * x;
+                float inner = x + 0.044715f * x3;
+                float tanh_arg = 0.7978845608028654f * inner;
+                float tanh_val = MathF.Tanh(tanh_arg);
+                output[i] = 0.5f * x * (1f + tanh_val);
+            }
+        }
+
+        /// <summary>
+        /// Pointer-based Mish — fused single-pass, no temp buffer allocation.
+        /// Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void MishUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
+            {
+                var vtwo = Vector256.Create(2.0f);
+                var vone = Vector256.Create(1.0f);
+                var vthreshold = Vector256.Create(20.0f);
+
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    for (int k = 0; k < 32; k += 8)
+                    {
+                        var x = Avx.LoadVector256(input + i + k);
+                        // softplus(x) = ln(1 + exp(x)), or x if x > 20
+                        var expx = FastExp256(x);
+                        var softplus = FastLog256(Avx.Add(vone, expx));
+                        // For large x, softplus ≈ x (avoid log overflow)
+                        var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
+                        softplus = Avx.BlendVariable(softplus, x, mask);
+                        // tanh(softplus) via 2*sigmoid(2*softplus)-1
+                        var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
+                        // mish = x * tanh(softplus(x))
+                        Avx.Store(output + i + k, Avx.Multiply(x, tanh_sp));
+                    }
+                }
+            }
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
+            {
+                var vtwo = Vector256.Create(2.0f);
+                var vone = Vector256.Create(1.0f);
+                var vthreshold = Vector256.Create(20.0f);
+
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var expx = FastExp256(x);
+                    var softplus = FastLog256(Avx.Add(vone, expx));
+                    var mask = Avx.Compare(x, vthreshold, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    softplus = Avx.BlendVariable(softplus, x, mask);
+                    var tanh_sp = Avx.Subtract(Avx.Multiply(vtwo, FastSigmoid256(Avx.Multiply(vtwo, softplus))), vone);
+                    Avx.Store(output + i, Avx.Multiply(x, tanh_sp));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float sp = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+                float th = MathF.Tanh(sp);
+                output[i] = x * th;
+            }
+        }
+
+        /// <summary>
         /// Unsafe pointer-based sum with 4-way accumulation. Eliminates Span bounds-checking.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -339,6 +730,90 @@ namespace AiDotNet.Tensors.Engines.Simd
                 sum += data[i];
             }
             return sum;
+        }
+
+        /// <summary>
+        /// Unsafe pointer-based Max with 4-way accumulation. Eliminates Span bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe float MaxUnsafe(float* data, int length)
+        {
+            int i = 0;
+            float max = float.NegativeInfinity;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmax0 = Vector256.Create(float.NegativeInfinity);
+                var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vmax0 = Avx.Max(vmax0, Avx.LoadVector256(data + i));
+                    vmax1 = Avx.Max(vmax1, Avx.LoadVector256(data + i + 8));
+                    vmax2 = Avx.Max(vmax2, Avx.LoadVector256(data + i + 16));
+                    vmax3 = Avx.Max(vmax3, Avx.LoadVector256(data + i + 24));
+                }
+                vmax0 = Avx.Max(Avx.Max(vmax0, vmax1), Avx.Max(vmax2, vmax3));
+                max = HorizontalMax(vmax0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vmax = Vector256.Create(max);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    vmax = Avx.Max(vmax, Avx.LoadVector256(data + i));
+                }
+                max = HorizontalMax(vmax);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                if (data[i] > max) max = data[i];
+            }
+            return max;
+        }
+
+        /// <summary>
+        /// Unsafe pointer-based Min with 4-way accumulation. Eliminates Span bounds-checking.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe float MinUnsafe(float* data, int length)
+        {
+            int i = 0;
+            float min = float.PositiveInfinity;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vmin0 = Vector256.Create(float.PositiveInfinity);
+                var vmin1 = vmin0; var vmin2 = vmin0; var vmin3 = vmin0;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    vmin0 = Avx.Min(vmin0, Avx.LoadVector256(data + i));
+                    vmin1 = Avx.Min(vmin1, Avx.LoadVector256(data + i + 8));
+                    vmin2 = Avx.Min(vmin2, Avx.LoadVector256(data + i + 16));
+                    vmin3 = Avx.Min(vmin3, Avx.LoadVector256(data + i + 24));
+                }
+                vmin0 = Avx.Min(Avx.Min(vmin0, vmin1), Avx.Min(vmin2, vmin3));
+                min = HorizontalMin(vmin0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vmin = Vector256.Create(min);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    vmin = Avx.Min(vmin, Avx.LoadVector256(data + i));
+                }
+                min = HorizontalMin(vmin);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                if (data[i] < min) min = data[i];
+            }
+            return min;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -910,7 +1385,27 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+            // 8x unrolled: helps SVML auto-vectorization on NET8+
+            if (length >= 8)
+            {
+                int unrolled = length & ~7;
+                for (; i < unrolled; i += 8)
+                {
+                    output[i] = Math.Exp(input[i]);
+                    output[i + 1] = Math.Exp(input[i + 1]);
+                    output[i + 2] = Math.Exp(input[i + 2]);
+                    output[i + 3] = Math.Exp(input[i + 3]);
+                    output[i + 4] = Math.Exp(input[i + 4]);
+                    output[i + 5] = Math.Exp(input[i + 5]);
+                    output[i + 6] = Math.Exp(input[i + 6]);
+                    output[i + 7] = Math.Exp(input[i + 7]);
+                }
+            }
+
+            for (; i < length; i++)
             {
                 output[i] = Math.Exp(input[i]);
             }
@@ -975,7 +1470,37 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            // 4x unrolled scalar: SVML auto-vectorizes Math.Exp on NET8+ with individual calls
+            if (length >= 16)
+            {
+                int unrolled = length & ~15;
+                for (; i < unrolled; i += 16)
+                {
+                    output[i] = 1.0 / (1.0 + Math.Exp(-input[i]));
+                    output[i + 1] = 1.0 / (1.0 + Math.Exp(-input[i + 1]));
+                    output[i + 2] = 1.0 / (1.0 + Math.Exp(-input[i + 2]));
+                    output[i + 3] = 1.0 / (1.0 + Math.Exp(-input[i + 3]));
+                    output[i + 4] = 1.0 / (1.0 + Math.Exp(-input[i + 4]));
+                    output[i + 5] = 1.0 / (1.0 + Math.Exp(-input[i + 5]));
+                    output[i + 6] = 1.0 / (1.0 + Math.Exp(-input[i + 6]));
+                    output[i + 7] = 1.0 / (1.0 + Math.Exp(-input[i + 7]));
+                    output[i + 8] = 1.0 / (1.0 + Math.Exp(-input[i + 8]));
+                    output[i + 9] = 1.0 / (1.0 + Math.Exp(-input[i + 9]));
+                    output[i + 10] = 1.0 / (1.0 + Math.Exp(-input[i + 10]));
+                    output[i + 11] = 1.0 / (1.0 + Math.Exp(-input[i + 11]));
+                    output[i + 12] = 1.0 / (1.0 + Math.Exp(-input[i + 12]));
+                    output[i + 13] = 1.0 / (1.0 + Math.Exp(-input[i + 13]));
+                    output[i + 14] = 1.0 / (1.0 + Math.Exp(-input[i + 14]));
+                    output[i + 15] = 1.0 / (1.0 + Math.Exp(-input[i + 15]));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
                 output[i] = 1.0 / (1.0 + Math.Exp(-input[i]));
             }

@@ -1934,6 +1934,18 @@ public class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        if (typeof(T) == typeof(double))
+        {
+            var aMem = AsDoubleMemory(a.Data);
+            var bMem = AsDoubleMemory(b.Data);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            return result;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
 
@@ -2381,8 +2393,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>(a.Shape);
         int length = a.Length;
 
-        // Fast path for float tensors with JIT kernel
-        if (typeof(T) == typeof(float) && CpuJitSelfTest.IsVerified && length >= 64)
+        if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
@@ -2394,7 +2405,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
+            }
+            else
+            {
+                SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+            }
             return result;
         }
 
@@ -2567,50 +2585,94 @@ public class CpuEngine : ITensorLevelEngine
     #region Tensor Element-wise Math Operations
 
     /// <inheritdoc/>
-    public Tensor<T> TensorLog<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> TensorLog<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var iMem = AsFloatMemory(tensor.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            SimdKernels.LogUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
-
         return result;
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorExp<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var iMem = AsFloatMemory(tensor.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            SimdKernels.ExpUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
-
         return result;
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
+        int length = tensor.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var iMem = AsFloatMemory(tensor.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            SimdKernels.SqrtUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
-
         return result;
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAbs<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
-        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
+        int length = tensor.Length;
 
+        if (typeof(T) == typeof(float))
+        {
+            var iMem = AsFloatMemory(tensor.Data);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            SimdKernels.AbsUnsafe((float*)pinI.Pointer, (float*)pinR.Pointer, length);
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
         return result;
     }
 
@@ -3153,20 +3215,36 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public T TensorMaxValue<T>(Tensor<T> tensor)
+    public unsafe T TensorMaxValue<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
+
+        if (typeof(T) == typeof(float))
+        {
+            var mem = AsFloatMemory(tensor.Data);
+            using var pin = mem.Pin();
+            float result = SimdKernels.MaxUnsafe((float*)pin.Pointer, tensor.Length);
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Max(tensor.AsSpan());
     }
 
     /// <inheritdoc/>
-    public T TensorMinValue<T>(Tensor<T> tensor)
+    public unsafe T TensorMinValue<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
+
+        if (typeof(T) == typeof(float))
+        {
+            var mem = AsFloatMemory(tensor.Data);
+            using var pin = mem.Pin();
+            float result = SimdKernels.MinUnsafe((float*)pin.Pointer, tensor.Length);
+            return Unsafe.As<float, T>(ref result);
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         return numOps.Min(tensor.AsSpan());
@@ -3888,17 +3966,25 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> Tanh<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> Tanh<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized Tanh - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
 
-        numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            return result;
+        }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
         return result;
     }
 
@@ -4284,31 +4370,47 @@ public class CpuEngine : ITensorLevelEngine
         return TensorPrimitivesHelper<T>.ELU(vector, alpha);
     }
 
-    public Tensor<T> GELU<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> GELU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized GELU - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
 
-        numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            return result;
+        }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
         return result;
     }
 
-    public Tensor<T> Mish<T>(Tensor<T> tensor)
+    public unsafe Tensor<T> Mish<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized Mish - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
 
-        numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            return result;
+        }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
         return result;
     }
 
@@ -4341,17 +4443,26 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
+    public unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized LeakyReLU - single allocation, zero-copy
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor.Shape);
 
-        numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            float alphaF = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref alpha);
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, alphaF);
+            return result;
+        }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
         return result;
     }
 
@@ -8503,8 +8614,8 @@ public class CpuEngine : ITensorLevelEngine
                     rowOut[j] = rowIn[j] - maxVal;
             }
 
-            // Pass 3: exp on entire flat array at once
-            SimdKernels.Exp(new ReadOnlySpan<float>(pOut, totalLen), new Span<float>(pOut, totalLen));
+            // Pass 3: exp on entire flat array at once (unsafe pointer path, no Span bounds checks)
+            SimdKernels.ExpUnsafe(pOut, pOut, totalLen);
 
             // Pass 4: per-row sum and divide
             for (int row = 0; row < outerSize; row++)
@@ -18552,5 +18663,10 @@ public class CpuEngine : ITensorLevelEngine
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
     {
         return Unsafe.As<Memory<T>, Memory<float>>(ref data);
+    }
+
+    private static Memory<double> AsDoubleMemory<T>(Memory<T> data)
+    {
+        return Unsafe.As<Memory<T>, Memory<double>>(ref data);
     }
 }
