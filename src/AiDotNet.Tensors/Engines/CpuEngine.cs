@@ -8825,41 +8825,60 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
     {
+        // Hybrid approach: per-row max/subtract, FLAT exp (amortizes FastExp overhead), per-row sum/divide.
+        // Per-row ExpUnsafe calls (512x on 1024 elements) have huge per-call overhead vs 1 flat call.
+        int totalLen = outerSize * axisSize;
+
         fixed (float* pIn = inputFloats)
         fixed (float* pOut = outputFloats)
         {
-            IntPtr ipIn = (IntPtr)pIn;
-            IntPtr ipOut = (IntPtr)pOut;
-            int axisSz = axisSize;
-
-            // Parallelize across rows when there are enough rows
+            // Pass 1+2: Per-row max and subtract (parallel if enough rows)
             int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
             bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
 
             if (useParallel)
             {
+                IntPtr ipIn = (IntPtr)pIn;
+                IntPtr ipOut = (IntPtr)pOut;
+                int axisSz = axisSize;
                 Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
                 {
-                    SoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
+                    SoftmaxMaxSubtractRow((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
                 });
             }
             else
             {
                 for (int row = 0; row < outerSize; row++)
+                    SoftmaxMaxSubtractRow(pIn + row * axisSize, pOut + row * axisSize, axisSize);
+            }
+
+            // Pass 3: FLAT exp across entire output (1 call, amortized overhead)
+            SimdKernels.ExpUnsafe(pOut, pOut, totalLen);
+
+            // Pass 4+5: Per-row sum and divide
+            if (useParallel)
+            {
+                IntPtr ipOut2 = (IntPtr)pOut;
+                int axisSz = axisSize;
+                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
                 {
-                    SoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
-                }
+                    SoftmaxSumDivideRow((float*)ipOut2 + row * axisSz, axisSz);
+                });
+            }
+            else
+            {
+                for (int row = 0; row < outerSize; row++)
+                    SoftmaxSumDivideRow(pOut + row * axisSize, axisSize);
             }
         }
     }
 
     /// <summary>
-    /// Processes a single softmax row: max → subtract → exp → sum → divide.
-    /// All operations are fused per-row for better cache locality.
+    /// Per-row pass 1+2: find max and subtract it (output = input - max).
     /// </summary>
-    private static unsafe void SoftmaxRowUnsafe(float* rowIn, float* rowOut, int axisSize)
+    private static unsafe void SoftmaxMaxSubtractRow(float* rowIn, float* rowOut, int axisSize)
     {
-        // Pass 1: Find max (4x unrolled AVX2)
+        // Find max (4x unrolled AVX2)
         float maxVal = float.NegativeInfinity;
         int j = 0;
 #if NET5_0_OR_GREATER
@@ -8893,7 +8912,7 @@ public class CpuEngine : ITensorLevelEngine
         for (; j < axisSize; j++)
             if (rowIn[j] > maxVal) maxVal = rowIn[j];
 
-        // Pass 2: Subtract max (write to output buffer)
+        // Subtract max
         j = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
@@ -8910,13 +8929,16 @@ public class CpuEngine : ITensorLevelEngine
 #endif
         for (; j < axisSize; j++)
             rowOut[j] = rowIn[j] - maxVal;
+    }
 
-        // Pass 3: exp in-place
-        SimdKernels.ExpUnsafe(rowOut, rowOut, axisSize);
-
-        // Pass 4: Sum (4x unrolled AVX2)
+    /// <summary>
+    /// Per-row pass 4+5: sum exp values, then divide by sum.
+    /// </summary>
+    private static unsafe void SoftmaxSumDivideRow(float* rowOut, int axisSize)
+    {
+        // Sum (4x unrolled AVX2)
         float sumExp = 0f;
-        j = 0;
+        int j = 0;
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
         {
@@ -8958,7 +8980,7 @@ public class CpuEngine : ITensorLevelEngine
         for (; j < axisSize; j++)
             sumExp += rowOut[j];
 
-        // Pass 5: Divide by sum (multiply by inverse)
+        // Divide by sum (multiply by inverse)
         if (sumExp > 0f)
         {
             float invSum = 1f / sumExp;
@@ -15675,102 +15697,87 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void LogSoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
     {
+        // Hybrid: per-row max/subtract, FLAT exp into temp, per-row sum+log+subtract.
+        // Avoids 512 per-row ExpUnsafe calls and 512 ArrayPool rent/return cycles.
+        int totalLen = outerSize * axisSize;
+
+        // Single temp buffer for flat exp
+        float[] expTempArr = System.Buffers.ArrayPool<float>.Shared.Rent(totalLen);
+
         fixed (float* pIn = inputFloats)
         fixed (float* pOut = outputFloats)
+        fixed (float* pExp = expTempArr)
         {
-            // Process each row: find max, compute shifted, exp+sum, then output = shifted - log(sum)
-            for (int row = 0; row < outerSize; row++)
+            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+            bool useParallel = outerSize >= 4 && totalLen >= 32768;
+
+            // Pass 1+2: Per-row max and subtract (output = input - max)
+            if (useParallel)
             {
-                float* rowIn = pIn + row * axisSize;
-                float* rowOut = pOut + row * axisSize;
-
-                // Pass 1: Find max
-                float maxVal = float.NegativeInfinity;
-                int j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                IntPtr ipIn = (IntPtr)pIn;
+                IntPtr ipOut = (IntPtr)pOut;
+                int axisSz = axisSize;
+                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
                 {
-                    var vmax0 = System.Runtime.Intrinsics.Vector256.Create(float.NegativeInfinity);
-                    var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
-                    int simdLen = axisSize & ~31;
-                    for (; j < simdLen; j += 32)
-                    {
-                        vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(vmax0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j));
-                        vmax1 = System.Runtime.Intrinsics.X86.Avx.Max(vmax1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 8));
-                        vmax2 = System.Runtime.Intrinsics.X86.Avx.Max(vmax2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 16));
-                        vmax3 = System.Runtime.Intrinsics.X86.Avx.Max(vmax3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 24));
-                    }
-                    vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(
-                        System.Runtime.Intrinsics.X86.Avx.Max(vmax0, vmax1),
-                        System.Runtime.Intrinsics.X86.Avx.Max(vmax2, vmax3));
-                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 1);
-                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 0);
-                    var max128 = System.Runtime.Intrinsics.X86.Sse.Max(lo, hi);
-                    var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_01_00_11_10);
-                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
-                    shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_10_11_00_01);
-                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
-                    float maxTmp;
-                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&maxTmp, max128);
-                    maxVal = maxTmp;
-                }
-#endif
-                for (; j < axisSize; j++)
-                    if (rowIn[j] > maxVal) maxVal = rowIn[j];
+                    SoftmaxMaxSubtractRow((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
+                });
+            }
+            else
+            {
+                for (int row = 0; row < outerSize; row++)
+                    SoftmaxMaxSubtractRow(pIn + row * axisSize, pOut + row * axisSize, axisSize);
+            }
 
-                // Pass 2: Compute shifted = x - max and store in output
-                j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+            // Pass 3: FLAT exp of output into temp buffer (preserves shifted values in pOut)
+            SimdKernels.ExpUnsafe(pOut, pExp, totalLen);
+
+            // Pass 4+5: Per-row sum of exp, then output = shifted - log(sum)
+            if (useParallel)
+            {
+                IntPtr ipOut2 = (IntPtr)pOut;
+                IntPtr ipExp = (IntPtr)pExp;
+                int axisSz = axisSize;
+                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
                 {
-                    var vmaxBcast = System.Runtime.Intrinsics.Vector256.Create(maxVal);
-                    int simdLen = axisSize & ~7;
-                    for (; j < simdLen; j += 8)
-                    {
-                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
-                            System.Runtime.Intrinsics.X86.Avx.Subtract(
-                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j), vmaxBcast));
-                    }
-                }
-#endif
-                for (; j < axisSize; j++)
-                    rowOut[j] = rowIn[j] - maxVal;
-
-                // Pass 3: exp(shifted) into temp buffer, then sum
-                // We preserve shifted values in rowOut for the final output
-                // Use a stackalloc or heap temp for exp values
-                float[] expTempArr = System.Buffers.ArrayPool<float>.Shared.Rent(axisSize);
-                float sumExp;
-                fixed (float* pExpTemp = expTempArr)
-                {
-                    // Compute exp(shifted) using SIMD
-                    SimdKernels.ExpUnsafe(rowOut, pExpTemp, axisSize);
-
-                    // Sum the exp values
-                    sumExp = SimdKernels.SumUnsafe(pExpTemp, axisSize);
-                }
-                System.Buffers.ArrayPool<float>.Shared.Return(expTempArr);
-
-                // Pass 4: output = shifted - log(sumExp)
-                float logSumExp = MathF.Log(sumExp);
-                j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
-                {
-                    var vLogSum = System.Runtime.Intrinsics.Vector256.Create(logSumExp);
-                    int simdLen = axisSize & ~7;
-                    for (; j < simdLen; j += 8)
-                    {
-                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
-                            System.Runtime.Intrinsics.X86.Avx.Subtract(
-                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vLogSum));
-                    }
-                }
-#endif
-                for (; j < axisSize; j++)
-                    rowOut[j] -= logSumExp;
+                    LogSoftmaxSumSubtractRow((float*)ipOut2 + row * axisSz, (float*)ipExp + row * axisSz, axisSz);
+                });
+            }
+            else
+            {
+                for (int row = 0; row < outerSize; row++)
+                    LogSoftmaxSumSubtractRow(pOut + row * axisSize, pExp + row * axisSize, axisSize);
             }
         }
+
+        System.Buffers.ArrayPool<float>.Shared.Return(expTempArr);
+    }
+
+    /// <summary>
+    /// Per-row LogSoftmax pass 4+5: sum exp values, compute log(sum), subtract from shifted output.
+    /// </summary>
+    private static unsafe void LogSoftmaxSumSubtractRow(float* rowOut, float* rowExp, int axisSize)
+    {
+        // Sum exp values
+        float sumExp = SimdKernels.SumUnsafe(rowExp, axisSize);
+
+        // output = shifted - log(sumExp)
+        float logSumExp = MathF.Log(sumExp);
+        int j = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+        {
+            var vLogSum = System.Runtime.Intrinsics.Vector256.Create(logSumExp);
+            int simdLen = axisSize & ~7;
+            for (; j < simdLen; j += 8)
+            {
+                System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                    System.Runtime.Intrinsics.X86.Avx.Subtract(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vLogSum));
+            }
+        }
+#endif
+        for (; j < axisSize; j++)
+            rowOut[j] -= logSumExp;
     }
 
     /// <inheritdoc/>
