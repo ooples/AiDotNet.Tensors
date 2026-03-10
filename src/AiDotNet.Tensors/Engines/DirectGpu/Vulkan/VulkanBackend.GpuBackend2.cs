@@ -1582,6 +1582,9 @@ public sealed unsafe partial class VulkanBackend
     public void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
         => CpuBinary(gradOutput, mask, gradInput, size, (g, m) => g * m);
 
+    public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale) => false;
+
     #endregion
 
     #region Embedding

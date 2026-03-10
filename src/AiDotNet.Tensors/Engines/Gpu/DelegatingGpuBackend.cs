@@ -750,6 +750,11 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
         => Inner.DropoutBackward(gradOutput, mask, gradInput, size, dropoutRate);
 
+    /// <inheritdoc/>
+    public virtual bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale)
+        => Inner.TryFusedBiasDropout(input, output, bias, mask, rows, cols, dropoutRate, scale);
+
     #endregion
 
     #region Embedding Operations

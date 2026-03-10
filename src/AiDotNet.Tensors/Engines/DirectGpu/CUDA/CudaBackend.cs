@@ -4559,6 +4559,34 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale)
+    {
+        if (!_kernelCache.TryGetValue("bias_dropout", out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        // 2D grid: x = columns (threads per row), y = rows
+        uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)rows;
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr maskPtr = mask.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &biasPtr;
+        args[3] = &maskPtr;
+        args[4] = &rows;
+        args[5] = &cols;
+        args[6] = &dropoutRate;
+        args[7] = &scale;
+
+        LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
+        return true;
+    }
+
     #endregion
 
 

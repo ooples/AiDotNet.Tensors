@@ -7529,6 +7529,112 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// GPU-accelerated fused BiasAdd + Dropout in a single kernel launch.
+    /// Eliminates one global memory round-trip compared to separate BiasAdd + Dropout calls.
+    /// Falls back to separate operations if the backend doesn't support the fused kernel.
+    /// </summary>
+    /// <typeparam name="T">Element type.</typeparam>
+    /// <param name="input">Input tensor [batch x features] or any shape where last dim = bias length.</param>
+    /// <param name="bias">1D bias tensor [features].</param>
+    /// <param name="dropoutRate">Probability of dropping each element (0.0 to 1.0).</param>
+    /// <param name="training">Whether we're in training mode (dropout only applies during training).</param>
+    /// <param name="mask">Output dropout mask tensor (1 = kept, 0 = dropped).</param>
+    /// <returns>Result tensor with bias added and dropout applied.</returns>
+    public Tensor<T> FusedBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
+    {
+        if (!TryGetBackend(out var backend))
+        {
+            // No GPU — fall back to CPU: add bias element-wise then dropout
+            return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+        }
+
+        if (!training || dropoutRate <= 0.0)
+        {
+            // No dropout — just do bias add on GPU, return all-ones mask
+            int lastDim = input.Shape[^1];
+            int rows = input.Length / lastDim;
+            try
+            {
+                using var inputBuf = GetOrAllocateBuffer(backend, input.GetDataArray());
+                using var biasBuf = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+                using var outBuf = AllocateOutputBuffer(backend, input.Length);
+                backend.BiasAdd(inputBuf.Buffer, biasBuf.Buffer, outBuf.Buffer, rows, lastDim);
+                float[] resultFloat = backend.DownloadBuffer(outBuf.Buffer);
+                var numOps = MathHelper.GetNumericOperations<T>();
+                var ones = new T[input.Length];
+                for (int i = 0; i < ones.Length; i++) ones[i] = numOps.One;
+                mask = new Tensor<T>(ones, input.Shape.ToArray());
+                return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), input.Shape.ToArray());
+            }
+            catch
+            {
+                return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+            }
+        }
+
+        try
+        {
+            int lastDim = input.Shape[^1];
+            int rows = input.Length / lastDim;
+            int cols = lastDim;
+            float scale = 1.0f / (1.0f - (float)dropoutRate);
+
+            using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
+            using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
+            using var outputBuffer = AllocateOutputBuffer(backend, input.Length);
+            using var maskBuffer = AllocateOutputBuffer(backend, input.Length);
+
+            // Generate mask via existing Dropout kernel (it writes the mask as a side effect)
+            ulong seed = (ulong)DateTime.UtcNow.Ticks;
+            using var tempBuffer = AllocateOutputBuffer(backend, input.Length);
+            backend.Dropout(inputBuffer.Buffer, tempBuffer.Buffer, maskBuffer.Buffer, input.Length, (float)dropoutRate, seed, training);
+
+            // Try fused path: single kernel does bias + mask application
+            bool fused = backend.TryFusedBiasDropout(
+                inputBuffer.Buffer, outputBuffer.Buffer, biasBuffer.Buffer, maskBuffer.Buffer,
+                rows, cols, (float)dropoutRate, scale);
+
+            if (!fused)
+            {
+                // Fallback: separate BiasAdd + re-apply dropout with existing mask
+                backend.BiasAdd(inputBuffer.Buffer, biasBuffer.Buffer, outputBuffer.Buffer, rows, cols);
+                backend.Dropout(outputBuffer.Buffer, outputBuffer.Buffer, maskBuffer.Buffer, input.Length, (float)dropoutRate, seed, training);
+            }
+
+            float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
+            float[] maskFloat = backend.DownloadBuffer(maskBuffer.Buffer);
+
+            mask = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(maskFloat), input.Shape.ToArray());
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), input.Shape.ToArray());
+        }
+        catch
+        {
+            return CpuFallbackBiasDropout(input, bias, dropoutRate, training, out mask);
+        }
+    }
+
+    /// <summary>
+    /// CPU fallback for fused bias + dropout when no GPU is available.
+    /// </summary>
+    private Tensor<T> CpuFallbackBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int lastDim = input.Shape[^1];
+        var inputData = input.GetDataArray();
+        var biasData = bias.GetDataArray();
+        var result = new T[input.Length];
+
+        // Add bias (broadcast along last dimension)
+        for (int i = 0; i < input.Length; i++)
+        {
+            result[i] = numOps.Add(inputData[i], biasData[i % lastDim]);
+        }
+
+        var biasedTensor = new Tensor<T>(result, input.Shape.ToArray());
+        return base.Dropout(biasedTensor, dropoutRate, training, out mask);
+    }
+
     #endregion
 
     #region Embedding Operations (GPU Accelerated)

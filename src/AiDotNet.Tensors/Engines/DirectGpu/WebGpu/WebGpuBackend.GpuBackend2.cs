@@ -1031,6 +1031,9 @@ public sealed partial class WebGpuBackend
             gradOutput, gradInput, mask, uniforms, size).GetAwaiter().GetResult();
     }
 
+    public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale) => false;
+
     #endregion
 
     #region Embedding Operations

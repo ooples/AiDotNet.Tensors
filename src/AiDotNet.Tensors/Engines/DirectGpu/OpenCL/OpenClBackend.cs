@@ -6474,6 +6474,31 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(size, Math.Min(256, size));
         }
 
+        public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+            int rows, int cols, float dropoutRate, float scale)
+        {
+            if (!_kernelCache.TryGetValue("bias_dropout", out var k))
+                return false;
+
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
+            k.SetArg(arg++, rows);
+            k.SetArg(arg++, cols);
+            k.SetArg(arg++, dropoutRate);
+            k.SetArg(arg++, scale);
+
+            // 2D dispatch: global_id(0)=col, global_id(1)=row
+            int localSizeX = Math.Min(16, cols);
+            int localSizeY = Math.Min(16, rows);
+            int globalSizeX = ((cols + localSizeX - 1) / localSizeX) * localSizeX;
+            int globalSizeY = ((rows + localSizeY - 1) / localSizeY) * localSizeY;
+            k.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
+            return true;
+        }
+
         #endregion
 
         #region Embedding Operations

@@ -646,6 +646,9 @@ public sealed partial class MetalBackend
         UploadToBuffer(gradInput, gradInputData);
     }
 
+    public bool TryFusedBiasDropout(IGpuBuffer input, IGpuBuffer output, IGpuBuffer bias, IGpuBuffer mask,
+        int rows, int cols, float dropoutRate, float scale) => false;
+
     #endregion
 
     #region Embedding Operations
