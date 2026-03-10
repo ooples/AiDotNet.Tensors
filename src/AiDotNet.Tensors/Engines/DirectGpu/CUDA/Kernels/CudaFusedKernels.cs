@@ -1027,19 +1027,27 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_mean_kernel(
     for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
         sum += input[i];
     }
-    sdata[tid] = sum;
+
+    // Warp-level reduction first (no __syncthreads needed within a warp)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    // Write warp results to shared memory
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Tree reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        atomicAdd(output, sdata[0]);
+    // Final reduction across warps (only first warp)
+    int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps) {
+        sum = sdata[tid];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (tid == 0)
+            atomicAdd(output, sum);
     }
 }
 
@@ -1060,19 +1068,27 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel(
         float diff = input[i] - mean;
         sum += diff * diff;
     }
-    sdata[tid] = sum;
+
+    // Warp-level reduction first
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    // Write warp results to shared memory
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    if (lane == 0) sdata[warpId] = sum;
     __syncthreads();
 
-    // Tree reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        atomicAdd(output, sdata[0]);
+    // Final reduction across warps (only first warp)
+    int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps) {
+        sum = sdata[tid];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (tid == 0)
+            atomicAdd(output, sum);
     }
 }
 ";
