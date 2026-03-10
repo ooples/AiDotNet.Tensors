@@ -10,25 +10,13 @@ namespace AiDotNet.Tensors.Engines.CpuJit;
 /// </summary>
 internal static class CpuJitSelfTest
 {
-    private static bool _tested;
-    private static bool _passed;
+    private static readonly Lazy<bool> _verified = new Lazy<bool>(RunSelfTest, System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
 
     /// <summary>
     /// Returns true if JIT kernels are verified working on this machine.
-    /// Runs the self-test on first call, caches the result.
+    /// Runs the self-test on first call, caches the result. Thread-safe.
     /// </summary>
-    public static bool IsVerified
-    {
-        get
-        {
-            if (!_tested)
-            {
-                _passed = RunSelfTest();
-                _tested = true;
-            }
-            return _passed;
-        }
-    }
+    public static bool IsVerified => _verified.Value;
 
     private static unsafe bool RunSelfTest()
     {
@@ -127,7 +115,10 @@ internal static class CpuJitSelfTest
 
         // Compare against SimdKernels (reference implementation using same polynomial)
         float[] simdOutput = new float[testSize];
-        Simd.SimdKernels.SigmoidUnsafe(src.FloatPtr, (float*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref simdOutput[0]), testSize);
+        fixed (float* pSimdOutput = simdOutput)
+        {
+            Simd.SimdKernels.SigmoidUnsafe(src.FloatPtr, pSimdOutput, testSize);
+        }
 
         for (int i = 0; i < testSize; i++)
         {

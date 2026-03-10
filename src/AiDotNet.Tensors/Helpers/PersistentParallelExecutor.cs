@@ -66,7 +66,9 @@ internal sealed class PersistentParallelExecutor
             _workReady[slot].Reset();
 
             // Execute all assigned chunks for this worker slot.
-            // Chunks are assigned round-robin: slot gets chunks (slot+1), (slot+1+_numWorkers), etc.
+            // Chunks are assigned round-robin across all participants (workers + main thread).
+            // Total participants = _numWorkers + 1 (main). Worker slot N gets chunks (slot+1), (slot+1+stride), etc.
+            int stride = _numWorkers + 1;
             int chunkId = slot + 1;
             while (chunkId < _numChunks)
             {
@@ -79,7 +81,7 @@ internal sealed class PersistentParallelExecutor
                     // Capture first exception — will be re-thrown on the caller thread
                     Interlocked.CompareExchange(ref _workerException, ex, null);
                 }
-                chunkId += _numWorkers;
+                chunkId += stride;
             }
 
             // Signal completion
