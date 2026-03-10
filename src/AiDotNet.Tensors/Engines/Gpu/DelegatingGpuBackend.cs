@@ -49,6 +49,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual long LocalMemoryBytes => Inner.LocalMemoryBytes;
 
+    /// <inheritdoc/>
+    public virtual double TheoreticalGflops => Inner.TheoreticalGflops;
+
     #endregion
 
     #region Memory Management

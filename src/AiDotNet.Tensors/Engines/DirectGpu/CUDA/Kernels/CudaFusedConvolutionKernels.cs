@@ -5,6 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 {
     /// <summary>
     /// CUDA fused convolution kernels for CNN performance optimization.
+    /// Uses device helper functions to deduplicate conv2d loop across activations.
     /// </summary>
     internal static class CudaFusedConvolutionKernels
     {
@@ -14,349 +15,152 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 #include <math.h>
 
 // ===========================================================================
-// FUSED CONVOLUTION KERNELS: CONV2D + BIAS/BATCHNORM + ACTIVATION
+// DEVICE HELPERS: Conv2D accumulation + activation functions
 // ===========================================================================
 
-// Fused Conv2D + Bias + ReLU
-extern ""C"" __global__ void conv2d_bias_relu(
-    const float* input, const float* weights, const float* bias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
+__device__ __forceinline__ float conv2d_accumulate(
+    const float* __restrict__ input, const float* __restrict__ weights,
+    int b, int oc, int oh, int ow,
+    int inChannels, int inHeight, int inWidth,
     int kernelH, int kernelW, int strideH, int strideW,
     int padH, int padW, int dilationH, int dilationW)
 {
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
     float sum = 0.0f;
-
     for (int ic = 0; ic < inChannels; ic++) {
         for (int kh = 0; kh < kernelH; kh++) {
             for (int kw = 0; kw < kernelW; kw++) {
                 int ih = oh * strideH - padH + kh * dilationH;
                 int iw = ow * strideW - padW + kw * dilationW;
-
                 if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
+                    sum += __ldg(&input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw])
+                         * __ldg(&weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw]);
                 }
             }
         }
     }
-
-    float result = sum + bias[oc];
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = fmaxf(0.0f, result);
+    return sum;
 }
 
-// Fused Conv2D + Bias + GELU
-extern ""C"" __global__ void conv2d_bias_gelu(
-    const float* input, const float* weights, const float* bias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
+__device__ __forceinline__ float depthwise_accumulate(
+    const float* __restrict__ input, const float* __restrict__ weights,
+    int b, int c, int oh, int ow,
+    int channels, int inHeight, int inWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW)
 {
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
     float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
+    for (int kh = 0; kh < kernelH; kh++) {
+        for (int kw = 0; kw < kernelW; kw++) {
+            int ih = oh * strideH - padH + kh;
+            int iw = ow * strideW - padW + kw;
+            if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                sum += __ldg(&input[((b * channels + c) * inHeight + ih) * inWidth + iw])
+                     * __ldg(&weights[(c * kernelH + kh) * kernelW + kw]);
             }
         }
     }
+    return sum;
+}
 
-    float x = sum + bias[oc];
+__device__ __forceinline__ float activate_relu(float x) { return fmaxf(0.0f, x); }
+__device__ __forceinline__ float activate_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float activate_gelu(float x) {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float COEFF = 0.044715f;
     float x3 = x * x * x;
     float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = 0.5f * x * (1.0f + tanhf(inner));
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+__device__ __forceinline__ float activate_identity(float x) { return x; }
+
+// ===========================================================================
+// FUSED CONV2D + BIAS + ACTIVATION KERNELS
+// ===========================================================================
+
+#define DEFINE_CONV2D_BIAS_KERNEL(name, activation_fn) \
+extern ""C"" __global__ __launch_bounds__(256) void name( \
+    const float* __restrict__ input, const float* __restrict__ weights, \
+    const float* __restrict__ bias, float* __restrict__ output, \
+    int batch, int inChannels, int inHeight, int inWidth, \
+    int outChannels, int outHeight, int outWidth, \
+    int kernelH, int kernelW, int strideH, int strideW, \
+    int padH, int padW, int dilationH, int dilationW) \
+{ \
+    int ow = blockIdx.x * blockDim.x + threadIdx.x; \
+    int oh = blockIdx.y * blockDim.y + threadIdx.y; \
+    int idx2 = blockIdx.z; \
+    int oc = idx2 % outChannels; \
+    int b = idx2 / outChannels; \
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return; \
+    float sum = conv2d_accumulate(input, weights, b, oc, oh, ow, \
+        inChannels, inHeight, inWidth, kernelH, kernelW, \
+        strideH, strideW, padH, padW, dilationH, dilationW); \
+    float x = sum + __ldg(&bias[oc]); \
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = activation_fn(x); \
 }
 
-// Fused Conv2D + Bias + Sigmoid
-extern ""C"" __global__ void conv2d_bias_sigmoid(
-    const float* input, const float* weights, const float* bias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
-            }
-        }
-    }
-
-    float x = sum + bias[oc];
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = 1.0f / (1.0f + expf(-x));
-}
-
-// Fused Conv2D + Bias (no activation)
-extern ""C"" __global__ void conv2d_bias(
-    const float* input, const float* weights, const float* bias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = weights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
-            }
-        }
-    }
-
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum + bias[oc];
-}
+DEFINE_CONV2D_BIAS_KERNEL(conv2d_bias_relu, activate_relu)
+DEFINE_CONV2D_BIAS_KERNEL(conv2d_bias_gelu, activate_gelu)
+DEFINE_CONV2D_BIAS_KERNEL(conv2d_bias_sigmoid, activate_sigmoid)
+DEFINE_CONV2D_BIAS_KERNEL(conv2d_bias, activate_identity)
 
 // ===========================================================================
 // FUSED CONV2D + BATCHNORM + ACTIVATION (INFERENCE MODE)
 // ===========================================================================
 
-// Fused Conv2D with folded BatchNorm + ReLU
-extern ""C"" __global__ void conv2d_batchnorm_relu(
-    const float* input, const float* foldedWeights, const float* foldedBias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = foldedWeights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
-            }
-        }
-    }
-
-    float result = sum + foldedBias[oc];
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = fmaxf(0.0f, result);
+#define DEFINE_CONV2D_BN_KERNEL(name, activation_fn) \
+extern ""C"" __global__ __launch_bounds__(256) void name( \
+    const float* __restrict__ input, const float* __restrict__ foldedWeights, \
+    const float* __restrict__ foldedBias, float* __restrict__ output, \
+    int batch, int inChannels, int inHeight, int inWidth, \
+    int outChannels, int outHeight, int outWidth, \
+    int kernelH, int kernelW, int strideH, int strideW, \
+    int padH, int padW, int dilationH, int dilationW) \
+{ \
+    int ow = blockIdx.x * blockDim.x + threadIdx.x; \
+    int oh = blockIdx.y * blockDim.y + threadIdx.y; \
+    int idx2 = blockIdx.z; \
+    int oc = idx2 % outChannels; \
+    int b = idx2 / outChannels; \
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return; \
+    float sum = conv2d_accumulate(input, foldedWeights, b, oc, oh, ow, \
+        inChannels, inHeight, inWidth, kernelH, kernelW, \
+        strideH, strideW, padH, padW, dilationH, dilationW); \
+    float x = sum + __ldg(&foldedBias[oc]); \
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = activation_fn(x); \
 }
 
-// Fused Conv2D with folded BatchNorm + GELU
-extern ""C"" __global__ void conv2d_batchnorm_gelu(
-    const float* input, const float* foldedWeights, const float* foldedBias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = foldedWeights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
-            }
-        }
-    }
-
-    float x = sum + foldedBias[oc];
-    const float SQRT_2_OVER_PI = 0.7978845608f;
-    const float COEFF = 0.044715f;
-    float x3 = x * x * x;
-    float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = 0.5f * x * (1.0f + tanhf(inner));
-}
-
-// Fused Conv2D with folded BatchNorm (no activation)
-extern ""C"" __global__ void conv2d_batchnorm(
-    const float* input, const float* foldedWeights, const float* foldedBias, float* output,
-    int batch, int inChannels, int inHeight, int inWidth,
-    int outChannels, int outHeight, int outWidth,
-    int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int oc = idx2 % outChannels;
-    int b = idx2 / outChannels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int ic = 0; ic < inChannels; ic++) {
-        for (int kh = 0; kh < kernelH; kh++) {
-            for (int kw = 0; kw < kernelW; kw++) {
-                int ih = oh * strideH - padH + kh * dilationH;
-                int iw = ow * strideW - padW + kw * dilationW;
-
-                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
-                    float wVal = foldedWeights[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
-                    sum += inVal * wVal;
-                }
-            }
-        }
-    }
-
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum + foldedBias[oc];
-}
+DEFINE_CONV2D_BN_KERNEL(conv2d_batchnorm_relu, activate_relu)
+DEFINE_CONV2D_BN_KERNEL(conv2d_batchnorm_gelu, activate_gelu)
+DEFINE_CONV2D_BN_KERNEL(conv2d_batchnorm, activate_identity)
 
 // ===========================================================================
 // DEPTHWISE FUSED KERNELS
 // ===========================================================================
 
-// Fused Depthwise Conv2D + Bias + ReLU
-extern ""C"" __global__ void depthwise_conv2d_bias_relu(
-    const float* input, const float* weights, const float* bias, float* output,
-    int batch, int channels, int inHeight, int inWidth,
-    int outHeight, int outWidth, int kernelH, int kernelW,
-    int strideH, int strideW, int padH, int padW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int c = idx2 % channels;
-    int b = idx2 / channels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int kh = 0; kh < kernelH; kh++) {
-        for (int kw = 0; kw < kernelW; kw++) {
-            int ih = oh * strideH - padH + kh;
-            int iw = ow * strideW - padW + kw;
-
-            if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                float inVal = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
-                float wVal = weights[(c * kernelH + kh) * kernelW + kw];
-                sum += inVal * wVal;
-            }
-        }
-    }
-
-    float result = sum + bias[c];
-    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = fmaxf(0.0f, result);
+#define DEFINE_DEPTHWISE_KERNEL(name, activation_fn, bias_name) \
+extern ""C"" __global__ __launch_bounds__(256) void name( \
+    const float* __restrict__ input, const float* __restrict__ weights, \
+    const float* __restrict__ bias_name, float* __restrict__ output, \
+    int batch, int channels, int inHeight, int inWidth, \
+    int outHeight, int outWidth, int kernelH, int kernelW, \
+    int strideH, int strideW, int padH, int padW) \
+{ \
+    int ow = blockIdx.x * blockDim.x + threadIdx.x; \
+    int oh = blockIdx.y * blockDim.y + threadIdx.y; \
+    int idx2 = blockIdx.z; \
+    int c = idx2 % channels; \
+    int b = idx2 / channels; \
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return; \
+    float sum = depthwise_accumulate(input, weights, b, c, oh, ow, \
+        channels, inHeight, inWidth, kernelH, kernelW, \
+        strideH, strideW, padH, padW); \
+    float x = sum + __ldg(&bias_name[c]); \
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = activation_fn(x); \
 }
 
-// Fused Depthwise Conv2D + BatchNorm + ReLU
-extern ""C"" __global__ void depthwise_conv2d_batchnorm_relu(
-    const float* input, const float* foldedWeights, const float* foldedBias, float* output,
-    int batch, int channels, int inHeight, int inWidth,
-    int outHeight, int outWidth, int kernelH, int kernelW,
-    int strideH, int strideW, int padH, int padW)
-{
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx2 = blockIdx.z;
-    int c = idx2 % channels;
-    int b = idx2 / channels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
-
-    float sum = 0.0f;
-
-    for (int kh = 0; kh < kernelH; kh++) {
-        for (int kw = 0; kw < kernelW; kw++) {
-            int ih = oh * strideH - padH + kh;
-            int iw = ow * strideW - padW + kw;
-
-            if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                float inVal = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
-                float wVal = foldedWeights[(c * kernelH + kh) * kernelW + kw];
-                sum += inVal * wVal;
-            }
-        }
-    }
-
-    float result = sum + foldedBias[c];
-    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = fmaxf(0.0f, result);
-}
+DEFINE_DEPTHWISE_KERNEL(depthwise_conv2d_bias_relu, activate_relu, bias)
+DEFINE_DEPTHWISE_KERNEL(depthwise_conv2d_batchnorm_relu, activate_relu, foldedBias)
 ";
         }
 

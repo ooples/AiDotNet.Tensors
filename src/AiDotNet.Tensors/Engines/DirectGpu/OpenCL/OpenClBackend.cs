@@ -76,6 +76,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public int ComputeUnits { get; }
         public long GlobalMemoryBytes { get; }
         public long LocalMemoryBytes { get; }
+        public double TheoreticalGflops { get; }
 
         // IAsyncGpuBackend properties
         public bool SupportsMultiStream => true;

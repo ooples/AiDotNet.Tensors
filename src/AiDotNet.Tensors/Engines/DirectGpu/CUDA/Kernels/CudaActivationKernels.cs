@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             return @"
 #include <math.h>
 
-extern ""C"" __global__ void relu(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void relu(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -17,7 +17,7 @@ extern ""C"" __global__ void relu(const float* input, float* output, int size)
     output[idx] = x > 0.0f ? x : 0.0f;
 }
 
-extern ""C"" __global__ void sigmoid(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sigmoid(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -25,7 +25,7 @@ extern ""C"" __global__ void sigmoid(const float* input, float* output, int size
     output[idx] = 1.0f / (1.0f + expf(-x));
 }
 
-extern ""C"" __global__ void tanh_activation(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void tanh_activation(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -34,7 +34,7 @@ extern ""C"" __global__ void tanh_activation(const float* input, float* output, 
     output[idx] = tanhf(x);
 }
 
-extern ""C"" __global__ void gelu(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void gelu(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -46,7 +46,7 @@ extern ""C"" __global__ void gelu(const float* input, float* output, int size)
     output[idx] = 0.5f * x * (1.0f + tanhf(inner));
 }
 
-extern ""C"" __global__ void swish(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void swish(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -60,7 +60,7 @@ extern ""C"" __global__ void swish(const float* input, float* output, int size)
 
 // Mish: x * tanh(softplus(x)) = x * tanh(ln(1 + e^x))
 // Uses numerically stable softplus to prevent overflow for large x
-extern ""C"" __global__ void mish(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void mish(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -78,7 +78,7 @@ extern ""C"" __global__ void mish(const float* input, float* output, int size)
 }
 
 // Softplus: ln(1 + e^x)
-extern ""C"" __global__ void softplus(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void softplus(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -89,12 +89,12 @@ extern ""C"" __global__ void softplus(const float* input, float* output, int siz
     } else if (x < -20.0f) {
         output[idx] = expf(x);
     } else {
-        output[idx] = logf(1.0f + expf(x));
+        output[idx] = log1pf(expf(x));
     }
 }
 
 // Hardswish: x * relu6(x + 3) / 6
-extern ""C"" __global__ void hardswish(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardswish(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -110,7 +110,7 @@ extern ""C"" __global__ void hardswish(const float* input, float* output, int si
 
 // SELU: scale * (max(0,x) + min(0, alpha*(exp(x)-1)))
 // scale = 1.0507009873554804934193349852946, alpha = 1.6732632423543772848170429916717
-extern ""C"" __global__ void selu(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void selu(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -121,7 +121,7 @@ extern ""C"" __global__ void selu(const float* input, float* output, int size)
 }
 
 // Hardsigmoid: relu6(x + 3) / 6 = clip((x + 3) / 6, 0, 1)
-extern ""C"" __global__ void hardsigmoid(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardsigmoid(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -131,7 +131,7 @@ extern ""C"" __global__ void hardsigmoid(const float* input, float* output, int 
 }
 
 // Hardtanh: clip(x, min_val, max_val) - default min=-1, max=1
-extern ""C"" __global__ void hardtanh(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardtanh(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -140,7 +140,7 @@ extern ""C"" __global__ void hardtanh(const float* input, float* output, int siz
 }
 
 // Leaky ReLU: x > 0 ? x : alpha * x
-extern ""C"" __global__ void leaky_relu(const float* input, float* output, float alpha, int size)
+extern ""C"" __global__ __launch_bounds__(256) void leaky_relu(const float* __restrict__ input, float* __restrict__ output, float alpha, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -153,7 +153,7 @@ extern ""C"" __global__ void leaky_relu(const float* input, float* output, float
 // ===========================================================================
 
 // ReLU backward: grad * (x > 0 ? 1 : 0)
-extern ""C"" __global__ void relu_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void relu_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -161,7 +161,7 @@ extern ""C"" __global__ void relu_backward(const float* gradOutput, const float*
 }
 
 // Leaky ReLU backward: grad * (x > 0 ? 1 : alpha)
-extern ""C"" __global__ void leaky_relu_backward(const float* gradOutput, const float* input, float* gradInput, float alpha, int size)
+extern ""C"" __global__ __launch_bounds__(256) void leaky_relu_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, float alpha, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -170,7 +170,7 @@ extern ""C"" __global__ void leaky_relu_backward(const float* gradOutput, const 
 }
 
 // Sigmoid backward: grad * sigmoid(x) * (1 - sigmoid(x))
-extern ""C"" __global__ void sigmoid_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sigmoid_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -179,7 +179,7 @@ extern ""C"" __global__ void sigmoid_backward(const float* gradOutput, const flo
 }
 
 // Tanh backward: grad * (1 - tanh(x)^2)
-extern ""C"" __global__ void tanh_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void tanh_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -188,7 +188,7 @@ extern ""C"" __global__ void tanh_backward(const float* gradOutput, const float*
 }
 
 // GELU backward (approximation)
-extern ""C"" __global__ void gelu_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void gelu_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -209,7 +209,7 @@ extern ""C"" __global__ void gelu_backward(const float* gradOutput, const float*
 }
 
 // Swish backward: grad * (swish(x) + sigmoid(x) * (1 - swish(x)))
-extern ""C"" __global__ void swish_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void swish_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -223,7 +223,7 @@ extern ""C"" __global__ void swish_backward(const float* gradOutput, const float
 
 // Mish backward: d/dx[x * tanh(softplus(x))]
 // Uses numerically stable softplus and sigmoid to prevent overflow
-extern ""C"" __global__ void mish_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void mish_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -254,7 +254,7 @@ extern ""C"" __global__ void mish_backward(const float* gradOutput, const float*
 }
 
 // Softplus backward: d/dx[ln(1 + e^x)] = sigmoid(x)
-extern ""C"" __global__ void softplus_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void softplus_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -264,7 +264,7 @@ extern ""C"" __global__ void softplus_backward(const float* gradOutput, const fl
 }
 
 // Hardswish backward
-extern ""C"" __global__ void hardswish_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardswish_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -282,7 +282,7 @@ extern ""C"" __global__ void hardswish_backward(const float* gradOutput, const f
 }
 
 // SELU backward
-extern ""C"" __global__ void selu_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void selu_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -294,7 +294,7 @@ extern ""C"" __global__ void selu_backward(const float* gradOutput, const float*
 }
 
 // Hardsigmoid backward
-extern ""C"" __global__ void hardsigmoid_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardsigmoid_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -304,7 +304,7 @@ extern ""C"" __global__ void hardsigmoid_backward(const float* gradOutput, const
 }
 
 // Hardtanh backward
-extern ""C"" __global__ void hardtanh_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -328,7 +328,7 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 
 // Parallel softmax: 1 block per row, 256 threads cooperate on reduction
 // Uses warp shuffles for the last 32 elements, shared memory tree for inter-warp
-extern ""C"" __global__ void softmax(const float* input, float* output, int batchSize, int features)
+extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* __restrict__ input, float* __restrict__ output, int batchSize, int features)
 {
     int batch = blockIdx.x;
     if (batch >= batchSize) return;
@@ -383,28 +383,28 @@ extern ""C"" __global__ void softmax(const float* input, float* output, int batc
     }
 }
 
-extern ""C"" __global__ void add_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void add_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     C[idx] = A[idx] + B[idx];
 }
 
-extern ""C"" __global__ void subtract_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void subtract_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     C[idx] = A[idx] - B[idx];
 }
 
-extern ""C"" __global__ void multiply_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void multiply_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     C[idx] = A[idx] * B[idx];
 }
 
-extern ""C"" __global__ void divide_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void divide_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -412,7 +412,7 @@ extern ""C"" __global__ void divide_vectors(const float* A, const float* B, floa
     C[idx] = (b != 0.0f) ? (A[idx] / b) : 0.0f;
 }
 
-extern ""C"" __global__ void min_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void min_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -421,7 +421,7 @@ extern ""C"" __global__ void min_vectors(const float* A, const float* B, float* 
     C[idx] = a < b ? a : b;
 }
 
-extern ""C"" __global__ void max_vectors(const float* A, const float* B, float* C, int size)
+extern ""C"" __global__ __launch_bounds__(256) void max_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -430,14 +430,14 @@ extern ""C"" __global__ void max_vectors(const float* A, const float* B, float* 
     C[idx] = a > b ? a : b;
 }
 
-extern ""C"" __global__ void scale_vector(const float* A, float* B, float scalar, int size)
+extern ""C"" __global__ __launch_bounds__(256) void scale_vector(const float* __restrict__ A, float* __restrict__ B, float scalar, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = A[idx] * scalar;
 }
 
-extern ""C"" __global__ void abs_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -445,63 +445,63 @@ extern ""C"" __global__ void abs_vector(const float* A, float* B, int size)
     B[idx] = x < 0.0f ? -x : x;
 }
 
-extern ""C"" __global__ void exp_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = expf(A[idx]);
 }
 
-extern ""C"" __global__ void log_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void log_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = logf(A[idx]);
 }
 
-extern ""C"" __global__ void log2_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void log2_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = log2f(A[idx]);
 }
 
-extern ""C"" __global__ void exp2_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void exp2_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = exp2f(A[idx]);
 }
 
-extern ""C"" __global__ void exp10_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void exp10_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = powf(10.0f, A[idx]);
 }
 
-extern ""C"" __global__ void expm1_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void expm1_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = expf(A[idx]) - 1.0f;
+    B[idx] = expm1f(A[idx]);
 }
 
-extern ""C"" __global__ void log1p_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void log1p_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = logf(1.0f + A[idx]);
+    B[idx] = log1pf(A[idx]);
 }
 
-extern ""C"" __global__ void sqrt_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sqrt_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = sqrtf(A[idx]);
 }
 
-extern ""C"" __global__ void sign_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -509,57 +509,87 @@ extern ""C"" __global__ void sign_vector(const float* A, float* B, int size)
     B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
 }
 
-extern ""C"" __global__ void power_scalar(const float* A, float* B, float exponent, int size)
+extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* __restrict__ A, float* __restrict__ B, float exponent, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = powf(A[idx], exponent);
 }
-extern ""C"" __global__ void reduce_sum(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     extern __shared__ float scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? input[idx] : 0.0f;
-    scratch[tid] = val;
+    float val = (idx < (unsigned int)size) ? __ldg(&input[idx]) : 0.0f;
+
+    // Warp-level reduction first (no __syncthreads needed within a warp)
+    unsigned int mask = 0xFFFFFFFF;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(mask, val, offset);
+
+    // Write warp results to shared memory
+    unsigned int lane = tid & 31;
+    unsigned int warpId = tid >> 5;
+    if (lane == 0)
+        scratch[warpId] = val;
     __syncthreads();
 
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    // Final reduction across warps (only first warp)
+    unsigned int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps)
     {
-        if (tid < s)
-            scratch[tid] += scratch[tid + s];
-        __syncthreads();
-    }
+        val = scratch[tid];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(mask, val, offset);
 
-    if (tid == 0)
-        output[blockIdx.x] = scratch[0];
+        if (tid == 0)
+            output[blockIdx.x] = val;
+    }
 }
 
-extern ""C"" __global__ void reduce_max(const float* input, float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __restrict__ input, float* __restrict__ output, int size)
 {
     extern __shared__ float scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? input[idx] : -INFINITY;
-    scratch[tid] = val;
+    float val = (idx < (unsigned int)size) ? __ldg(&input[idx]) : -INFINITY;
+
+    // Warp-level reduction first (no __syncthreads needed within a warp)
+    unsigned int mask = 0xFFFFFFFF;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        float other = __shfl_down_sync(mask, val, offset);
+        val = fmaxf(val, other);
+    }
+
+    // Write warp results to shared memory
+    unsigned int lane = tid & 31;
+    unsigned int warpId = tid >> 5;
+    if (lane == 0)
+        scratch[warpId] = val;
     __syncthreads();
 
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    // Final reduction across warps (only first warp)
+    unsigned int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps)
     {
-        if (tid < s)
+        val = scratch[tid];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = scratch[tid + s];
-            if (other > scratch[tid])
-                scratch[tid] = other;
+            float other = __shfl_down_sync(mask, val, offset);
+            val = fmaxf(val, other);
         }
-        __syncthreads();
-    }
 
-    if (tid == 0)
-        output[blockIdx.x] = scratch[0];
+        if (tid == 0)
+            output[blockIdx.x] = val;
+    }
 }
 
-extern ""C"" __global__ void sum_axis(const float* input, float* output, int outerSize, int reduceSize)
+extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* __restrict__ input, float* __restrict__ output, int outerSize, int reduceSize)
 {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (unsigned int)outerSize) return;
@@ -571,23 +601,22 @@ extern ""C"" __global__ void sum_axis(const float* input, float* output, int out
     output[idx] = sum;
 }
 
-extern ""C"" __global__ void bias_add(float* data, const float* bias, int rows, int cols)
+extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = rows * cols;
-    if (idx >= size) return;
-    int col = idx % cols;
-    data[idx] += bias[col];
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= cols || row >= rows) return;
+    data[row * cols + col] += __ldg(&bias[col]);
 }
 
 // Bias add with separate output: C[i,j] = A[i,j] + bias[j]
-extern ""C"" __global__ void bias_add_out(const float* A, const float* bias, float* C, int rows, int cols)
+extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = rows * cols;
-    if (idx >= size) return;
-    int col = idx % cols;
-    C[idx] = A[idx] + bias[col];
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= cols || row >= rows) return;
+    int idx = row * cols + col;
+    C[idx] = A[idx] + __ldg(&bias[col]);
 }
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
@@ -595,7 +624,7 @@ extern ""C"" __global__ void bias_add_out(const float* A, const float* bias, flo
 // For element at linear index idx:
 //   - spatial_idx = idx % spatialSize (position within H*W)
 //   - channel = (idx / spatialSize) % channels
-extern ""C"" __global__ void conv2d_bias_add(float* output, const float* bias, int batch, int channels, int spatialSize)
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int totalSize = batch * channels * spatialSize;
@@ -608,42 +637,42 @@ extern ""C"" __global__ void conv2d_bias_add(float* output, const float* bias, i
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void sin_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = sinf(A[idx]);
 }
 
-extern ""C"" __global__ void cos_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void cos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = cosf(A[idx]);
 }
 
-extern ""C"" __global__ void tan_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void tan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = tanf(A[idx]);
 }
 
-extern ""C"" __global__ void asin_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void asin_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = asinf(A[idx]);
 }
 
-extern ""C"" __global__ void acos_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void acos_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = acosf(A[idx]);
 }
 
-extern ""C"" __global__ void atan_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void atan_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -654,35 +683,35 @@ extern ""C"" __global__ void atan_vector(const float* A, float* B, int size)
 // HYPERBOLIC KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void sinh_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void sinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = sinhf(A[idx]);
 }
 
-extern ""C"" __global__ void cosh_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void cosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = coshf(A[idx]);
 }
 
-extern ""C"" __global__ void asinh_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void asinh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = asinhf(A[idx]);
 }
 
-extern ""C"" __global__ void acosh_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void acosh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = acoshf(A[idx]);
 }
 
-extern ""C"" __global__ void atanh_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void atanh_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -693,56 +722,56 @@ extern ""C"" __global__ void atanh_vector(const float* A, float* B, int size)
 // ADDITIONAL UNARY KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void reciprocal_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void reciprocal_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = 1.0f / A[idx];
 }
 
-extern ""C"" __global__ void cbrt_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void cbrt_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = cbrtf(A[idx]);
 }
 
-extern ""C"" __global__ void log10_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void log10_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = log10f(A[idx]);
 }
 
-extern ""C"" __global__ void negate_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void negate_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = -A[idx];
 }
 
-extern ""C"" __global__ void floor_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void floor_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = floorf(A[idx]);
 }
 
-extern ""C"" __global__ void ceil_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void ceil_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = ceilf(A[idx]);
 }
 
-extern ""C"" __global__ void round_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void round_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     B[idx] = roundf(A[idx]);
 }
 
-extern ""C"" __global__ void trunc_vector(const float* A, float* B, int size)
+extern ""C"" __global__ __launch_bounds__(256) void trunc_vector(const float* __restrict__ A, float* __restrict__ B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -754,7 +783,7 @@ extern ""C"" __global__ void trunc_vector(const float* A, float* B, int size)
 // Each thread processes 4 elements. size4 = originalSize / 4.
 // ===========================================================================
 
-extern ""C"" __global__ void relu_vec4(const float* input, float* output, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void relu_vec4(const float* __restrict__ input, float* __restrict__ output, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -767,7 +796,7 @@ extern ""C"" __global__ void relu_vec4(const float* input, float* output, int si
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 
-extern ""C"" __global__ void sigmoid_vec4(const float* input, float* output, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void sigmoid_vec4(const float* __restrict__ input, float* __restrict__ output, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -780,7 +809,7 @@ extern ""C"" __global__ void sigmoid_vec4(const float* input, float* output, int
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 
-extern ""C"" __global__ void tanh_activation_vec4(const float* input, float* output, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void tanh_activation_vec4(const float* __restrict__ input, float* __restrict__ output, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -793,7 +822,7 @@ extern ""C"" __global__ void tanh_activation_vec4(const float* input, float* out
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 
-extern ""C"" __global__ void gelu_vec4(const float* input, float* output, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void gelu_vec4(const float* __restrict__ input, float* __restrict__ output, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -808,7 +837,7 @@ extern ""C"" __global__ void gelu_vec4(const float* input, float* output, int si
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 
-extern ""C"" __global__ void swish_vec4(const float* input, float* output, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void swish_vec4(const float* __restrict__ input, float* __restrict__ output, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -821,7 +850,7 @@ extern ""C"" __global__ void swish_vec4(const float* input, float* output, int s
     reinterpret_cast<float4*>(output)[idx] = r;
 }
 
-extern ""C"" __global__ void abs_vector_vec4(const float* A, float* B, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void abs_vector_vec4(const float* __restrict__ A, float* __restrict__ B, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -834,7 +863,7 @@ extern ""C"" __global__ void abs_vector_vec4(const float* A, float* B, int size4
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
-extern ""C"" __global__ void exp_vector_vec4(const float* A, float* B, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void exp_vector_vec4(const float* __restrict__ A, float* __restrict__ B, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -844,7 +873,7 @@ extern ""C"" __global__ void exp_vector_vec4(const float* A, float* B, int size4
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
-extern ""C"" __global__ void log_vector_vec4(const float* A, float* B, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void log_vector_vec4(const float* __restrict__ A, float* __restrict__ B, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -854,7 +883,7 @@ extern ""C"" __global__ void log_vector_vec4(const float* A, float* B, int size4
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
-extern ""C"" __global__ void sqrt_vector_vec4(const float* A, float* B, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void sqrt_vector_vec4(const float* __restrict__ A, float* __restrict__ B, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -864,7 +893,7 @@ extern ""C"" __global__ void sqrt_vector_vec4(const float* A, float* B, int size
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
-extern ""C"" __global__ void negate_vector_vec4(const float* A, float* B, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void negate_vector_vec4(const float* __restrict__ A, float* __restrict__ B, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -874,7 +903,7 @@ extern ""C"" __global__ void negate_vector_vec4(const float* A, float* B, int si
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
-extern ""C"" __global__ void scale_vector_vec4(const float* A, float* B, float scalar, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void scale_vector_vec4(const float* __restrict__ A, float* __restrict__ B, float scalar, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -888,7 +917,7 @@ extern ""C"" __global__ void scale_vector_vec4(const float* A, float* B, float s
 // VECTORIZED (float4) BINARY KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void add_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void add_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -899,7 +928,7 @@ extern ""C"" __global__ void add_vectors_vec4(const float* A, const float* B, fl
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
-extern ""C"" __global__ void subtract_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void subtract_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -910,7 +939,7 @@ extern ""C"" __global__ void subtract_vectors_vec4(const float* A, const float* 
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
-extern ""C"" __global__ void multiply_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void multiply_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -921,7 +950,7 @@ extern ""C"" __global__ void multiply_vectors_vec4(const float* A, const float* 
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
-extern ""C"" __global__ void divide_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void divide_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -935,7 +964,7 @@ extern ""C"" __global__ void divide_vectors_vec4(const float* A, const float* B,
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
-extern ""C"" __global__ void min_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void min_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;
@@ -946,7 +975,7 @@ extern ""C"" __global__ void min_vectors_vec4(const float* A, const float* B, fl
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
-extern ""C"" __global__ void max_vectors_vec4(const float* A, const float* B, float* C, int size4)
+extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size4)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size4) return;

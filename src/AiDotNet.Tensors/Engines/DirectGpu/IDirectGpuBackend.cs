@@ -55,6 +55,12 @@ public interface IDirectGpuBackend : IDisposable
     /// </summary>
     long LocalMemoryBytes { get; }
 
+    /// <summary>
+    /// Gets the estimated theoretical peak FP32 GFLOPS for this GPU.
+    /// Computed from clock rate, compute units, and FP32 cores per compute unit.
+    /// </summary>
+    double TheoreticalGflops { get; }
+
     #region Memory Management
 
     /// <summary>

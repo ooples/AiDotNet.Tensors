@@ -418,13 +418,20 @@ public sealed class BackgroundAutoTuner : IDisposable
 
     private double EstimateTheoreticalGflops()
     {
-        // Rough estimates based on vendor
+        // Use the backend's computed theoretical GFLOPS (from clock rate + SM count + cores/SM)
+        double backendGflops = _backend.TheoreticalGflops;
+        if (backendGflops > 0)
+        {
+            return backendGflops;
+        }
+
+        // Fallback: rough estimates based on vendor
         return DirectGpuBackendFactory.DetectedVendor switch
         {
-            GpuVendor.NVIDIA => 15000,   // ~15 TFLOPS for mid-range NVIDIA
-            GpuVendor.AMD => 10000,      // ~10 TFLOPS for mid-range AMD
-            GpuVendor.Intel => 5000,     // ~5 TFLOPS for Intel iGPU
-            _ => 8000                    // Conservative default
+            GpuVendor.NVIDIA => 15000,
+            GpuVendor.AMD => 10000,
+            GpuVendor.Intel => 5000,
+            _ => 8000
         };
     }
 

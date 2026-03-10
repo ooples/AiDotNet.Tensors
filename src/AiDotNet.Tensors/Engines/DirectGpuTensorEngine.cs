@@ -555,12 +555,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
     {
+        List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
         lock (_activationCacheLock)
         {
-            // Evict old entries if cache is full
+            // Evict old entries if cache is full (removal under lock, disposal deferred)
             if (_activationCache.Count >= _maxActivationCacheSize)
             {
-                EvictOldestActivationsUnsafe();
+                evicted = EvictOldestActivationsUnsafe();
             }
 
             var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
@@ -579,29 +580,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
+
+        // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups
+        foreach (var entry in evicted)
+        {
+            entry.Dispose();
+        }
     }
 
     /// <summary>
     /// Evicts the oldest half of the activation cache entries.
     /// Must be called while holding _activationCacheLock.
+    /// Returns entries to dispose AFTER releasing the lock.
     /// </summary>
-    private void EvictOldestActivationsUnsafe()
+    private List<ActivationCacheEntry> EvictOldestActivationsUnsafe()
     {
         var entries = _activationCache.ToArray();
-        if (entries.Length == 0) return;
+        var toDispose = new List<ActivationCacheEntry>();
+        if (entries.Length == 0) return toDispose;
 
-        // Sort by timestamp (oldest first)
-        var sorted = entries.OrderBy(e => e.Value.Timestamp).ToArray();
+        int removeCount = entries.Length / 2;
+        if (removeCount == 0) return toDispose;
 
-        // Remove oldest half
-        int removeCount = sorted.Length / 2;
-        for (int i = 0; i < removeCount; i++)
+        // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
+        var timestamps = new long[entries.Length];
+        for (int i = 0; i < entries.Length; i++)
+            timestamps[i] = entries[i].Value.Timestamp;
+        Array.Sort(timestamps);
+        long threshold = timestamps[removeCount - 1];
+
+        // Remove entries at or below threshold, collect for disposal outside lock
+        int removed = 0;
+        for (int i = 0; i < entries.Length && removed < removeCount; i++)
         {
-            if (_activationCache.TryRemove(sorted[i].Key, out var removed))
+            if (entries[i].Value.Timestamp <= threshold)
             {
-                removed.Dispose();
+                if (_activationCache.TryRemove(entries[i].Key, out var entry))
+                {
+                    toDispose.Add(entry);
+                    removed++;
+                }
             }
         }
+
+        return toDispose;
     }
 
     /// <summary>
@@ -611,13 +633,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
+        List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
-            foreach (var entry in _activationCache.Values)
-            {
-                entry.Dispose();
-            }
+            toDispose = new List<ActivationCacheEntry>(_activationCache.Values);
             _activationCache.Clear();
+        }
+
+        // Dispose GPU buffers outside the lock
+        foreach (var entry in toDispose)
+        {
+            entry.Dispose();
         }
     }
 

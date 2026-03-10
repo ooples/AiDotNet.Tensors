@@ -94,6 +94,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     /// </summary>
     public long LocalMemoryBytes => _device.MaxSharedMemorySize;
 
+    public double TheoreticalGflops { get; }
+
     /// <summary>
     /// Gets the maximum workgroup size.
     /// </summary>

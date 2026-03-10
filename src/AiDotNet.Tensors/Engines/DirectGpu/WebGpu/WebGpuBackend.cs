@@ -89,6 +89,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     /// </summary>
     public long LocalMemoryBytes => 16384L;
 
+    public double TheoreticalGflops { get; }
+
     /// <summary>
     /// Gets the maximum buffer size in bytes.
     /// </summary>

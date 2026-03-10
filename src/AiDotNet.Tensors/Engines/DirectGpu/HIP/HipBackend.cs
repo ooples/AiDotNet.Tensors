@@ -96,6 +96,7 @@ public sealed class HipBackend : IAsyncGpuBackend
     public int ComputeUnits { get; }
     public long GlobalMemoryBytes { get; }
     public long LocalMemoryBytes { get; }
+    public double TheoreticalGflops { get; }
 
     private void ReturnBufferToPool(HipGpuBuffer buffer)
     {

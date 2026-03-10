@@ -12,7 +12,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 public enum CudaDeviceAttribute
 {
+    MaxThreadsPerBlock = 1,
     MaxSharedMemoryPerBlock = 8,
+    ClockRate = 13,
     MultiprocessorCount = 16,
     ComputeCapabilityMajor = 75,
     ComputeCapabilityMinor = 76,

@@ -51,6 +51,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
+    private int _clockRateKHz;
     private bool _hasWmmaSupport;
 
     [ThreadStatic]
@@ -63,6 +64,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public int ComputeUnits { get; }
     public long GlobalMemoryBytes { get; }
     public long LocalMemoryBytes { get; }
+    public double TheoreticalGflops { get; private set; }
 
     // IAsyncGpuBackend properties
     public bool SupportsMultiStream => true;
@@ -177,6 +179,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
             _ccMajor = cc.Major;
             _ccMinor = cc.Minor;
 
+            // Query clock rate for theoretical GFLOPS calculation
+            if (CuBlasNative.cuDeviceGetAttribute(out int clockKHz, (int)CudaDeviceAttribute.ClockRate, device) == CudaResult.Success)
+            {
+                _clockRateKHz = clockKHz;
+            }
+
+            // Compute theoretical peak FP32 GFLOPS from hardware specs
+            TheoreticalGflops = ComputeTheoreticalGflops(_ccMajor, _ccMinor, _multiProcessorCount, _clockRateKHz);
+
             CompileAllKernels(device);
 
             IsAvailable = true;
@@ -260,6 +271,36 @@ public sealed class CudaBackend : IAsyncGpuBackend
             return (5, 2);
 
         return (major, minor);
+    }
+
+    /// <summary>
+    /// Computes theoretical peak FP32 GFLOPS from GPU hardware specs.
+    /// Formula: SMs * FP32_cores_per_SM * 2 (FMA) * clock_GHz
+    /// </summary>
+    private static double ComputeTheoreticalGflops(int ccMajor, int ccMinor, int smCount, int clockRateKHz)
+    {
+        if (smCount <= 0 || clockRateKHz <= 0)
+        {
+            // Fallback: conservative estimate
+            return 8000;
+        }
+
+        // FP32 CUDA cores per SM by compute capability
+        int coresPerSm = ccMajor switch
+        {
+            3 => 192,  // Kepler
+            5 => 128,  // Maxwell
+            6 => ccMinor == 0 ? 64 : 128, // Pascal (GP100 vs GP10x)
+            7 => ccMinor == 0 ? 64 : 64,  // Volta/Turing
+            8 => ccMinor == 0 ? 64 : 128,  // Ampere (GA100 vs GA10x)
+            9 => 128,  // Hopper/Ada Lovelace
+            10 => 128, // Blackwell
+            _ => 128   // Future architectures
+        };
+
+        // GFLOPS = cores * 2 (FMA = multiply + add) * clock_GHz
+        double clockGHz = clockRateKHz / 1_000_000.0;
+        return smCount * coresPerSm * 2.0 * clockGHz;
     }
 
     private void CompileActivationKernels(int device)
@@ -725,7 +766,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Relu(temp, output, M * N);
-            Synchronize(); // Ensure all stream work completes before returning buffer
+            // Synchronize removed: kernel serializes on same stream, temp pool return doesn't free memory
             temp.Dispose();
             return output;
         }
@@ -747,7 +788,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Gelu(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -769,7 +809,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Sigmoid(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -791,7 +830,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Tanh(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -821,7 +859,6 @@ public sealed class CudaBackend : IAsyncGpuBackend
             temp = GemmBias(A, B, bias, M, N, K);
             output = AllocateBuffer(M * N);
             Silu(temp, output, M * N);
-            Synchronize();
             temp.Dispose();
             return output;
         }
@@ -892,8 +929,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: bias_add_out");
 
         using var _ = PushContext();
-        int size = M * N;
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridX = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)M;
         IntPtr aPtr = A.Handle;
         IntPtr biasPtr = bias.Handle;
         IntPtr cPtr = C.Handle;
@@ -905,7 +942,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[2] = &cPtr;
         args[3] = &rows;
         args[4] = &cols;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
@@ -2350,8 +2387,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
             throw new InvalidOperationException("CUDA kernel not found: bias_add");
 
         using var _ = PushContext();
-        int size = rows * cols;
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)rows;
         IntPtr dataPtr = data.Handle;
         IntPtr biasPtr = bias.Handle;
         int r = rows;
@@ -2361,7 +2398,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[1] = &biasPtr;
         args[2] = &r;
         args[3] = &c;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockX, void** args)
@@ -6618,8 +6655,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             args[2] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
             LaunchKernelWithSharedMem(meanKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
-            Synchronize();
-
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] meanResult = DownloadBuffer(meanBuffer);
             mean = meanResult[0] / size;
         }
@@ -6646,8 +6682,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
             args[3] = &n;
             uint sharedBytes = (uint)(blockSize * sizeof(float));
             LaunchKernelWithSharedMem(varKernel, (uint)gridSize, (uint)blockSize, sharedBytes, args);
-            Synchronize();
-
+            // Synchronize() removed: DownloadBuffer uses cuMemcpyDtoH which is synchronous
             float[] varResult = DownloadBuffer(varianceBuffer);
             variance = varResult[0] / size;
         }
