@@ -202,7 +202,9 @@ internal static class SimdGemm
             sliceNcs[w] = localNc;
             sliceJStarts[w] = jStart;
 
-            packedBSlices[w] = ArrayPool<float>.Shared.Rent(kc * localNc);
+            // Round up to Nr boundary since PackB pads remaining columns
+            int packedNc = ((localNc + Nr - 1) / Nr) * Nr;
+            packedBSlices[w] = ArrayPool<float>.Shared.Rent(kc * packedNc);
             PackB(b, packedBSlices[w], n, pc, kc, jc + jStart, localNc);
         }
 
@@ -252,7 +254,9 @@ internal static class SimdGemm
                     for (int ic = Mc; ic < localM; ic += Mc)
                     {
                         int mc = Math.Min(Mc, localM - ic);
-                        float[] workerPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
+                        // Round up to Mr boundary since PackA pads remaining rows
+                        int packedMc = ((mc + Mr - 1) / Mr) * Mr;
+                        float[] workerPackedA = ArrayPool<float>.Shared.Rent(packedMc * localKc);
                         try
                         {
                             var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);
@@ -318,8 +322,9 @@ internal static class SimdGemm
                 {
                     int ic = iiBlock * Mc;
                     int mc = Math.Min(Mc, localM - ic);
-
-                    float[] localPackedA = ArrayPool<float>.Shared.Rent(mc * localKc);
+                    // Round up to Mr boundary since PackA pads remaining rows
+                    int packedMc = ((mc + Mr - 1) / Mr) * Mr;
+                    float[] localPackedA = ArrayPool<float>.Shared.Rent(packedMc * localKc);
                     try
                     {
                         var aSpan = new ReadOnlySpan<float>(localAPtr, localALen);

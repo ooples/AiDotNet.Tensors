@@ -1790,24 +1790,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Fast vectorized sigmoid using direct 5th-degree odd polynomial.
-        /// sigmoid(x) ≈ 0.5 + x*(c1 + x²*(c3 + x²*c5)) for |x| ≤ 5.
-        /// Only 6 SIMD ops total — minimal instruction count for throughput.
-        /// Max absolute error ~0.004 — acceptable for ML workloads.
+        /// Fast vectorized sigmoid using FastExp256: sigmoid(x) = 1 / (1 + exp(-x)).
+        /// Uses Cephes-style exp polynomial (~0.01% relative error) for high accuracy.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
-            // Clamp input to [-5, 5] — sigmoid is <0.007 or >0.993 outside this range.
-            // The polynomial naturally maps [-5,5] -> [0,1] so no output clamp needed.
-            var clamped = Avx.Min(Avx.Max(x, Vector256.Create(-5.0f)), Vector256.Create(5.0f));
-            var x2 = Avx.Multiply(clamped, clamped);
-
-            // 5th-degree odd polynomial (2 FMA + 1 FMA for final = 3 FMA total):
-            // sigmoid(x) ≈ 0.5 + x*(c1 + x²*(c3 + x²*c5))
-            var inner = Fma.MultiplyAdd(x2, Vector256.Create(1.5854344e-4f), Vector256.Create(-8.9219211e-3f));
-            inner = Fma.MultiplyAdd(x2, inner, Vector256.Create(2.1562920e-1f));
-            return Fma.MultiplyAdd(clamped, inner, Vector256.Create(0.5f));
+            // sigmoid(x) = 1 / (1 + exp(-x))
+            var negX = Avx.Subtract(Vector256<float>.Zero, x);
+            var expNegX = FastExp256(negX);
+            return Avx.Divide(Vector256.Create(1.0f), Avx.Add(Vector256.Create(1.0f), expNegX));
         }
 
         /// <summary>

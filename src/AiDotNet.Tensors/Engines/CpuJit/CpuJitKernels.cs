@@ -66,7 +66,8 @@ internal static class CpuJitKernels
     internal unsafe delegate void GemmMicroKernel(float* packedA, float* packedB, float* c, int kc);
 
     // Cache compiled kernels by (opId, aligned, length)
-    private static readonly ConcurrentDictionary<long, (ExecutableBuffer Buffer, Delegate Kernel)> _cache = new();
+    // Uses Lazy<> to ensure only one kernel is generated per key (avoids ExecutableBuffer leak under contention)
+    private static readonly ConcurrentDictionary<long, Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>> _cache = new();
 
     // Pack (opId, aligned, length) into a single long key
     private static long MakeKey(int opId, bool aligned, int length)
@@ -89,14 +90,14 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetBinaryKernel(JitBinaryOp op, int length, bool aligned = false)
     {
         long key = MakeKey(op.Id, aligned, length);
-        var entry = _cache.GetOrAdd(key, _ =>
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = aligned
                 ? GenerateBinaryKernelAligned(length, op)
                 : GenerateBinaryKernelUnaligned(length, op);
             return (buf, (Delegate)buf.CreateDelegate<BinaryKernel>());
-        });
-        return (BinaryKernel)entry.Kernel;
+        }));
+        return (BinaryKernel)entry.Value.Kernel;
     }
 
     /// <summary>
@@ -107,14 +108,14 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetReLUKernel(int length, bool aligned = false)
     {
         long key = MakeKey(OP_RELU, aligned, length);
-        var entry = _cache.GetOrAdd(key, _ =>
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = aligned
                 ? GenerateReLUKernelAligned(length)
                 : GenerateReLUKernelUnaligned(length);
             return (buf, (Delegate)buf.CreateDelegate<UnaryKernel>());
-        });
-        return (UnaryKernel)entry.Kernel;
+        }));
+        return (UnaryKernel)entry.Value.Kernel;
     }
 
     /// <summary>
@@ -124,12 +125,12 @@ internal static class CpuJitKernels
     public static unsafe BinaryKernel GetFusedAddReLUKernel(int length)
     {
         long key = MakeKey(OP_FUSED_ADD_RELU, false, length);
-        var entry = _cache.GetOrAdd(key, _ =>
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateFusedAddReLUKernel(length);
             return (buf, (Delegate)buf.CreateDelegate<BinaryKernel>());
-        });
-        return (BinaryKernel)entry.Kernel;
+        }));
+        return (BinaryKernel)entry.Value.Kernel;
     }
 
     /// <summary>
@@ -139,12 +140,12 @@ internal static class CpuJitKernels
     public static unsafe UnaryKernel GetSigmoidKernel(int length)
     {
         long key = MakeKey(OP_SIGMOID, false, length);
-        var entry = _cache.GetOrAdd(key, _ =>
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateSigmoidKernel(length);
             return (buf, (Delegate)buf.CreateDelegate<UnaryKernel>());
-        });
-        return (UnaryKernel)entry.Kernel;
+        }));
+        return (UnaryKernel)entry.Value.Kernel;
     }
 
     /// <summary>
@@ -156,12 +157,12 @@ internal static class CpuJitKernels
     {
         // Pack ldc into the key: OP_GEMM_MICRO in opId, ldc in aligned flag area, kc in length
         long key = ((long)(OP_GEMM_MICRO + ldc) << 33) | (uint)kc;
-        var entry = _cache.GetOrAdd(key, _ =>
+        var entry = _cache.GetOrAdd(key, _ => new Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>(() =>
         {
             var buf = GenerateGemmMicroKernel(kc, ldc);
             return (buf, (Delegate)buf.CreateDelegate<GemmMicroKernel>());
-        });
-        return (GemmMicroKernel)entry.Kernel;
+        }));
+        return (GemmMicroKernel)entry.Value.Kernel;
     }
 
     /// <summary>
@@ -452,6 +453,23 @@ internal static class CpuJitKernels
             e.Vaddps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.RDX, off);
             e.Vmaxps(X86Emitter.YMM0, X86Emitter.YMM0, X86Emitter.YMM15);
             e.VmovupsStore(X86Emitter.YMM0, X86Emitter.R8, off);
+        }
+
+        // Scalar tail: process remaining <8 elements one at a time
+        int scalarStart = vec8Count * 8;
+        int scalarTail = remaining - scalarStart;
+        if (scalarTail > 0)
+        {
+            int baseOff = vec8Count * 32;
+            for (int s = 0; s < scalarTail; s++)
+            {
+                int off = baseOff + s * 4;
+                // Load src0[i], add src1[i], max with zero, store to dst[i]
+                EmitScalarLoad(e, X86Emitter.YMM0, X86Emitter.RCX, off);
+                EmitScalarBinaryOp(e, JitBinaryOp.Add, X86Emitter.YMM0, X86Emitter.RDX, off);
+                EmitScalarMaxWithZero(e, X86Emitter.YMM0, X86Emitter.YMM15);
+                EmitScalarStore(e, X86Emitter.YMM0, X86Emitter.R8, off);
+            }
         }
 
         e.Epilogue();
@@ -855,7 +873,8 @@ internal static class CpuJitKernels
     {
         foreach (var kvp in _cache)
         {
-            kvp.Value.Buffer.Dispose();
+            if (kvp.Value.IsValueCreated)
+                kvp.Value.Value.Buffer.Dispose();
         }
         _cache.Clear();
     }
