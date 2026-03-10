@@ -275,6 +275,13 @@ internal sealed class X86Emitter
     public void VbinaryPs(byte opcode, int dst, int src1, int baseReg, int disp)
         => EmitVexRM(1, 0, 0, opcode, dst, src1, baseReg, disp);
 
+    /// <summary>
+    /// Generic scalar single-precision op: op xmm_dst, xmm_src1, [base+disp] (register-memory).
+    /// Uses F3 prefix (pp=2) and L=0 for scalar (VADDSS, VSUBSS, VMULSS, VDIVSS, VMAXSS).
+    /// </summary>
+    public void VbinarySs(byte opcode, int dst, int src1, int baseReg, int disp)
+        => EmitVexRM(1, 2 /*F3*/, 0, opcode, dst, src1, baseReg, disp, l: 0);
+
     // ==================== AVX2 Memory Operations ====================
 
     /// <summary>VMOVAPS ymm, [base+disp] — Aligned load (requires 32-byte alignment)</summary>

@@ -221,49 +221,14 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Fma.IsSupported && Avx.IsSupported && length >= 32)
             {
-                // Pre-load constants outside the loop to avoid repeated creation
-                var vmin = Vector256.Create(-5.0f);
-                var vmax = Vector256.Create(5.0f);
-                var vc5 = Vector256.Create(1.5854344e-4f);
-                var vc3 = Vector256.Create(-8.9219211e-3f);
-                var vc1 = Vector256.Create(2.1562920e-1f);
-                var vhalf = Vector256.Create(0.5f);
-
-                // 5th-order odd polynomial: sigmoid(x) ≈ 0.5 + x * (c1 + x² * (c3 + x² * c5))
-                // 4x unrolled: 12 FMA + 4 mul + 8 min/max per 32 floats
-                // No prefetch (branch in hot loop costs more than it saves)
+                // 4x unrolled FastSigmoid256: consistent approximation across all SIMD paths
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    // Load 4 vectors and clamp (ILP-friendly — all loads independent)
-                    var x0 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vmin), vmax);
-                    var x1 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), vmin), vmax);
-                    var x2 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 16), vmin), vmax);
-                    var x3 = Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 24), vmin), vmax);
-
-                    // x² for all 4 — independent, can execute in parallel on multiple ports
-                    var sq0 = Avx.Multiply(x0, x0);
-                    var sq1 = Avx.Multiply(x1, x1);
-                    var sq2 = Avx.Multiply(x2, x2);
-                    var sq3 = Avx.Multiply(x3, x3);
-
-                    // FMA chain step 1: c5*x² + c3
-                    var p0 = Fma.MultiplyAdd(sq0, vc5, vc3);
-                    var p1 = Fma.MultiplyAdd(sq1, vc5, vc3);
-                    var p2 = Fma.MultiplyAdd(sq2, vc5, vc3);
-                    var p3 = Fma.MultiplyAdd(sq3, vc5, vc3);
-
-                    // FMA chain step 2: c1 + x²*(c3+c5*x²)
-                    p0 = Fma.MultiplyAdd(sq0, p0, vc1);
-                    p1 = Fma.MultiplyAdd(sq1, p1, vc1);
-                    p2 = Fma.MultiplyAdd(sq2, p2, vc1);
-                    p3 = Fma.MultiplyAdd(sq3, p3, vc1);
-
-                    // FMA chain step 3: 0.5 + x*poly
-                    Avx.Store(output + i, Fma.MultiplyAdd(x0, p0, vhalf));
-                    Avx.Store(output + i + 8, Fma.MultiplyAdd(x1, p1, vhalf));
-                    Avx.Store(output + i + 16, Fma.MultiplyAdd(x2, p2, vhalf));
-                    Avx.Store(output + i + 24, Fma.MultiplyAdd(x3, p3, vhalf));
+                    Avx.Store(output + i, FastSigmoid256(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, FastSigmoid256(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, FastSigmoid256(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, FastSigmoid256(Avx.LoadVector256(input + i + 24)));
                 }
             }
             if (Fma.IsSupported && Avx.IsSupported && length - i >= 8)
@@ -4252,6 +4217,12 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// </summary>
         public static unsafe void Softmax(ReadOnlySpan<float> input, Span<float> output, int outerSize, int axisSize)
         {
+            int totalElements = outerSize * axisSize;
+            if (input.Length < totalElements)
+                throw new ArgumentException($"Input span length {input.Length} is less than outerSize*axisSize ({totalElements}).", nameof(input));
+            if (output.Length < totalElements)
+                throw new ArgumentException($"Output span length {output.Length} is less than outerSize*axisSize ({totalElements}).", nameof(output));
+
             fixed (float* pIn = input)
             fixed (float* pOut = output)
             {

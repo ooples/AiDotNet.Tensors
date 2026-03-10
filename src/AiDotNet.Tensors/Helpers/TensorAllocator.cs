@@ -70,7 +70,7 @@ internal static class TensorAllocator
         if (pooledArray != null)
         {
             tensor.DetachPooledArray();
-            ArrayPool<T>.Shared.Return(pooledArray);
+            ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
         }
     }
 

@@ -719,7 +719,7 @@ public abstract class VectorBase<T>
                 SimdKernels.VectorAdd(
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), Length));
                 return;
             }
             if (typeof(T) == typeof(float))
@@ -728,7 +728,7 @@ public abstract class VectorBase<T>
                 SimdKernels.VectorAdd(
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), Length));
                 return;
             }
         }
@@ -826,7 +826,7 @@ public abstract class VectorBase<T>
                 SimdKernels.VectorSubtract(
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), Length));
                 return;
             }
             if (typeof(T) == typeof(float))
@@ -835,7 +835,7 @@ public abstract class VectorBase<T>
                 SimdKernels.VectorSubtract(
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), Length));
                 return;
             }
         }
@@ -919,7 +919,7 @@ public abstract class VectorBase<T>
                 SimdKernels.MultiplyScalar(
                     (ReadOnlySpan<double>)dArr,
                     Unsafe.As<T, double>(ref scalar),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref dstart), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref dstart), Length));
                 return;
             }
             if (typeof(T) == typeof(float))
@@ -929,7 +929,7 @@ public abstract class VectorBase<T>
                 SimdKernels.MultiplyScalar(
                     (ReadOnlySpan<float>)fArr,
                     Unsafe.As<T, float>(ref scalar),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref dstart), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref dstart), Length));
                 return;
             }
         }

@@ -718,19 +718,21 @@ public abstract class MatrixBase<T>
             if (typeof(T) == typeof(double))
             {
                 ref T sd = ref MemoryMarshal.GetReference(destination);
+                var logicalLen = _rows * _cols;
                 SimdKernels.VectorAdd(
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), logicalLen));
                 return;
             }
             if (typeof(T) == typeof(float))
             {
                 ref T sd = ref MemoryMarshal.GetReference(destination);
+                var logicalLen = _rows * _cols;
                 SimdKernels.VectorAdd(
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), logicalLen));
                 return;
             }
         }
@@ -823,19 +825,21 @@ public abstract class MatrixBase<T>
             if (typeof(T) == typeof(double))
             {
                 ref T sd = ref MemoryMarshal.GetReference(destination);
+                var logicalLen = _rows * _cols;
                 SimdKernels.VectorSubtract(
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref arr),
                     (ReadOnlySpan<double>)Unsafe.As<T[], double[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref sd), logicalLen));
                 return;
             }
             if (typeof(T) == typeof(float))
             {
                 ref T sd = ref MemoryMarshal.GetReference(destination);
+                var logicalLen = _rows * _cols;
                 SimdKernels.VectorSubtract(
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref arr),
                     (ReadOnlySpan<float>)Unsafe.As<T[], float[]>(ref otherArr),
-                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), destination.Length));
+                    MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref sd), logicalLen));
                 return;
             }
         }

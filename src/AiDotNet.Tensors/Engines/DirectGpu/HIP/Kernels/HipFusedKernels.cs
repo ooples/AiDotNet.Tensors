@@ -61,7 +61,7 @@ internal static class HipFusedKernels
             int _smCol4 = _i % _bn4; \
             int _gRow = t * bk + _smRow; \
             int _gCol = blockIdxX * bn + _smCol4 * 4; \
-            if (_gRow < K && _gCol + 3 < N) { \
+            if (_gRow < K && _gCol + 3 < N && ((_gRow * N + _gCol) % 4 == 0)) { \
                 float4 _bv = *((const float4*)&B[_gRow * N + _gCol]); \
                 Bs[_smRow][_smCol4 * 4 + 0] = _bv.x; \
                 Bs[_smRow][_smCol4 * 4 + 1] = _bv.y; \

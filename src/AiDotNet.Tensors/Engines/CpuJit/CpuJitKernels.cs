@@ -849,7 +849,8 @@ internal static class CpuJitKernels
 
     private static void EmitScalarBinaryOp(X86Emitter e, JitBinaryOp op, int dst, int srcBase, int disp)
     {
-        e.VbinaryPs(op.Opcode, dst, dst, srcBase, disp);
+        // Use scalar (SS) variant to read exactly 4 bytes, not packed (PS) which reads 32
+        e.VbinarySs(op.Opcode, dst, dst, srcBase, disp);
     }
 
     private static void EmitScalarMaxWithZero(X86Emitter e, int dst, int zero)
@@ -868,11 +869,15 @@ internal static class CpuJitKernels
     /// </summary>
     public static void ClearCache()
     {
-        foreach (var kvp in _cache)
+        // Atomically swap the dictionary so concurrent GetOrAdd callers get a fresh cache
+        // rather than accessing entries being disposed
+        var old = new ConcurrentDictionary<long, Lazy<(ExecutableBuffer Buffer, Delegate Kernel)>>(_cache);
+        _cache.Clear();
+
+        foreach (var kvp in old)
         {
             if (kvp.Value.IsValueCreated)
                 kvp.Value.Value.Buffer.Dispose();
         }
-        _cache.Clear();
     }
 }
