@@ -28,11 +28,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 // ===========================================================================
 
 extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention(
-    const float* query,      // [batch * heads * seqQ * headDim]
-    const float* key,        // [batch * heads * seqK * headDim]
-    const float* value,      // [batch * heads * seqK * headDim]
-    float* output,           // [batch * heads * seqQ * headDim]
-    float* attentionWeights, // [batch * heads * seqQ * seqK] (optional)
+    const float* __restrict__ query,      // [batch * heads * seqQ * headDim]
+    const float* __restrict__ key,        // [batch * heads * seqK * headDim]
+    const float* __restrict__ value,      // [batch * heads * seqK * headDim]
+    float* __restrict__ output,           // [batch * heads * seqQ * headDim]
+    float* __restrict__ attentionWeights, // [batch * heads * seqQ * seqK] (optional)
     int batch,
     int numHeads,
     int seqQ,
@@ -155,11 +155,11 @@ extern ""C"" __global__ __launch_bounds__(256) void scaled_dot_product_attention
 // ===========================================================================
 
 extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
-    const float* query,          // [batch * heads * seqQ * headDim]
-    const float* key,            // [batch * heads * seqK * headDim]
-    const float* value,          // [batch * heads * seqK * headDim]
-    float* output,               // [batch * heads * seqQ * headDim]
-    float* softmaxStats,         // [batch * heads * seqQ] (log-sum-exp)
+    const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
+    const float* __restrict__ key,            // [batch * heads * seqK * headDim]
+    const float* __restrict__ value,          // [batch * heads * seqK * headDim]
+    float* __restrict__ output,               // [batch * heads * seqQ * headDim]
+    float* __restrict__ softmaxStats,         // [batch * heads * seqQ] (log-sum-exp)
     int batch,
     int numHeads,
     int seqQ,
@@ -167,7 +167,7 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
     int headDim,
     float scale,
     int isCausal,
-    const float* attentionBias,  // optional, NULL if unused
+    const float* __restrict__ attentionBias,  // optional, NULL if unused
     int hasBias,
     int biasBatchStride)
 {
@@ -277,15 +277,15 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_v2(
 // ===========================================================================
 
 extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
-    const float* gradOutput,     // [batch * heads * seqQ * headDim]
-    const float* query,          // [batch * heads * seqQ * headDim]
-    const float* key,            // [batch * heads * seqK * headDim]
-    const float* value,          // [batch * heads * seqK * headDim]
-    const float* output,         // [batch * heads * seqQ * headDim]
-    const float* softmaxStats,   // [batch * heads * seqQ]
-    float* gradQuery,            // [batch * heads * seqQ * headDim]
-    float* gradKey,              // [batch * heads * seqK * headDim]
-    float* gradValue,            // [batch * heads * seqK * headDim]
+    const float* __restrict__ gradOutput,     // [batch * heads * seqQ * headDim]
+    const float* __restrict__ query,          // [batch * heads * seqQ * headDim]
+    const float* __restrict__ key,            // [batch * heads * seqK * headDim]
+    const float* __restrict__ value,          // [batch * heads * seqK * headDim]
+    const float* __restrict__ output,         // [batch * heads * seqQ * headDim]
+    const float* __restrict__ softmaxStats,   // [batch * heads * seqQ]
+    float* __restrict__ gradQuery,            // [batch * heads * seqQ * headDim]
+    float* __restrict__ gradKey,              // [batch * heads * seqK * headDim]
+    float* __restrict__ gradValue,            // [batch * heads * seqK * headDim]
     int batch,
     int numHeads,
     int seqQ,
@@ -293,7 +293,7 @@ extern ""C"" __global__ __launch_bounds__(256) void flash_attention_backward(
     int headDim,
     float scale,
     int isCausal,
-    const float* attentionBias,  // optional bias (NULL if unused)
+    const float* __restrict__ attentionBias,  // optional bias (NULL if unused)
     int hasBias,
     int biasBatchStride)
 {

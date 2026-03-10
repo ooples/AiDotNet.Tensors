@@ -83,7 +83,7 @@ extern ""C"" __global__ __launch_bounds__(256) void elu(const float* input, floa
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+    output[idx] = x > 0.0f ? x : alpha * expm1f(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void elu_backward(const float* gradOutput, const float* input, const float* output, float* gradInput, float alpha, int size)
@@ -275,7 +275,7 @@ extern ""C"" __global__ __launch_bounds__(256) void expm1_vector(const float* A,
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = expf(A[idx]) - 1.0f;
+    B[idx] = expm1f(A[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void log1p_vector(const float* A, float* B, int size)
@@ -542,7 +542,7 @@ extern ""C"" __global__ __launch_bounds__(256) void selu_vector(const float* A, 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = A[idx];
-    B[idx] = scale * (x > 0.0f ? x : alpha * (expf(x) - 1.0f));
+    B[idx] = scale * (x > 0.0f ? x : alpha * expm1f(x));
 }
 
 // Hardsigmoid: min(max((x+3)/6, 0), 1)

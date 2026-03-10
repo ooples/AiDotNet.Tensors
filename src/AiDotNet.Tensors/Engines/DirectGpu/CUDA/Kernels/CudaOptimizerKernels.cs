@@ -25,7 +25,7 @@ internal static class CudaOptimizerKernels
 // SGD with momentum update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sgd_momentum_update(
-    float* param, const float* gradient, float* velocity,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ velocity,
     float learningRate, float momentum, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -45,7 +45,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_momentum_update(
 // Vanilla SGD update (no momentum)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void sgd_update(
-    float* param, const float* gradient,
+    float* __restrict__ param, const float* __restrict__ gradient,
     float learningRate, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -63,7 +63,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_update(
 // Adam optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adam_update(
-    float* param, const float* gradient, float* m, float* v,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
@@ -91,7 +91,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_update(
 // AdamW optimizer update (decoupled weight decay)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
-    float* param, const float* gradient, float* m, float* v,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
@@ -120,7 +120,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
 // RMSprop optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void rmsprop_update(
-    float* param, const float* gradient, float* squaredAvg,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ squaredAvg,
     float learningRate, float rho, float epsilon, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -141,7 +141,7 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsprop_update(
 // Adagrad optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adagrad_update(
-    float* param, const float* gradient, float* accumulatedGrad,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ accumulatedGrad,
     float learningRate, float epsilon, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -162,7 +162,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adagrad_update(
 // Nesterov Accelerated Gradient (NAG) optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void nag_update(
-    float* param, const float* gradient, float* velocity,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ velocity,
     float learningRate, float momentum, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -184,7 +184,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nag_update(
 // LARS optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void lars_update(
-    float* param, const float* gradient, float* velocity,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ velocity,
     float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -210,7 +210,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lars_update(
 // Set trustRatio=1.0f to disable trust ratio scaling (degenerates to AdamW).
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void lamb_update(
-    float* param, const float* gradient, float* m, float* v,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, float trustRatio, int step, int size)
 {
@@ -239,7 +239,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lamb_update(
 // AdaDelta optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adadelta_update(
-    float* param, const float* gradient, float* accumGrad, float* accumUpdate,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ accumGrad, float* __restrict__ accumUpdate,
     float rho, float epsilon, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -266,7 +266,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adadelta_update(
 // AMSGrad optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
-    float* param, const float* gradient, float* m, float* v, float* vMax,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ v, float* __restrict__ vMax,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
@@ -296,7 +296,7 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
 // AdaMax optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adamax_update(
-    float* param, const float* gradient, float* m, float* u,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ u,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
@@ -323,7 +323,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adamax_update(
 // Lion optimizer update (Evolved Sign Momentum)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void lion_update(
-    float* param, const float* gradient, float* m,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m,
     float learningRate, float beta1, float beta2, float weightDecay, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -348,7 +348,7 @@ extern ""C"" __global__ __launch_bounds__(256) void lion_update(
 // Nadam optimizer update (Nesterov-accelerated Adam)
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
-    float* param, const float* gradient, float* m, float* v,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ m, float* __restrict__ v,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int size)
 {
@@ -380,7 +380,7 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
 // FTRL optimizer update
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void ftrl_update(
-    float* param, const float* gradient, float* z, float* n,
+    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ z, float* __restrict__ n,
     float learningRate, float l1Reg, float l2Reg, float beta, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

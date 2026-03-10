@@ -117,7 +117,7 @@ extern ""C"" __global__ __launch_bounds__(256) void selu(const float* __restrict
     const float alpha = 1.6732632423543772848170429916717f;
     const float scale = 1.0507009873554804934193349852946f;
     float x = input[idx];
-    output[idx] = scale * (x > 0.0f ? x : alpha * (expf(x) - 1.0f));
+    output[idx] = scale * (x > 0.0f ? x : alpha * expm1f(x));
 }
 
 // Hardsigmoid: relu6(x + 3) / 6 = clip((x + 3) / 6, 0, 1)

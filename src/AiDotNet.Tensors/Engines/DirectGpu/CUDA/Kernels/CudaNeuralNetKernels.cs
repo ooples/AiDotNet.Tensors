@@ -102,7 +102,7 @@ extern ""C"" __global__ __launch_bounds__(256) void elu(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = x >= 0.0f ? x : alpha * (expf(x) - 1.0f);
+    output[idx] = x >= 0.0f ? x : alpha * expm1f(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void elu_backward(

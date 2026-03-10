@@ -57,15 +57,15 @@ __device__ __forceinline__ float tanh_derivative(float tanh_output) {
 // output newH: [batch, hiddenSize]
 // gateZ, gateR, gateH: [batch, hiddenSize] (cached for backward)
 extern ""C"" __global__ __launch_bounds__(256) void gru_cell_forward(
-    const float* input,
-    const float* prevH,
-    const float* Wz, const float* Wr, const float* Wh,
-    const float* Uz, const float* Ur, const float* Uh,
-    const float* bz, const float* br, const float* bh,
-    float* newH,
-    float* gateZ,
-    float* gateR,
-    float* gateHCandidate,
+    const float* __restrict__ input,
+    const float* __restrict__ prevH,
+    const float* __restrict__ Wz, const float* __restrict__ Wr, const float* __restrict__ Wh,
+    const float* __restrict__ Uz, const float* __restrict__ Ur, const float* __restrict__ Uh,
+    const float* __restrict__ bz, const float* __restrict__ br, const float* __restrict__ bh,
+    float* __restrict__ newH,
+    float* __restrict__ gateZ,
+    float* __restrict__ gateR,
+    float* __restrict__ gateHCandidate,
     int batch,
     int inputSize,
     int hiddenSize)

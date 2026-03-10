@@ -57,18 +57,18 @@ __device__ __forceinline__ float tanh_derivative(float tanh_output) {
 // output newH, newC: [batch, hiddenSize]
 // gateF, gateI, gateC, gateO: [batch, hiddenSize] (cached for backward)
 extern ""C"" __global__ __launch_bounds__(256) void lstm_cell_forward(
-    const float* input,
-    const float* prevH,
-    const float* prevC,
-    const float* Wi,      // [4*hidden, input]
-    const float* Wh,      // [4*hidden, hidden]
-    const float* bias,    // [4*hidden]
-    float* newH,
-    float* newC,
-    float* gateF,
-    float* gateI,
-    float* gateC,
-    float* gateO,
+    const float* __restrict__ input,
+    const float* __restrict__ prevH,
+    const float* __restrict__ prevC,
+    const float* __restrict__ Wi,      // [4*hidden, input]
+    const float* __restrict__ Wh,      // [4*hidden, hidden]
+    const float* __restrict__ bias,    // [4*hidden]
+    float* __restrict__ newH,
+    float* __restrict__ newC,
+    float* __restrict__ gateF,
+    float* __restrict__ gateI,
+    float* __restrict__ gateC,
+    float* __restrict__ gateO,
     int batch,
     int inputSize,
     int hiddenSize)
