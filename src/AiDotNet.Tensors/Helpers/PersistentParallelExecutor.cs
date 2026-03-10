@@ -99,7 +99,9 @@ internal sealed class PersistentParallelExecutor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Execute(int numChunks, Action<int> action)
     {
-        if (numChunks <= 1)
+        if (numChunks <= 0)
+            return;
+        if (numChunks == 1)
         {
             action(0);
             return;
