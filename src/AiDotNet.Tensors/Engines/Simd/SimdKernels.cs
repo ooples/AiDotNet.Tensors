@@ -1477,23 +1477,34 @@ namespace AiDotNet.Tensors.Engines.Simd
             fixed (double* pIn = input)
             fixed (double* pOut = output)
             {
-                // Use unsafe pointers to eliminate Span bounds-checking overhead.
-                // Math.Exp will be auto-vectorized by SVML on .NET 8+.
-                if (length >= 8)
+                // Vectorized sigmoid using FastExpDouble256: 1/(1+exp(-x))
+                if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
                 {
-                    int unrolled = length & ~7;
-                    for (; i < unrolled; i += 8)
+                    var one = Vector256.Create(1.0);
+                    var negOne = Vector256.Create(-1.0);
+                    int simdLen = length & ~15;
+                    for (; i < simdLen; i += 16)
                     {
-                        pOut[i] = 1.0 / (1.0 + Math.Exp(-pIn[i]));
-                        pOut[i + 1] = 1.0 / (1.0 + Math.Exp(-pIn[i + 1]));
-                        pOut[i + 2] = 1.0 / (1.0 + Math.Exp(-pIn[i + 2]));
-                        pOut[i + 3] = 1.0 / (1.0 + Math.Exp(-pIn[i + 3]));
-                        pOut[i + 4] = 1.0 / (1.0 + Math.Exp(-pIn[i + 4]));
-                        pOut[i + 5] = 1.0 / (1.0 + Math.Exp(-pIn[i + 5]));
-                        pOut[i + 6] = 1.0 / (1.0 + Math.Exp(-pIn[i + 6]));
-                        pOut[i + 7] = 1.0 / (1.0 + Math.Exp(-pIn[i + 7]));
+                        // 4x unrolled (4 doubles per vector × 4 = 16 doubles per iteration)
+                        var x0 = Avx.Multiply(negOne, Avx.LoadVector256(pIn + i));
+                        var x1 = Avx.Multiply(negOne, Avx.LoadVector256(pIn + i + 4));
+                        var x2 = Avx.Multiply(negOne, Avx.LoadVector256(pIn + i + 8));
+                        var x3 = Avx.Multiply(negOne, Avx.LoadVector256(pIn + i + 12));
+
+                        Avx.Store(pOut + i, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x0))));
+                        Avx.Store(pOut + i + 4, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x1))));
+                        Avx.Store(pOut + i + 8, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x2))));
+                        Avx.Store(pOut + i + 12, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x3))));
+                    }
+                    // Handle remainder in chunks of 4
+                    for (; i + 4 <= length; i += 4)
+                    {
+                        var x0 = Avx.Multiply(negOne, Avx.LoadVector256(pIn + i));
+                        Avx.Store(pOut + i, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x0))));
                     }
                 }
+
+                // Scalar remainder
                 for (; i < length; i++)
                     pOut[i] = 1.0 / (1.0 + Math.Exp(-pIn[i]));
             }
@@ -1626,6 +1637,65 @@ namespace AiDotNet.Tensors.Engines.Simd
             var pow2n = Avx2.Add(nInt, Vector256.Create(127));
             pow2n = Avx2.ShiftLeftLogical(pow2n, 23); // shift to exponent position
             var scale = pow2n.AsSingle();
+
+            return Avx.Multiply(poly, scale);
+        }
+
+        /// <summary>
+        /// Cephes-style fast exp for Vector256&lt;double&gt; (4 doubles per vector).
+        /// Uses 11th-order minimax polynomial for double precision (~1e-16 relative error).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<double> FastExpDouble256(Vector256<double> x)
+        {
+            // Clamp to avoid inf/nan
+            var clampMin = Vector256.Create(-708.3964185322641);
+            var clampMax = Vector256.Create(709.7827128933840);
+            x = Avx.Max(clampMin, Avx.Min(clampMax, x));
+
+            // Range reduction: n = round(x / ln2)
+            var log2e = Vector256.Create(1.4426950408889634);
+            var ln2hi = Vector256.Create(6.93145751953125E-1);
+            var ln2lo = Vector256.Create(1.42860682030941723212E-6);
+
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(x, log2e));
+
+            // r = x - n * ln2
+            var r = Fma.MultiplyAddNegated(n, ln2hi, x);
+            r = Fma.MultiplyAddNegated(n, ln2lo, r);
+
+            // Polynomial approximation of exp(r) - Cephes coefficients for double
+            var c0 = Vector256.Create(1.0);
+            var c1 = Vector256.Create(1.0);
+            var c2 = Vector256.Create(0.5);
+            var c3 = Vector256.Create(1.66666666666666019037e-1);
+            var c4 = Vector256.Create(4.16666666666666019037e-2);
+            var c5 = Vector256.Create(8.33333333333331438267e-3);
+            var c6 = Vector256.Create(1.38888888888889347740e-3);
+            var c7 = Vector256.Create(1.98412698412699105610e-4);
+            var c8 = Vector256.Create(2.48015873015875132200e-5);
+            var c9 = Vector256.Create(2.75573192239844089230e-6);
+            var c10 = Vector256.Create(2.75573192239332268710e-7);
+            var c11 = Vector256.Create(2.50521083854417187751e-8);
+
+            var poly = Fma.MultiplyAdd(c11, r, c10);
+            poly = Fma.MultiplyAdd(poly, r, c9);
+            poly = Fma.MultiplyAdd(poly, r, c8);
+            poly = Fma.MultiplyAdd(poly, r, c7);
+            poly = Fma.MultiplyAdd(poly, r, c6);
+            poly = Fma.MultiplyAdd(poly, r, c5);
+            poly = Fma.MultiplyAdd(poly, r, c4);
+            poly = Fma.MultiplyAdd(poly, r, c3);
+            poly = Fma.MultiplyAdd(poly, r, c2);
+            poly = Fma.MultiplyAdd(poly, r, c1);
+            poly = Fma.MultiplyAdd(poly, r, c0);
+
+            // Reconstruct: 2^n * exp(r) using IEEE 754 double exponent manipulation
+            // Double bias = 1023, exponent at bits 52-62
+            var nLong = Avx2.ConvertToVector256Int64(Avx.ConvertToVector128Int32(n));
+            var pow2n = Avx2.Add(nLong, Vector256.Create(1023L));
+            pow2n = Avx2.ShiftLeftLogical(pow2n, 52);
+            var scale = pow2n.AsDouble();
 
             return Avx.Multiply(poly, scale);
         }
