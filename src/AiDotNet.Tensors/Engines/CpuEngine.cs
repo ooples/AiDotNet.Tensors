@@ -3381,65 +3381,74 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
         {
             int bc = batch * channels;
-            if (bc >= 4 && padding == 0)
+            int h = height, w = width, oH = outputHeight, oW = outputWidth;
+            int ps = poolSize, st = stride, pd = padding;
+
+            if (padding == 0)
             {
-                // Parallel over batch*channels, no padding (hot path)
+                // No padding: skip bounds checks in inner loop
                 Parallel.For(0, bc, idx =>
                 {
-                    int inputBase = idx * height * width;
-                    int outputBase = idx * outputHeight * outputWidth;
+                    int inputBase = idx * h * w;
+                    int outputBase = idx * oH * oW;
 
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    for (int oh = 0; oh < oH; oh++)
                     {
-                        int ihStart = oh * stride;
-                        for (int ow = 0; ow < outputWidth; ow++)
+                        int ihStart = oh * st;
+                        for (int ow = 0; ow < oW; ow++)
                         {
-                            int iwStart = ow * stride;
+                            int iwStart = ow * st;
                             float maxVal = float.NegativeInfinity;
 
-                            for (int kh = 0; kh < poolSize; kh++)
+                            for (int kh = 0; kh < ps; kh++)
                             {
-                                int rowOff = inputBase + (ihStart + kh) * width + iwStart;
-                                for (int kw = 0; kw < poolSize; kw++)
+                                int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                                for (int kw = 0; kw < ps; kw++)
                                 {
                                     float v = inArr[rowOff + kw];
                                     if (v > maxVal) maxVal = v;
                                 }
                             }
-                            outArr[outputBase + oh * outputWidth + ow] = maxVal;
+                            outArr[outputBase + oh * oW + ow] = maxVal;
                         }
                     }
                 });
             }
             else
             {
-                // General float path with padding support
-                for (int idx = 0; idx < bc; idx++)
+                // With padding: parallelize across batch*channels, inline bounds checks
+                Parallel.For(0, bc, idx =>
                 {
-                    int inputBase = idx * height * width;
-                    int outputBase = idx * outputHeight * outputWidth;
+                    int inputBase = idx * h * w;
+                    int outputBase = idx * oH * oW;
 
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    for (int oh = 0; oh < oH; oh++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
+                        for (int ow = 0; ow < oW; ow++)
                         {
                             float maxVal = float.NegativeInfinity;
-                            for (int kh = 0; kh < poolSize; kh++)
+
+                            // Clamp kernel bounds to valid input region
+                            int ihStart = oh * st - pd;
+                            int iwStart = ow * st - pd;
+                            int khStart = ihStart < 0 ? -ihStart : 0;
+                            int kwStart = iwStart < 0 ? -iwStart : 0;
+                            int khEnd = Math.Min(ps, h - ihStart);
+                            int kwEnd = Math.Min(ps, w - iwStart);
+
+                            for (int kh = khStart; kh < khEnd; kh++)
                             {
-                                int ih = oh * stride + kh - padding;
-                                if (ih < 0 || ih >= height) continue;
-                                for (int kw = 0; kw < poolSize; kw++)
+                                int rowOff = inputBase + (ihStart + kh) * w + iwStart;
+                                for (int kw = kwStart; kw < kwEnd; kw++)
                                 {
-                                    int iw = ow * stride + kw - padding;
-                                    if (iw < 0 || iw >= width) continue;
-                                    float v = inArr[inputBase + ih * width + iw];
+                                    float v = inArr[rowOff + kw];
                                     if (v > maxVal) maxVal = v;
                                 }
                             }
-                            outArr[outputBase + oh * outputWidth + ow] = maxVal;
+                            outArr[outputBase + oh * oW + ow] = maxVal;
                         }
                     }
-                }
+                });
             }
             return result;
         }
@@ -8717,149 +8726,165 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Fast SIMD softmax for float arrays.
-    /// Uses 3-pass approach: (1) per-row max, (2) flat subtract+exp, (3) per-row sum+divide.
-    /// This minimizes per-row overhead by doing exp as a single flat pass.
+    /// Fast SIMD softmax for float arrays with parallel row processing.
+    /// Each row is independent: max → subtract → exp → sum → divide.
+    /// Parallelized across rows for large tensors.
     /// </summary>
     private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
     {
         fixed (float* pIn = inputFloats)
         fixed (float* pOut = outputFloats)
         {
-            int totalLen = outerSize * axisSize;
+            IntPtr ipIn = (IntPtr)pIn;
+            IntPtr ipOut = (IntPtr)pOut;
+            int axisSz = axisSize;
 
-            // Pass 1+2: per-row max and subtract (fused to reduce memory passes)
-            for (int row = 0; row < outerSize; row++)
+            // Parallelize across rows when there are enough rows
+            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+            bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
+
+            if (useParallel)
             {
-                float* rowIn = pIn + row * axisSize;
-                float* rowOut = pOut + row * axisSize;
-
-                // Find max
-                float maxVal = float.NegativeInfinity;
-                int j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
                 {
-                    var vmax0 = System.Runtime.Intrinsics.Vector256.Create(float.NegativeInfinity);
-                    var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
-                    int simdLen = axisSize & ~31;
-                    for (; j < simdLen; j += 32)
-                    {
-                        vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(vmax0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j));
-                        vmax1 = System.Runtime.Intrinsics.X86.Avx.Max(vmax1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 8));
-                        vmax2 = System.Runtime.Intrinsics.X86.Avx.Max(vmax2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 16));
-                        vmax3 = System.Runtime.Intrinsics.X86.Avx.Max(vmax3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 24));
-                    }
-                    vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(
-                        System.Runtime.Intrinsics.X86.Avx.Max(vmax0, vmax1),
-                        System.Runtime.Intrinsics.X86.Avx.Max(vmax2, vmax3));
-                    // Horizontal max
-                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 1);
-                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 0);
-                    var max128 = System.Runtime.Intrinsics.X86.Sse.Max(lo, hi);
-                    var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_01_00_11_10);
-                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
-                    shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_10_11_00_01);
-                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
-                    float maxTmp;
-                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&maxTmp, max128);
-                    maxVal = maxTmp;
-                }
-#endif
-                for (; j < axisSize; j++)
-                    if (rowIn[j] > maxVal) maxVal = rowIn[j];
-
-                // Subtract max
-                j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
-                {
-                    var vmaxBcast = System.Runtime.Intrinsics.Vector256.Create(maxVal);
-                    int simdLen = axisSize & ~7;
-                    for (; j < simdLen; j += 8)
-                    {
-                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
-                            System.Runtime.Intrinsics.X86.Avx.Subtract(
-                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j), vmaxBcast));
-                    }
-                }
-#endif
-                for (; j < axisSize; j++)
-                    rowOut[j] = rowIn[j] - maxVal;
+                    SoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
+                });
             }
-
-            // Pass 3: exp on entire flat array at once (unsafe pointer path, no Span bounds checks)
-            SimdKernels.ExpUnsafe(pOut, pOut, totalLen);
-
-            // Pass 4: per-row sum and divide
-            for (int row = 0; row < outerSize; row++)
+            else
             {
-                float* rowOut = pOut + row * axisSize;
-                float sumExp = 0f;
-                int j = 0;
-#if NET5_0_OR_GREATER
-                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                for (int row = 0; row < outerSize; row++)
                 {
-                    var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
-                    var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
-                    int simdLen = axisSize & ~31;
-                    for (; j < simdLen; j += 32)
-                    {
-                        vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j));
-                        vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 8));
-                        vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 16));
-                        vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 24));
-                    }
-                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
-                        System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
-                        System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
-                    // Horizontal sum
-                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
-                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
-                    var sum128 = System.Runtime.Intrinsics.X86.Sse.Add(lo, hi);
-                    if (System.Runtime.Intrinsics.X86.Sse3.IsSupported)
-                    {
-                        var shuf = System.Runtime.Intrinsics.X86.Sse3.MoveHighAndDuplicate(sum128);
-                        var sums = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
-                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sums,
-                            System.Runtime.Intrinsics.X86.Sse.MoveHighToLow(sums, sums));
-                    }
-                    else
-                    {
-                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_01_00_11_10);
-                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
-                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_10_11_00_01);
-                        sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shuf);
-                    }
-                    float sumTmp;
-                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&sumTmp, sum128);
-                    sumExp = sumTmp;
-                }
-#endif
-                for (; j < axisSize; j++)
-                    sumExp += rowOut[j];
-
-                if (sumExp > 0f)
-                {
-                    float invSum = 1f / sumExp;
-                    j = 0;
-#if NET5_0_OR_GREATER
-                    if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
-                    {
-                        var vInvSum = System.Runtime.Intrinsics.Vector256.Create(invSum);
-                        int simdLen = axisSize & ~7;
-                        for (; j < simdLen; j += 8)
-                        {
-                            System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
-                                System.Runtime.Intrinsics.X86.Avx.Multiply(
-                                    System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vInvSum));
-                        }
-                    }
-#endif
-                    for (; j < axisSize; j++)
-                        rowOut[j] *= invSum;
+                    SoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Processes a single softmax row: max → subtract → exp → sum → divide.
+    /// All operations are fused per-row for better cache locality.
+    /// </summary>
+    private static unsafe void SoftmaxRowUnsafe(float* rowIn, float* rowOut, int axisSize)
+    {
+        // Pass 1: Find max (4x unrolled AVX2)
+        float maxVal = float.NegativeInfinity;
+        int j = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+        {
+            var vmax0 = System.Runtime.Intrinsics.Vector256.Create(float.NegativeInfinity);
+            var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
+            int simdLen = axisSize & ~31;
+            for (; j < simdLen; j += 32)
+            {
+                vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(vmax0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j));
+                vmax1 = System.Runtime.Intrinsics.X86.Avx.Max(vmax1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 8));
+                vmax2 = System.Runtime.Intrinsics.X86.Avx.Max(vmax2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 16));
+                vmax3 = System.Runtime.Intrinsics.X86.Avx.Max(vmax3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 24));
+            }
+            vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(
+                System.Runtime.Intrinsics.X86.Avx.Max(vmax0, vmax1),
+                System.Runtime.Intrinsics.X86.Avx.Max(vmax2, vmax3));
+            var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 1);
+            var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 0);
+            var max128 = System.Runtime.Intrinsics.X86.Sse.Max(lo, hi);
+            var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_01_00_11_10);
+            max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+            shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_10_11_00_01);
+            max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+            float maxTmp;
+            System.Runtime.Intrinsics.X86.Sse.StoreScalar(&maxTmp, max128);
+            maxVal = maxTmp;
+        }
+#endif
+        for (; j < axisSize; j++)
+            if (rowIn[j] > maxVal) maxVal = rowIn[j];
+
+        // Pass 2: Subtract max (write to output buffer)
+        j = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+        {
+            var vmaxBcast = System.Runtime.Intrinsics.Vector256.Create(maxVal);
+            int simdLen = axisSize & ~7;
+            for (; j < simdLen; j += 8)
+            {
+                System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                    System.Runtime.Intrinsics.X86.Avx.Subtract(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j), vmaxBcast));
+            }
+        }
+#endif
+        for (; j < axisSize; j++)
+            rowOut[j] = rowIn[j] - maxVal;
+
+        // Pass 3: exp in-place
+        SimdKernels.ExpUnsafe(rowOut, rowOut, axisSize);
+
+        // Pass 4: Sum (4x unrolled AVX2)
+        float sumExp = 0f;
+        j = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+        {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = axisSize & ~31;
+            for (; j < simdLen; j += 32)
+            {
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j));
+                vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 8));
+                vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 16));
+                vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j + 24));
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            var shi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
+            var slo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
+            var sum128 = System.Runtime.Intrinsics.X86.Sse.Add(slo, shi);
+            if (System.Runtime.Intrinsics.X86.Sse3.IsSupported)
+            {
+                var shf = System.Runtime.Intrinsics.X86.Sse3.MoveHighAndDuplicate(sum128);
+                var sums = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shf);
+                sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sums,
+                    System.Runtime.Intrinsics.X86.Sse.MoveHighToLow(sums, sums));
+            }
+            else
+            {
+                var shf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_01_00_11_10);
+                sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shf);
+                shf = System.Runtime.Intrinsics.X86.Sse.Shuffle(sum128, sum128, 0b_10_11_00_01);
+                sum128 = System.Runtime.Intrinsics.X86.Sse.Add(sum128, shf);
+            }
+            float sumTmp;
+            System.Runtime.Intrinsics.X86.Sse.StoreScalar(&sumTmp, sum128);
+            sumExp = sumTmp;
+        }
+#endif
+        for (; j < axisSize; j++)
+            sumExp += rowOut[j];
+
+        // Pass 5: Divide by sum (multiply by inverse)
+        if (sumExp > 0f)
+        {
+            float invSum = 1f / sumExp;
+            j = 0;
+#if NET5_0_OR_GREATER
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+            {
+                var vInvSum = System.Runtime.Intrinsics.Vector256.Create(invSum);
+                int simdLen = axisSize & ~7;
+                for (; j < simdLen; j += 8)
+                {
+                    System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(
+                            System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vInvSum));
+                }
+            }
+#endif
+            for (; j < axisSize; j++)
+                rowOut[j] *= invSum;
         }
     }
 
@@ -9656,7 +9681,18 @@ public class CpuEngine : ITensorLevelEngine
         int elementsPerChannel = batch * spatialSize;
         float invCount = 1f / elementsPerChannel;
 
-        for (int c = 0; c < channels; c++)
+        // Parallelize across channels — each channel's mean/var/normalize is independent
+        Parallel.For(0, channels, c =>
+        {
+            BatchNorm4DFloatChannel(input, gamma, beta, eps, batch, channels, spatialSize,
+                invCount, c, meanOut, varOut, output);
+        });
+    }
+
+    private static unsafe void BatchNorm4DFloatChannel(float[] input, float[] gamma, float[] beta, float eps,
+        int batch, int channels, int spatialSize, float invCount, int c,
+        float[] meanOut, float[] varOut, float[] output)
+    {
         {
             // Pass 1: Mean with SIMD accumulation
             float sum = 0f;
