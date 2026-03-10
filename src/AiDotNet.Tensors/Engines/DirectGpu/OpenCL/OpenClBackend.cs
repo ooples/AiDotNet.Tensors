@@ -77,7 +77,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public int ComputeUnits { get; }
         public long GlobalMemoryBytes { get; }
         public long LocalMemoryBytes { get; }
-        public double TheoreticalGflops { get; }
+        public double TheoreticalGflops { get; private set; }
 
         // IAsyncGpuBackend properties
         public bool SupportsMultiStream => true;
@@ -143,6 +143,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
                 LocalMemoryBytes = (long)_context.LocalMemSize;
+                TheoreticalGflops = EstimateTheoreticalGflops();
 
                 // Store GPU capabilities for dynamic work group sizing
                 _maxWorkGroupSize = _context.MaxWorkGroupSize;

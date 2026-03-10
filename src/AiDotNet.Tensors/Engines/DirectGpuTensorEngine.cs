@@ -7543,6 +7543,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>Result tensor with bias added and dropout applied.</returns>
     public Tensor<T> FusedBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
     {
+        if (input.Shape.Length == 0)
+            throw new ArgumentException("Input tensor must have at least one dimension.", nameof(input));
+        if (bias.Shape.Length != 1)
+            throw new ArgumentException("Bias tensor must be 1-dimensional.", nameof(bias));
+        if (bias.Length != input.Shape[^1])
+            throw new ArgumentException($"Bias length {bias.Length} must match input's last dimension {input.Shape[^1]}.", nameof(bias));
+        if (dropoutRate < 0.0 || dropoutRate >= 1.0)
+            throw new ArgumentOutOfRangeException(nameof(dropoutRate), dropoutRate, "Dropout rate must be in [0, 1).");
+
         if (!TryGetBackend(out var backend))
         {
             // No GPU — fall back to CPU: add bias element-wise then dropout
