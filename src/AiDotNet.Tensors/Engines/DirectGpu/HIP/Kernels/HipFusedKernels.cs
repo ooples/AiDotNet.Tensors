@@ -36,6 +36,47 @@ internal static class HipFusedKernels
 #define BLOCK_DIM 16
 
 // ===========================================================================
+// COOPERATIVE TILE LOADING MACROS WITH FLOAT4 VECTORIZATION
+// float4 loads collapse 4 separate 4-byte transactions into 1 x 16-byte
+// transaction per thread, giving ~4x effective bandwidth utilization.
+// ===========================================================================
+
+// Load A tile [BM x BK] into shared memory (scalar loads, strided access)
+#define LOAD_A_TILE_SMEM(As, A, tid, bm, bk, blockDim2, blockIdxY, t, M, K) \
+    for (int _i = tid; _i < bm * bk; _i += blockDim2) { \
+        int _smRow = _i % bm; \
+        int _smCol = _i / bm; \
+        int _gRow = blockIdxY * bm + _smRow; \
+        int _gCol = t * bk + _smCol; \
+        As[_smCol][_smRow] = (_gRow < M && _gCol < K) ? A[_gRow * K + _gCol] : 0.0f; \
+    }
+
+// Load B tile [BK x BN] into shared memory using float4 vectorized loads
+// B is row-major with BN=128 consecutive columns — ideal for float4
+#define LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, bk, bn, blockDim2, blockIdxX, t, K, N) \
+    { \
+        const int _bn4 = bn / 4; \
+        for (int _i = tid; _i < bk * _bn4; _i += blockDim2) { \
+            int _smRow = _i / _bn4; \
+            int _smCol4 = _i % _bn4; \
+            int _gRow = t * bk + _smRow; \
+            int _gCol = blockIdxX * bn + _smCol4 * 4; \
+            if (_gRow < K && _gCol + 3 < N) { \
+                float4 _bv = *((const float4*)&B[_gRow * N + _gCol]); \
+                Bs[_smRow][_smCol4 * 4 + 0] = _bv.x; \
+                Bs[_smRow][_smCol4 * 4 + 1] = _bv.y; \
+                Bs[_smRow][_smCol4 * 4 + 2] = _bv.z; \
+                Bs[_smRow][_smCol4 * 4 + 3] = _bv.w; \
+            } else { \
+                Bs[_smRow][_smCol4 * 4 + 0] = (_gRow < K && _gCol < N) ? B[_gRow * N + _gCol] : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 1] = (_gRow < K && _gCol + 1 < N) ? B[_gRow * N + _gCol + 1] : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 2] = (_gRow < K && _gCol + 2 < N) ? B[_gRow * N + _gCol + 2] : 0.0f; \
+                Bs[_smRow][_smCol4 * 4 + 3] = (_gRow < K && _gCol + 3 < N) ? B[_gRow * N + _gCol + 3] : 0.0f; \
+            } \
+        } \
+    }
+
+// ===========================================================================
 // FUSED KERNELS: GEMM + BIAS + ACTIVATION
 // Single kernel for entire DenseLayer forward pass.
 // Eliminates memory round-trips between operations.
@@ -69,20 +110,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_relu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -143,20 +173,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_gelu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -221,20 +240,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_sigmoid(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -295,20 +303,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_tanh(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -369,20 +366,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -441,20 +427,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_swish(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -516,20 +491,9 @@ extern ""C"" __global__ __launch_bounds__(256) void gemm_bias_leaky_relu(
 
     int numTilesK = (K + BK - 1) / BK;
     for (int t = 0; t < numTilesK; t++) {
-        for (int i = tid; i < BM * BK; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i % BM;
-            int smCol = i / BM;
-            int gRow = blockIdx.y * BM + smRow;
-            int gCol = t * BK + smCol;
-            As[smCol][smRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
-        }
-        for (int i = tid; i < BK * BN; i += BLOCK_DIM * BLOCK_DIM) {
-            int smRow = i / BN;
-            int smCol = i % BN;
-            int gRow = t * BK + smRow;
-            int gCol = blockIdx.x * BN + smCol;
-            Bs[smRow][smCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
-        }
+        // Cooperative load with float4 vectorized loads for B tile
+        LOAD_A_TILE_SMEM(As, A, tid, BM, BK, BLOCK_DIM * BLOCK_DIM, blockIdx.y, t, M, K)
+        LOAD_B_TILE_SMEM_FLOAT4(Bs, B, tid, BK, BN, BLOCK_DIM * BLOCK_DIM, blockIdx.x, t, K, N)
         __syncthreads();
 
         #pragma unroll
@@ -816,11 +780,13 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_dropout(
     const unsigned int* __restrict__ mask,
     int rows, int cols, float dropoutProb, float scale)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = rows * cols;
-    if (idx >= size) return;
+    // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
+    // Eliminates ~20-cycle integer division from idx % cols
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= cols || row >= rows) return;
 
-    int col = idx % cols;
+    int idx = row * cols + col;
     float val = input[idx] + bias[col];
 
     // Apply dropout using pre-generated mask

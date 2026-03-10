@@ -2155,7 +2155,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
 
 // Batched General Matrix Multiply: C[b] = alpha * A[b] * B[b] + beta * C[b]
 // Uses tiled approach with shared memory for better memory access patterns
-#define BATCHED_TILE_SIZE 16
+#define BATCHED_TILE_SIZE 32
 
 extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
     const float* A, const float* B, float* C,
@@ -2178,8 +2178,8 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
     const float* Bbatch = B + batch * bStride;
     float* Cbatch = C + batch * cStride;
 
-    __shared__ float As[BATCHED_TILE_SIZE][BATCHED_TILE_SIZE];
-    __shared__ float Bs[BATCHED_TILE_SIZE][BATCHED_TILE_SIZE];
+    __shared__ float As[BATCHED_TILE_SIZE][BATCHED_TILE_SIZE + 1];
+    __shared__ float Bs[BATCHED_TILE_SIZE][BATCHED_TILE_SIZE + 1];
 
     float sum = 0.0f;
 

@@ -1071,8 +1071,8 @@ public sealed class HipBackend : IAsyncGpuBackend
             args[8] = &beta;
 
 
-            // 3D grid: (N tiles, M tiles, batches)
-            const int tileSize = 16;
+            // 3D grid: (N tiles, M tiles, batches) — must match BATCHED_TILE_SIZE in kernel
+            const int tileSize = 32;
             uint gridX = (uint)((N + tileSize - 1) / tileSize);
             uint gridY = (uint)((M + tileSize - 1) / tileSize);
             uint gridZ = (uint)batchCount;
@@ -1251,9 +1251,11 @@ public sealed class HipBackend : IAsyncGpuBackend
             args[3] = &N;
 
 
-            uint totalElements = (uint)(M * N);
-            uint grid = (totalElements + DefaultBlockSize - 1) / DefaultBlockSize;
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            // 2D grid: gridX covers columns, gridY covers rows
+            // Eliminates ~20-cycle integer division from idx % cols in the kernel
+            uint gridX = (uint)(N + DefaultBlockSize - 1) / DefaultBlockSize;
+            uint gridY = (uint)M;
+            LaunchKernel2D(krnl, gridX, gridY, DefaultBlockSize, 1, args);
             Synchronize();
             }
     }
@@ -1281,8 +1283,10 @@ public sealed class HipBackend : IAsyncGpuBackend
             args[3] = &N;
 
 
-            uint grid = (uint)((M * N + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
+            // 2D grid: gridX covers columns, gridY covers rows
+            uint gridX = (uint)(N + DefaultBlockSize - 1) / DefaultBlockSize;
+            uint gridY = (uint)M;
+            LaunchKernel2D(krnl, gridX, gridY, DefaultBlockSize, 1, args);
             Synchronize();
             }
     }

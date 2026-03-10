@@ -39,6 +39,7 @@ internal static class SparseGemmKernels
 // ===========================================================================
 
 #define TILE_SIZE 16
+#define PAD 1  // +1 padding to avoid shared memory bank conflicts
 #define SPARSE_GROUP_SIZE 4
 #define SPARSE_NONZEROS 2
 
@@ -67,7 +68,7 @@ __kernel void sparse_gemm_2_4(
     const float alpha,
     const float beta)
 {
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);
@@ -161,7 +162,7 @@ __kernel void sparse_gemm_bias_relu(
     const int N,
     const int K)
 {
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    __local float Bs[TILE_SIZE][TILE_SIZE + PAD];
 
     const int row = get_global_id(0);
     const int col = get_global_id(1);

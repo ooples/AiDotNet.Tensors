@@ -363,13 +363,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* input,
     output[idx] = sum;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* data, const float* bias, int rows, int cols)
+extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int size = rows * cols;
-    if (idx >= size) return;
-    int col = idx % cols;
-    data[idx] += bias[col];
+    // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
+    // Eliminates ~20-cycle integer division from idx % cols
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= cols || row >= rows) return;
+    data[row * cols + col] += bias[col];
 }
 
 // Trigonometric
