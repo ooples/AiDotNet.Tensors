@@ -29,11 +29,13 @@ jobs:
       run: dotnet restore
 
     - name: Build
-      run: dotnet build --configuration Release --no-restore --framework net10.0 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+      run: |
+        dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net10.0 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+        dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net10.0
 
     - name: Test with Coverage
       run: |
-        dotnet test --configuration Release --no-build --verbosity normal --framework net10.0 \
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura \
