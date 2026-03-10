@@ -15304,22 +15304,176 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
+    public unsafe Tensor<T> TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        // log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
-        // More numerically stable than log(softmax(x))
+        int rank = tensor.Rank;
+        if (axis < 0) axis = rank + axis;
+        if (axis < 0 || axis >= rank)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
-        if (axis < 0) axis = tensor.Rank + axis;
+        // Compute outer and inner sizes relative to the axis
+        int outerSize = 1, axisSize = tensor.Shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape[i];
 
-        var maxValues = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
-        var shifted = TensorSubtract(tensor, maxValues);
-        var expValues = TensorExp(shifted);
-        var sumExp = ReduceSum(expValues, new[] { axis }, keepDims: true);
-        var logSumExp = TensorLog(sumExp);
+        // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
+        if (typeof(T) == typeof(float) && innerSize == 1)
+        {
+            var inputFloats = (float[])(object)tensor.GetDataArray();
+#if NET5_0_OR_GREATER
+            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
+#else
+            var outputFloats = new float[inputFloats.Length];
+#endif
+            LogSoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
+            return (Tensor<T>)(object)new Tensor<float>(tensor.Shape, Vector<float>.FromMemory(outputFloats));
+        }
 
-        return TensorSubtract(shifted, logSumExp);
+        // Generic scalar fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var inputData = tensor.GetDataArray();
+        var outputData = new T[inputData.Length];
+
+        Parallel.For(0, outerSize * innerSize, idx =>
+        {
+            int outer = idx / innerSize;
+            int inner = idx % innerSize;
+
+            // Find max for numerical stability
+            T maxVal = numOps.MinValue;
+            for (int i = 0; i < axisSize; i++)
+            {
+                int flatIdx = (outer * axisSize + i) * innerSize + inner;
+                if (numOps.GreaterThan(inputData[flatIdx], maxVal))
+                    maxVal = inputData[flatIdx];
+            }
+
+            // Compute exp(x - max) and sum
+            T sumExp = numOps.Zero;
+            for (int i = 0; i < axisSize; i++)
+            {
+                int flatIdx = (outer * axisSize + i) * innerSize + inner;
+                T shifted = numOps.Subtract(inputData[flatIdx], maxVal);
+                sumExp = numOps.Add(sumExp, numOps.Exp(shifted));
+            }
+
+            // log_softmax = (x - max) - log(sum(exp(x - max)))
+            T logSumExp = numOps.Log(sumExp);
+            for (int i = 0; i < axisSize; i++)
+            {
+                int flatIdx = (outer * axisSize + i) * innerSize + inner;
+                T shifted = numOps.Subtract(inputData[flatIdx], maxVal);
+                outputData[flatIdx] = numOps.Subtract(shifted, logSumExp);
+            }
+        });
+
+        return new Tensor<T>(tensor.Shape, new Vector<T>(outputData));
+    }
+
+    /// <summary>
+    /// Fast SIMD log_softmax for float arrays on last axis.
+    /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
+    /// </summary>
+    private static unsafe void LogSoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    {
+        fixed (float* pIn = inputFloats)
+        fixed (float* pOut = outputFloats)
+        {
+            // Process each row: find max, compute shifted, exp+sum, then output = shifted - log(sum)
+            for (int row = 0; row < outerSize; row++)
+            {
+                float* rowIn = pIn + row * axisSize;
+                float* rowOut = pOut + row * axisSize;
+
+                // Pass 1: Find max
+                float maxVal = float.NegativeInfinity;
+                int j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+                {
+                    var vmax0 = System.Runtime.Intrinsics.Vector256.Create(float.NegativeInfinity);
+                    var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
+                    int simdLen = axisSize & ~31;
+                    for (; j < simdLen; j += 32)
+                    {
+                        vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(vmax0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j));
+                        vmax1 = System.Runtime.Intrinsics.X86.Avx.Max(vmax1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 8));
+                        vmax2 = System.Runtime.Intrinsics.X86.Avx.Max(vmax2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 16));
+                        vmax3 = System.Runtime.Intrinsics.X86.Avx.Max(vmax3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j + 24));
+                    }
+                    vmax0 = System.Runtime.Intrinsics.X86.Avx.Max(
+                        System.Runtime.Intrinsics.X86.Avx.Max(vmax0, vmax1),
+                        System.Runtime.Intrinsics.X86.Avx.Max(vmax2, vmax3));
+                    var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 1);
+                    var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vmax0, 0);
+                    var max128 = System.Runtime.Intrinsics.X86.Sse.Max(lo, hi);
+                    var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_01_00_11_10);
+                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+                    shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(max128, max128, 0b_10_11_00_01);
+                    max128 = System.Runtime.Intrinsics.X86.Sse.Max(max128, shuf);
+                    float maxTmp;
+                    System.Runtime.Intrinsics.X86.Sse.StoreScalar(&maxTmp, max128);
+                    maxVal = maxTmp;
+                }
+#endif
+                for (; j < axisSize; j++)
+                    if (rowIn[j] > maxVal) maxVal = rowIn[j];
+
+                // Pass 2: Compute shifted = x - max and store in output
+                j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+                {
+                    var vmaxBcast = System.Runtime.Intrinsics.Vector256.Create(maxVal);
+                    int simdLen = axisSize & ~7;
+                    for (; j < simdLen; j += 8)
+                    {
+                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                            System.Runtime.Intrinsics.X86.Avx.Subtract(
+                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowIn + j), vmaxBcast));
+                    }
+                }
+#endif
+                for (; j < axisSize; j++)
+                    rowOut[j] = rowIn[j] - maxVal;
+
+                // Pass 3: exp(shifted) into temp buffer, then sum
+                // We preserve shifted values in rowOut for the final output
+                // Use a stackalloc or heap temp for exp values
+                float[] expTempArr = System.Buffers.ArrayPool<float>.Shared.Rent(axisSize);
+                float sumExp;
+                fixed (float* pExpTemp = expTempArr)
+                {
+                    // Compute exp(shifted) using SIMD
+                    SimdKernels.ExpUnsafe(rowOut, pExpTemp, axisSize);
+
+                    // Sum the exp values
+                    sumExp = SimdKernels.SumUnsafe(pExpTemp, axisSize);
+                }
+                System.Buffers.ArrayPool<float>.Shared.Return(expTempArr);
+
+                // Pass 4: output = shifted - log(sumExp)
+                float logSumExp = MathF.Log(sumExp);
+                j = 0;
+#if NET5_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 8)
+                {
+                    var vLogSum = System.Runtime.Intrinsics.Vector256.Create(logSumExp);
+                    int simdLen = axisSize & ~7;
+                    for (; j < simdLen; j += 8)
+                    {
+                        System.Runtime.Intrinsics.X86.Avx.Store(rowOut + j,
+                            System.Runtime.Intrinsics.X86.Avx.Subtract(
+                                System.Runtime.Intrinsics.X86.Avx.LoadVector256(rowOut + j), vLogSum));
+                    }
+                }
+#endif
+                for (; j < axisSize; j++)
+                    rowOut[j] -= logSumExp;
+            }
+        }
     }
 
     /// <inheritdoc/>
