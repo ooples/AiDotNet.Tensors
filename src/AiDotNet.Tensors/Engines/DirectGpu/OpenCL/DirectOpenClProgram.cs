@@ -224,6 +224,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         try
                         {
                             File.WriteAllBytes(tempPath, binary);
+                            // Delete destination first for net471 compat (File.Move doesn't overwrite)
+                            try { File.Delete(cachePath); } catch { /* may not exist */ }
                             File.Move(tempPath, cachePath);
                         }
                         catch (IOException)

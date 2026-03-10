@@ -6126,6 +6126,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, epsilon);
 
             int totalSize = batch * channels * spatialSize;
+            if (totalSize <= 0) return false;
             int localSize = Math.Min(256, totalSize);
             localSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, localSize), 2)));
             localSize = Math.Max(1, localSize);

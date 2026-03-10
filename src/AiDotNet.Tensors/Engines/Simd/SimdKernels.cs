@@ -453,8 +453,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
             for (; i < length; i++)
             {
-                float ex = MathF.Exp(2f * input[i]);
-                output[i] = (ex - 1f) / (ex + 1f);
+                output[i] = MathF.Tanh(input[i]);
             }
         }
 
