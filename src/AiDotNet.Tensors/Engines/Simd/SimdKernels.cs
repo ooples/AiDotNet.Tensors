@@ -1526,7 +1526,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Fma.IsSupported && Avx.IsSupported && length >= 16)
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
             {
                 var one = Vector256.Create(1.0);
                 var negOne = Vector256.Create(-1.0);
@@ -1545,7 +1545,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i + 12, Avx.Divide(one, Avx.Add(one, FastExpDouble256(x3))));
                 }
             }
-            if (Fma.IsSupported && Avx.IsSupported && length - i >= 4)
+            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
             {
                 var one = Vector256.Create(1.0);
                 var negOne = Vector256.Create(-1.0);

@@ -194,12 +194,11 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_relu(
     __half2 zero2 = __float2half2_rn(0.0f);
     if (pairIdx + 1 < size) {
         __half2 v = *reinterpret_cast<const __half2*>(&input[pairIdx]);
-        __half2 mask = __hge2(v, zero2);
-        *reinterpret_cast<__half2*>(&output[pairIdx]) = __hmul2(v, mask);
+        *reinterpret_cast<__half2*>(&output[pairIdx]) = __hmax2(v, zero2);
     } else if (pairIdx < size) {
         __half v = *reinterpret_cast<const __half*>(&input[pairIdx]);
         __half zero = __float2half(0.0f);
-        *reinterpret_cast<__half*>(&output[pairIdx]) = __hgt(v, zero) ? v : zero;
+        *reinterpret_cast<__half*>(&output[pairIdx]) = __hmax(v, zero);
     }
 }
 

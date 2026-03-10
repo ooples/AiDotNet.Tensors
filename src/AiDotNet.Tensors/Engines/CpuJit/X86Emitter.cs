@@ -342,18 +342,24 @@ internal sealed class X86Emitter
         }
         // 0F 18 /1  (reg=1 in ModR/M)
         Emit(0x0F, 0x18);
-        if (disp == 0 && (baseReg & 7) != RBP)
+        int rm = baseReg & 7;
+        bool needSib = rm == (RSP & 7); // RSP/R12 require SIB byte
+
+        if (disp == 0 && rm != (RBP & 7))
         {
-            EmitModRM(0, 1, baseReg & 7);
+            EmitModRM(0, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
         }
         else if (disp >= -128 && disp <= 127)
         {
-            EmitModRM(1, 1, baseReg & 7);
+            EmitModRM(1, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
             Emit((byte)(disp & 0xFF));
         }
         else
         {
-            EmitModRM(2, 1, baseReg & 7);
+            EmitModRM(2, 1, needSib ? 4 : rm);
+            if (needSib) EmitSIB(0, 4, rm);
             EmitImm32(disp);
         }
     }
