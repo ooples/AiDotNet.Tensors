@@ -43,22 +43,29 @@ public static unsafe class VulkanNativeBindings
         // Remap to "libvulkan.1.dylib" so MoltenVK is found correctly.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
-                typeof(VulkanNativeBindings).Assembly,
-                (libraryName, assembly, searchPath) =>
-                {
-                    // Only remap Vulkan library names; pass through all other libraries
-                    if (libraryName == VulkanLinux)
+            try
+            {
+                System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(
+                    typeof(VulkanNativeBindings).Assembly,
+                    (libraryName, assembly, searchPath) =>
                     {
-                        if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
-                            VulkanMacOS, assembly, searchPath, out var handle))
+                        // Only remap Vulkan library names; pass through all other libraries
+                        if (libraryName == VulkanLinux)
                         {
-                            return handle;
+                            if (System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                                VulkanMacOS, assembly, searchPath, out var handle))
+                            {
+                                return handle;
+                            }
                         }
-                    }
-                    // Return IntPtr.Zero for non-Vulkan libraries so the default resolver handles them
-                    return IntPtr.Zero;
-                });
+                        // Return IntPtr.Zero for non-Vulkan libraries so the default resolver handles them
+                        return IntPtr.Zero;
+                    });
+            }
+            catch (InvalidOperationException)
+            {
+                // A resolver was already registered for this assembly — skip.
+            }
         }
     }
 #endif
