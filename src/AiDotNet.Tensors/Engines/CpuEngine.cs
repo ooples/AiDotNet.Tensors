@@ -5412,13 +5412,22 @@ public class CpuEngine : ITensorLevelEngine
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
-        // Direct array transpose avoids indexer overhead
-        for (int i = 0; i < rows; i++)
+        // Cache-blocked transpose for better locality
+        const int Block = 32;
+        for (int ii = 0; ii < rows; ii += Block)
         {
-            int srcRow = i * cols;
-            for (int j = 0; j < cols; j++)
+            int iEnd = Math.Min(ii + Block, rows);
+            for (int jj = 0; jj < cols; jj += Block)
             {
-                dstData[j * rows + i] = srcData[srcRow + j];
+                int jEnd = Math.Min(jj + Block, cols);
+                for (int i = ii; i < iEnd; i++)
+                {
+                    int srcRow = i * cols;
+                    for (int j = jj; j < jEnd; j++)
+                    {
+                        dstData[j * rows + i] = srcData[srcRow + j];
+                    }
+                }
             }
         }
 
