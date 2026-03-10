@@ -24,7 +24,7 @@ public static class HipFp16Kernels
 // Convert FP32 (float) array to FP16 (half) array
 // input: float array of size 'size'
 // output: half array of size 'size' (stored as unsigned short for compatibility)
-extern ""C"" __global__ void convert_fp32_to_fp16(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16(
     const float* input, unsigned short* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,7 +37,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16(
 // Convert FP16 (half) array to FP32 (float) array
 // input: half array of size 'size' (stored as unsigned short for compatibility)
 // output: float array of size 'size'
-extern ""C"" __global__ void convert_fp16_to_fp32(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32(
     const unsigned short* input, float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -49,7 +49,7 @@ extern ""C"" __global__ void convert_fp16_to_fp32(
 
 // Convert FP32 to FP16 with rounding mode control
 // roundMode: 0 = round to nearest even (default), 1 = round toward zero, 2 = round down, 3 = round up
-extern ""C"" __global__ void convert_fp32_to_fp16_rounding(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16_rounding(
     const float* input, unsigned short* output, int size, int roundMode)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -66,7 +66,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16_rounding(
 }
 
 // Vectorized FP32 to FP16 conversion (processes 2 elements per thread for better performance)
-extern ""C"" __global__ void convert_fp32_to_fp16_vec2(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp32_to_fp16_vec2(
     const float2* input, unsigned int* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -79,7 +79,7 @@ extern ""C"" __global__ void convert_fp32_to_fp16_vec2(
 }
 
 // Vectorized FP16 to FP32 conversion (processes 2 elements per thread for better performance)
-extern ""C"" __global__ void convert_fp16_to_fp32_vec2(
+extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32_vec2(
     const unsigned int* input, float2* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

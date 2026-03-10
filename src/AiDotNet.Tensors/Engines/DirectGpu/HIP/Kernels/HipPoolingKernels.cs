@@ -14,7 +14,7 @@ internal static class HipPoolingKernels
 #define INFINITY __builtin_huge_valf()
 #endif
 
-extern ""C"" __global__ void maxpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
     const float* input, float* output, int* indices,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
@@ -50,7 +50,7 @@ extern ""C"" __global__ void maxpool2d(
     if (saveIndices) indices[outIdx] = maxIdx;
 }
 
-extern ""C"" __global__ void maxpool2d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
     const float* gradOutput, const int* indices, float* gradInput,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
 {
@@ -70,7 +70,7 @@ extern ""C"" __global__ void maxpool2d_backward(
     atomicAdd(&gradInput[inputIdx], grad);
 }
 
-extern ""C"" __global__ void avgpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
     const float* input, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
@@ -103,7 +103,7 @@ extern ""C"" __global__ void avgpool2d(
     output[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum / (float)max(divisor, 1);
 }
 
-extern ""C"" __global__ void avgpool2d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void avgpool2d_backward(
     const float* gradOutput, float* gradInput,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
@@ -142,7 +142,7 @@ extern ""C"" __global__ void avgpool2d_backward(
     gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] = sum;
 }
 
-extern ""C"" __global__ void global_avgpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void global_avgpool2d(
     const float* input, float* output, int batch, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -161,7 +161,7 @@ extern ""C"" __global__ void global_avgpool2d(
     output[b * channels + c] = sum / (float)spatialSize;
 }
 
-extern ""C"" __global__ void global_maxpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d(
     const float* input, float* output, int* indices,
     int batch, int channels, int height, int width, int saveIndices)
 {
@@ -192,7 +192,7 @@ extern ""C"" __global__ void global_maxpool2d(
 }
 
 // Global Average Pooling 2D Backward
-extern ""C"" __global__ void global_avgpool2d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void global_avgpool2d_backward(
     const float* gradOutput, float* gradInput, int batch, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,7 +212,7 @@ extern ""C"" __global__ void global_avgpool2d_backward(
 }
 
 // Global Max Pooling 2D Backward with indices
-extern ""C"" __global__ void global_maxpool2d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void global_maxpool2d_backward(
     const float* gradOutput, const int* indices, float* gradInput,
     int batch, int channels, int height, int width)
 {
@@ -237,7 +237,7 @@ extern ""C"" __global__ void global_maxpool2d_backward(
     atomicAdd(&gradInput[inputOffset + maxIdx], grad);
 }
 
-extern ""C"" __global__ void adaptive_avgpool2d(
+extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(
     const float* input, float* output,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
 {
@@ -268,7 +268,7 @@ extern ""C"" __global__ void adaptive_avgpool2d(
 // 3D POOLING KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void maxpool3d(
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d(
     const float* input, float* output, int* indices,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -320,7 +320,7 @@ extern ""C"" __global__ void maxpool3d(
     if (saveIndices) indices[outIdx] = maxIdx;
 }
 
-extern ""C"" __global__ void maxpool3d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void maxpool3d_backward(
     const float* gradOutput, const int* indices, float* gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -353,7 +353,7 @@ extern ""C"" __global__ void maxpool3d_backward(
 }
 
 // Average Pooling 3D
-extern ""C"" __global__ void avgpool3d(
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -402,7 +402,7 @@ extern ""C"" __global__ void avgpool3d(
 }
 
 // Average Pooling 3D backward pass
-extern ""C"" __global__ void avgpool3d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void avgpool3d_backward(
     const float* gradOutput, float* gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -460,7 +460,7 @@ extern ""C"" __global__ void avgpool3d_backward(
     gradInput[inputIdx] = sum;
 }
 
-extern ""C"" __global__ void nearest_upsample3d(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d(
     const float* input, float* output,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -492,7 +492,7 @@ extern ""C"" __global__ void nearest_upsample3d(
     output[outIdx] = input[inputIdx];
 }
 
-extern ""C"" __global__ void nearest_upsample3d_backward(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_upsample3d_backward(
     const float* gradOutput, float* gradInput,
     int batch, int channels,
     int inDepth, int inHeight, int inWidth,
@@ -528,7 +528,7 @@ extern ""C"" __global__ void nearest_upsample3d_backward(
 // 2D NEAREST NEIGHBOR UPSAMPLING
 // ===========================================================================
 
-extern ""C"" __global__ void nearest_neighbor_upsample(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample(
     const float* input, float* output,
     int batchChannels, int height, int width,
     int scaleFactor, int totalOutputSize)
@@ -555,7 +555,7 @@ extern ""C"" __global__ void nearest_neighbor_upsample(
 // Nearest Neighbor Upsample 2D backward pass
 // Iterates over INPUT elements to avoid race conditions and atomic contention
 // Each thread accumulates gradients from the scaleFactor x scaleFactor output region
-extern ""C"" __global__ void nearest_neighbor_upsample_backward(
+extern ""C"" __global__ __launch_bounds__(256) void nearest_neighbor_upsample_backward(
     const float* gradOutput, float* gradInput,
     int batchChannels, int height, int width,
     int scaleFactor, int totalInputSize)

@@ -14,7 +14,7 @@ internal static class HipNormalizationKernels
 #define INFINITY __builtin_huge_valf()
 #endif
 
-extern ""C"" __global__ void batchnorm_forward(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_forward(
     const float* input, float* output,
     const float* gamma, const float* beta,
     float* runningMean, float* runningVar,
@@ -64,7 +64,7 @@ extern ""C"" __global__ void batchnorm_forward(
     }
 }
 
-extern ""C"" __global__ void batchnorm_backward(
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_backward(
     const float* gradOutput, const float* input,
     const float* gamma, const float* saveMean, const float* saveInvVar,
     float* gradInput, float* gradGamma, float* gradBeta,
@@ -110,7 +110,7 @@ extern ""C"" __global__ void batchnorm_backward(
     }
 }
 
-extern ""C"" __global__ void layernorm_forward(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_forward(
     const float* input, float* output,
     const float* gamma, const float* beta,
     float* saveMean, float* saveInvVar,
@@ -143,7 +143,7 @@ extern ""C"" __global__ void layernorm_forward(
     }
 }
 
-extern ""C"" __global__ void layernorm_backward(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_backward(
     const float* gradOutput, const float* input,
     const float* gamma, const float* saveMean, const float* saveInvVar,
     float* gradInput, float* gradGamma, float* gradBeta,
@@ -172,7 +172,7 @@ extern ""C"" __global__ void layernorm_backward(
     }
 }
 
-extern ""C"" __global__ void layernorm_grad_params(
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params(
     const float* gradOutput, const float* input,
     const float* saveMean, const float* saveInvVar,
     float* gradGamma, float* gradBeta,
@@ -195,7 +195,7 @@ extern ""C"" __global__ void layernorm_grad_params(
     gradBeta[i] = dBeta;
 }
 
-extern ""C"" __global__ void groupnorm_forward(
+extern ""C"" __global__ __launch_bounds__(256) void groupnorm_forward(
     const float* input, float* output,
     const float* gamma, const float* beta,
     float* saveMean, float* saveInvVar,
@@ -241,7 +241,7 @@ extern ""C"" __global__ void groupnorm_forward(
     }
 }
 
-extern ""C"" __global__ void instancenorm_forward(
+extern ""C"" __global__ __launch_bounds__(256) void instancenorm_forward(
     const float* input, float* output,
     const float* gamma, const float* beta,
     float* saveMean, float* saveInvVar,
@@ -280,7 +280,7 @@ extern ""C"" __global__ void instancenorm_forward(
     }
 }
 
-extern ""C"" __global__ void rmsnorm_forward(
+extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_forward(
     const float* input, float* output,
     const float* gamma, float* saveRms,
     int batchSize, int normalizedSize, float epsilon)
@@ -306,7 +306,7 @@ extern ""C"" __global__ void rmsnorm_forward(
 }
 
 // RMS Normalization backward pass
-extern ""C"" __global__ void rmsnorm_backward(
+extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_backward(
     const float* gradOutput, const float* input,
     const float* gamma, const float* saveRms,
     float* gradInput, float* gradGamma,
@@ -339,7 +339,7 @@ extern ""C"" __global__ void rmsnorm_backward(
 }
 
 // RMS Normalization gradient accumulation for gamma
-extern ""C"" __global__ void rmsnorm_grad_gamma(
+extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
     const float* gradOutput, const float* input,
     const float* saveRms, float* gradGamma,
     int batchSize, int normalizedSize)

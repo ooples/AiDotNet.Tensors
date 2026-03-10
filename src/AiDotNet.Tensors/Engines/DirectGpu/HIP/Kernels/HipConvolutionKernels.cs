@@ -14,7 +14,7 @@ internal static class HipConvolutionKernels
 #define INFINITY __builtin_huge_valf()
 #endif
 
-extern ""C"" __global__ void im2col(
+extern ""C"" __global__ __launch_bounds__(256) void im2col(
     const float* input, float* output,
     int batch, int channels, int height, int width,
     int kernelH, int kernelW, int strideH, int strideW,
@@ -48,7 +48,7 @@ extern ""C"" __global__ void im2col(
     }
 }
 
-extern ""C"" __global__ void col2im(
+extern ""C"" __global__ __launch_bounds__(256) void col2im(
     const float* input, float* output,
     int batch, int channels, int height, int width,
     int kernelH, int kernelW, int strideH, int strideW,
@@ -86,7 +86,7 @@ extern ""C"" __global__ void col2im(
     output[idx] = sum;
 }
 
-extern ""C"" __global__ void conv2d_direct(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -117,7 +117,7 @@ extern ""C"" __global__ void conv2d_direct(
     output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
 }
 
-extern ""C"" __global__ void conv2d_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_input(
     const float* gradOutput, const float* kernel, float* gradInput,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -152,7 +152,7 @@ extern ""C"" __global__ void conv2d_backward_input(
     gradInput[((b * inChannels + ic) * inHeight + ih) * inWidth + iw] = sum;
 }
 
-extern ""C"" __global__ void conv2d_backward_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
     const float* input, const float* gradOutput, float* gradKernel,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -183,7 +183,7 @@ extern ""C"" __global__ void conv2d_backward_kernel(
     gradKernel[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw] = sum;
 }
 
-extern ""C"" __global__ void depthwise_conv2d(
+extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(
     const float* input, const float* kernel, float* output,
     int batch, int channels, int inHeight, int inWidth,
     int outHeight, int outWidth, int kernelH, int kernelW,
@@ -211,7 +211,7 @@ extern ""C"" __global__ void depthwise_conv2d(
     output[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum;
 }
 
-extern ""C"" __global__ void conv_transpose2d(
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -247,7 +247,7 @@ extern ""C"" __global__ void conv_transpose2d(
 }
 
 // Transposed Conv2D backward pass for input gradients
-extern ""C"" __global__ void conv_transpose2d_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d_backward_input(
     const float* gradOutput, const float* kernel, float* gradInput,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -285,7 +285,7 @@ extern ""C"" __global__ void conv_transpose2d_backward_input(
 }
 
 // Transposed Conv2D backward pass for kernel gradients
-extern ""C"" __global__ void conv_transpose2d_backward_kernel(
+extern ""C"" __global__ __launch_bounds__(256) void conv_transpose2d_backward_kernel(
     const float* input, const float* gradOutput, float* gradKernel,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -327,7 +327,7 @@ extern ""C"" __global__ void conv_transpose2d_backward_kernel(
 // ===========================================================================
 #define TILE_OUT 16
 
-extern ""C"" __global__ void conv2d_tiled(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
     const float* input, const float* weight, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -447,7 +447,7 @@ __device__ __forceinline__ void winograd_output_transform(const float m[4][4], f
     out2x2[1][1] = tmp[1][1] - tmp[1][2] - tmp[1][3];
 }
 
-extern ""C"" __global__ void conv2d_winograd_f2x2_3x3(
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_winograd_f2x2_3x3(
     const float* input, const float* weight, float* output,
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
@@ -515,7 +515,7 @@ extern ""C"" __global__ void conv2d_winograd_f2x2_3x3(
     }
 }
 
-extern ""C"" __global__ void conv3d_direct(
+extern ""C"" __global__ __launch_bounds__(256) void conv3d_direct(
     const float* input, const float* kernel, float* output,
     int batch, int inChannels, int inDepth, int inHeight, int inWidth,
     int outChannels, int outDepth, int outHeight, int outWidth,

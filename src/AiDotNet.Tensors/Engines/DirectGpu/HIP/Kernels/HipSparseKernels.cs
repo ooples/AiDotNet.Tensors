@@ -19,7 +19,7 @@ internal static class HipSparseKernels
 // CSR SPARSE MATRIX - DENSE MATRIX MULTIPLICATION (SpMM)
 // ===========================================================================
 
-extern ""C"" __global__ void csr_spmm(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -46,7 +46,7 @@ extern ""C"" __global__ void csr_spmm(
     output[row * N + col] = sum;
 }
 
-extern ""C"" __global__ void csr_spmm_warp(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_warp(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -76,7 +76,7 @@ extern ""C"" __global__ void csr_spmm_warp(
     }
 }
 
-extern ""C"" __global__ void csr_spmm_bias(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -104,7 +104,7 @@ extern ""C"" __global__ void csr_spmm_bias(
     output[row * N + col] = sum;
 }
 
-extern ""C"" __global__ void csr_spmm_bias_relu(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_bias_relu(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -136,7 +136,7 @@ extern ""C"" __global__ void csr_spmm_bias_relu(
 // GRAPH NEURAL NETWORK MESSAGE PASSING OPERATIONS
 // ===========================================================================
 
-extern ""C"" __global__ void scatter_add_edges(
+extern ""C"" __global__ __launch_bounds__(256) void scatter_add_edges(
     const float* __restrict__ input,
     const int* __restrict__ sourceIndices,
     const int* __restrict__ targetIndices,
@@ -162,7 +162,7 @@ extern ""C"" __global__ void scatter_add_edges(
     atomicAdd(&output[tgt * features + feat], value);
 }
 
-extern ""C"" __global__ void gather_source_features(
+extern ""C"" __global__ __launch_bounds__(256) void gather_source_features(
     const float* __restrict__ input,
     const int* __restrict__ sourceIndices,
     float* __restrict__ output,
@@ -177,7 +177,7 @@ extern ""C"" __global__ void gather_source_features(
     output[edge * features + feat] = input[src * features + feat];
 }
 
-extern ""C"" __global__ void gather_target_features(
+extern ""C"" __global__ __launch_bounds__(256) void gather_target_features(
     const float* __restrict__ input,
     const int* __restrict__ targetIndices,
     float* __restrict__ output,
@@ -192,7 +192,7 @@ extern ""C"" __global__ void gather_target_features(
     output[edge * features + feat] = input[tgt * features + feat];
 }
 
-extern ""C"" __global__ void segment_sum(
+extern ""C"" __global__ __launch_bounds__(256) void segment_sum(
     const float* __restrict__ input,
     const int* __restrict__ segmentIds,
     float* __restrict__ output,
@@ -207,7 +207,7 @@ extern ""C"" __global__ void segment_sum(
     atomicAdd(&output[segment * features + feat], input[item * features + feat]);
 }
 
-extern ""C"" __global__ void segment_mean(
+extern ""C"" __global__ __launch_bounds__(256) void segment_mean(
     const float* __restrict__ input,
     const int* __restrict__ segmentIds,
     const int* __restrict__ segmentSizes,
@@ -227,7 +227,7 @@ extern ""C"" __global__ void segment_mean(
     }
 }
 
-extern ""C"" __global__ void segment_max(
+extern ""C"" __global__ __launch_bounds__(256) void segment_max(
     const float* __restrict__ input,
     const int* __restrict__ segmentIds,
     float* __restrict__ output,
@@ -255,7 +255,7 @@ extern ""C"" __global__ void segment_max(
 // SPARSE MATRIX BACKWARD OPERATIONS
 // ===========================================================================
 
-extern ""C"" __global__ void csr_spmm_backward_b(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_b(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -283,7 +283,7 @@ extern ""C"" __global__ void csr_spmm_backward_b(
     }
 }
 
-extern ""C"" __global__ void csr_spmm_backward_values(
+extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_backward_values(
     const float* __restrict__ csrColIndices_float,
     const int* __restrict__ csrColIndices,
     const int* __restrict__ csrRowPointers,
@@ -320,19 +320,19 @@ extern ""C"" __global__ void csr_spmm_backward_values(
 // SPARSE UTILITY OPERATIONS
 // ===========================================================================
 
-extern ""C"" __global__ void zero_buffer(float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void zero_buffer(float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] = 0.0f;
 }
 
-extern ""C"" __global__ void init_neg_inf(float* output, int size)
+extern ""C"" __global__ __launch_bounds__(256) void init_neg_inf(float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] = -3.402823466e+38f;
 }
 
-extern ""C"" __global__ void degree_normalize(
+extern ""C"" __global__ __launch_bounds__(256) void degree_normalize(
     const float* __restrict__ input,
     const float* __restrict__ degrees,
     float* __restrict__ output,
@@ -348,7 +348,7 @@ extern ""C"" __global__ void degree_normalize(
     output[node * features + feat] = input[node * features + feat] * normFactor;
 }
 
-extern ""C"" __global__ void symmetric_degree_normalize(
+extern ""C"" __global__ __launch_bounds__(256) void symmetric_degree_normalize(
     const float* __restrict__ edgeValues,
     const int* __restrict__ sourceIndices,
     const int* __restrict__ targetIndices,

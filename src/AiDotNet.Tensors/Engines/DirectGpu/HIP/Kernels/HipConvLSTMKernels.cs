@@ -38,7 +38,7 @@ __device__ float tanh_derivative(float tanh_output) {
 // CONVLSTM CELL FORWARD KERNEL
 // ===========================================================================
 
-extern ""C"" __global__ void convlstm_cell_forward(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_forward(
     const float* input,
     const float* prevH,
     const float* prevC,
@@ -127,7 +127,7 @@ extern ""C"" __global__ void convlstm_cell_forward(
 // CONVLSTM CELL BACKWARD KERNELS
 // ===========================================================================
 
-extern ""C"" __global__ void convlstm_cell_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_input(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,
@@ -190,7 +190,7 @@ extern ""C"" __global__ void convlstm_cell_backward_input(
     gradInput[gid] = gradSum;
 }
 
-extern ""C"" __global__ void convlstm_cell_backward_prevh(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_prevh(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,
@@ -253,7 +253,7 @@ extern ""C"" __global__ void convlstm_cell_backward_prevh(
     gradPrevH[gid] = gradSum;
 }
 
-extern ""C"" __global__ void convlstm_cell_backward_prevc(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_prevc(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateO,
@@ -278,7 +278,7 @@ extern ""C"" __global__ void convlstm_cell_backward_prevc(
     gradPrevC[gid] = dC * f;
 }
 
-extern ""C"" __global__ void convlstm_cell_backward_weights_input(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_weights_input(
     const float* input,
     const float* gradH,
     const float* gradC,
@@ -344,7 +344,7 @@ extern ""C"" __global__ void convlstm_cell_backward_weights_input(
     gradWeightsOi[gid] = gradO;
 }
 
-extern ""C"" __global__ void convlstm_cell_backward_weights_hidden(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_weights_hidden(
     const float* prevH,
     const float* gradH,
     const float* gradC,
@@ -410,7 +410,7 @@ extern ""C"" __global__ void convlstm_cell_backward_weights_hidden(
     gradWeightsOh[gid] = gradO;
 }
 
-extern ""C"" __global__ void convlstm_cell_backward_biases(
+extern ""C"" __global__ __launch_bounds__(256) void convlstm_cell_backward_biases(
     const float* gradH,
     const float* gradC,
     const float* gateF, const float* gateI, const float* gateC, const float* gateO,

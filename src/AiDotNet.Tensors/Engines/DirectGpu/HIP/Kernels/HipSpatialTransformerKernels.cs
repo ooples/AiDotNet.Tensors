@@ -53,7 +53,7 @@ __device__ inline float atomicAddFloat(float* addr, float val) {
 
 // TopK selection - each work group handles one row
 // Uses heap-based selection for efficient O(n log k) complexity
-extern ""C"" __global__ void topk(
+extern ""C"" __global__ __launch_bounds__(256) void topk(
     const float* input,
     float* values,
     int* indices,
@@ -154,7 +154,7 @@ extern ""C"" __global__ void topk(
 // Generate affine sampling grid from transformation matrices
 // theta: [batch, 2, 3] affine transformation matrices (row-major)
 // grid: [batch, outH, outW, 2] output sampling coordinates in [-1, 1]
-extern ""C"" __global__ void affine_grid(
+extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
     const float* theta,
     float* grid,
     int batch,
@@ -193,7 +193,7 @@ extern ""C"" __global__ void affine_grid(
 // output: [batch, channels, outH, outW]
 // paddingMode: 0 = zeros, 1 = border
 // alignCorners: if true, treat [-1,1] as exact corner coordinates
-extern ""C"" __global__ void grid_sample(
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
     const float* input,
     const float* grid,
     float* output,
@@ -284,7 +284,7 @@ extern ""C"" __global__ void grid_sample(
 // ===========================================================================
 
 // Backward pass for grid sampling - computes gradients for input and grid
-extern ""C"" __global__ void grid_sample_backward(
+extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
     const float* gradOutput,
     const float* input,
     const float* grid,

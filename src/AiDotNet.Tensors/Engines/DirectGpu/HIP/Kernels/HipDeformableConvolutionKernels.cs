@@ -85,7 +85,7 @@ __device__ float bilinear_sample(
 // Offsets: [batch, deformGroups * 2 * kH * kW, outH, outW]
 // Mask:    [batch, deformGroups * kH * kW, outH, outW] (optional for DCNv2)
 // Output:  [batch, outChannels, outH, outW]
-extern ""C"" __global__ void deformable_conv2d(
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d(
     const float* input,
     const float* weights,
     const float* offsets,
@@ -169,7 +169,7 @@ extern ""C"" __global__ void deformable_conv2d(
 }
 
 // Backward pass for input gradients
-extern ""C"" __global__ void deformable_conv2d_backward_input(
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_input(
     const float* gradOutput,
     const float* weights,
     const float* offsets,
@@ -272,7 +272,7 @@ extern ""C"" __global__ void deformable_conv2d_backward_input(
 }
 
 // Backward pass for weight gradients
-extern ""C"" __global__ void deformable_conv2d_backward_weights(
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_weights(
     const float* input,
     const float* gradOutput,
     const float* offsets,
@@ -350,7 +350,7 @@ extern ""C"" __global__ void deformable_conv2d_backward_weights(
 }
 
 // Backward pass for offset gradients
-extern ""C"" __global__ void deformable_conv2d_backward_offset(
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_offset(
     const float* input,
     const float* weights,
     const float* gradOutput,
@@ -467,7 +467,7 @@ extern ""C"" __global__ void deformable_conv2d_backward_offset(
 }
 
 // Backward pass for mask gradients (DCNv2 only)
-extern ""C"" __global__ void deformable_conv2d_backward_mask(
+extern ""C"" __global__ __launch_bounds__(256) void deformable_conv2d_backward_mask(
     const float* input,
     const float* weights,
     const float* gradOutput,
