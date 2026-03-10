@@ -55,16 +55,16 @@ internal static class ClBlastXgemmDirectDatabase
     {
         return new ClBlastXgemmDirectParameters
         {
-            Kwid = 1,
-            MdimAd = 8,
-            MdimCd = 8,
-            NdimBd = 8,
-            NdimCd = 8,
+            Kwid = 2,
+            MdimAd = 16,
+            MdimCd = 16,
+            NdimBd = 16,
+            NdimCd = 16,
             PadA = 1,
             PadB = 1,
-            Vwm = 1,
-            Vwn = 1,
-            Wgd = 8
+            Vwm = 2,
+            Vwn = 2,
+            Wgd = 32
         };
     }
 }
