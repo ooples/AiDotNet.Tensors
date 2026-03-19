@@ -5,19 +5,15 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
+/// Low-level tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
 /// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for correctness under concurrent access.
 /// <see cref="RentUninitialized{T}"/> returns uninitialized memory for callers that will
 /// immediately overwrite all elements (e.g., weight initialization, copy targets).
+/// Callers should prefer <see cref="TensorPool"/> which gates all paths through
+/// <see cref="TensorPool.Enabled"/> before delegating here.
 /// </summary>
 public static class TensorAllocator
 {
-    /// <summary>
-    /// Whether pooled tensor allocation is enabled. Defaults to true.
-    /// Can be disabled via AIDOTNET_DISABLE_TENSOR_POOL=1 environment variable.
-    /// </summary>
-    public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
-
     /// <summary>
     /// Threshold above which ArrayPool is used instead of standard allocation.
     /// ArrayPool avoids GC pressure for repeated large allocations (e.g., GEMM temporaries).
@@ -36,7 +32,7 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        if (!Enabled || totalSize == 0)
+        if (totalSize == 0)
         {
             return new Tensor<T>(shape);
         }
@@ -71,6 +67,13 @@ public static class TensorAllocator
     /// (e.g., weight initialization with random values, copy targets).
     /// WARNING: Contains stale/garbage data until overwritten.
     /// </summary>
+    /// <remarks>
+    /// On .NET 5+, uses <c>GC.AllocateUninitializedArray</c> or <c>ArrayPool</c> to skip zeroing.
+    /// On pre-.NET 5 targets (e.g., net471), <c>GC.AllocateUninitializedArray</c> is unavailable,
+    /// so the fallback returns zero-initialized memory via <c>new T[]</c>. This is safe (callers
+    /// overwrite all elements anyway) but does not provide the performance benefit of skipping
+    /// zero-initialization on older frameworks.
+    /// </remarks>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
         int totalSize = 1;
@@ -83,7 +86,7 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        if (Enabled && totalSize >= ArrayPoolThreshold)
+        if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             // Clear only when T holds references to avoid keeping stale objects alive
@@ -117,7 +120,7 @@ public static class TensorAllocator
                 $"Data length ({data.Length}) must match shape total ({totalSize}).",
                 nameof(data));
 
-        if (!Enabled || totalSize == 0)
+        if (totalSize == 0)
         {
             return new Tensor<T>(shape, data);
         }
@@ -164,12 +167,5 @@ public static class TensorAllocator
             ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
 #endif
         }
-    }
-
-    private static bool IsEnvTrue(string name)
-    {
-        string? val = Environment.GetEnvironmentVariable(name);
-        return string.Equals(val, "1", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(val, "true", StringComparison.OrdinalIgnoreCase);
     }
 }

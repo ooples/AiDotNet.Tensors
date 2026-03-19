@@ -1,5 +1,3 @@
-using System.Buffers;
-using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -9,9 +7,18 @@ namespace AiDotNet.Tensors.Helpers;
 /// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for safe concurrent access.
 /// <see cref="RentUninitialized{T}"/> returns uninitialized memory for callers that will
 /// immediately overwrite all elements (e.g., weight initialization, copy targets).
+/// All overloads respect <see cref="Enabled"/>; when disabled, plain non-pooled
+/// tensors are returned instead.
 /// </summary>
 public static class TensorPool
 {
+    /// <summary>
+    /// Single source of truth for whether pooled/optimized tensor allocation is enabled.
+    /// Defaults to true. Can be disabled via AIDOTNET_DISABLE_TENSOR_POOL=1 environment variable.
+    /// When disabled, all Rent overloads fall back to standard <c>new Tensor&lt;T&gt;(shape)</c>.
+    /// </summary>
+    public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
+
     /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
@@ -19,6 +26,9 @@ public static class TensorPool
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape)
     {
+        if (!Enabled)
+            return new Tensor<T>(shape);
+
         return TensorAllocator.Rent<T>(shape);
     }
 
@@ -30,6 +40,9 @@ public static class TensorPool
     /// </summary>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
+        if (!Enabled)
+            return new Tensor<T>(shape);
+
         return TensorAllocator.RentUninitialized<T>(shape);
     }
 
@@ -38,6 +51,9 @@ public static class TensorPool
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape, Vector<T> data)
     {
+        if (!Enabled)
+            return new Tensor<T>(shape, data);
+
         return TensorAllocator.Rent(shape, data);
     }
 
@@ -48,5 +64,12 @@ public static class TensorPool
     public static void Return<T>(Tensor<T>? tensor)
     {
         TensorAllocator.Return(tensor);
+    }
+
+    private static bool IsEnvTrue(string name)
+    {
+        string? val = Environment.GetEnvironmentVariable(name);
+        return string.Equals(val, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(val, "true", StringComparison.OrdinalIgnoreCase);
     }
 }
