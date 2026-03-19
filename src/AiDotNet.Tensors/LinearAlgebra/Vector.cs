@@ -1029,6 +1029,27 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a new vector of the specified size filled with random values using the specified random number generator.
+    /// </summary>
+    /// <param name="random">The random number generator to use. Pass a seeded Random for reproducible results.</param>
+    /// <param name="size">The size of the vector to create.</param>
+    /// <returns>A new vector filled with random values between 0 and 1.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This overload lets you control the random source for reproducible results.
+    /// Use <c>new Random(42)</c> to always get the same vector values.</para>
+    /// </remarks>
+    public static Vector<T> CreateRandom(Random random, int size)
+    {
+        Vector<T> vector = new(size);
+        for (int i = 0; i < size; i++)
+        {
+            vector[i] = _numOps.FromDouble(random.NextDouble());
+        }
+
+        return vector;
+    }
+
+    /// <summary>
     /// Creates a new vector of the specified size filled with random values between the specified minimum and maximum values.
     /// </summary>
     /// <param name="size">The size of the vector to create.</param>

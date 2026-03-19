@@ -500,6 +500,32 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a matrix filled with random values using the specified random number generator.
+    /// </summary>
+    /// <param name="random">The random number generator to use. Pass a seeded Random for reproducible results.</param>
+    /// <param name="rows">The number of rows.</param>
+    /// <param name="columns">The number of columns.</param>
+    /// <returns>A matrix of the specified size filled with random values between 0 and 1.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This overload lets you control the random source for reproducible results.
+    /// Use <c>new Random(42)</c> to always get the same matrix values.</para>
+    /// </remarks>
+    public static Matrix<T> CreateRandom(Random random, int rows, int columns)
+    {
+        Matrix<T> matrix = new(rows, columns);
+
+        for (int i = 0; i < rows; i++)
+        {
+            for (int j = 0; j < columns; j++)
+            {
+                matrix[i, j] = _numOps.FromDouble(random.NextDouble());
+            }
+        }
+
+        return matrix;
+    }
+
+    /// <summary>
     /// Creates a matrix filled with a specified default value.
     /// </summary>
     /// <param name="rows">The number of rows.</param>
