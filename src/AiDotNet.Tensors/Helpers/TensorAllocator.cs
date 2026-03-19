@@ -45,13 +45,18 @@ internal static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Slice to exact size (pooled array may be larger)
+            // Zero-fill the rented region — ArrayPool returns arrays with stale data
+            // from previous tenants, causing data corruption under concurrent access
+            Array.Clear(pooled, 0, totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium tensors: skip zero-initialization
-        T[] array = GC.AllocateUninitializedArray<T>(totalSize);
+        // Small-medium tensors: use zero-initialized allocation for correctness.
+        // GC.AllocateUninitializedArray skips zeroing for performance, but this
+        // causes stale-data races when tensors are allocated concurrently (e.g.,
+        // parallel test execution or multi-threaded model training).
+        T[] array = new T[totalSize];
         var mem = new Memory<T>(array);
         return Tensor<T>.FromMemory(mem, shape);
 #else
