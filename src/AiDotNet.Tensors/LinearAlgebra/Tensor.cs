@@ -488,6 +488,40 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a tensor with random values using the specified random number generator.
+    /// </summary>
+    /// <param name="random">The random number generator to use. Pass a seeded Random for reproducible results.</param>
+    /// <param name="dimensions">The dimensions of the tensor to create.</param>
+    /// <returns>A new tensor filled with random values between 0 and 1.</returns>
+    /// <exception cref="ArgumentException">Thrown when dimensions are null or empty.</exception>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This overload lets you control the random number generator used for initialization.
+    /// By passing a seeded Random (e.g., <c>new Random(42)</c>), you get reproducible results — the same seed
+    /// always produces the same tensor values. This is essential for:
+    /// - Reproducible experiments and testing
+    /// - Debugging neural network training
+    /// - Ensuring consistent model initialization across runs
+    /// </para>
+    /// </remarks>
+    public static Tensor<T> CreateRandom(Random random, params int[] dimensions)
+    {
+        if (random == null)
+            throw new ArgumentNullException(nameof(random));
+        if (dimensions == null || dimensions.Length == 0)
+            throw new ArgumentException("Dimensions cannot be null or empty.", nameof(dimensions));
+
+        var tensor = new Tensor<T>(dimensions);
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        for (int i = 0; i < tensor.Length; i++)
+        {
+            tensor._data[i] = numOps.FromDouble(random.NextDouble());
+        }
+
+        return tensor;
+    }
+
+    /// <summary>
     /// Creates a tensor filled with ones with the specified dimensions.
     /// </summary>
     /// <param name="dimensions">An array specifying the size of each dimension.</param>
