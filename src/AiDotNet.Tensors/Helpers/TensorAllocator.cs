@@ -42,9 +42,11 @@ public static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Zero-fill the rented region — ArrayPool returns arrays with stale data
-            // from previous tenants, causing data corruption under concurrent access
-            Array.Clear(pooled, 0, totalSize);
+            // Zero-fill the active region for correctness under concurrent access.
+            // When T contains references, clear the full array so stale objects in the
+            // tail [totalSize, pooled.Length) aren't kept alive via _pooledArray.
+            Array.Clear(pooled, 0,
+                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
@@ -89,9 +91,10 @@ public static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Clear only when T holds references to avoid keeping stale objects alive
+            // Clear the full array when T holds references to avoid keeping stale
+            // objects alive — including the tail [totalSize, pooled.Length)
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                Array.Clear(pooled, 0, totalSize);
+                Array.Clear(pooled, 0, pooled.Length);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
@@ -126,11 +129,15 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        ReadOnlySpan<T> src = data.AsWritableSpan();
+        ReadOnlySpan<T> src = data.AsSpan();
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             src.CopyTo(pooled.AsSpan(0, totalSize));
+            // Clear tail [totalSize, pooled.Length) when T contains references so
+            // stale objects from previous tenants aren't kept alive via _pooledArray
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > totalSize)
+                Array.Clear(pooled, totalSize, pooled.Length - totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
@@ -152,7 +159,7 @@ public static class TensorAllocator
     /// Return is undefined behavior (data corruption from reuse).
     /// Only call this for internal temporaries that immediately go out of scope.
     /// </summary>
-    public static void Return<T>(Tensor<T>? tensor)
+    internal static void Return<T>(Tensor<T>? tensor)
     {
         if (tensor == null) return;
 
