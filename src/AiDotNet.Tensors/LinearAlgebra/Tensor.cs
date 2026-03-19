@@ -505,14 +505,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> CreateRandom(Random random, params int[] dimensions)
     {
+        if (random == null)
+            throw new ArgumentNullException(nameof(random));
         if (dimensions == null || dimensions.Length == 0)
             throw new ArgumentException("Dimensions cannot be null or empty.", nameof(dimensions));
 
         var tensor = new Tensor<T>(dimensions);
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        var flattenedSize = dimensions.Aggregate(1, (a, b) => a * b);
-        for (int i = 0; i < flattenedSize; i++)
+        for (int i = 0; i < tensor.Length; i++)
         {
             tensor._data[i] = numOps.FromDouble(random.NextDouble());
         }

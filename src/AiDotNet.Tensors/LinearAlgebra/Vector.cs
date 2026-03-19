@@ -1040,6 +1040,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Vector<T> CreateRandom(Random random, int size)
     {
+        if (random == null)
+            throw new ArgumentNullException(nameof(random));
+
         Vector<T> vector = new(size);
         for (int i = 0; i < size; i++)
         {

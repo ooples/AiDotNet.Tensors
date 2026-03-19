@@ -512,6 +512,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public static Matrix<T> CreateRandom(Random random, int rows, int columns)
     {
+        if (random == null)
+            throw new ArgumentNullException(nameof(random));
+
         Matrix<T> matrix = new(rows, columns);
 
         for (int i = 0; i < rows; i++)
