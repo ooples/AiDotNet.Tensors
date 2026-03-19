@@ -65,6 +65,23 @@ internal static class TensorPool
     }
 
     /// <summary>
+    /// Creates a tensor WITHOUT zero-initialization for immediate-overwrite scenarios.
+    /// Use ONLY when caller will fully overwrite all elements before reading.
+    /// </summary>
+    public static Tensor<T> RentUninitialized<T>(int[] shape)
+    {
+        return TensorAllocator.RentUninitialized<T>(shape);
+    }
+
+    /// <summary>
+    /// Creates a tensor with data from a Vector, using pooled memory for large tensors.
+    /// </summary>
+    public static Tensor<T> Rent<T>(int[] shape, Vector<T> data)
+    {
+        return TensorAllocator.Rent(shape, data);
+    }
+
+    /// <summary>
     /// Returns a tensor's backing array to the pool if it was pooled.
     /// Call this when a tensor from Rent() is no longer needed.
     /// </summary>
