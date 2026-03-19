@@ -5,29 +5,30 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// High-performance tensor allocation helper that eliminates zero-initialization overhead.
-/// Uses GC.AllocateUninitializedArray on .NET 5+ for small-medium tensors, and
-/// ArrayPool for large tensors to reduce GC pressure from frequent allocations.
+/// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
+/// All returned tensors are zero-initialized for correctness under concurrent access.
+/// On .NET 5+, large tensors use ArrayPool (with explicit clearing), and small-medium
+/// tensors use standard <c>new T[]</c> allocation which is zero-initialized by the CLR.
 /// </summary>
 internal static class TensorAllocator
 {
     /// <summary>
-    /// Whether fast tensor allocation is enabled. Defaults to true.
+    /// Whether pooled tensor allocation is enabled. Defaults to true.
     /// Can be disabled via AIDOTNET_DISABLE_TENSOR_POOL=1 environment variable.
     /// </summary>
     public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
 
     /// <summary>
-    /// Threshold above which ArrayPool is used instead of GC.AllocateUninitializedArray.
+    /// Threshold above which ArrayPool is used instead of standard allocation.
     /// ArrayPool avoids GC pressure for repeated large allocations (e.g., GEMM temporaries).
     /// 256K elements = 1MB for float, 2MB for double.
     /// </summary>
     private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
-    /// Creates a tensor with the given shape using uninitialized or pooled memory.
-    /// The tensor's data is NOT zero-initialized for performance.
-    /// Caller MUST overwrite all elements before exposing to consumers.
+    /// Creates a zero-initialized tensor with the given shape.
+    /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
+    /// use standard CLR allocation. All paths return zeroed memory.
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape)
     {
@@ -45,13 +46,18 @@ internal static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Slice to exact size (pooled array may be larger)
+            // Zero-fill the rented region — ArrayPool returns arrays with stale data
+            // from previous tenants, causing data corruption under concurrent access
+            Array.Clear(pooled, 0, totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium tensors: skip zero-initialization
-        T[] array = GC.AllocateUninitializedArray<T>(totalSize);
+        // Small-medium tensors: use zero-initialized allocation for correctness.
+        // GC.AllocateUninitializedArray skips zeroing for performance, but this
+        // causes stale-data races when tensors are allocated concurrently (e.g.,
+        // parallel test execution or multi-threaded model training).
+        T[] array = new T[totalSize];
         var mem = new Memory<T>(array);
         return Tensor<T>.FromMemory(mem, shape);
 #else
