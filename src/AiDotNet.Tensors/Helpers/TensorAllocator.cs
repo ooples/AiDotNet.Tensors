@@ -6,11 +6,11 @@ namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
 /// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
-/// All returned tensors are zero-initialized for correctness under concurrent access.
-/// On .NET 5+, large tensors use ArrayPool (with explicit clearing), and small-medium
-/// tensors use standard <c>new T[]</c> allocation which is zero-initialized by the CLR.
+/// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for correctness under concurrent access.
+/// <see cref="RentUninitialized{T}"/> returns uninitialized memory for callers that will
+/// immediately overwrite all elements (e.g., weight initialization, copy targets).
 /// </summary>
-internal static class TensorAllocator
+public static class TensorAllocator
 {
     /// <summary>
     /// Whether pooled tensor allocation is enabled. Defaults to true.
@@ -77,16 +77,18 @@ internal static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        if (!Enabled || totalSize == 0)
+        if (totalSize == 0)
         {
             return new Tensor<T>(shape);
         }
 
 #if NET5_0_OR_GREATER
-        if (totalSize >= ArrayPoolThreshold)
+        if (Enabled && totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // NO Array.Clear — caller will overwrite all elements
+            // Clear only when T holds references to avoid keeping stale objects alive
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                Array.Clear(pooled, 0, totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
@@ -121,20 +123,18 @@ internal static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
+        ReadOnlySpan<T> src = data.AsWritableSpan();
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Copy data into pooled array
-            for (int i = 0; i < totalSize; i++)
-                pooled[i] = data[i];
+            src.CopyTo(pooled.AsSpan(0, totalSize));
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium: allocate uninitialized then copy (avoid double-write from new T[] + copy)
+        // Small-medium: allocate uninitialized then span-copy (avoid double-write from new T[] + copy)
         T[] array = GC.AllocateUninitializedArray<T>(totalSize);
-        for (int i = 0; i < totalSize; i++)
-            array[i] = data[i];
+        src.CopyTo(array);
         var mem = new Memory<T>(array);
         return Tensor<T>.FromMemory(mem, shape);
 #else
@@ -149,7 +149,7 @@ internal static class TensorAllocator
     /// Return is undefined behavior (data corruption from reuse).
     /// Only call this for internal temporaries that immediately go out of scope.
     /// </summary>
-    internal static void Return<T>(Tensor<T>? tensor)
+    public static void Return<T>(Tensor<T>? tensor)
     {
         if (tensor == null) return;
 
