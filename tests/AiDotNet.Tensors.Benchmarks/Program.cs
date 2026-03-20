@@ -210,6 +210,13 @@ class Program
             return;
         }
 
+        // Run TensorWorkspace zero-allocation benchmarks
+        if (args[0] == "--workspace")
+        {
+            BenchmarkRunner.Run<TensorWorkspaceBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
@@ -297,6 +304,7 @@ class Program
         Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");
         Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
         Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
+        Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
 #endif
     }
 }
