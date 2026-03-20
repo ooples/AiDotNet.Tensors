@@ -1,4 +1,5 @@
 #if NET8_0_OR_GREATER
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines;
 using BenchmarkDotNet.Attributes;
@@ -729,6 +730,32 @@ public class TorchSharpCpuComparisonBenchmarks
         using var result = torch.nn.functional.layer_norm(
             _torchNormInput!, new long[] { 64, 32, 32 }, _torchNormWeight, _torchNormBias, eps: 1e-5);
         ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<float> AiDotNet_GroupNorm()
+    {
+        if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
+            throw new InvalidOperationException("Setup not called");
+        return _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out _, out _);
+    }
+
+    [Benchmark]
+    public void TorchSharp_GroupNorm()
+    {
+        using var result = torch.nn.functional.group_norm(
+            _torchNormInput, 32, _torchNormWeight, _torchNormBias, eps: 1e-5);
+        if (result is not null) ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public void AiDotNet_GroupNormSwish()
+    {
+        if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
+            throw new InvalidOperationException("Setup not called");
+        var output = TensorAllocator.Rent<float>(_aiNormInput.Shape);
+        _cpuEngine.GroupNormSwishInto(output, _aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5);
+        TensorAllocator.Return(output);
     }
 
     #endregion
