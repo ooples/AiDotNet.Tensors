@@ -1704,7 +1704,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<double> FastExpDouble256(Vector256<double> x)
         {
-            // Clamp to avoid inf/nan
+            // Save original for underflow/overflow restoration
+            var origX = x;
+
+            // Clamp to avoid inf/nan in polynomial
             var clampMin = Vector256.Create(-708.3964185322641);
             var clampMax = Vector256.Create(709.7827128933840);
             x = Avx.Max(clampMin, Avx.Min(clampMax, x));
@@ -1753,7 +1756,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             pow2n = Avx2.ShiftLeftLogical(pow2n, 52);
             var scale = pow2n.AsDouble();
 
-            return Avx.Multiply(poly, scale);
+            var result = Avx.Multiply(poly, scale);
+
+            // Restore underflow/overflow to match Math.Exp semantics
+            // exp(x < -745) = 0, exp(x > 709.78) = +inf, exp(NaN) = NaN
+            var underflowMask = Avx.Compare(origX, Vector256.Create(-745.1332191019412), FloatComparisonMode.OrderedLessThanSignaling);
+            var overflowMask = Avx.Compare(origX, clampMax, FloatComparisonMode.OrderedGreaterThanSignaling);
+            var nanMask = Avx.Compare(origX, origX, FloatComparisonMode.UnorderedNotEqualSignaling);
+            result = Avx.BlendVariable(result, Vector256<double>.Zero, underflowMask);
+            result = Avx.BlendVariable(result, Vector256.Create(double.PositiveInfinity), overflowMask);
+            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), nanMask);
+
+            return result;
         }
 
         /// <summary>
@@ -1765,6 +1779,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<double> FastLogDouble256(Vector256<double> x)
         {
+            // Special-case masks: preserve Math.Log semantics for edge cases
+            var zeroMask = Avx.Compare(x, Vector256<double>.Zero, FloatComparisonMode.OrderedEqualSignaling);
+            var negativeMask = Avx.Compare(x, Vector256<double>.Zero, FloatComparisonMode.OrderedLessThanSignaling);
+            var infMask = Avx.Compare(x, Vector256.Create(double.PositiveInfinity), FloatComparisonMode.OrderedEqualSignaling);
+            // NaN: x != x
+            var nanMask = Avx.Compare(x, x, FloatComparisonMode.UnorderedNotEqualSignaling);
+
+            // Clamp to positive for the polynomial (will restore special values at end)
+            x = Avx.Max(x, Vector256.Create(double.Epsilon));
+
             // Extract exponent and mantissa via integer bit manipulation
             var xi = x.AsInt64();
             // Exponent: shift right 52, subtract bias 1023
@@ -1835,7 +1859,15 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             // log(x) = e * ln2 + log(m)
             var ln2 = Vector256.Create(0.693147180559945309417);
-            return Fma.MultiplyAdd(e, ln2, logm);
+            var result = Fma.MultiplyAdd(e, ln2, logm);
+
+            // Restore special values: log(0) = -inf, log(negative) = NaN, log(+inf) = +inf, log(NaN) = NaN
+            result = Avx.BlendVariable(result, Vector256.Create(double.NegativeInfinity), zeroMask);
+            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), negativeMask);
+            result = Avx.BlendVariable(result, Vector256.Create(double.PositiveInfinity), infMask);
+            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), nanMask);
+
+            return result;
         }
 
         /// <summary>
@@ -1846,6 +1878,19 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<double> FastSinDouble256(Vector256<double> x)
         {
+            // Guard: fall back to scalar Math.Sin for |x| > 1e9 to avoid int32 overflow
+            // in quadrant computation (j = round(|x| * 2/pi) must fit in int32)
+            var safeLimit = Vector256.Create(1e9);
+            var absX = Avx.And(x, Vector256.Create(0x7FFFFFFFFFFFFFFFL).AsDouble());
+            var unsafeMask = Avx.Compare(absX, safeLimit, FloatComparisonMode.OrderedGreaterThanSignaling);
+            if (Avx.MoveMask(unsafeMask) != 0)
+            {
+                // At least one element is too large — compute all via scalar
+                return Vector256.Create(
+                    Math.Sin(x.GetElement(0)), Math.Sin(x.GetElement(1)),
+                    Math.Sin(x.GetElement(2)), Math.Sin(x.GetElement(3)));
+            }
+
             // Range reduction: j = round(x / (pi/2))
             var twoOverPi = Vector256.Create(0.6366197723675814);
             var piOver2Hi = Vector256.Create(1.5707963267341256);    // pi/2 high part
@@ -1853,7 +1898,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             // Sign extraction
             var signBit = Avx2.And(x.AsInt64(), Vector256.Create(unchecked((long)0x8000000000000000L)));
-            x = Avx.And(x, Vector256.Create(0x7FFFFFFFFFFFFFFFL).AsDouble()); // abs(x)
+            x = absX;
 
             // j = round(x * 2/pi)
             var j = Avx.RoundToNearestInteger(Avx.Multiply(x, twoOverPi));
@@ -2025,13 +2070,25 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<float> FastSin256(Vector256<float> x)
         {
+            // Guard: fall back to scalar for |x| > 1e6 to avoid int32 overflow in quadrant
+            var absX = Avx.And(x, Vector256.Create(0x7FFFFFFF).AsSingle());
+            var unsafeMask = Avx.Compare(absX, Vector256.Create(1e6f), FloatComparisonMode.OrderedGreaterThanSignaling);
+            if (Avx.MoveMask(unsafeMask) != 0)
+            {
+                return Vector256.Create(
+                    MathF.Sin(x.GetElement(0)), MathF.Sin(x.GetElement(1)),
+                    MathF.Sin(x.GetElement(2)), MathF.Sin(x.GetElement(3)),
+                    MathF.Sin(x.GetElement(4)), MathF.Sin(x.GetElement(5)),
+                    MathF.Sin(x.GetElement(6)), MathF.Sin(x.GetElement(7)));
+            }
+
             var twoOverPi = Vector256.Create(0.6366197723675814f);
             var piOver2Hi = Vector256.Create(1.5707963267341256f);
             var piOver2Lo = Vector256.Create(6.077100506303966e-11f);
 
             // Extract sign and work with abs(x)
             var signBit = Avx2.And(x.AsInt32(), Vector256.Create(unchecked((int)0x80000000)));
-            x = Avx.And(x, Vector256.Create(0x7FFFFFFF).AsSingle()); // abs(x)
+            x = absX;
 
             // j = round(x * 2/pi)
             var j = Avx.RoundToNearestInteger(Avx.Multiply(x, twoOverPi));
@@ -3406,13 +3463,23 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // pow(x, y) = exp(y * log(x))
+            // pow(x, y) = exp(y * log(x)) — only valid for positive bases
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var logBase = FastLog256(ReadVector256(baseValues, i));
+                    var bases = ReadVector256(baseValues, i);
+                    // Check if all bases are positive — fall back to scalar if any are <= 0
+                    var nonPositive = Avx.Compare(bases, Vector256<float>.Zero, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    if (Avx.MoveMask(nonPositive) != 0)
+                    {
+                        // Scalar fallback for this chunk
+                        for (int k = i; k < i + 8; k++)
+                            output[k] = MathF.Pow(baseValues[k], exponents[k]);
+                        continue;
+                    }
+                    var logBase = FastLog256(bases);
                     var yLogX = Avx.Multiply(ReadVector256(exponents, i), logBase);
                     WriteVector256(output, i, FastExp256(yLogX));
                 }
@@ -3440,14 +3507,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // pow(x, y) = exp(y * log(x))
+            // pow(x, y) = exp(y * log(x)) — only valid for positive bases
             if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var vExp = Vector256.Create(exponent);
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    var logBase = FastLog256(ReadVector256(baseValues, i));
+                    var bases = ReadVector256(baseValues, i);
+                    var nonPositive = Avx.Compare(bases, Vector256<float>.Zero, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    if (Avx.MoveMask(nonPositive) != 0)
+                    {
+                        for (int k = i; k < i + 8; k++)
+                            output[k] = MathF.Pow(baseValues[k], exponent);
+                        continue;
+                    }
+                    var logBase = FastLog256(bases);
                     WriteVector256(output, i, FastExp256(Avx.Multiply(vExp, logBase)));
                 }
             }
@@ -3503,14 +3578,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // pow(x, y) = exp(y * log(x))
+            // pow(x, y) = exp(y * log(x)) — only valid for positive bases
             if (Avx2.IsSupported && Fma.IsSupported && length >= 4)
             {
                 var vExp = Vector256.Create(exponent);
                 int simdLength = i + ((length - i) & ~3);
                 for (; i < simdLength; i += 4)
                 {
-                    var logVal = FastLogDouble256(ReadVector256Double(baseValues, i));
+                    var bases = ReadVector256Double(baseValues, i);
+                    var nonPositive = Avx.Compare(bases, Vector256<double>.Zero, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    if (Avx.MoveMask(nonPositive) != 0)
+                    {
+                        for (int k = i; k < i + 4; k++)
+                            output[k] = Math.Pow(baseValues[k], exponent);
+                        continue;
+                    }
+                    var logVal = FastLogDouble256(bases);
                     WriteVector256Double(output, i, FastExpDouble256(Avx.Multiply(vExp, logVal)));
                 }
             }
