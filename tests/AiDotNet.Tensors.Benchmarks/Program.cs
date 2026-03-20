@@ -224,6 +224,13 @@ class Program
             return;
         }
 
+        // Run UNet-scale model benchmarks
+        if (args[0] == "--unet")
+        {
+            BenchmarkRunner.Run<UNetForwardBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
