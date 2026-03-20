@@ -1226,6 +1226,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMultiplyScalar(tensor, scalar);
     }
 
+    // In-place operations: GPU engines fall back to CpuEngine base implementations.
+    // GPU backends can override these with kernel-level in-place ops for zero-copy performance.
+    void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorAddInPlace(a, b);
+    void IEngine.TensorAddInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b) => base.TensorAddInto(dest, a, b);
+    void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorMultiplyInPlace(a, b);
+    void IEngine.TensorMultiplyInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b) => base.TensorMultiplyInto(dest, a, b);
+    void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorBroadcastAddInPlace(a, b);
+    void IEngine.SigmoidInPlace<T>(Tensor<T> tensor) => base.SigmoidInPlace(tensor);
+    void IEngine.SigmoidInto<T>(Tensor<T> dest, Tensor<T> input) => base.SigmoidInto(dest, input);
+    void IEngine.ReLUInPlace<T>(Tensor<T> tensor) => base.ReLUInPlace(tensor);
+    void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input) => base.ReLUInto(dest, input);
+    void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation) => base.Conv2DInto(output, input, kernel, stride, padding, dilation);
+    void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance) => base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+
     Tensor<T> IEngine.TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         var scalarValue = ToFloatScalar(scalar);
