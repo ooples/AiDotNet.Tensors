@@ -46,6 +46,7 @@ public sealed class TensorWorkspace<T> : IDisposable
     private readonly List<int[]> _shapes = new();
     private readonly List<int> _offsets = new();
     private T[]? _buffer;
+    private bool _isPooled;
     private bool _isAllocated;
     private bool _disposed;
 
@@ -71,10 +72,20 @@ public sealed class TensorWorkspace<T> : IDisposable
     /// <param name="shape">The shape of the tensor to reserve space for.</param>
     /// <returns>The slot ID to use with <see cref="Get"/>.</returns>
     /// <exception cref="InvalidOperationException">If workspace is already allocated.</exception>
+    /// <exception cref="ArgumentException">If shape is null, empty, or contains non-positive dimensions.</exception>
     public int Register(int[] shape)
     {
+        ThrowIfDisposed();
+
         if (_isAllocated)
             throw new InvalidOperationException("Cannot register new shapes after allocation. Call Reset() first.");
+        if (shape == null || shape.Length == 0)
+            throw new ArgumentException("Shape cannot be null or empty.", nameof(shape));
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] <= 0)
+                throw new ArgumentException($"All dimensions must be positive. Dimension {i} was {shape[i]}.", nameof(shape));
+        }
 
         int id = _shapes.Count;
         _shapes.Add((int[])shape.Clone());
@@ -84,9 +95,11 @@ public sealed class TensorWorkspace<T> : IDisposable
     /// <summary>
     /// Allocates the workspace buffer. Call after all shapes are registered.
     /// Uses a single contiguous allocation for all tensor slots.
+    /// Respects <see cref="TensorPool.Enabled"/>; when disabled, uses standard allocation.
     /// </summary>
     public void Allocate()
     {
+        ThrowIfDisposed();
         if (_isAllocated) return;
 
         // Compute offsets and total size
@@ -95,26 +108,37 @@ public sealed class TensorWorkspace<T> : IDisposable
         for (int i = 0; i < _shapes.Count; i++)
         {
             _offsets.Add(offset);
-            int slotSize = 1;
-            foreach (int dim in _shapes[i])
-                slotSize = checked(slotSize * dim);
-            offset = checked(offset + slotSize);
+            offset = checked(offset + ComputeSlotLength(i));
         }
 
         TotalElements = offset;
 
+        // Return any previous pooled buffer before allocating a new one
+        ReturnBufferToPool();
+
         // Single allocation — no fragmentation, no GC pressure during forward passes
 #if NET5_0_OR_GREATER
-        if (TotalElements >= TensorAllocator.ArrayPoolThresholdValue)
+        if (TensorPool.Enabled && TotalElements >= TensorAllocator.ArrayPoolThresholdValue)
         {
             _buffer = ArrayPool<T>.Shared.Rent(TotalElements);
+            _isPooled = true;
+            // Clear when T contains references to avoid retaining stale objects
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                Array.Clear(_buffer, 0, _buffer.Length);
+        }
+        else if (TensorPool.Enabled)
+        {
+            _buffer = GC.AllocateUninitializedArray<T>(TotalElements);
+            _isPooled = false;
         }
         else
         {
-            _buffer = GC.AllocateUninitializedArray<T>(TotalElements);
+            _buffer = new T[TotalElements];
+            _isPooled = false;
         }
 #else
         _buffer = new T[TotalElements];
+        _isPooled = false;
 #endif
         _isAllocated = true;
     }
@@ -128,19 +152,16 @@ public sealed class TensorWorkspace<T> : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Get(int slotId)
     {
-        if (!_isAllocated)
+        ThrowIfDisposed();
+        if (!_isAllocated || _buffer is null)
             throw new InvalidOperationException("Workspace not allocated. Call Allocate() first.");
-        if (_buffer is null)
-            throw new ObjectDisposedException(nameof(TensorWorkspace<T>));
+        ValidateSlotId(slotId);
 
         int offset = _offsets[slotId];
-        int[] shape = _shapes[slotId];
-        int length = 1;
-        foreach (int dim in shape)
-            length *= dim;
+        int length = ComputeSlotLength(slotId);
 
         var memory = new Memory<T>(_buffer, offset, length);
-        return Tensor<T>.FromMemory(memory, shape);
+        return Tensor<T>.FromMemory(memory, _shapes[slotId]);
     }
 
     /// <summary>
@@ -150,11 +171,13 @@ public sealed class TensorWorkspace<T> : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Span<T> GetSpan(int slotId)
     {
+        ThrowIfDisposed();
         if (!_isAllocated || _buffer is null)
-            throw new InvalidOperationException("Workspace not allocated.");
+            throw new InvalidOperationException("Workspace not allocated. Call Allocate() first.");
+        ValidateSlotId(slotId);
 
         int offset = _offsets[slotId];
-        int length = GetSlotLength(slotId);
+        int length = ComputeSlotLength(slotId);
         return _buffer.AsSpan(offset, length);
     }
 
@@ -164,29 +187,33 @@ public sealed class TensorWorkspace<T> : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Memory<T> GetMemory(int slotId)
     {
+        ThrowIfDisposed();
         if (!_isAllocated || _buffer is null)
-            throw new InvalidOperationException("Workspace not allocated.");
+            throw new InvalidOperationException("Workspace not allocated. Call Allocate() first.");
+        ValidateSlotId(slotId);
 
         int offset = _offsets[slotId];
-        int length = GetSlotLength(slotId);
+        int length = ComputeSlotLength(slotId);
         return new Memory<T>(_buffer, offset, length);
     }
 
     /// <summary>
-    /// Gets the shape registered for a slot.
+    /// Gets a copy of the shape registered for a slot.
     /// </summary>
-    public int[] GetShape(int slotId) => _shapes[slotId];
+    public int[] GetShape(int slotId)
+    {
+        ValidateSlotId(slotId);
+        return (int[])_shapes[slotId].Clone();
+    }
 
     /// <summary>
-    /// Gets the element count for a slot.
+    /// Gets the element count for a slot using checked arithmetic.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int GetSlotLength(int slotId)
     {
-        int length = 1;
-        foreach (int dim in _shapes[slotId])
-            length *= dim;
-        return length;
+        ValidateSlotId(slotId);
+        return ComputeSlotLength(slotId);
     }
 
     /// <summary>
@@ -196,20 +223,23 @@ public sealed class TensorWorkspace<T> : IDisposable
     /// </summary>
     public void Clear()
     {
+        ThrowIfDisposed();
         if (_buffer is not null)
             Array.Clear(_buffer, 0, TotalElements);
     }
 
     /// <summary>
     /// Resets the workspace so new shapes can be registered.
-    /// Does not free the buffer — call <see cref="Dispose"/> for that.
+    /// Returns the buffer to the pool if it was pooled.
     /// </summary>
     public void Reset()
     {
+        ThrowIfDisposed();
         _shapes.Clear();
         _offsets.Clear();
         _isAllocated = false;
-        // Keep the buffer for potential reuse
+        ReturnBufferToPool();
+        _buffer = null;
     }
 
     /// <summary>
@@ -220,16 +250,43 @@ public sealed class TensorWorkspace<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        if (_buffer is not null)
-        {
+        ReturnBufferToPool();
+        _buffer = null;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int ComputeSlotLength(int slotId)
+    {
+        int length = 1;
+        foreach (int dim in _shapes[slotId])
+            length = checked(length * dim);
+        return length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ValidateSlotId(int slotId)
+    {
+        if (slotId < 0 || slotId >= _shapes.Count)
+            throw new ArgumentOutOfRangeException(nameof(slotId),
+                $"Slot ID {slotId} is out of range. Valid range: 0 to {_shapes.Count - 1}.");
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(TensorWorkspace<T>));
+    }
+
+    private void ReturnBufferToPool()
+    {
 #if NET5_0_OR_GREATER
-            if (_buffer.Length >= TensorAllocator.ArrayPoolThresholdValue)
-            {
-                ArrayPool<T>.Shared.Return(_buffer,
-                    clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
-            }
-#endif
-            _buffer = null;
+        if (_buffer is not null && _isPooled)
+        {
+            ArrayPool<T>.Shared.Return(_buffer,
+                clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+            _isPooled = false;
         }
+#endif
     }
 }

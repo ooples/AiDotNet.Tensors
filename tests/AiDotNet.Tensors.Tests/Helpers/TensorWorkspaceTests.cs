@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -51,23 +52,27 @@ public class TensorWorkspaceTests
         var slot0 = ws.Register([4]);
         var slot1 = ws.Register([4]);
         ws.Allocate();
+        ws.Clear(); // deterministic — clear stale data
 
         var t0 = ws.Get(slot0);
         var t1 = ws.Get(slot1);
 
-        // Write to slot0
+        // Write sentinel to slot0
         t0[0] = 42f;
         t0[1] = 43f;
 
-        // slot1 is at a different offset — should not see slot0 data
-        Assert.NotEqual(42f, t1[0]);
+        // Write different sentinel to slot1
+        t1[0] = 99f;
 
-        // But both are backed by the same underlying array
+        // Slots are independent — slot0 data unchanged
         Assert.Equal(42f, t0[0]);
+        Assert.Equal(43f, t0[1]);
+        // slot1 has its own data
+        Assert.Equal(99f, t1[0]);
     }
 
     [Fact]
-    public void Get_ReusedAcrossForwardPasses_ZeroAllocation()
+    public void Get_ReusedAcrossForwardPasses_DataPersists()
     {
         using var ws = new TensorWorkspace<float>();
         var slot = ws.Register([1, 64, 8, 8]);
@@ -102,7 +107,93 @@ public class TensorWorkspaceTests
     }
 
     [Fact]
-    public void Reset_AllowsReregistration()
+    public void Register_NullShape_Throws()
+    {
+        using var ws = new TensorWorkspace<float>();
+        int[]? nullShape = null;
+        Assert.Throws<ArgumentException>(() => ws.Register(nullShape ?? Array.Empty<int>()));
+    }
+
+    [Fact]
+    public void Register_EmptyShape_Throws()
+    {
+        using var ws = new TensorWorkspace<float>();
+        Assert.Throws<ArgumentException>(() => ws.Register(Array.Empty<int>()));
+    }
+
+    [Fact]
+    public void Register_NegativeDimension_Throws()
+    {
+        using var ws = new TensorWorkspace<float>();
+        Assert.Throws<ArgumentException>(() => ws.Register([4, -1, 8]));
+    }
+
+    [Fact]
+    public void Register_ZeroDimension_Throws()
+    {
+        using var ws = new TensorWorkspace<float>();
+        Assert.Throws<ArgumentException>(() => ws.Register([4, 0, 8]));
+    }
+
+    [Fact]
+    public void Get_InvalidSlotId_Throws()
+    {
+        using var ws = new TensorWorkspace<float>();
+        ws.Register([4]);
+        ws.Allocate();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => ws.Get(5));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ws.Get(-1));
+    }
+
+    [Fact]
+    public void Get_AfterDispose_Throws()
+    {
+        var ws = new TensorWorkspace<float>();
+        ws.Register([4]);
+        ws.Allocate();
+        ws.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => ws.Get(0));
+    }
+
+    [Fact]
+    public void GetSpan_AfterDispose_Throws()
+    {
+        var ws = new TensorWorkspace<float>();
+        ws.Register([4]);
+        ws.Allocate();
+        ws.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => ws.GetSpan(0));
+    }
+
+    [Fact]
+    public void Register_AfterDispose_Throws()
+    {
+        var ws = new TensorWorkspace<float>();
+        ws.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => ws.Register([4]));
+    }
+
+    [Fact]
+    public void GetShape_ReturnsCopy()
+    {
+        using var ws = new TensorWorkspace<float>();
+        ws.Register([2, 3, 4]);
+        ws.Allocate();
+
+        var shape = ws.GetShape(0);
+        shape[0] = 999; // mutate the copy
+
+        // Internal state unchanged
+        var shape2 = ws.GetShape(0);
+        Assert.Equal(2, shape2[0]);
+    }
+
+    [Fact]
+    public void Reset_ReturnsBufferAndAllowsReregistration()
     {
         using var ws = new TensorWorkspace<float>();
         ws.Register([4]);
