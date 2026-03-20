@@ -4153,42 +4153,43 @@ public class CpuEngine : ITensorLevelEngine
     {
         int colH = inChannels * kernelHeight * kernelWidth;
         int colW = outputHeight * outputWidth;
-        int bufferSize = batch * colH * colW;
+        // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
+        int sliceSize = colH * colW;
 
         var inputSpan = input.Data.Span;
         var kernelSpan = kernel.Data.Span;
         var outputSpan = result.Data.Span;
+        int inputSliceSize = inChannels * height * width;
 
 #if !NET471
         // Use native memory for im2col buffer to reduce GC pressure
-        using var im2colBuffer = new NativeBuffer<float>(bufferSize);
+        using var im2colBuffer = new NativeBuffer<float>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
 #else
         // Fallback to ArrayPool for .NET Framework
         var pool = System.Buffers.ArrayPool<float>.Shared;
-        float[] im2colArray = pool.Rent(bufferSize);
+        float[] im2colArray = pool.Rent(sliceSize);
         try
         {
-        var im2colSpan = im2colArray.AsSpan(0, bufferSize);
+        var im2colSpan = im2colArray.AsSpan(0, sliceSize);
 #endif
 
-        // Step 1: im2col transformation
-        Helpers.Im2ColHelper.Im2Col(
-            inputSpan, im2colSpan,
-            batch, inChannels, height, width,
-            kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
-
-        // Step 2: GEMM for each batch
         for (int b = 0; b < batch; b++)
         {
-            int im2colOffset = b * colH * colW;
+            // Step 1: im2col for this batch slice only
+            Helpers.Im2ColHelper.Im2Col(
+                inputSpan.Slice(b * inputSliceSize, inputSliceSize), im2colSpan,
+                1, inChannels, height, width,
+                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
+
+            // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
 
             bool usedBlas = Helpers.BlasProvider.TryGemm(
                 outChannels, colW, colH,
                 kernelSpan.Slice(0, outChannels * colH),
                 colH,
-                im2colSpan.Slice(im2colOffset, colH * colW),
+                im2colSpan.Slice(0, sliceSize),
                 colW,
                 outputSpan.Slice(outputOffset, outChannels * colW),
                 colW);
@@ -4197,7 +4198,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 MultiplyMatrixBlockedFloat(
                     kernelSpan,
-                    im2colSpan.Slice(im2colOffset, colH * colW),
+                    im2colSpan.Slice(0, sliceSize),
                     outputSpan.Slice(outputOffset, outChannels * colW),
                     outChannels, colH, colW);
             }
@@ -4225,40 +4226,41 @@ public class CpuEngine : ITensorLevelEngine
     {
         int colH = inChannels * kernelHeight * kernelWidth;
         int colW = outputHeight * outputWidth;
-        int bufferSize = batch * colH * colW;
+        // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
+        int sliceSize = colH * colW;
 
         var inputSpan = input.Data.Span;
         var kernelSpan = kernel.Data.Span;
         var outputSpan = result.Data.Span;
+        int inputSliceSize = inChannels * height * width;
 
 #if !NET471
-        using var im2colBuffer = new NativeBuffer<double>(bufferSize);
+        using var im2colBuffer = new NativeBuffer<double>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
 #else
         var pool = System.Buffers.ArrayPool<double>.Shared;
-        double[] im2colArray = pool.Rent(bufferSize);
+        double[] im2colArray = pool.Rent(sliceSize);
         try
         {
-        var im2colSpan = im2colArray.AsSpan(0, bufferSize);
+        var im2colSpan = im2colArray.AsSpan(0, sliceSize);
 #endif
 
-        // Step 1: im2col transformation (double precision)
-        Helpers.Im2ColHelper.Im2Col(
-            inputSpan, im2colSpan,
-            batch, inChannels, height, width,
-            kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
-
-        // Step 2: GEMM for each batch
         for (int b = 0; b < batch; b++)
         {
-            int im2colOffset = b * colH * colW;
+            // Step 1: im2col for this batch slice only
+            Helpers.Im2ColHelper.Im2Col(
+                inputSpan.Slice(b * inputSliceSize, inputSliceSize), im2colSpan,
+                1, inChannels, height, width,
+                kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation);
+
+            // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
 
             bool usedBlas = Helpers.BlasProvider.TryGemm(
                 outChannels, colW, colH,
                 kernelSpan.Slice(0, outChannels * colH),
                 colH,
-                im2colSpan.Slice(im2colOffset, colH * colW),
+                im2colSpan.Slice(0, sliceSize),
                 colW,
                 outputSpan.Slice(outputOffset, outChannels * colW),
                 colW);
@@ -4267,7 +4269,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
                     kernelSpan.Slice(0, outChannels * colH),
-                    im2colSpan.Slice(im2colOffset, colH * colW),
+                    im2colSpan.Slice(0, sliceSize),
                     outputSpan.Slice(outputOffset, outChannels * colW),
                     outChannels, colH, colW);
             }

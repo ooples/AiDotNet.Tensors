@@ -495,6 +495,48 @@ public class TensorLevelOpsTests
         }
     }
 
+    [Fact]
+    public void TensorConv2D_Double_MatchesNaive()
+    {
+        var engine = new CpuEngine();
+        // [1, 1, 4, 4] input, [1, 1, 3, 3] kernel — same as float test
+        var input = new Tensor<double>(new[] { 1, 1, 4, 4 });
+        for (int i = 0; i < 16; i++)
+            input.AsWritableSpan()[i] = 1.0;
+
+        var kernel = new Tensor<double>(new[] { 1, 1, 3, 3 });
+        for (int i = 0; i < 9; i++)
+            kernel.AsWritableSpan()[i] = 1.0;
+
+        var result = engine.TensorConv2D(input, kernel, stride: 1, padding: 0);
+
+        Assert.Equal(new[] { 1, 1, 2, 2 }, result.Shape);
+        for (int i = 0; i < result.Length; i++)
+            Assert.Equal(9.0, result.AsSpan()[i], 1e-10);
+    }
+
+    [Fact]
+    public void TensorConv2D_Double_WithPaddingAndStride()
+    {
+        var engine = new CpuEngine();
+        // [2, 1, 5, 5] input with batch=2, [1, 1, 3, 3] kernel, stride=2, padding=1
+        var input = new Tensor<double>(new[] { 2, 1, 5, 5 });
+        for (int i = 0; i < input.Length; i++)
+            input.AsWritableSpan()[i] = (i % 5) + 1.0;
+
+        var kernel = new Tensor<double>(new[] { 1, 1, 3, 3 });
+        for (int i = 0; i < 9; i++)
+            kernel.AsWritableSpan()[i] = 0.5;
+
+        var result = engine.TensorConv2D(input, kernel, stride: 2, padding: 1);
+
+        // output shape: [2, 1, 3, 3]
+        Assert.Equal(new[] { 2, 1, 3, 3 }, result.Shape);
+        // Both batches should produce identical results
+        for (int i = 0; i < 9; i++)
+            Assert.Equal(result.AsSpan()[i], result.AsSpan()[9 + i], 1e-10);
+    }
+
     #endregion
 
     #region API Consistency

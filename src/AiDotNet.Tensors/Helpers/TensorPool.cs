@@ -5,8 +5,9 @@ namespace AiDotNet.Tensors.Helpers;
 /// <summary>
 /// Public facade for tensor pooling that delegates to <see cref="TensorAllocator"/>.
 /// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for safe concurrent access.
-/// <see cref="RentUninitialized{T}"/> returns uninitialized memory for callers that will
-/// immediately overwrite all elements (e.g., weight initialization, copy targets).
+/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ when
+/// <see cref="Enabled"/> is true; on older targets or when disabled, the returned
+/// memory may be zero-initialized (callers must not rely on uninitialized content).
 /// All overloads respect <see cref="Enabled"/>; when disabled, plain non-pooled
 /// tensors are returned instead.
 /// </summary>
@@ -33,10 +34,11 @@ public static class TensorPool
     }
 
     /// <summary>
-    /// Creates a tensor WITHOUT zero-initialization for immediate-overwrite scenarios.
-    /// Use ONLY when caller will fully overwrite all elements before reading.
-    /// WARNING: Contains stale/garbage data until overwritten (except for reference-containing
-    /// types, which are always cleared to prevent keeping stale objects alive).
+    /// Creates a tensor for immediate-overwrite scenarios, skipping zero-initialization
+    /// where possible. On .NET 5+ with pooling enabled, memory is truly uninitialized
+    /// (except for reference-containing types which are always cleared). When pooling is
+    /// disabled or on older targets, the returned memory may be zero-initialized.
+    /// Callers MUST overwrite all elements before reading regardless of initialization state.
     /// </summary>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
