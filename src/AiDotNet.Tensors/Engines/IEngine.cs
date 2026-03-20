@@ -2668,6 +2668,19 @@ public interface IEngine
     Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation);
 
     /// <summary>
+    /// Performs 2D convolution into a pre-allocated output tensor (zero-allocation forward pass).
+    /// The output tensor must have correct shape [batch, out_channels, output_height, output_width].
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="output">Pre-allocated output tensor with correct shape.</param>
+    /// <param name="input">The input tensor [batch, in_channels, height, width].</param>
+    /// <param name="kernel">The convolution kernel [out_channels, in_channels, kernel_height, kernel_width].</param>
+    /// <param name="stride">The stride of the convolution.</param>
+    /// <param name="padding">The padding to add to the input.</param>
+    /// <param name="dilation">The dilation spacing between kernel elements.</param>
+    void Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
+
+    /// <summary>
     /// Computes the gradient of Conv2D with respect to the input tensor.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
