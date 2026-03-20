@@ -2511,6 +2511,67 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int hiddenSize);
 
     #endregion
+
+    #region GPU Graph Execution and Workspace
+
+    /// <summary>
+    /// Allocates a single contiguous GPU buffer to serve as a workspace for all
+    /// intermediate tensors during graph execution. Sub-regions are addressed via
+    /// offset+length into this buffer, eliminating per-operation GPU allocation.
+    /// </summary>
+    /// <param name="totalElements">Total number of float elements needed.</param>
+    /// <returns>A single GPU buffer large enough for all slots.</returns>
+    IGpuBuffer AllocateWorkspaceBuffer(int totalElements)
+    {
+        return AllocateBuffer(totalElements);
+    }
+
+    /// <summary>
+    /// Begins recording a batch of GPU operations into a single command buffer.
+    /// Call GPU operations (Add, MatMul, etc.) between BeginBatch and EndBatch
+    /// to defer submission. EndBatch submits all recorded operations at once,
+    /// eliminating per-operation kernel launch overhead.
+    /// </summary>
+    /// <remarks>
+    /// Default implementation: no-op (operations execute immediately as before).
+    /// GPU backends that support batching should override this.
+    /// </remarks>
+    void BeginBatch() { }
+
+    /// <summary>
+    /// Ends batch recording and submits all recorded operations as a single GPU submission.
+    /// Blocks until all operations complete.
+    /// </summary>
+    void EndBatch() { }
+
+    /// <summary>
+    /// Gets whether this backend supports batch recording via BeginBatch/EndBatch.
+    /// </summary>
+    bool SupportsBatchExecution => false;
+
+    /// <summary>
+    /// Begins a secondary stream for executing independent operations concurrently.
+    /// Operations dispatched after this call run on the secondary stream until
+    /// EndSecondaryStream is called. Only available when the backend supports multi-stream
+    /// (check via IAsyncGpuBackend.SupportsMultiStream).
+    /// </summary>
+    void BeginSecondaryStream() { }
+
+    /// <summary>
+    /// Ends the secondary stream and synchronizes with the primary stream.
+    /// Blocks until both streams complete.
+    /// </summary>
+    void EndSecondaryStream() { }
+
+    /// <summary>
+    /// Inserts a memory barrier ensuring all prior writes to the buffer are visible
+    /// to subsequent reads. Used between dependent operations in batched execution
+    /// to ensure correct data flow without flushing the entire pipeline.
+    /// </summary>
+    /// <param name="buffer">The buffer to synchronize.</param>
+    void InsertBarrier(IGpuBuffer buffer) { }
+
+    #endregion
 }
 
 /// <summary>
