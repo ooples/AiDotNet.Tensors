@@ -541,6 +541,46 @@ public class TensorLevelOpsTests
         Assert.Equal(18.0, result.AsSpan()[1], 1e-10);
     }
 
+    [Fact]
+    public void Conv2DInto_Double_MatchesConv2D()
+    {
+        var engine = new CpuEngine();
+
+        var input = new Tensor<double>(new[] { 1, 1, 4, 4 });
+        var kernel = new Tensor<double>(new[] { 1, 1, 3, 3 });
+        for (int i = 0; i < input.Length; i++) input[i] = i + 1.0;
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = 1.0;
+
+        var expected = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var output = new Tensor<double>(expected.Shape);
+        engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
+
+        Assert.Equal(expected.Shape, output.Shape);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], output[i]);
+    }
+
+    [Fact]
+    public void Conv2DInto_Float_MatchesConv2D()
+    {
+        var engine = new CpuEngine();
+
+        var input = new Tensor<float>(new[] { 1, 2, 5, 5 });
+        var kernel = new Tensor<float>(new[] { 3, 2, 3, 3 });
+        var rng = new Random(42);
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() - 0.5);
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = (float)(rng.NextDouble() - 0.5);
+
+        var expected = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+
+        var output = new Tensor<float>(expected.Shape);
+        engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
+
+        for (int i = 0; i < expected.Length; i++)
+            Assert.Equal(expected[i], output[i], 1e-5f);
+    }
+
     #endregion
 
     #region API Consistency

@@ -2104,6 +2104,87 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public void TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var aSpan = a.Data.Span;
+        var bSpan = b.Data.Span;
+
+        // Fast path: same shape — no broadcasting needed
+        if (ShapesMatch(a.Shape, b.Shape))
+        {
+            for (int i = 0; i < aSpan.Length; i++)
+                aSpan[i] = numOps.Add(aSpan[i], bSpan[i]);
+            return;
+        }
+
+        // Conv bias pattern: a=[B,C,H,W], b=[1,C,1,1] — most common case
+        if (a.Rank == 4 && b.Rank == 4 &&
+            b.Shape[0] == 1 && b.Shape[2] == 1 && b.Shape[3] == 1 &&
+            a.Shape[1] == b.Shape[1])
+        {
+            int batch = a.Shape[0];
+            int channels = a.Shape[1];
+            int spatial = a.Shape[2] * a.Shape[3];
+
+            for (int n = 0; n < batch; n++)
+            {
+                for (int c = 0; c < channels; c++)
+                {
+                    T biasVal = bSpan[c];
+                    int offset = (n * channels + c) * spatial;
+                    for (int s = 0; s < spatial; s++)
+                    {
+                        aSpan[offset + s] = numOps.Add(aSpan[offset + s], biasVal);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Scalar broadcast: b has 1 element
+        if (b.Length == 1)
+        {
+            T scalar = bSpan[0];
+            for (int i = 0; i < aSpan.Length; i++)
+                aSpan[i] = numOps.Add(aSpan[i], scalar);
+            return;
+        }
+
+        // 1D bias along last dimension: a=[..., N], b=[N]
+        if (b.Rank == 1 && a.Shape[^1] == b.Shape[0])
+        {
+            int lastDim = b.Shape[0];
+            int outerSize = a.Length / lastDim;
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                int offset = outer * lastDim;
+                for (int i = 0; i < lastDim; i++)
+                    aSpan[offset + i] = numOps.Add(aSpan[offset + i], bSpan[i]);
+            }
+            return;
+        }
+
+        // General fallback: compute broadcast result and copy back.
+        // This allocates a temporary — acceptable for rare arbitrary broadcast shapes.
+        var result = TensorBroadcastAdd(a, b);
+        result.Data.Span.CopyTo(aSpan);
+    }
+
+    /// <inheritdoc/>
+    public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    {
+        // GroupNorm writes normalized values into pre-allocated output.
+        // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
+        // The main output tensor avoids allocation since it's pre-allocated by the caller.
+        var result = GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        result.Data.Span.CopyTo(output.Data.Span);
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));

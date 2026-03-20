@@ -95,12 +95,6 @@ internal static class Im2ColHelper
             fixed (float* inputPtr = input)
             fixed (float* outputPtr = output)
             {
-                // Calculate valid ranges that apply to all kernel positions
-                int owValidStart = Math.Max(0, padW);
-                int owValidEnd = Math.Min(outputW, width + padW);
-                int ohValidStart = Math.Max(0, padH);
-                int ohValidEnd = Math.Min(outputH, height + padH);
-
                 int rowIdx = 0;
                 for (int c = 0; c < channels; c++)
                 {
@@ -108,15 +102,17 @@ internal static class Im2ColHelper
 
                     for (int kh = 0; kh < kernelH; kh++)
                     {
-                        // Adjust valid output row range for this kernel height position
-                        int ohStart = Math.Max(ohValidStart, padH - kh);
-                        int ohEnd = Math.Min(ohValidEnd, height + padH - kh);
+                        // Per-kh valid output row range:
+                        // ih = oh + kh - padH, valid when 0 <= ih < height
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
 
                         for (int kw = 0; kw < kernelW; kw++)
                         {
-                            // Adjust valid output column range for this kernel width position
-                            int owStart = Math.Max(owValidStart, padW - kw);
-                            int owEnd = Math.Min(owValidEnd, width + padW - kw);
+                            // Per-kw valid output column range:
+                            // iw = ow + kw - padW, valid when 0 <= iw < width
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
                             int validWidth = owEnd - owStart;
 
                             if (validWidth > 0 && ohEnd > ohStart)
@@ -568,9 +564,6 @@ internal static class Im2ColHelper
             fixed (double* inputPtr = input)
             fixed (double* outputPtr = output)
             {
-                int owValidStart = Math.Max(0, padW);
-                int owValidEnd = Math.Min(outputW, width + padW);
-
                 int rowIdx = 0;
                 for (int c = 0; c < channels; c++)
                 {
@@ -583,8 +576,10 @@ internal static class Im2ColHelper
 
                         for (int kw = 0; kw < kernelW; kw++)
                         {
-                            int owStart = Math.Max(owValidStart, padW - kw);
-                            int owEnd = Math.Min(owValidEnd, width + padW - kw);
+                            // Per-kw valid output column range:
+                            // iw = ow + kw - padW, valid when 0 <= iw < width
+                            int owStart = Math.Max(0, padW - kw);
+                            int owEnd = Math.Min(outputW, width + padW - kw);
                             int validWidth = owEnd - owStart;
 
                             if (validWidth > 0 && ohEnd > ohStart)
