@@ -1349,34 +1349,20 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
+            // Math.Exp is faster than our SIMD polynomial for standalone double exp
+            // (11th-order polynomial can't beat SVML/libc microcode).
+            // FastExpDouble256 is still used internally by Sigmoid/Tanh/GELU/Mish
+            // where it's combined with other SIMD ops that amortize the polynomial cost.
             int length = input.Length;
             int i = 0;
-
-#if NET5_0_OR_GREATER
-            // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
-            // Vector256<double> holds 4 doubles; 4x unrolled = 16 doubles per iteration.
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            int unrolled = length & ~3;
+            for (; i < unrolled; i += 4)
             {
-                int simdLength = length & ~15;
-                for (; i < simdLength; i += 16)
-                {
-                    WriteVector256Double(output, i, FastExpDouble256(ReadVector256Double(input, i)));
-                    WriteVector256Double(output, i + 4, FastExpDouble256(ReadVector256Double(input, i + 4)));
-                    WriteVector256Double(output, i + 8, FastExpDouble256(ReadVector256Double(input, i + 8)));
-                    WriteVector256Double(output, i + 12, FastExpDouble256(ReadVector256Double(input, i + 12)));
-                }
+                output[i] = Math.Exp(input[i]);
+                output[i + 1] = Math.Exp(input[i + 1]);
+                output[i + 2] = Math.Exp(input[i + 2]);
+                output[i + 3] = Math.Exp(input[i + 3]);
             }
-
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
-            {
-                int simdLength = i + ((length - i) & ~3);
-                for (; i < simdLength; i += 4)
-                {
-                    WriteVector256Double(output, i, FastExpDouble256(ReadVector256Double(input, i)));
-                }
-            }
-#endif
-
             for (; i < length; i++)
             {
                 output[i] = Math.Exp(input[i]);
@@ -1704,10 +1690,8 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<double> FastExpDouble256(Vector256<double> x)
         {
-            // Save original for underflow/overflow restoration
-            var origX = x;
-
-            // Clamp to avoid inf/nan in polynomial
+            // Clamp to avoid inf/nan in polynomial — no per-vector edge-case handling
+            // (edge cases are handled at the span level for Math.Exp compatibility)
             var clampMin = Vector256.Create(-708.3964185322641);
             var clampMax = Vector256.Create(709.7827128933840);
             x = Avx.Max(clampMin, Avx.Min(clampMax, x));
@@ -1756,18 +1740,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             pow2n = Avx2.ShiftLeftLogical(pow2n, 52);
             var scale = pow2n.AsDouble();
 
-            var result = Avx.Multiply(poly, scale);
-
-            // Restore underflow/overflow to match Math.Exp semantics
-            // exp(x < -745) = 0, exp(x > 709.78) = +inf, exp(NaN) = NaN
-            var underflowMask = Avx.Compare(origX, Vector256.Create(-745.1332191019412), FloatComparisonMode.OrderedLessThanSignaling);
-            var overflowMask = Avx.Compare(origX, clampMax, FloatComparisonMode.OrderedGreaterThanSignaling);
-            var nanMask = Avx.Compare(origX, origX, FloatComparisonMode.UnorderedNotEqualSignaling);
-            result = Avx.BlendVariable(result, Vector256<double>.Zero, underflowMask);
-            result = Avx.BlendVariable(result, Vector256.Create(double.PositiveInfinity), overflowMask);
-            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), nanMask);
-
-            return result;
+            return Avx.Multiply(poly, scale);
         }
 
         /// <summary>
@@ -1779,32 +1752,15 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector256<double> FastLogDouble256(Vector256<double> x)
         {
-            // Special-case masks: preserve Math.Log semantics for edge cases
-            var zeroMask = Avx.Compare(x, Vector256<double>.Zero, FloatComparisonMode.OrderedEqualSignaling);
-            var negativeMask = Avx.Compare(x, Vector256<double>.Zero, FloatComparisonMode.OrderedLessThanSignaling);
-            var infMask = Avx.Compare(x, Vector256.Create(double.PositiveInfinity), FloatComparisonMode.OrderedEqualSignaling);
-            // NaN: x != x
-            var nanMask = Avx.Compare(x, x, FloatComparisonMode.UnorderedNotEqualSignaling);
-
-            // Handle subnormals: multiply by 2^52 to normalize, then subtract 52 from exponent later
-            var minNormal = Vector256.Create(2.2250738585072014e-308); // smallest normal double
-            var subnormalMask = Avx.AndNot(zeroMask, // not zero AND less than MinNormal
-                Avx.Compare(x, minNormal, FloatComparisonMode.OrderedLessThanSignaling));
-            // Scale subnormals: x * 2^52 makes them normalized
-            var scale = Vector256.Create(4503599627370496.0); // 2^52
-            var xScaled = Avx.BlendVariable(x, Avx.Multiply(x, scale), subnormalMask);
-            // Exponent adjustment: subtract 52 for scaled values
-            var exponentAdj = Avx2.And(subnormalMask.AsInt64(), Vector256.Create(52L));
-
-            // Clamp to positive for the polynomial (will restore special values at end)
-            x = Avx.Max(xScaled, Vector256.Create(double.Epsilon));
+            // No per-vector edge-case handling — edge cases (zero, negative, NaN, inf)
+            // are handled at the span level. This keeps the hot path fast.
+            // Clamp to avoid log(0) producing -inf in bit manipulation
+            x = Avx.Max(x, Vector256.Create(double.Epsilon));
 
             // Extract exponent and mantissa via integer bit manipulation
             var xi = x.AsInt64();
             // Exponent: shift right 52, subtract bias 1023
-            var eLong = Avx2.Subtract(
-                Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L)),
-                exponentAdj); // Subtract 52 for subnormals that were scaled by 2^52
+            var eLong = Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L));
             // Mantissa: clear exponent bits, set exponent to bias (1023 << 52)
             var mantissaBits = Avx2.Or(
                 Avx2.And(xi, Vector256.Create(0x000FFFFFFFFFFFFFL)),
@@ -1872,12 +1828,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             // log(x) = e * ln2 + log(m)
             var ln2 = Vector256.Create(0.693147180559945309417);
             var result = Fma.MultiplyAdd(e, ln2, logm);
-
-            // Restore special values: log(0) = -inf, log(negative) = NaN, log(+inf) = +inf, log(NaN) = NaN
-            result = Avx.BlendVariable(result, Vector256.Create(double.NegativeInfinity), zeroMask);
-            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), negativeMask);
-            result = Avx.BlendVariable(result, Vector256.Create(double.PositiveInfinity), infMask);
-            result = Avx.BlendVariable(result, Vector256.Create(double.NaN), nanMask);
 
             return result;
         }
@@ -3138,32 +3088,20 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
+            // Math.Log is faster than our SIMD rational approximation for standalone double log
+            // (Padé rational with division can't beat SVML/libc microcode).
+            // FastLogDouble256 is still used internally by Mish and Pow where it's combined
+            // with other SIMD ops.
             int length = input.Length;
             int i = 0;
-
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
+            int unrolled = length & ~3;
+            for (; i < unrolled; i += 4)
             {
-                int simdLength = length & ~15;
-                for (; i < simdLength; i += 16)
-                {
-                    WriteVector256Double(output, i, FastLogDouble256(ReadVector256Double(input, i)));
-                    WriteVector256Double(output, i + 4, FastLogDouble256(ReadVector256Double(input, i + 4)));
-                    WriteVector256Double(output, i + 8, FastLogDouble256(ReadVector256Double(input, i + 8)));
-                    WriteVector256Double(output, i + 12, FastLogDouble256(ReadVector256Double(input, i + 12)));
-                }
+                output[i] = Math.Log(input[i]);
+                output[i + 1] = Math.Log(input[i + 1]);
+                output[i + 2] = Math.Log(input[i + 2]);
+                output[i + 3] = Math.Log(input[i + 3]);
             }
-
-            if (Avx2.IsSupported && Fma.IsSupported && length - i >= 4)
-            {
-                int simdLength = i + ((length - i) & ~3);
-                for (; i < simdLength; i += 4)
-                {
-                    WriteVector256Double(output, i, FastLogDouble256(ReadVector256Double(input, i)));
-                }
-            }
-#endif
-
             for (; i < length; i++)
             {
                 output[i] = Math.Log(input[i]);
