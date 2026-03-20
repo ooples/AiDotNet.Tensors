@@ -21,6 +21,11 @@ public static class TensorAllocator
     private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
+    /// Public accessor for the ArrayPool threshold used by TensorWorkspace and other helpers.
+    /// </summary>
+    public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
     /// Large tensors use ArrayPool to reduce GC pressure; small-medium tensors
     /// use standard CLR allocation. All paths return zeroed memory.
