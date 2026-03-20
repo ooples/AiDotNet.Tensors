@@ -1911,20 +1911,23 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            // Use 500K threshold for bandwidth-bound ops
+            // Use PersistentParallelExecutor for near-zero dispatch overhead
+            // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
             int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
             if (addChunks >= 2)
             {
                 int chunkSize = (length + addChunks - 1) / addChunks;
                 chunkSize = (chunkSize + 31) & ~31;
+                var pACap = pA; var pBCap = pB; var pRCap = pR;
+                int lenCap = length;
 
-                Parallel.For(0, addChunks, chunk =>
+                PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
                 {
                     int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
+                    int count = Math.Min(chunkSize, lenCap - start);
                     if (count > 0)
                     {
-                        SimdKernels.VectorAddUnsafe(pA + start, pB + start, pR + start, count);
+                        SimdKernels.VectorAddUnsafe(pACap + start, pBCap + start, pRCap + start, count);
                     }
                 });
             }
