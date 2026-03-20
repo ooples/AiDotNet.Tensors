@@ -578,7 +578,6 @@ internal static class Im2ColHelper
                         {
                             // Per-kw valid output column range:
                             // iw = ow + kw - padW, valid when 0 <= iw < width
-                            // => ow >= padW - kw and ow < width + padW - kw
                             int owStart = Math.Max(0, padW - kw);
                             int owEnd = Math.Min(outputW, width + padW - kw);
                             int validWidth = owEnd - owStart;
