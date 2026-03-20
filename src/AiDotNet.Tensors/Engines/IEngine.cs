@@ -2015,6 +2015,12 @@ public interface IEngine
     /// <summary>Transpose tensor into pre-allocated destination.</summary>
     void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes);
 
+    /// <summary>Softmax into pre-allocated destination. Zero allocation.</summary>
+    void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
+
+    /// <summary>LogSoftmax into pre-allocated destination. Zero allocation.</summary>
+    void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
+
     #endregion
 
     /// <summary>

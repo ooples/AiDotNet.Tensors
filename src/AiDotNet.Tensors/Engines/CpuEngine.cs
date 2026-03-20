@@ -2349,6 +2349,42 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public unsafe void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+
+        int rank = input.Rank;
+        if (axis < 0) axis = rank + axis;
+
+        int outerSize = 1, axisSize = input.Shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+
+        if (typeof(T) == typeof(float) && innerSize == 1)
+        {
+            var inputArr = input.GetDataArray();
+            var outputArr = destination.GetDataArray();
+            var floatIn = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref inputArr);
+            var floatOut = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref outputArr);
+            SoftmaxFloatFast(floatIn, floatOut, outerSize, axisSize);
+            return;
+        }
+
+        // Fallback: compute and copy
+        var result = Softmax(input, axis);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
+    {
+        var result = TensorLogSoftmax(input, axis);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));

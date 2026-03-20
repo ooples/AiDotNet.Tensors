@@ -667,6 +667,15 @@ public class TorchSharpCpuComparisonBenchmarks
         => _cpuEngine.TensorSoftmax(_aiSoftmaxInput!, axis: 1);
 
     [Benchmark]
+    public void AiDotNet_Softmax_ZeroAlloc()
+    {
+        if (_aiSoftmaxInput is null) throw new InvalidOperationException("Setup not called");
+        var output = TensorAllocator.Rent<float>(_aiSoftmaxInput.Shape);
+        _cpuEngine.SoftmaxInto(output, _aiSoftmaxInput, axis: 1);
+        TensorAllocator.Return(output);
+    }
+
+    [Benchmark]
     public void TorchSharp_Softmax()
     {
         using var result = torch.nn.functional.softmax(_torchSoftmaxInput!, dim: 1);
