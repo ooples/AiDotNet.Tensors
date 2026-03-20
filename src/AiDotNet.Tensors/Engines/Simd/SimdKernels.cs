@@ -1786,13 +1786,25 @@ namespace AiDotNet.Tensors.Engines.Simd
             // NaN: x != x
             var nanMask = Avx.Compare(x, x, FloatComparisonMode.UnorderedNotEqualSignaling);
 
+            // Handle subnormals: multiply by 2^52 to normalize, then subtract 52 from exponent later
+            var minNormal = Vector256.Create(2.2250738585072014e-308); // smallest normal double
+            var subnormalMask = Avx.AndNot(zeroMask, // not zero AND less than MinNormal
+                Avx.Compare(x, minNormal, FloatComparisonMode.OrderedLessThanSignaling));
+            // Scale subnormals: x * 2^52 makes them normalized
+            var scale = Vector256.Create(4503599627370496.0); // 2^52
+            var xScaled = Avx.BlendVariable(x, Avx.Multiply(x, scale), subnormalMask);
+            // Exponent adjustment: subtract 52 for scaled values
+            var exponentAdj = Avx2.And(subnormalMask.AsInt64(), Vector256.Create(52L));
+
             // Clamp to positive for the polynomial (will restore special values at end)
-            x = Avx.Max(x, Vector256.Create(double.Epsilon));
+            x = Avx.Max(xScaled, Vector256.Create(double.Epsilon));
 
             // Extract exponent and mantissa via integer bit manipulation
             var xi = x.AsInt64();
             // Exponent: shift right 52, subtract bias 1023
-            var eLong = Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L));
+            var eLong = Avx2.Subtract(
+                Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L)),
+                exponentAdj); // Subtract 52 for subnormals that were scaled by 2^52
             // Mantissa: clear exponent bits, set exponent to bias (1023 << 52)
             var mantissaBits = Avx2.Or(
                 Avx2.And(xi, Vector256.Create(0x000FFFFFFFFFFFFFL)),
@@ -1994,9 +2006,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             var vone = Vector256.Create(1.0f);
             var vzero = Vector256<float>.Zero;
 
-            // Preserve special values: log(0)=-inf, log(negative)=NaN
+            // Preserve special values: log(0)=-inf, log(negative)=NaN, log(+inf)=+inf, log(NaN)=NaN
             var zeroMask = Avx.CompareEqual(x, vzero);
             var negativeMask = Avx.CompareLessThan(x, vzero);
+            var infMask = Avx.CompareEqual(x, Vector256.Create(float.PositiveInfinity));
+            var nanMask = Avx.CompareNotEqual(x, x); // NaN != NaN
             var minNormPos = Vector256.Create(1.17549435e-38f); // smallest normal float
 
             // Clamp denormals to minimum normal positive for mantissa extraction
@@ -2055,9 +2069,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             result = Avx.Add(result, poly);
             result = Avx.Subtract(result, halfF2);
 
-            // Restore special values: log(0) = -inf, log(negative) = NaN
+            // Restore special values: log(0) = -inf, log(negative) = NaN, log(+inf) = +inf, log(NaN) = NaN
             result = Avx.BlendVariable(result, Vector256.Create(float.NegativeInfinity), zeroMask);
             result = Avx.BlendVariable(result, Vector256.Create(float.NaN), negativeMask);
+            result = Avx.BlendVariable(result, Vector256.Create(float.PositiveInfinity), infMask);
+            result = Avx.BlendVariable(result, Vector256.Create(float.NaN), nanMask);
 
             return result;
         }
@@ -3470,9 +3486,13 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 8)
                 {
                     var bases = ReadVector256(baseValues, i);
-                    // Check if all bases are positive — fall back to scalar if any are <= 0
+                    // Check if all bases are positive and finite — fall back to scalar for
+                    // non-positive, NaN, or Infinity bases (MathF.Pow handles these correctly)
                     var nonPositive = Avx.Compare(bases, Vector256<float>.Zero, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
-                    if (Avx.MoveMask(nonPositive) != 0)
+                    var nanBases = Avx.Compare(bases, bases, FloatComparisonMode.UnorderedNotEqualSignaling);
+                    var infBases = Avx.CompareEqual(bases, Vector256.Create(float.PositiveInfinity));
+                    var needScalar = Avx.Or(nonPositive, Avx.Or(nanBases, infBases));
+                    if (Avx.MoveMask(needScalar) != 0)
                     {
                         // Scalar fallback for this chunk
                         for (int k = i; k < i + 8; k++)
