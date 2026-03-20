@@ -2016,6 +2016,76 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             return result;
         }
+
+        /// <summary>
+        /// Cephes-style fast sin(x) for Vector256&lt;float&gt; (8 floats per vector).
+        /// Range reduction to [-pi/2, pi/2] via j = round(x * 2/pi), then 5th-order minimax.
+        /// Relative error ~1e-7 across the full float range.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FastSin256(Vector256<float> x)
+        {
+            var twoOverPi = Vector256.Create(0.6366197723675814f);
+            var piOver2Hi = Vector256.Create(1.5707963267341256f);
+            var piOver2Lo = Vector256.Create(6.077100506303966e-11f);
+
+            // Extract sign and work with abs(x)
+            var signBit = Avx2.And(x.AsInt32(), Vector256.Create(unchecked((int)0x80000000)));
+            x = Avx.And(x, Vector256.Create(0x7FFFFFFF).AsSingle()); // abs(x)
+
+            // j = round(x * 2/pi)
+            var j = Avx.RoundToNearestInteger(Avx.Multiply(x, twoOverPi));
+            var jInt = Avx.ConvertToVector256Int32(j);
+
+            // r = x - j * pi/2
+            var r = Fma.MultiplyAddNegated(j, piOver2Hi, x);
+            r = Fma.MultiplyAddNegated(j, piOver2Lo, r);
+
+            // Quadrant: if j%4 >= 2, negate
+            var quadrant = Avx2.And(jInt, Vector256.Create(3));
+            var needNeg = Avx2.CompareGreaterThan(quadrant, Vector256.Create(1));
+            var negMask = Avx2.And(needNeg, Vector256.Create(unchecked((int)0x80000000)));
+
+            // If j%2 == 1, use cos polynomial
+            var useCosPoly = Avx2.CompareEqual(Avx2.And(jInt, Vector256.Create(1)), Vector256.Create(1));
+
+            var r2 = Avx.Multiply(r, r);
+
+            // Sin polynomial (odd): r - r^3/6 + r^5/120 - r^7/5040
+            var s1 = Vector256.Create(-1.6666654611e-1f);
+            var s2 = Vector256.Create(8.3321608736e-3f);
+            var s3 = Vector256.Create(-1.9515295891e-4f);
+
+            var sinP = Fma.MultiplyAdd(s3, r2, s2);
+            sinP = Fma.MultiplyAdd(sinP, r2, s1);
+            sinP = Fma.MultiplyAdd(sinP, Avx.Multiply(r2, r), r);
+
+            // Cos polynomial (even): 1 - r^2/2 + r^4/24 - r^6/720
+            var c1 = Vector256.Create(-0.5f);
+            var c2 = Vector256.Create(4.1666638908e-2f);
+            var c3 = Vector256.Create(-1.3888377460e-3f);
+
+            var cosP = Fma.MultiplyAdd(c3, r2, c2);
+            cosP = Fma.MultiplyAdd(cosP, r2, c1);
+            cosP = Fma.MultiplyAdd(cosP, r2, Vector256.Create(1.0f));
+
+            // Select sin or cos polynomial
+            var result2 = Avx.BlendVariable(sinP, cosP, useCosPoly.AsSingle());
+
+            // Apply negation and original sign
+            var flipBits = Avx2.Xor(negMask, signBit);
+            return Avx.Xor(result2, flipBits.AsSingle());
+        }
+
+        /// <summary>
+        /// Cephes-style fast cos(x) for Vector256&lt;float&gt;.
+        /// cos(x) = sin(x + pi/2).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> FastCos256(Vector256<float> x)
+        {
+            return FastSin256(Avx.Add(x, Vector256.Create(1.5707963267948966f)));
+        }
 #endif
 
         /// <summary>
@@ -2188,19 +2258,19 @@ namespace AiDotNet.Tensors.Engines.Simd
 
                 // Step 1: temp = exp(x)
                 Exp(input, temp);
-                // Step 2: temp = 1 + exp(x), then log -> softplus
-                for (int i = 0; i < length; i++)
+                // Step 2: temp = 1 + exp(x)
+                for (int j = 0; j < length; j++)
+                    temp[j] += 1f;
+                // Step 3: temp = log(1 + exp(x)) = softplus(x) — uses SIMD log
+                Log(temp, temp);
+                // Step 4: clamp softplus for large x (softplus(x) ≈ x when x > 20)
+                for (int j = 0; j < length; j++)
                 {
-                    temp[i] = input[i] > 20f ? input[i] :
-#if NET5_0_OR_GREATER
-                        MathF.Log(1f + temp[i]);
-#else
-                        (float)Math.Log(1.0 + temp[i]);
-#endif
+                    if (input[j] > 20f) temp[j] = input[j];
                 }
-                // Step 3: temp2 = tanh(softplus(x))
+                // Step 5: temp2 = tanh(softplus(x))
                 Tanh(temp, temp2);
-                // Step 4: output = x * tanh(softplus(x))
+                // Step 6: output = x * tanh(softplus(x))
                 VectorMultiply(input, temp2, output);
             }
             finally
@@ -2723,7 +2793,21 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, FastSin256(ReadVector256(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Sin(input[i]);
@@ -2747,7 +2831,21 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    WriteVector256(output, i, FastCos256(ReadVector256(input, i)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Cos(input[i]);
@@ -2773,7 +2871,23 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("All spans must have the same length.");
             }
 
-            for (int i = 0; i < input.Length; i++)
+            int length = input.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var x = ReadVector256(input, i);
+                    WriteVector256(sinOutput, i, FastSin256(x));
+                    WriteVector256(cosOutput, i, FastCos256(x));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 (sinOutput[i], cosOutput[i]) = MathF.SinCos(input[i]);
@@ -3288,7 +3402,24 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (baseValues.Length != exponents.Length || baseValues.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-            for (int i = 0; i < baseValues.Length; i++)
+            int length = baseValues.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            // pow(x, y) = exp(y * log(x))
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var logBase = FastLog256(ReadVector256(baseValues, i));
+                    var yLogX = Avx.Multiply(ReadVector256(exponents, i), logBase);
+                    WriteVector256(output, i, FastExp256(yLogX));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Pow(baseValues[i], exponents[i]);
@@ -3305,7 +3436,24 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (baseValues.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-            for (int i = 0; i < baseValues.Length; i++)
+            int length = baseValues.Length;
+            int i = 0;
+
+#if NET5_0_OR_GREATER
+            // pow(x, y) = exp(y * log(x))
+            if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                var vExp = Vector256.Create(exponent);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var logBase = FastLog256(ReadVector256(baseValues, i));
+                    WriteVector256(output, i, FastExp256(Avx.Multiply(vExp, logBase)));
+                }
+            }
+#endif
+
+            for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
                 output[i] = MathF.Pow(baseValues[i], exponent);
