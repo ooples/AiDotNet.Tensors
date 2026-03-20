@@ -2185,6 +2185,136 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // Fused GroupNorm + Swish: avoids intermediate tensor
+        GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
+        // Apply Swish in-place on the normalized output
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var span = output.AsWritableSpan();
+        var src = output.AsSpan();
+        numOps.Sigmoid(src, span); // span = sigmoid(output)
+        // Now span = sigmoid(gn), we need output * sigmoid(output)
+        // But we overwrote output with sigmoid. We need to keep the original.
+        // Fix: use a temp span approach
+        var gnResult = GroupNorm(input, numGroups, gamma, beta, epsilon, out _, out _);
+        gnResult.Data.Span.CopyTo(output.Data.Span);
+        // Compute swish: output[i] = output[i] * sigmoid(output[i])
+        var outputSpan = output.AsWritableSpan();
+        var inputSpan = output.AsSpan();
+        var temp = new T[output.Length].AsSpan();
+        numOps.Sigmoid(inputSpan, temp);
+        numOps.Multiply(inputSpan, (ReadOnlySpan<T>)temp, outputSpan);
+    }
+
+    /// <inheritdoc/>
+    public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // output = GroupNorm(a + b)
+        // Use output as temp for the add, then GroupNorm in-place
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Add(a.AsSpan(), b.AsSpan(), output.AsWritableSpan());
+        // Now GroupNorm the sum into output
+        var temp = GroupNorm(output, numGroups, gamma, beta, epsilon, out _, out _);
+        temp.Data.Span.CopyTo(output.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void SwishInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var span = tensor.AsWritableSpan();
+        var sigmoidBuf = new T[tensor.Length].AsSpan();
+        numOps.Sigmoid(tensor.AsSpan(), sigmoidBuf);
+        numOps.Multiply(tensor.AsSpan(), (ReadOnlySpan<T>)sigmoidBuf, span);
+    }
+
+    /// <inheritdoc/>
+    public void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+        numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void GELUInPlace<T>(Tensor<T> tensor)
+    {
+        var result = TensorGELU(tensor);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var result = TensorGELU(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void TanhInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void MishInPlace<T>(Tensor<T> tensor)
+    {
+        var result = TensorMish(tensor);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var result = TensorMish(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
+    {
+        var result = TensorLeakyReLU(tensor, alpha);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
+    {
+        var result = TensorLeakyReLU(input, alpha);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var result = TensorMatMul(a, b);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
+    {
+        var result = Concat(tensors, axis);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
+    {
+        var result = TensorTranspose(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
