@@ -76,10 +76,16 @@ public class TorchSharpCpuComparisonBenchmarks
     private Tensor<double>? _aiDoubleVectorB;
     private Tensor<double>? _aiDoubleMatA;
     private Tensor<double>? _aiDoubleMatB;
+    private Tensor<double>? _aiDoubleSoftmaxInput;
+    private Tensor<double>? _aiDoubleConvInput;
+    private Tensor<double>? _aiDoubleConvKernel;
     private TorchTensor? _torchDoubleVectorA;
     private TorchTensor? _torchDoubleVectorB;
     private TorchTensor? _torchDoubleMatA;
     private TorchTensor? _torchDoubleMatB;
+    private TorchTensor? _torchDoubleSoftmaxInput;
+    private TorchTensor? _torchDoubleConvInput;
+    private TorchTensor? _torchDoubleConvKernel;
 
     private int _convStride;
     private int _convPadding;
@@ -164,6 +170,9 @@ public class TorchSharpCpuComparisonBenchmarks
         _torchDoubleVectorB?.Dispose();
         _torchDoubleMatA?.Dispose();
         _torchDoubleMatB?.Dispose();
+        _torchDoubleSoftmaxInput?.Dispose();
+        _torchDoubleConvInput?.Dispose();
+        _torchDoubleConvKernel?.Dispose();
     }
 
     [IterationSetup]
@@ -319,6 +328,27 @@ public class TorchSharpCpuComparisonBenchmarks
 
         _torchDoubleMatA = torch.tensor(matDataA, new long[] { matSize, matSize }, device: _torchDevice);
         _torchDoubleMatB = torch.tensor(matDataB, new long[] { matSize, matSize }, device: _torchDevice);
+
+        // Double softmax data
+        const int dBatch = 512, dFeatures = 1024;
+        var dSoftmaxData = new double[dBatch * dFeatures];
+        for (int i = 0; i < dSoftmaxData.Length; i++)
+            dSoftmaxData[i] = DeterministicValue(i + 600_000);
+        _aiDoubleSoftmaxInput = new Tensor<double>(dSoftmaxData, new[] { dBatch, dFeatures });
+        _torchDoubleSoftmaxInput = torch.tensor(dSoftmaxData, new long[] { dBatch, dFeatures }, device: _torchDevice);
+
+        // Double conv2d data
+        const int dConvBatch = 1, dInCh = 3, dOutCh = 16, dH = 32, dW = 32, dKs = 3;
+        var dConvInputData = new double[dConvBatch * dInCh * dH * dW];
+        var dConvKernelData = new double[dOutCh * dInCh * dKs * dKs];
+        for (int i = 0; i < dConvInputData.Length; i++)
+            dConvInputData[i] = DeterministicValue(i + 700_000);
+        for (int i = 0; i < dConvKernelData.Length; i++)
+            dConvKernelData[i] = DeterministicValue(i + 800_000);
+        _aiDoubleConvInput = new Tensor<double>(dConvInputData, new[] { dConvBatch, dInCh, dH, dW });
+        _aiDoubleConvKernel = new Tensor<double>(dConvKernelData, new[] { dOutCh, dInCh, dKs, dKs });
+        _torchDoubleConvInput = torch.tensor(dConvInputData, new long[] { dConvBatch, dInCh, dH, dW }, device: _torchDevice);
+        _torchDoubleConvKernel = torch.tensor(dConvKernelData, new long[] { dOutCh, dInCh, dKs, dKs }, device: _torchDevice);
     }
 
     private void ConsumeTorchResult(TorchTensor result) => _consumer.Consume(result);
@@ -805,6 +835,84 @@ public class TorchSharpCpuComparisonBenchmarks
     public void TorchSharp_Sigmoid_Double()
     {
         using var result = torch.sigmoid(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Exp_Double()
+        => _cpuEngine.TensorExp(_aiDoubleVectorA!);
+
+    [Benchmark]
+    public void TorchSharp_Exp_Double()
+    {
+        using var result = torch.exp(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Log_Double()
+        => _cpuEngine.TensorLog(_aiDoubleVectorA!);
+
+    [Benchmark]
+    public void TorchSharp_Log_Double()
+    {
+        using var result = torch.log(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Tanh_Double()
+        => _cpuEngine.TensorTanh(_aiDoubleVectorA!);
+
+    [Benchmark]
+    public void TorchSharp_Tanh_Double()
+    {
+        using var result = torch.tanh(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_GELU_Double()
+        => _cpuEngine.TensorGELU(_aiDoubleVectorA!);
+
+    [Benchmark]
+    public void TorchSharp_GELU_Double()
+    {
+        using var result = torch.nn.functional.gelu(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Mish_Double()
+        => _cpuEngine.TensorMish(_aiDoubleVectorA!);
+
+    [Benchmark]
+    public void TorchSharp_Mish_Double()
+    {
+        using var result = torch.nn.functional.mish(_torchDoubleVectorA!);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Softmax_Double()
+        => _cpuEngine.TensorSoftmax(_aiDoubleSoftmaxInput!, axis: 1);
+
+    [Benchmark]
+    public void TorchSharp_Softmax_Double()
+    {
+        using var result = torch.nn.functional.softmax(_torchDoubleSoftmaxInput!, dim: 1);
+        ConsumeTorchResult(result);
+    }
+
+    [Benchmark]
+    public Tensor<double> AiDotNet_Conv2D_Double()
+        => _cpuEngine.Conv2D(_aiDoubleConvInput!, _aiDoubleConvKernel!, _convStride, _convPadding, _convDilation);
+
+    [Benchmark]
+    public void TorchSharp_Conv2D_Double()
+    {
+        using var result = torch.nn.functional.conv2d(_torchDoubleConvInput!, _torchDoubleConvKernel!,
+            strides: _torchConvStride!, padding: _torchConvPadding!, dilation: _torchConvDilation!);
         ConsumeTorchResult(result);
     }
 
