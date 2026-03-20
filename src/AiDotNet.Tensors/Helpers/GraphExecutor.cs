@@ -25,6 +25,7 @@ public sealed class GraphExecutor<T> : IDisposable
     private readonly TensorWorkspace<T> _workspace;
     private readonly IEngine _engine;
     private readonly int[] _nodeToTensorId;
+    private readonly Dictionary<OpType, Action<GraphNode, Tensor<T>[], Tensor<T>>> _opHandlers;
     private bool _disposed;
 
     /// <summary>The workspace backing all intermediate tensors.</summary>
@@ -56,6 +57,19 @@ public sealed class GraphExecutor<T> : IDisposable
         {
             _nodeToTensorId[i] = nextId++;
         }
+
+        // Build dispatch table — follows open/closed principle
+        // New ops are added by registering handlers, not modifying a switch
+        _opHandlers = BuildDispatchTable();
+    }
+
+    /// <summary>
+    /// Registers a custom operation handler. Allows extending the executor
+    /// without modifying the class (open/closed principle).
+    /// </summary>
+    public void RegisterOpHandler(OpType opType, Action<GraphNode, Tensor<T>[], Tensor<T>> handler)
+    {
+        _opHandlers[opType] = handler;
     }
 
     /// <summary>
@@ -126,104 +140,75 @@ public sealed class GraphExecutor<T> : IDisposable
 
     private void ExecuteOp(GraphNode node, Tensor<T>[] inputs, Tensor<T> output)
     {
-        var p = node.Params;
-
-        switch (node.Type)
+        if (_opHandlers.TryGetValue(node.Type, out var handler))
         {
-            // Element-wise arithmetic — use Into variants for zero-alloc
-            case OpType.Add:
-            case OpType.Residual:
-                _engine.TensorAddInto(output, inputs[0], inputs[1]);
-                break;
-            case OpType.Subtract:
-                var subOps = MathHelper.GetNumericOperations<T>();
-                subOps.Subtract(inputs[0].AsSpan(), inputs[1].AsSpan(), output.AsWritableSpan());
-                break;
-            case OpType.Multiply:
-                _engine.TensorMultiplyInto(output, inputs[0], inputs[1]);
-                break;
+            handler(node, inputs, output);
+        }
+        else
+        {
+            // Default: copy input to output (passthrough for unregistered ops)
+            if (inputs.Length > 0 && inputs[0].Length == output.Length)
+                inputs[0].Data.Span.CopyTo(output.Data.Span);
+        }
+    }
 
-            // Activations — copy input then apply in-place, or use Into variant
-            case OpType.ReLU:
-                inputs[0].Data.Span.CopyTo(output.Data.Span);
-                _engine.ReLUInPlace(output);
-                break;
-            case OpType.Sigmoid:
-                inputs[0].Data.Span.CopyTo(output.Data.Span);
-                _engine.SigmoidInPlace(output);
-                break;
-            case OpType.Tanh:
-                _engine.TanhInto(output, inputs[0]);
-                break;
-            case OpType.GELU:
-                _engine.GELUInto(output, inputs[0]);
-                break;
-            case OpType.Mish:
-                _engine.MishInto(output, inputs[0]);
-                break;
-            case OpType.Swish:
-            case OpType.SiLU:
-                _engine.SwishInto(output, inputs[0]);
-                break;
-            case OpType.LeakyReLU:
-                T alpha = p != null ? MathHelper.GetNumericOperations<T>().FromDouble(p.Alpha) : MathHelper.GetNumericOperations<T>().FromDouble(0.01);
-                _engine.LeakyReLUInto(output, inputs[0], alpha);
-                break;
-            case OpType.Softmax:
-                _engine.SoftmaxInto(output, inputs[0], axis: p?.Axis ?? -1);
-                break;
+    private Dictionary<OpType, Action<GraphNode, Tensor<T>[], Tensor<T>>> BuildDispatchTable()
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var defaultAlpha = numOps.FromDouble(0.01);
+
+        return new Dictionary<OpType, Action<GraphNode, Tensor<T>[], Tensor<T>>>
+        {
+            // Element-wise arithmetic
+            [OpType.Add] = (_, inp, o) => _engine.TensorAddInto(o, inp[0], inp[1]),
+            [OpType.Residual] = (_, inp, o) => _engine.TensorAddInto(o, inp[0], inp[1]),
+            [OpType.Subtract] = (_, inp, o) => numOps.Subtract(inp[0].AsSpan(), inp[1].AsSpan(), o.AsWritableSpan()),
+            [OpType.Multiply] = (_, inp, o) => _engine.TensorMultiplyInto(o, inp[0], inp[1]),
+
+            // Activations
+            [OpType.ReLU] = (_, inp, o) => { inp[0].Data.Span.CopyTo(o.Data.Span); _engine.ReLUInPlace(o); },
+            [OpType.Sigmoid] = (_, inp, o) => { inp[0].Data.Span.CopyTo(o.Data.Span); _engine.SigmoidInPlace(o); },
+            [OpType.Tanh] = (_, inp, o) => _engine.TanhInto(o, inp[0]),
+            [OpType.GELU] = (_, inp, o) => _engine.GELUInto(o, inp[0]),
+            [OpType.Mish] = (_, inp, o) => _engine.MishInto(o, inp[0]),
+            [OpType.Swish] = (_, inp, o) => _engine.SwishInto(o, inp[0]),
+            [OpType.SiLU] = (_, inp, o) => _engine.SwishInto(o, inp[0]),
+            [OpType.LeakyReLU] = (n, inp, o) =>
+            {
+                T alpha = n.Params != null ? numOps.FromDouble(n.Params.Alpha) : defaultAlpha;
+                _engine.LeakyReLUInto(o, inp[0], alpha);
+            },
+            [OpType.Softmax] = (n, inp, o) => _engine.SoftmaxInto(o, inp[0], axis: n.Params?.Axis ?? -1),
 
             // Convolution
-            case OpType.Conv2D:
-                if (inputs.Length >= 2)
-                {
-                    _engine.Conv2DInto(output, inputs[0], inputs[1],
-                        stride: p?.Stride ?? 1, padding: p?.Padding ?? 0, dilation: p?.Dilation ?? 1);
-                }
+            [OpType.Conv2D] = (n, inp, o) =>
+            {
+                if (inp.Length >= 2)
+                    _engine.Conv2DInto(o, inp[0], inp[1],
+                        stride: n.Params?.Stride ?? 1, padding: n.Params?.Padding ?? 0, dilation: n.Params?.Dilation ?? 1);
                 else
-                {
-                    // Single input conv (kernel baked into graph — not supported yet)
-                    inputs[0].Data.Span.CopyTo(output.Data.Span);
-                }
-                break;
+                    inp[0].Data.Span.CopyTo(o.Data.Span);
+            },
 
             // Normalization
-            case OpType.GroupNorm:
-                _engine.GroupNormInto(output, inputs[0], p?.Groups ?? 32,
-                    inputs.Length > 1 ? inputs[1] : CreateOnes(output.Shape[1]),
-                    inputs.Length > 2 ? inputs[2] : CreateZeros(output.Shape[1]),
-                    p?.Epsilon ?? 1e-5, out _, out _);
-                break;
-
-            // Fused operations
-            case OpType.FusedGroupNormActivation:
-                _engine.GroupNormSwishInto(output, inputs[0], p?.Groups ?? 32,
-                    inputs.Length > 1 ? inputs[1] : CreateOnes(output.Shape[1]),
-                    inputs.Length > 2 ? inputs[2] : CreateZeros(output.Shape[1]),
-                    p?.Epsilon ?? 1e-5);
-                break;
+            [OpType.GroupNorm] = (n, inp, o) =>
+                _engine.GroupNormInto(o, inp[0], n.Params?.Groups ?? 32,
+                    inp.Length > 1 ? inp[1] : CreateOnes(o.Shape[1]),
+                    inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
+                    n.Params?.Epsilon ?? 1e-5, out _, out _),
+            [OpType.FusedGroupNormActivation] = (n, inp, o) =>
+                _engine.GroupNormSwishInto(o, inp[0], n.Params?.Groups ?? 32,
+                    inp.Length > 1 ? inp[1] : CreateOnes(o.Shape[1]),
+                    inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
+                    n.Params?.Epsilon ?? 1e-5),
 
             // Linear algebra
-            case OpType.MatMul:
-                _engine.MatMulInto(output, inputs[0], inputs[1]);
-                break;
+            [OpType.MatMul] = (_, inp, o) => _engine.MatMulInto(o, inp[0], inp[1]),
 
             // Reductions
-            case OpType.Sum:
-                var sumVal = _engine.TensorSum(inputs[0]);
-                output.AsWritableSpan()[0] = sumVal;
-                break;
-            case OpType.Mean:
-                var meanVal = _engine.TensorMean(inputs[0]);
-                output.AsWritableSpan()[0] = meanVal;
-                break;
-
-            // Default: copy input to output (passthrough for unimplemented ops)
-            default:
-                if (inputs.Length > 0 && inputs[0].Length == output.Length)
-                    inputs[0].Data.Span.CopyTo(output.Data.Span);
-                break;
-        }
+            [OpType.Sum] = (_, inp, o) => { o.AsWritableSpan()[0] = _engine.TensorSum(inp[0]); },
+            [OpType.Mean] = (_, inp, o) => { o.AsWritableSpan()[0] = _engine.TensorMean(inp[0]); },
+        };
     }
 
     private Tensor<T> CreateOnes(int size)

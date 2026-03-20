@@ -83,9 +83,17 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
-                // 4x unrolled AVX2 with software prefetch for large arrays
+                // 4x unrolled AVX2 with software prefetch for bandwidth-bound large arrays
+                // Prefetch 256 bytes (4 cache lines) ahead to hide memory latency
+                const int prefetchDist = 256 / sizeof(float); // 64 elements ahead
                 for (; i < simdLength; i += 32)
                 {
+                    // Software prefetch: bring next chunk into L1 cache while processing current
+                    if (Sse.IsSupported && i + prefetchDist < length)
+                    {
+                        Sse.Prefetch0(a + i + prefetchDist);
+                        Sse.Prefetch0(b + i + prefetchDist);
+                    }
                     Avx.Store(result + i, Avx.Add(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
                     Avx.Store(result + i + 8, Avx.Add(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
                     Avx.Store(result + i + 16, Avx.Add(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
