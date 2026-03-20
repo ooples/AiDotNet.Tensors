@@ -166,6 +166,52 @@ public class TensorLifetimeAnalyzerTests
     }
 
     [Fact]
+    public void InPlaceOps_DetectedWhenInputDies()
+    {
+        // t0 = input
+        // t1 = conv(t0)         — t1 alive [0,1]
+        // t2 = relu(t1)         — t1 dies at op1, relu can execute in-place
+        // t3 = output(t2)
+        var ops = new Operation[]
+        {
+            new(inputs: [0], outputs: [1], outputSizes: [1000]),
+            new(inputs: [1], outputs: [2], outputSizes: [1000], canExecuteInPlace: true),
+            new(inputs: [2], outputs: [3], outputSizes: [1000]),
+        };
+
+        var plan = Analyze(ops, tensorCount: 4, inputTensorIds: [0]);
+
+        // op1 (relu) should be detected as in-place: t2 overwrites t1
+        Assert.True(plan.InPlaceOps.ContainsKey(1), "relu (op1) should be in-place");
+        var (inId, outId) = plan.InPlaceOps[1];
+        Assert.Equal(1, inId);
+        Assert.Equal(2, outId);
+        // t1 and t2 should share the same slot
+        Assert.Equal(plan.SlotAssignments[1], plan.SlotAssignments[2]);
+    }
+
+    [Fact]
+    public void InPlaceOps_NotDetectedWhenInputStillAlive()
+    {
+        // t0 = input
+        // t1 = conv(t0)         — t1 alive [0, 2] (used in op0 AND op2)
+        // t2 = relu(t1)         — t1 still alive, can NOT execute in-place
+        // t3 = t1 + t2          — residual, consumes t1 again
+        var ops = new Operation[]
+        {
+            new(inputs: [0], outputs: [1], outputSizes: [1000]),
+            new(inputs: [1], outputs: [2], outputSizes: [1000], canExecuteInPlace: true),
+            new(inputs: [1, 2], outputs: [3], outputSizes: [1000]),
+        };
+
+        var plan = Analyze(ops, tensorCount: 4, inputTensorIds: [0]);
+
+        // op1 should NOT be in-place because t1 is still needed at op2
+        Assert.False(plan.InPlaceOps.ContainsKey(1),
+            "relu should NOT be in-place when input is still alive for residual");
+    }
+
+    [Fact]
     public void SavingsRatio_ComputedCorrectly()
     {
         // Two tensors that can share a slot: 50% savings

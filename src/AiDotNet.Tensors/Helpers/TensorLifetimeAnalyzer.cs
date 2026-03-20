@@ -115,7 +115,14 @@ public sealed class TensorLifetimeAnalyzer
             ? 1.0 - (double)TotalElementsWithReuse / TotalElementsWithoutReuse
             : 0.0;
 
-        internal AllocationPlan(LiveRange[] liveRanges, int[] slotAssignments, int[] slotSizes)
+        /// <summary>
+        /// Operations that can execute in-place (output overwrites input).
+        /// Key: operation index, Value: (inputTensorId, outputTensorId) that share a slot.
+        /// </summary>
+        public Dictionary<int, (int InputTensorId, int OutputTensorId)> InPlaceOps { get; }
+
+        internal AllocationPlan(LiveRange[] liveRanges, int[] slotAssignments, int[] slotSizes,
+            Dictionary<int, (int, int)>? inPlaceOps = null)
         {
             LiveRanges = liveRanges;
             SlotAssignments = slotAssignments;
@@ -127,6 +134,7 @@ public sealed class TensorLifetimeAnalyzer
             TotalElementsWithReuse = 0;
             foreach (int s in slotSizes)
                 TotalElementsWithReuse += s;
+            InPlaceOps = inPlaceOps ?? new Dictionary<int, (int, int)>();
         }
     }
 
@@ -212,7 +220,44 @@ public sealed class TensorLifetimeAnalyzer
         for (int i = 0; i < slots.Count; i++)
             slotSizes[i] = slots[i].size;
 
-        return new AllocationPlan(liveRanges, slotAssignments, slotSizes);
+        // Step 4: Detect in-place opportunities
+        // An operation can execute in-place when:
+        // 1. CanExecuteInPlace is true
+        // 2. The first input tensor dies at this operation (lastUse == opIndex)
+        // 3. The output and input have the same size
+        // 4. Both are assigned workspace slots
+        var inPlaceOps = new Dictionary<int, (int, int)>();
+        for (int opIdx = 0; opIdx < operations.Length; opIdx++)
+        {
+            ref readonly var op = ref operations[opIdx];
+            if (!op.CanExecuteInPlace || op.Inputs.Length == 0 || op.Outputs.Length == 0)
+                continue;
+
+            int inputId = op.Inputs[0];
+            int outputId = op.Outputs[0];
+
+            if (inputId < 0 || inputId >= tensorCount || outputId < 0 || outputId >= tensorCount)
+                continue;
+            if (isInput[inputId]) continue; // Can't overwrite external inputs
+
+            var inputRange = liveRanges[inputId];
+            var outputRange = liveRanges[outputId];
+
+            // Input must die at this operation and sizes must match
+            if (inputRange.LastUse == opIdx && inputRange.Size == outputRange.Size &&
+                slotAssignments[inputId] >= 0 && slotAssignments[outputId] >= 0)
+            {
+                // Assign output to input's slot (overwrite in place)
+                int oldSlot = slotAssignments[outputId];
+                slotAssignments[outputId] = slotAssignments[inputId];
+                inPlaceOps[opIdx] = (inputId, outputId);
+
+                // Update slot tracking: the old output slot may now be unused
+                // (handled implicitly — slot sizes remain max of all occupants)
+            }
+        }
+
+        return new AllocationPlan(liveRanges, slotAssignments, slotSizes, inPlaceOps);
     }
 
     /// <summary>
