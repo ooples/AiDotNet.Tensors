@@ -276,6 +276,18 @@ public sealed class TensorLifetimeAnalyzer
             }
         }
 
+        // Recompute slot sizes after in-place reassignment to remove inflated counts
+        if (inPlaceOps.Count > 0)
+        {
+            Array.Clear(slotSizes, 0, slotSizes.Length);
+            for (int tid = 0; tid < tensorCount; tid++)
+            {
+                int slot = slotAssignments[tid];
+                if (slot >= 0 && slot < slotSizes.Length)
+                    slotSizes[slot] = Math.Max(slotSizes[slot], liveRanges[tid].Size);
+            }
+        }
+
         return new AllocationPlan(liveRanges, slotAssignments, slotSizes, inPlaceOps);
     }
 

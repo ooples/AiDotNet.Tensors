@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution
 {
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -633,6 +633,12 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     /// </summary>
     public bool SupportsBatchExecution => true;
 
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateWorkspaceBuffer(int totalElements)
+    {
+        return AllocateBuffer(totalElements);
+    }
+
     /// <summary>
     /// Begins recording a batch of GPU operations into a single command buffer.
     /// All subsequent GPU operations (Add, MatMul, etc.) are recorded without submission
@@ -701,6 +707,20 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     }
 
     #endregion
+
+    /// <inheritdoc/>
+    public void BeginSecondaryStream()
+    {
+        // Vulkan multi-stream requires separate command pools per thread/stream.
+        // Not yet implemented — would need a secondary VkCommandPool + VkQueue.
+        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+    }
+
+    /// <inheritdoc/>
+    public void EndSecondaryStream()
+    {
+        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+    }
 
     /// <summary>
     /// Disposes the backend and releases all resources.

@@ -88,7 +88,9 @@ public sealed class GpuWorkspace : IDisposable
         }
 
         TotalElements = offset;
-        _buffer = _backend.AllocateWorkspaceBuffer(TotalElements);
+        _buffer = _backend is IGpuBatchExecution batchBe
+            ? batchBe.AllocateWorkspaceBuffer(TotalElements)
+            : _backend.AllocateBuffer(TotalElements);
         _isAllocated = true;
     }
 
@@ -146,16 +148,16 @@ public sealed class GpuWorkspace : IDisposable
         if (!_isAllocated || _buffer == null)
             throw new InvalidOperationException("Not allocated.");
 
-        if (_backend.SupportsBatchExecution)
+        if (_backend is IGpuBatchExecution batchBackend && batchBackend.SupportsBatchExecution)
         {
-            _backend.BeginBatch();
+            batchBackend.BeginBatch();
             try
             {
                 operations(this);
             }
             finally
             {
-                _backend.EndBatch();
+                batchBackend.EndBatch();
             }
         }
         else

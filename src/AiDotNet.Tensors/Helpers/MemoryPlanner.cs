@@ -214,7 +214,16 @@ public sealed class MemoryPlanner
             var workspace = new TensorWorkspace<T>();
             for (int i = 0; i < SlotCount; i++)
             {
-                workspace.Register(SlotShapes[i]);
+                // Skip zero-size slots (can occur from dummy pin operations)
+                if (AllocationPlan.SlotSizes[i] <= 0) continue;
+                // Ensure all dimensions are positive
+                bool validShape = true;
+                foreach (int dim in SlotShapes[i])
+                {
+                    if (dim <= 0) { validShape = false; break; }
+                }
+                if (validShape)
+                    workspace.Register(SlotShapes[i]);
             }
             workspace.Allocate();
             return workspace;
