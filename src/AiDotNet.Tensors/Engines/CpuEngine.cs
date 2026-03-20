@@ -2282,12 +2282,48 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    /// <remarks>
-    /// Current implementation computes into a temporary tensor then copies to destination.
-    /// A future optimization would compute GEMM directly into destination memory.
-    /// </remarks>
     public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a.Shape[0];
+            int n = a.Shape[1];
+            int p = b.Shape[1];
+
+            if (n != b.Shape[0])
+                throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
+
+            // Try BLAS directly into destination memory (true zero-alloc)
+            if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, destination.Data, 0, m, n, p))
+                return;
+
+            // Fallback: compute via numOps into destination spans
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var dstSpan = destination.AsWritableSpan();
+            dstSpan.Clear();
+
+            for (int i = 0; i < m; i++)
+            {
+                for (int k = 0; k < n; k++)
+                {
+                    T aVal = aSpan[i * n + k];
+                    for (int j = 0; j < p; j++)
+                    {
+                        dstSpan[i * p + j] = numOps.Add(dstSpan[i * p + j],
+                            numOps.Multiply(aVal, bSpan[k * p + j]));
+                    }
+                }
+            }
+            return;
+        }
+
+        // For batched/ND cases, fall back to allocate-copy
         var result = TensorMatMul(a, b);
         result.Data.Span.CopyTo(destination.Data.Span);
     }
