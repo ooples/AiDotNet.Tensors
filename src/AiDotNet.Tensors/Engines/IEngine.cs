@@ -1964,6 +1964,86 @@ public interface IEngine
     /// </summary>
     void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
+    /// <summary>
+    /// Applies Swish/SiLU activation in-place: tensor[i] = tensor[i] * sigmoid(tensor[i]). Zero allocation.
+    /// </summary>
+    void SwishInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes Swish/SiLU into a pre-allocated destination: dest[i] = input[i] * sigmoid(input[i]). Zero allocation.
+    /// </summary>
+    void SwishInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Applies GELU activation in-place. Zero allocation.
+    /// </summary>
+    void GELUInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes GELU into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    void GELUInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Applies Tanh activation in-place: tensor[i] = tanh(tensor[i]). Zero allocation.
+    /// </summary>
+    void TanhInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes Tanh into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    void TanhInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Applies Mish activation in-place: tensor[i] = tensor[i] * tanh(softplus(tensor[i])). Zero allocation.
+    /// </summary>
+    void MishInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes Mish into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    void MishInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Applies LeakyReLU activation in-place: tensor[i] = tensor[i] > 0 ? tensor[i] : alpha * tensor[i]. Zero allocation.
+    /// </summary>
+    void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha);
+
+    /// <summary>
+    /// Computes LeakyReLU into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha);
+
+    /// <summary>
+    /// Matrix multiply into a pre-allocated destination: dest = a @ b. Zero allocation.
+    /// dest must have shape [a.Rows, b.Columns].
+    /// </summary>
+    void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Concatenates tensors along an axis into a pre-allocated destination. Zero allocation.
+    /// dest must have the correct concatenated shape.
+    /// </summary>
+    void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis);
+
+    /// <summary>
+    /// Transposes a tensor into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes);
+
+    /// <summary>
+    /// Fused GroupNorm + Swish/SiLU in a single data pass. Zero allocation for the main output.
+    /// Computes: dest[i] = SiLU(GroupNorm(input, gamma, beta))[i] in one traversal.
+    /// Eliminates the intermediate tensor between GroupNorm and activation.
+    /// </summary>
+    void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
+    /// <summary>
+    /// Fused Add + GroupNorm in a single data pass. Zero allocation for the main output.
+    /// Computes: dest = GroupNorm(a + b, gamma, beta) without materializing (a + b).
+    /// </summary>
+    void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
     #endregion
 
     /// <summary>

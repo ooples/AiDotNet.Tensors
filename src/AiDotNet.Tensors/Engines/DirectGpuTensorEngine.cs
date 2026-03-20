@@ -1300,9 +1300,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+        => base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+
+    void IEngine.SwishInPlace<T>(Tensor<T> tensor)
     {
-        base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
+            return;
+        base.SwishInPlace(tensor);
     }
+
+    void IEngine.SwishInto<T>(Tensor<T> dest, Tensor<T> input)
+    {
+        var result = ((IEngine)this).Swish(input);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.GELUInPlace<T>(Tensor<T> tensor) => base.GELUInPlace(tensor);
+    void IEngine.GELUInto<T>(Tensor<T> dest, Tensor<T> input) => base.GELUInto(dest, input);
+    void IEngine.TanhInPlace<T>(Tensor<T> tensor) => base.TanhInPlace(tensor);
+    void IEngine.TanhInto<T>(Tensor<T> dest, Tensor<T> input) => base.TanhInto(dest, input);
+    void IEngine.MishInPlace<T>(Tensor<T> tensor) => base.MishInPlace(tensor);
+    void IEngine.MishInto<T>(Tensor<T> dest, Tensor<T> input) => base.MishInto(dest, input);
+    void IEngine.LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha) => base.LeakyReLUInPlace(tensor, alpha);
+    void IEngine.LeakyReLUInto<T>(Tensor<T> dest, Tensor<T> input, T alpha) => base.LeakyReLUInto(dest, input, alpha);
+    void IEngine.MatMulInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b) => base.MatMulInto(dest, a, b);
+    void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis) => base.ConcatInto(dest, tensors, axis);
+    void IEngine.TransposeInto<T>(Tensor<T> dest, Tensor<T> input, int[] axes) => base.TransposeInto(dest, input, axes);
+    void IEngine.GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+        => base.GroupNormSwishInto(output, input, numGroups, gamma, beta, epsilon);
+    void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+        => base.AddGroupNormInto(output, a, b, numGroups, gamma, beta, epsilon);
 
     /// <summary>
     /// Runs a binary GPU operation in-place on tensor a: a = op(a, b).

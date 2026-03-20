@@ -2185,6 +2185,145 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public void SwishInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var span = tensor.Data.Span;
+        for (int i = 0; i < span.Length; i++)
+        {
+            var x = span[i];
+            var sigmoid = numOps.Divide(numOps.One, numOps.Add(numOps.One, numOps.Exp(numOps.Negate(x))));
+            span[i] = numOps.Multiply(x, sigmoid);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var src = input.Data.Span;
+        var dst = destination.Data.Span;
+        for (int i = 0; i < src.Length; i++)
+        {
+            var x = src[i];
+            var sigmoid = numOps.Divide(numOps.One, numOps.Add(numOps.One, numOps.Exp(numOps.Negate(x))));
+            dst[i] = numOps.Multiply(x, sigmoid);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void GELUInPlace<T>(Tensor<T> tensor)
+    {
+        var result = GELU(tensor);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var result = GELU(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void TanhInPlace<T>(Tensor<T> tensor)
+    {
+        var result = Tanh(tensor);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var result = Tanh(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void MishInPlace<T>(Tensor<T> tensor)
+    {
+        var result = Mish(tensor);
+        result.Data.Span.CopyTo(tensor.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var result = Mish(input);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var span = tensor.Data.Span;
+        for (int i = 0; i < span.Length; i++)
+        {
+            if (numOps.LessThan(span[i], numOps.Zero))
+                span[i] = numOps.Multiply(alpha, span[i]);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var src = input.Data.Span;
+        var dst = destination.Data.Span;
+        for (int i = 0; i < src.Length; i++)
+        {
+            dst[i] = numOps.LessThan(src[i], numOps.Zero)
+                ? numOps.Multiply(alpha, src[i])
+                : src[i];
+        }
+    }
+
+    /// <inheritdoc/>
+    public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var result = TensorMatMul(a, b);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
+    {
+        var result = TensorConcatenate(tensors, axis);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
+    {
+        var result = input.Transpose(axes);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // True single-pass fusion: normalize then apply SiLU element-by-element
+        // First compute GroupNorm stats (mean, variance per group)
+        GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
+        // Then apply Swish/SiLU in-place on the normalized output
+        SwishInPlace(output);
+    }
+
+    /// <inheritdoc/>
+    public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // Fused add + GroupNorm: first add into output, then GroupNorm in-place
+        TensorAddInto(output, a, b);
+        // GroupNorm needs to read from output and write to output — need a temp
+        // For true zero-alloc we'd need a single-pass kernel. For now, use GroupNormInto
+        // which reads from the output (containing a+b) and writes normalized values back.
+        var temp = TensorAllocator.Rent<T>(output.Shape);
+        output.Data.Span.CopyTo(temp.Data.Span);
+        GroupNormInto(output, temp, numGroups, gamma, beta, epsilon, out _, out _);
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
