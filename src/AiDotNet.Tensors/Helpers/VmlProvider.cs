@@ -146,28 +146,57 @@ internal static class VmlProvider
     }
 
 #if NET5_0_OR_GREATER
-    private static bool TryLoadSymbols(IntPtr handle)
+    private static unsafe bool TryLoadSymbols(IntPtr handle)
     {
         try
         {
-            if (NativeLibrary.TryGetExport(handle, "vsExp", out var vsExpPtr))
-                _vsExp = Marshal.GetDelegateForFunctionPointer<VsExpDelegate>(vsExpPtr);
+            // Try multiple symbol name patterns (varies by MKL version/platform)
+            _vsExp = TryGetDelegate<VsExpDelegate>(handle, "vsExp", "MKL_vsExp", "VSEXP");
+            _vdExp = TryGetDelegate<VdExpDelegate>(handle, "vdExp", "MKL_vdExp", "VDEXP");
+            _vsLn = TryGetDelegate<VsLnDelegate>(handle, "vsLn", "MKL_vsLn", "VSLN");
+            _vdLn = TryGetDelegate<VdLnDelegate>(handle, "vdLn", "MKL_vdLn", "VDLN");
 
-            if (NativeLibrary.TryGetExport(handle, "vdExp", out var vdExpPtr))
-                _vdExp = Marshal.GetDelegateForFunctionPointer<VdExpDelegate>(vdExpPtr);
+            // Verify with a tiny test call to catch broken function pointers
+            if (_vsExp != null)
+            {
+                try
+                {
+                    var testIn = new float[] { 1.0f };
+                    var testOut = new float[] { 0f };
+                    fixed (float* pIn = testIn)
+                    fixed (float* pOut = testOut)
+                    {
+                        _vsExp(1, pIn, pOut);
+                    }
+                    if (float.IsNaN(testOut[0]) || float.IsInfinity(testOut[0]) || Math.Abs(testOut[0] - 2.71828f) > 0.01f)
+                    {
+                        _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
+                    }
+                }
+                catch
+                {
+                    _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
+                }
+            }
 
-            if (NativeLibrary.TryGetExport(handle, "vsLn", out var vsLnPtr))
-                _vsLn = Marshal.GetDelegateForFunctionPointer<VsLnDelegate>(vsLnPtr);
-
-            if (NativeLibrary.TryGetExport(handle, "vdLn", out var vdLnPtr))
-                _vdLn = Marshal.GetDelegateForFunctionPointer<VdLnDelegate>(vdLnPtr);
-
-            return _vsExp != null || _vdExp != null;
+            return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null;
         }
         catch
         {
+            _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
             return false;
         }
     }
+
+    private static T? TryGetDelegate<T>(IntPtr handle, params string[] names) where T : Delegate
+    {
+        foreach (var name in names)
+        {
+            if (NativeLibrary.TryGetExport(handle, name, out var ptr))
+                return Marshal.GetDelegateForFunctionPointer<T>(ptr);
+        }
+        return null;
+    }
+
 #endif
 }

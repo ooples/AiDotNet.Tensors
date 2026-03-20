@@ -1323,18 +1323,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // Try MKL VML first — uses SVML intrinsics, 2-3x faster than our polynomial
-            if (Helpers.VmlProvider.IsAvailable && length >= 32)
-            {
-                fixed (float* pIn = input)
-                fixed (float* pOut = output)
-                {
-                    if (Helpers.VmlProvider.TryExp(pIn, pOut, length))
-                        return;
-                }
-            }
-
-            // Fallback: Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
+            // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
+            // Note: MKL VML was tested but delegate-based P/Invoke overhead negated the
+            // SVML benefit. Our FastExp256 is competitive for float.
             // This is ~8x faster than scalar MathF.Exp loop for large arrays.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
@@ -1383,18 +1374,8 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
-            // Try MKL VML for double exp — SVML vdExp
-            if (Helpers.VmlProvider.IsAvailable && length >= 16)
-            {
-                fixed (double* pIn = input)
-                fixed (double* pOut = output)
-                {
-                    if (Helpers.VmlProvider.TryExp(pIn, pOut, length))
-                        return;
-                }
-            }
-#endif
+            // Scalar Math.Exp is fastest for double (MKL VML tested but delegate overhead
+            // negated benefit; our polynomial can't beat SVML microcode either)
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
@@ -3087,18 +3068,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // Try MKL VML first — uses SVML intrinsics
-            if (Helpers.VmlProvider.IsAvailable && length >= 32)
-            {
-                fixed (float* pIn = input)
-                fixed (float* pOut = output)
-                {
-                    if (Helpers.VmlProvider.TryLn(pIn, pOut, length))
-                        return;
-                }
-            }
-
-            // Fallback: FastLog256 polynomial.
+            // FastLog256 polynomial (MKL VML tested but delegate overhead negated benefit).
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -3141,18 +3111,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
             int i = 0;
 
-#if NET5_0_OR_GREATER
-            // Try MKL VML for double log — SVML vdLn
-            if (Helpers.VmlProvider.IsAvailable && length >= 16)
-            {
-                fixed (double* pIn = input)
-                fixed (double* pOut = output)
-                {
-                    if (Helpers.VmlProvider.TryLn(pIn, pOut, length))
-                        return;
-                }
-            }
-#endif
+            // Scalar Math.Log is fastest for double
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
