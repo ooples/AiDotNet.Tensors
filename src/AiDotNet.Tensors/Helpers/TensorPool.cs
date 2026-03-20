@@ -1,29 +1,24 @@
-using System.Buffers;
-using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Tensor pool that uses ArrayPool for large tensors to reduce GC pressure.
-/// All returned tensors are zero-initialized for correctness under concurrent access.
-/// On .NET 5+, large tensors use ArrayPool (with explicit clearing), and small-medium
-/// tensors use standard <c>new T[]</c> allocation which is zero-initialized by the CLR.
+/// Public facade for tensor pooling that delegates to <see cref="TensorAllocator"/>.
+/// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for safe concurrent access.
+/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ when
+/// <see cref="Enabled"/> is true; on older targets or when disabled, the returned
+/// memory may be zero-initialized (callers must not rely on uninitialized content).
+/// All overloads respect <see cref="Enabled"/>; when disabled, plain non-pooled
+/// tensors are returned instead.
 /// </summary>
-internal static class TensorPool
+public static class TensorPool
 {
     /// <summary>
-    /// Whether pooled tensor allocation is enabled. Defaults to true.
-    /// Can be disabled via AIDOTNET_DISABLE_TENSOR_POOL=1 environment variable.
+    /// Single source of truth for whether pooled/optimized tensor allocation is enabled.
+    /// Defaults to true. Can be disabled via AIDOTNET_DISABLE_TENSOR_POOL=1 environment variable.
+    /// When disabled, all Rent overloads fall back to standard <c>new Tensor&lt;T&gt;(shape)</c>.
     /// </summary>
     public static bool Enabled { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_TENSOR_POOL");
-
-    /// <summary>
-    /// Threshold above which ArrayPool is used instead of standard allocation.
-    /// ArrayPool avoids GC pressure for repeated large allocations (e.g., GEMM temporaries).
-    /// 256K elements = 1MB for float, 2MB for double.
-    /// </summary>
-    private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
     /// Creates a zero-initialized tensor with the given shape.
@@ -32,36 +27,36 @@ internal static class TensorPool
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape)
     {
-        int totalSize = 1;
-        for (int i = 0; i < shape.Length; i++)
-            totalSize = checked(totalSize * shape[i]);
-
-        if (!Enabled || totalSize == 0)
-        {
+        if (!Enabled)
             return new Tensor<T>(shape);
-        }
 
-#if NET5_0_OR_GREATER
-        // Large tensors: use ArrayPool to avoid GC pressure from repeated allocations
-        if (totalSize >= ArrayPoolThreshold)
-        {
-            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Zero-fill the rented region — ArrayPool returns arrays with stale data
-            // from previous tenants, causing data corruption under concurrent access
-            Array.Clear(pooled, 0, totalSize);
-            var memory = new Memory<T>(pooled, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
-        }
+        return TensorAllocator.Rent<T>(shape);
+    }
 
-        // Small-medium tensors: use zero-initialized allocation for correctness.
-        // GC.AllocateUninitializedArray skips zeroing for performance, but this
-        // causes stale-data races when tensors are allocated concurrently.
-        T[] array = new T[totalSize];
-        var mem = new Memory<T>(array);
-        return Tensor<T>.FromMemory(mem, shape);
-#else
-        return new Tensor<T>(shape);
-#endif
+    /// <summary>
+    /// Creates a tensor for immediate-overwrite scenarios, skipping zero-initialization
+    /// where possible. On .NET 5+ with pooling enabled, memory is truly uninitialized
+    /// (except for reference-containing types which are always cleared). When pooling is
+    /// disabled or on older targets, the returned memory may be zero-initialized.
+    /// Callers MUST overwrite all elements before reading regardless of initialization state.
+    /// </summary>
+    public static Tensor<T> RentUninitialized<T>(int[] shape)
+    {
+        if (!Enabled)
+            return new Tensor<T>(shape);
+
+        return TensorAllocator.RentUninitialized<T>(shape);
+    }
+
+    /// <summary>
+    /// Creates a tensor with data from a Vector, using pooled memory for large tensors.
+    /// </summary>
+    public static Tensor<T> Rent<T>(int[] shape, Vector<T> data)
+    {
+        if (!Enabled)
+            return new Tensor<T>(shape, data);
+
+        return TensorAllocator.Rent(shape, data);
     }
 
     /// <summary>
@@ -70,19 +65,7 @@ internal static class TensorPool
     /// </summary>
     public static void Return<T>(Tensor<T>? tensor)
     {
-        if (tensor == null) return;
-
-        T[]? pooledArray = tensor.PooledArray;
-        if (pooledArray != null)
-        {
-            tensor.DetachPooledArray();
-#if NET5_0_OR_GREATER
-            ArrayPool<T>.Shared.Return(pooledArray,
-                clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
-#else
-            ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
-#endif
-        }
+        TensorAllocator.Return(tensor);
     }
 
     private static bool IsEnvTrue(string name)
