@@ -2425,6 +2425,47 @@ public class CpuEngine : ITensorLevelEngine
         result.Data.Span.CopyTo(destination.Data.Span);
     }
 
+    /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
+    public void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Divide into pre-allocated destination. Zero allocation.</summary>
+    public void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Exp into pre-allocated destination. Zero allocation.</summary>
+    public void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Log into pre-allocated destination. Zero allocation.</summary>
+    public void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Log(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Sqrt into pre-allocated destination. Zero allocation.</summary>
+    public void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Abs into pre-allocated destination. Zero allocation.</summary>
+    public void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
+    }
 
     /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
@@ -9446,6 +9487,85 @@ public class CpuEngine : ITensorLevelEngine
     /// Each row is independent: max → subtract → exp → sum → divide.
     /// Parallelized across rows for large tensors.
     /// </summary>
+    /// <summary>
+    /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
+    /// and parallelizes across batch*groups using PersistentParallelExecutor.
+    /// </summary>
+    private unsafe void GroupNormFloat(
+        float[] inputData, float[] outputData,
+        float[] gammaData, float[] betaData,
+        int batch, int channels, int spatialSize, int numGroups, int channelsPerGroup,
+        float eps, out float[] meanArr, out float[] varArr)
+    {
+        // Use arrays directly (Span can't be captured in lambdas)
+
+        int groupSize = channelsPerGroup * spatialSize;
+        meanArr = new float[batch * numGroups];
+        varArr = new float[batch * numGroups];
+
+        int totalGroups = batch * numGroups;
+        var meanLocal = meanArr;
+        var varLocal = varArr;
+
+        // Parallelize across batch*groups — each group is independent
+        PersistentParallelExecutor.Instance.Execute(
+            Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism),
+            chunk =>
+            {
+                int chunkSize = (totalGroups + Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism) - 1)
+                    / Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism);
+                int startIdx = chunk * chunkSize;
+                int endIdx = Math.Min(startIdx + chunkSize, totalGroups);
+
+                for (int idx = startIdx; idx < endIdx; idx++)
+                {
+                    int b = idx / numGroups;
+                    int g = idx % numGroups;
+                    int startChannel = g * channelsPerGroup;
+                    int batchOffset = b * channels * spatialSize;
+
+                    // Fused mean computation
+                    float sum = 0f;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int chanOff = batchOffset + (startChannel + c) * spatialSize;
+                        for (int s = 0; s < spatialSize; s++)
+                            sum += inputData[chanOff + s];
+                    }
+                    float groupMean = sum / groupSize;
+                    meanLocal[idx] = groupMean;
+
+                    // Fused variance computation
+                    float sumSq = 0f;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int chanOff = batchOffset + (startChannel + c) * spatialSize;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float diff = inputData[chanOff + s] - groupMean;
+                            sumSq += diff * diff;
+                        }
+                    }
+                    float groupVar = sumSq / groupSize;
+                    varLocal[idx] = groupVar;
+
+                    // Normalize and apply scale/shift
+                    float invStd = 1f / MathF.Sqrt(groupVar + eps);
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOff = batchOffset + channel * spatialSize;
+                        float g_val = gammaData[channel];
+                        float b_val = betaData[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            outputData[chanOff + s] = (inputData[chanOff + s] - groupMean) * invStd * g_val + b_val;
+                        }
+                    }
+                }
+            });
+    }
+
     private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
     {
         // Delegate to SimdKernels.SoftmaxRowUnsafe which has inline FastExp256
@@ -9459,12 +9579,23 @@ public class CpuEngine : ITensorLevelEngine
 
             if (useParallel)
             {
-                IntPtr ipIn = (IntPtr)pIn;
-                IntPtr ipOut = (IntPtr)pOut;
+                // Use PersistentParallelExecutor for near-zero dispatch overhead
+                // Each worker processes a chunk of consecutive rows for cache locality
+                int numChunks = Math.Min(maxThreads, outerSize);
+                int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
+                float* pInCap = pIn;
+                float* pOutCap = pOut;
                 int axisSz = axisSize;
-                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
+                int outerSz = outerSize;
+
+                PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
                 {
-                    SimdKernels.SoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
+                    int startRow = chunk * rowsPerChunk;
+                    int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
+                    for (int row = startRow; row < endRow; row++)
+                    {
+                        SimdKernels.SoftmaxRowUnsafe(pInCap + row * axisSz, pOutCap + row * axisSz, axisSz);
+                    }
                 });
             }
             else
@@ -10823,6 +10954,30 @@ public class CpuEngine : ITensorLevelEngine
 
         int groupSize = channelsPerGroup * spatialSize;  // Elements per group
 
+        // Fast float path: direct float operations, PersistentParallelExecutor, TensorAllocator.Rent
+        if (typeof(T) == typeof(float))
+        {
+            var result = TensorAllocator.Rent<T>(input.Shape);
+            var inputArr = input.GetDataArray();
+            var outputArr = result.GetDataArray();
+            var gammaArr = gamma.GetDataArray();
+            var betaArr = beta.GetDataArray();
+            var floatIn = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref inputArr);
+            var floatOut = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref outputArr);
+            var floatGamma = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref gammaArr);
+            var floatBeta = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref betaArr);
+            GroupNormFloat(
+                floatIn, floatOut, floatGamma, floatBeta,
+                batch, channels, spatialSize, numGroups, channelsPerGroup,
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
+                out var meanArr, out var varArr);
+            mean = new Tensor<T>(new[] { batch, numGroups },
+                new Vector<T>((T[])(object)meanArr));
+            variance = new Tensor<T>(new[] { batch, numGroups },
+                new Vector<T>((T[])(object)varArr));
+            return result;
+        }
+
         var inputData = input.GetDataArray();
         var gammaData = gamma.GetDataArray();
         var betaData = beta.GetDataArray();
@@ -10830,7 +10985,7 @@ public class CpuEngine : ITensorLevelEngine
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
-        var outputData = new T[input.Length];
+        var outputData = TensorAllocator.Rent<T>(input.Shape).GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
         Parallel.For(0, batch * numGroups, idx =>

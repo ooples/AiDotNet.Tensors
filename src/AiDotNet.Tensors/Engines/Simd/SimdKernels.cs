@@ -4834,17 +4834,76 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static unsafe void SoftmaxRowUnsafe(float* input, float* output, int length)
         {
+            // Tiled softmax: process in L1-cache-sized tiles to maximize data reuse.
+            // Tile size = 2048 floats = 8KB (fits in 32KB L1 with room for input+output).
+            // For small rows (<= tileSize), this degrades to the original 2-pass approach
+            // but with the divide fused into the same cache-hot window.
+            const int tileSize = 2048;
+
+            if (length <= tileSize)
+            {
+                // Small row: data fits in L1. Use fast 2-pass approach.
+                SoftmaxRowSmall(input, output, length);
+                return;
+            }
+
+            // Large row: tile to keep data in L1 cache.
+            // Pass 1: find global max across all tiles
+            float maxVal = float.NegativeInfinity;
+            for (int t = 0; t < length; t += tileSize)
+            {
+                int count = Math.Min(tileSize, length - t);
+                for (int j = 0; j < count; j++)
+                {
+                    float v = input[t + j];
+                    if (v > maxVal) maxVal = v;
+                }
+            }
+
+            // Pass 2: per-tile exp+store+sum, then immediately divide the tile
+            // while it's still in L1 cache (avoids full-array divide pass)
+            float totalSum = 0f;
+            // First compute all exp values and accumulate total sum
+            for (int t = 0; t < length; t += tileSize)
+            {
+                int count = Math.Min(tileSize, length - t);
+                float tileSum = 0f;
+                for (int j = 0; j < count; j++)
+                {
+#if NET5_0_OR_GREATER
+                    float e = MathF.Exp(input[t + j] - maxVal);
+#else
+                    float e = (float)Math.Exp(input[t + j] - maxVal);
+#endif
+                    output[t + j] = e;
+                    tileSum += e;
+                }
+                totalSum += tileSum;
+            }
+
+            // Pass 3: divide (can't fuse with pass 2 because we need total sum)
+            if (totalSum == 0f) return;
+            float invSum = 1f / totalSum;
+            for (int j = 0; j < length; j++)
+                output[j] *= invSum;
+        }
+
+        /// <summary>
+        /// Optimized softmax for rows that fit in L1 cache (≤ 2048 floats = 8KB).
+        /// Uses SIMD for max, fused exp+sum, and divide passes.
+        /// All data stays in L1 across the 2 passes.
+        /// </summary>
+        private static unsafe void SoftmaxRowSmall(float* input, float* output, int length)
+        {
             int i = 0;
 
-            // Step 1: Find max for numerical stability
+            // Pass 1: Find max (SIMD 4x unrolled)
             float maxVal = float.NegativeInfinity;
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
                 var vmax0 = Vector256.Create(float.NegativeInfinity);
-                var vmax1 = vmax0;
-                var vmax2 = vmax0;
-                var vmax3 = vmax0;
+                var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
                 int simdLen = length & ~31;
                 for (; i < simdLen; i += 32)
                 {
@@ -4858,12 +4917,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 #endif
             for (; i < length; i++)
-            {
                 if (input[i] > maxVal) maxVal = input[i];
-            }
 
-            // Fused Step 2+3+4: subtract max, exp, and accumulate sum in ONE pass
-            // Halves memory traffic vs 3 separate passes (sub, exp, sum)
+            // Pass 2: Fused exp + store + sum (SIMD 4x unrolled)
             float sumExp = 0f;
             i = 0;
 #if NET5_0_OR_GREATER
@@ -4905,7 +4961,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 sumExp += e;
             }
 
-            // Step 5: Divide by sum
+            // Divide (data still in L1 from pass 2)
             if (sumExp == 0f) return;
             float invSum = 1f / sumExp;
             i = 0;
@@ -4924,9 +4980,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 #endif
             for (; i < length; i++)
-            {
                 output[i] *= invSum;
-            }
         }
 
         /// <summary>
