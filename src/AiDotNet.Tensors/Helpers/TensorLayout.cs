@@ -115,6 +115,10 @@ public static class TensorLayout
     {
         if (nchw.Rank != 4)
             throw new ArgumentException($"Expected 4D tensor [N,C,H,W] but got rank {nchw.Rank}.");
+        if (destination.Rank != 4)
+            throw new ArgumentException($"Expected 4D destination [N,H,W,C] but got rank {destination.Rank}.");
+        if (destination.Length != nchw.Length)
+            throw new ArgumentException($"Destination length ({destination.Length}) must match source length ({nchw.Length}).");
 
         int n = nchw.Shape[0];
         int c = nchw.Shape[1];
@@ -151,6 +155,10 @@ public static class TensorLayout
     {
         if (nhwc.Rank != 4)
             throw new ArgumentException($"Expected 4D tensor [N,H,W,C] but got rank {nhwc.Rank}.");
+        if (destination.Rank != 4)
+            throw new ArgumentException($"Expected 4D destination [N,C,H,W] but got rank {destination.Rank}.");
+        if (destination.Length != nhwc.Length)
+            throw new ArgumentException($"Destination length ({destination.Length}) must match source length ({nhwc.Length}).");
 
         int n = nhwc.Shape[0];
         int h = nhwc.Shape[1];

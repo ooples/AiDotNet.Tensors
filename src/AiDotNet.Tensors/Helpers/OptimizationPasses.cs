@@ -76,10 +76,10 @@ public static class OptimizationPasses
         int tileN = Math.Min(n, tileSize);
         int tileK = Math.Min(k, tileSize);
 
-        // Align to SIMD width
+        // Align to SIMD width, but never exceed actual dimension
         int simdWidth = elementSize == 4 ? 8 : 4; // AVX2: 8 floats or 4 doubles
         tileN = (tileN / simdWidth) * simdWidth;
-        if (tileN == 0) tileN = simdWidth;
+        if (tileN == 0) tileN = Math.Min(simdWidth, n);
 
         return (tileM, tileN, tileK);
     }

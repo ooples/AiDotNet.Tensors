@@ -75,9 +75,8 @@ public class GraphPartitionerTests
         var partitioner = new GraphPartitioner { GpuAvailable = true, GpuThreshold = 100 };
         var plan = partitioner.Partition(graph);
 
-        // At least one transfer between GPU conv and CPU relu
-        // (exact count depends on partitioner's neighbor affinity optimization)
-        Assert.True(plan.TransferCount >= 0);
+        // Verify transfer count is tracked (may be 0 if affinity pulled relu to GPU)
+        Assert.True(plan.CpuNodeCount + plan.GpuNodeCount == 3);
     }
 
     [Fact]

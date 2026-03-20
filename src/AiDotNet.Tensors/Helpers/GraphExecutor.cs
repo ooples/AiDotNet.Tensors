@@ -130,33 +130,25 @@ public sealed class GraphExecutor<T> : IDisposable
 
         switch (node.Type)
         {
-            // Element-wise arithmetic
+            // Element-wise arithmetic — use Into variants for zero-alloc
             case OpType.Add:
-                _engine.TensorAddInPlace(output, inputs[0]);
-                _engine.TensorAddInPlace(output, inputs[1]);
+            case OpType.Residual:
+                _engine.TensorAddInto(output, inputs[0], inputs[1]);
                 break;
             case OpType.Subtract:
-                var subResult = _engine.TensorSubtract(inputs[0], inputs[1]);
-                subResult.Data.Span.CopyTo(output.Data.Span);
+                var subOps = MathHelper.GetNumericOperations<T>();
+                subOps.Subtract(inputs[0].AsSpan(), inputs[1].AsSpan(), output.AsWritableSpan());
                 break;
             case OpType.Multiply:
-                var mulResult = _engine.TensorMultiply(inputs[0], inputs[1]);
-                mulResult.Data.Span.CopyTo(output.Data.Span);
-                break;
-            case OpType.Residual:
-                // output = a + b
-                inputs[0].Data.Span.CopyTo(output.Data.Span);
-                _engine.TensorAddInPlace(output, inputs[1]);
+                _engine.TensorMultiplyInto(output, inputs[0], inputs[1]);
                 break;
 
-            // Activations (use Into variants for zero-alloc)
+            // Activations — copy input then apply in-place, or use Into variant
             case OpType.ReLU:
-                _engine.ReLUInPlace(output);
                 inputs[0].Data.Span.CopyTo(output.Data.Span);
                 _engine.ReLUInPlace(output);
                 break;
             case OpType.Sigmoid:
-                _engine.SigmoidInPlace(output);
                 inputs[0].Data.Span.CopyTo(output.Data.Span);
                 _engine.SigmoidInPlace(output);
                 break;
@@ -178,8 +170,7 @@ public sealed class GraphExecutor<T> : IDisposable
                 _engine.LeakyReLUInto(output, inputs[0], alpha);
                 break;
             case OpType.Softmax:
-                var smResult = _engine.TensorSoftmax(inputs[0], axis: p?.Axis ?? -1);
-                smResult.Data.Span.CopyTo(output.Data.Span);
+                _engine.SoftmaxInto(output, inputs[0], axis: p?.Axis ?? -1);
                 break;
 
             // Convolution

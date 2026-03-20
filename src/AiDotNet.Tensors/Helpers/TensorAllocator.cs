@@ -21,19 +21,6 @@ public static class TensorAllocator
     private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
-    /// Threshold above which SizeClassPool is used instead of standard allocation.
-    /// SizeClassPool provides exact-size reuse for medium tensors (1K-256K elements).
-    /// </summary>
-    private const int SizeClassPoolThreshold = 1024;
-
-    /// <summary>
-    /// Size-class pool for exact-fit buffer reuse. Avoids ArrayPool's power-of-2 waste
-    /// for medium-sized tensor allocations that are repeatedly allocated at the same size.
-    /// </summary>
-    private static readonly SizeClassPool<float> FloatPool = new(maxBuffersPerSize: 4);
-    private static readonly SizeClassPool<double> DoublePool = new(maxBuffersPerSize: 4);
-
-    /// <summary>
     /// Public accessor for the ArrayPool threshold used by TensorWorkspace and other helpers.
     /// </summary>
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;

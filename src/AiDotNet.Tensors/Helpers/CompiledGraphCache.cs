@@ -144,6 +144,20 @@ public sealed class CompiledGraphCache
                 sb.Append(inp);
                 sb.Append('+');
             }
+            // Include op parameters in the key so different stride/padding/etc. don't collide
+            if (node.Params is { } prm)
+            {
+                sb.Append('P');
+                sb.Append(prm.Stride);
+                sb.Append(',');
+                sb.Append(prm.Padding);
+                sb.Append(',');
+                sb.Append(prm.Dilation);
+                sb.Append(',');
+                sb.Append(prm.Groups);
+                sb.Append(',');
+                sb.Append(prm.Axis);
+            }
             sb.Append(';');
         }
 
