@@ -26,6 +26,12 @@ public sealed class GraphExecutor<T> : IDisposable
     private readonly IEngine _engine;
     private readonly int[] _nodeToTensorId;
     private readonly Dictionary<OpType, Action<GraphNode, Tensor<T>[], Tensor<T>>> _opHandlers;
+    // Pre-allocated per-execute buffers to avoid per-call allocation
+    private readonly Tensor<T>[] _tensorCache;
+    private readonly Tensor<T>[][] _inputBuffers;
+    // Cached default gamma/beta tensors (one per unique size)
+    private readonly Dictionary<int, Tensor<T>> _cachedOnes = new();
+    private readonly Dictionary<int, Tensor<T>> _cachedZeros = new();
     private bool _disposed;
 
     /// <summary>The workspace backing all intermediate tensors.</summary>
@@ -58,6 +64,16 @@ public sealed class GraphExecutor<T> : IDisposable
             _nodeToTensorId[i] = nextId++;
         }
 
+        // Pre-allocate per-execute buffers (zero allocation during forward passes)
+        _tensorCache = new Tensor<T>[graph.NodeCount];
+        _inputBuffers = new Tensor<T>[graph.NodeCount][];
+        for (int i = 0; i < graph.NodeCount; i++)
+        {
+            var node = graph.Nodes[i];
+            if (!node.IsInput)
+                _inputBuffers[i] = new Tensor<T>[node.InputIds.Length];
+        }
+
         // Build dispatch table — follows open/closed principle
         // New ops are added by registering handlers, not modifying a switch
         _opHandlers = BuildDispatchTable();
@@ -87,12 +103,14 @@ public sealed class GraphExecutor<T> : IDisposable
                 $"Expected {_graph.InputNodeIds.Count} inputs but got {inputs.Length}.");
 
         var nodes = _graph.Nodes;
-        var tensorCache = new Tensor<T>[nodes.Count];
+
+        // Use pre-allocated tensorCache (zero per-call allocation)
+        Array.Clear(_tensorCache, 0, _tensorCache.Length);
 
         // Map input nodes to provided tensors
         for (int i = 0; i < _graph.InputNodeIds.Count; i++)
         {
-            tensorCache[_graph.InputNodeIds[i]] = inputs[i];
+            _tensorCache[_graph.InputNodeIds[i]] = inputs[i];
         }
 
         // Execute each non-input node
@@ -106,33 +124,31 @@ public sealed class GraphExecutor<T> : IDisposable
             int slotId = _plan.GetSlotForTensor(tensorId);
             Tensor<T> output;
 
-            if (slotId >= 0)
+            if (slotId >= 0 && slotId < _workspace.SlotCount)
             {
                 output = _workspace.Get(slotId);
             }
             else
             {
-                // Fallback: allocate if not in workspace (shouldn't happen normally)
                 output = new Tensor<T>(node.OutputShape);
             }
 
-            // Get input tensors
-            var inputTensors = new Tensor<T>[node.InputIds.Length];
+            // Use pre-allocated input buffer (zero per-node allocation)
+            var inputTensors = _inputBuffers[nodeIdx];
             for (int j = 0; j < node.InputIds.Length; j++)
             {
-                inputTensors[j] = tensorCache[node.InputIds[j]];
+                inputTensors[j] = _tensorCache[node.InputIds[j]];
             }
 
-            // Execute the operation
             ExecuteOp(node, inputTensors, output);
-            tensorCache[nodeIdx] = output;
+            _tensorCache[nodeIdx] = output;
         }
 
-        // Collect outputs
+        // Collect outputs (this small array is the only per-call allocation)
         var outputs = new Tensor<T>[_graph.OutputNodeIds.Count];
         for (int i = 0; i < outputs.Length; i++)
         {
-            outputs[i] = tensorCache[_graph.OutputNodeIds[i]];
+            outputs[i] = _tensorCache[_graph.OutputNodeIds[i]];
         }
 
         return outputs;
@@ -146,9 +162,8 @@ public sealed class GraphExecutor<T> : IDisposable
         }
         else
         {
-            // Default: copy input to output (passthrough for unregistered ops)
-            if (inputs.Length > 0 && inputs[0].Length == output.Length)
-                inputs[0].Data.Span.CopyTo(output.Data.Span);
+            throw new NotSupportedException(
+                $"Operation type '{node.Type}' is not registered. Use RegisterOpHandler to add support.");
         }
     }
 
@@ -213,17 +228,24 @@ public sealed class GraphExecutor<T> : IDisposable
 
     private Tensor<T> CreateOnes(int size)
     {
+        if (_cachedOnes.TryGetValue(size, out var cached))
+            return cached;
         var t = new Tensor<T>(new[] { size });
         var numOps = MathHelper.GetNumericOperations<T>();
         var span = t.AsWritableSpan();
         for (int i = 0; i < size; i++)
             span[i] = numOps.One;
+        _cachedOnes[size] = t;
         return t;
     }
 
     private Tensor<T> CreateZeros(int size)
     {
-        return new Tensor<T>(new[] { size });
+        if (_cachedZeros.TryGetValue(size, out var cached))
+            return cached;
+        var t = new Tensor<T>(new[] { size });
+        _cachedZeros[size] = t;
+        return t;
     }
 
     /// <inheritdoc/>

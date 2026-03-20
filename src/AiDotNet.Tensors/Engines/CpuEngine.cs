@@ -2413,16 +2413,30 @@ public class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // Fallback: compute and copy
+        // Fallback: compute and copy, return pooled tensor
         var result = Softmax(input, axis);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
     }
 
     /// <inheritdoc/>
     public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
         var result = TensorLogSoftmax(input, axis);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
     }
 
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>

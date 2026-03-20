@@ -69,7 +69,8 @@ public sealed class GpuWorkspace : IDisposable
 
     /// <summary>
     /// Allocates a single contiguous GPU buffer for all registered tensor slots.
-    /// Uses <see cref="IDirectGpuBackend.AllocateWorkspaceBuffer"/> for a single GPU allocation.
+    /// When the backend implements <see cref="IGpuBatchExecution"/>, uses its
+    /// AllocateWorkspaceBuffer; otherwise falls back to AllocateBuffer.
     /// </summary>
     public void Allocate()
     {
