@@ -9390,19 +9390,18 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             var inputFloats = (float[])(object)input.GetDataArray();
-#if NET5_0_OR_GREATER
-            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
-#else
-            var outputFloats = new float[inputFloats.Length];
-#endif
+            // Use TensorAllocator.Rent to get pooled output — avoids 2MB GC allocation per call
+            var result = TensorAllocator.Rent<T>(input.Shape);
+            var outputFloats = (float[])(object)result.GetDataArray();
             SoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
-            return (Tensor<T>)(object)new Tensor<float>(input.Shape, Vector<float>.FromMemory(outputFloats));
+            return result;
         }
 
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var outputDataGeneric = new T[inputData.Length];
+        var result2 = TensorAllocator.Rent<T>(input.Shape);
+        var outputDataGeneric = result2.GetDataArray();
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
@@ -9436,7 +9435,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(outputDataGeneric));
+        return result2;
     }
 
     /// <summary>
@@ -16111,13 +16110,11 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             var inputFloats = (float[])(object)tensor.GetDataArray();
-#if NET5_0_OR_GREATER
-            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
-#else
-            var outputFloats = new float[inputFloats.Length];
-#endif
+            // Use TensorAllocator.Rent to get pooled output — avoids 2MB GC allocation per call
+            var result = TensorAllocator.Rent<T>(tensor.Shape);
+            var outputFloats = (float[])(object)result.GetDataArray();
             LogSoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
-            return (Tensor<T>)(object)new Tensor<float>(tensor.Shape, Vector<float>.FromMemory(outputFloats));
+            return result;
         }
 
         // Generic scalar fallback

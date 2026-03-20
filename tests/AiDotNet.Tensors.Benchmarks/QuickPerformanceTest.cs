@@ -19,6 +19,11 @@ public static class QuickPerformanceTest
         Console.WriteLine(TensorPrimitivesCore.GetHardwareAccelerationInfo());
         Console.WriteLine();
 
+        Console.WriteLine($"BLAS Status:");
+        Console.WriteLine($"  Available: {AiDotNet.Tensors.Helpers.BlasProvider.IsAvailable}");
+        Console.WriteLine($"  Backend:   {AiDotNet.Tensors.Helpers.BlasProvider.BackendName}");
+        Console.WriteLine();
+
         int[] sizes = { 1000, 10000, 100000 };
 
         foreach (int size in sizes)
