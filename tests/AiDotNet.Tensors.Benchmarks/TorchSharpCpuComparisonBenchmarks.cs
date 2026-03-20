@@ -88,6 +88,9 @@ public class TorchSharpCpuComparisonBenchmarks
     private TorchTensor? _torchDoubleConvInput;
     private TorchTensor? _torchDoubleConvKernel;
 
+    // Pre-allocated workspace output tensors for zero-alloc benchmarks
+    private Tensor<float>? _wsOutputLarge;  // LargeSize (1M) float output
+
     private int _convStride;
     private int _convPadding;
     private int _convDilation;
@@ -144,6 +147,10 @@ public class TorchSharpCpuComparisonBenchmarks
         InitializeBackwardData();
         InitializeAttention();
         InitializeDoublePrecision();
+
+        // Pre-allocate workspace output tensors for zero-alloc benchmarks
+        _wsOutputLarge = TensorAllocator.Rent<float>(new[] { LargeSize });
+
         Warmup();
     }
 
@@ -604,6 +611,45 @@ public class TorchSharpCpuComparisonBenchmarks
     {
         using var result = torch.nn.functional.leaky_relu(_torchVectorsA[LargeSize], 0.01);
         ConsumeTorchResult(result);
+    }
+
+    #endregion
+
+    #region Zero-Alloc Element-wise (TensorWorkspace proof)
+
+    [Benchmark]
+    public void AiDotNet_Subtract_ZeroAlloc()
+    {
+        if (_wsOutputLarge is null || _aiVectorsA[LargeSize] is null) return;
+        _cpuEngine.TensorSubtractInto(_wsOutputLarge, _aiVectorsA[LargeSize], _aiVectorsB[LargeSize]);
+    }
+
+    [Benchmark]
+    public void AiDotNet_Exp_ZeroAlloc()
+    {
+        if (_wsOutputLarge is null || _aiVectorsA[LargeSize] is null) return;
+        _cpuEngine.TensorExpInto(_wsOutputLarge, _aiVectorsA[LargeSize]);
+    }
+
+    [Benchmark]
+    public void AiDotNet_Log_ZeroAlloc()
+    {
+        if (_wsOutputLarge is null || _aiVectorsA[LargeSize] is null) return;
+        _cpuEngine.TensorLogInto(_wsOutputLarge, _aiVectorsA[LargeSize]);
+    }
+
+    [Benchmark]
+    public void AiDotNet_Tanh_ZeroAlloc()
+    {
+        if (_wsOutputLarge is null || _aiVectorsA[LargeSize] is null) return;
+        _cpuEngine.TanhInto(_wsOutputLarge, _aiVectorsA[LargeSize]);
+    }
+
+    [Benchmark]
+    public void AiDotNet_GELU_ZeroAlloc()
+    {
+        if (_wsOutputLarge is null || _aiVectorsA[LargeSize] is null) return;
+        _cpuEngine.GELUInto(_wsOutputLarge, _aiVectorsA[LargeSize]);
     }
 
     #endregion
