@@ -1226,19 +1226,130 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result != null ? new Tensor<T>(result, tensor.Shape) : base.TensorMultiplyScalar(tensor, scalar);
     }
 
-    // In-place operations: GPU engines fall back to CpuEngine base implementations.
-    // GPU backends can override these with kernel-level in-place ops for zero-copy performance.
-    void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorAddInPlace(a, b);
-    void IEngine.TensorAddInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b) => base.TensorAddInto(dest, a, b);
-    void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorMultiplyInPlace(a, b);
-    void IEngine.TensorMultiplyInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b) => base.TensorMultiplyInto(dest, a, b);
-    void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b) => base.TensorBroadcastAddInPlace(a, b);
-    void IEngine.SigmoidInPlace<T>(Tensor<T> tensor) => base.SigmoidInPlace(tensor);
-    void IEngine.SigmoidInto<T>(Tensor<T> dest, Tensor<T> input) => base.SigmoidInto(dest, input);
-    void IEngine.ReLUInPlace<T>(Tensor<T> tensor) => base.ReLUInPlace(tensor);
-    void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input) => base.ReLUInto(dest, input);
-    void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation) => base.Conv2DInto(output, input, kernel, stride, padding, dilation);
-    void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance) => base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+    // GPU-accelerated in-place operations.
+    // Uses the same GPU buffer for input and output where safe (element-wise ops).
+    // Falls back to CpuEngine base when GPU is not available.
+
+    void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (ShapesMatch(a.Shape, b.Shape) && TryRunBinaryInPlace(a, b,
+            static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
+            return;
+        base.TensorAddInPlace(a, b);
+    }
+
+    void IEngine.TensorAddInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
+    {
+        // Use allocating GPU path and copy result
+        var result = ((IEngine)this).TensorAdd(a, b);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (ShapesMatch(a.Shape, b.Shape) && TryRunBinaryInPlace(a, b,
+            static (backend, bufA, bufB, size) => backend.Multiply(bufA, bufB, bufA, size)))
+            return;
+        base.TensorMultiplyInPlace(a, b);
+    }
+
+    void IEngine.TensorMultiplyInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
+    {
+        var result = ((IEngine)this).TensorMultiply(a, b);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // GPU broadcast requires same shapes; fall back to CPU for broadcasting
+        base.TensorBroadcastAddInPlace(a, b);
+    }
+
+    void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
+    {
+        if (TryRunUnaryInPlace(tensor,
+            static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
+            return;
+        base.SigmoidInPlace(tensor);
+    }
+
+    void IEngine.SigmoidInto<T>(Tensor<T> dest, Tensor<T> input)
+    {
+        var result = ((IEngine)this).Sigmoid(input);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
+    {
+        if (TryRunUnaryInPlace(tensor,
+            static (backend, buf, size) => backend.Relu(buf, buf, size)))
+            return;
+        base.ReLUInPlace(tensor);
+    }
+
+    void IEngine.ReLUInto<T>(Tensor<T> dest, Tensor<T> input)
+    {
+        var result = ((IEngine)this).ReLU(input);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
+    {
+        // Conv2D is not safe for in-place (output != input shape), use CPU path
+        base.Conv2DInto(output, input, kernel, stride, padding, dilation);
+    }
+
+    void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    {
+        base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+    }
+
+    /// <summary>
+    /// Runs a binary GPU operation in-place on tensor a: a = op(a, b).
+    /// Uploads a and b to GPU, runs kernel with a's buffer as output, downloads back.
+    /// </summary>
+    private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
+    {
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        if (aData.Length != bData.Length)
+            return false;
+
+        using var bufferA = GetOrAllocateBuffer(backend, aData);
+        using var bufferB = GetOrAllocateBuffer(backend, bData);
+
+        op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
+
+        // Download result back into a's backing array
+        float[] resultFloat = backend.DownloadBuffer(bufferA.Buffer);
+        var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        Array.Copy(resultT, aData, aData.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Runs a unary GPU operation in-place on tensor: tensor = op(tensor).
+    /// Uploads tensor to GPU, runs kernel with same buffer as input and output, downloads back.
+    /// </summary>
+    private bool TryRunUnaryInPlace<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
+    {
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        var data = tensor.GetDataArray();
+        using var buffer = GetOrAllocateBuffer(backend, data);
+
+        op(backend, buffer.Buffer, data.Length);
+
+        // Download result back into tensor's backing array
+        float[] resultFloat = backend.DownloadBuffer(buffer.Buffer);
+        var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+        Array.Copy(resultT, data, data.Length);
+        return true;
+    }
 
     Tensor<T> IEngine.TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
