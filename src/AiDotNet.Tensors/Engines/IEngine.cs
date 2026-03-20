@@ -1908,6 +1908,61 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b);
 
+    #region In-Place and Into Operations (Zero-Allocation)
+
+    /// <summary>
+    /// Adds tensor b into tensor a in-place: a[i] += b[i]. Zero allocation.
+    /// </summary>
+    void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Adds two tensors into a pre-allocated destination: dest[i] = a[i] + b[i]. Zero allocation.
+    /// </summary>
+    void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Multiplies tensor b into tensor a element-wise in-place: a[i] *= b[i]. Zero allocation.
+    /// </summary>
+    void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Multiplies two tensors element-wise into a pre-allocated destination: dest[i] = a[i] * b[i]. Zero allocation.
+    /// </summary>
+    void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Adds tensor b to tensor a in-place with broadcasting: a += broadcast(b). Zero allocation.
+    /// Essential for bias addition in Conv/Dense layers without allocating a new output tensor.
+    /// </summary>
+    void TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Applies sigmoid activation in-place: tensor[i] = 1 / (1 + exp(-tensor[i])). Zero allocation.
+    /// </summary>
+    void SigmoidInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes sigmoid into a pre-allocated destination: dest[i] = sigmoid(input[i]). Zero allocation.
+    /// </summary>
+    void SigmoidInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Applies ReLU activation in-place: tensor[i] = max(0, tensor[i]). Zero allocation.
+    /// </summary>
+    void ReLUInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes ReLU into a pre-allocated destination: dest[i] = max(0, input[i]). Zero allocation.
+    /// </summary>
+    void ReLUInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>
+    /// Computes Group Normalization into a pre-allocated output tensor. Zero allocation.
+    /// </summary>
+    void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
+
+    #endregion
+
     /// <summary>
     /// Subtracts two tensors element-wise with NumPy-style broadcasting.
     /// </summary>

@@ -2104,6 +2104,61 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public void TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var aSpan = a.Data.Span;
+        var bSpan = b.Data.Span;
+
+        // Fast path: same shape — no broadcasting needed
+        if (ShapesMatch(a.Shape, b.Shape))
+        {
+            for (int i = 0; i < aSpan.Length; i++)
+                aSpan[i] = numOps.Add(aSpan[i], bSpan[i]);
+            return;
+        }
+
+        // Conv bias pattern: a=[B,C,H,W], b=[1,C,1,1] — most common case
+        if (a.Rank == 4 && b.Rank == 4 &&
+            b.Shape[0] == 1 && b.Shape[2] == 1 && b.Shape[3] == 1 &&
+            a.Shape[1] == b.Shape[1])
+        {
+            int batch = a.Shape[0];
+            int channels = a.Shape[1];
+            int spatial = a.Shape[2] * a.Shape[3];
+
+            for (int n = 0; n < batch; n++)
+            {
+                for (int c = 0; c < channels; c++)
+                {
+                    T biasVal = bSpan[c];
+                    int offset = (n * channels + c) * spatial;
+                    for (int s = 0; s < spatial; s++)
+                    {
+                        aSpan[offset + s] = numOps.Add(aSpan[offset + s], biasVal);
+                    }
+                }
+            }
+            return;
+        }
+
+        // General fallback: compute broadcast result and copy back
+        var result = TensorBroadcastAdd(a, b);
+        result.Data.Span.CopyTo(aSpan);
+    }
+
+    /// <inheritdoc/>
+    public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    {
+        // Delegate to the allocating version and copy result into pre-allocated output
+        var result = GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        result.Data.Span.CopyTo(output.Data.Span);
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
