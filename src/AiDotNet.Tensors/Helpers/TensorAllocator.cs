@@ -43,22 +43,17 @@ public static class TensorAllocator
 
 #if NET5_0_OR_GREATER
         // Large tensors: use ArrayPool to avoid GC pressure from repeated allocations
+        // Large tensors: use ArrayPool for GC pressure reduction
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Zero-fill the active region for correctness under concurrent access.
-            // When T contains references, clear the full array so stale objects in the
-            // tail [totalSize, pooled.Length) aren't kept alive via _pooledArray.
             Array.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium tensors: use zero-initialized allocation for correctness.
-        // GC.AllocateUninitializedArray skips zeroing for performance, but this
-        // causes stale-data races when tensors are allocated concurrently (e.g.,
-        // parallel test execution or multi-threaded model training).
+        // Small tensors: standard managed allocation
         T[] array = new T[totalSize];
         var mem = new Memory<T>(array);
         return Tensor<T>.FromMemory(mem, shape);
