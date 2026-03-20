@@ -495,6 +495,52 @@ public class TensorLevelOpsTests
         }
     }
 
+    [Fact]
+    public void TensorConv2D_Double_AllOnesKernel_ReturnsWindowSum()
+    {
+        var engine = new CpuEngine();
+        // [1, 1, 4, 4] input all ones, [1, 1, 3, 3] kernel all ones
+        // Each output = sum of 3x3 window of 1s = 9
+        var input = new Tensor<double>(new[] { 1, 1, 4, 4 });
+        for (int i = 0; i < 16; i++)
+            input.AsWritableSpan()[i] = 1.0;
+
+        var kernel = new Tensor<double>(new[] { 1, 1, 3, 3 });
+        for (int i = 0; i < 9; i++)
+            kernel.AsWritableSpan()[i] = 1.0;
+
+        var result = engine.TensorConv2D(input, kernel, stride: 1, padding: 0);
+
+        Assert.Equal(new[] { 1, 1, 2, 2 }, result.Shape);
+        for (int i = 0; i < result.Length; i++)
+            Assert.Equal(9.0, result.AsSpan()[i], 1e-10);
+    }
+
+    [Fact]
+    public void TensorConv2D_Double_DistinctBatches_CorrectOutputValues()
+    {
+        var engine = new CpuEngine();
+        // [2, 1, 3, 3] input — batch 0 all 1s, batch 1 all 2s
+        var input = new Tensor<double>(new[] { 2, 1, 3, 3 });
+        var inSpan = input.AsWritableSpan();
+        for (int i = 0; i < 9; i++) inSpan[i] = 1.0;      // batch 0
+        for (int i = 9; i < 18; i++) inSpan[i] = 2.0;     // batch 1
+
+        // [1, 1, 3, 3] kernel all 1s → output is sum of 3x3 window
+        var kernel = new Tensor<double>(new[] { 1, 1, 3, 3 });
+        for (int i = 0; i < 9; i++)
+            kernel.AsWritableSpan()[i] = 1.0;
+
+        var result = engine.TensorConv2D(input, kernel, stride: 1, padding: 0);
+
+        // Output: [2, 1, 1, 1] — each batch produces a single value
+        Assert.Equal(new[] { 2, 1, 1, 1 }, result.Shape);
+        // batch 0: sum of 9 ones = 9
+        Assert.Equal(9.0, result.AsSpan()[0], 1e-10);
+        // batch 1: sum of 9 twos = 18
+        Assert.Equal(18.0, result.AsSpan()[1], 1e-10);
+    }
+
     #endregion
 
     #region API Consistency

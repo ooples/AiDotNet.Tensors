@@ -492,4 +492,214 @@ internal static class Im2ColHelper
             }
         }
     }
+
+    #region Double Precision Support
+
+    /// <summary>
+    /// Performs im2col transformation for double precision tensors.
+    /// Same algorithm as the float version but operates on double data.
+    /// </summary>
+    public static void Im2Col(
+        ReadOnlySpan<double> input,
+        Span<double> output,
+        int batch,
+        int channels,
+        int height,
+        int width,
+        int kernelH,
+        int kernelW,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        int effectiveKernelH = dilationH * (kernelH - 1) + 1;
+        int effectiveKernelW = dilationW * (kernelW - 1) + 1;
+        int outputH = (height + 2 * padH - effectiveKernelH) / strideH + 1;
+        int outputW = (width + 2 * padW - effectiveKernelW) / strideW + 1;
+
+        int colH = channels * kernelH * kernelW;
+        int colW = outputH * outputW;
+        int inputImageSize = channels * height * width;
+
+        for (int b = 0; b < batch; b++)
+        {
+            int inputOffset = b * inputImageSize;
+            int outputOffset = b * colH * colW;
+
+            Im2ColSingleImageDouble(
+                input.Slice(inputOffset, inputImageSize),
+                output.Slice(outputOffset, colH * colW),
+                channels, height, width,
+                kernelH, kernelW,
+                strideH, strideW,
+                padH, padW,
+                dilationH, dilationW,
+                outputH, outputW);
+        }
+    }
+
+    private static unsafe void Im2ColSingleImageDouble(
+        ReadOnlySpan<double> input,
+        Span<double> output,
+        int channels,
+        int height,
+        int width,
+        int kernelH,
+        int kernelW,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW,
+        int outputH,
+        int outputW)
+    {
+        int colH = channels * kernelH * kernelW;
+        int colW = outputH * outputW;
+
+        if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1)
+        {
+            output.Slice(0, colH * colW).Clear();
+
+            fixed (double* inputPtr = input)
+            fixed (double* outputPtr = output)
+            {
+                int owValidStart = Math.Max(0, padW);
+                int owValidEnd = Math.Min(outputW, width + padW);
+
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        int ohStart = Math.Max(0, padH - kh);
+                        int ohEnd = Math.Min(outputH, height + padH - kh);
+
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            int owStart = Math.Max(owValidStart, padW - kw);
+                            int owEnd = Math.Min(owValidEnd, width + padW - kw);
+                            int validWidth = owEnd - owStart;
+
+                            if (validWidth > 0 && ohEnd > ohStart)
+                            {
+                                double* outRow = outputPtr + rowIdx * colW;
+
+                                for (int oh = ohStart; oh < ohEnd; oh++)
+                                {
+                                    int ih = oh + kh - padH;
+                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
+                                    int outputStart = oh * outputW + owStart;
+
+                                    Buffer.MemoryCopy(
+                                        inputPtr + inputStart,
+                                        outRow + outputStart,
+                                        validWidth * sizeof(double),
+                                        validWidth * sizeof(double));
+                                }
+                            }
+
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            fixed (double* inputPtr = input)
+            fixed (double* outputPtr = output)
+            {
+                int rowIdx = 0;
+                for (int c = 0; c < channels; c++)
+                {
+                    int channelOffset = c * height * width;
+
+                    for (int kh = 0; kh < kernelH; kh++)
+                    {
+                        for (int kw = 0; kw < kernelW; kw++)
+                        {
+                            double* outRow = outputPtr + rowIdx * colW;
+                            int colIdx = 0;
+
+                            for (int oh = 0; oh < outputH; oh++)
+                            {
+                                int ih = oh * strideH + kh * dilationH - padH;
+
+                                for (int ow = 0; ow < outputW; ow++)
+                                {
+                                    int iw = ow * strideW + kw * dilationW - padW;
+
+                                    double val = 0.0;
+                                    if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    {
+                                        val = inputPtr[channelOffset + ih * width + iw];
+                                    }
+
+                                    outRow[colIdx++] = val;
+                                }
+                            }
+
+                            rowIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Blocked matrix multiplication for double precision.
+    /// C = A @ B where A is [m, k], B is [k, n], C is [m, n]
+    /// </summary>
+    internal static void MultiplyMatrixBlockedDouble(
+        ReadOnlySpan<double> a,
+        ReadOnlySpan<double> b,
+        Span<double> c,
+        int m,
+        int k,
+        int n)
+    {
+        const int BlockSize = 64;
+
+        c.Clear();
+
+        for (int ii = 0; ii < m; ii += BlockSize)
+        {
+            int iEnd = Math.Min(ii + BlockSize, m);
+
+            for (int kk = 0; kk < k; kk += BlockSize)
+            {
+                int kEnd = Math.Min(kk + BlockSize, k);
+
+                for (int jj = 0; jj < n; jj += BlockSize)
+                {
+                    int jEnd = Math.Min(jj + BlockSize, n);
+
+                    for (int i = ii; i < iEnd; i++)
+                    {
+                        for (int kIdx = kk; kIdx < kEnd; kIdx++)
+                        {
+                            double aik = a[i * k + kIdx];
+                            int bRowOffset = kIdx * n + jj;
+                            int cRowOffset = i * n + jj;
+
+                            for (int j = 0; j < jEnd - jj; j++)
+                            {
+                                c[cRowOffset + j] += aik * b[bRowOffset + j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #endregion
 }

@@ -5,12 +5,11 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Low-level tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
-/// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for correctness under concurrent access.
-/// <see cref="RentUninitialized{T}"/> returns uninitialized memory for callers that will
-/// immediately overwrite all elements (e.g., weight initialization, copy targets).
-/// Callers should prefer <see cref="TensorPool"/> which gates all paths through
-/// <see cref="TensorPool.Enabled"/> before delegating here.
+/// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
+/// All methods respect <see cref="TensorPool.Enabled"/>; when disabled, they fall back to
+/// standard non-pooled allocation. <see cref="Rent{T}(int[])"/> returns zero-initialized memory.
+/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ for callers that
+/// will immediately overwrite all elements. Return pooled tensors via <see cref="TensorPool.Return{T}"/>.
 /// </summary>
 public static class TensorAllocator
 {
@@ -32,7 +31,7 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        if (totalSize == 0)
+        if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape);
         }
@@ -82,7 +81,7 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        if (totalSize == 0)
+        if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape);
         }
@@ -123,7 +122,7 @@ public static class TensorAllocator
                 $"Data length ({data.Length}) must match shape total ({totalSize}).",
                 nameof(data));
 
-        if (totalSize == 0)
+        if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape, data);
         }
@@ -154,10 +153,7 @@ public static class TensorAllocator
 
     /// <summary>
     /// Returns a tensor's backing array to the pool if it was pooled.
-    /// SAFETY: The caller MUST ensure the tensor is never accessed after this call.
-    /// The tensor's Memory still references the returned array — any access after
-    /// Return is undefined behavior (data corruption from reuse).
-    /// Only call this for internal temporaries that immediately go out of scope.
+    /// External callers should use <see cref="TensorPool.Return{T}"/> instead.
     /// </summary>
     internal static void Return<T>(Tensor<T>? tensor)
     {
