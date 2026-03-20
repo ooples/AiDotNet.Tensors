@@ -482,8 +482,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             // Insert barrier between dispatches to ensure data dependencies
             if (_batchDispatchCount > 0)
             {
-                // Use a global memory barrier (via IntPtr to avoid needing VkMemoryBarrier struct)
-                // This ensures all prior compute shader writes are visible to subsequent reads
+                // Full execution + memory dependency barrier between compute dispatches.
+                // Uses execution dependency (no VkMemoryBarrier struct needed since
+                // Vulkan guarantees that a pipeline barrier with matching stage masks
+                // also creates a memory dependency for storage buffer accesses when
+                // the stages are COMPUTE_SHADER_BIT on both sides).
+                // NOTE: For strict correctness with independent buffer sets, per-buffer
+                // VkBufferMemoryBarriers would be more precise but require tracking
+                // which buffers each dispatch accesses.
                 VulkanNativeBindings.vkCmdPipelineBarrier(
                     batchCmd,
                     (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

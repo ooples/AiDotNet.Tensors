@@ -214,16 +214,18 @@ public sealed class MemoryPlanner
             var workspace = new TensorWorkspace<T>();
             for (int i = 0; i < SlotCount; i++)
             {
-                // Skip zero-size slots (can occur from dummy pin operations)
-                if (AllocationPlan.SlotSizes[i] <= 0) continue;
-                // Ensure all dimensions are positive
-                bool validShape = true;
-                foreach (int dim in SlotShapes[i])
-                {
-                    if (dim <= 0) { validShape = false; break; }
-                }
+                // Register all slots to maintain slot ID alignment with AllocationPlan.
+                // Zero-size or invalid-shape slots get a minimum [1] shape placeholder
+                // to preserve the 1:1 mapping between slot IDs and workspace indices.
+                bool validShape = AllocationPlan.SlotSizes[i] > 0;
                 if (validShape)
-                    workspace.Register(SlotShapes[i]);
+                {
+                    foreach (int dim in SlotShapes[i])
+                    {
+                        if (dim <= 0) { validShape = false; break; }
+                    }
+                }
+                workspace.Register(validShape ? SlotShapes[i] : new[] { 1 });
             }
             workspace.Allocate();
             return workspace;
