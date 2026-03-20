@@ -42,8 +42,25 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Large tensors: use ArrayPool to avoid GC pressure from repeated allocations
-        // Large tensors: use ArrayPool for GC pressure reduction
+        // Large tensors: use NativeMemory for zero GC pressure (matches TorchSharp's pattern)
+        // NativeMemoryOwner<T> provides Memory<T> backed by native memory — 64-byte aligned,
+        // already pinned, zero GC overhead. Tensor becomes a thin wrapper (48 bytes managed).
+        if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
+                return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
+                return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
+            }
+            // Non-float/double unmanaged types: fall through to ArrayPool
+        }
+
+        // Large tensors for reference types or fallback: use ArrayPool
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
