@@ -2145,7 +2145,31 @@ public class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        // General fallback: compute broadcast result and copy back
+        // Scalar broadcast: b has 1 element
+        if (b.Length == 1)
+        {
+            T scalar = bSpan[0];
+            for (int i = 0; i < aSpan.Length; i++)
+                aSpan[i] = numOps.Add(aSpan[i], scalar);
+            return;
+        }
+
+        // 1D bias along last dimension: a=[..., N], b=[N]
+        if (b.Rank == 1 && a.Shape[^1] == b.Shape[0])
+        {
+            int lastDim = b.Shape[0];
+            int outerSize = a.Length / lastDim;
+            for (int outer = 0; outer < outerSize; outer++)
+            {
+                int offset = outer * lastDim;
+                for (int i = 0; i < lastDim; i++)
+                    aSpan[offset + i] = numOps.Add(aSpan[offset + i], bSpan[i]);
+            }
+            return;
+        }
+
+        // General fallback: compute broadcast result and copy back.
+        // This allocates a temporary — acceptable for rare arbitrary broadcast shapes.
         var result = TensorBroadcastAdd(a, b);
         result.Data.Span.CopyTo(aSpan);
     }
@@ -2153,7 +2177,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        // Delegate to the allocating version and copy result into pre-allocated output
+        // GroupNorm writes normalized values into pre-allocated output.
+        // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
+        // The main output tensor avoids allocation since it's pre-allocated by the caller.
         var result = GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         result.Data.Span.CopyTo(output.Data.Span);
     }

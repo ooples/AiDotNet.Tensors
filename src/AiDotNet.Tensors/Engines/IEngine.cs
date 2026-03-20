@@ -1957,7 +1957,10 @@ public interface IEngine
     void ReLUInto<T>(Tensor<T> destination, Tensor<T> input);
 
     /// <summary>
-    /// Computes Group Normalization into a pre-allocated output tensor. Zero allocation.
+    /// Computes Group Normalization into a pre-allocated output tensor.
+    /// The main output avoids allocation since it's pre-allocated by the caller.
+    /// The mean and variance stats are small tensors [batch, numGroups] allocated by the callee
+    /// (needed for backward pass; negligible size compared to the feature map output).
     /// </summary>
     void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
@@ -2724,6 +2727,7 @@ public interface IEngine
 
     /// <summary>
     /// Performs 2D convolution into a pre-allocated output tensor (zero-allocation forward pass).
+    /// OVERWRITES the output tensor completely — previous contents are discarded.
     /// The output tensor must have correct shape [batch, out_channels, output_height, output_width].
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
