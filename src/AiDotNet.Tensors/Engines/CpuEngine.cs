@@ -9538,27 +9538,22 @@ public class CpuEngine : ITensorLevelEngine
                     int startChannel = g * channelsPerGroup;
                     int batchOffset = b * channels * spatialSize;
 
-                    // Fused mean computation
+                    // SIMD-accelerated mean computation
                     float sum = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                            sum += inputData[chanOff + s];
+                        sum += SimdSumFloat(inputData, chanOff, spatialSize);
                     }
                     float groupMean = sum / groupSize;
                     meanLocal[idx] = groupMean;
 
-                    // Fused variance computation
+                    // SIMD-accelerated variance computation
                     float sumSq = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            float diff = inputData[chanOff + s] - groupMean;
-                            sumSq += diff * diff;
-                        }
+                        sumSq += SimdSumSquaredDiffFloat(inputData, chanOff, spatialSize, groupMean);
                     }
                     float groupVar = sumSq / groupSize;
                     varLocal[idx] = groupVar;
@@ -9578,6 +9573,74 @@ public class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+    }
+
+    /// <summary>SIMD-accelerated sum of float array segment.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SimdSumFloat(float[] data, int offset, int count)
+    {
+        float sum = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && count >= 32)
+        {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = count & ~31;
+            for (; i < simdLen; i += 32)
+            {
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, SimdKernels.ReadVector256(data.AsSpan(), offset + i));
+                vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 8));
+                vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 16));
+                vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 24));
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            sum = SimdKernels.HorizontalSum(vsum0);
+        }
+#endif
+        for (; i < count; i++)
+            sum += data[offset + i];
+        return sum;
+    }
+
+    /// <summary>SIMD-accelerated sum of squared differences: sum((x-mean)^2).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SimdSumSquaredDiffFloat(float[] data, int offset, int count, float mean)
+    {
+        float sumSq = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported && count >= 32)
+        {
+            var vmean = System.Runtime.Intrinsics.Vector256.Create(mean);
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = count & ~31;
+            for (; i < simdLen; i += 32)
+            {
+                var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i), vmean);
+                var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 8), vmean);
+                var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 16), vmean);
+                var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 24), vmean);
+                vsum0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, vsum0);
+                vsum1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, vsum1);
+                vsum2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, d2, vsum2);
+                vsum3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, d3, vsum3);
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            sumSq = SimdKernels.HorizontalSum(vsum0);
+        }
+#endif
+        for (; i < count; i++)
+        {
+            float diff = data[offset + i] - mean;
+            sumSq += diff * diff;
+        }
+        return sumSq;
     }
 
     private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)

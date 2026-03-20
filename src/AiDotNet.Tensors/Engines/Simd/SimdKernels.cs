@@ -125,9 +125,15 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
+                const int prefetchDist = 256 / sizeof(float);
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
+                    if (Sse.IsSupported && i + prefetchDist < length)
+                    {
+                        Sse.Prefetch0(a + i + prefetchDist);
+                        Sse.Prefetch0(b + i + prefetchDist);
+                    }
                     Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
                     Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
                     Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
@@ -159,9 +165,15 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
+                const int prefetchDist = 256 / sizeof(float);
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
+                    if (Sse.IsSupported && i + prefetchDist < length)
+                    {
+                        Sse.Prefetch0(a + i + prefetchDist);
+                        Sse.Prefetch0(b + i + prefetchDist);
+                    }
                     Avx.Store(result + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
                     Avx.Store(result + i + 8, Avx.Subtract(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
                     Avx.Store(result + i + 16, Avx.Subtract(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16)));
@@ -1300,7 +1312,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Relative error ~0.01% across the valid range [-87.3, 88.7].
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Exp(ReadOnlySpan<float> input, Span<float> output)
+        public static unsafe void Exp(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
             {
@@ -1311,7 +1323,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // Use Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
+            // Try MKL VML first — uses SVML intrinsics, 2-3x faster than our polynomial
+            if (Helpers.VmlProvider.IsAvailable && length >= 32)
+            {
+                fixed (float* pIn = input)
+                fixed (float* pOut = output)
+                {
+                    if (Helpers.VmlProvider.TryExp(pIn, pOut, length))
+                        return;
+                }
+            }
+
+            // Fallback: Cephes-style fast exp polynomial with explicit AVX2/FMA intrinsics.
             // This is ~8x faster than scalar MathF.Exp loop for large arrays.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
@@ -1350,19 +1373,28 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes element-wise exp(x) for double precision using scalar Math.Exp fallback.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Exp(ReadOnlySpan<double> input, Span<double> output)
+        public static unsafe void Exp(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
             {
                 throw new ArgumentException("Input and output spans must have the same length.");
             }
 
-            // Math.Exp is faster than our SIMD polynomial for standalone double exp
-            // (11th-order polynomial can't beat SVML/libc microcode).
-            // FastExpDouble256 is still used internally by Sigmoid/Tanh/GELU/Mish
-            // where it's combined with other SIMD ops that amortize the polynomial cost.
             int length = input.Length;
             int i = 0;
+
+#if NET5_0_OR_GREATER
+            // Try MKL VML for double exp — SVML vdExp
+            if (Helpers.VmlProvider.IsAvailable && length >= 16)
+            {
+                fixed (double* pIn = input)
+                fixed (double* pOut = output)
+                {
+                    if (Helpers.VmlProvider.TryExp(pIn, pOut, length))
+                        return;
+                }
+            }
+#endif
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
@@ -3046,7 +3078,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>Element-wise natural log using SIMD with Cephes-style polynomial approximation.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Log(ReadOnlySpan<float> input, Span<float> output)
+        public static unsafe void Log(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
@@ -3055,8 +3087,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
 
 #if NET5_0_OR_GREATER
-            // Use FastLog256 on ALL .NET versions — benchmarks prove SVML auto-vectorization
-            // does NOT work through Span indexing, so our polynomial is 5-20x faster.
+            // Try MKL VML first — uses SVML intrinsics
+            if (Helpers.VmlProvider.IsAvailable && length >= 32)
+            {
+                fixed (float* pIn = input)
+                fixed (float* pOut = output)
+                {
+                    if (Helpers.VmlProvider.TryLn(pIn, pOut, length))
+                        return;
+                }
+            }
+
+            // Fallback: FastLog256 polynomial.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 int simdLength = length & ~31;
@@ -3091,17 +3133,26 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>Element-wise natural log for double precision.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Log(ReadOnlySpan<double> input, Span<double> output)
+        public static unsafe void Log(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
                 throw new ArgumentException("Input and output spans must have the same length.");
 
-            // Math.Log is faster than our SIMD rational approximation for standalone double log
-            // (Padé rational with division can't beat SVML/libc microcode).
-            // FastLogDouble256 is still used internally by Mish and Pow where it's combined
-            // with other SIMD ops.
             int length = input.Length;
             int i = 0;
+
+#if NET5_0_OR_GREATER
+            // Try MKL VML for double log — SVML vdLn
+            if (Helpers.VmlProvider.IsAvailable && length >= 16)
+            {
+                fixed (double* pIn = input)
+                fixed (double* pOut = output)
+                {
+                    if (Helpers.VmlProvider.TryLn(pIn, pOut, length))
+                        return;
+                }
+            }
+#endif
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
@@ -4563,7 +4614,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
 #if NET5_0_OR_GREATER
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector256<float> ReadVector256(ReadOnlySpan<float> data, int offset)
+        internal static Vector256<float> ReadVector256(ReadOnlySpan<float> data, int offset)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
             ref float element = ref Unsafe.Add(ref start, offset);
@@ -4595,7 +4646,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float HorizontalSum(Vector256<float> v)
+        internal static float HorizontalSum(Vector256<float> v)
         {
             // SIMD shuffle reduction: no stack spill
             // Step 1: Add upper 128 bits to lower 128 bits
