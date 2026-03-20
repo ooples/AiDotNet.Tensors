@@ -217,6 +217,13 @@ class Program
             return;
         }
 
+        // Run layer-level benchmarks (ResBlock, Attention)
+        if (args[0] == "--layers")
+        {
+            BenchmarkRunner.Run<LayerLevelBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
