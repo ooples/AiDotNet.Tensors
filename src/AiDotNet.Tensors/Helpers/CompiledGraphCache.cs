@@ -74,12 +74,11 @@ public sealed class CompiledGraphCache
 
         Interlocked.Increment(ref _misses);
 
-        // Compile the graph
-        var plan = graph.Optimize();
-        var entry = new CacheEntry(plan, DateTime.UtcNow);
-        _cache.TryAdd(key, entry);
+        // Use GetOrAdd so only one thread's compilation wins for a given key
+        var graphRef = graph;
+        var entry = _cache.GetOrAdd(key, _ => new CacheEntry(graphRef.Optimize(), DateTime.UtcNow));
 
-        return plan;
+        return entry.Plan;
     }
 
     /// <summary>
@@ -91,7 +90,7 @@ public sealed class CompiledGraphCache
     }
 
     /// <summary>
-    /// Evicts cached graphs that haven't been used since the given cutoff.
+    /// Evicts cached graphs created before the given cutoff time.
     /// </summary>
     /// <param name="cutoff">Evict entries created before this time.</param>
     /// <returns>Number of entries evicted.</returns>

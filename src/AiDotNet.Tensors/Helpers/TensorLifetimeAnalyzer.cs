@@ -247,13 +247,32 @@ public sealed class TensorLifetimeAnalyzer
             if (inputRange.LastUse == opIdx && inputRange.Size == outputRange.Size &&
                 slotAssignments[inputId] >= 0 && slotAssignments[outputId] >= 0)
             {
-                // Assign output to input's slot (overwrite in place)
-                int oldSlot = slotAssignments[outputId];
-                slotAssignments[outputId] = slotAssignments[inputId];
-                inPlaceOps[opIdx] = (inputId, outputId);
+                int inputSlot = slotAssignments[inputId];
 
-                // Update slot tracking: the old output slot may now be unused
-                // (handled implicitly — slot sizes remain max of all occupants)
+                // Safety check: ensure no other tensor in the input's slot has a
+                // lifetime that strictly overlaps with the output's lifetime.
+                // A tensor produced at the same op where the output dies is safe
+                // (consumption before production at the same op index).
+                bool slotIsSafe = true;
+                for (int t = 0; t < tensorCount; t++)
+                {
+                    if (t == inputId || t == outputId) continue;
+                    if (slotAssignments[t] != inputSlot) continue;
+                    var tRange = liveRanges[t];
+                    // Conflict only if the other tensor is alive during the output's
+                    // exclusive live range (firstUse < other.lastUse AND other.firstUse < lastUse)
+                    if (tRange.FirstUse < outputRange.LastUse && outputRange.FirstUse < tRange.LastUse)
+                    {
+                        slotIsSafe = false;
+                        break;
+                    }
+                }
+
+                if (slotIsSafe)
+                {
+                    slotAssignments[outputId] = inputSlot;
+                    inPlaceOps[opIdx] = (inputId, outputId);
+                }
             }
         }
 
@@ -312,6 +331,11 @@ public sealed class TensorLifetimeAnalyzer
     /// </summary>
     public static TensorWorkspace<T> CreateWorkspace<T>(AllocationPlan plan, int[][] slotShapes)
     {
+        if (slotShapes.Length < plan.SlotCount)
+            throw new ArgumentException(
+                $"slotShapes length ({slotShapes.Length}) must be >= SlotCount ({plan.SlotCount}).",
+                nameof(slotShapes));
+
         var workspace = new TensorWorkspace<T>();
         for (int i = 0; i < plan.SlotCount; i++)
         {

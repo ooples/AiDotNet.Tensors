@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
@@ -82,7 +81,7 @@ public sealed class SizeClassPool<T>
     /// Callers must not access the buffer after returning it.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Return(T[] buffer)
+    public void Return(T[]? buffer)
     {
         if (buffer == null) return;
 

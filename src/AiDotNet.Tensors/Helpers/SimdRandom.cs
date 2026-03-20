@@ -81,8 +81,10 @@ public sealed class SimdRandom
                 var s1x5 = Multiply(vs1, Vector256.Create(5UL));
                 var result = Multiply(RotateLeft7(s1x5), Vector256.Create(9UL));
 
-                // Convert to double [0, 1): take upper 52 bits, set exponent to 1.0, subtract 1.0
-                var bits = Avx2.Or(Avx2.And(result, mantissaMask), exponentMask);
+                // Convert to double [0, 1): shift right 12 to use upper 52 bits (matches scalar path),
+                // then set exponent to 1.0, subtract 1.0
+                var shifted = Avx2.ShiftRightLogical(result, 12);
+                var bits = Avx2.Or(Avx2.And(shifted, mantissaMask), exponentMask);
                 var doubles = Avx.Subtract(bits.AsDouble(), one);
 
                 // Store 4 doubles
@@ -135,17 +137,17 @@ public sealed class SimdRandom
             for (; i < simdLength; i += 4)
             {
                 NextDoubles(temp);
-                destination[i] = (float)temp[0];
-                destination[i + 1] = (float)temp[1];
-                destination[i + 2] = (float)temp[2];
-                destination[i + 3] = (float)temp[3];
+                destination[i] = Math.Min((float)temp[0], 0.99999994f);
+                destination[i + 1] = Math.Min((float)temp[1], 0.99999994f);
+                destination[i + 2] = Math.Min((float)temp[2], 0.99999994f);
+                destination[i + 3] = Math.Min((float)temp[3], 0.99999994f);
             }
         }
 #endif
 
         for (; i < length; i++)
         {
-            destination[i] = (float)NextDoubleScalar();
+            destination[i] = Math.Min((float)NextDoubleScalar(), 0.99999994f);
         }
     }
 

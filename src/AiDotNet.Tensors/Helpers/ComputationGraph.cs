@@ -188,6 +188,14 @@ public sealed class ComputationGraph
     {
         ThrowIfNotCapturing();
 
+        // Validate all input IDs reference existing nodes
+        for (int i = 0; i < inputIds.Length; i++)
+        {
+            if (inputIds[i] < 0 || inputIds[i] >= _nodes.Count)
+                throw new ArgumentOutOfRangeException(nameof(inputIds),
+                    $"Input ID {inputIds[i]} at index {i} does not reference an existing node (0 to {_nodes.Count - 1}).");
+        }
+
         bool canInPlace = IsInPlaceEligible(type);
         int id = _nodes.Count;
         _nodes.Add(new GraphNode(id, type, (int[])inputIds.Clone(), (int[])outputShape.Clone(),
@@ -251,6 +259,12 @@ public sealed class ComputationGraph
                     node.OutputShape,
                     canInPlace: node.CanExecuteInPlace);
             }
+        }
+
+        // Pin output tensors so their slots are never recycled
+        foreach (int outputNodeId in _outputNodeIds)
+        {
+            planner.MarkOutput(nodeToTensor[outputNodeId]);
         }
 
         return planner.Plan();

@@ -1,6 +1,3 @@
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
@@ -146,7 +143,8 @@ public static class OptimizationPasses
 
         for (int i = 0; i < count; i++)
         {
-            foreach (int dep in nodes[i].InputIds)
+            // Deduplicate to prevent double-counting when InputIds has repeats
+            foreach (int dep in new HashSet<int>(nodes[i].InputIds))
             {
                 if (dep >= 0 && dep < count)
                     dependedBy[dep].Add(i);

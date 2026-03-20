@@ -31,6 +31,7 @@ public sealed class MemoryPlanner
     private readonly List<int[]> _tensorShapes = new();
     private readonly List<TensorLifetimeAnalyzer.Operation> _operations = new();
     private readonly HashSet<int> _externalInputs = new();
+    private readonly HashSet<int> _outputTensorIds = new();
     private int _nextTensorId;
 
     /// <summary>
@@ -44,6 +45,15 @@ public sealed class MemoryPlanner
         _tensorShapes.Add((int[])shape.Clone());
         _externalInputs.Add(id);
         return id;
+    }
+
+    /// <summary>
+    /// Marks a tensor as a graph output. Output tensors have their lifetimes
+    /// extended to the end of the graph so their slots are never recycled.
+    /// </summary>
+    public void MarkOutput(int tensorId)
+    {
+        _outputTensorIds.Add(tensorId);
     }
 
     /// <summary>
@@ -109,7 +119,22 @@ public sealed class MemoryPlanner
     /// <returns>A plan with slot assignments, sizes, and in-place operations.</returns>
     public MemoryPlan Plan()
     {
-        var ops = _operations.ToArray();
+        var opsList = new List<TensorLifetimeAnalyzer.Operation>(_operations);
+
+        // Pin output tensors by adding a dummy final operation that consumes them.
+        // This extends their lifetimes to the end of the graph so their slots
+        // are never recycled before execution completes.
+        if (_outputTensorIds.Count > 0)
+        {
+            var outputIds = new int[_outputTensorIds.Count];
+            int oi = 0;
+            foreach (int id in _outputTensorIds)
+                outputIds[oi++] = id;
+            opsList.Add(new TensorLifetimeAnalyzer.Operation(
+                inputs: outputIds, outputs: Array.Empty<int>(), outputSizes: Array.Empty<int>()));
+        }
+
+        var ops = opsList.ToArray();
         var inputIds = new int[_externalInputs.Count];
         int idx = 0;
         foreach (int id in _externalInputs)

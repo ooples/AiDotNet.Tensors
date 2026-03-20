@@ -2199,22 +2199,19 @@ public class CpuEngine : ITensorLevelEngine
     public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
         // output = GroupNorm(a + b)
-        // Use output as temp for the add, then GroupNorm in-place
+        // Step 1: Add a + b directly into output (zero alloc)
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), output.AsWritableSpan());
-        // Now GroupNorm the sum into output
-        var temp = GroupNorm(output, numGroups, gamma, beta, epsilon, out _, out _);
-        temp.Data.Span.CopyTo(output.Data.Span);
+        // Step 2: GroupNorm in-place on output via GroupNormInto
+        GroupNormInto(output, output, numGroups, gamma, beta, epsilon, out _, out _);
     }
 
     /// <inheritdoc/>
     public void SwishInPlace<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var span = tensor.AsWritableSpan();
-        var sigmoidBuf = new T[tensor.Length].AsSpan();
-        numOps.Sigmoid(tensor.AsSpan(), sigmoidBuf);
-        numOps.Multiply(tensor.AsSpan(), (ReadOnlySpan<T>)sigmoidBuf, span);
+        // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
+        numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -2344,8 +2341,50 @@ public class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
-        var result = TensorTranspose(input);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        if (axes == null || axes.Length == 0 ||
+            (input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0))
+        {
+            // Standard 2D transpose
+            var result = TensorTranspose(input);
+            result.Data.Span.CopyTo(destination.Data.Span);
+            return;
+        }
+
+        // General ND permutation: map each destination coord back to source
+        var srcShape = input.Shape;
+        var srcSpan = input.AsSpan();
+        var dstSpan = destination.AsWritableSpan();
+        int rank = srcShape.Length;
+
+        var srcStrides = new int[rank];
+        srcStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            srcStrides[d] = srcStrides[d + 1] * srcShape[d + 1];
+
+        var dstStrides = new int[rank];
+        var dstShape = destination.Shape;
+        dstStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            dstStrides[d] = dstStrides[d + 1] * dstShape[d + 1];
+
+        int totalElements = destination.Length;
+        var coords = new int[rank];
+
+        for (int dstIdx = 0; dstIdx < totalElements; dstIdx++)
+        {
+            int remaining = dstIdx;
+            for (int d = 0; d < rank; d++)
+            {
+                coords[d] = remaining / dstStrides[d];
+                remaining %= dstStrides[d];
+            }
+
+            int srcIdx = 0;
+            for (int d = 0; d < rank; d++)
+                srcIdx += coords[d] * srcStrides[axes[d]];
+
+            dstSpan[dstIdx] = srcSpan[srcIdx];
+        }
     }
 
     /// <inheritdoc/>
