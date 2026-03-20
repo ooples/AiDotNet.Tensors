@@ -2187,24 +2187,12 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        // Fused GroupNorm + Swish: avoids intermediate tensor
+        // Step 1: GroupNorm into output (single computation)
         GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
-        // Apply Swish in-place on the normalized output
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var span = output.AsWritableSpan();
-        var src = output.AsSpan();
-        numOps.Sigmoid(src, span); // span = sigmoid(output)
-        // Now span = sigmoid(gn), we need output * sigmoid(output)
-        // But we overwrote output with sigmoid. We need to keep the original.
-        // Fix: use a temp span approach
-        var gnResult = GroupNorm(input, numGroups, gamma, beta, epsilon, out _, out _);
-        gnResult.Data.Span.CopyTo(output.Data.Span);
-        // Compute swish: output[i] = output[i] * sigmoid(output[i])
-        var outputSpan = output.AsWritableSpan();
-        var inputSpan = output.AsSpan();
-        var temp = new T[output.Length].AsSpan();
-        numOps.Sigmoid(inputSpan, temp);
-        numOps.Multiply(inputSpan, (ReadOnlySpan<T>)temp, outputSpan);
+
+        // Step 2: Swish in-place on the normalized output
+        // swish(x) = x * sigmoid(x) — needs a temp buffer for sigmoid values
+        SwishInPlace(output);
     }
 
     /// <inheritdoc/>
@@ -2240,15 +2228,15 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInPlace<T>(Tensor<T> tensor)
     {
-        var result = TensorGELU(tensor);
-        result.Data.Span.CopyTo(tensor.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
 
     /// <inheritdoc/>
     public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
-        var result = TensorGELU(input);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -2268,32 +2256,36 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInPlace<T>(Tensor<T> tensor)
     {
-        var result = TensorMish(tensor);
-        result.Data.Span.CopyTo(tensor.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
     }
 
     /// <inheritdoc/>
     public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
-        var result = TensorMish(input);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
     public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
-        var result = TensorLeakyReLU(tensor, alpha);
-        result.Data.Span.CopyTo(tensor.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
     }
 
     /// <inheritdoc/>
     public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
     {
-        var result = TensorLeakyReLU(input, alpha);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// A future optimization would compute GEMM directly into destination memory.
+    /// </remarks>
     public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         var result = TensorMatMul(a, b);
@@ -2301,6 +2293,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// </remarks>
     public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
     {
         var result = Concat(tensors, axis);
@@ -2308,6 +2303,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// </remarks>
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
         var result = TensorTranspose(input);
