@@ -42,25 +42,17 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Large unmanaged tensors: POH-pinned managed array.
-        // POH arrays are never moved by GC (zero-cost Pin() for SIMD), and they provide
-        // a real T[] so GetDataArray() returns the backing array without copying.
-        // NativeMemory was previously used here but GetDataArray() returned a copy for
-        // NativeMemory-backed tensors (MemoryMarshal.TryGetArray fails), causing silent
-        // data loss on any write path — a critical correctness bug for tensors >= 256K.
-        if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-        {
-            T[] array = GC.AllocateUninitializedArray<T>(totalSize, pinned: true);
-            Array.Clear(array, 0, totalSize);
-            var memory = new Memory<T>(array);
-            return Tensor<T>.FromMemory(memory, shape);
-        }
-
-        // Large tensors for reference types: use ArrayPool
+        // Large tensors: ArrayPool-backed caching allocator.
+        // ArrayPool.Shared reuses buffers across Rent/Return cycles — after warmup,
+        // Rent is O(1) with zero allocation. This matches PyTorch's caching allocator
+        // pattern. Callers should call TensorPool.Return() when done, or the buffer
+        // will be reclaimed by GC (still correct, just misses the reuse opportunity).
+        // GetDataArray() works with ArrayPool buffers (relaxed offset-only check).
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            Array.Clear(pooled, 0, pooled.Length);
+            Array.Clear(pooled, 0,
+                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }

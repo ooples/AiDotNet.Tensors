@@ -460,8 +460,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorSubtract()
-        => _cpuEngine.TensorSubtract(_aiVectorsA[LargeSize], _aiVectorsB[LargeSize]);
+    public void AiDotNet_TensorSubtract()
+    {
+        var result = _cpuEngine.TensorSubtract(_aiVectorsA[LargeSize], _aiVectorsB[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Subtract()
@@ -471,8 +474,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorDivide()
-        => _cpuEngine.TensorDivide(_aiVectorsA[LargeSize], _aiVectorsB[LargeSize]);
+    public void AiDotNet_TensorDivide()
+    {
+        var result = _cpuEngine.TensorDivide(_aiVectorsA[LargeSize], _aiVectorsB[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Divide()
@@ -486,8 +492,11 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Unary Element-wise
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorExp()
-        => _cpuEngine.TensorExp(_aiVectorsA[LargeSize]);
+    public void AiDotNet_TensorExp()
+    {
+        var result = _cpuEngine.TensorExp(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Exp()
@@ -497,8 +506,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorLog()
-        => _cpuEngine.TensorLog(_aiVectorsA[LargeSize]);
+    public void AiDotNet_TensorLog()
+    {
+        var result = _cpuEngine.TensorLog(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Log()
@@ -508,8 +520,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorSqrt()
-        => _cpuEngine.TensorSqrt(_aiVectorsA[LargeSize]);
+    public void AiDotNet_TensorSqrt()
+    {
+        var result = _cpuEngine.TensorSqrt(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Sqrt()
@@ -519,8 +534,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TensorAbs()
-        => _cpuEngine.TensorAbs(_aiVectorsA[LargeSize]);
+    public void AiDotNet_TensorAbs()
+    {
+        var result = _cpuEngine.TensorAbs(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Abs()
@@ -534,10 +552,9 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Activations
 
     [Benchmark]
-    public Tensor<float> AiDotNet_ReLU()
+    public void AiDotNet_ReLU()
     {
         _cpuEngine.ReLUInPlace(_aiVectorsA[LargeSize]);
-        return _aiVectorsA[LargeSize];
     }
 
     [Benchmark]
@@ -548,10 +565,9 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_Sigmoid()
+    public void AiDotNet_Sigmoid()
     {
         _cpuEngine.SigmoidInPlace(_aiVectorsA[LargeSize]);
-        return _aiVectorsA[LargeSize];
     }
 
     [Benchmark]
@@ -570,8 +586,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_Tanh()
-        => _cpuEngine.TensorTanh(_aiVectorsA[LargeSize]);
+    public void AiDotNet_Tanh()
+    {
+        var result = _cpuEngine.TensorTanh(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Tanh()
@@ -581,8 +600,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_GELU()
-        => _cpuEngine.TensorGELU(_aiVectorsA[LargeSize]);
+    public void AiDotNet_GELU()
+    {
+        var result = _cpuEngine.TensorGELU(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_GELU()
@@ -592,8 +614,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_Mish()
-        => _cpuEngine.TensorMish(_aiVectorsA[LargeSize]);
+    public void AiDotNet_Mish()
+    {
+        var result = _cpuEngine.TensorMish(_aiVectorsA[LargeSize]);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_Mish()
@@ -603,8 +628,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_LeakyReLU()
-        => _cpuEngine.TensorLeakyReLU(_aiVectorsA[LargeSize], 0.01f);
+    public void AiDotNet_LeakyReLU()
+    {
+        var result = _cpuEngine.TensorLeakyReLU(_aiVectorsA[LargeSize], 0.01f);
+        TensorPool.Return(result);
+    }
 
     [Benchmark]
     public void TorchSharp_LeakyReLU()
@@ -709,7 +737,7 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Softmax
 
     [Benchmark]
-    public Tensor<float> AiDotNet_Softmax()
+    public void AiDotNet_Softmax()
         => _cpuEngine.TensorSoftmax(_aiSoftmaxInput!, axis: 1);
 
     [Benchmark]
@@ -729,7 +757,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_LogSoftmax()
+    public void AiDotNet_LogSoftmax()
         => _cpuEngine.TensorLogSoftmax(_aiSoftmaxInput!, axis: 1);
 
     [Benchmark]
@@ -744,7 +772,7 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Conv2D
 
     [Benchmark]
-    public Tensor<float> AiDotNet_Conv2D()
+    public void AiDotNet_Conv2D()
         => AiDotNetEngine.Current.Conv2D(_aiConvInput!, _aiConvKernel!, _convStride, _convPadding, _convDilation);
 
     [Benchmark]
@@ -764,7 +792,7 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Normalization
 
     [Benchmark]
-    public Tensor<float> AiDotNet_BatchNorm()
+    public void AiDotNet_BatchNorm()
         => _cpuEngine.BatchNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
 
     [Benchmark]
@@ -776,7 +804,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_LayerNorm()
+    public void AiDotNet_LayerNorm()
         => _cpuEngine.LayerNorm(_aiNormInput!, _aiNormGamma!, _aiNormBeta!, 1e-5, out _, out _);
 
     [Benchmark]
@@ -788,11 +816,11 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_GroupNorm()
+    public void AiDotNet_GroupNorm()
     {
         if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
             throw new InvalidOperationException("Setup not called");
-        return _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out _, out _);
+        _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out _, out _);
     }
 
     [Benchmark]
@@ -818,7 +846,7 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Pooling
 
     [Benchmark]
-    public Tensor<float> AiDotNet_MaxPool2D()
+    public void AiDotNet_MaxPool2D()
         => _cpuEngine.TensorMaxPool2D(_aiPoolInput!, poolSize: 3, stride: 2, padding: 1);
 
     [Benchmark]
@@ -833,7 +861,7 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Backward Passes
 
     [Benchmark]
-    public Tensor<float> AiDotNet_SigmoidBackward()
+    public void AiDotNet_SigmoidBackward()
         => _cpuEngine.SigmoidBackward(_aiGradOutput!, _aiSigmoidOutput!);
 
     [Benchmark]
@@ -847,7 +875,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<float> AiDotNet_TanhBackward()
+    public void AiDotNet_TanhBackward()
         => _cpuEngine.TanhBackward(_aiGradOutput!, _aiTanhOutput!);
 
     [Benchmark]
@@ -865,11 +893,13 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Attention Q@K^T
 
     [Benchmark]
-    public Tensor<float> AiDotNet_AttentionQKT()
+    public void AiDotNet_AttentionQKT()
     {
         // Q @ K^T for attention scores (512x64 @ 64x512 = 512x512)
         var keyT = _cpuEngine.TensorTranspose(_aiKeyMatrix!);
-        return _cpuEngine.TensorMatMul(_aiQueryMatrix!, keyT);
+        var result = _cpuEngine.TensorMatMul(_aiQueryMatrix!, keyT);
+        TensorPool.Return(result);
+        TensorPool.Return(keyT);
     }
 
     [Benchmark]
@@ -885,10 +915,10 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Double Precision
 
     [Benchmark]
-    public Tensor<double> AiDotNet_TensorAdd_Double()
+    public void AiDotNet_TensorAdd_Double()
     {
         var result = _cpuEngine.TensorAdd(_aiDoubleVectorA!, _aiDoubleVectorB!);
-        return result;
+        TensorPool.Return(result);
     }
 
     [Benchmark]
@@ -899,7 +929,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_MatMul_Double()
+    public void AiDotNet_MatMul_Double()
         => _cpuEngine.TensorMatMul(_aiDoubleMatA!, _aiDoubleMatB!);
 
     [Benchmark]
@@ -910,7 +940,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Sigmoid_Double()
+    public void AiDotNet_Sigmoid_Double()
         => _cpuEngine.Sigmoid(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -921,7 +951,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Exp_Double()
+    public void AiDotNet_Exp_Double()
         => _cpuEngine.TensorExp(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -932,7 +962,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Log_Double()
+    public void AiDotNet_Log_Double()
         => _cpuEngine.TensorLog(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -943,7 +973,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Tanh_Double()
+    public void AiDotNet_Tanh_Double()
         => _cpuEngine.TensorTanh(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -954,7 +984,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_GELU_Double()
+    public void AiDotNet_GELU_Double()
         => _cpuEngine.TensorGELU(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -965,7 +995,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Mish_Double()
+    public void AiDotNet_Mish_Double()
         => _cpuEngine.TensorMish(_aiDoubleVectorA!);
 
     [Benchmark]
@@ -976,7 +1006,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Softmax_Double()
+    public void AiDotNet_Softmax_Double()
         => _cpuEngine.TensorSoftmax(_aiDoubleSoftmaxInput!, axis: 1);
 
     [Benchmark]
@@ -987,7 +1017,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
-    public Tensor<double> AiDotNet_Conv2D_Double()
+    public void AiDotNet_Conv2D_Double()
         => _cpuEngine.Conv2D(_aiDoubleConvInput!, _aiDoubleConvKernel!, _convStride, _convPadding, _convDilation);
 
     [Benchmark]
