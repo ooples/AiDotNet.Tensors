@@ -42,16 +42,28 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Tier 1: Thread-local cache — zero allocation, zero contention.
-        // After warmup, this path hits on every call (same shapes used repeatedly).
-        T[]? cached = ThreadLocalTensorCache<T>.TryRent(
-            totalSize >= ArrayPoolThreshold ? 0 : totalSize); // only cache small; large go to ArrayPool
-        if (cached is null && totalSize >= ArrayPoolThreshold)
+        // Tier 1: NativeMemory for large unmanaged tensors (float/double).
+        // 64-byte aligned, zero GC overhead, zero-cost Pin().
+        // oneDNN/VML/SIMD operate directly on native memory — zero copy.
+        // GetDataArray() does lazy demotion to managed array only when needed.
+        if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
         {
-            // For large tensors, ArrayPool.Rent returns power-of-2 sizes.
-            // Cache by ArrayPool bucket size so we match on return.
-            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
+            if (typeof(T) == typeof(float))
+            {
+                var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
+                return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
+            }
+            if (typeof(T) == typeof(double))
+            {
+                var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
+                return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
+            }
         }
+
+        // Tier 2: Thread-local cache for managed arrays.
+        T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
+        if (cached is null && totalSize >= ArrayPoolThreshold)
+            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
             Array.Clear(cached, 0,
@@ -60,7 +72,7 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, cached);
         }
 
-        // Tier 2: ArrayPool — O(1) allocation with buffer reuse across threads.
+        // Tier 3: ArrayPool for large reference types.
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
@@ -70,7 +82,7 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Tier 3: Standard managed allocation for small tensors.
+        // Tier 4: Standard managed allocation for small tensors.
         T[] arr = new T[totalSize];
         var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);

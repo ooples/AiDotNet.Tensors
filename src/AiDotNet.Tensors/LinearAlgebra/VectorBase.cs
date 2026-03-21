@@ -26,14 +26,14 @@ public abstract class VectorBase<T>
     /// <para><b>Issue #693:</b> Memory&lt;T&gt; provides zero-copy slicing, better Span&lt;T&gt; interop,
     /// and integration with memory pooling.</para>
     /// </remarks>
-    protected readonly Memory<T> _memory;
+    protected Memory<T> _memory;
 
     /// <summary>
     /// Cached direct reference to the backing array for SIMD fast paths.
-    /// Eliminates Memory&lt;T&gt;.Span property overhead (~30ns per access).
-    /// May be null if Memory&lt;T&gt; is not backed by a simple array.
+    /// Null when backed by NativeMemory — populated on first GetDataArray() call
+    /// via lazy demotion (native → managed).
     /// </summary>
-    internal readonly T[]? _cachedArray;
+    internal T[]? _cachedArray;
 
     /// <summary>
     /// Optional memory owner for pooled memory management.
@@ -266,25 +266,35 @@ public abstract class VectorBase<T>
     }
 
     /// <summary>
-    /// Gets a reference to the underlying array without copying.
-    /// The returned array may be larger than <see cref="Length"/> when backed by ArrayPool
-    /// (which returns power-of-2 buffers). Callers MUST index by Length, not array.Length.
+    /// Gets a reference to the underlying array. For managed-backed tensors, returns the
+    /// backing array directly. For NativeMemory-backed tensors (large float/double), performs
+    /// lazy demotion: copies native → managed array, replaces _memory, and caches the array.
+    /// After demotion, the tensor is fully managed and all subsequent operations use the array.
+    /// Hot paths (Pin/Span) access native memory directly and never trigger demotion.
     /// </summary>
     internal T[] GetDataArray()
     {
+        // Fast path: already have a cached managed array
+        if (_cachedArray is not null)
+            return _cachedArray;
+
+        // Check if Memory<T> is backed by a managed array
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            // Return the backing array when offset is 0. The array may be larger than
-            // the logical length (ArrayPool/POH buffers), but all callers bound by
-            // tensor.Length so this is safe. Requiring Count == Array.Length caused
-            // GetDataArray() to return a copy for ArrayPool-backed tensors, silently
-            // losing writes — a critical correctness bug.
             if (segment.Offset == 0)
             {
+                _cachedArray = segment.Array;
                 return segment.Array;
             }
         }
-        return _memory.ToArray();
+
+        // Lazy demotion: NativeMemory-backed → copy to managed array, replace backing store.
+        // This is a one-time cost. After this, the tensor is fully managed.
+        // Hot paths (Softmax, Conv2D, MatMul) use Pin() and never reach here.
+        T[] array = _memory.ToArray();
+        _memory = new Memory<T>(array);
+        _cachedArray = array;
+        return array;
     }
 
     /// <summary>

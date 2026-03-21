@@ -27,8 +27,8 @@ public abstract class MatrixBase<T>
     /// <para><b>Migration Note:</b> This field replaces the previous T[] _data field.
     /// Memory&lt;T&gt; provides zero-copy slicing, better Span&lt;T&gt; interop, and integration with memory pooling.</para>
     /// </remarks>
-    protected readonly Memory<T> _memory;
-    internal readonly T[]? _cachedArray;
+    protected Memory<T> _memory;
+    internal T[]? _cachedArray;
     private long _version;
 
 
@@ -65,20 +65,23 @@ public abstract class MatrixBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        if (_cachedArray is not null)
+            return _cachedArray;
+
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            // Return the backing array when offset is 0. The array may be larger than
-            // the logical length (ArrayPool buffers), but all callers bound by rows*cols.
             if (segment.Offset == 0)
             {
+                _cachedArray = segment.Array;
                 return segment.Array;
             }
         }
 
-        // Cannot get backing array (non-zero offset or MemoryManager-backed).
-        // Fall back to ToArray() for read-only scenarios; callers that mutate
-        // must use Span-based paths instead.
-        return _memory.ToArray();
+        // Lazy demotion: NativeMemory → managed array
+        T[] array = _memory.ToArray();
+        _memory = new Memory<T>(array);
+        _cachedArray = array;
+        return array;
     }
 
     /// <summary>
