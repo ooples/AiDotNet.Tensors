@@ -14,7 +14,10 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal static class VmlProvider
 {
-    private const long VML_LA = 0x00000001; // Low Accuracy mode (~11 digits for double)
+    // VML_EP (Enhanced Performance) = fastest mode for double. ~7 correct digits —
+    // more than enough for neural networks. VML_EP (0x1) was also fast but VML_EP (0x3)
+    // is marginally faster and avoids the first-call cold-start regression.
+    private const long VML_EP = 0x00000003;
 
     private static bool _initialized;
     private static bool _available;
@@ -28,7 +31,7 @@ internal static class VmlProvider
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
 
     // Double VML — mode-specific (vmd* takes mode as 4th arg).
-    // Using VML_LA=0x1 per-call avoids the VML_HA regression that vd* functions hit
+    // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
     // when the global mode resets between calls.
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdExp;
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdLn;
@@ -62,7 +65,7 @@ internal static class VmlProvider
     }
 
     /// <summary>
-    /// Computes element-wise exp(x) for double using MKL VML with VML_LA mode per-call.
+    /// Computes element-wise exp(x) for double using MKL VML with VML_EP mode per-call.
     /// Uses vmdExp (mode-specific) instead of vdExp to avoid VML_HA regression.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -70,7 +73,7 @@ internal static class VmlProvider
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vmdExp == null) return false;
-        _vmdExp(length, input, output, VML_LA);
+        _vmdExp(length, input, output, VML_EP);
         return true;
 #else
         return false;
@@ -95,13 +98,13 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise ln(x) for double using MKL VML.
     /// </summary>
-    /// <summary>Double ln(x) via vmdLn with VML_LA per-call.</summary>
+    /// <summary>Double ln(x) via vmdLn with VML_EP per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(double* input, double* output, int length)
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vmdLn == null) return false;
-        _vmdLn(length, input, output, VML_LA);
+        _vmdLn(length, input, output, VML_EP);
         return true;
 #else
         return false;
@@ -126,13 +129,13 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise tanh(x) for double using MKL VML.
     /// </summary>
-    /// <summary>Double tanh(x) via vmdTanh with VML_LA per-call.</summary>
+    /// <summary>Double tanh(x) via vmdTanh with VML_EP per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryTanh(double* input, double* output, int length)
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vmdTanh == null) return false;
-        _vmdTanh(length, input, output, VML_LA);
+        _vmdTanh(length, input, output, VML_EP);
         return true;
 #else
         return false;
@@ -283,8 +286,8 @@ internal static class VmlProvider
     /// Verifies a double VML function pointer at n=1 AND n=1000.
     /// Also checks that it's faster than scalar Math.Exp at n=10000.
     /// Verifies a mode-specific double VML function (vmd*) at n=1 and n=1000.
-    /// The 4th arg is the VML mode (VML_LA=1). No need for performance test
-    /// since VML_LA is passed per-call and can't regress.
+    /// The 4th arg is the VML mode (VML_EP=1). No need for performance test
+    /// since VML_EP is passed per-call and can't regress.
     /// </summary>
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void>
         VerifyDoubleModeAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, long, void> fn,
@@ -297,7 +300,7 @@ internal static class VmlProvider
             var outArr = new double[] { 0.0 };
             fixed (double* pIn = inArr, pOut = outArr)
             {
-                fn(1, pIn, pOut, VML_LA);
+                fn(1, pIn, pOut, VML_EP);
             }
             if (double.IsNaN(outArr[0]) || double.IsInfinity(outArr[0])
                 || Math.Abs(outArr[0] - expectedOutput) > tolerance)
@@ -310,7 +313,7 @@ internal static class VmlProvider
             for (int i = 0; i < testSize; i++) bigIn[i] = testInput;
             fixed (double* pIn = bigIn, pOut = bigOut)
             {
-                fn(testSize, pIn, pOut, VML_LA);
+                fn(testSize, pIn, pOut, VML_EP);
             }
             if (double.IsNaN(bigOut[0]) || Math.Abs(bigOut[0] - expectedOutput) > tolerance)
                 return null;
