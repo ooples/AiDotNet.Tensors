@@ -42,22 +42,16 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Tier 1: NativeMemory for large unmanaged tensors (float/double).
-        // 64-byte aligned, zero GC overhead, zero-cost Pin().
-        // oneDNN/VML/SIMD operate directly on native memory — zero copy.
-        // GetDataArray() does lazy demotion to managed array only when needed.
+        // Tier 1: POH-pinned managed arrays for large unmanaged tensors.
+        // POH arrays: real T[] for GetDataArray(), free Pin() (already pinned),
+        // zero GC compaction. Best of both worlds — managed array compatibility
+        // with native-like performance. oneDNN/VML access via Pin() with zero overhead.
         if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
         {
-            if (typeof(T) == typeof(float))
-            {
-                var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
-                return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
-            }
-            if (typeof(T) == typeof(double))
-            {
-                var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
-                return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
-            }
+            T[] array = GC.AllocateUninitializedArray<T>(totalSize, pinned: true);
+            Array.Clear(array, 0, totalSize);
+            var memory = new Memory<T>(array);
+            return Tensor<T>.FromMemory(memory, shape);
         }
 
         // Tier 2: Thread-local cache for managed arrays.
@@ -108,6 +102,37 @@ public static class TensorAllocator
         v |= v >> 8;
         v |= v >> 16;
         return v + 1;
+    }
+
+    /// <summary>
+    /// Creates a tensor backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for tensors that will ONLY be accessed via Pin()/Memory.Span — never GetDataArray().
+    /// oneDNN and VML operations should use this for optimal performance.
+    /// GetDataArray() triggers lazy demotion (one-time copy to managed array).
+    /// </summary>
+    public static Tensor<T> RentNative<T>(int[] shape) where T : unmanaged
+    {
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+
+        if (totalSize == 0)
+            return new Tensor<T>(shape);
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float))
+        {
+            var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
+            return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
+            return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
+        }
+#endif
+        // Fallback for other unmanaged types
+        return Rent<T>(shape);
     }
 
     /// <summary>
