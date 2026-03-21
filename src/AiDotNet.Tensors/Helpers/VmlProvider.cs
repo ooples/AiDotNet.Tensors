@@ -164,6 +164,7 @@ internal static class VmlProvider
                 {
                     if (TryLoadSymbols(handle))
                         return true;
+                    NativeLibrary.Free(handle);
                 }
             }
 
@@ -177,6 +178,7 @@ internal static class VmlProvider
                     {
                         if (TryLoadSymbols(handle))
                             return true;
+                        NativeLibrary.Free(handle);
                     }
                 }
             }

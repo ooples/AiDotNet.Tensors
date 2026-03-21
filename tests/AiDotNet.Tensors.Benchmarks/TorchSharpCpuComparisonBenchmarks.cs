@@ -716,7 +716,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public float AiDotNet_TensorMaxValue()
-        => _cpuEngine.TensorMaxValue(_aiVectorsA[LargeSize]);
+    {
+        var r = _cpuEngine.TensorMaxValue(_aiVectorsA[LargeSize]);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Max()
@@ -727,7 +730,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public float AiDotNet_TensorMinValue()
-        => _cpuEngine.TensorMinValue(_aiVectorsA[LargeSize]);
+    {
+        var r = _cpuEngine.TensorMinValue(_aiVectorsA[LargeSize]);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Min()
@@ -742,7 +748,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Softmax()
-        => _cpuEngine.TensorSoftmax(_aiSoftmaxInput!, axis: 1);
+    {
+        var r = _cpuEngine.TensorSoftmax(_aiSoftmaxInput!, axis: 1);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void AiDotNet_Softmax_ZeroAlloc()
@@ -762,7 +771,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_LogSoftmax()
-        => _cpuEngine.TensorLogSoftmax(_aiSoftmaxInput!, axis: 1);
+    {
+        var r = _cpuEngine.TensorLogSoftmax(_aiSoftmaxInput!, axis: 1);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_LogSoftmax()
@@ -851,7 +863,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_MaxPool2D()
-        => _cpuEngine.TensorMaxPool2D(_aiPoolInput!, poolSize: 3, stride: 2, padding: 1);
+    {
+        var r = _cpuEngine.TensorMaxPool2D(_aiPoolInput!, poolSize: 3, stride: 2, padding: 1);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_MaxPool2D()
@@ -866,7 +881,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_SigmoidBackward()
-        => _cpuEngine.SigmoidBackward(_aiGradOutput!, _aiSigmoidOutput!);
+    {
+        var r = _cpuEngine.SigmoidBackward(_aiGradOutput!, _aiSigmoidOutput!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_SigmoidBackward()
@@ -880,7 +898,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_TanhBackward()
-        => _cpuEngine.TanhBackward(_aiGradOutput!, _aiTanhOutput!);
+    {
+        var r = _cpuEngine.TanhBackward(_aiGradOutput!, _aiTanhOutput!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_TanhBackward()
@@ -934,7 +955,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_MatMul_Double()
-        => _cpuEngine.TensorMatMul(_aiDoubleMatA!, _aiDoubleMatB!);
+    {
+        var r = _cpuEngine.TensorMatMul(_aiDoubleMatA!, _aiDoubleMatB!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_MatMul_Double()

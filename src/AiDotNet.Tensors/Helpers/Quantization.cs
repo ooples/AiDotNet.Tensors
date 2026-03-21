@@ -84,6 +84,9 @@ public static class Quantization
     /// </summary>
     public static Tensor<sbyte> QuantizeInt8(Tensor<float> input, QuantizationParams qparams)
     {
+        if (qparams.Scale <= 0)
+            throw new ArgumentException("Scale must be positive.", nameof(qparams));
+
         var src = input.AsSpan();
         var result = new Tensor<sbyte>(input.Shape);
         var dst = result.AsWritableSpan();

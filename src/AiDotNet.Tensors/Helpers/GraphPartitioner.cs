@@ -154,10 +154,10 @@ public sealed class GraphPartitioner
 
         if (!GpuAvailable) return DeviceTarget.CPU;
 
-        // Compute output tensor size
-        int size = 1;
+        // Compute output tensor size with checked arithmetic
+        long size = 1;
         foreach (int dim in node.OutputShape)
-            size *= dim;
+            size = checked(size * dim);
 
         // Small tensors: keep on CPU to avoid transfer overhead
         if (size < GpuThreshold) return DeviceTarget.CPU;

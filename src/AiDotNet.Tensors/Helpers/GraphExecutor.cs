@@ -226,12 +226,7 @@ public sealed class GraphExecutor<T> : IDisposable
             // Linear algebra
             [OpType.MatMul] = (_, inp, o) => _engine.MatMulInto(o, inp[0], inp[1]),
 
-            // Pooling
-            [OpType.MaxPool2D] = (n, inp, o) =>
-            {
-                var result = _engine.MaxPool2D(inp[0], n.Params?.Stride ?? 2, n.Params?.Stride ?? 2, n.Params?.Padding ?? 0);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            },
+            // Pooling (handler registered later in the table)
 
             // Reductions
             [OpType.Sum] = (_, inp, o) => { o.AsWritableSpan()[0] = _engine.TensorSum(inp[0]); },

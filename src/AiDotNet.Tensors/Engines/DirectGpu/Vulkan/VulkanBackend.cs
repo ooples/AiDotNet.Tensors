@@ -710,13 +710,21 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         var cmdBuffer = _batchThreadRes.CommandBuffer;
 
-        // Execution-only barrier: ensures all prior compute dispatches complete
-        // before subsequent dispatches begin reading
-        VulkanNativeBindings.vkCmdPipelineBarrier(
-            cmdBuffer,
-            (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, IntPtr.Zero, 0, null, 0, IntPtr.Zero);
+        // Full memory barrier: ensures all shader writes are visible to subsequent reads.
+        // VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46, SHADER_WRITE = 0x40, SHADER_READ = 0x20
+        unsafe
+        {
+            var memBarrier = stackalloc ulong[4]; // sType, pNext, srcAccessMask, dstAccessMask
+            memBarrier[0] = 46; // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+            memBarrier[1] = 0;  // pNext = null
+            memBarrier[2] = 0x40; // VK_ACCESS_SHADER_WRITE_BIT
+            memBarrier[3] = 0x20; // VK_ACCESS_SHADER_READ_BIT
+            VulkanNativeBindings.vkCmdPipelineBarrier(
+                cmdBuffer,
+                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, (IntPtr)memBarrier, 0, null, 0, IntPtr.Zero);
+        }
     }
 
     #endregion

@@ -34,8 +34,8 @@ internal static class ThreadLocalTensorCache<T>
     private static Dictionary<int, Stack<T[]>>? _cache;
 
     /// <summary>
-    /// Tries to get a reusable buffer of at least <paramref name="minSize"/> elements.
-    /// Returns null if no cached buffer is available (caller should allocate fresh).
+    /// Tries to get a reusable buffer of exactly <paramref name="minSize"/> elements.
+    /// Returns null if no cached buffer of that exact size is available.
     /// Zero contention — thread-local access only.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
