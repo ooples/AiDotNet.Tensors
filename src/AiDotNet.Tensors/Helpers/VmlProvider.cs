@@ -206,28 +206,15 @@ internal static class VmlProvider
             _vdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
                 TryGetExport(handle, "vdTanh", "MKL_vdTanh", "VDTANH");
 
-            // Verify with a tiny test call to catch broken function pointers
-            if (_vsExp != null)
-            {
-                try
-                {
-                    var testIn = new float[] { 1.0f };
-                    var testOut = new float[] { 0f };
-                    fixed (float* pIn = testIn)
-                    fixed (float* pOut = testOut)
-                    {
-                        _vsExp(1, pIn, pOut);
-                    }
-                    if (float.IsNaN(testOut[0]) || float.IsInfinity(testOut[0]) || Math.Abs(testOut[0] - 2.71828f) > 0.01f)
-                    {
-                        ClearAllPointers();
-                    }
-                }
-                catch
-                {
-                    ClearAllPointers();
-                }
-            }
+            // Verify each function pointer with a tiny test call.
+            // Previous bug: only vsExp was verified, vdExp/vdTanh had corrupt pointers
+            // that caused 68x regression.
+            _vsExp = VerifyFloat(_vsExp, 1.0f, 2.71828f, 0.01f);
+            _vsLn = VerifyFloat(_vsLn, 2.71828f, 1.0f, 0.01f);
+            _vsTanh = VerifyFloat(_vsTanh, 1.0f, 0.7616f, 0.01f);
+            _vdExp = VerifyDouble(_vdExp, 1.0, 2.71828, 0.001);
+            _vdLn = VerifyDouble(_vdLn, 2.71828, 1.0, 0.001);
+            _vdTanh = VerifyDouble(_vdTanh, 1.0, 0.76159, 0.001);
 
             return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null
                 || _vsTanh != null || _vdTanh != null;
@@ -250,6 +237,56 @@ internal static class VmlProvider
                 return ptr;
         }
         return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// Verifies a float VML function pointer by calling it with a test input.
+    /// Returns the pointer if valid, null if corrupt.
+    /// </summary>
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void>
+        VerifyFloat(delegate* unmanaged[Cdecl]<int, float*, float*, void> fn,
+        float testInput, float expectedOutput, float tolerance)
+    {
+        if (fn == null) return null;
+        try
+        {
+            var inArr = new float[] { testInput };
+            var outArr = new float[] { 0f };
+            fixed (float* pIn = inArr, pOut = outArr)
+            {
+                fn(1, pIn, pOut);
+            }
+            if (float.IsNaN(outArr[0]) || float.IsInfinity(outArr[0])
+                || Math.Abs(outArr[0] - expectedOutput) > tolerance)
+                return null;
+            return fn;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Verifies a double VML function pointer by calling it with a test input.
+    /// Returns the pointer if valid, null if corrupt.
+    /// </summary>
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void>
+        VerifyDouble(delegate* unmanaged[Cdecl]<int, double*, double*, void> fn,
+        double testInput, double expectedOutput, double tolerance)
+    {
+        if (fn == null) return null;
+        try
+        {
+            var inArr = new double[] { testInput };
+            var outArr = new double[] { 0.0 };
+            fixed (double* pIn = inArr, pOut = outArr)
+            {
+                fn(1, pIn, pOut);
+            }
+            if (double.IsNaN(outArr[0]) || double.IsInfinity(outArr[0])
+                || Math.Abs(outArr[0] - expectedOutput) > tolerance)
+                return null;
+            return fn;
+        }
+        catch { return null; }
     }
 
     private static unsafe void ClearAllPointers()
