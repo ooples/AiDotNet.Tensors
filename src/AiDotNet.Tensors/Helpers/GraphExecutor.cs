@@ -217,12 +217,86 @@ public sealed class GraphExecutor<T> : IDisposable
                     inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
                     n.Params?.Epsilon ?? 1e-5),
 
+            // Element-wise math
+            [OpType.Exp] = (_, inp, o) => { var r = _engine.TensorExp(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
+            [OpType.Log] = (_, inp, o) => { var r = _engine.TensorLog(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
+            [OpType.Sqrt] = (_, inp, o) => { var r = _engine.TensorSqrt(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
+            [OpType.Abs] = (_, inp, o) => { var r = _engine.TensorAbs(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
+
             // Linear algebra
             [OpType.MatMul] = (_, inp, o) => _engine.MatMulInto(o, inp[0], inp[1]),
+
+            // Pooling
+            [OpType.MaxPool2D] = (n, inp, o) =>
+            {
+                var result = _engine.MaxPool2D(inp[0], n.Params?.Stride ?? 2, n.Params?.Stride ?? 2, n.Params?.Padding ?? 0);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            },
 
             // Reductions
             [OpType.Sum] = (_, inp, o) => { o.AsWritableSpan()[0] = _engine.TensorSum(inp[0]); },
             [OpType.Mean] = (_, inp, o) => { o.AsWritableSpan()[0] = _engine.TensorMean(inp[0]); },
+
+            // Concat
+            [OpType.Concat] = (n, inp, o) =>
+            {
+                _engine.ConcatInto(o, inp, n.Params?.Axis ?? 0);
+            },
+
+            // Transpose
+            [OpType.Transpose] = (_, inp, o) =>
+            {
+                var axes = new int[inp[0].Rank];
+                for (int ax = 0; ax < axes.Length; ax++) axes[ax] = axes.Length - 1 - ax;
+                _engine.TransposeInto(o, inp[0], axes);
+            },
+
+            // Attention
+            [OpType.FlashAttention] = (_, inp, o) =>
+            {
+                if (inp.Length >= 3)
+                {
+                    Tensor<T> stats;
+                    var result = _engine.FlashAttention(inp[0], inp[1], inp[2], scale: null, isCausal: false, softmaxStats: out stats);
+                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                }
+            },
+
+            // Fused operations
+            [OpType.FusedConv2DBiasActivation] = (n, inp, o) =>
+            {
+                if (inp.Length >= 2)
+                {
+                    var bias = inp.Length >= 3 ? inp[2] : null;
+                    var result = _engine.FusedConv2D(inp[0], inp[1], bias,
+                        n.Params?.Stride ?? 1, n.Params?.Stride ?? 1,
+                        n.Params?.Padding ?? 0, n.Params?.Padding ?? 0,
+                        n.Params?.Dilation ?? 1, n.Params?.Dilation ?? 1,
+                        (Engines.FusedActivationType)(int)(n.Params?.FusedActivation ?? ComputationGraph.FusedActivationType.None));
+                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                }
+            },
+
+            // BatchNorm
+            [OpType.BatchNorm] = (n, inp, o) =>
+            {
+                if (inp.Length >= 3)
+                {
+                    var result = _engine.BatchNorm(inp[0], inp[1], inp[2],
+                        n.Params?.Epsilon ?? 1e-5, out _, out _);
+                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                }
+            },
+
+            // MaxPool
+            [OpType.MaxPool2D] = (n, inp, o) =>
+            {
+                var result = _engine.MaxPool2D(inp[0], n.Params?.Stride ?? 2, n.Params?.Stride ?? 2, n.Params?.Padding ?? 0);
+                Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+            },
+
+            // Dropout (pass-through for inference)
+            [OpType.Dropout] = (_, inp, o) => Array.Copy(inp[0].GetDataArray(), o.GetDataArray(), Math.Min(inp[0].Length, o.Length)),
         };
     }
 
