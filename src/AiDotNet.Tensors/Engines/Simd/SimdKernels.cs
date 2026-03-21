@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Helpers;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -301,11 +302,18 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Exp — Cephes FastExp256 with zero bounds-checking.
+        /// Pointer-based Exp — tries MKL VML first (SVML microcode, zero-overhead function pointer),
+        /// falls back to Cephes FastExp256 polynomial approximation.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void ExpUnsafe(float* input, float* output, int length)
         {
+#if NET5_0_OR_GREATER
+            // MKL VML path: SVML microcode exp, ~3x faster than our polynomial
+            if (VmlProvider.TryExp(input, output, length))
+                return;
+#endif
+
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
@@ -335,11 +343,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Log — FastLog256 with zero bounds-checking.
+        /// Pointer-based Log — tries MKL VML first, falls back to FastLog256.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void LogUnsafe(float* input, float* output, int length)
         {
+#if NET5_0_OR_GREATER
+            if (VmlProvider.TryLn(input, output, length))
+                return;
+#endif
+
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
@@ -1372,10 +1385,19 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             int length = input.Length;
-            int i = 0;
 
-            // Scalar Math.Exp is fastest for double (MKL VML tested but delegate overhead
-            // negated benefit; our polynomial can't beat SVML microcode either)
+#if NET5_0_OR_GREATER
+            // MKL VML path: SVML microcode exp, zero-overhead unmanaged function pointer.
+            // Previous delegate-based attempt added ~50ns overhead that negated the benefit.
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
+            {
+                if (VmlProvider.TryExp(pIn, pOut, length))
+                    return;
+            }
+#endif
+
+            int i = 0;
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
@@ -1497,12 +1519,53 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based double Sigmoid — zero bounds-checking overhead, 4x unrolled AVX2+FMA.
-        /// Uses FastExpDouble256: sigmoid(x) = 1/(1+exp(-x)) for full double precision accuracy.
+        /// Pointer-based double Sigmoid — tries MKL VML exp first for SVML performance,
+        /// falls back to 4x unrolled AVX2+FMA with FastExpDouble256.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void SigmoidUnsafe(double* input, double* output, int length)
         {
+#if NET5_0_OR_GREATER
+            // VML path: negate input, call vdExp, then compute 1/(1+exp(-x)) with SIMD divide
+            if (VmlProvider.IsAvailable && length >= 64)
+            {
+                // Step 1: output = -input
+                int j = 0;
+                if (Avx.IsSupported)
+                {
+                    var negMask = Vector256.Create(-0.0); // sign bit only
+                    int simdLen = length & ~3;
+                    for (; j < simdLen; j += 4)
+                    {
+                        var v = Avx.LoadVector256(input + j);
+                        Avx.Store(output + j, Avx.Xor(v, negMask));
+                    }
+                }
+                for (; j < length; j++)
+                    output[j] = -input[j];
+
+                // Step 2: output = exp(-input) via MKL VML (SVML microcode)
+                if (VmlProvider.TryExp(output, output, length))
+                {
+                    // Step 3: output = 1/(1+exp(-x)) with SIMD
+                    j = 0;
+                    if (Avx.IsSupported)
+                    {
+                        var one = Vector256.Create(1.0);
+                        int simdLen = length & ~3;
+                        for (; j < simdLen; j += 4)
+                        {
+                            var e = Avx.LoadVector256(output + j);
+                            Avx.Store(output + j, Avx.Divide(one, Avx.Add(one, e)));
+                        }
+                    }
+                    for (; j < length; j++)
+                        output[j] = 1.0 / (1.0 + output[j]);
+                    return;
+                }
+            }
+#endif
+
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 16)
@@ -4903,11 +4966,99 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses SIMD for max, fused exp+sum, and divide passes.
         /// All data stays in L1 across the 2 passes.
         /// </summary>
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// VML-accelerated softmax row: SIMD max → subtract → VML exp (SVML) → SIMD sum → SIMD divide.
+        /// Returns false if VML exp fails (caller falls through to polynomial path).
+        /// </summary>
+        private static unsafe bool SoftmaxRowVml(float* input, float* output, int length)
+        {
+            // Pass 1: Find max (SIMD 4x unrolled)
+            float maxVal = float.NegativeInfinity;
+            int j = 0;
+            var vm0 = Vector256.Create(float.NegativeInfinity);
+            var vm1 = vm0; var vm2 = vm0; var vm3 = vm0;
+            int simdLen = length & ~31;
+            for (; j < simdLen; j += 32)
+            {
+                vm0 = Avx.Max(vm0, Avx.LoadVector256(input + j));
+                vm1 = Avx.Max(vm1, Avx.LoadVector256(input + j + 8));
+                vm2 = Avx.Max(vm2, Avx.LoadVector256(input + j + 16));
+                vm3 = Avx.Max(vm3, Avx.LoadVector256(input + j + 24));
+            }
+            vm0 = Avx.Max(Avx.Max(vm0, vm1), Avx.Max(vm2, vm3));
+            maxVal = HorizontalMax(vm0);
+            for (; j < length; j++)
+                if (input[j] > maxVal) maxVal = input[j];
+
+            // Pass 2a: output = input - max (SIMD subtract)
+            j = 0;
+            var vmaxBc = Vector256.Create(maxVal);
+            for (; j < simdLen; j += 32)
+            {
+                Avx.Store(output + j, Avx.Subtract(Avx.LoadVector256(input + j), vmaxBc));
+                Avx.Store(output + j + 8, Avx.Subtract(Avx.LoadVector256(input + j + 8), vmaxBc));
+                Avx.Store(output + j + 16, Avx.Subtract(Avx.LoadVector256(input + j + 16), vmaxBc));
+                Avx.Store(output + j + 24, Avx.Subtract(Avx.LoadVector256(input + j + 24), vmaxBc));
+            }
+            for (; j < length; j++)
+                output[j] = input[j] - maxVal;
+
+            // Pass 2b: output = exp(output) via MKL VML (SVML microcode — the key speedup)
+            if (!VmlProvider.TryExp(output, output, length))
+                return false;
+
+            // Pass 3: sum (SIMD 4x unrolled)
+            float sumExp = 0f;
+            j = 0;
+            var vs0 = Vector256<float>.Zero;
+            var vs1 = Vector256<float>.Zero;
+            var vs2 = Vector256<float>.Zero;
+            var vs3 = Vector256<float>.Zero;
+            for (; j < simdLen; j += 32)
+            {
+                vs0 = Avx.Add(vs0, Avx.LoadVector256(output + j));
+                vs1 = Avx.Add(vs1, Avx.LoadVector256(output + j + 8));
+                vs2 = Avx.Add(vs2, Avx.LoadVector256(output + j + 16));
+                vs3 = Avx.Add(vs3, Avx.LoadVector256(output + j + 24));
+            }
+            vs0 = Avx.Add(Avx.Add(vs0, vs1), Avx.Add(vs2, vs3));
+            sumExp = HorizontalSum(vs0);
+            for (; j < length; j++)
+                sumExp += output[j];
+
+            // Divide
+            if (sumExp == 0f) return true;
+            float inv = 1f / sumExp;
+            j = 0;
+            var vInv = Vector256.Create(inv);
+            for (; j < simdLen; j += 32)
+            {
+                Avx.Store(output + j, Avx.Multiply(Avx.LoadVector256(output + j), vInv));
+                Avx.Store(output + j + 8, Avx.Multiply(Avx.LoadVector256(output + j + 8), vInv));
+                Avx.Store(output + j + 16, Avx.Multiply(Avx.LoadVector256(output + j + 16), vInv));
+                Avx.Store(output + j + 24, Avx.Multiply(Avx.LoadVector256(output + j + 24), vInv));
+            }
+            for (; j < length; j++)
+                output[j] *= inv;
+            return true;
+        }
+#endif
+
         private static unsafe void SoftmaxRowSmall(float* input, float* output, int length)
         {
+#if NET5_0_OR_GREATER
+            // VML fast path: SIMD max → VML exp(x-max) → SIMD sum → SIMD divide
+            if (VmlProvider.IsAvailable && Avx.IsSupported && length >= 32)
+            {
+                if (SoftmaxRowVml(input, output, length))
+                    return;
+            }
+#endif
+
             int i = 0;
 
-            // Pass 1: Find max (SIMD 4x unrolled)
+            // Pass 1: Find max (SIMD 4x unrolled) — fallback when VML not available
             float maxVal = float.NegativeInfinity;
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)

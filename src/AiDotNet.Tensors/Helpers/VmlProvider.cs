@@ -6,8 +6,11 @@ namespace AiDotNet.Tensors.Helpers;
 /// <summary>
 /// Provides access to Intel MKL's Vector Math Library (VML) for high-performance
 /// vectorized transcendental functions (Exp, Log, Sqrt, etc.).
-/// VML uses SVML intrinsics internally and is 2-5x faster than our polynomial
-/// approximations for these operations.
+/// VML uses SVML intrinsics internally and is 2-5x faster than polynomial approximations.
+///
+/// Uses C# 9 unmanaged function pointers (delegate* unmanaged[Cdecl]) for zero-overhead
+/// P/Invoke — no delegate allocation, no marshal overhead, just a direct call instruction.
+/// Previous delegate-based approach added ~50ns overhead per call which negated the SVML benefit.
 /// </summary>
 internal static class VmlProvider
 {
@@ -16,24 +19,15 @@ internal static class VmlProvider
     private static readonly object InitLock = new();
 
 #if NET5_0_OR_GREATER
-    // VML function pointers (only used on .NET 5+ where NativeLibrary is available)
-    private static VsExpDelegate? _vsExp;
-    private static VdExpDelegate? _vdExp;
-    private static VsLnDelegate? _vsLn;
-    private static VdLnDelegate? _vdLn;
+    // Unmanaged function pointers — zero marshal overhead (C# 9 feature).
+    // These are raw native function pointers, not managed delegates.
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsExp;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdExp;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsLn;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdLn;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdTanh;
 #endif
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private unsafe delegate void VsExpDelegate(int n, float* a, float* y);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private unsafe delegate void VdExpDelegate(int n, double* a, double* y);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private unsafe delegate void VsLnDelegate(int n, float* a, float* y);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private unsafe delegate void VdLnDelegate(int n, double* a, double* y);
 
     /// <summary>Whether MKL VML functions are available.</summary>
     public static bool IsAvailable
@@ -47,6 +41,7 @@ internal static class VmlProvider
 
     /// <summary>
     /// Computes element-wise exp(x) using MKL VML. Returns false if VML not available.
+    /// Zero overhead — uses unmanaged function pointer, not delegate.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryExp(float* input, float* output, int length)
@@ -105,6 +100,36 @@ internal static class VmlProvider
 #endif
     }
 
+    /// <summary>
+    /// Computes element-wise tanh(x) using MKL VML.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TryTanh(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsTanh == null) return false;
+        _vsTanh(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>
+    /// Computes element-wise tanh(x) for double using MKL VML.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TryTanh(double* input, double* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vdTanh == null) return false;
+        _vdTanh(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     private static bool EnsureInitialized()
     {
         if (_initialized) return _available;
@@ -123,9 +148,7 @@ internal static class VmlProvider
 #if NET5_0_OR_GREATER
         try
         {
-            // MKL.NET already loads the MKL native library.
-            // Try to find VML symbols in already-loaded MKL modules.
-            // The symbols are in mkl_rt.dll (Windows) or libmkl_rt.so (Linux)
+            // Try to load MKL runtime library from multiple candidate names
             var candidates = new[]
             {
                 "mkl_rt", "mkl_rt.2", "libmkl_rt", "libmkl_rt.so", "libmkl_rt.so.2",
@@ -157,7 +180,7 @@ internal static class VmlProvider
         }
         catch
         {
-            // VML not available
+            // MKL not available — fall back to polynomial approximations
         }
 #endif
         return false;
@@ -168,11 +191,20 @@ internal static class VmlProvider
     {
         try
         {
-            // Try multiple symbol name patterns (varies by MKL version/platform)
-            _vsExp = TryGetDelegate<VsExpDelegate>(handle, "vsExp", "MKL_vsExp", "VSEXP");
-            _vdExp = TryGetDelegate<VdExpDelegate>(handle, "vdExp", "MKL_vdExp", "VDEXP");
-            _vsLn = TryGetDelegate<VsLnDelegate>(handle, "vsLn", "MKL_vsLn", "VSLN");
-            _vdLn = TryGetDelegate<VdLnDelegate>(handle, "vdLn", "MKL_vdLn", "VDLN");
+            // Load function pointers as unmanaged[Cdecl] — zero overhead calls.
+            // Cast IntPtr directly to function pointer (can't use generics with fn ptrs).
+            _vsExp = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsExp", "MKL_vsExp", "VSEXP");
+            _vdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
+                TryGetExport(handle, "vdExp", "MKL_vdExp", "VDEXP");
+            _vsLn = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsLn", "MKL_vsLn", "VSLN");
+            _vdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
+                TryGetExport(handle, "vdLn", "MKL_vdLn", "VDLN");
+            _vsTanh = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsTanh", "MKL_vsTanh", "VSTANH");
+            _vdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
+                TryGetExport(handle, "vdTanh", "MKL_vdTanh", "VDTANH");
 
             // Verify with a tiny test call to catch broken function pointers
             if (_vsExp != null)
@@ -188,33 +220,46 @@ internal static class VmlProvider
                     }
                     if (float.IsNaN(testOut[0]) || float.IsInfinity(testOut[0]) || Math.Abs(testOut[0] - 2.71828f) > 0.01f)
                     {
-                        _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
+                        ClearAllPointers();
                     }
                 }
                 catch
                 {
-                    _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
+                    ClearAllPointers();
                 }
             }
 
-            return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null;
+            return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null
+                || _vsTanh != null || _vdTanh != null;
         }
         catch
         {
-            _vsExp = null; _vdExp = null; _vsLn = null; _vdLn = null;
+            ClearAllPointers();
             return false;
         }
     }
 
-    private static T? TryGetDelegate<T>(IntPtr handle, params string[] names) where T : Delegate
+    /// <summary>
+    /// Tries multiple symbol names and returns the first found export address, or IntPtr.Zero.
+    /// </summary>
+    private static IntPtr TryGetExport(IntPtr handle, params string[] names)
     {
         foreach (var name in names)
         {
             if (NativeLibrary.TryGetExport(handle, name, out var ptr))
-                return Marshal.GetDelegateForFunctionPointer<T>(ptr);
+                return ptr;
         }
-        return null;
+        return IntPtr.Zero;
     }
 
+    private static unsafe void ClearAllPointers()
+    {
+        _vsExp = null;
+        _vdExp = null;
+        _vsLn = null;
+        _vdLn = null;
+        _vsTanh = null;
+        _vdTanh = null;
+    }
 #endif
 }
