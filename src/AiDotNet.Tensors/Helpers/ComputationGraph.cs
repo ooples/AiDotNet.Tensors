@@ -73,11 +73,15 @@ public sealed class ComputationGraph
         Reshape, Transpose, Permute, Flatten,
 
         // Attention
-        ScaledDotProductAttention, MultiHeadAttention,
+        ScaledDotProductAttention, MultiHeadAttention, FlashAttention,
+
+        // Scatter / Gather (sparse and attention operations)
+        ScatterAdd, ScatterMean, ScatterMax, ScatterSoftmax,
+        GatherNd, ScatterNd,
 
         // Other
         Concat, Split, Residual, Upsample, Interpolate,
-        Custom
+        Embedding, Dropout, Custom
     }
 
     /// <summary>Parameters for an operation (convolution stride, padding, etc.).</summary>
