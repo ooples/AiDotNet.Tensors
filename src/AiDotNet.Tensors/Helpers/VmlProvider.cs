@@ -65,6 +65,7 @@ internal static class VmlProvider
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vdExp == null) return false;
+        EnforceVmlLaMode();
         _vdExp(length, input, output);
         return true;
 #else
@@ -95,6 +96,7 @@ internal static class VmlProvider
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vdLn == null) return false;
+        EnforceVmlLaMode();
         _vdLn(length, input, output);
         return true;
 #else
@@ -125,10 +127,26 @@ internal static class VmlProvider
     {
 #if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vdTanh == null) return false;
+        EnforceVmlLaMode();
         _vdTanh(length, input, output);
         return true;
 #else
         return false;
+#endif
+    }
+
+    /// <summary>
+    /// Enforces VML_LA mode before every double VML call.
+    /// MKL can reset the mode between calls; without this, double VML
+    /// falls into VML_HA mode (600x slower) causing catastrophic outliers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void EnforceVmlLaMode()
+    {
+#if NET5_0_OR_GREATER
+        const uint VML_LA = 0x00000001;
+        if (_vmlSetMode != null)
+            _vmlSetMode(VML_LA);
 #endif
     }
 

@@ -945,7 +945,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Sigmoid_Double()
-        => _cpuEngine.Sigmoid(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.Sigmoid(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Sigmoid_Double()
@@ -956,7 +959,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Exp_Double()
-        => _cpuEngine.TensorExp(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.TensorExp(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Exp_Double()
@@ -967,7 +973,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Log_Double()
-        => _cpuEngine.TensorLog(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.TensorLog(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Log_Double()
@@ -978,7 +987,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Tanh_Double()
-        => _cpuEngine.TensorTanh(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.TensorTanh(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Tanh_Double()
@@ -989,7 +1001,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_GELU_Double()
-        => _cpuEngine.TensorGELU(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.TensorGELU(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_GELU_Double()
@@ -1000,7 +1015,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Mish_Double()
-        => _cpuEngine.TensorMish(_aiDoubleVectorA!);
+    {
+        var r = _cpuEngine.TensorMish(_aiDoubleVectorA!);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Mish_Double()
@@ -1011,7 +1029,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Softmax_Double()
-        => _cpuEngine.TensorSoftmax(_aiDoubleSoftmaxInput!, axis: 1);
+    {
+        var r = _cpuEngine.TensorSoftmax(_aiDoubleSoftmaxInput!, axis: 1);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Softmax_Double()
@@ -1022,7 +1043,10 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Conv2D_Double()
-        => _cpuEngine.Conv2D(_aiDoubleConvInput!, _aiDoubleConvKernel!, _convStride, _convPadding, _convDilation);
+    {
+        var r = _cpuEngine.Conv2D(_aiDoubleConvInput!, _aiDoubleConvKernel!, _convStride, _convPadding, _convDilation);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void TorchSharp_Conv2D_Double()
