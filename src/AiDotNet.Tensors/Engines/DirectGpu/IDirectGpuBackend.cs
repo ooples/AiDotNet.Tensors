@@ -2511,6 +2511,45 @@ public interface IDirectGpuBackend : IDisposable
         int batch, int hiddenSize);
 
     #endregion
+
+    #region GPU Graph Execution and Workspace
+
+    /// <summary>
+    /// Allocates a single contiguous GPU buffer to serve as a workspace for all
+    /// intermediate tensors during graph execution. Sub-regions are addressed via
+    /// offset+length into this buffer, eliminating per-operation GPU allocation.
+    /// </summary>
+    /// <param name="totalElements">Total number of float elements needed.</param>
+    /// <returns>A single GPU buffer large enough for all slots.</returns>
+    #endregion
+}
+
+/// <summary>
+/// Extension interface for GPU backends that support batch execution and multi-stream.
+/// Separate from IDirectGpuBackend to avoid default interface members (not supported on net471).
+/// </summary>
+public interface IGpuBatchExecution : IDirectGpuBackend
+{
+    /// <summary>Allocates a single contiguous GPU buffer for workspace slots.</summary>
+    IGpuBuffer AllocateWorkspaceBuffer(int totalElements);
+
+    /// <summary>Begins recording a batch of GPU operations into a single command buffer.</summary>
+    void BeginBatch();
+
+    /// <summary>Ends batch recording and submits all operations as a single GPU submission.</summary>
+    void EndBatch();
+
+    /// <summary>Gets whether this backend supports batch recording.</summary>
+    bool SupportsBatchExecution { get; }
+
+    /// <summary>Begins a secondary stream for concurrent execution.</summary>
+    void BeginSecondaryStream();
+
+    /// <summary>Ends the secondary stream and synchronizes with primary.</summary>
+    void EndSecondaryStream();
+
+    /// <summary>Inserts a memory barrier for data dependency in batched execution.</summary>
+    void InsertBarrier(IGpuBuffer buffer);
 }
 
 /// <summary>

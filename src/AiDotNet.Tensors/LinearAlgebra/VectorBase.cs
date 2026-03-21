@@ -111,9 +111,13 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
-        // Try to extract backing array for SIMD fast paths
+        // Extract backing array for SIMD fast paths. The array may be LARGER than Length
+        // when backed by ArrayPool (which returns power-of-2 buffers).
+        // INVARIANT: all SIMD consumers MUST pass Length as the element count, never array.Length.
+        // This invariant is enforced by _cachedArray being internal (not public) and all SIMD
+        // paths in VectorBase/MatrixBase/SimdKernels explicitly using Length for bounds.
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
-            && segment.Array is not null && segment.Offset == 0 && segment.Count == segment.Array.Length)
+            && segment.Array is not null && segment.Offset == 0)
         {
             _cachedArray = segment.Array;
         }
@@ -263,18 +267,20 @@ public abstract class VectorBase<T>
 
     /// <summary>
     /// Gets a reference to the underlying array without copying.
+    /// The returned array may be larger than <see cref="Length"/> when backed by ArrayPool.
+    /// Callers MUST index by Length, not array.Length.
     /// </summary>
     internal T[] GetDataArray()
     {
+        if (_cachedArray is not null)
+            return _cachedArray;
+
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            // Safety: verify the segment covers the full array from offset 0.
-            // All VectorBase constructors allocate fresh arrays, so this should always hold.
-            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
-            {
+            if (segment.Offset == 0)
                 return segment.Array;
-            }
         }
+
         return _memory.ToArray();
     }
 

@@ -59,11 +59,19 @@ public abstract class TensorBase<T>
 
     /// <summary>
     /// Gets the underlying data as a Memory&lt;T&gt; for zero-copy access.
+    /// Use .Pin() for unsafe pointer access compatible with both managed and POH-backed tensors.
+    /// Use .Span for indexed access or iteration.
     /// </summary>
     /// <remarks>
-    /// <para><b>For Beginners:</b> This provides direct access to the tensor's data without copying.
-    /// Use .Span for indexed access or iteration. Use this for async operations.</para>
+    /// <para>Internal to prevent external consumers from directly accessing model weights/tensor data.
+    /// AiDotNet libraries access this via InternalsVisibleTo.</para>
+    /// <para>For large tensors (>256K elements), the memory is POH-pinned, so Pin() is essentially free.</para>
     /// </remarks>
+    internal Memory<T> Memory => _data.AsWritableMemory();
+
+    /// <summary>
+    /// Shorthand alias for <see cref="Memory"/> — used by engine code.
+    /// </summary>
     internal Memory<T> Data => _data.AsWritableMemory();
 
     /// <summary>

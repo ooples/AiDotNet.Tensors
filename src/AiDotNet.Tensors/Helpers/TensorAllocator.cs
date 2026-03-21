@@ -5,11 +5,11 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
-/// All methods respect <see cref="TensorPool.Enabled"/>; when disabled, they fall back to
-/// standard non-pooled allocation. <see cref="Rent{T}(int[])"/> returns zero-initialized memory.
-/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ for callers that
-/// will immediately overwrite all elements. Return pooled tensors via <see cref="TensorPool.Return{T}"/>.
+/// Tensor allocation with transparent zero-alloc caching via <see cref="ThreadLocalTensorCache{T}"/>.
+/// After the first forward pass warms the cache, <see cref="Rent{T}(int[])"/> reuses thread-local
+/// buffers — zero allocation, zero GC, zero lock contention, completely invisible to callers.
+/// Falls back to ArrayPool for cache misses, then standard allocation when pooling is disabled.
+/// Return pooled tensors via <see cref="TensorPool.Return{T}"/> to enable buffer reuse.
 /// </summary>
 public static class TensorAllocator
 {
@@ -42,29 +42,85 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Large tensors: use ArrayPool to avoid GC pressure from repeated allocations
+        // Tier 1: Thread-local cache — zero allocation after warmup.
+        T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
+        if (cached is null && totalSize >= ArrayPoolThreshold)
+            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
+        if (cached is not null)
+        {
+            Array.Clear(cached, 0,
+                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : totalSize);
+            var memory = new Memory<T>(cached, 0, totalSize);
+            return Tensor<T>.FromPooledMemory(memory, shape, cached);
+        }
+
+        // Tier 3: ArrayPool for large reference types.
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Zero-fill the active region for correctness under concurrent access.
-            // When T contains references, clear the full array so stale objects in the
-            // tail [totalSize, pooled.Length) aren't kept alive via _pooledArray.
             Array.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium tensors: use zero-initialized allocation for correctness.
-        // GC.AllocateUninitializedArray skips zeroing for performance, but this
-        // causes stale-data races when tensors are allocated concurrently (e.g.,
-        // parallel test execution or multi-threaded model training).
-        T[] array = new T[totalSize];
-        var mem = new Memory<T>(array);
+        // Tier 4: Standard managed allocation for small tensors.
+        T[] arr = new T[totalSize];
+        var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
         return new Tensor<T>(shape);
 #endif
+    }
+
+    /// <summary>
+    /// Computes the ArrayPool bucket size for a given request.
+    /// ArrayPool returns power-of-2 sizes, so we need to match on return.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ArrayPoolBucketSize(int requestedSize)
+    {
+        // ArrayPool.Shared uses power-of-2 buckets starting at 16
+        if (requestedSize <= 16) return 16;
+        // Round up to next power of 2
+        int v = requestedSize - 1;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        return v + 1;
+    }
+
+    /// <summary>
+    /// Creates a tensor backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for tensors that will ONLY be accessed via Pin()/Memory.Span — never GetDataArray().
+    /// oneDNN and VML operations should use this for optimal performance.
+    /// GetDataArray() triggers lazy demotion (one-time copy to managed array).
+    /// </summary>
+    public static Tensor<T> RentNative<T>(int[] shape) where T : unmanaged
+    {
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+
+        if (totalSize == 0)
+            return new Tensor<T>(shape);
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float))
+        {
+            var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
+            return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
+            return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
+        }
+#endif
+        // Fallback for other unmanaged types
+        return Rent<T>(shape);
     }
 
     /// <summary>
@@ -113,8 +169,10 @@ public static class TensorAllocator
     }
 
     /// <summary>
-    /// Creates a tensor with the given shape and copies data from a Vector.
-    /// Uses pooled memory for large tensors to reduce GC pressure.
+    /// Creates a tensor with the given shape and data from a Vector.
+    /// Zero-copy when the Vector's backing array is exactly the right size
+    /// (common pattern: caller does new T[n], computes into it, wraps in Vector).
+    /// Falls back to copy when the backing array can't be extracted.
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape, Vector<T> data)
     {
@@ -127,6 +185,18 @@ public static class TensorAllocator
                 $"Data length ({data.Length}) must match shape total ({totalSize}).",
                 nameof(data));
 
+#if NET5_0_OR_GREATER
+        // Zero-copy path: if the Vector's backing array is exactly totalSize,
+        // wrap it directly — no allocation, no copy. This is the common case when
+        // callers do: var arr = new T[n]; compute(arr); Rent(shape, new Vector<T>(arr))
+        T[]? backingArray = data._cachedArray;
+        if (backingArray is not null && backingArray.Length == totalSize)
+        {
+            var memory = new Memory<T>(backingArray);
+            return Tensor<T>.FromMemory(memory, shape);
+        }
+#endif
+
         if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape, data);
@@ -138,15 +208,12 @@ public static class TensorAllocator
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             src.CopyTo(pooled.AsSpan(0, totalSize));
-            // Clear tail [totalSize, pooled.Length) when T contains references so
-            // stale objects from previous tenants aren't kept alive via _pooledArray
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > totalSize)
                 Array.Clear(pooled, totalSize, pooled.Length - totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium: allocate uninitialized then span-copy (avoid double-write from new T[] + copy)
         T[] array = GC.AllocateUninitializedArray<T>(totalSize);
         src.CopyTo(array);
         var mem = new Memory<T>(array);
@@ -173,6 +240,11 @@ public static class TensorAllocator
         {
             tensor.DetachPooledArray();
 #if NET5_0_OR_GREATER
+            // Tier 1: Try thread-local cache first — zero contention, instant reuse.
+            if (ThreadLocalTensorCache<T>.TryReturn(pooledArray))
+                return;
+
+            // Tier 2: Cache full — fall through to ArrayPool.
             ArrayPool<T>.Shared.Return(pooledArray,
                 clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
 #else

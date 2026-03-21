@@ -1810,7 +1810,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[rank - 1] = n;
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
@@ -1911,20 +1911,23 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            // Use 500K threshold for bandwidth-bound ops
+            // Use PersistentParallelExecutor for near-zero dispatch overhead
+            // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
             int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
             if (addChunks >= 2)
             {
                 int chunkSize = (length + addChunks - 1) / addChunks;
                 chunkSize = (chunkSize + 31) & ~31;
+                var pACap = pA; var pBCap = pB; var pRCap = pR;
+                int lenCap = length;
 
-                Parallel.For(0, addChunks, chunk =>
+                PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
                 {
                     int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
+                    int count = Math.Min(chunkSize, lenCap - start);
                     if (count > 0)
                     {
-                        SimdKernels.VectorAddUnsafe(pA + start, pB + start, pR + start, count);
+                        SimdKernels.VectorAddUnsafe(pACap + start, pBCap + start, pRCap + start, count);
                     }
                 });
             }
@@ -2185,6 +2188,302 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // Step 1: GroupNorm into output (single computation)
+        GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
+
+        // Step 2: Swish in-place on the normalized output
+        // swish(x) = x * sigmoid(x) — needs a temp buffer for sigmoid values
+        SwishInPlace(output);
+    }
+
+    /// <inheritdoc/>
+    public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        // output = GroupNorm(a + b)
+        // Step 1: Add a + b directly into output (zero alloc)
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Add(a.AsSpan(), b.AsSpan(), output.AsWritableSpan());
+        // Step 2: GroupNorm in-place on output via GroupNormInto
+        GroupNormInto(output, output, numGroups, gamma, beta, epsilon, out _, out _);
+    }
+
+    /// <inheritdoc/>
+    public void SwishInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
+        numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+        numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void GELUInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void TanhInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void MishInPlace<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
+    public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (a.Rank == 2 && b.Rank == 2)
+        {
+            int m = a.Shape[0];
+            int n = a.Shape[1];
+            int p = b.Shape[1];
+
+            if (n != b.Shape[0])
+                throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
+
+            // Try BLAS directly into destination memory (true zero-alloc)
+            if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, destination.Data, 0, m, n, p))
+                return;
+
+            // Fallback: compute via numOps into destination spans
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var aSpan = a.AsSpan();
+            var bSpan = b.AsSpan();
+            var dstSpan = destination.AsWritableSpan();
+            dstSpan.Clear();
+
+            for (int i = 0; i < m; i++)
+            {
+                for (int k = 0; k < n; k++)
+                {
+                    T aVal = aSpan[i * n + k];
+                    for (int j = 0; j < p; j++)
+                    {
+                        dstSpan[i * p + j] = numOps.Add(dstSpan[i * p + j],
+                            numOps.Multiply(aVal, bSpan[k * p + j]));
+                    }
+                }
+            }
+            return;
+        }
+
+        // For batched/ND cases, fall back to allocate-copy
+        var result = TensorMatMul(a, b);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// </remarks>
+    public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
+    {
+        var result = Concat(tensors, axis);
+        result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// </remarks>
+    public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
+    {
+        if (axes == null || axes.Length == 0 ||
+            (input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0))
+        {
+            // Standard 2D transpose
+            var result = TensorTranspose(input);
+            result.Data.Span.CopyTo(destination.Data.Span);
+            return;
+        }
+
+        // General ND permutation: map each destination coord back to source
+        var srcShape = input.Shape;
+        var srcSpan = input.AsSpan();
+        var dstSpan = destination.AsWritableSpan();
+        int rank = srcShape.Length;
+
+        var srcStrides = new int[rank];
+        srcStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            srcStrides[d] = srcStrides[d + 1] * srcShape[d + 1];
+
+        var dstStrides = new int[rank];
+        var dstShape = destination.Shape;
+        dstStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            dstStrides[d] = dstStrides[d + 1] * dstShape[d + 1];
+
+        int totalElements = destination.Length;
+        var coords = new int[rank];
+
+        for (int dstIdx = 0; dstIdx < totalElements; dstIdx++)
+        {
+            int remaining = dstIdx;
+            for (int d = 0; d < rank; d++)
+            {
+                coords[d] = remaining / dstStrides[d];
+                remaining %= dstStrides[d];
+            }
+
+            int srcIdx = 0;
+            for (int d = 0; d < rank; d++)
+                srcIdx += coords[d] * srcStrides[axes[d]];
+
+            dstSpan[dstIdx] = srcSpan[srcIdx];
+        }
+    }
+
+    /// <inheritdoc/>
+    public unsafe void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+
+        int rank = input.Rank;
+        if (axis < 0) axis = rank + axis;
+
+        int outerSize = 1, axisSize = input.Shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+
+        if (typeof(T) == typeof(float) && innerSize == 1)
+        {
+            // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
+            using var pinIn = input.Data.Pin();
+            using var pinOut = destination.Data.Pin();
+            unsafe
+            {
+                SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
+            return;
+        }
+
+        // Fallback: compute and copy, return pooled tensor
+        var result = Softmax(input, axis);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
+    }
+
+    /// <inheritdoc/>
+    public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
+    {
+        var result = TensorLogSoftmax(input, axis);
+        try
+        {
+            result.Data.Span.CopyTo(destination.Data.Span);
+        }
+        finally
+        {
+            TensorAllocator.Return(result);
+        }
+    }
+
+    /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
+    public void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Divide into pre-allocated destination. Zero allocation.</summary>
+    public void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Exp into pre-allocated destination. Zero allocation.</summary>
+    public void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Log into pre-allocated destination. Zero allocation.</summary>
+    public void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Log(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Sqrt into pre-allocated destination. Zero allocation.</summary>
+    public void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Abs into pre-allocated destination. Zero allocation.</summary>
+    public void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorAddMany<T>(params Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
@@ -2208,7 +2507,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Chain pairwise additions using span-based numOps: result = t0 + t1 + t2 + ...
         // First: result = tensors[0] + tensors[1]
-        var result = new Tensor<T>(referenceShape);
+        var result = TensorAllocator.Rent<T>(referenceShape);
         numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
 
         // Accumulate remaining tensors into result
@@ -2462,7 +2761,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
-        var result = new Tensor<T>(referenceShape);
+        var result = TensorAllocator.Rent<T>(referenceShape);
         numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
 
         for (int t = 2; t < tensors.Length; t++)
@@ -2846,7 +3145,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensors must have the same shape for element-wise power.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(bases.Shape);
+        var result = TensorAllocator.Rent<T>(bases.Shape);
         var srcB = bases.AsSpan();
         var srcE = exponents.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2946,7 +3245,7 @@ public class CpuEngine : ITensorLevelEngine
         int channels = grid.Shape[3];
         int numPositions = positions.Shape[0];
 
-        var result = new Tensor<T>(new[] { numPositions, channels });
+        var result = TensorAllocator.Rent<T>(new[] { numPositions, channels });
 
         Parallel.For(0, numPositions, n =>
         {
@@ -3023,7 +3322,7 @@ public class CpuEngine : ITensorLevelEngine
         int numPositions = positions.Shape[0];
 
         // Initialize gradient grid with zeros
-        var gradGrid = new Tensor<T>(grid.Shape);
+        var gradGrid = TensorAllocator.Rent<T>(grid.Shape);
 
         // Use thread-local gradients to avoid contention, then combine
         int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -3307,11 +3606,11 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var shape = new int[tensor.Rank];
                 for (int i = 0; i < tensor.Rank; i++) shape[i] = 1;
-                var result = new Tensor<T>(shape);
+                var result = TensorAllocator.Rent<T>(shape);
                 result.GetDataArray()[0] = sum;
                 return result;
             }
-            return new Tensor<T>([1], new Vector<T>([sum]));
+            return TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
         }
 
         // Validate and normalize axes consistently with other reducers
@@ -3331,7 +3630,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result2 = new Tensor<T>(outputShape.ToArray());
+        var result2 = TensorAllocator.Rent<T>(outputShape.ToArray());
 
         // Use tensor's built-in Sum which is already optimized
         var summed = tensor.Sum(normalizedAxes);
@@ -5143,7 +5442,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = halfSize;
 
         var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length / 2];
+        var outputData = new T[input.Length / 2];
 
         // Calculate strides for the dimension
         int innerSize = 1;
@@ -5173,7 +5472,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -5194,7 +5493,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var gradOutData = gradOutput.GetDataArray();
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5228,7 +5527,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5257,7 +5556,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = halfSize;
 
         var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length / 2];
+        var outputData = new T[input.Length / 2];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5291,7 +5590,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -5312,7 +5611,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var gradOutData = gradOutput.GetDataArray();
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5355,7 +5654,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5385,7 +5684,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = halfSize;
 
         var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length / 2];
+        var outputData = new T[input.Length / 2];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5417,7 +5716,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -5438,7 +5737,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var gradOutData = gradOutput.GetDataArray();
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5475,7 +5774,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5504,7 +5803,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = halfSize;
 
         var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length / 2];
+        var outputData = new T[input.Length / 2];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5535,7 +5834,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -5556,7 +5855,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var gradOutData = gradOutput.GetDataArray();
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
@@ -5591,7 +5890,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
 
@@ -5815,7 +6114,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[rank - 2] = m;
         outputShape[rank - 1] = p;
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeB = n * p;
@@ -5892,7 +6191,7 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check kernel size, stride, padding, and dilation parameters.");
 
-        var result = new Tensor<T>([batch, outChannels, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();
@@ -6013,7 +6312,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInput));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInput));
     }
 
     /// <inheritdoc/>
@@ -6094,7 +6393,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
     }
 
     /// <inheritdoc/>
@@ -6121,7 +6420,7 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
-        var result = new Tensor<T>([batch, channels, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         // Use local variable to avoid capturing out parameter in lambda
         var indices = new int[batch, channels, outputHeight, outputWidth, 2];
 
@@ -6187,7 +6486,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput.Shape[2];
         int outputWidth = gradOutput.Shape[3];
 
-        var result = new Tensor<T>(inputShape);
+        var result = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
 
@@ -6276,7 +6575,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -6297,7 +6596,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput.Shape[2];
         int outputWidth = gradOutput.Shape[3];
 
-        var result = new Tensor<T>(inputShape);
+        var result = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         T poolArea = numOps.FromDouble(poolH * poolW);
@@ -6401,7 +6700,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -6469,7 +6768,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInput));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInput));
     }
 
     /// <inheritdoc/>
@@ -6540,7 +6839,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
     }
 
     /// <inheritdoc/>
@@ -6635,7 +6934,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return new Tensor<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -6725,7 +7024,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(kernelShape, new Vector<T>(gradKernel));
+        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernel));
     }
 
     #region Deformable Convolution Operations
@@ -6811,7 +7110,7 @@ public class CpuEngine : ITensorLevelEngine
                     $"Got [{string.Join(",", mask.Shape)}].", nameof(mask));
         }
 
-        var result = new Tensor<T>([batch, outChannels, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
         var offsetData = offset.GetDataArray();
@@ -6977,7 +7276,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradInput = new Tensor<T>(inputShape);
+        var gradInput = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
@@ -7144,7 +7443,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradKernel = new Tensor<T>(kernelShape);
+        var gradKernel = TensorAllocator.Rent<T>(kernelShape);
         var gradKernelData = gradKernel.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -7265,7 +7564,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput.Shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradOffset = new Tensor<T>(offset.Shape);
+        var gradOffset = TensorAllocator.Rent<T>(offset.Shape);
         var gradOffsetData = gradOffset.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -7578,7 +7877,7 @@ public class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         // Mask shape: [batch, kernel_h*kernel_w, out_h, out_w]
-        var gradMask = new Tensor<T>([batch, numKernelPositions, outputHeight, outputWidth]);
+        var gradMask = TensorAllocator.Rent<T>([batch, numKernelPositions, outputHeight, outputWidth]);
         var gradMaskData = gradMask.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -7672,7 +7971,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput.Shape[1]},{gradOutput.Shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
         if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
 
-        var gradInput = new Tensor<T>(inputShape);
+        var gradInput = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
@@ -7743,7 +8042,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput.Shape[1]},{gradOutput.Shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
         if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
 
-        var gradGrid = new Tensor<T>(grid.Shape);
+        var gradGrid = TensorAllocator.Rent<T>(grid.Shape);
         var gradGridData = gradGrid.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -7850,7 +8149,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Check kernel size, stride, padding, and dilation parameters for input size {depth}x{height}x{width}.");
         }
 
-        var result = new Tensor<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
         var outputData = result.GetDataArray();
@@ -8000,7 +8299,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -8100,7 +8399,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(kernelShape, new Vector<T>(gradKernelData));
+        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernelData));
     }
 
     /// <inheritdoc/>
@@ -8151,7 +8450,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Check pool size, stride, and padding parameters for input size {depth}x{height}x{width}.");
         }
 
-        var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
@@ -8236,7 +8535,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Check pool size and stride parameters for input size {depth}x{height}x{width}.");
         }
 
-        var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
         var localMaxIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
@@ -8353,7 +8652,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -8395,7 +8694,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Check pool size, stride, and padding parameters for input size {depth}x{height}x{width}.");
         }
 
-        var result = new Tensor<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
@@ -8541,7 +8840,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -8588,7 +8887,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -8648,7 +8947,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -8754,7 +9053,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return new Tensor<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -8861,7 +9160,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return new Tensor<T>(kernelShape, new Vector<T>(gradKernelData));
+        return TensorAllocator.Rent<T>(kernelShape, new Vector<T>(gradKernelData));
     }
 
     #endregion
@@ -8904,7 +9203,7 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight != expectedOutputH || outputWidth != expectedOutputW)
             throw new ArgumentException($"Calculated output dimensions ({expectedOutputH}x{expectedOutputW}) do not match weights dimensions ({outputHeight}x{outputWidth}). Check input, kernel, and stride parameters.");
 
-        var result = new Tensor<T>(new[] { batch, outChannels, outputHeight, outputWidth });
+        var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
         var inputData = input.GetDataArray();
         var weightsData = weights.GetDataArray();
         var biasData = bias?.GetDataArray();
@@ -9017,7 +9316,7 @@ public class CpuEngine : ITensorLevelEngine
             finalGradInput[idx] = sumGrad;
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(finalGradInput));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(finalGradInput));
     }
 
     /// <inheritdoc/>
@@ -9087,7 +9386,7 @@ public class CpuEngine : ITensorLevelEngine
             gradWeights[idx] = sum;
         });
 
-        return new Tensor<T>(weightsShape, new Vector<T>(gradWeights));
+        return TensorAllocator.Rent<T>(weightsShape, new Vector<T>(gradWeights));
     }
 
     /// <inheritdoc/>
@@ -9125,7 +9424,7 @@ public class CpuEngine : ITensorLevelEngine
             gradBias[oc] = sum;
         });
 
-        return new Tensor<T>(new[] { outChannels }, new Vector<T>(gradBias));
+        return TensorAllocator.Rent<T>(new[] { outChannels }, new Vector<T>(gradBias));
     }
 
     #endregion
@@ -9150,20 +9449,22 @@ public class CpuEngine : ITensorLevelEngine
         // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var inputFloats = (float[])(object)input.GetDataArray();
-#if NET5_0_OR_GREATER
-            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
-#else
-            var outputFloats = new float[inputFloats.Length];
-#endif
-            SoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
-            return (Tensor<T>)(object)new Tensor<float>(input.Shape, Vector<float>.FromMemory(outputFloats));
+            // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
+            var result = TensorAllocator.Rent<T>(input.Shape);
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
+            return result;
         }
 
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var outputDataGeneric = new T[inputData.Length];
+        var result2 = TensorAllocator.Rent<T>(input.Shape);
+        var outputDataGeneric = result2.GetDataArray();
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
@@ -9197,7 +9498,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(input.Shape, new Vector<T>(outputDataGeneric));
+        return result2;
     }
 
     /// <summary>
@@ -9205,25 +9506,186 @@ public class CpuEngine : ITensorLevelEngine
     /// Each row is independent: max → subtract → exp → sum → divide.
     /// Parallelized across rows for large tensors.
     /// </summary>
-    private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    /// <summary>
+    /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
+    /// and parallelizes across batch*groups using PersistentParallelExecutor.
+    /// </summary>
+    private unsafe void GroupNormFloatPtr(
+        float* inputData, float* outputData,
+        float* gammaData, float* betaData,
+        int batch, int channels, int spatialSize, int numGroups, int channelsPerGroup,
+        float eps, out float[] meanArr, out float[] varArr)
     {
-        // Delegate to SimdKernels.SoftmaxRowUnsafe which has inline FastExp256
-        // (no function call overhead per row — exp is computed inline with AVX2/FMA).
-        // Parallel dispatch across rows for large workloads.
-        fixed (float* pIn = inputFloats)
-        fixed (float* pOut = outputFloats)
+        // Use arrays directly (Span can't be captured in lambdas)
+
+        int groupSize = channelsPerGroup * spatialSize;
+        meanArr = new float[batch * numGroups];
+        varArr = new float[batch * numGroups];
+
+        int totalGroups = batch * numGroups;
+        var meanLocal = meanArr;
+        var varLocal = varArr;
+
+        // Parallelize across batch*groups — each group is independent
+        PersistentParallelExecutor.Instance.Execute(
+            Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism),
+            chunk =>
+            {
+                int chunkSize = (totalGroups + Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism) - 1)
+                    / Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism);
+                int startIdx = chunk * chunkSize;
+                int endIdx = Math.Min(startIdx + chunkSize, totalGroups);
+
+                for (int idx = startIdx; idx < endIdx; idx++)
+                {
+                    int b = idx / numGroups;
+                    int g = idx % numGroups;
+                    int startChannel = g * channelsPerGroup;
+                    int batchOffset = b * channels * spatialSize;
+
+                    // Mean computation (pointer-based for NativeMemory compat)
+                    float sum = 0f;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int chanOff = batchOffset + (startChannel + c) * spatialSize;
+                        for (int s = 0; s < spatialSize; s++)
+                            sum += inputData[chanOff + s];
+                    }
+                    float groupMean = sum / groupSize;
+                    meanLocal[idx] = groupMean;
+
+                    // Variance computation (pointer-based)
+                    float sumSq = 0f;
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int chanOff = batchOffset + (startChannel + c) * spatialSize;
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float diff = inputData[chanOff + s] - groupMean;
+                            sumSq += diff * diff;
+                        }
+                    }
+                    float groupVar = sumSq / groupSize;
+                    varLocal[idx] = groupVar;
+
+                    // Normalize and apply scale/shift
+                    float invStd = 1f / MathF.Sqrt(groupVar + eps);
+                    for (int c = 0; c < channelsPerGroup; c++)
+                    {
+                        int channel = startChannel + c;
+                        int chanOff = batchOffset + channel * spatialSize;
+                        float g_val = gammaData[channel];
+                        float b_val = betaData[channel];
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            outputData[chanOff + s] = (inputData[chanOff + s] - groupMean) * invStd * g_val + b_val;
+                        }
+                    }
+                }
+            });
+    }
+
+    /// <summary>SIMD-accelerated sum of float array segment.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SimdSumFloat(float[] data, int offset, int count)
+    {
+        float sum = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && count >= 32)
         {
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = count & ~31;
+            for (; i < simdLen; i += 32)
+            {
+                vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, SimdKernels.ReadVector256(data.AsSpan(), offset + i));
+                vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 8));
+                vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 16));
+                vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, SimdKernels.ReadVector256(data.AsSpan(), offset + i + 24));
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            sum = SimdKernels.HorizontalSum(vsum0);
+        }
+#endif
+        for (; i < count; i++)
+            sum += data[offset + i];
+        return sum;
+    }
+
+    /// <summary>SIMD-accelerated sum of squared differences: sum((x-mean)^2).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SimdSumSquaredDiffFloat(float[] data, int offset, int count, float mean)
+    {
+        float sumSq = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported && count >= 32)
+        {
+            var vmean = System.Runtime.Intrinsics.Vector256.Create(mean);
+            var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            var vsum1 = vsum0; var vsum2 = vsum0; var vsum3 = vsum0;
+            int simdLen = count & ~31;
+            for (; i < simdLen; i += 32)
+            {
+                var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i), vmean);
+                var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 8), vmean);
+                var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 16), vmean);
+                var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(SimdKernels.ReadVector256(data.AsSpan(), offset + i + 24), vmean);
+                vsum0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, vsum0);
+                vsum1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, vsum1);
+                vsum2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, d2, vsum2);
+                vsum3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, d3, vsum3);
+            }
+            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1),
+                System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+            sumSq = SimdKernels.HorizontalSum(vsum0);
+        }
+#endif
+        for (; i < count; i++)
+        {
+            float diff = data[offset + i] - mean;
+            sumSq += diff * diff;
+        }
+        return sumSq;
+    }
+
+    /// <summary>Pointer-based softmax — works with both managed arrays and NativeMemory.</summary>
+    private static unsafe void SoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
+    {
+        {
+#if NET5_0_OR_GREATER
+            // oneDNN path: fused SVML-accelerated softmax — processes all rows in one call.
+            // This matches TorchSharp's libtorch which uses the same MKLDNN backend.
+            if (OneDnnProvider.TrySoftmax(pIn, pOut, outerSize, axisSize))
+                return;
+#endif
+
             int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
             bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
 
             if (useParallel)
             {
-                IntPtr ipIn = (IntPtr)pIn;
-                IntPtr ipOut = (IntPtr)pOut;
+                // Use PersistentParallelExecutor for near-zero dispatch overhead
+                // Each worker processes a chunk of consecutive rows for cache locality
+                int numChunks = Math.Min(maxThreads, outerSize);
+                int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
+                float* pInCap = pIn;
+                float* pOutCap = pOut;
                 int axisSz = axisSize;
-                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
+                int outerSz = outerSize;
+
+                PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
                 {
-                    SimdKernels.SoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
+                    int startRow = chunk * rowsPerChunk;
+                    int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
+                    for (int row = startRow; row < endRow; row++)
+                    {
+                        SimdKernels.SoftmaxRowUnsafe(pInCap + row * axisSz, pOutCap + row * axisSz, axisSz);
+                    }
                 });
             }
             else
@@ -9240,24 +9702,36 @@ public class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
-
-        var gradOutputData = gradOutput.GetDataArray();
-        var outputData = output.GetDataArray();
-        var gradInputData = new T[outputData.Length];
 
         int outerSize = 1, axisSize = output.Shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= output.Shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= output.Shape[i];
+
+#if NET5_0_OR_GREATER
+        // Float SIMD fast path for last-axis softmax backward (innerSize == 1)
+        if (typeof(T) == typeof(float) && innerSize == 1
+            && gradOutput.GetDataArray() is float[] gOutF
+            && output.GetDataArray() is float[] outF)
+        {
+            var gInF = new float[outF.Length];
+            SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output.Shape, new Vector<T>((T[])(object)gInF));
+        }
+#endif
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradOutputData = gradOutput.GetDataArray();
+        var outputData = output.GetDataArray();
+        var gradInputData = new T[outputData.Length];
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
 
-            // Compute dot product of grad and output along axis
             T dotProduct = numOps.Zero;
             for (int i = 0; i < axisSize; i++)
             {
@@ -9265,7 +9739,6 @@ public class CpuEngine : ITensorLevelEngine
                 dotProduct = numOps.Add(dotProduct, numOps.Multiply(gradOutputData[flatIdx], outputData[flatIdx]));
             }
 
-            // Compute gradient: grad_input = output * (grad_output - dot_product)
             for (int i = 0; i < axisSize; i++)
             {
                 int flatIdx = (outer * axisSize + i) * innerSize + inner;
@@ -9273,8 +9746,107 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(output.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradInputData));
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD-optimized softmax backward for float with contiguous axis (innerSize == 1).
+    /// Per row: dotProduct = sum(gradOut * output), gradIn = output * (gradOut - dotProduct).
+    /// </summary>
+    private static unsafe void SoftmaxBackwardFloat(float[] gradOut, float[] output, float[] gradIn,
+        int outerSize, int axisSize)
+    {
+        bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
+
+        if (useParallel)
+        {
+            Parallel.For(0, outerSize, row =>
+            {
+                SoftmaxBackwardFloatRow(gradOut, output, gradIn, row, axisSize);
+            });
+        }
+        else
+        {
+            for (int row = 0; row < outerSize; row++)
+                SoftmaxBackwardFloatRow(gradOut, output, gradIn, row, axisSize);
+        }
+    }
+
+    private static unsafe void SoftmaxBackwardFloatRow(float[] gradOut, float[] output, float[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        fixed (float* pGO = gradOut, pO = output, pGI = gradIn)
+        {
+            float* go = pGO + baseIdx;
+            float* o = pO + baseIdx;
+            float* gi = pGI + baseIdx;
+
+            // Step 1: dot product = sum(gradOut[i] * output[i])
+            float dot = 0f;
+            int i = 0;
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && axisSize >= 32)
+            {
+                var vdot0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                int simdLen = axisSize & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    vdot0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i), vdot0);
+                    vdot1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8), vdot1);
+                    vdot2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 16),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 16), vdot2);
+                    vdot3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 24),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 24), vdot3);
+                }
+                vdot0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot0, vdot1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot2, vdot3));
+                dot = SimdKernels.HorizontalSum(vdot0);
+            }
+            for (; i < axisSize; i++)
+                dot += go[i] * o[i];
+
+            // Step 2: gradIn[i] = output[i] * (gradOut[i] - dot)
+            i = 0;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+            {
+                var vdot = System.Runtime.Intrinsics.Vector256.Create(dot);
+                int simdLen = axisSize & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 16);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 24);
+                    var o0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i);
+                    var o1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8);
+                    var o2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 16);
+                    var o3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 24);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o0, System.Runtime.Intrinsics.X86.Avx.Subtract(go0, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 8,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o1, System.Runtime.Intrinsics.X86.Avx.Subtract(go1, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 16,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o2, System.Runtime.Intrinsics.X86.Avx.Subtract(go2, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 24,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o3, System.Runtime.Intrinsics.X86.Avx.Subtract(go3, vdot)));
+                }
+            }
+            for (; i < axisSize; i++)
+                gi[i] = o[i] * (go[i] - dot);
+        }
+    }
+#endif
 
     /// <inheritdoc/>
     public Tensor<T> GumbelSoftmax<T>(Tensor<T> input, double temperature = 1.0, bool hard = false, int axis = -1)
@@ -9295,8 +9867,8 @@ public class CpuEngine : ITensorLevelEngine
 
         // Add Gumbel noise: -log(-log(U)) where U ~ Uniform(0, 1)
         var random = RandomHelper.ThreadSafeRandom;
-        var perturbedData = new T[inputData.Length];
-        for (int i = 0; i < inputData.Length; i++)
+        var perturbedData = new T[input.Length];
+        for (int i = 0; i < input.Length; i++)
         {
             var u = random.NextDouble();
             u = Math.Max(u, eps);
@@ -9307,7 +9879,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Apply softmax
-        var perturbedTensor = new Tensor<T>(shape, new Vector<T>(perturbedData));
+        var perturbedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(perturbedData));
         var softResult = Softmax(perturbedTensor, axis);
 
         if (!hard)
@@ -9346,7 +9918,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(hardData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(hardData));
     }
 
     /// <inheritdoc/>
@@ -9363,12 +9935,12 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = softmaxGrad.GetDataArray();
         var scale = numOps.FromDouble(1.0 / temperature);
 
-        for (int i = 0; i < gradData.Length; i++)
+        for (int i = 0; i < gradOutput.Length; i++)
         {
             gradData[i] = numOps.Multiply(gradData[i], scale);
         }
 
-        return new Tensor<T>(output.Shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradData));
     }
 
     /// <inheritdoc/>
@@ -9384,7 +9956,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var shape = input.Shape;
-        var outputData = new T[inputData.Length];
+        var outputData = new T[input.Length];
 
         // Precompute factorials
         var factorials = new double[order + 1];
@@ -9449,7 +10021,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -9534,7 +10106,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -9548,7 +10120,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var shape = input.Shape;
-        var outputData = new T[inputData.Length];
+        var outputData = new T[input.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -9601,7 +10173,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -9656,7 +10228,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -9670,7 +10242,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetDataArray();
         var shape = input.Shape;
-        var normalizedData = new T[inputData.Length];
+        var normalizedData = new T[input.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -9704,7 +10276,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         // Apply softmax to normalized data
-        var normalizedTensor = new Tensor<T>(shape, new Vector<T>(normalizedData));
+        var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
         return Softmax(normalizedTensor, axis);
     }
 
@@ -9727,7 +10299,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
         // First compute the normalized input
-        var normalizedData = new T[inputData.Length];
+        var normalizedData = new T[input.Length];
         var norms = new T[outerSize * innerSize];
 
         Parallel.For(0, outerSize * innerSize, idx =>
@@ -9757,12 +10329,12 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         // Get softmax gradient with respect to normalized input
-        var normalizedTensor = new Tensor<T>(shape, new Vector<T>(normalizedData));
+        var normalizedTensor = TensorAllocator.Rent<T>(shape, new Vector<T>(normalizedData));
         var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
         var softmaxGradData = softmaxGrad.GetDataArray();
 
         // Chain rule through L2 normalization
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
@@ -9788,7 +10360,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -9865,11 +10437,11 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = new Tensor<T>([features], new Vector<T>(meanData));
-        variance = new Tensor<T>([features], new Vector<T>(varData));
+        mean = TensorAllocator.Rent<T>([features], new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>([features], new Vector<T>(varData));
 
         // Return with original shape (restore 1D if input was 1D)
-        var result = new Tensor<T>(workingInput.Shape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(workingInput.Shape, new Vector<T>(outputData));
         return was1D ? result.Reshape([features]) : result;
     }
 
@@ -9890,7 +10462,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var meanData = new T[channels];
         var varData = new T[channels];
-        var outputData = new T[inputData.Length];
+        var outputData = new T[input.Length];
 
         // Compute mean per channel (across height, width)
         Parallel.For(0, channels, c =>
@@ -9934,9 +10506,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = new Tensor<T>([channels], new Vector<T>(meanData));
-        variance = new Tensor<T>([channels], new Vector<T>(varData));
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>([channels], new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>([channels], new Vector<T>(varData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
     }
 
 
@@ -9969,14 +10541,14 @@ public class CpuEngine : ITensorLevelEngine
             var outF = new float[inF.Length];
 #endif
             BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outF);
-            mean = (Tensor<T>)(object)new Tensor<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
-            variance = (Tensor<T>)(object)new Tensor<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
-            return (Tensor<T>)(object)new Tensor<T>(input.Shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
+            mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
+            variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input.Shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
         }
 
         var meanData = new T[channels];
         var varData = new T[channels];
-        var outputData = new T[inputData.Length];
+        var outputData = new T[input.Length];
 
         for (int c = 0; c < channels; c++)
         {
@@ -10016,9 +10588,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mean = new Tensor<T>(new[] { channels }, new Vector<T>(meanData));
-        variance = new Tensor<T>(new[] { channels }, new Vector<T>(varData));
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(varData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
     }
 
     private static unsafe void BatchNorm4DFloat(float[] input, float[] gamma, float[] beta, float eps,
@@ -10040,13 +10612,112 @@ public class CpuEngine : ITensorLevelEngine
         float[] meanOut, float[] varOut, float[] output)
     {
         {
-            // Pass 1: Mean with SIMD accumulation
-            float sum = 0f;
 #if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 32)
             {
-                fixed (float* inp = input)
+                // Pin once for all 3 passes — avoids per-pass pinning overhead
+                fixed (float* inp = input, outp = output)
                 {
+                    // Pass 1: Mean with 4x unrolled SIMD accumulation
+                    float sum = 0f;
+                    var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* ptr = inp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
+                            vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8));
+                            vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16));
+                            vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24));
+                        }
+                        for (; s < spatialSize; s++)
+                            sum += ptr[s];
+                    }
+                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                    sum += SimdKernels.HorizontalSum(vsum0);
+
+                    float channelMean = sum * invCount;
+                    meanOut[c] = channelMean;
+
+                    // Pass 2: Variance with 4x unrolled FMA
+                    float sumSq = 0f;
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                    var vsq0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* ptr = inp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
+                            var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8), vmean);
+                            var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16), vmean);
+                            var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24), vmean);
+                            vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, vsq0);
+                            vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, vsq1);
+                            vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, d2, vsq2);
+                            vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, d3, vsq3);
+                        }
+                        for (; s < spatialSize; s++)
+                        {
+                            float diff = ptr[s] - channelMean;
+                            sumSq += diff * diff;
+                        }
+                    }
+                    vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1), System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
+                    sumSq += SimdKernels.HorizontalSum(vsq0);
+
+                    float channelVar = sumSq * invCount;
+                    varOut[c] = channelVar;
+                    float invStd = 1f / MathF.Sqrt(channelVar + eps);
+                    float g = gamma[c];
+                    float b = beta[c];
+
+                    // Pass 3: Normalize with 4x unrolled FMA: output = gamma * (x - mean) * invStd + beta
+                    var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                    var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* pi = inp + offset;
+                        float* po = outp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                            var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 8), vmean);
+                            var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 16), vmean);
+                            var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 24), vmean);
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 16, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 24, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, vscale, vbias));
+                        }
+                        for (; s < spatialSize; s++)
+                            outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                    }
+                }
+                return;
+            }
+            else if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
+            {
+                fixed (float* inp = input, outp = output)
+                {
+                    // Pass 1: Mean
+                    float sum = 0f;
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10056,43 +10727,16 @@ public class CpuEngine : ITensorLevelEngine
                         int simdLen = spatialSize & ~7;
                         for (; s < simdLen; s += 8)
                             vsum = System.Runtime.Intrinsics.X86.Avx.Add(vsum, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
-                        // Horizontal sum
-                        var hi128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum, 1);
-                        var lo128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum, 0);
-                        var s128 = System.Runtime.Intrinsics.X86.Sse.Add(lo128, hi128);
-                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_01_00_11_10);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_10_11_00_01);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        float partialSum;
-                        System.Runtime.Intrinsics.X86.Sse.StoreScalar(&partialSum, s128);
-                        sum += partialSum;
+                        sum += SimdKernels.HorizontalSum(vsum);
                         for (; s < spatialSize; s++)
                             sum += ptr[s];
                     }
-                }
-            }
-            else
-#endif
-            {
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spatialSize + c * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                        sum += input[offset + s];
-                }
-            }
-            float channelMean = sum * invCount;
-            meanOut[c] = channelMean;
+                    float channelMean = sum * invCount;
+                    meanOut[c] = channelMean;
 
-            // Pass 2: Variance + Pass 3: Normalize (fused)
-            float sumSq = 0f;
-#if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
-            {
-                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
-                fixed (float* inp = input)
-                {
+                    // Pass 2: Variance
+                    float sumSq = 0f;
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10103,54 +10747,24 @@ public class CpuEngine : ITensorLevelEngine
                         for (; s < simdLen; s += 8)
                         {
                             var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
-                            vsumSq = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(diff, diff, vsumSq);
+                            vsumSq = System.Runtime.Intrinsics.X86.Avx.Add(vsumSq, System.Runtime.Intrinsics.X86.Avx.Multiply(diff, diff));
                         }
-                        var hi128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsumSq, 1);
-                        var lo128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsumSq, 0);
-                        var s128 = System.Runtime.Intrinsics.X86.Sse.Add(lo128, hi128);
-                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_01_00_11_10);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_10_11_00_01);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        float partialSumSq;
-                        System.Runtime.Intrinsics.X86.Sse.StoreScalar(&partialSumSq, s128);
-                        sumSq += partialSumSq;
+                        sumSq += SimdKernels.HorizontalSum(vsumSq);
                         for (; s < spatialSize; s++)
                         {
-                            float diff = inp[offset + s] - channelMean;
+                            float diff = ptr[s] - channelMean;
                             sumSq += diff * diff;
                         }
                     }
-                }
-            }
-            else
-#endif
-            {
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spatialSize + c * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        float diff = input[offset + s] - channelMean;
-                        sumSq += diff * diff;
-                    }
-                }
-            }
-            float channelVar = sumSq * invCount;
-            varOut[c] = channelVar;
-            float invStd = 1f / MathF.Sqrt(channelVar + eps);
-            float g = gamma[c];
-            float b = beta[c];
+                    float channelVar = sumSq * invCount;
+                    varOut[c] = channelVar;
+                    float invStd = 1f / MathF.Sqrt(channelVar + eps);
+                    float g = gamma[c];
+                    float b = beta[c];
 
-            // Pass 3: Normalize with SIMD: output = gamma * (x - mean) * invStd + beta
-#if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 8)
-            {
-                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
-                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
-                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
-                fixed (float* inp = input, outp = output)
-                {
+                    // Pass 3: Normalize
+                    var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                    var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10161,16 +10775,50 @@ public class CpuEngine : ITensorLevelEngine
                         for (; s < simdLen; s += 8)
                         {
                             var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
-                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(diff, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Multiply(diff, vscale), vbias));
                         }
                         for (; s < spatialSize; s++)
-                            output[offset + s] = g * (input[offset + s] - channelMean) * invStd + b;
+                            outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
                     }
                 }
+                return;
             }
-            else
 #endif
+            // Scalar fallback
             {
+                // Pass 1: Mean
+                float sum = 0f;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                        sum += input[offset + s];
+                }
+                float channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+
+                // Pass 2: Variance
+                float sumSq = 0f;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        float diff = input[offset + s] - channelMean;
+                        sumSq += diff * diff;
+                    }
+                }
+                float channelVar = sumSq * invCount;
+                varOut[c] = channelVar;
+#if NET5_0_OR_GREATER
+                float invStd = 1f / MathF.Sqrt(channelVar + eps);
+#else
+                float invStd = 1f / (float)Math.Sqrt(channelVar + eps);
+#endif
+                float g = gamma[c];
+                float b = beta[c];
+
+                // Pass 3: Normalize
                 for (int n = 0; n < batch; n++)
                 {
                     int offset = n * channels * spatialSize + c * spatialSize;
@@ -10265,9 +10913,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = new Tensor<T>([features], new Vector<T>(gradGammaData));
-        gradBeta = new Tensor<T>([features], new Vector<T>(gradBetaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([features], new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>([features], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
 
@@ -10292,7 +10940,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
-        var gradInputData = new T[inputData.Length];
+        var gradInputData = new T[input.Length];
 
         // Compute gradGamma and gradBeta per channel
         Parallel.For(0, channels, c =>
@@ -10362,9 +11010,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = new Tensor<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = new Tensor<T>([channels], new Vector<T>(gradBetaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -10459,9 +11107,9 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         // Create mean and variance tensors with batch shape
-        mean = new Tensor<T>(batchShape, new Vector<T>(meanData));
-        variance = new Tensor<T>(batchShape, new Vector<T>(varData));
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>(batchShape, new Vector<T>(varData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -10546,9 +11194,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = new Tensor<T>(gamma.Shape, new Vector<T>(gradGammaData));
-        gradBeta = new Tensor<T>(gamma.Shape, new Vector<T>(gradBetaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -10582,6 +11230,31 @@ public class CpuEngine : ITensorLevelEngine
 
         int groupSize = channelsPerGroup * spatialSize;  // Elements per group
 
+        // Fast float path: Pin() for NativeMemory compatibility
+        if (typeof(T) == typeof(float))
+        {
+            var result = TensorAllocator.Rent<T>(input.Shape);
+            // Pin all memory to get float* pointers (works with both managed and NativeMemory)
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            using var pinGamma = gamma.Data.Pin();
+            using var pinBeta = beta.Data.Pin();
+            unsafe
+            {
+                GroupNormFloatPtr(
+                    (float*)pinIn.Pointer, (float*)pinOut.Pointer,
+                    (float*)pinGamma.Pointer, (float*)pinBeta.Pointer,
+                    batch, channels, spatialSize, numGroups, channelsPerGroup,
+                    System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
+                    out var meanArr, out var varArr);
+                mean = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)meanArr));
+                variance = TensorAllocator.Rent<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)varArr));
+            }
+            return result;
+        }
+
         var inputData = input.GetDataArray();
         var gammaData = gamma.GetDataArray();
         var betaData = beta.GetDataArray();
@@ -10589,7 +11262,7 @@ public class CpuEngine : ITensorLevelEngine
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
-        var outputData = new T[input.Length];
+        var outputData = TensorAllocator.Rent<T>(input.Shape).GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
         Parallel.For(0, batch * numGroups, idx =>
@@ -10639,9 +11312,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = new Tensor<T>([batch, numGroups], new Vector<T>(meanData));
-        variance = new Tensor<T>([batch, numGroups], new Vector<T>(varData));
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(varData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -10752,9 +11425,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = new Tensor<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = new Tensor<T>([channels], new Vector<T>(gradBetaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
 
@@ -10816,8 +11489,8 @@ public class CpuEngine : ITensorLevelEngine
                 outputData[offset + f] = numOps.Multiply(gammaData[f], numOps.Multiply(inputData[offset + f], invRms));
         });
 
-        rms = new Tensor<T>(batchShape, new Vector<T>(rmsData));
-        return new Tensor<T>(input.Shape, new Vector<T>(outputData));
+        rms = TensorAllocator.Rent<T>(batchShape, new Vector<T>(rmsData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -10874,8 +11547,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = new Tensor<T>(gamma.Shape, new Vector<T>(gradGammaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradGammaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     #endregion
@@ -10996,7 +11669,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        attentionWeights = new Tensor<T>([batch, heads, seqQ, seqK], new Vector<T>(weightsData));
+        attentionWeights = TensorAllocator.Rent<T>([batch, heads, seqQ, seqK], new Vector<T>(weightsData));
 
         // Compute output: weights @ V -> [batch, heads, seqQ, d_v]
         var outputData = new T[batch * heads * seqQ * d_v];
@@ -11024,7 +11697,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, heads, seqQ, d_v], new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -11157,9 +11830,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = new Tensor<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = new Tensor<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = new Tensor<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -11373,8 +12046,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        softmaxStats = new Tensor<T>([batch, heads, seqQ], new Vector<T>(statsData));
-        return new Tensor<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
+        softmaxStats = TensorAllocator.Rent<T>([batch, heads, seqQ], new Vector<T>(statsData));
+        return TensorAllocator.Rent<T>([batch, heads, seqQ, headDim], new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -11573,9 +12246,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = new Tensor<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = new Tensor<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = new Tensor<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -11703,8 +12376,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        attentionWeights = new Tensor<T>([batch, numQHeads, seqQ, seqK], new Vector<T>(weightsData));
-        return new Tensor<T>([batch, numQHeads, seqQ, headDim], new Vector<T>(outputData));
+        attentionWeights = TensorAllocator.Rent<T>([batch, numQHeads, seqQ, seqK], new Vector<T>(weightsData));
+        return TensorAllocator.Rent<T>([batch, numQHeads, seqQ, headDim], new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -11847,9 +12520,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = new Tensor<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = new Tensor<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = new Tensor<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -11979,8 +12652,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        attentionCoeffs = new Tensor<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
-        return new Tensor<T>(nodeFeatures.Shape, new Vector<T>(outputData));
+        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
+        return TensorAllocator.Rent<T>(nodeFeatures.Shape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12137,9 +12810,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        gradNodeFeatures = new Tensor<T>(nodeFeatures.Shape, new Vector<T>(gradNodeData));
-        gradAttentionWeightSource = new Tensor<T>(attentionWeightSource.Shape, new Vector<T>(gradAttnSrc));
-        gradAttentionWeightTarget = new Tensor<T>(attentionWeightTarget.Shape, new Vector<T>(gradAttnTgt));
+        gradNodeFeatures = TensorAllocator.Rent<T>(nodeFeatures.Shape, new Vector<T>(gradNodeData));
+        gradAttentionWeightSource = TensorAllocator.Rent<T>(attentionWeightSource.Shape, new Vector<T>(gradAttnSrc));
+        gradAttentionWeightTarget = TensorAllocator.Rent<T>(attentionWeightTarget.Shape, new Vector<T>(gradAttnTgt));
 
         return gradOutput;
     }
@@ -12209,9 +12882,9 @@ public class CpuEngine : ITensorLevelEngine
             }
 
             // Create transformed tensor for this head
-            var transformedTensor = new Tensor<T>(new[] { batchSize, numNodes, headDim }, new Vector<T>(transformedData));
-            var headAttnSrcTensor = new Tensor<T>(new[] { headDim }, new Vector<T>(headAttnSrc));
-            var headAttnTgtTensor = new Tensor<T>(new[] { headDim }, new Vector<T>(headAttnTgt));
+            var transformedTensor = TensorAllocator.Rent<T>(new[] { batchSize, numNodes, headDim }, new Vector<T>(transformedData));
+            var headAttnSrcTensor = TensorAllocator.Rent<T>(new[] { headDim }, new Vector<T>(headAttnSrc));
+            var headAttnTgtTensor = TensorAllocator.Rent<T>(new[] { headDim }, new Vector<T>(headAttnTgt));
 
             // Apply single-head GAT
             var headOutput = GraphAttention(
@@ -12279,8 +12952,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        attentionCoeffs = new Tensor<T>(new[] { batchSize, numHeads, numEdges }, new Vector<T>(allCoeffsData));
-        return new Tensor<T>(new[] { batchSize, numNodes, outFeatures }, new Vector<T>(outputData));
+        attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numHeads, numEdges }, new Vector<T>(allCoeffsData));
+        return TensorAllocator.Rent<T>(new[] { batchSize, numNodes, outFeatures }, new Vector<T>(outputData));
     }
 
 
@@ -12354,7 +13027,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12403,7 +13076,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -12486,7 +13159,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         counts = new Tensor<int>([outDimSize], new Vector<int>(countData));
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12540,7 +13213,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -12614,7 +13287,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         argmax = new Tensor<int>(outputShape, new Vector<int>(argmaxData));
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12668,7 +13341,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(sourceShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(sourceShape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -12694,7 +13367,7 @@ public class CpuEngine : ITensorLevelEngine
         int numGroups = outputSize ?? (maxIndex + 1);
 
         var sourceData = source.GetDataArray();
-        var outputData = new T[sourceData.Length];
+        var outputData = new T[source.Length];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
@@ -12755,7 +13428,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(source.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(source.Shape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12828,7 +13501,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(output.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradInputData));
     }
 
     #endregion
@@ -12938,7 +13611,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -12961,7 +13634,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -13032,7 +13705,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -13098,7 +13771,7 @@ public class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(gradOutputData[outputIdx], scale);
         }
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -13151,7 +13824,7 @@ public class CpuEngine : ITensorLevelEngine
         var meanStrides = ComputeStrides(meanShape);
 
         // Accumulate squared differences from mean
-        int inputSize = inputData.Length;
+        int inputSize = input.Length;
         for (int i = 0; i < inputSize; i++)
         {
             var multiIndex = FlatToMultiIndex(i, inputShape, inputStrides);
@@ -13194,7 +13867,7 @@ public class CpuEngine : ITensorLevelEngine
             outputData[i] = numOps.Multiply(outputData[i], scale);
         }
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -13215,7 +13888,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var gradOutputShape = gradOutput.Shape;
 
-        int inputSize = inputData.Length;
+        int inputSize = input.Length;
         var gradInputData = new T[inputSize];
 
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
@@ -13244,7 +13917,7 @@ public class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, scale), gradOutputData[outputIdx]);
         }
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -13266,7 +13939,7 @@ public class CpuEngine : ITensorLevelEngine
             varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
         }
 
-        return new Tensor<T>(variance.Shape, new Vector<T>(varianceData));
+        return TensorAllocator.Rent<T>(variance.Shape, new Vector<T>(varianceData));
     }
 
     /// <inheritdoc/>
@@ -13291,7 +13964,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var gradOutputShape = gradOutput.Shape;
 
-        int inputSize = inputData.Length;
+        int inputSize = input.Length;
         var gradInputData = new T[inputSize];
 
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
@@ -13363,7 +14036,7 @@ public class CpuEngine : ITensorLevelEngine
             gradInputData[i] = numOps.Multiply(numOps.Multiply(diff, gradScale), gradOutputData[outputIdx]);
         }
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     // Helper methods for reduction operations
@@ -13503,7 +14176,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[heightIdx] = newHeight;
         outputShape[widthIdx] = newWidth;
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -13557,7 +14230,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -13605,7 +14278,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -13646,7 +14319,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     public Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
@@ -13656,7 +14329,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("AffineGrid expects theta shape [batch, 2, 3]");
 
         int batchSize = theta.Shape[0];
-        var grid = new Tensor<T>([batchSize, outputHeight, outputWidth, 2]);
+        var grid = TensorAllocator.Rent<T>([batchSize, outputHeight, outputWidth, 2]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         for (int b = 0; b < batchSize; b++)
@@ -13714,7 +14387,7 @@ public class CpuEngine : ITensorLevelEngine
         int outH = grid.Shape[1];
         int outW = grid.Shape[2];
 
-        var output = new Tensor<T>([batch, outH, outW, channels]);
+        var output = TensorAllocator.Rent<T>([batch, outH, outW, channels]);
 
         T heightScale = numOps.FromDouble((inH - 1) / 2.0);
         T widthScale = numOps.FromDouble((inW - 1) / 2.0);
@@ -13780,8 +14453,8 @@ public class CpuEngine : ITensorLevelEngine
         int k = aShape[1];
         int n = bShape[1];
 
-        var realOut = new Tensor<T>([m, n]);
-        var imagOut = new Tensor<T>([m, n]);
+        var realOut = TensorAllocator.Rent<T>([m, n]);
+        var imagOut = TensorAllocator.Rent<T>([m, n]);
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -13817,7 +14490,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Real and imaginary parts must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var output = new Tensor<T>(real.Shape);
+        var output = TensorAllocator.Rent<T>(real.Shape);
         for (int idx = 0; idx < real.Length; idx++)
         {
             var r = real[idx];
@@ -13835,7 +14508,7 @@ public class CpuEngine : ITensorLevelEngine
         if (numOps.Equals(total, numOps.Zero))
             return (real.Clone(), imag.Clone());
         var denom = numOps.Sqrt(total);
-        var denomTensor = new Tensor<T>(magSq.Shape);
+        var denomTensor = TensorAllocator.Rent<T>(magSq.Shape);
         denomTensor.Fill(denom);
         var realNorm = TensorDivide(real, denomTensor);
         var imagNorm = TensorDivide(imag, denomTensor);
@@ -13878,7 +14551,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>([batch, channels, height, width], new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -13919,7 +14592,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -13965,7 +14638,7 @@ public class CpuEngine : ITensorLevelEngine
         newShape[rank - 2] = newHeight;
         newShape[rank - 1] = newWidth;
 
-        return new Tensor<T>(newShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -14001,7 +14674,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(inputShape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(inputShape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -14058,7 +14731,7 @@ public class CpuEngine : ITensorLevelEngine
             axisOffset += tensor.Shape[axis];
         }
 
-        return new Tensor<T>(outputShape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -14245,7 +14918,7 @@ public class CpuEngine : ITensorLevelEngine
         if (epsilons.Shape[0] != numCenters)
             throw new ArgumentException($"epsilons length ({epsilons.Shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
 
-        var output = new Tensor<T>([batchSize, numCenters]);
+        var output = TensorAllocator.Rent<T>([batchSize, numCenters]);
         var inputData = input.GetDataArray();
         var centersData = centers.GetDataArray();
         var epsilonsData = epsilons.GetDataArray();
@@ -14310,9 +14983,9 @@ public class CpuEngine : ITensorLevelEngine
         if (output.Shape[0] != batchSize || output.Shape[1] != numCenters)
             throw new ArgumentException($"output shape [{output.Shape[0]}, {output.Shape[1]}] must be [{batchSize}, {numCenters}]", nameof(output));
 
-        var gradInput = new Tensor<T>(input.Shape);
-        var gradCenters = new Tensor<T>(centers.Shape);
-        var gradEpsilons = new Tensor<T>(epsilons.Shape);
+        var gradInput = TensorAllocator.Rent<T>(input.Shape);
+        var gradCenters = TensorAllocator.Rent<T>(centers.Shape);
+        var gradEpsilons = TensorAllocator.Rent<T>(epsilons.Shape);
 
         var inputData = input.GetDataArray();
         var centersData = centers.GetDataArray();
@@ -14391,7 +15064,7 @@ public class CpuEngine : ITensorLevelEngine
         Array.Copy(tensor.Shape, outputShape, tensor.Shape.Length);
         outputShape[axis] *= repeats;
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         // Calculate strides for the tensor
         int outerSize = 1;
@@ -14442,7 +15115,7 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = tensor.Shape[i] * multiples[i];
         }
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
         int totalElements = result.Shape.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -14494,7 +15167,7 @@ public class CpuEngine : ITensorLevelEngine
                 throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor.Shape[i]}");
         }
 
-        var result = new Tensor<T>(length);
+        var result = TensorAllocator.Rent<T>(length);
         int totalElements = length.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -14539,7 +15212,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Create a copy of destination to avoid modifying the original
-        var result = new Tensor<T>(destination.Shape);
+        var result = TensorAllocator.Rent<T>(destination.Shape);
         var destData = destination.GetDataArray();
         var resultData = result.GetDataArray();
         Array.Copy(destData, resultData, destData.Length);
@@ -14580,7 +15253,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("All tensors must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(condition.Shape);
+        var result = TensorAllocator.Rent<T>(condition.Shape);
         var condSpan = condition.AsSpan();
         var xSpan = x.AsSpan();
         var ySpan = y.AsSpan();
@@ -14628,7 +15301,7 @@ public class CpuEngine : ITensorLevelEngine
         // Flatten both tensors to 1D
         int n = a.Length;
         int m = b.Length;
-        var result = new Tensor<T>([n, m]);
+        var result = TensorAllocator.Rent<T>([n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         var aData = a.GetDataArray();
@@ -14661,7 +15334,7 @@ public class CpuEngine : ITensorLevelEngine
         int batch = a.Shape[0];
         int n = a.Shape[1];
         int m = b.Shape[1];
-        var result = new Tensor<T>([batch, n, m]);
+        var result = TensorAllocator.Rent<T>([batch, n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         Parallel.For(0, batch, bIdx =>
@@ -14749,7 +15422,7 @@ public class CpuEngine : ITensorLevelEngine
         if (updates == null) throw new ArgumentNullException(nameof(updates));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(destination.Shape);
+        var result = TensorAllocator.Rent<T>(destination.Shape);
         TensorCopy(destination, result);
 
         // Simple 1D scatter-add for now (most common use case: embeddings)
@@ -14794,7 +15467,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             int embeddingDim = source.Shape[1];
             int numIndices = indices.Length;
-            var result = new Tensor<T>([numIndices, embeddingDim]);
+            var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
 
             var indicesData = indices.GetDataArray();
             var sourceData = source.GetDataArray();
@@ -14903,7 +15576,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = RandomHelper.ThreadSafeRandom;
-        var result = new Tensor<T>(shape);
+        var result = TensorAllocator.Rent<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         var resultData = result.GetDataArray();
@@ -14938,7 +15611,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = new Tensor<T>(shape);
+        var result = TensorAllocator.Rent<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double minD = numOps.ToDouble(min);
@@ -14991,7 +15664,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = new Tensor<T>(shape);
+        var result = TensorAllocator.Rent<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double dropoutRateD = numOps.ToDouble(dropoutRate);
@@ -15057,7 +15730,7 @@ public class CpuEngine : ITensorLevelEngine
         if (size <= 0) throw new ArgumentException("Size must be positive", nameof(size));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>([size, size]);
+        var result = TensorAllocator.Rent<T>([size, size]);
         result.Fill(numOps.Zero);
 
         for (int i = 0; i < size; i++)
@@ -15075,7 +15748,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = diagonal.Length;
-        var result = new Tensor<T>([n, n]);
+        var result = TensorAllocator.Rent<T>([n, n]);
         result.Fill(numOps.Zero);
 
         var diagData = diagonal.GetDataArray();
@@ -15097,7 +15770,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensor must be 2D");
 
         int n = Math.Min(tensor.Shape[0], tensor.Shape[1]);
-        var result = new Tensor<T>([n]);
+        var result = TensorAllocator.Rent<T>([n]);
 
         for (int i = 0; i < n; i++)
         {
@@ -15154,7 +15827,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 int batch = tensors[0].Shape[0];
                 int n = tensors[0].Shape[1];
-                var result = new Tensor<T>([batch]);
+                var result = TensorAllocator.Rent<T>([batch]);
                 Parallel.For(0, batch, b =>
                 {
                     T sum = numOps.Zero;
@@ -15214,7 +15887,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tanhOutput == null) throw new ArgumentNullException(nameof(tanhOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(tanhOutput.Shape);
+        var result = TensorAllocator.Rent<T>(tanhOutput.Shape);
 
         // d/dx tanh(x) = 1 - tanh(x)^2: compute y*y then subtract from 1
         // Use span-based: result = 1 - y*y
@@ -15233,8 +15906,8 @@ public class CpuEngine : ITensorLevelEngine
         if (sigmoidOutput == null) throw new ArgumentNullException(nameof(sigmoidOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(sigmoidOutput.Shape);
-        var temp = new Tensor<T>(sigmoidOutput.Shape);
+        var result = TensorAllocator.Rent<T>(sigmoidOutput.Shape);
+        var temp = TensorAllocator.Rent<T>(sigmoidOutput.Shape);
 
         // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
         var y = sigmoidOutput.AsSpan();
@@ -15252,7 +15925,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         int totalElements = input.Length;
 
         // ReLU derivative: 1 if x > 0, else 0
@@ -15272,7 +15945,7 @@ public class CpuEngine : ITensorLevelEngine
         if (size <= 0) throw new ArgumentException("Size must be positive", nameof(size));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>([size, size]);
+        var result = TensorAllocator.Rent<T>([size, size]);
 
         for (int i = 0; i < size; i++)
         {
@@ -15301,14 +15974,14 @@ public class CpuEngine : ITensorLevelEngine
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
 
         // Compute scale factor: ||v||^2 / (1 + ||v||^2)
-        var one = new Tensor<T>(normSquared.Shape);
+        var one = TensorAllocator.Rent<T>(normSquared.Shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(normSquared, denom);
 
         // Compute ||v||
         var norm = TensorSqrt(normSquared);
-        var epsilon = new Tensor<T>(norm.Shape);
+        var epsilon = TensorAllocator.Rent<T>(norm.Shape);
         epsilon.Fill(numOps.FromDouble(1e-8));
         norm = TensorAdd(norm, epsilon);
 
@@ -15335,7 +16008,7 @@ public class CpuEngine : ITensorLevelEngine
         // For now, approximate with element-wise gradient scaling
         var squared = TensorMultiply(input, input);
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
-        var one = new Tensor<T>(normSquared.Shape);
+        var one = TensorAllocator.Rent<T>(normSquared.Shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(one, denom);
@@ -15365,7 +16038,7 @@ public class CpuEngine : ITensorLevelEngine
         var norm = TensorNorm(tensor, axis, keepDims: true);
 
         // Add epsilon for numerical stability
-        var epsArray = new Tensor<T>(norm.Shape);
+        var epsArray = TensorAllocator.Rent<T>(norm.Shape);
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
@@ -15422,7 +16095,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numIndices = indices.Length;
-        var result = new Tensor<T>([numIndices, depth]);
+        var result = TensorAllocator.Rent<T>([numIndices, depth]);
         result.Fill(numOps.Zero);
 
         var idxData = indices.GetDataArray();
@@ -15549,7 +16222,7 @@ public class CpuEngine : ITensorLevelEngine
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions.Shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -15588,7 +16261,7 @@ public class CpuEngine : ITensorLevelEngine
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions.Shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -15628,8 +16301,8 @@ public class CpuEngine : ITensorLevelEngine
         int width = x.Length;
         int height = y.Length;
 
-        var X = new Tensor<T>([height, width]);
-        var Y = new Tensor<T>([height, width]);
+        var X = TensorAllocator.Rent<T>([height, width]);
+        var Y = TensorAllocator.Rent<T>([height, width]);
         var xData = x.GetDataArray();
         var yData = y.GetDataArray();
         var XData = X.GetDataArray();
@@ -15666,14 +16339,14 @@ public class CpuEngine : ITensorLevelEngine
         {
             case 0:
                 // Slice along first axis: result[j,k] = tensor[index, j, k]
-                result = new Tensor<T>([dim1, dim2]);
+                result = TensorAllocator.Rent<T>([dim1, dim2]);
                 // tensor flat: index * dim1 * dim2 + j * dim2 + k => contiguous block
                 Array.Copy(tensorData, index * dim1 * dim2, result.GetDataArray(), 0, dim1 * dim2);
                 break;
 
             case 1:
                 // Slice along second axis: result[i,k] = tensor[i, index, k]
-                result = new Tensor<T>([dim0, dim2]);
+                result = TensorAllocator.Rent<T>([dim0, dim2]);
                 var resultData1 = result.GetDataArray();
                 Parallel.For(0, dim0, i =>
                 {
@@ -15684,7 +16357,7 @@ public class CpuEngine : ITensorLevelEngine
 
             case 2:
                 // Slice along third axis: result[i,j] = tensor[i, j, index]
-                result = new Tensor<T>([dim0, dim1]);
+                result = TensorAllocator.Rent<T>([dim0, dim1]);
                 var resultData2 = result.GetDataArray();
                 Parallel.For(0, dim0, i =>
                 {
@@ -15708,7 +16381,7 @@ public class CpuEngine : ITensorLevelEngine
         if (count < 2) throw new ArgumentException("Count must be at least 2.", nameof(count));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>([count]);
+        var result = TensorAllocator.Rent<T>([count]);
 
         T range = numOps.Subtract(end, start);
         T divisor = numOps.FromDouble(count - 1);
@@ -15757,7 +16430,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Matrix dimensions incompatible. a has shape [{batch}, {M}, {K}], b has shape [{b.Shape[0]}, {N}]. Inner dimensions must match.");
         }
 
-        var result = new Tensor<T>([batch, M, N]);
+        var result = TensorAllocator.Rent<T>([batch, M, N]);
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var resultData = result.GetDataArray();
@@ -15871,20 +16544,21 @@ public class CpuEngine : ITensorLevelEngine
         // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var inputFloats = (float[])(object)tensor.GetDataArray();
-#if NET5_0_OR_GREATER
-            var outputFloats = GC.AllocateUninitializedArray<float>(inputFloats.Length);
-#else
-            var outputFloats = new float[inputFloats.Length];
-#endif
-            LogSoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
-            return (Tensor<T>)(object)new Tensor<float>(tensor.Shape, Vector<float>.FromMemory(outputFloats));
+            // Use Pin() for NativeMemory compatibility
+            var result = TensorAllocator.Rent<T>(tensor.Shape);
+            using var pinIn = tensor.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
+            return result;
         }
 
         // Generic scalar fallback
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = tensor.GetDataArray();
-        var outputData = new T[inputData.Length];
+        var outputData = new T[tensor.Length];
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
@@ -15919,38 +16593,42 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return new Tensor<T>(tensor.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(tensor.Shape, new Vector<T>(outputData));
     }
 
     /// <summary>
     /// Fast SIMD log_softmax for float arrays on last axis.
     /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
     /// </summary>
-    private static unsafe void LogSoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    /// <summary>Pointer-based log-softmax — works with both managed and NativeMemory.</summary>
+    private static unsafe void LogSoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
-        // Delegate to SimdKernels.LogSoftmaxRowUnsafe which has inline FastExp256
-        // (computes exp+sum in a single fused pass — no temp buffer needed).
-        fixed (float* pIn = inputFloats)
-        fixed (float* pOut = outputFloats)
-        {
-            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-            bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
+        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
 
-            if (useParallel)
+        if (useParallel)
+        {
+            float* pInCap = pIn;
+            float* pOutCap = pOut;
+            int axisSz = axisSize;
+            int outerSz = outerSize;
+            int numChunks = Math.Min(maxThreads, outerSize);
+            int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
+
+            PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
             {
-                IntPtr ipIn = (IntPtr)pIn;
-                IntPtr ipOut = (IntPtr)pOut;
-                int axisSz = axisSize;
-                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
+                int startRow = chunk * rowsPerChunk;
+                int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
+                for (int row = startRow; row < endRow; row++)
                 {
-                    SimdKernels.LogSoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
-                });
-            }
-            else
-            {
-                for (int row = 0; row < outerSize; row++)
-                    SimdKernels.LogSoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
-            }
+                    SimdKernels.LogSoftmaxRowUnsafe(pInCap + row * axisSz, pOutCap + row * axisSz, axisSz);
+                }
+            });
+        }
+        else
+        {
+            for (int row = 0; row < outerSize; row++)
+                SimdKernels.LogSoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
         }
     }
 
@@ -15970,7 +16648,7 @@ public class CpuEngine : ITensorLevelEngine
             int features = tensor.Shape[1];
             k = Math.Min(k, features);
 
-            var resultValues = new Tensor<T>([batch, k]);
+            var resultValues = TensorAllocator.Rent<T>([batch, k]);
             var indicesResult = new Tensor<int>([batch, k]);
 
             Parallel.For(0, batch, b =>
@@ -16052,7 +16730,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             int numIndices = indices.Length;
             int cols = tensor.Shape[1];
-            var result = new Tensor<T>([numIndices, cols]);
+            var result = TensorAllocator.Rent<T>([numIndices, cols]);
 
             var indicesData = indices.GetDataArray();
             var tensorData = tensor.GetDataArray();
@@ -16069,7 +16747,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             int rows = tensor.Shape[0];
             int numIndices = indices.Length;
-            var result = new Tensor<T>([rows, numIndices]);
+            var result = TensorAllocator.Rent<T>([rows, numIndices]);
             var indicesData = indices.GetDataArray();
             var tensorData = tensor.GetDataArray();
             var resultData = result.GetDataArray();
@@ -16116,7 +16794,7 @@ public class CpuEngine : ITensorLevelEngine
         newShape[axis] = numTensors;
         for (int i = axis; i < firstShape.Length; i++) newShape[i + 1] = firstShape[i];
 
-        var result = new Tensor<T>(newShape);
+        var result = TensorAllocator.Rent<T>(newShape);
 
         var resultData = result.GetDataArray();
 
@@ -16217,7 +16895,7 @@ public class CpuEngine : ITensorLevelEngine
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
 
-        var result = new Tensor<T>(x.Shape);
+        var result = TensorAllocator.Rent<T>(x.Shape);
         var condData = condition.GetDataArray();
         var xData = x.GetDataArray();
         var yData = y.GetDataArray();
@@ -16547,7 +17225,7 @@ public class CpuEngine : ITensorLevelEngine
         int m = y.Shape[0];
         int d = x.Shape[1];
 
-        var result = new Tensor<T>([n, m]);
+        var result = TensorAllocator.Rent<T>([n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Use the identity: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x.y
@@ -16622,7 +17300,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = (int[])input.Shape.Clone();
         outputShape[axis] = k;
 
-        var values = new Tensor<T>(outputShape);
+        var values = TensorAllocator.Rent<T>(outputShape);
         var indices = new Tensor<int>(outputShape);
         var inputData = input.GetDataArray();
         var valuesData = values.GetDataArray();
@@ -16733,7 +17411,7 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = i == axis ? indices.Length : input.Shape[i];
         }
 
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
         var inputData = input.GetDataArray();
         var indicesData = indices.GetDataArray();
         var resultData = result.GetDataArray();
@@ -16769,10 +17447,10 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
 
         // Create a copy of input
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
-        Array.Copy(inputData, resultData, inputData.Length);
+        Array.Copy(inputData, resultData, input.Length);
 
         var indicesData = indices.GetDataArray();
         var valuesData = values.GetDataArray();
@@ -16810,10 +17488,10 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Create a copy of input
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
-        Array.Copy(inputData, resultData, inputData.Length);
+        Array.Copy(inputData, resultData, input.Length);
 
         var indicesData = indices.GetDataArray();
         var valuesData = values.GetDataArray();
@@ -16887,7 +17565,7 @@ public class CpuEngine : ITensorLevelEngine
         int n = a.Shape[0];
         int m = b.Shape[0];
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>([n, m]);
+        var result = TensorAllocator.Rent<T>([n, m]);
 
         for (int i = 0; i < n; i++)
         {
@@ -16921,7 +17599,7 @@ public class CpuEngine : ITensorLevelEngine
             if (weights.Shape[0] != K)
                 throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights.Shape[0]}, {weights.Shape[1]}]");
 
-            var result = new Tensor<T>([M, N]);
+            var result = TensorAllocator.Rent<T>([M, N]);
 
             // Use optimized fused operations for float type
             if (typeof(T) == typeof(float))
@@ -16938,7 +17616,7 @@ public class CpuEngine : ITensorLevelEngine
 
                 // Reinterpret float[] as T[] using Unsafe.As (safe since T is float)
                 var typedOutput = Unsafe.As<float[], T[]>(ref outputArray);
-                return new Tensor<T>([M, N], new Vector<T>(typedOutput));
+                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
             }
 
             // Use optimized fused operations for double type
@@ -16956,7 +17634,7 @@ public class CpuEngine : ITensorLevelEngine
 
                 // Reinterpret double[] as T[] using Unsafe.As (safe since T is double)
                 var typedOutput = Unsafe.As<double[], T[]>(ref outputArray);
-                return new Tensor<T>([M, N], new Vector<T>(typedOutput));
+                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
             }
         }
 
@@ -16999,7 +17677,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             int batchSize = gradActivation.Shape[0];
             int outputSize = gradActivation.Shape[1];
-            var biasGrad = new Tensor<T>([outputSize]);
+            var biasGrad = TensorAllocator.Rent<T>([outputSize]);
 
             for (int j = 0; j < outputSize; j++)
             {
@@ -17201,7 +17879,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> SwishDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -17222,7 +17900,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> LeakyReLUDerivative<T>(Tensor<T> input, T alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -17238,7 +17916,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> GELUDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input.Shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -17313,7 +17991,7 @@ public class CpuEngine : ITensorLevelEngine
         // Compute shape for output (last dim becomes 2 * numFreqs for interleaved complex)
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
 
@@ -17357,7 +18035,7 @@ public class CpuEngine : ITensorLevelEngine
         // Output shape
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
-        var result = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
 
@@ -17411,8 +18089,8 @@ public class CpuEngine : ITensorLevelEngine
         int n = inputReal.Shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = new Tensor<T>(inputReal.Shape);
-        var outImag = new Tensor<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -17457,8 +18135,8 @@ public class CpuEngine : ITensorLevelEngine
         int n = inputReal.Shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = new Tensor<T>(inputReal.Shape);
-        var outImag = new Tensor<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -17508,8 +18186,8 @@ public class CpuEngine : ITensorLevelEngine
         int width = inputReal.Shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = new Tensor<T>(inputReal.Shape);
-        var outImag = new Tensor<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
         var tempRealData = tempReal.GetDataArray();
         var tempImagData = tempImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -17560,12 +18238,12 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputReal.Shape[^2];
         int width = inputReal.Shape[^1];
 
-        var tempReal = new Tensor<T>(inputReal.Shape);
-        var tempImag = new Tensor<T>(inputImag.Shape);
+        var tempReal = TensorAllocator.Rent<T>(inputReal.Shape);
+        var tempImag = TensorAllocator.Rent<T>(inputImag.Shape);
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = new Tensor<T>(inputReal.Shape);
-        var outImag = new Tensor<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var tempRealData = tempReal.GetDataArray();
@@ -17653,7 +18331,7 @@ public class CpuEngine : ITensorLevelEngine
             int padAmount = nFft / 2;
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
-            paddedInput = new Tensor<T>(paddedShape);
+            paddedInput = TensorAllocator.Rent<T>(paddedShape);
             var inputData = input.GetDataArray();
             var paddedData = paddedInput.GetDataArray();
 
@@ -17695,8 +18373,8 @@ public class CpuEngine : ITensorLevelEngine
         newShape[^1] = numFrames;
 
         // Create local variables to use in lambda (out params can't be captured)
-        var magOut = new Tensor<T>(newShape);
-        var phOut = new Tensor<T>(newShape);
+        var magOut = TensorAllocator.Rent<T>(newShape);
+        var phOut = TensorAllocator.Rent<T>(newShape);
         var paddedInputData = paddedInput.GetDataArray();
         var windowData = window.GetDataArray();
         var magOutData = magOut.GetDataArray();
@@ -17766,8 +18444,8 @@ public class CpuEngine : ITensorLevelEngine
         // Output shape
         var outputShape = magnitude.Shape.Take(magnitude.Shape.Length - 2).ToArray();
         outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
-        var result = new Tensor<T>(outputShape);
-        var windowSum = new Tensor<T>(outputShape);
+        var result = TensorAllocator.Rent<T>(outputShape);
+        var windowSum = TensorAllocator.Rent<T>(outputShape);
         var magData = magnitude.GetDataArray();
         var phaseData = phase.GetDataArray();
         var windowData = window.GetDataArray();
@@ -17873,7 +18551,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var melShape = magnitude.Shape.ToArray();
         melShape[^2] = nMels;
-        var melSpec = new Tensor<T>(melShape);
+        var melSpec = TensorAllocator.Rent<T>(melShape);
         var melFilterData = melFilterbank.GetDataArray();
         var powerSpecData = powerSpec.GetDataArray();
         var melSpecData = melSpec.GetDataArray();
@@ -17937,7 +18615,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Initialize with random phase
         var random = RandomHelper.ThreadSafeRandom;
-        var phase = new Tensor<T>(magnitude.Shape);
+        var phase = TensorAllocator.Rent<T>(magnitude.Shape);
         var phaseData = phase.GetDataArray();
         for (int i = 0; i < phase.Length; i++)
         {
@@ -17997,7 +18675,7 @@ public class CpuEngine : ITensorLevelEngine
         double fMaxHz = numOps.ToDouble(fMax);
 
         int numFreqs = nFft / 2 + 1;
-        var filterbank = new Tensor<T>([nMels, numFreqs]);
+        var filterbank = TensorAllocator.Rent<T>([nMels, numFreqs]);
         filterbank.Fill(numOps.Zero);
 
         // Convert Hz to Mel scale
@@ -18057,7 +18735,7 @@ public class CpuEngine : ITensorLevelEngine
         if (length <= 0) throw new ArgumentException("Length must be positive", nameof(length));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var window = new Tensor<T>([length]);
+        var window = TensorAllocator.Rent<T>([length]);
 
         switch (windowType.ToLowerInvariant())
         {
@@ -18285,7 +18963,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(input.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18315,7 +18993,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(input.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18324,8 +19002,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
@@ -18340,7 +19018,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18349,7 +19027,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        int length = gradData.Length;
+        int length = gradOutput.Length;
 
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
         if (gradData is float[] gF && outData is float[] oF)
@@ -18360,7 +19038,7 @@ public class CpuEngine : ITensorLevelEngine
             var resultArr = new float[length];
 #endif
             SigmoidBackwardFloat(gF, oF, resultArr);
-            return (Tensor<T>)(object)new Tensor<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
         var result = new T[length];
@@ -18372,7 +19050,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * s * (1.0 - s));
         }
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
     }
 
     private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
@@ -18417,7 +19095,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        int length = gradData.Length;
+        int length = gradOutput.Length;
 
         // Float fast path: SIMD grad * (1 - tanh^2)
         if (gradData is float[] gF && outData is float[] oF)
@@ -18428,7 +19106,7 @@ public class CpuEngine : ITensorLevelEngine
             var resultArr = new float[length];
 #endif
             TanhBackwardFloat(gF, oF, resultArr);
-            return (Tensor<T>)(object)new Tensor<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
         var result = new T[length];
@@ -18440,7 +19118,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * (1.0 - t * t));
         }
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
     }
 
     private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
@@ -18485,8 +19163,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         const double sqrtTwoPi = 0.7978845608028654;
         const double coeff = 0.044715;
@@ -18519,7 +19197,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18528,8 +19206,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
@@ -18546,7 +19224,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -18631,9 +19309,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mean = new Tensor<T>([batch, channels], new Vector<T>(meanData));
-        variance = new Tensor<T>([batch, channels], new Vector<T>(varData));
-        return new Tensor<T>(input.Shape, new Vector<T>(resultData));
+        mean = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(meanData));
+        variance = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(varData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -18702,9 +19380,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        gradGamma = new Tensor<T>([channels], new Vector<T>(gradGammaData));
-        gradBeta = new Tensor<T>([channels], new Vector<T>(gradBetaData));
-        return new Tensor<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -18712,12 +19390,12 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var maskData = new T[inputData.Length];
-        var resultData = new T[inputData.Length];
+        var maskData = new T[input.Length];
+        var resultData = new T[input.Length];
 
         if (!training || dropoutRate <= 0)
         {
-            Array.Copy(inputData, resultData, inputData.Length);
+            Array.Copy(inputData, resultData, input.Length);
             for (int i = 0; i < maskData.Length; i++)
                 maskData[i] = numOps.One;
         }
@@ -18725,7 +19403,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
             double scale = 1.0 / (1.0 - dropoutRate);
-            for (int i = 0; i < inputData.Length; i++)
+            for (int i = 0; i < input.Length; i++)
             {
                 if (rand.NextDouble() >= dropoutRate)
                 {
@@ -18740,8 +19418,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mask = new Tensor<T>(input.Shape, new Vector<T>(maskData));
-        return new Tensor<T>(input.Shape, new Vector<T>(resultData));
+        mask = TensorAllocator.Rent<T>(input.Shape, new Vector<T>(maskData));
+        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -18750,12 +19428,12 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var maskData = mask.GetDataArray();
-        var resultData = new T[gradData.Length];
+        var resultData = new T[gradOutput.Length];
 
-        for (int i = 0; i < gradData.Length; i++)
+        for (int i = 0; i < gradOutput.Length; i++)
             resultData[i] = numOps.Multiply(gradData[i], maskData[i]);
 
-        return new Tensor<T>(gradOutput.Shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -18789,7 +19467,7 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = indices.Shape[i];
         outputShape[^1] = embeddingDim;
 
-        return new Tensor<T>(outputShape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -18816,7 +19494,7 @@ public class CpuEngine : ITensorLevelEngine
                 resultData[dstOffset + j] = numOps.Add(resultData[dstOffset + j], gradData[srcOffset + j]);
         }
 
-        return new Tensor<T>([vocabSize, embeddingDim], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([vocabSize, embeddingDim], new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -18960,7 +19638,7 @@ public class CpuEngine : ITensorLevelEngine
             for (int b = 0; b < batchSize; b++) processBatch(b);
         }
 
-        return new Tensor<T>(predictions.Shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(predictions.Shape, new Vector<T>(gradData));
     }
 
     /// <inheritdoc/>
@@ -18970,7 +19648,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
-        var diff = new Tensor<T>(predictions.Shape);
+        var diff = TensorAllocator.Rent<T>(predictions.Shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpan());
         T sumSq = numOps.Dot(diff.AsSpan(), diff.AsSpan());
 
@@ -18983,7 +19661,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // grad = 2 * (pred - target) / N
-        var result = new Tensor<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions.Shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpan());
         T scale = numOps.FromDouble(2.0 / predictions.Length);
         numOps.MultiplyScalar(result.AsSpan(), scale, result.AsWritableSpan());
@@ -19020,7 +19698,7 @@ public class CpuEngine : ITensorLevelEngine
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
-        return new Tensor<T>([batch, channels, 1, 1], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -19054,7 +19732,7 @@ public class CpuEngine : ITensorLevelEngine
         else
             for (int bc = 0; bc < totalChannels; bc++) processChannel(bc);
 
-        return new Tensor<T>([batch, channels, 1, 1], new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>([batch, channels, 1, 1], new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -19067,7 +19745,7 @@ public class CpuEngine : ITensorLevelEngine
         int inWidth = input.Shape[3];
 
         var inputData = input.GetDataArray();
-        var result = new Tensor<T>([batch, channels, outputHeight, outputWidth]);
+        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         var resultData = result.GetDataArray();
 
         Parallel.For(0, batch * channels, idx =>
@@ -19288,7 +19966,7 @@ public class CpuEngine : ITensorLevelEngine
             resultData[i] = numOps.Sqrt(v);
         }
 
-        return new Tensor<T>(variance.Shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(variance.Shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>

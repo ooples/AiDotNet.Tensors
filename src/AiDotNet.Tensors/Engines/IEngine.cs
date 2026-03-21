@@ -1964,6 +1964,63 @@ public interface IEngine
     /// </summary>
     void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
+    /// <summary>
+    /// Fused GroupNorm + Swish/SiLU: output = swish(GroupNorm(input)).
+    /// Eliminates one intermediate tensor per DiffusionResBlock.
+    /// </summary>
+    void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
+    /// <summary>
+    /// Fused Add + GroupNorm: output = GroupNorm(a + b).
+    /// For residual connections followed by normalization.
+    /// </summary>
+    void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
+    /// <summary>In-place Swish/SiLU activation.</summary>
+    void SwishInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>Swish/SiLU into destination.</summary>
+    void SwishInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>In-place GELU activation.</summary>
+    void GELUInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>GELU into destination.</summary>
+    void GELUInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>In-place Tanh activation.</summary>
+    void TanhInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>Tanh into destination.</summary>
+    void TanhInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>In-place Mish activation.</summary>
+    void MishInPlace<T>(Tensor<T> tensor);
+
+    /// <summary>Mish into destination.</summary>
+    void MishInto<T>(Tensor<T> destination, Tensor<T> input);
+
+    /// <summary>In-place LeakyReLU activation.</summary>
+    void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha);
+
+    /// <summary>LeakyReLU into destination.</summary>
+    void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha);
+
+    /// <summary>Matrix multiply into pre-allocated destination.</summary>
+    void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>Concatenate tensors along axis into pre-allocated destination.</summary>
+    void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis);
+
+    /// <summary>Transpose tensor into pre-allocated destination.</summary>
+    void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes);
+
+    /// <summary>Softmax into pre-allocated destination. Zero allocation.</summary>
+    void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
+
+    /// <summary>LogSoftmax into pre-allocated destination. Zero allocation.</summary>
+    void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
+
     #endregion
 
     /// <summary>

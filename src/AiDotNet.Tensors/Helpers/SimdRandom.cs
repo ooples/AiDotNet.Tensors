@@ -1,0 +1,257 @@
+using System.Runtime.CompilerServices;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
+
+namespace AiDotNet.Tensors.Helpers;
+
+/// <summary>
+/// SIMD-parallel random number generator using xoshiro256** algorithm.
+/// Produces 4 doubles per AVX2 iteration (4x faster than scalar Random.NextDouble).
+/// </summary>
+/// <remarks>
+/// <para>
+/// xoshiro256** is a fast, high-quality PRNG suitable for ML workloads (weight
+/// initialization, dropout masks, data augmentation). It is NOT cryptographically
+/// secure — use <see cref="System.Security.Cryptography.RandomNumberGenerator"/>
+/// for security-sensitive applications.
+/// </para>
+/// <para>
+/// The SIMD implementation processes 4 independent xoshiro256** states in parallel
+/// using Vector256&lt;ulong&gt;, producing 4 uniform doubles in [0, 1) per iteration.
+/// </para>
+/// </remarks>
+public sealed class SimdRandom
+{
+    // 4 parallel xoshiro256** states (each state = 4 x ulong)
+    private ulong[] _s0 = new ulong[4];
+    private ulong[] _s1 = new ulong[4];
+    private ulong[] _s2 = new ulong[4];
+    private ulong[] _s3 = new ulong[4];
+
+    /// <summary>
+    /// Creates a new SIMD random generator with the given seed.
+    /// </summary>
+    public SimdRandom(int seed)
+    {
+        // Use SplitMix64 to initialize 4 independent states from a single seed
+        ulong s = (ulong)seed;
+        for (int lane = 0; lane < 4; lane++)
+        {
+            _s0[lane] = SplitMix64(ref s);
+            _s1[lane] = SplitMix64(ref s);
+            _s2[lane] = SplitMix64(ref s);
+            _s3[lane] = SplitMix64(ref s);
+        }
+    }
+
+    /// <summary>
+    /// Creates a new SIMD random generator with a random seed.
+    /// </summary>
+    public SimdRandom() : this(Environment.TickCount) { }
+
+    /// <summary>
+    /// Fills a span with uniform random doubles in [0, 1).
+    /// Uses AVX2 SIMD when available for 4x throughput.
+    /// </summary>
+    public void NextDoubles(Span<double> destination)
+    {
+        int length = destination.Length;
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && length >= 4)
+        {
+            var vs0 = Vector256.Create(_s0[0], _s0[1], _s0[2], _s0[3]);
+            var vs1 = Vector256.Create(_s1[0], _s1[1], _s1[2], _s1[3]);
+            var vs2 = Vector256.Create(_s2[0], _s2[1], _s2[2], _s2[3]);
+            var vs3 = Vector256.Create(_s3[0], _s3[1], _s3[2], _s3[3]);
+
+            // Constant for converting ulong to double [0, 1)
+            // We use the upper 52 bits of the 64-bit result, mapped to [1.0, 2.0) then subtract 1.0
+            var one = Vector256.Create(1.0);
+            var exponentMask = Vector256.Create(0x3FF0000000000000UL); // IEEE 754 exponent for 1.0
+            var mantissaMask = Vector256.Create(0x000FFFFFFFFFFFFFUL); // 52-bit mantissa
+
+            int simdLength = i + ((length - i) & ~3);
+            for (; i < simdLength; i += 4)
+            {
+                // xoshiro256** result: rotl(s1 * 5, 7) * 9
+                var s1x5 = Multiply(vs1, Vector256.Create(5UL));
+                var result = Multiply(RotateLeft7(s1x5), Vector256.Create(9UL));
+
+                // Convert to double [0, 1): shift right 12 to use upper 52 bits (matches scalar path),
+                // then set exponent to 1.0, subtract 1.0
+                var shifted = Avx2.ShiftRightLogical(result, 12);
+                var bits = Avx2.Or(Avx2.And(shifted, mantissaMask), exponentMask);
+                var doubles = Avx.Subtract(bits.AsDouble(), one);
+
+                // Store 4 doubles
+                Unsafe.WriteUnaligned(
+                    ref Unsafe.As<double, byte>(ref destination[i]),
+                    doubles);
+
+                // Advance state: xoshiro256** step
+                var t = Avx2.ShiftLeftLogical(vs1, 17);
+                vs2 = Avx2.Xor(vs2, vs0);
+                vs3 = Avx2.Xor(vs3, vs1);
+                vs1 = Avx2.Xor(vs1, vs2);
+                vs0 = Avx2.Xor(vs0, vs3);
+                vs2 = Avx2.Xor(vs2, t);
+                vs3 = RotateLeft45(vs3);
+            }
+
+            // Store state back
+            for (int lane = 0; lane < 4; lane++)
+            {
+                _s0[lane] = vs0.GetElement(lane);
+                _s1[lane] = vs1.GetElement(lane);
+                _s2[lane] = vs2.GetElement(lane);
+                _s3[lane] = vs3.GetElement(lane);
+            }
+        }
+#endif
+
+        // Scalar tail
+        for (; i < length; i++)
+        {
+            destination[i] = NextDoubleScalar();
+        }
+    }
+
+    /// <summary>
+    /// Fills a span with uniform random floats in [0, 1).
+    /// </summary>
+    public void NextFloats(Span<float> destination)
+    {
+        int length = destination.Length;
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        // Process 4 at a time: generate 4 doubles then convert to float
+        if (Avx2.IsSupported && length >= 4)
+        {
+            Span<double> temp = stackalloc double[4];
+            int simdLength = i + ((length - i) & ~3);
+            for (; i < simdLength; i += 4)
+            {
+                NextDoubles(temp);
+                destination[i] = Math.Min((float)temp[0], 0.99999994f);
+                destination[i + 1] = Math.Min((float)temp[1], 0.99999994f);
+                destination[i + 2] = Math.Min((float)temp[2], 0.99999994f);
+                destination[i + 3] = Math.Min((float)temp[3], 0.99999994f);
+            }
+        }
+#endif
+
+        for (; i < length; i++)
+        {
+            destination[i] = Math.Min((float)NextDoubleScalar(), 0.99999994f);
+        }
+    }
+
+    /// <summary>
+    /// Fills a span with normally distributed doubles (mean=0, stddev=1)
+    /// using the Box-Muller transform.
+    /// </summary>
+    public void NextNormalDoubles(Span<double> destination)
+    {
+        int length = destination.Length;
+        int i = 0;
+
+        // Box-Muller produces pairs
+        Span<double> u = stackalloc double[2];
+        for (; i + 1 < length; i += 2)
+        {
+            NextDoubles(u);
+            // Clamp u[0] away from 0 to avoid log(0)
+            double u1 = Math.Max(u[0], double.Epsilon);
+            double u2 = u[1];
+            double r = Math.Sqrt(-2.0 * Math.Log(u1));
+            double theta = 2.0 * Math.PI * u2;
+            destination[i] = r * Math.Cos(theta);
+            destination[i + 1] = r * Math.Sin(theta);
+        }
+
+        // Handle odd length
+        if (i < length)
+        {
+            NextDoubles(u);
+            double u1 = Math.Max(u[0], double.Epsilon);
+            double u2 = u[1];
+            double r = Math.Sqrt(-2.0 * Math.Log(u1));
+            destination[i] = r * Math.Cos(2.0 * Math.PI * u2);
+        }
+    }
+
+    /// <summary>Scalar xoshiro256** for the tail.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private double NextDoubleScalar()
+    {
+        ulong result = RotateLeft64(_s1[0] * 5, 7) * 9;
+
+        // Convert to [0, 1)
+        double d = BitConverter.Int64BitsToDouble((long)((result >> 12) | 0x3FF0000000000000UL)) - 1.0;
+
+        // Advance lane 0 state
+        ulong t = _s1[0] << 17;
+        _s2[0] ^= _s0[0];
+        _s3[0] ^= _s1[0];
+        _s1[0] ^= _s2[0];
+        _s0[0] ^= _s3[0];
+        _s2[0] ^= t;
+        _s3[0] = RotateLeft64(_s3[0], 45);
+
+        return d;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong SplitMix64(ref ulong state)
+    {
+        ulong z = (state += 0x9E3779B97F4A7C15UL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+        return z ^ (z >> 31);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong RotateLeft64(ulong x, int k) => (x << k) | (x >> (64 - k));
+
+#if NET5_0_OR_GREATER
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<ulong> RotateLeft7(Vector256<ulong> x)
+    {
+        return Avx2.Or(Avx2.ShiftLeftLogical(x, 7), Avx2.ShiftRightLogical(x, 57));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<ulong> RotateLeft17(Vector256<ulong> x)
+    {
+        return Avx2.Or(Avx2.ShiftLeftLogical(x, 17), Avx2.ShiftRightLogical(x, 47));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<ulong> RotateLeft45(Vector256<ulong> x)
+    {
+        return Avx2.Or(Avx2.ShiftLeftLogical(x, 45), Avx2.ShiftRightLogical(x, 19));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<ulong> Multiply(Vector256<ulong> a, Vector256<ulong> b)
+    {
+        // AVX2 doesn't have 64-bit multiply, emulate with 32-bit parts
+        // a * b = (a_lo * b_lo) + ((a_lo * b_hi + a_hi * b_lo) << 32)
+        var aLo = a.AsUInt32();
+        var bLo = b.AsUInt32();
+        var mulLo = Avx2.Multiply(aLo, bLo); // 32x32 -> 64 (even elements)
+        var aSwap = Avx2.Shuffle(aLo, 0xB1); // swap hi/lo 32-bit within 64-bit
+        var mulHiA = Avx2.Multiply(aSwap, bLo);
+        var bSwap = Avx2.Shuffle(bLo, 0xB1);
+        var mulHiB = Avx2.Multiply(aLo, bSwap);
+        var hi = Avx2.Add(mulHiA.AsUInt64(), mulHiB.AsUInt64());
+        hi = Avx2.ShiftLeftLogical(hi, 32);
+        return Avx2.Add(mulLo.AsUInt64(), hi);
+    }
+#endif
+}

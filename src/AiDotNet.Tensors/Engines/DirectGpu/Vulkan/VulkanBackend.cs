@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution
 {
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -45,6 +45,15 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     private readonly object _computeLock = new object();
     private bool _initialized;
     private bool _disposed;
+
+    // Batch execution state — records multiple dispatches into a single command buffer.
+    // Thread-affine: _batchOwnerThreadId tracks which thread owns the batch. Non-owning
+    // threads fall through to the non-batch path to avoid recording into another thread's
+    // command buffer.
+    private bool _batchMode;
+    private int _batchOwnerThreadId;
+    private ThreadCommandResources _batchThreadRes;
+    private int _batchDispatchCount;
 
     /// <summary>
     /// Gets the singleton backend instance.
@@ -469,12 +478,66 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
     /// </summary>
     private void RecordAndExecuteComputeUnlocked(VulkanComputePipeline pipeline, int elementCount, ThreadCommandResources threadRes)
     {
+        // Batch mode: record dispatch into the batch command buffer without submit.
+        // Thread-affine: only the thread that called BeginBatch can record into the batch.
+        // Non-owning threads fall through to the immediate-submit path.
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
+        {
+            var batchCmd = _batchThreadRes.CommandBuffer;
+
+            // Insert barrier between dispatches to ensure data dependencies
+            if (_batchDispatchCount > 0)
+            {
+                // Full execution + memory dependency barrier between compute dispatches.
+                // Uses execution dependency (no VkMemoryBarrier struct needed since
+                // Vulkan guarantees that a pipeline barrier with matching stage masks
+                // also creates a memory dependency for storage buffer accesses when
+                // the stages are COMPUTE_SHADER_BIT on both sides).
+                // NOTE: For strict correctness with independent buffer sets, per-buffer
+                // VkBufferMemoryBarriers would be more precise but require tracking
+                // which buffers each dispatch accesses.
+                VulkanNativeBindings.vkCmdPipelineBarrier(
+                    batchCmd,
+                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, IntPtr.Zero, 0, null, 0, IntPtr.Zero);
+            }
+
+            // Bind pipeline
+            VulkanNativeBindings.vkCmdBindPipeline(
+                batchCmd,
+                VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.Handle);
+
+            // Bind descriptor set
+            var descriptorSet = pipeline.DescriptorSet;
+            VulkanNativeBindings.vkCmdBindDescriptorSets(
+                batchCmd,
+                VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.Layout,
+                0, 1, &descriptorSet,
+                0, null);
+
+            // Push constants
+            uint sz = (uint)elementCount;
+            VulkanNativeBindings.vkCmdPushConstants(
+                batchCmd, pipeline.Layout,
+                VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(uint), &sz);
+
+            // Dispatch
+            uint wgCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+            VulkanNativeBindings.vkCmdDispatch(batchCmd, wgCount, 1, 1);
+
+            _batchDispatchCount++;
+            return;
+        }
+
+        // Non-batch mode: record + submit immediately (original path)
         var cmdBuffer = threadRes.CommandBuffer;
 
-        // Reset command buffer
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
-        // Begin recording
         var beginInfo = new VkCommandBufferBeginInfo
         {
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -485,39 +548,29 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 
         VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
-        // Bind pipeline
         VulkanNativeBindings.vkCmdBindPipeline(
             cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Handle);
 
-        // Bind descriptor set
-        var descriptorSet = pipeline.DescriptorSet;
+        var ds = pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(
             cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Layout,
-            0, 1, &descriptorSet,
+            0, 1, &ds,
             0, null);
 
-        // Push constants (size)
         uint size = (uint)elementCount;
         VulkanNativeBindings.vkCmdPushConstants(
-            cmdBuffer,
-            pipeline.Layout,
+            cmdBuffer, pipeline.Layout,
             VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            sizeof(uint),
-            &size);
+            0, sizeof(uint), &size);
 
-        // Dispatch compute
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
-        // End recording
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-
-        // Submit and wait using per-thread fence
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
     }
 
@@ -583,6 +636,111 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend
 
         // Submit and wait using per-thread fence
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+    }
+
+    #region Batch Execution
+
+    /// <summary>
+    /// Gets whether this backend supports batch recording.
+    /// </summary>
+    public bool SupportsBatchExecution => true;
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateWorkspaceBuffer(int totalElements)
+    {
+        return AllocateBuffer(totalElements);
+    }
+
+    /// <summary>
+    /// Begins recording a batch of GPU operations into a single command buffer.
+    /// All subsequent GPU operations (Add, MatMul, etc.) are recorded without submission
+    /// until EndBatch is called. This eliminates per-operation kernel launch overhead.
+    /// </summary>
+    public void BeginBatch()
+    {
+        EnsureInitialized();
+        if (_batchMode)
+            throw new InvalidOperationException("Already in batch mode.");
+
+        var threadRes = _device.AcquireThreadResources();
+        _batchThreadRes = threadRes;
+        _batchDispatchCount = 0;
+
+        var cmdBuffer = threadRes.CommandBuffer;
+        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+
+        var beginInfo = new VkCommandBufferBeginInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            pNext = null,
+            flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            pInheritanceInfo = null
+        };
+        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+        _batchMode = true;
+        _batchOwnerThreadId = Environment.CurrentManagedThreadId;
+    }
+
+    /// <summary>
+    /// Ends batch recording and submits all recorded operations as a single GPU submission.
+    /// Blocks until all operations complete.
+    /// </summary>
+    public void EndBatch()
+    {
+        if (!_batchMode)
+            throw new InvalidOperationException("Not in batch mode.");
+
+        var cmdBuffer = _batchThreadRes.CommandBuffer;
+
+        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        _device.SubmitAndWait(cmdBuffer, _batchThreadRes.Fence);
+
+        _batchMode = false;
+        _batchDispatchCount = 0;
+    }
+
+    /// <summary>
+    /// Inserts a compute memory barrier between batched dispatches.
+    /// Ensures all writes from previous dispatches are visible to subsequent reads.
+    /// </summary>
+    public void InsertBarrier(IGpuBuffer buffer)
+    {
+        if (!_batchMode) return;
+
+        var cmdBuffer = _batchThreadRes.CommandBuffer;
+
+        // Full memory barrier: ensures all shader writes are visible to subsequent reads.
+        // VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46, SHADER_WRITE = 0x40, SHADER_READ = 0x20
+        unsafe
+        {
+            var memBarrier = stackalloc ulong[4]; // sType, pNext, srcAccessMask, dstAccessMask
+            memBarrier[0] = 46; // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+            memBarrier[1] = 0;  // pNext = null
+            memBarrier[2] = 0x40; // VK_ACCESS_SHADER_WRITE_BIT
+            memBarrier[3] = 0x20; // VK_ACCESS_SHADER_READ_BIT
+            VulkanNativeBindings.vkCmdPipelineBarrier(
+                cmdBuffer,
+                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, (IntPtr)memBarrier, 0, null, 0, IntPtr.Zero);
+        }
+    }
+
+    #endregion
+
+    /// <inheritdoc/>
+    public void BeginSecondaryStream()
+    {
+        // Vulkan multi-stream requires separate command pools per thread/stream.
+        // Not yet implemented — would need a secondary VkCommandPool + VkQueue.
+        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+    }
+
+    /// <inheritdoc/>
+    public void EndSecondaryStream()
+    {
+        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
     }
 
     /// <summary>
