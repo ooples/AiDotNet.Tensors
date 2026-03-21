@@ -62,19 +62,27 @@ internal static class OneDnnProvider
                 if (libraryName != "dnnl")
                     return IntPtr.Zero;
 
-                // Try NuGet runtime native directory first (where AiDotNet.Native.OneDNN puts dnnl.dll)
-                string? assemblyDir = Path.GetDirectoryName(assembly.Location);
-                if (assemblyDir is not null)
+                // Try app base directory
+                var handle = TryLoadFromDirectory(AppContext.BaseDirectory);
+                if (handle != IntPtr.Zero) return handle;
+
+                // Try runtimes/win-x64/native (NuGet RID-specific layout)
+                string ridDir = Path.Combine(AppContext.BaseDirectory, "runtimes", "win-x64", "native");
+                if (Directory.Exists(ridDir))
                 {
-                    var handle = TryLoadFromDirectory(assemblyDir);
+                    handle = TryLoadFromDirectory(ridDir);
                     if (handle != IntPtr.Zero) return handle;
                 }
 
-                // Try AppContext.BaseDirectory
-                var handle2 = TryLoadFromDirectory(AppContext.BaseDirectory);
-                if (handle2 != IntPtr.Zero) return handle2;
+                // Try assembly directory
+                string? assemblyDir = Path.GetDirectoryName(assembly.Location);
+                if (assemblyDir is not null)
+                {
+                    handle = TryLoadFromDirectory(assemblyDir);
+                    if (handle != IntPtr.Zero) return handle;
+                }
 
-                // Try NativeLibrary.TryLoad with default search
+                // Try default search
                 if (NativeLibrary.TryLoad("dnnl", out var defaultHandle))
                     return defaultHandle;
 
@@ -1572,17 +1580,33 @@ internal static class OneDnnProvider
             if (_initialized)
                 return _available;
 
-            // Register resolver lazily (not in static constructor to avoid BenchmarkDotNet hang)
-            RegisterDllResolver();
-
-            // Pre-check: try to load dnnl.dll to avoid P/Invoke hang when dll is missing
-            if (!NativeLibrary.TryLoad("dnnl", typeof(OneDnnProvider).Assembly, null, out _))
+            // Pre-load dnnl.dll before registering resolver or calling P/Invoke.
+            // This prevents P/Invoke from hanging when the dll can't be found.
+            IntPtr dnnlHandle = IntPtr.Zero;
+            string[] searchPaths = new[]
             {
-                Trace("[oneDNN] dnnl.dll not found — oneDNN disabled");
+                Path.Combine(AppContext.BaseDirectory, "dnnl.dll"),
+                Path.Combine(AppContext.BaseDirectory, "runtimes", "win-x64", "native", "dnnl.dll"),
+            };
+            foreach (var path in searchPaths)
+            {
+                if (File.Exists(path) && NativeLibrary.TryLoad(path, out dnnlHandle))
+                    break;
+            }
+            if (dnnlHandle == IntPtr.Zero)
+            {
+                // Try default system search as last resort
+                NativeLibrary.TryLoad("dnnl", out dnnlHandle);
+            }
+            if (dnnlHandle == IntPtr.Zero)
+            {
                 _initialized = true;
                 _available = false;
                 return false;
             }
+
+            // Register resolver AFTER we know dnnl.dll exists (avoids hang on missing dll)
+            RegisterDllResolver();
 
             _available = TryInitialize();
             _initialized = true;

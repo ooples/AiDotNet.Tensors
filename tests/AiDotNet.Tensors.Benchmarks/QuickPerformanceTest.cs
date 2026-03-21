@@ -24,6 +24,8 @@ public static class QuickPerformanceTest
         Console.WriteLine($"  Backend:   {AiDotNet.Tensors.Helpers.BlasProvider.BackendName}");
         Console.WriteLine($"VML Status:");
         Console.WriteLine($"  Available: {AiDotNet.Tensors.Helpers.VmlProvider.IsAvailable}");
+        Console.WriteLine($"oneDNN Status:");
+        Console.WriteLine($"  Available: {AiDotNet.Tensors.Helpers.OneDnnProvider.IsAvailable}");
         Console.WriteLine();
 
         int[] sizes = { 1000, 10000, 100000 };
