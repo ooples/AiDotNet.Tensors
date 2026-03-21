@@ -716,10 +716,7 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public float AiDotNet_TensorMaxValue()
-    {
-        var r = _cpuEngine.TensorMaxValue(_aiVectorsA[LargeSize]);
-        TensorPool.Return(r);
-    }
+        => _cpuEngine.TensorMaxValue(_aiVectorsA[LargeSize]);
 
     [Benchmark]
     public void TorchSharp_Max()
@@ -730,10 +727,7 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public float AiDotNet_TensorMinValue()
-    {
-        var r = _cpuEngine.TensorMinValue(_aiVectorsA[LargeSize]);
-        TensorPool.Return(r);
-    }
+        => _cpuEngine.TensorMinValue(_aiVectorsA[LargeSize]);
 
     [Benchmark]
     public void TorchSharp_Min()
