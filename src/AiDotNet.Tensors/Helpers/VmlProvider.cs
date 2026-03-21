@@ -17,7 +17,7 @@ internal static class VmlProvider
     // VML_EP (Enhanced Performance) = fastest mode for double. ~7 correct digits —
     // more than enough for neural networks. VML_EP (0x1) was also fast but VML_EP (0x3)
     // is marginally faster and avoids the first-call cold-start regression.
-    private const int VML_EP = 0x00000003;
+    private const long VML_EP = 0x00000003;
 
     private static bool _initialized;
     private static bool _available;
@@ -33,9 +33,9 @@ internal static class VmlProvider
     // Double VML — mode-specific (vmd* takes mode as 4th arg).
     // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
     // when the global mode resets between calls.
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, int, void> _vmdExp;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, int, void> _vmdLn;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, int, void> _vmdTanh;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdExp;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdLn;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdTanh;
 #endif
 
     /// <summary>Whether MKL VML functions are available.</summary>
@@ -218,11 +218,11 @@ internal static class VmlProvider
             // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
             // This avoids the VML_HA regression that vd* functions hit when
             // the global vmlSetMode resets between calls.
-            _vmdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, int, void>)
+            _vmdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
                 TryGetExport(handle, "vmdExp", "MKL_vmdExp", "VMDEXP");
-            _vmdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, int, void>)
+            _vmdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
                 TryGetExport(handle, "vmdLn", "MKL_vmdLn", "VMDLN");
-            _vmdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, int, void>)
+            _vmdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
                 TryGetExport(handle, "vmdTanh", "MKL_vmdTanh", "VMDTANH");
 
             // Verify correctness at n=1 AND n=1000 (catches scale-dependent issues).
@@ -289,8 +289,8 @@ internal static class VmlProvider
     /// The 4th arg is the VML mode (VML_EP=1). No need for performance test
     /// since VML_EP is passed per-call and can't regress.
     /// </summary>
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, int, void>
-        VerifyDoubleModeAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, int, void> fn,
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void>
+        VerifyDoubleModeAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, long, void> fn,
         double testInput, double expectedOutput, double tolerance)
     {
         if (fn == null) return null;
