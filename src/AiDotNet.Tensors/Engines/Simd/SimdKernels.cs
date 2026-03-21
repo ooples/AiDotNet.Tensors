@@ -1392,17 +1392,9 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = input.Length;
 
-#if NET5_0_OR_GREATER
-            // MKL VML path: SVML microcode exp, zero-overhead unmanaged function pointer.
-            // Previous delegate-based attempt added ~50ns overhead that negated the benefit.
-            fixed (double* pIn = input)
-            fixed (double* pOut = output)
-            {
-                if (VmlProvider.TryExp(pIn, pOut, length))
-                    return;
-            }
-#endif
-
+            // Note: VML double paths (vdExp/vdTanh) disabled — function pointer verification
+            // only covers vsExp (float). Double pointers caused 68x regression in benchmarks,
+            // suggesting corrupt/mismatched function pointers. Float VML is verified and working.
             int i = 0;
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
@@ -1532,8 +1524,9 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void SigmoidUnsafe(double* input, double* output, int length)
         {
 #if NET5_0_OR_GREATER
-            // VML path: negate input, call vdExp, then compute 1/(1+exp(-x)) with SIMD divide
-            if (VmlProvider.IsAvailable && length >= 64)
+            // VML double paths disabled — function pointers not verified for double.
+            // See Exp(double) comment for details.
+            if (false && VmlProvider.IsAvailable && length >= 64)
             {
                 // Step 1: output = -input
                 int j = 0;
@@ -1678,15 +1671,8 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = input.Length;
 
-#if NET5_0_OR_GREATER
-            // MKL VML path: SVML tanh
-            fixed (double* pIn = input)
-            fixed (double* pOut = output)
-            {
-                if (VmlProvider.TryTanh(pIn, pOut, length))
-                    return;
-            }
-#endif
+            // Note: VML double Tanh (vdTanh) disabled — double function pointers not verified.
+            // See Exp(double) comment for details.
 
             int i = 0;
 
