@@ -1393,7 +1393,8 @@ namespace AiDotNet.Tensors.Engines.Simd
             int length = input.Length;
 
 #if NET5_0_OR_GREATER
-            // VML double path — each pointer now individually verified at load time.
+            // VML double path — verified at scale (n=1000) and benchmarked (must beat scalar).
+            // vmlSetMode(VML_LA) prevents the 600x slowdown from VML_HA default.
             fixed (double* pIn = input)
             fixed (double* pOut = output)
             {

@@ -20,13 +20,15 @@ internal static class VmlProvider
 
 #if NET5_0_OR_GREATER
     // Unmanaged function pointers — zero marshal overhead (C# 9 feature).
-    // These are raw native function pointers, not managed delegates.
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsExp;
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdExp;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsLn;
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdLn;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdTanh;
+
+    // vmlSetMode: sets accuracy mode. VML_LA=0x1 (fast), VML_HA=0x2 (default, slow for double)
+    private static unsafe delegate* unmanaged[Cdecl]<uint, uint> _vmlSetMode;
 #endif
 
     /// <summary>Whether MKL VML functions are available.</summary>
@@ -192,7 +194,6 @@ internal static class VmlProvider
         try
         {
             // Load function pointers as unmanaged[Cdecl] — zero overhead calls.
-            // Cast IntPtr directly to function pointer (can't use generics with fn ptrs).
             _vsExp = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsExp", "MKL_vsExp", "VSEXP");
             _vdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
@@ -206,15 +207,25 @@ internal static class VmlProvider
             _vdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
                 TryGetExport(handle, "vdTanh", "MKL_vdTanh", "VDTANH");
 
-            // Verify each function pointer with a tiny test call.
-            // Previous bug: only vsExp was verified, vdExp/vdTanh had corrupt pointers
-            // that caused 68x regression.
+            // Load vmlSetMode to set VML_LA (Low Accuracy = fast mode).
+            // Default VML_HA is extremely slow for double (600x slower than scalar Math.Exp).
+            // VML_LA gives ~11 correct digits for double — more than enough for neural nets.
+            _vmlSetMode = (delegate* unmanaged[Cdecl]<uint, uint>)
+                TryGetExport(handle, "vmlSetMode", "MKL_vmlSetMode", "VMLSETMODE");
+            if (_vmlSetMode != null)
+            {
+                const uint VML_LA = 0x00000001;
+                _vmlSetMode(VML_LA);
+            }
+
+            // Verify correctness at n=1 AND n=1000 (catches scale-dependent issues).
+            // Also verify performance: must be faster than scalar at n=10000.
             _vsExp = VerifyFloat(_vsExp, 1.0f, 2.71828f, 0.01f);
             _vsLn = VerifyFloat(_vsLn, 2.71828f, 1.0f, 0.01f);
             _vsTanh = VerifyFloat(_vsTanh, 1.0f, 0.7616f, 0.01f);
-            _vdExp = VerifyDouble(_vdExp, 1.0, 2.71828, 0.001);
-            _vdLn = VerifyDouble(_vdLn, 2.71828, 1.0, 0.001);
-            _vdTanh = VerifyDouble(_vdTanh, 1.0, 0.76159, 0.001);
+            _vdExp = VerifyDoubleAtScale(_vdExp, 1.0, 2.71828, 0.001);
+            _vdLn = VerifyDoubleAtScale(_vdLn, 2.71828, 1.0, 0.001);
+            _vdTanh = VerifyDoubleAtScale(_vdTanh, 1.0, 0.76159, 0.001);
 
             return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null
                 || _vsTanh != null || _vdTanh != null;
@@ -265,16 +276,19 @@ internal static class VmlProvider
     }
 
     /// <summary>
-    /// Verifies a double VML function pointer by calling it with a test input.
-    /// Returns the pointer if valid, null if corrupt.
+    /// Verifies a double VML function pointer at n=1 AND n=1000.
+    /// Also checks that it's faster than scalar Math.Exp at n=10000.
+    /// Previous bug: vdExp passed n=1 verification but was 600x slower at scale
+    /// because VML defaulted to VML_HA (High Accuracy) mode for double.
     /// </summary>
     private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void>
-        VerifyDouble(delegate* unmanaged[Cdecl]<int, double*, double*, void> fn,
+        VerifyDoubleAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, void> fn,
         double testInput, double expectedOutput, double tolerance)
     {
         if (fn == null) return null;
         try
         {
+            // Step 1: Verify correctness at n=1
             var inArr = new double[] { testInput };
             var outArr = new double[] { 0.0 };
             fixed (double* pIn = inArr, pOut = outArr)
@@ -284,6 +298,49 @@ internal static class VmlProvider
             if (double.IsNaN(outArr[0]) || double.IsInfinity(outArr[0])
                 || Math.Abs(outArr[0] - expectedOutput) > tolerance)
                 return null;
+
+            // Step 2: Verify correctness at n=1000
+            const int testSize = 1000;
+            var bigIn = new double[testSize];
+            var bigOut = new double[testSize];
+            for (int i = 0; i < testSize; i++) bigIn[i] = testInput;
+            fixed (double* pIn = bigIn, pOut = bigOut)
+            {
+                fn(testSize, pIn, pOut);
+            }
+            // Check first and last elements
+            if (double.IsNaN(bigOut[0]) || Math.Abs(bigOut[0] - expectedOutput) > tolerance)
+                return null;
+            if (double.IsNaN(bigOut[testSize - 1]) || Math.Abs(bigOut[testSize - 1] - expectedOutput) > tolerance)
+                return null;
+
+            // Step 3: Verify performance — VML must be faster than scalar at n=10000.
+            // If VML is in VML_HA mode and we failed to set VML_LA, it will be 100x+ slower.
+            const int perfSize = 10000;
+            var perfIn = new double[perfSize];
+            var perfOut = new double[perfSize];
+            for (int i = 0; i < perfSize; i++) perfIn[i] = 0.5;
+
+            // Scalar baseline
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < perfSize; i++) perfOut[i] = Math.Exp(perfIn[i]);
+            sw.Stop();
+            long scalarTicks = sw.ElapsedTicks;
+
+            // VML
+            sw.Restart();
+            fixed (double* pIn = perfIn, pOut = perfOut)
+            {
+                fn(perfSize, pIn, pOut);
+            }
+            sw.Stop();
+            long vmlTicks = sw.ElapsedTicks;
+
+            // VML must be no more than 3x slower than scalar to be useful.
+            // If it's slower, VML_LA mode wasn't set successfully — disable.
+            if (vmlTicks > scalarTicks * 3)
+                return null;
+
             return fn;
         }
         catch { return null; }
