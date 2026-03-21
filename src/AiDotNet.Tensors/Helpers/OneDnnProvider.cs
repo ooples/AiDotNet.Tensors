@@ -139,8 +139,9 @@ internal static class OneDnnProvider
     private const int DnnlBinaryAdd = 0x1fff0;  // binary_add = 131056
     private const int DnnlBinaryMul = 0x1fff1;  // binary_mul = 131057
 
-    // Softmax algorithm (from dnnl_types.h)
-    private const int DnnlSoftmaxAccurate = 0;  // dnnl_softmax_accurate
+    // Softmax algorithm (from dnnl_types.h — oneDNN 3.x)
+    private const int DnnlSoftmaxAccurate = 0x30000;  // dnnl_softmax_accurate
+    private const int DnnlSoftmaxLog = 0x30001;        // dnnl_softmax_log
 
     // Format tags (from dnnl_types.h)
     private const int DnnlFormatTagAny = 1;  // Let oneDNN choose optimal format (format_tag_any = 1, not 0)
