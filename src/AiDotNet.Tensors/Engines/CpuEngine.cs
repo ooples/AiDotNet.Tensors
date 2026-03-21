@@ -9935,7 +9935,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = softmaxGrad.GetDataArray();
         var scale = numOps.FromDouble(1.0 / temperature);
 
-        for (int i = 0; i < gradData.Length; i++)
+        for (int i = 0; i < gradOutput.Length; i++)
         {
             gradData[i] = numOps.Multiply(gradData[i], scale);
         }
@@ -19002,8 +19002,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
@@ -19027,7 +19027,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        int length = gradData.Length;
+        int length = gradOutput.Length;
 
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
         if (gradData is float[] gF && outData is float[] oF)
@@ -19095,7 +19095,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
-        int length = gradData.Length;
+        int length = gradOutput.Length;
 
         // Float fast path: SIMD grad * (1 - tanh^2)
         if (gradData is float[] gF && outData is float[] oF)
@@ -19163,8 +19163,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         const double sqrtTwoPi = 0.7978845608028654;
         const double coeff = 0.044715;
@@ -19206,8 +19206,8 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-        var result = new T[gradData.Length];
-        int length = gradData.Length;
+        var result = new T[gradOutput.Length];
+        int length = gradOutput.Length;
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
@@ -19428,9 +19428,9 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var maskData = mask.GetDataArray();
-        var resultData = new T[gradData.Length];
+        var resultData = new T[gradOutput.Length];
 
-        for (int i = 0; i < gradData.Length; i++)
+        for (int i = 0; i < gradOutput.Length; i++)
             resultData[i] = numOps.Multiply(gradData[i], maskData[i]);
 
         return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(resultData));

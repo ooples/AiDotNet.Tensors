@@ -144,8 +144,10 @@ public static class TensorAllocator
     }
 
     /// <summary>
-    /// Creates a tensor with the given shape and copies data from a Vector.
-    /// Uses pooled memory for large tensors to reduce GC pressure.
+    /// Creates a tensor with the given shape and data from a Vector.
+    /// Zero-copy when the Vector's backing array is exactly the right size
+    /// (common pattern: caller does new T[n], computes into it, wraps in Vector).
+    /// Falls back to copy when the backing array can't be extracted.
     /// </summary>
     public static Tensor<T> Rent<T>(int[] shape, Vector<T> data)
     {
@@ -158,6 +160,18 @@ public static class TensorAllocator
                 $"Data length ({data.Length}) must match shape total ({totalSize}).",
                 nameof(data));
 
+#if NET5_0_OR_GREATER
+        // Zero-copy path: if the Vector's backing array is exactly totalSize,
+        // wrap it directly — no allocation, no copy. This is the common case when
+        // callers do: var arr = new T[n]; compute(arr); Rent(shape, new Vector<T>(arr))
+        T[]? backingArray = data._cachedArray;
+        if (backingArray is not null && backingArray.Length == totalSize)
+        {
+            var memory = new Memory<T>(backingArray);
+            return Tensor<T>.FromMemory(memory, shape);
+        }
+#endif
+
         if (!TensorPool.Enabled || totalSize == 0)
         {
             return new Tensor<T>(shape, data);
@@ -169,15 +183,12 @@ public static class TensorAllocator
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
             src.CopyTo(pooled.AsSpan(0, totalSize));
-            // Clear tail [totalSize, pooled.Length) when T contains references so
-            // stale objects from previous tenants aren't kept alive via _pooledArray
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > totalSize)
                 Array.Clear(pooled, totalSize, pooled.Length - totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small-medium: allocate uninitialized then span-copy (avoid double-write from new T[] + copy)
         T[] array = GC.AllocateUninitializedArray<T>(totalSize);
         src.CopyTo(array);
         var mem = new Memory<T>(array);
