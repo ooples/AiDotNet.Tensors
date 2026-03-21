@@ -157,6 +157,10 @@ public class TorchSharpCpuComparisonBenchmarks
     [GlobalCleanup]
     public void Cleanup()
     {
+        // Return workspace tensor to pool
+        TensorPool.Return(_wsOutputLarge);
+        _wsOutputLarge = null;
+
         foreach (var tensor in _torchMatricesA.Values) tensor.Dispose();
         foreach (var tensor in _torchMatricesB.Values) tensor.Dispose();
         foreach (var tensor in _torchVectorsA.Values) tensor.Dispose();

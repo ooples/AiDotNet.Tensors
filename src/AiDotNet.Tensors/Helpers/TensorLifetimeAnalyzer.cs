@@ -190,7 +190,13 @@ public sealed class TensorLifetimeAnalyzer
                 if (slotLastUse < lr.FirstUse)
                 {
                     // Slot is free — prefer one with minimal size waste
-                    int waste = slotSize >= lr.Size ? slotSize - lr.Size : lr.Size - slotSize;
+                    // Prefer slots that are already large enough (no expansion needed).
+                    // Among those, prefer the smallest waste. Among slots that need expansion,
+                    // prefer the smallest expansion (penalized by adding int.MaxValue/2 to
+                    // separate them from the "fits" category).
+                    int waste = slotSize >= lr.Size
+                        ? slotSize - lr.Size
+                        : (lr.Size - slotSize) + (int.MaxValue / 2);
                     if (waste < bestWaste)
                     {
                         bestWaste = waste;

@@ -1321,7 +1321,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     // GPU softmax kernel
                     int axisSize = input.Shape[axis < 0 ? input.Rank + axis : axis];
-                    gpuBackend.Softmax(gpuIn, gpuOut, inputData.Length, axisSize);
+                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length, axisSize);
                     gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
                 }
                 finally
