@@ -192,7 +192,7 @@ public sealed class SimdRandom
         ulong result = RotateLeft64(_s1[0] * 5, 7) * 9;
 
         // Convert to [0, 1)
-        double d = BitConverter.UInt64BitsToDouble((result >> 12) | 0x3FF0000000000000UL) - 1.0;
+        double d = BitConverter.Int64BitsToDouble((long)((result >> 12) | 0x3FF0000000000000UL)) - 1.0;
 
         // Advance lane 0 state
         ulong t = _s1[0] << 17;

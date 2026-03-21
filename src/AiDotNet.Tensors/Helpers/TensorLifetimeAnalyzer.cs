@@ -167,7 +167,7 @@ public sealed class TensorLifetimeAnalyzer
         Array.Sort(sortedIds, (a, b) => liveRanges[a].FirstUse.CompareTo(liveRanges[b].FirstUse));
 
         var slotAssignments = new int[tensorCount];
-        Array.Fill(slotAssignments, -1);
+        for (int i = 0; i < slotAssignments.Length; i++) slotAssignments[i] = -1;
 
         // Each slot tracks: current size and last-use time of current occupant
         var slots = new List<(int size, int lastUse)>();
@@ -299,8 +299,8 @@ public sealed class TensorLifetimeAnalyzer
         var firstUse = new int[tensorCount];
         var lastUse = new int[tensorCount];
         var sizes = new int[tensorCount];
-        Array.Fill(firstUse, int.MaxValue);
-        Array.Fill(lastUse, -1);
+        for (int i = 0; i < firstUse.Length; i++) firstUse[i] = int.MaxValue;
+        for (int i = 0; i < lastUse.Length; i++) lastUse[i] = -1;
 
         for (int opIdx = 0; opIdx < operations.Length; opIdx++)
         {

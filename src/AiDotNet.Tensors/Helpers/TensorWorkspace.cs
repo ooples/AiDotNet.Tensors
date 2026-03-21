@@ -46,7 +46,9 @@ public sealed class TensorWorkspace<T> : IDisposable
     private readonly List<int[]> _shapes = new();
     private readonly List<int> _offsets = new();
     private T[]? _buffer;
+#if NET5_0_OR_GREATER
     private bool _isPooled;
+#endif
     private bool _isAllocated;
     private bool _disposed;
 
@@ -138,7 +140,6 @@ public sealed class TensorWorkspace<T> : IDisposable
         }
 #else
         _buffer = new T[TotalElements];
-        _isPooled = false;
 #endif
         _isAllocated = true;
     }

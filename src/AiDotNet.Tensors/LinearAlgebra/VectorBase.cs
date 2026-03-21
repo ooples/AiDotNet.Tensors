@@ -111,9 +111,10 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
-        // Try to extract backing array for SIMD fast paths
+        // Extract backing array for SIMD fast paths. Accept arrays larger than the Memory
+        // slice (e.g., ArrayPool buffers) — all SIMD paths bound by Length, not array.Length.
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
-            && segment.Array is not null && segment.Offset == 0 && segment.Count == segment.Array.Length)
+            && segment.Array is not null && segment.Offset == 0)
         {
             _cachedArray = segment.Array;
         }
@@ -263,14 +264,19 @@ public abstract class VectorBase<T>
 
     /// <summary>
     /// Gets a reference to the underlying array without copying.
+    /// The returned array may be larger than <see cref="Length"/> when backed by ArrayPool
+    /// (which returns power-of-2 buffers). Callers MUST index by Length, not array.Length.
     /// </summary>
     internal T[] GetDataArray()
     {
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            // Safety: verify the segment covers the full array from offset 0.
-            // All VectorBase constructors allocate fresh arrays, so this should always hold.
-            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            // Return the backing array when offset is 0. The array may be larger than
+            // the logical length (ArrayPool/POH buffers), but all callers bound by
+            // tensor.Length so this is safe. Requiring Count == Array.Length caused
+            // GetDataArray() to return a copy for ArrayPool-backed tensors, silently
+            // losing writes — a critical correctness bug.
+            if (segment.Offset == 0)
             {
                 return segment.Array;
             }

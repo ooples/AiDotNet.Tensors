@@ -15,11 +15,13 @@ internal static class VmlProvider
     private static bool _available;
     private static readonly object InitLock = new();
 
-    // VML function pointers
+#if NET5_0_OR_GREATER
+    // VML function pointers (only used on .NET 5+ where NativeLibrary is available)
     private static VsExpDelegate? _vsExp;
     private static VdExpDelegate? _vdExp;
     private static VsLnDelegate? _vsLn;
     private static VdLnDelegate? _vdLn;
+#endif
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private unsafe delegate void VsExpDelegate(int n, float* a, float* y);
@@ -49,9 +51,13 @@ internal static class VmlProvider
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryExp(float* input, float* output, int length)
     {
+#if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vsExp == null) return false;
         _vsExp(length, input, output);
         return true;
+#else
+        return false;
+#endif
     }
 
     /// <summary>
@@ -60,9 +66,13 @@ internal static class VmlProvider
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryExp(double* input, double* output, int length)
     {
+#if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vdExp == null) return false;
         _vdExp(length, input, output);
         return true;
+#else
+        return false;
+#endif
     }
 
     /// <summary>
@@ -71,9 +81,13 @@ internal static class VmlProvider
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(float* input, float* output, int length)
     {
+#if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vsLn == null) return false;
         _vsLn(length, input, output);
         return true;
+#else
+        return false;
+#endif
     }
 
     /// <summary>
@@ -82,9 +96,13 @@ internal static class VmlProvider
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(double* input, double* output, int length)
     {
+#if NET5_0_OR_GREATER
         if (!EnsureInitialized() || _vdLn == null) return false;
         _vdLn(length, input, output);
         return true;
+#else
+        return false;
+#endif
     }
 
     private static bool EnsureInitialized()

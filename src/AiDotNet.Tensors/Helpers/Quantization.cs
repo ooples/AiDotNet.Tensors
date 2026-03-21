@@ -67,7 +67,7 @@ public sealed class QuantizationParams
             float scale = (max - min) / (qmax - qmin);
             if (scale == 0) scale = 1f;
             int zeroPoint = (int)Math.Round(qmin - min / scale);
-            zeroPoint = Math.Clamp(zeroPoint, qmin, qmax);
+            zeroPoint = Math.Max(qmin, Math.Min(qmax, zeroPoint));
             return new QuantizationParams(scale, zeroPoint, mode, bits);
         }
     }
@@ -96,7 +96,7 @@ public static class Quantization
         {
             float val = src[i] * invScale + zp;
             val = MathF.Round(val);
-            dst[i] = (sbyte)Math.Clamp((int)val, -128, 127);
+            dst[i] = (sbyte)Math.Max(-128, Math.Min(127, (int)val));
         }
 
         return result;

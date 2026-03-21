@@ -42,37 +42,32 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Large tensors: use NativeMemory for zero GC pressure (matches TorchSharp's pattern)
-        // NativeMemoryOwner<T> provides Memory<T> backed by native memory — 64-byte aligned,
-        // already pinned, zero GC overhead. Tensor becomes a thin wrapper (48 bytes managed).
+        // Large unmanaged tensors: POH-pinned managed array.
+        // POH arrays are never moved by GC (zero-cost Pin() for SIMD), and they provide
+        // a real T[] so GetDataArray() returns the backing array without copying.
+        // NativeMemory was previously used here but GetDataArray() returned a copy for
+        // NativeMemory-backed tensors (MemoryMarshal.TryGetArray fails), causing silent
+        // data loss on any write path — a critical correctness bug for tensors >= 256K.
         if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
         {
-            if (typeof(T) == typeof(float))
-            {
-                var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
-                return (Tensor<T>)(object)Tensor<float>.FromMemory(owner.Memory, shape);
-            }
-            if (typeof(T) == typeof(double))
-            {
-                var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
-                return (Tensor<T>)(object)Tensor<double>.FromMemory(owner.Memory, shape);
-            }
-            // Non-float/double unmanaged types: fall through to ArrayPool
+            T[] array = GC.AllocateUninitializedArray<T>(totalSize, pinned: true);
+            Array.Clear(array, 0, totalSize);
+            var memory = new Memory<T>(array);
+            return Tensor<T>.FromMemory(memory, shape);
         }
 
-        // Large tensors for reference types or fallback: use ArrayPool
+        // Large tensors for reference types: use ArrayPool
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            Array.Clear(pooled, 0,
-                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
+            Array.Clear(pooled, 0, pooled.Length);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
         // Small tensors: standard managed allocation
-        T[] array = new T[totalSize];
-        var mem = new Memory<T>(array);
+        T[] arr = new T[totalSize];
+        var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
         return new Tensor<T>(shape);

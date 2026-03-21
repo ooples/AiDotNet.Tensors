@@ -67,13 +67,15 @@ public abstract class MatrixBase<T>
     {
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
-            if (segment.Offset == 0 && segment.Count == segment.Array.Length)
+            // Return the backing array when offset is 0. The array may be larger than
+            // the logical length (ArrayPool buffers), but all callers bound by rows*cols.
+            if (segment.Offset == 0)
             {
                 return segment.Array;
             }
         }
 
-        // Cannot get backing array — this means mutations would be lost.
+        // Cannot get backing array (non-zero offset or MemoryManager-backed).
         // Fall back to ToArray() for read-only scenarios; callers that mutate
         // must use Span-based paths instead.
         return _memory.ToArray();
@@ -173,7 +175,7 @@ public abstract class MatrixBase<T>
         this._cols = cols;
         this._memory = memory;
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
-            && segment.Array is not null && segment.Offset == 0 && segment.Count == segment.Array.Length)
+            && segment.Array is not null && segment.Offset == 0)
         {
             this._cachedArray = segment.Array;
         }
