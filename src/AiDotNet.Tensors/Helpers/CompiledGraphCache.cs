@@ -157,6 +157,17 @@ public sealed class CompiledGraphCache
                 sb.Append(prm.Groups);
                 sb.Append(',');
                 sb.Append(prm.Axis);
+                sb.Append(',');
+                sb.Append(prm.Epsilon);
+                sb.Append(',');
+                sb.Append(prm.Alpha);
+                sb.Append(',');
+                sb.Append((int)prm.FusedActivation);
+                if (prm.CustomName is not null)
+                {
+                    sb.Append(',');
+                    sb.Append(prm.CustomName);
+                }
             }
             sb.Append(';');
         }

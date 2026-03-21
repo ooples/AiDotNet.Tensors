@@ -1316,7 +1316,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var inputData = floatInput.GetDataArray();
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
-                var gpuOut = gpuBackend.AllocateBuffer(inputData.Length);
+                var gpuOut = gpuBackend.AllocateBuffer(input.Length);
                 try
                 {
                     // GPU softmax kernel
@@ -1354,7 +1354,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
                 var inputData = floatInput.GetDataArray();
-                int size = inputData.Length;
+                int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
                 var gpuSigmoid = gpuBackend.AllocateBuffer(size);
@@ -1390,7 +1390,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
                 var inputData = floatInput.GetDataArray();
-                int size = inputData.Length;
+                int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
                 var gpuOut = gpuBackend.AllocateBuffer(size);
@@ -1423,7 +1423,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
                 var inputData = floatInput.GetDataArray();
-                int size = inputData.Length;
+                int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
                 var gpuOut = gpuBackend.AllocateBuffer(size);
@@ -5568,12 +5568,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (center)
             {
                 int padAmount = nFft / 2;
-                T[] paddedData = new T[inputData.Length + 2 * padAmount];
-                Array.Copy(inputData, 0, paddedData, padAmount, inputData.Length);
+                T[] paddedData = new T[input.Length + 2 * padAmount];
+                Array.Copy(inputData, 0, paddedData, padAmount, input.Length);
                 inputData = paddedData;
             }
 
-            int numSamples = inputData.Length;
+            int numSamples = input.Length;
             int numFrames = (numSamples - nFft) / hopLength + 1;
             int numFreqs = nFft / 2 + 1;
 
@@ -8969,10 +8969,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         var inputData = input.GetDataArray();
-        var outputData = new T[inputData.Length];
+        var outputData = new T[input.Length];
 
         // Permute data
-        for (int i = 0; i < inputData.Length; i++)
+        for (int i = 0; i < input.Length; i++)
         {
             // Convert flat index to multi-index
             var multiIndex = new int[rank];

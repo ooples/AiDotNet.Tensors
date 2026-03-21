@@ -46,8 +46,12 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private bool _initialized;
     private bool _disposed;
 
-    // Batch execution state — records multiple dispatches into a single command buffer
+    // Batch execution state — records multiple dispatches into a single command buffer.
+    // Thread-affine: _batchOwnerThreadId tracks which thread owns the batch. Non-owning
+    // threads fall through to the non-batch path to avoid recording into another thread's
+    // command buffer.
     private bool _batchMode;
+    private int _batchOwnerThreadId;
     private ThreadCommandResources _batchThreadRes;
     private int _batchDispatchCount;
 
@@ -474,8 +478,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void RecordAndExecuteComputeUnlocked(VulkanComputePipeline pipeline, int elementCount, ThreadCommandResources threadRes)
     {
-        // Batch mode: record dispatch into the batch command buffer without submit
-        if (_batchMode)
+        // Batch mode: record dispatch into the batch command buffer without submit.
+        // Thread-affine: only the thread that called BeginBatch can record into the batch.
+        // Non-owning threads fall through to the immediate-submit path.
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
 
@@ -673,6 +679,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
         _batchMode = true;
+        _batchOwnerThreadId = Environment.CurrentManagedThreadId;
     }
 
     /// <summary>

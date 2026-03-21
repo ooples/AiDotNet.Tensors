@@ -111,8 +111,11 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
-        // Extract backing array for SIMD fast paths. Accept arrays larger than the Memory
-        // slice (e.g., ArrayPool buffers) — all SIMD paths bound by Length, not array.Length.
+        // Extract backing array for SIMD fast paths. The array may be LARGER than Length
+        // when backed by ArrayPool (which returns power-of-2 buffers).
+        // INVARIANT: all SIMD consumers MUST pass Length as the element count, never array.Length.
+        // This invariant is enforced by _cachedArray being internal (not public) and all SIMD
+        // paths in VectorBase/MatrixBase/SimdKernels explicitly using Length for bounds.
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {
