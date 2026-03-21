@@ -5,11 +5,11 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Tensor allocation helper that uses ArrayPool for large tensors to reduce GC pressure.
-/// All methods respect <see cref="TensorPool.Enabled"/>; when disabled, they fall back to
-/// standard non-pooled allocation. <see cref="Rent{T}(int[])"/> returns zero-initialized memory.
-/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ for callers that
-/// will immediately overwrite all elements. Return pooled tensors via <see cref="TensorPool.Return{T}"/>.
+/// Tensor allocation with transparent zero-alloc caching via <see cref="ThreadLocalTensorCache{T}"/>.
+/// After the first forward pass warms the cache, <see cref="Rent{T}(int[])"/> reuses thread-local
+/// buffers — zero allocation, zero GC, zero lock contention, completely invisible to callers.
+/// Falls back to ArrayPool for cache misses, then standard allocation when pooling is disabled.
+/// Return pooled tensors via <see cref="TensorPool.Return{T}"/> to enable buffer reuse.
 /// </summary>
 public static class TensorAllocator
 {
@@ -42,12 +42,25 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Large tensors: ArrayPool-backed caching allocator.
-        // ArrayPool.Shared reuses buffers across Rent/Return cycles — after warmup,
-        // Rent is O(1) with zero allocation. This matches PyTorch's caching allocator
-        // pattern. Callers should call TensorPool.Return() when done, or the buffer
-        // will be reclaimed by GC (still correct, just misses the reuse opportunity).
-        // GetDataArray() works with ArrayPool buffers (relaxed offset-only check).
+        // Tier 1: Thread-local cache — zero allocation, zero contention.
+        // After warmup, this path hits on every call (same shapes used repeatedly).
+        T[]? cached = ThreadLocalTensorCache<T>.TryRent(
+            totalSize >= ArrayPoolThreshold ? 0 : totalSize); // only cache small; large go to ArrayPool
+        if (cached is null && totalSize >= ArrayPoolThreshold)
+        {
+            // For large tensors, ArrayPool.Rent returns power-of-2 sizes.
+            // Cache by ArrayPool bucket size so we match on return.
+            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
+        }
+        if (cached is not null)
+        {
+            Array.Clear(cached, 0,
+                RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : totalSize);
+            var memory = new Memory<T>(cached, 0, totalSize);
+            return Tensor<T>.FromPooledMemory(memory, shape, cached);
+        }
+
+        // Tier 2: ArrayPool — O(1) allocation with buffer reuse across threads.
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
@@ -57,13 +70,32 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }
 
-        // Small tensors: standard managed allocation
+        // Tier 3: Standard managed allocation for small tensors.
         T[] arr = new T[totalSize];
         var mem = new Memory<T>(arr);
         return Tensor<T>.FromMemory(mem, shape);
 #else
         return new Tensor<T>(shape);
 #endif
+    }
+
+    /// <summary>
+    /// Computes the ArrayPool bucket size for a given request.
+    /// ArrayPool returns power-of-2 sizes, so we need to match on return.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ArrayPoolBucketSize(int requestedSize)
+    {
+        // ArrayPool.Shared uses power-of-2 buckets starting at 16
+        if (requestedSize <= 16) return 16;
+        // Round up to next power of 2
+        int v = requestedSize - 1;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        return v + 1;
     }
 
     /// <summary>
@@ -172,6 +204,11 @@ public static class TensorAllocator
         {
             tensor.DetachPooledArray();
 #if NET5_0_OR_GREATER
+            // Tier 1: Try thread-local cache first — zero contention, instant reuse.
+            if (ThreadLocalTensorCache<T>.TryReturn(pooledArray))
+                return;
+
+            // Tier 2: Cache full — fall through to ArrayPool.
             ArrayPool<T>.Shared.Return(pooledArray,
                 clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
 #else

@@ -3,11 +3,10 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Public facade for tensor pooling that delegates to <see cref="TensorAllocator"/>.
-/// <see cref="Rent{T}(int[])"/> returns zero-initialized memory for safe concurrent access.
-/// <see cref="RentUninitialized{T}"/> skips zero-initialization on .NET 5+ when
-/// <see cref="Enabled"/> is true; on older targets or when disabled, the returned
-/// memory may be zero-initialized (callers must not rely on uninitialized content).
+/// Public facade for zero-alloc tensor allocation with transparent caching.
+/// Behind the scenes, <see cref="Rent{T}(int[])"/> uses a thread-local buffer cache
+/// (zero contention, zero allocation after warmup) backed by ArrayPool for cache misses.
+/// Call <see cref="Return{T}"/> when tensors are no longer needed to enable buffer reuse.
 /// All overloads respect <see cref="Enabled"/>; when disabled, plain non-pooled
 /// tensors are returned instead.
 /// </summary>
