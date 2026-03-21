@@ -215,6 +215,24 @@ public class TorchSharpCpuComparisonBenchmarks
         using (var result = torch.nn.functional.conv2d(_torchConvInput!, _torchConvKernel!,
             strides: _torchConvStride!, padding: _torchConvPadding!, dilation: _torchConvDilation!))
             ConsumeTorchResult(result);
+
+        // Warm up MKL VML double paths — each vmd* function has a one-time JIT cold-start (~9ms).
+        // Without this, the first benchmark iteration pays the cold-start, skewing the mean.
+        if (_aiDoubleVectorA is not null)
+        {
+            var warmupDbl = TensorAllocator.Rent<double>(_aiDoubleVectorA.Shape);
+            TensorPool.Return(_cpuEngine.TensorExp(warmupDbl));
+            TensorPool.Return(_cpuEngine.TensorLog(warmupDbl));
+            TensorPool.Return(_cpuEngine.TensorTanh(warmupDbl));
+            TensorPool.Return(_cpuEngine.Sigmoid(warmupDbl));
+            TensorPool.Return(warmupDbl);
+        }
+
+        // Warm up oneDNN softmax primitive
+        if (_aiSoftmaxInput is not null)
+        {
+            TensorPool.Return(_cpuEngine.TensorSoftmax(_aiSoftmaxInput, axis: 1));
+        }
     }
 
     private void InitializeConv2D()
