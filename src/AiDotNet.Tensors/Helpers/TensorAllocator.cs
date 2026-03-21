@@ -42,19 +42,7 @@ public static class TensorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        // Tier 1: POH-pinned managed arrays for large unmanaged tensors.
-        // POH arrays: real T[] for GetDataArray(), free Pin() (already pinned),
-        // zero GC compaction. Best of both worlds — managed array compatibility
-        // with native-like performance. oneDNN/VML access via Pin() with zero overhead.
-        if (totalSize >= ArrayPoolThreshold && !RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-        {
-            T[] array = GC.AllocateUninitializedArray<T>(totalSize, pinned: true);
-            Array.Clear(array, 0, totalSize);
-            var memory = new Memory<T>(array);
-            return Tensor<T>.FromMemory(memory, shape);
-        }
-
-        // Tier 2: Thread-local cache for managed arrays.
+        // Tier 1: Thread-local cache — zero allocation after warmup.
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
         if (cached is null && totalSize >= ArrayPoolThreshold)
             cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
