@@ -119,11 +119,10 @@ public static class TensorLayout
             throw new ArgumentException($"Expected 4D destination [N,H,W,C] but got rank {destination.Rank}.");
         if (destination.Length != nchw.Length)
             throw new ArgumentException($"Destination length ({destination.Length}) must match source length ({nchw.Length}).");
-
-        int n = nchw.Shape[0];
-        int c = nchw.Shape[1];
-        int h = nchw.Shape[2];
-        int w = nchw.Shape[3];
+        // Validate destination shape matches expected NHWC layout
+        int n = nchw.Shape[0], c = nchw.Shape[1], h = nchw.Shape[2], w = nchw.Shape[3];
+        if (destination.Shape[0] != n || destination.Shape[1] != h || destination.Shape[2] != w || destination.Shape[3] != c)
+            throw new ArgumentException($"Destination shape [{string.Join(",", destination.Shape)}] must be [N={n},H={h},W={w},C={c}].");
 
         var src = nchw.AsSpan();
         var dst = destination.AsWritableSpan();

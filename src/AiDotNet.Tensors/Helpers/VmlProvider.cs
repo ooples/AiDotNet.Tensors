@@ -95,9 +95,6 @@ internal static class VmlProvider
 #endif
     }
 
-    /// <summary>
-    /// Computes element-wise ln(x) for double using MKL VML.
-    /// </summary>
     /// <summary>Double ln(x) via vmdLn with VML_EP per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(double* input, double* output, int length)
@@ -126,9 +123,6 @@ internal static class VmlProvider
 #endif
     }
 
-    /// <summary>
-    /// Computes element-wise tanh(x) for double using MKL VML.
-    /// </summary>
     /// <summary>Double tanh(x) via vmdTanh with VML_EP per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryTanh(double* input, double* output, int length)

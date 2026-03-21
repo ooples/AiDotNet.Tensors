@@ -158,9 +158,9 @@ public sealed class CompiledGraphCache
                 sb.Append(',');
                 sb.Append(prm.Axis);
                 sb.Append(',');
-                sb.Append(prm.Epsilon);
+                sb.Append(prm.Epsilon.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 sb.Append(',');
-                sb.Append(prm.Alpha);
+                sb.Append(prm.Alpha.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 sb.Append(',');
                 sb.Append((int)prm.FusedActivation);
                 if (prm.CustomName is not null)

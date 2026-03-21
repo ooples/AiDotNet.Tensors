@@ -238,12 +238,13 @@ public sealed class GraphExecutor<T> : IDisposable
                 _engine.ConcatInto(o, inp, n.Params?.Axis ?? 0);
             },
 
-            // Transpose
-            [OpType.Transpose] = (_, inp, o) =>
+            // Transpose — use params Axis if available, otherwise reverse dimensions
+            [OpType.Transpose] = (n, inp, o) =>
             {
-                var axes = new int[inp[0].Rank];
-                for (int ax = 0; ax < axes.Length; ax++) axes[ax] = axes.Length - 1 - ax;
-                _engine.TransposeInto(o, inp[0], axes);
+                int rank = inp[0].Rank;
+                Span<int> axes = rank <= 8 ? stackalloc int[rank] : new int[rank];
+                for (int ax = 0; ax < rank; ax++) axes[ax] = rank - 1 - ax;
+                _engine.TransposeInto(o, inp[0], axes.ToArray());
             },
 
             // Attention
