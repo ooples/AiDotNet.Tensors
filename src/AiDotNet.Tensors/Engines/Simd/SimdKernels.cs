@@ -1392,8 +1392,16 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = input.Length;
 
-            // VML double permanently disabled — unreliable on MKL 2022 (VML_HA mode persists).
-            // Use SIMD FastExpDouble256 polynomial instead.
+#if NET5_0_OR_GREATER
+            // VML double via vmdExp (mode-per-call, VML_LA guaranteed).
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
+            {
+                if (VmlProvider.TryExp(pIn, pOut, length))
+                    return;
+            }
+#endif
+
             int i = 0;
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
@@ -1669,7 +1677,15 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             int length = input.Length;
 
-            // VML double permanently disabled — unreliable on MKL 2022.
+#if NET5_0_OR_GREATER
+            // VML double via vmdTanh (mode-per-call, VML_LA guaranteed).
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
+            {
+                if (VmlProvider.TryTanh(pIn, pOut, length))
+                    return;
+            }
+#endif
 
             int i = 0;
 

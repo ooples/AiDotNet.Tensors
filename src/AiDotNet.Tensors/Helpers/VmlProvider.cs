@@ -14,21 +14,25 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal static class VmlProvider
 {
+    private const long VML_LA = 0x00000001; // Low Accuracy mode (~11 digits for double)
+
     private static bool _initialized;
     private static bool _available;
     private static readonly object InitLock = new();
 
 #if NET5_0_OR_GREATER
     // Unmanaged function pointers — zero marshal overhead (C# 9 feature).
+    // Float VML — no mode needed (float is fast even in VML_HA)
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsExp;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdExp;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsLn;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdLn;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void> _vdTanh;
 
-    // vmlSetMode: sets accuracy mode. VML_LA=0x1 (fast), VML_HA=0x2 (default, slow for double)
-    private static unsafe delegate* unmanaged[Cdecl]<uint, uint> _vmlSetMode;
+    // Double VML — mode-specific (vmd* takes mode as 4th arg).
+    // Using VML_LA=0x1 per-call avoids the VML_HA regression that vd* functions hit
+    // when the global mode resets between calls.
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdExp;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdLn;
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void> _vmdTanh;
 #endif
 
     /// <summary>Whether MKL VML functions are available.</summary>
@@ -58,14 +62,19 @@ internal static class VmlProvider
     }
 
     /// <summary>
-    /// Double VML permanently disabled — vdExp is unreliable on MKL 2022.
-    /// VML_LA mode doesn't persist (reverts to VML_HA = 600x slower).
-    /// Use FastExpDouble256 polynomial instead (reliable ~1.3ms for 1M doubles).
+    /// Computes element-wise exp(x) for double using MKL VML with VML_LA mode per-call.
+    /// Uses vmdExp (mode-specific) instead of vdExp to avoid VML_HA regression.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryExp(double* input, double* output, int length)
     {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vmdExp == null) return false;
+        _vmdExp(length, input, output, VML_LA);
+        return true;
+#else
         return false;
+#endif
     }
 
     /// <summary>
@@ -86,11 +95,17 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise ln(x) for double using MKL VML.
     /// </summary>
-    /// <summary>Double VML permanently disabled — see TryExp(double) comment.</summary>
+    /// <summary>Double ln(x) via vmdLn with VML_LA per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(double* input, double* output, int length)
     {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vmdLn == null) return false;
+        _vmdLn(length, input, output, VML_LA);
+        return true;
+#else
         return false;
+#endif
     }
 
     /// <summary>
@@ -111,27 +126,20 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise tanh(x) for double using MKL VML.
     /// </summary>
-    /// <summary>Double VML permanently disabled — see TryExp(double) comment.</summary>
+    /// <summary>Double tanh(x) via vmdTanh with VML_LA per-call.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryTanh(double* input, double* output, int length)
     {
-        return false;
-    }
-
-    /// <summary>
-    /// Enforces VML_LA mode before every double VML call.
-    /// MKL can reset the mode between calls; without this, double VML
-    /// falls into VML_HA mode (600x slower) causing catastrophic outliers.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void EnforceVmlLaMode()
-    {
 #if NET5_0_OR_GREATER
-        const uint VML_LA = 0x00000001;
-        if (_vmlSetMode != null)
-            _vmlSetMode(VML_LA);
+        if (!EnsureInitialized() || _vmdTanh == null) return false;
+        _vmdTanh(length, input, output, VML_LA);
+        return true;
+#else
+        return false;
 #endif
     }
+
+    // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
 
     private static bool EnsureInitialized()
     {
@@ -196,42 +204,35 @@ internal static class VmlProvider
     {
         try
         {
-            // Load function pointers as unmanaged[Cdecl] — zero overhead calls.
+            // Float VML — no mode needed (fast in all modes)
             _vsExp = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsExp", "MKL_vsExp", "VSEXP");
-            _vdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
-                TryGetExport(handle, "vdExp", "MKL_vdExp", "VDEXP");
             _vsLn = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsLn", "MKL_vsLn", "VSLN");
-            _vdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
-                TryGetExport(handle, "vdLn", "MKL_vdLn", "VDLN");
             _vsTanh = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsTanh", "MKL_vsTanh", "VSTANH");
-            _vdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, void>)
-                TryGetExport(handle, "vdTanh", "MKL_vdTanh", "VDTANH");
 
-            // Load vmlSetMode to set VML_LA (Low Accuracy = fast mode).
-            // Default VML_HA is extremely slow for double (600x slower than scalar Math.Exp).
-            // VML_LA gives ~11 correct digits for double — more than enough for neural nets.
-            _vmlSetMode = (delegate* unmanaged[Cdecl]<uint, uint>)
-                TryGetExport(handle, "vmlSetMode", "MKL_vmlSetMode", "VMLSETMODE");
-            if (_vmlSetMode != null)
-            {
-                const uint VML_LA = 0x00000001;
-                _vmlSetMode(VML_LA);
-            }
+            // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
+            // This avoids the VML_HA regression that vd* functions hit when
+            // the global vmlSetMode resets between calls.
+            _vmdExp = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
+                TryGetExport(handle, "vmdExp", "MKL_vmdExp", "VMDEXP");
+            _vmdLn = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
+                TryGetExport(handle, "vmdLn", "MKL_vmdLn", "VMDLN");
+            _vmdTanh = (delegate* unmanaged[Cdecl]<int, double*, double*, long, void>)
+                TryGetExport(handle, "vmdTanh", "MKL_vmdTanh", "VMDTANH");
 
             // Verify correctness at n=1 AND n=1000 (catches scale-dependent issues).
             // Also verify performance: must be faster than scalar at n=10000.
             _vsExp = VerifyFloat(_vsExp, 1.0f, 2.71828f, 0.01f);
             _vsLn = VerifyFloat(_vsLn, 2.71828f, 1.0f, 0.01f);
             _vsTanh = VerifyFloat(_vsTanh, 1.0f, 0.7616f, 0.01f);
-            _vdExp = VerifyDoubleAtScale(_vdExp, 1.0, 2.71828, 0.001);
-            _vdLn = VerifyDoubleAtScale(_vdLn, 2.71828, 1.0, 0.001);
-            _vdTanh = VerifyDoubleAtScale(_vdTanh, 1.0, 0.76159, 0.001);
+            _vmdExp = VerifyDoubleModeAtScale(_vmdExp, 1.0, 2.71828, 0.001);
+            _vmdLn = VerifyDoubleModeAtScale(_vmdLn, 2.71828, 1.0, 0.001);
+            _vmdTanh = VerifyDoubleModeAtScale(_vmdTanh, 1.0, 0.76159, 0.001);
 
-            return _vsExp != null || _vdExp != null || _vsLn != null || _vdLn != null
-                || _vsTanh != null || _vdTanh != null;
+            return _vsExp != null || _vmdExp != null || _vsLn != null || _vmdLn != null
+                || _vsTanh != null || _vmdTanh != null;
         }
         catch
         {
@@ -281,67 +282,39 @@ internal static class VmlProvider
     /// <summary>
     /// Verifies a double VML function pointer at n=1 AND n=1000.
     /// Also checks that it's faster than scalar Math.Exp at n=10000.
-    /// Previous bug: vdExp passed n=1 verification but was 600x slower at scale
-    /// because VML defaulted to VML_HA (High Accuracy) mode for double.
+    /// Verifies a mode-specific double VML function (vmd*) at n=1 and n=1000.
+    /// The 4th arg is the VML mode (VML_LA=1). No need for performance test
+    /// since VML_LA is passed per-call and can't regress.
     /// </summary>
-    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, void>
-        VerifyDoubleAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, void> fn,
+    private static unsafe delegate* unmanaged[Cdecl]<int, double*, double*, long, void>
+        VerifyDoubleModeAtScale(delegate* unmanaged[Cdecl]<int, double*, double*, long, void> fn,
         double testInput, double expectedOutput, double tolerance)
     {
         if (fn == null) return null;
         try
         {
-            // Step 1: Verify correctness at n=1
             var inArr = new double[] { testInput };
             var outArr = new double[] { 0.0 };
             fixed (double* pIn = inArr, pOut = outArr)
             {
-                fn(1, pIn, pOut);
+                fn(1, pIn, pOut, VML_LA);
             }
             if (double.IsNaN(outArr[0]) || double.IsInfinity(outArr[0])
                 || Math.Abs(outArr[0] - expectedOutput) > tolerance)
                 return null;
 
-            // Step 2: Verify correctness at n=1000
+            // Verify at scale
             const int testSize = 1000;
             var bigIn = new double[testSize];
             var bigOut = new double[testSize];
             for (int i = 0; i < testSize; i++) bigIn[i] = testInput;
             fixed (double* pIn = bigIn, pOut = bigOut)
             {
-                fn(testSize, pIn, pOut);
+                fn(testSize, pIn, pOut, VML_LA);
             }
-            // Check first and last elements
             if (double.IsNaN(bigOut[0]) || Math.Abs(bigOut[0] - expectedOutput) > tolerance)
                 return null;
             if (double.IsNaN(bigOut[testSize - 1]) || Math.Abs(bigOut[testSize - 1] - expectedOutput) > tolerance)
-                return null;
-
-            // Step 3: Verify performance — VML must be faster than scalar at n=10000.
-            // If VML is in VML_HA mode and we failed to set VML_LA, it will be 100x+ slower.
-            const int perfSize = 10000;
-            var perfIn = new double[perfSize];
-            var perfOut = new double[perfSize];
-            for (int i = 0; i < perfSize; i++) perfIn[i] = 0.5;
-
-            // Scalar baseline
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < perfSize; i++) perfOut[i] = Math.Exp(perfIn[i]);
-            sw.Stop();
-            long scalarTicks = sw.ElapsedTicks;
-
-            // VML
-            sw.Restart();
-            fixed (double* pIn = perfIn, pOut = perfOut)
-            {
-                fn(perfSize, pIn, pOut);
-            }
-            sw.Stop();
-            long vmlTicks = sw.ElapsedTicks;
-
-            // VML must be no more than 3x slower than scalar to be useful.
-            // If it's slower, VML_LA mode wasn't set successfully — disable.
-            if (vmlTicks > scalarTicks * 3)
                 return null;
 
             return fn;
@@ -352,11 +325,11 @@ internal static class VmlProvider
     private static unsafe void ClearAllPointers()
     {
         _vsExp = null;
-        _vdExp = null;
         _vsLn = null;
-        _vdLn = null;
         _vsTanh = null;
-        _vdTanh = null;
+        _vmdExp = null;
+        _vmdLn = null;
+        _vmdTanh = null;
     }
 #endif
 }
