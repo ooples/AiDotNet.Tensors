@@ -1212,8 +1212,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
-        if (newShape.Aggregate(1, (a, b) => a * b) != Length)
-            throw new ArgumentException("New shape must have the same total number of elements as the original tensor.");
+        int newTotal = newShape.Aggregate(1, (a, b) => a * b);
+        if (newTotal != Length)
+            throw new ArgumentException(
+                $"Cannot reshape tensor with {Length} elements to shape [{string.Join(",", newShape)}] ({newTotal} elements).");
 
         var reshaped = new Tensor<T>(newShape);
         // Use vectorized Copy operation for SIMD acceleration (5-15x faster with AVX2)
