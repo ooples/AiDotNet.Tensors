@@ -9695,24 +9695,36 @@ public class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
-
-        var gradOutputData = gradOutput.GetDataArray();
-        var outputData = output.GetDataArray();
-        var gradInputData = new T[outputData.Length];
 
         int outerSize = 1, axisSize = output.Shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= output.Shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= output.Shape[i];
+
+#if NET5_0_OR_GREATER
+        // Float SIMD fast path for last-axis softmax backward (innerSize == 1)
+        if (typeof(T) == typeof(float) && innerSize == 1
+            && gradOutput.GetDataArray() is float[] gOutF
+            && output.GetDataArray() is float[] outF)
+        {
+            var gInF = new float[outF.Length];
+            SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
+            return (Tensor<T>)(object)new Tensor<T>(output.Shape, new Vector<T>((T[])(object)gInF));
+        }
+#endif
+
+        // Generic fallback
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradOutputData = gradOutput.GetDataArray();
+        var outputData = output.GetDataArray();
+        var gradInputData = new T[outputData.Length];
 
         Parallel.For(0, outerSize * innerSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
 
-            // Compute dot product of grad and output along axis
             T dotProduct = numOps.Zero;
             for (int i = 0; i < axisSize; i++)
             {
@@ -9720,7 +9732,6 @@ public class CpuEngine : ITensorLevelEngine
                 dotProduct = numOps.Add(dotProduct, numOps.Multiply(gradOutputData[flatIdx], outputData[flatIdx]));
             }
 
-            // Compute gradient: grad_input = output * (grad_output - dot_product)
             for (int i = 0; i < axisSize; i++)
             {
                 int flatIdx = (outer * axisSize + i) * innerSize + inner;
@@ -9730,6 +9741,105 @@ public class CpuEngine : ITensorLevelEngine
 
         return new Tensor<T>(output.Shape, new Vector<T>(gradInputData));
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// SIMD-optimized softmax backward for float with contiguous axis (innerSize == 1).
+    /// Per row: dotProduct = sum(gradOut * output), gradIn = output * (gradOut - dotProduct).
+    /// </summary>
+    private static unsafe void SoftmaxBackwardFloat(float[] gradOut, float[] output, float[] gradIn,
+        int outerSize, int axisSize)
+    {
+        bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
+
+        if (useParallel)
+        {
+            Parallel.For(0, outerSize, row =>
+            {
+                SoftmaxBackwardFloatRow(gradOut, output, gradIn, row, axisSize);
+            });
+        }
+        else
+        {
+            for (int row = 0; row < outerSize; row++)
+                SoftmaxBackwardFloatRow(gradOut, output, gradIn, row, axisSize);
+        }
+    }
+
+    private static unsafe void SoftmaxBackwardFloatRow(float[] gradOut, float[] output, float[] gradIn,
+        int row, int axisSize)
+    {
+        int baseIdx = row * axisSize;
+        fixed (float* pGO = gradOut, pO = output, pGI = gradIn)
+        {
+            float* go = pGO + baseIdx;
+            float* o = pO + baseIdx;
+            float* gi = pGI + baseIdx;
+
+            // Step 1: dot product = sum(gradOut[i] * output[i])
+            float dot = 0f;
+            int i = 0;
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && axisSize >= 32)
+            {
+                var vdot0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                var vdot3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                int simdLen = axisSize & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    vdot0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i), vdot0);
+                    vdot1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8), vdot1);
+                    vdot2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 16),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 16), vdot2);
+                    vdot3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 24),
+                        System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 24), vdot3);
+                }
+                vdot0 = System.Runtime.Intrinsics.X86.Avx.Add(
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot0, vdot1),
+                    System.Runtime.Intrinsics.X86.Avx.Add(vdot2, vdot3));
+                dot = SimdKernels.HorizontalSum(vdot0);
+            }
+            for (; i < axisSize; i++)
+                dot += go[i] * o[i];
+
+            // Step 2: gradIn[i] = output[i] * (gradOut[i] - dot)
+            i = 0;
+            if (System.Runtime.Intrinsics.X86.Avx.IsSupported && axisSize >= 32)
+            {
+                var vdot = System.Runtime.Intrinsics.Vector256.Create(dot);
+                int simdLen = axisSize & ~31;
+                for (; i < simdLen; i += 32)
+                {
+                    var go0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i);
+                    var go1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 8);
+                    var go2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 16);
+                    var go3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(go + i + 24);
+                    var o0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i);
+                    var o1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 8);
+                    var o2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 16);
+                    var o3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(o + i + 24);
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o0, System.Runtime.Intrinsics.X86.Avx.Subtract(go0, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 8,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o1, System.Runtime.Intrinsics.X86.Avx.Subtract(go1, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 16,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o2, System.Runtime.Intrinsics.X86.Avx.Subtract(go2, vdot)));
+                    System.Runtime.Intrinsics.X86.Avx.Store(gi + i + 24,
+                        System.Runtime.Intrinsics.X86.Avx.Multiply(o3, System.Runtime.Intrinsics.X86.Avx.Subtract(go3, vdot)));
+                }
+            }
+            for (; i < axisSize; i++)
+                gi[i] = o[i] * (go[i] - dot);
+        }
+    }
+#endif
 
     /// <inheritdoc/>
     public Tensor<T> GumbelSoftmax<T>(Tensor<T> input, double temperature = 1.0, bool hard = false, int axis = -1)
