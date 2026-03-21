@@ -21,7 +21,8 @@
     <PackageReference Include="SciSharp.TensorFlow.Redist" Version="2.16.0" />
     <PackageReference Include="TorchSharp" Version="0.106.0" />
     <PackageReference Include="TorchSharp-cuda-windows" Version="0.106.0" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
-    <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.12.0" />
+    <!-- oneDNN disabled for now — DllImportResolver conflicts with BenchmarkDotNet process isolation -->
+    <!-- <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.12.0" /> -->
   </ItemGroup>
 
   <ItemGroup>
