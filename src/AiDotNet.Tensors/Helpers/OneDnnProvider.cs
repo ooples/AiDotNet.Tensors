@@ -33,6 +33,9 @@ internal static class OneDnnProvider
     private const int MaxCacheSize = 32; // Limit cache size to avoid memory bloat
     private const int MaxEltwiseCacheSize = 16; // Limit eltwise cache size
     private const int MaxBinaryCacheSize = 16; // Limit binary cache size
+    private static readonly ConcurrentDictionary<SoftmaxKey, CachedSoftmax> _softmaxCache = new();
+    private const int MaxSoftmaxCacheSize = 8;
+    private static readonly ReaderWriterLockSlim _softmaxCacheLock = new(LockRecursionPolicy.NoRecursion);
 
     // Reader-writer locks to prevent use-after-free during cache eviction
     // These ensure that eviction doesn't happen while cached objects are in use
@@ -132,6 +135,9 @@ internal static class OneDnnProvider
     // Binary algorithms (from dnnl_types.h)
     private const int DnnlBinaryAdd = 0x1fff0;  // binary_add = 131056
     private const int DnnlBinaryMul = 0x1fff1;  // binary_mul = 131057
+
+    // Softmax algorithm (from dnnl_types.h)
+    private const int DnnlSoftmaxAccurate = 0;  // dnnl_softmax_accurate
 
     // Format tags (from dnnl_types.h)
     private const int DnnlFormatTagAny = 1;  // Let oneDNN choose optimal format (format_tag_any = 1, not 0)
@@ -427,6 +433,54 @@ internal static class OneDnnProvider
         }
     }
 
+    /// <summary>
+    /// Cache key for softmax primitives, keyed by outer size and axis size.
+    /// </summary>
+    private readonly struct SoftmaxKey : IEquatable<SoftmaxKey>
+    {
+        public readonly int OuterSize;
+        public readonly int AxisSize;
+
+        public SoftmaxKey(int outerSize, int axisSize)
+        {
+            OuterSize = outerSize;
+            AxisSize = axisSize;
+        }
+
+        public bool Equals(SoftmaxKey other) =>
+            OuterSize == other.OuterSize && AxisSize == other.AxisSize;
+
+        public override bool Equals(object? obj) => obj is SoftmaxKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(OuterSize, AxisSize);
+    }
+
+    /// <summary>
+    /// Cached softmax primitive with source and destination memory objects.
+    /// </summary>
+    private sealed class CachedSoftmax : IDisposable
+    {
+        public IntPtr Primitive;
+        public IntPtr PrimDesc;
+        public IntPtr SrcDesc;
+        public IntPtr DstDesc;
+        public IntPtr SrcMem;
+        public IntPtr DstMem;
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (SrcMem != IntPtr.Zero) dnnl_memory_destroy(SrcMem);
+            if (DstMem != IntPtr.Zero) dnnl_memory_destroy(DstMem);
+            if (Primitive != IntPtr.Zero) dnnl_primitive_destroy(Primitive);
+            if (PrimDesc != IntPtr.Zero) dnnl_primitive_desc_destroy(PrimDesc);
+            if (SrcDesc != IntPtr.Zero) dnnl_memory_desc_destroy(SrcDesc);
+            if (DstDesc != IntPtr.Zero) dnnl_memory_desc_destroy(DstDesc);
+        }
+    }
+
     #endregion
 
     #region P/Invoke Declarations
@@ -554,6 +608,17 @@ internal static class OneDnnProvider
         IntPtr src0Desc,
         IntPtr src1Desc,
         IntPtr dstDesc,
+        IntPtr attr);
+
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe int dnnl_softmax_forward_primitive_desc_create(
+        out IntPtr primitiveDesc,
+        IntPtr engine,
+        int propKind,
+        int algorithm,
+        IntPtr srcDesc,
+        IntPtr dstDesc,
+        int softmaxAxis,
         IntPtr attr);
 
     #endregion
@@ -912,6 +977,149 @@ internal static class OneDnnProvider
     internal static unsafe bool TryMultiply(float* src0, float* src1, float* dst, int length)
     {
         return TryBinary(src0, src1, dst, length, DnnlBinaryMul);
+    }
+
+    /// <summary>
+    /// Performs softmax using oneDNN's fused SVML-accelerated implementation.
+    /// oneDNN softmax is a single fused primitive — max, subtract, exp, sum, divide are all
+    /// computed in 2 optimized passes with inlined SVML exp. This matches or beats TorchSharp's
+    /// libtorch softmax which uses the same oneDNN/MKLDNN backend.
+    /// </summary>
+    /// <param name="input">Source data pointer (not modified).</param>
+    /// <param name="output">Destination data pointer (receives softmax output).</param>
+    /// <param name="outerSize">Number of independent softmax rows (batch * spatial).</param>
+    /// <param name="axisSize">Size of the softmax axis (number of classes).</param>
+    internal static unsafe bool TrySoftmax(float* input, float* output, int outerSize, int axisSize)
+    {
+        if (!EnsureInitialized())
+            return false;
+
+        var key = new SoftmaxKey(outerSize, axisSize);
+        CachedSoftmax? cached = null;
+
+        _softmaxCacheLock.EnterReadLock();
+        try
+        {
+            if (_softmaxCache.TryGetValue(key, out cached))
+                return ExecuteSoftmaxOperation(cached, input, output);
+        }
+        finally
+        {
+            _softmaxCacheLock.ExitReadLock();
+        }
+
+        _softmaxCacheLock.EnterWriteLock();
+        try
+        {
+            if (!_softmaxCache.TryGetValue(key, out cached))
+            {
+                cached = CreateSoftmaxPrimitive(outerSize, axisSize);
+                if (cached == null)
+                    return false;
+
+                _softmaxCache[key] = cached;
+
+                if (_softmaxCache.Count > MaxSoftmaxCacheSize)
+                {
+                    foreach (var k in _softmaxCache.Keys)
+                    {
+                        if (!k.Equals(key) && _softmaxCache.TryRemove(k, out var removed))
+                        {
+                            removed.Dispose();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return ExecuteSoftmaxOperation(cached, input, output);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            _softmaxCacheLock.ExitWriteLock();
+        }
+    }
+
+    private static unsafe bool ExecuteSoftmaxOperation(CachedSoftmax cached, float* src, float* dst)
+    {
+        try
+        {
+            int status = dnnl_memory_set_data_handle(cached.SrcMem, (IntPtr)src);
+            if (status != DnnlSuccess) return false;
+
+            status = dnnl_memory_set_data_handle(cached.DstMem, (IntPtr)dst);
+            if (status != DnnlSuccess) return false;
+
+            DnnlExecArg* args = stackalloc DnnlExecArg[2];
+            args[0].Arg = DnnlArgSrc;
+            args[0].Memory = cached.SrcMem;
+            args[1].Arg = DnnlArgDst;
+            args[1].Memory = cached.DstMem;
+
+            status = dnnl_primitive_execute(cached.Primitive, _stream, 2, args);
+            if (status != DnnlSuccess) return false;
+
+            dnnl_stream_wait(_stream);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static unsafe CachedSoftmax? CreateSoftmaxPrimitive(int outerSize, int axisSize)
+    {
+        var cached = new CachedSoftmax();
+
+        try
+        {
+            // Create 2D memory descriptor: [outerSize, axisSize]
+            // Softmax is applied along axis 1 (the axisSize dimension)
+            long* dims = stackalloc long[2];
+            dims[0] = outerSize;
+            dims[1] = axisSize;
+
+            long* strides = stackalloc long[2];
+            strides[0] = axisSize; // row-major: stride for dim 0 = axisSize
+            strides[1] = 1;       // stride for dim 1 = 1
+
+            int status = dnnl_memory_desc_create_with_strides(
+                out cached.SrcDesc, 2, dims, DnnlF32, strides);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            status = dnnl_memory_desc_create_with_strides(
+                out cached.DstDesc, 2, dims, DnnlF32, strides);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            // Create softmax primitive descriptor — axis=1 (softmax along the class dimension)
+            status = dnnl_softmax_forward_primitive_desc_create(
+                out cached.PrimDesc, _engine, DnnlForwardInference, DnnlSoftmaxAccurate,
+                cached.SrcDesc, cached.DstDesc, 1, IntPtr.Zero);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            // Create primitive
+            status = dnnl_primitive_create(out cached.Primitive, cached.PrimDesc);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            // Create memory objects with null handle
+            status = dnnl_memory_create(out cached.SrcMem, cached.SrcDesc, _engine, IntPtr.Zero);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            status = dnnl_memory_create(out cached.DstMem, cached.DstDesc, _engine, IntPtr.Zero);
+            if (status != DnnlSuccess) { cached.Dispose(); return null; }
+
+            return cached;
+        }
+        catch
+        {
+            cached.Dispose();
+            return null;
+        }
     }
 
     /// <summary>

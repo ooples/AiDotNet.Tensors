@@ -4909,6 +4909,13 @@ namespace AiDotNet.Tensors.Engines.Simd
             fixed (float* pIn = input)
             fixed (float* pOut = output)
             {
+#if NET5_0_OR_GREATER
+                // oneDNN path: fused SVML-accelerated softmax in a single call.
+                // Processes ALL rows in one primitive execution (2 optimized passes).
+                if (OneDnnProvider.TrySoftmax(pIn, pOut, outerSize, axisSize))
+                    return;
+#endif
+
                 for (int row = 0; row < outerSize; row++)
                 {
                     float* rowIn = pIn + row * axisSize;

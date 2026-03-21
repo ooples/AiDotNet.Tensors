@@ -9657,6 +9657,13 @@ public class CpuEngine : ITensorLevelEngine
     private static unsafe void SoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
         {
+#if NET5_0_OR_GREATER
+            // oneDNN path: fused SVML-accelerated softmax — processes all rows in one call.
+            // This matches TorchSharp's libtorch which uses the same MKLDNN backend.
+            if (OneDnnProvider.TrySoftmax(pIn, pOut, outerSize, axisSize))
+                return;
+#endif
+
             int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
             bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
 
