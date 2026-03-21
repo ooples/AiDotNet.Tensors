@@ -3188,9 +3188,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                 throw new ArgumentException("Input and output spans must have the same length.");
 
             int length = input.Length;
-            int i = 0;
 
-            // Scalar Math.Log is fastest for double
+#if NET5_0_OR_GREATER
+            // VML double via vmdLn (mode-per-call, VML_EP guaranteed).
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
+            {
+                if (VmlProvider.TryLn(pIn, pOut, length))
+                    return;
+            }
+#endif
+
+            int i = 0;
             int unrolled = length & ~3;
             for (; i < unrolled; i += 4)
             {
