@@ -46,11 +46,9 @@ internal static class OneDnnProvider
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool SetDllDirectory(string lpPathName);
 
-    // Static constructor to register the native library resolver
-    static OneDnnProvider()
-    {
-        RegisterDllResolver();
-    }
+    // No static constructor — registration is lazy in EnsureInitialized().
+    // Previous static constructor caused BenchmarkDotNet to hang because SetDllImportResolver
+    // ran during type validation in the isolated benchmark process.
 
     private static void RegisterDllResolver()
     {
@@ -61,34 +59,31 @@ internal static class OneDnnProvider
         {
             NativeLibrary.SetDllImportResolver(typeof(OneDnnProvider).Assembly, (libraryName, assembly, searchPath) =>
             {
-            if (libraryName != "dnnl")
-            {
+                if (libraryName != "dnnl")
+                    return IntPtr.Zero;
+
+                // Try NuGet runtime native directory first (where AiDotNet.Native.OneDNN puts dnnl.dll)
+                string? assemblyDir = Path.GetDirectoryName(assembly.Location);
+                if (assemblyDir is not null)
+                {
+                    var handle = TryLoadFromDirectory(assemblyDir);
+                    if (handle != IntPtr.Zero) return handle;
+                }
+
+                // Try AppContext.BaseDirectory
+                var handle2 = TryLoadFromDirectory(AppContext.BaseDirectory);
+                if (handle2 != IntPtr.Zero) return handle2;
+
+                // Try NativeLibrary.TryLoad with default search
+                if (NativeLibrary.TryLoad("dnnl", out var defaultHandle))
+                    return defaultHandle;
+
                 return IntPtr.Zero;
-            }
-
-            // Try to load from the application directory first
-            string? assemblyDir = Path.GetDirectoryName(assembly.Location);
-            if (assemblyDir != null)
-            {
-                return TryLoadFromDirectory(assemblyDir);
-            }
-
-            // Try AppContext.BaseDirectory
-            string baseDir = AppContext.BaseDirectory;
-            var handle = TryLoadFromDirectory(baseDir);
-            if (handle != IntPtr.Zero) return handle;
-
-            // Try current directory
-            handle = TryLoadFromDirectory(Environment.CurrentDirectory);
-            if (handle != IntPtr.Zero) return handle;
-
-            return IntPtr.Zero;
-        });
+            });
         }
         catch (InvalidOperationException)
         {
-            // A DllImportResolver is already registered for this assembly (e.g., by OpenBLAS provider).
-            // This is non-fatal — oneDNN will fall back to default library search.
+            // Resolver already registered — non-fatal, use default library search.
         }
     }
 
@@ -1570,15 +1565,23 @@ internal static class OneDnnProvider
     private static bool EnsureInitialized()
     {
         if (_initialized)
-        {
             return _available;
-        }
 
         lock (InitLock)
         {
             if (_initialized)
-            {
                 return _available;
+
+            // Register resolver lazily (not in static constructor to avoid BenchmarkDotNet hang)
+            RegisterDllResolver();
+
+            // Pre-check: try to load dnnl.dll to avoid P/Invoke hang when dll is missing
+            if (!NativeLibrary.TryLoad("dnnl", typeof(OneDnnProvider).Assembly, null, out _))
+            {
+                Trace("[oneDNN] dnnl.dll not found — oneDNN disabled");
+                _initialized = true;
+                _available = false;
+                return false;
             }
 
             _available = TryInitialize();

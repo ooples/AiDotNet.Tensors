@@ -58,19 +58,14 @@ internal static class VmlProvider
     }
 
     /// <summary>
-    /// Computes element-wise exp(x) for double using MKL VML.
+    /// Double VML permanently disabled — vdExp is unreliable on MKL 2022.
+    /// VML_LA mode doesn't persist (reverts to VML_HA = 600x slower).
+    /// Use FastExpDouble256 polynomial instead (reliable ~1.3ms for 1M doubles).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryExp(double* input, double* output, int length)
     {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vdExp == null) return false;
-        EnforceVmlLaMode();
-        _vdExp(length, input, output);
-        return true;
-#else
         return false;
-#endif
     }
 
     /// <summary>
@@ -91,17 +86,11 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise ln(x) for double using MKL VML.
     /// </summary>
+    /// <summary>Double VML permanently disabled — see TryExp(double) comment.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryLn(double* input, double* output, int length)
     {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vdLn == null) return false;
-        EnforceVmlLaMode();
-        _vdLn(length, input, output);
-        return true;
-#else
         return false;
-#endif
     }
 
     /// <summary>
@@ -122,17 +111,11 @@ internal static class VmlProvider
     /// <summary>
     /// Computes element-wise tanh(x) for double using MKL VML.
     /// </summary>
+    /// <summary>Double VML permanently disabled — see TryExp(double) comment.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool TryTanh(double* input, double* output, int length)
     {
-#if NET5_0_OR_GREATER
-        if (!EnsureInitialized() || _vdTanh == null) return false;
-        EnforceVmlLaMode();
-        _vdTanh(length, input, output);
-        return true;
-#else
         return false;
-#endif
     }
 
     /// <summary>
