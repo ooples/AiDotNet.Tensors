@@ -9510,9 +9510,9 @@ public class CpuEngine : ITensorLevelEngine
     /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
     /// and parallelizes across batch*groups using PersistentParallelExecutor.
     /// </summary>
-    private unsafe void GroupNormFloat(
-        float[] inputData, float[] outputData,
-        float[] gammaData, float[] betaData,
+    private unsafe void GroupNormFloatPtr(
+        float* inputData, float* outputData,
+        float* gammaData, float* betaData,
         int batch, int channels, int spatialSize, int numGroups, int channelsPerGroup,
         float eps, out float[] meanArr, out float[] varArr)
     {
@@ -9543,22 +9543,27 @@ public class CpuEngine : ITensorLevelEngine
                     int startChannel = g * channelsPerGroup;
                     int batchOffset = b * channels * spatialSize;
 
-                    // SIMD-accelerated mean computation
+                    // Mean computation (pointer-based for NativeMemory compat)
                     float sum = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        sum += SimdSumFloat(inputData, chanOff, spatialSize);
+                        for (int s = 0; s < spatialSize; s++)
+                            sum += inputData[chanOff + s];
                     }
                     float groupMean = sum / groupSize;
                     meanLocal[idx] = groupMean;
 
-                    // SIMD-accelerated variance computation
+                    // Variance computation (pointer-based)
                     float sumSq = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        sumSq += SimdSumSquaredDiffFloat(inputData, chanOff, spatialSize, groupMean);
+                        for (int s = 0; s < spatialSize; s++)
+                        {
+                            float diff = inputData[chanOff + s] - groupMean;
+                            sumSq += diff * diff;
+                        }
                     }
                     float groupVar = sumSq / groupSize;
                     varLocal[idx] = groupVar;
@@ -11032,27 +11037,28 @@ public class CpuEngine : ITensorLevelEngine
 
         int groupSize = channelsPerGroup * spatialSize;  // Elements per group
 
-        // Fast float path: direct float operations, PersistentParallelExecutor, TensorAllocator.Rent
+        // Fast float path: Pin() for NativeMemory compatibility
         if (typeof(T) == typeof(float))
         {
             var result = TensorAllocator.Rent<T>(input.Shape);
-            var inputArr = input.GetDataArray();
-            var outputArr = result.GetDataArray();
-            var gammaArr = gamma.GetDataArray();
-            var betaArr = beta.GetDataArray();
-            var floatIn = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref inputArr);
-            var floatOut = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref outputArr);
-            var floatGamma = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref gammaArr);
-            var floatBeta = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref betaArr);
-            GroupNormFloat(
-                floatIn, floatOut, floatGamma, floatBeta,
-                batch, channels, spatialSize, numGroups, channelsPerGroup,
-                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
-                out var meanArr, out var varArr);
-            mean = new Tensor<T>(new[] { batch, numGroups },
-                new Vector<T>((T[])(object)meanArr));
-            variance = new Tensor<T>(new[] { batch, numGroups },
-                new Vector<T>((T[])(object)varArr));
+            // Pin all memory to get float* pointers (works with both managed and NativeMemory)
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            using var pinGamma = gamma.Data.Pin();
+            using var pinBeta = beta.Data.Pin();
+            unsafe
+            {
+                GroupNormFloatPtr(
+                    (float*)pinIn.Pointer, (float*)pinOut.Pointer,
+                    (float*)pinGamma.Pointer, (float*)pinBeta.Pointer,
+                    batch, channels, spatialSize, numGroups, channelsPerGroup,
+                    System.Runtime.CompilerServices.Unsafe.As<T, float>(ref eps),
+                    out var meanArr, out var varArr);
+                mean = new Tensor<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)meanArr));
+                variance = new Tensor<T>(new[] { batch, numGroups },
+                    new Vector<T>((T[])(object)varArr));
+            }
             return result;
         }
 
@@ -16345,11 +16351,14 @@ public class CpuEngine : ITensorLevelEngine
         // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var inputFloats = (float[])(object)tensor.GetDataArray();
-            // Use TensorAllocator.Rent to get pooled output — avoids 2MB GC allocation per call
+            // Use Pin() for NativeMemory compatibility
             var result = TensorAllocator.Rent<T>(tensor.Shape);
-            var outputFloats = (float[])(object)result.GetDataArray();
-            LogSoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
+            using var pinIn = tensor.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
             return result;
         }
 
@@ -16398,31 +16407,35 @@ public class CpuEngine : ITensorLevelEngine
     /// Fast SIMD log_softmax for float arrays on last axis.
     /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
     /// </summary>
-    private static unsafe void LogSoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    /// <summary>Pointer-based log-softmax — works with both managed and NativeMemory.</summary>
+    private static unsafe void LogSoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
-        // Delegate to SimdKernels.LogSoftmaxRowUnsafe which has inline FastExp256
-        // (computes exp+sum in a single fused pass — no temp buffer needed).
-        fixed (float* pIn = inputFloats)
-        fixed (float* pOut = outputFloats)
-        {
-            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-            bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
+        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
 
-            if (useParallel)
+        if (useParallel)
+        {
+            float* pInCap = pIn;
+            float* pOutCap = pOut;
+            int axisSz = axisSize;
+            int outerSz = outerSize;
+            int numChunks = Math.Min(maxThreads, outerSize);
+            int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
+
+            PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
             {
-                IntPtr ipIn = (IntPtr)pIn;
-                IntPtr ipOut = (IntPtr)pOut;
-                int axisSz = axisSize;
-                Parallel.For(0, outerSize, new ParallelOptions { MaxDegreeOfParallelism = maxThreads }, row =>
+                int startRow = chunk * rowsPerChunk;
+                int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
+                for (int row = startRow; row < endRow; row++)
                 {
-                    SimdKernels.LogSoftmaxRowUnsafe((float*)ipIn + row * axisSz, (float*)ipOut + row * axisSz, axisSz);
-                });
-            }
-            else
-            {
-                for (int row = 0; row < outerSize; row++)
-                    SimdKernels.LogSoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
-            }
+                    SimdKernels.LogSoftmaxRowUnsafe(pInCap + row * axisSz, pOutCap + row * axisSz, axisSz);
+                }
+            });
+        }
+        else
+        {
+            for (int row = 0; row < outerSize; row++)
+                SimdKernels.LogSoftmaxRowUnsafe(pIn + row * axisSize, pOut + row * axisSize, axisSize);
         }
     }
 
