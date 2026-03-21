@@ -2592,8 +2592,8 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a.Shape, b.Shape))
         {
-            throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+            // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
+            return TensorBroadcastMultiply(a, b);
         }
 
         var result = TensorAllocator.Rent<T>(a.Shape);
