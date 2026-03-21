@@ -10495,13 +10495,112 @@ public class CpuEngine : ITensorLevelEngine
         float[] meanOut, float[] varOut, float[] output)
     {
         {
-            // Pass 1: Mean with SIMD accumulation
-            float sum = 0f;
 #if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
+            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 32)
             {
-                fixed (float* inp = input)
+                // Pin once for all 3 passes — avoids per-pass pinning overhead
+                fixed (float* inp = input, outp = output)
                 {
+                    // Pass 1: Mean with 4x unrolled SIMD accumulation
+                    float sum = 0f;
+                    var vsum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsum3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* ptr = inp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
+                            vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8));
+                            vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16));
+                            vsum3 = System.Runtime.Intrinsics.X86.Avx.Add(vsum3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24));
+                        }
+                        for (; s < spatialSize; s++)
+                            sum += ptr[s];
+                    }
+                    vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsum0, vsum1), System.Runtime.Intrinsics.X86.Avx.Add(vsum2, vsum3));
+                    sum += SimdKernels.HorizontalSum(vsum0);
+
+                    float channelMean = sum * invCount;
+                    meanOut[c] = channelMean;
+
+                    // Pass 2: Variance with 4x unrolled FMA
+                    float sumSq = 0f;
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
+                    var vsq0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    var vsq3 = System.Runtime.Intrinsics.Vector256<float>.Zero;
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* ptr = inp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
+                            var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 8), vmean);
+                            var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 16), vmean);
+                            var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s + 24), vmean);
+                            vsq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, vsq0);
+                            vsq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, vsq1);
+                            vsq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, d2, vsq2);
+                            vsq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, d3, vsq3);
+                        }
+                        for (; s < spatialSize; s++)
+                        {
+                            float diff = ptr[s] - channelMean;
+                            sumSq += diff * diff;
+                        }
+                    }
+                    vsq0 = System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Add(vsq0, vsq1), System.Runtime.Intrinsics.X86.Avx.Add(vsq2, vsq3));
+                    sumSq += SimdKernels.HorizontalSum(vsq0);
+
+                    float channelVar = sumSq * invCount;
+                    varOut[c] = channelVar;
+                    float invStd = 1f / MathF.Sqrt(channelVar + eps);
+                    float g = gamma[c];
+                    float b = beta[c];
+
+                    // Pass 3: Normalize with 4x unrolled FMA: output = gamma * (x - mean) * invStd + beta
+                    var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                    var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
+                    for (int n = 0; n < batch; n++)
+                    {
+                        int offset = n * channels * spatialSize + c * spatialSize;
+                        float* pi = inp + offset;
+                        float* po = outp + offset;
+                        int s = 0;
+                        int simdLen = spatialSize & ~31;
+                        for (; s < simdLen; s += 32)
+                        {
+                            var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
+                            var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 8), vmean);
+                            var d2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 16), vmean);
+                            var d3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s + 24), vmean);
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 8, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 16, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d2, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s + 24, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d3, vscale, vbias));
+                        }
+                        for (; s < spatialSize; s++)
+                            outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
+                    }
+                }
+                return;
+            }
+            else if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
+            {
+                fixed (float* inp = input, outp = output)
+                {
+                    // Pass 1: Mean
+                    float sum = 0f;
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10511,43 +10610,16 @@ public class CpuEngine : ITensorLevelEngine
                         int simdLen = spatialSize & ~7;
                         for (; s < simdLen; s += 8)
                             vsum = System.Runtime.Intrinsics.X86.Avx.Add(vsum, System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s));
-                        // Horizontal sum
-                        var hi128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum, 1);
-                        var lo128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum, 0);
-                        var s128 = System.Runtime.Intrinsics.X86.Sse.Add(lo128, hi128);
-                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_01_00_11_10);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_10_11_00_01);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        float partialSum;
-                        System.Runtime.Intrinsics.X86.Sse.StoreScalar(&partialSum, s128);
-                        sum += partialSum;
+                        sum += SimdKernels.HorizontalSum(vsum);
                         for (; s < spatialSize; s++)
                             sum += ptr[s];
                     }
-                }
-            }
-            else
-#endif
-            {
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spatialSize + c * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                        sum += input[offset + s];
-                }
-            }
-            float channelMean = sum * invCount;
-            meanOut[c] = channelMean;
+                    float channelMean = sum * invCount;
+                    meanOut[c] = channelMean;
 
-            // Pass 2: Variance + Pass 3: Normalize (fused)
-            float sumSq = 0f;
-#if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && spatialSize >= 8)
-            {
-                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
-                fixed (float* inp = input)
-                {
+                    // Pass 2: Variance
+                    float sumSq = 0f;
+                    var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10558,54 +10630,24 @@ public class CpuEngine : ITensorLevelEngine
                         for (; s < simdLen; s += 8)
                         {
                             var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ptr + s), vmean);
-                            vsumSq = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(diff, diff, vsumSq);
+                            vsumSq = System.Runtime.Intrinsics.X86.Avx.Add(vsumSq, System.Runtime.Intrinsics.X86.Avx.Multiply(diff, diff));
                         }
-                        var hi128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsumSq, 1);
-                        var lo128 = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsumSq, 0);
-                        var s128 = System.Runtime.Intrinsics.X86.Sse.Add(lo128, hi128);
-                        var shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_01_00_11_10);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        shuf = System.Runtime.Intrinsics.X86.Sse.Shuffle(s128, s128, 0b_10_11_00_01);
-                        s128 = System.Runtime.Intrinsics.X86.Sse.Add(s128, shuf);
-                        float partialSumSq;
-                        System.Runtime.Intrinsics.X86.Sse.StoreScalar(&partialSumSq, s128);
-                        sumSq += partialSumSq;
+                        sumSq += SimdKernels.HorizontalSum(vsumSq);
                         for (; s < spatialSize; s++)
                         {
-                            float diff = inp[offset + s] - channelMean;
+                            float diff = ptr[s] - channelMean;
                             sumSq += diff * diff;
                         }
                     }
-                }
-            }
-            else
-#endif
-            {
-                for (int n = 0; n < batch; n++)
-                {
-                    int offset = n * channels * spatialSize + c * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
-                    {
-                        float diff = input[offset + s] - channelMean;
-                        sumSq += diff * diff;
-                    }
-                }
-            }
-            float channelVar = sumSq * invCount;
-            varOut[c] = channelVar;
-            float invStd = 1f / MathF.Sqrt(channelVar + eps);
-            float g = gamma[c];
-            float b = beta[c];
+                    float channelVar = sumSq * invCount;
+                    varOut[c] = channelVar;
+                    float invStd = 1f / MathF.Sqrt(channelVar + eps);
+                    float g = gamma[c];
+                    float b = beta[c];
 
-            // Pass 3: Normalize with SIMD: output = gamma * (x - mean) * invStd + beta
-#if NET5_0_OR_GREATER
-            if (System.Runtime.Intrinsics.X86.Fma.IsSupported && spatialSize >= 8)
-            {
-                var vmean = System.Runtime.Intrinsics.Vector256.Create(channelMean);
-                var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
-                var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
-                fixed (float* inp = input, outp = output)
-                {
+                    // Pass 3: Normalize
+                    var vscale = System.Runtime.Intrinsics.Vector256.Create(g * invStd);
+                    var vbias = System.Runtime.Intrinsics.Vector256.Create(b);
                     for (int n = 0; n < batch; n++)
                     {
                         int offset = n * channels * spatialSize + c * spatialSize;
@@ -10616,16 +10658,50 @@ public class CpuEngine : ITensorLevelEngine
                         for (; s < simdLen; s += 8)
                         {
                             var diff = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(pi + s), vmean);
-                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(diff, vscale, vbias));
+                            System.Runtime.Intrinsics.X86.Avx.Store(po + s, System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Multiply(diff, vscale), vbias));
                         }
                         for (; s < spatialSize; s++)
-                            output[offset + s] = g * (input[offset + s] - channelMean) * invStd + b;
+                            outp[offset + s] = g * (inp[offset + s] - channelMean) * invStd + b;
                     }
                 }
+                return;
             }
-            else
 #endif
+            // Scalar fallback
             {
+                // Pass 1: Mean
+                float sum = 0f;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                        sum += input[offset + s];
+                }
+                float channelMean = sum * invCount;
+                meanOut[c] = channelMean;
+
+                // Pass 2: Variance
+                float sumSq = 0f;
+                for (int n = 0; n < batch; n++)
+                {
+                    int offset = n * channels * spatialSize + c * spatialSize;
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        float diff = input[offset + s] - channelMean;
+                        sumSq += diff * diff;
+                    }
+                }
+                float channelVar = sumSq * invCount;
+                varOut[c] = channelVar;
+#if NET5_0_OR_GREATER
+                float invStd = 1f / MathF.Sqrt(channelVar + eps);
+#else
+                float invStd = 1f / (float)Math.Sqrt(channelVar + eps);
+#endif
+                float g = gamma[c];
+                float b = beta[c];
+
+                // Pass 3: Normalize
                 for (int n = 0; n < batch; n++)
                 {
                     int offset = n * channels * spatialSize + c * spatialSize;
