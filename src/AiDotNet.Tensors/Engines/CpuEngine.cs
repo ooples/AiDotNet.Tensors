@@ -2405,11 +2405,13 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var inputArr = input.GetDataArray();
-            var outputArr = destination.GetDataArray();
-            var floatIn = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref inputArr);
-            var floatOut = System.Runtime.CompilerServices.Unsafe.As<T[], float[]>(ref outputArr);
-            SoftmaxFloatFast(floatIn, floatOut, outerSize, axisSize);
+            // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
+            using var pinIn = input.Data.Pin();
+            using var pinOut = destination.Data.Pin();
+            unsafe
+            {
+                SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
             return;
         }
 
@@ -9447,11 +9449,14 @@ public class CpuEngine : ITensorLevelEngine
         // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var inputFloats = (float[])(object)input.GetDataArray();
-            // Use TensorAllocator.Rent to get pooled output — avoids 2MB GC allocation per call
+            // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
             var result = TensorAllocator.Rent<T>(input.Shape);
-            var outputFloats = (float[])(object)result.GetDataArray();
-            SoftmaxFloatFast(inputFloats, outputFloats, outerSize, axisSize);
+            using var pinIn = input.Data.Pin();
+            using var pinOut = result.Data.Pin();
+            unsafe
+            {
+                SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
+            }
             return result;
         }
 
@@ -9643,13 +9648,9 @@ public class CpuEngine : ITensorLevelEngine
         return sumSq;
     }
 
-    private static unsafe void SoftmaxFloatFast(float[] inputFloats, float[] outputFloats, int outerSize, int axisSize)
+    /// <summary>Pointer-based softmax — works with both managed arrays and NativeMemory.</summary>
+    private static unsafe void SoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
-        // Delegate to SimdKernels.SoftmaxRowUnsafe which has inline FastExp256
-        // (no function call overhead per row — exp is computed inline with AVX2/FMA).
-        // Parallel dispatch across rows for large workloads.
-        fixed (float* pIn = inputFloats)
-        fixed (float* pOut = outputFloats)
         {
             int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
             bool useParallel = outerSize >= 4 && outerSize * axisSize >= 32768;
