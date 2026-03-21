@@ -993,50 +993,16 @@ public class DoubleOperations : INumericOperations<double>
     /// </summary>
     public unsafe void Exp(ReadOnlySpan<double> x, Span<double> destination)
     {
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (double* xPtr = x)
-            fixed (double* destPtr = destination)
-            {
-                double* xp = xPtr;
-                double* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    Engines.Simd.SimdKernels.Exp(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new Span<double>(dp + start, count));
-                });
-            }
-            return;
-        }
+        // Call SimdKernels.Exp for the FULL array — VML (vmdExp) internally parallelizes.
+        // Chunking caused per-chunk VML cold-start overhead.
         Engines.Simd.SimdKernels.Exp(x, destination);
     }
 
     /// <summary>
-    /// Computes natural logarithm with parallel processing for large arrays.
+    /// Computes natural logarithm using VML-accelerated SimdKernels.
     /// </summary>
     public unsafe void Log(ReadOnlySpan<double> x, Span<double> destination)
     {
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (double* xPtr = x)
-            fixed (double* destPtr = destination)
-            {
-                double* xp = xPtr;
-                double* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    Engines.Simd.SimdKernels.Log(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new Span<double>(dp + start, count));
-                });
-            }
-            return;
-        }
         Engines.Simd.SimdKernels.Log(x, destination);
     }
 
@@ -1045,24 +1011,9 @@ public class DoubleOperations : INumericOperations<double>
     /// </summary>
     public unsafe void Tanh(ReadOnlySpan<double> x, Span<double> destination)
     {
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (double* xPtr = x)
-            fixed (double* destPtr = destination)
-            {
-                double* xp = xPtr;
-                double* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    Engines.Simd.SimdKernels.Tanh(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new Span<double>(dp + start, count));
-                });
-            }
-            return;
-        }
+        // Call SimdKernels.Tanh for the FULL array — VML internally parallelizes.
+        // Previous approach split into chunks via ParallelForChunks, causing
+        // per-chunk VML cold-start overhead (9ms × N chunks = catastrophic).
         Engines.Simd.SimdKernels.Tanh(x, destination);
     }
 
@@ -1071,24 +1022,7 @@ public class DoubleOperations : INumericOperations<double>
     /// </summary>
     public unsafe void Sigmoid(ReadOnlySpan<double> x, Span<double> destination)
     {
-        int length = x.Length;
-        if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1 &&
-            destination.Length >= length)
-        {
-            fixed (double* xPtr = x)
-            fixed (double* destPtr = destination)
-            {
-                double* xp = xPtr;
-                double* dp = destPtr;
-                ParallelForChunks(length, MinChunkSize, (start, count) =>
-                {
-                    Engines.Simd.SimdKernels.Sigmoid(
-                        new ReadOnlySpan<double>(xp + start, count),
-                        new Span<double>(dp + start, count));
-                });
-            }
-            return;
-        }
+        // Call SimdKernels.Sigmoid for the FULL array — VML internally parallelizes.
         Engines.Simd.SimdKernels.Sigmoid(x, destination);
     }
 
