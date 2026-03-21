@@ -457,6 +457,12 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void TanhUnsafe(float* input, float* output, int length)
         {
+#if NET5_0_OR_GREATER
+            // MKL VML path: SVML tanh, zero-overhead function pointer
+            if (VmlProvider.TryTanh(input, output, length))
+                return;
+#endif
+
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
@@ -1663,7 +1669,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes element-wise tanh for double precision.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void Tanh(ReadOnlySpan<double> input, Span<double> output)
+        public static unsafe void Tanh(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
             {
@@ -1671,6 +1677,17 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
 
             int length = input.Length;
+
+#if NET5_0_OR_GREATER
+            // MKL VML path: SVML tanh
+            fixed (double* pIn = input)
+            fixed (double* pOut = output)
+            {
+                if (VmlProvider.TryTanh(pIn, pOut, length))
+                    return;
+            }
+#endif
+
             int i = 0;
 
 #if NET5_0_OR_GREATER
