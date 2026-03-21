@@ -5045,6 +5045,96 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 #endif
 
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// VML-accelerated log-softmax: max → subtract → VML exp → sum → log(sum) → subtract.
+        /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
+        /// </summary>
+        private static unsafe bool LogSoftmaxRowVml(float* input, float* output, int length)
+        {
+            // Pass 1: Find max
+            float maxVal = float.NegativeInfinity;
+            int j = 0;
+            var vm0 = Vector256.Create(float.NegativeInfinity);
+            var vm1 = vm0; var vm2 = vm0; var vm3 = vm0;
+            int simdLen = length & ~31;
+            for (; j < simdLen; j += 32)
+            {
+                vm0 = Avx.Max(vm0, Avx.LoadVector256(input + j));
+                vm1 = Avx.Max(vm1, Avx.LoadVector256(input + j + 8));
+                vm2 = Avx.Max(vm2, Avx.LoadVector256(input + j + 16));
+                vm3 = Avx.Max(vm3, Avx.LoadVector256(input + j + 24));
+            }
+            vm0 = Avx.Max(Avx.Max(vm0, vm1), Avx.Max(vm2, vm3));
+            maxVal = HorizontalMax(vm0);
+            for (; j < length; j++)
+                if (input[j] > maxVal) maxVal = input[j];
+
+            // Pass 2: output = input - max
+            j = 0;
+            var vmaxBc = Vector256.Create(maxVal);
+            for (; j < simdLen; j += 32)
+            {
+                Avx.Store(output + j, Avx.Subtract(Avx.LoadVector256(input + j), vmaxBc));
+                Avx.Store(output + j + 8, Avx.Subtract(Avx.LoadVector256(input + j + 8), vmaxBc));
+                Avx.Store(output + j + 16, Avx.Subtract(Avx.LoadVector256(input + j + 16), vmaxBc));
+                Avx.Store(output + j + 24, Avx.Subtract(Avx.LoadVector256(input + j + 24), vmaxBc));
+            }
+            for (; j < length; j++)
+                output[j] = input[j] - maxVal;
+
+            // We need exp(output) for the sum, but we want to keep output = (x - max).
+            // Use a temp buffer via stackalloc for small, or compute exp sum from VML in-place then restore.
+            // Strategy: compute sum(exp(output)) using VML exp on a temp, then subtract log(sum) from output.
+            // For simplicity: use the existing output as temp, compute exp, sum, then rewrite as (x-max)-log(sum).
+
+            // Actually, simpler: we already have output = (x - max). We need sum(exp(output)).
+            // We can't use VML in-place without losing the shifted values.
+            // Instead: use VML on a copy, or compute exp+sum without storing.
+            // Best approach: compute VML exp into output, sum it, then rewrite output as (x-max) - log(sum).
+
+            // Step A: Save shifted values will be recomputed from log(sum) subtraction
+            // VML exp in-place on output
+            if (!VmlProvider.TryExp(output, output, length))
+                return false;
+
+            // Step B: Sum the exp values
+            float sumExp = 0f;
+            j = 0;
+            var vs0 = Vector256<float>.Zero;
+            var vs1 = Vector256<float>.Zero;
+            var vs2 = Vector256<float>.Zero;
+            var vs3 = Vector256<float>.Zero;
+            for (; j < simdLen; j += 32)
+            {
+                vs0 = Avx.Add(vs0, Avx.LoadVector256(output + j));
+                vs1 = Avx.Add(vs1, Avx.LoadVector256(output + j + 8));
+                vs2 = Avx.Add(vs2, Avx.LoadVector256(output + j + 16));
+                vs3 = Avx.Add(vs3, Avx.LoadVector256(output + j + 24));
+            }
+            vs0 = Avx.Add(Avx.Add(vs0, vs1), Avx.Add(vs2, vs3));
+            sumExp = HorizontalSum(vs0);
+            for (; j < length; j++)
+                sumExp += output[j];
+
+            // Step C: output = (x - max) - log(sum) = input - max - log(sum)
+            float logSumExp = MathF.Log(sumExp);
+            float maxPlusLog = maxVal + logSumExp;
+            j = 0;
+            var vMPL = Vector256.Create(maxPlusLog);
+            for (; j < simdLen; j += 32)
+            {
+                Avx.Store(output + j, Avx.Subtract(Avx.LoadVector256(input + j), vMPL));
+                Avx.Store(output + j + 8, Avx.Subtract(Avx.LoadVector256(input + j + 8), vMPL));
+                Avx.Store(output + j + 16, Avx.Subtract(Avx.LoadVector256(input + j + 16), vMPL));
+                Avx.Store(output + j + 24, Avx.Subtract(Avx.LoadVector256(input + j + 24), vMPL));
+            }
+            for (; j < length; j++)
+                output[j] = input[j] - maxPlusLog;
+            return true;
+        }
+#endif
+
         private static unsafe void SoftmaxRowSmall(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -5152,6 +5242,15 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static unsafe void LogSoftmaxRowUnsafe(float* input, float* output, int length)
         {
+#if NET5_0_OR_GREATER
+            // VML fast path: SIMD max → SIMD subtract → VML exp → SIMD sum → log → SIMD subtract
+            if (VmlProvider.IsAvailable && Avx.IsSupported && length >= 32)
+            {
+                if (LogSoftmaxRowVml(input, output, length))
+                    return;
+            }
+#endif
+
             int i = 0;
 
             // Step 1: Find max for numerical stability
