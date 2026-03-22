@@ -10872,4 +10872,258 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_ownsDirectGpu)
             _directGpu?.Dispose();
     }
+
+    #region GPU-wired tensor-level ops (dispatch to existing backend fused kernels)
+
+    // TensorSum already implemented above (line ~1622)
+
+    T IEngine.TensorMean<T>(Tensor<T> input)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(1);
+                b.Fill(go, 0f, 1);
+                b.ReduceMean(gi, go, input.Length);
+                return (T)(object)b.DownloadBuffer(go)[0];
+            }
+            catch { }
+        }
+        return base.TensorMean(input);
+    }
+
+    Tensor<T> IEngine.TensorClip<T>(Tensor<T> input, T min, T max)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(input.Length);
+                b.ClipKernel(gi, go, (float)(object)min, (float)(object)max, input.Length);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorClip(input, min, max);
+    }
+
+    Tensor<T> IEngine.TensorPow<T>(Tensor<T> input, T exponent)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(input.Length);
+                b.PowScalar(gi, go, (float)(object)exponent, input.Length);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorPow(input, exponent);
+    }
+
+    Tensor<T> IEngine.TensorFrac<T>(Tensor<T> input)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(input.Length);
+                b.FracKernel(gi, go, input.Length);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorFrac(input);
+    }
+
+    Tensor<T> IEngine.TensorEye<T>(int n)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var go = b.AllocateBuffer(n * n);
+                b.EyeKernel(go, n);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), new[] { n, n });
+            }
+            catch { }
+        }
+        return base.TensorEye<T>(n);
+    }
+
+    // TensorOneHot, TensorMaskedFill have non-float generic params (Tensor<int>, Tensor<bool>)
+    // — GPU dispatch requires float-only buffers, handled by base CpuEngine
+
+    Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape, b2.Shape))
+        {
+            try
+            {
+                using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
+                using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
+                using var go = b.AllocateBuffer(a.Length);
+                b.EqualsKernel(ga, gb, go, a.Length);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), a.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorEquals(a, b2);
+    }
+
+    Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape, b2.Shape))
+        {
+            try
+            {
+                using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
+                using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
+                using var go = b.AllocateBuffer(a.Length);
+                b.NotEqualsKernel(ga, gb, go, a.Length);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), a.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorNotEquals(a, b2);
+    }
+
+    Tensor<T> IEngine.TensorOuter<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int M = a.Length, N = b2.Length;
+                using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
+                using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
+                using var go = b.AllocateBuffer(M * N);
+                b.OuterProduct(ga, gb, go, M, N);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), new[] { M, N });
+            }
+            catch { }
+        }
+        return base.TensorOuter(a, b2);
+    }
+
+    T IEngine.DotProduct<T>(Vector<T> a, Vector<T> b2)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var ga = b.AllocateBuffer(((Vector<float>)(object)a).ToArray());
+                using var gb = b.AllocateBuffer(((Vector<float>)(object)b2).ToArray());
+                using var go = b.AllocateBuffer(1);
+                b.BatchDotProduct(ga, gb, go, 1, a.Length);
+                return (T)(object)b.DownloadBuffer(go)[0];
+            }
+            catch { }
+        }
+        return base.DotProduct(a, b2);
+    }
+
+    // TensorBinaryCrossEntropy has 3-param signature (includes epsilon) — handled in base
+
+    Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int rank = input.Rank;
+                int ea = axis < 0 ? rank + axis : axis;
+                int halfDim = input.Shape[ea] / 2;
+                int outerSize = 1;
+                for (int i = 0; i < ea; i++) outerSize *= input.Shape[i];
+                int outputLen = outerSize * halfDim;
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(outputLen);
+                b.GluForward(gi, go, outerSize, halfDim);
+                int[] outShape = (int[])input.Shape.Clone();
+                outShape[ea] = halfDim;
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+            }
+            catch { }
+        }
+        return base.GLU(input, axis);
+    }
+
+    Tensor<T> IEngine.GeGLU<T>(Tensor<T> input, int axis)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int rank = input.Rank;
+                int ea = axis < 0 ? rank + axis : axis;
+                int halfDim = input.Shape[ea] / 2;
+                int outerSize = 1;
+                for (int i = 0; i < ea; i++) outerSize *= input.Shape[i];
+                int outputLen = outerSize * halfDim;
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(outputLen);
+                b.GeGluForward(gi, go, outerSize, halfDim);
+                int[] outShape = (int[])input.Shape.Clone();
+                outShape[ea] = halfDim;
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+            }
+            catch { }
+        }
+        return base.GeGLU(input, axis);
+    }
+
+    Tensor<T> IEngine.ReGLU<T>(Tensor<T> input, int axis)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int ea = axis < 0 ? input.Rank + axis : axis;
+                int halfDim = input.Shape[ea] / 2;
+                int outerSize = 1;
+                for (int i = 0; i < ea; i++) outerSize *= input.Shape[i];
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(outerSize * halfDim);
+                b.ReGluForward(gi, go, outerSize, halfDim);
+                int[] outShape = (int[])input.Shape.Clone();
+                outShape[ea] = halfDim;
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+            }
+            catch { }
+        }
+        return base.ReGLU(input, axis);
+    }
+
+    Tensor<T> IEngine.SwiGLU<T>(Tensor<T> input, int axis)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int ea = axis < 0 ? input.Rank + axis : axis;
+                int halfDim = input.Shape[ea] / 2;
+                int outerSize = 1;
+                for (int i = 0; i < ea; i++) outerSize *= input.Shape[i];
+                using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                using var go = b.AllocateBuffer(outerSize * halfDim);
+                b.SwiGluForward(gi, go, outerSize, halfDim);
+                int[] outShape = (int[])input.Shape.Clone();
+                outShape[ea] = halfDim;
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+            }
+            catch { }
+        }
+        return base.SwiGLU(input, axis);
+    }
+
+    // FillZero returns Vector<T>(length), not void — handled in base
+
+    #endregion
 }
