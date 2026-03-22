@@ -1608,4 +1608,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastMulLast(a, b, o, os, isz);
     public virtual void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastDivLast(a, b, o, os, isz);
 
+
+    public virtual void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.DotProduct(a, b, o, sz);
+    public virtual void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz, int sA, int sB, int cnt) => Inner.StridedDotProduct(a, b, o, sz, sA, sB, cnt);
+
+    public virtual void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => Inner.BatchedDotProduct(a, b, o, bs, dim);
 }

@@ -2870,4 +2870,46 @@ kernel void cosine_similarity(device const float* a [[buffer(0)]],
 ";
 
     #endregion
+
+    public static readonly string DotProductKernels = @"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void dot_product(device const float* a [[buffer(0)]],
+                        device const float* b [[buffer(1)]],
+                        device float* output [[buffer(2)]],
+                        constant uint& size [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= 1) return;
+    float sum = 0.0f;
+    for (uint i = 0; i < size; i++) sum += a[i] * b[i];
+    output[0] = sum;
+}
+
+kernel void batched_dot_product(device const float* a [[buffer(0)]],
+                                device const float* b [[buffer(1)]],
+                                device float* output [[buffer(2)]],
+                                constant uint& batchSize [[buffer(3)]],
+                                constant uint& dim [[buffer(4)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= batchSize) return;
+    float sum = 0.0f;
+    for (uint i = 0; i < dim; i++) sum += a[gid * dim + i] * b[gid * dim + i];
+    output[gid] = sum;
+}
+
+kernel void strided_dot_product(device const float* a [[buffer(0)]],
+                                device const float* b [[buffer(1)]],
+                                device float* output [[buffer(2)]],
+                                constant uint& size [[buffer(3)]],
+                                constant uint& strideA [[buffer(4)]],
+                                constant uint& strideB [[buffer(5)]],
+                                constant uint& count [[buffer(6)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    float sum = 0.0f;
+    for (uint i = 0; i < size; i++) sum += a[gid * strideA + i] * b[gid * strideB + i];
+    output[gid] = sum;
+}
+";
 }

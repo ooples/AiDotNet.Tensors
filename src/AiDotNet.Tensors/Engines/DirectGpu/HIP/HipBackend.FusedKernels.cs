@@ -39,4 +39,12 @@ public sealed partial class HipBackend
     public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]-bd[j%isz]; UploadToExistingHip(r,o); }
     public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]*bd[j%isz]; UploadToExistingHip(r,o); }
     public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]/(bd[j%isz]+1e-12f); UploadToExistingHip(r,o); }
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float s=0; for(int i=0;i<size;i++) s+=ad[i]*bd[i]; UploadToExistingHip(new[]{s}, output); }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
+    { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[count]; for(int c2=0;c2<count;c2++){float s=0; for(int i=0;i<size;i++) s+=ad[c2*strideA+i]*bd[c2*strideB+i]; r[c2]=s;} UploadToExistingHip(r, output); }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[batchSize]; for(int i=0;i<batchSize;i++){float s=0;for(int j=0;j<dim;j++)s+=ad[i*dim+j]*bd[i*dim+j];r[i]=s;} UploadToExistingHip(r,output); }
 }

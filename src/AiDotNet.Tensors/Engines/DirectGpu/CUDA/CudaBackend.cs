@@ -9994,6 +9994,40 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     #endregion
 
+    
+    public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: dot_product");
+        using var _ = PushContext();
+        IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
+        void** args = stackalloc void*[4];
+        args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&size;
+        LaunchKernel(kernel, (uint)((size+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
+    {
+        if (!_kernelCache.TryGetValue("strided_dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: strided_dot_product");
+        using var _ = PushContext();
+        IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
+        void** args = stackalloc void*[7];
+        args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&size; args[4]=&strideA; args[5]=&strideB; args[6]=&count;
+        LaunchKernel(kernel, (uint)((count+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim)
+    {
+        if (!_kernelCache.TryGetValue("batched_dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: batched_dot_product");
+        using var _ = PushContext();
+        IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
+        void** args = stackalloc void*[5];
+        args[0]=&ap; args[1]=&bp; args[2]=&op; args[3]=&batchSize; args[4]=&dim;
+        LaunchKernel(kernel, (uint)((batchSize+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
+    }
+
     ~CudaBackend()
     {
         Dispose();
