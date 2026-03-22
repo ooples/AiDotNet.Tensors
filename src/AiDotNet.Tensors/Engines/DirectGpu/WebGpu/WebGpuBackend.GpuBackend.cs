@@ -231,6 +231,9 @@ public sealed partial class WebGpuBackend
     public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
         if (size <= 0) return;
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
         // Compose: temp = A * B, result = sum(temp)
         using var temp = AllocateBuffer(size);
         Multiply(a, b, temp, size);
@@ -260,8 +263,13 @@ public sealed partial class WebGpuBackend
         int batchSize, int vecSize)
     {
         if (batchSize <= 0 || vecSize <= 0) return;
-        using var temp = AllocateBuffer(batchSize * vecSize);
-        Multiply(a, b, temp, batchSize * vecSize);
+        long totalElements = (long)batchSize * vecSize;
+        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
+        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
+        if (totalElements > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batchSize), "batchSize*vecSize exceeds int.MaxValue.");
+
+        using var temp = AllocateBuffer((int)totalElements);
+        Multiply(a, b, temp, (int)totalElements);
         SumAxis(temp, result, batchSize, vecSize);
     }
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();

@@ -2140,8 +2140,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// You specify which dimension to "walk along" and fix all the other dimensions.
     ///
     /// For example, in a 3D tensor with shape [batch, features, dims]:
-    /// - GetVectorAlongAxis(2, batch: 0, feature: 3) extracts all dims for batch 0, feature 3
-    /// - GetVectorAlongAxis(1, batch: 0, dim: 5) extracts all features for batch 0, dim 5
+    /// <code>
+    /// // Extract all dims for batch 0, feature 3:
+    /// var slice = tensor.GetVectorAlongAxis(2, 0, 3);
+    /// // Extract all features for batch 0, dim 5:
+    /// var slice2 = tensor.GetVectorAlongAxis(1, 0, 5);
+    /// </code>
     /// </para>
     /// <para><b>Performance:</b> When the extraction axis is the last (innermost) dimension,
     /// the data is contiguous in memory and this uses a fast bulk copy. For other axes,
