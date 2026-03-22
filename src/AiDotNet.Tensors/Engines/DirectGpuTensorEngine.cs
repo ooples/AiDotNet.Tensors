@@ -10931,6 +10931,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorBroadcastDivide(a,b2);
     }
 
+    Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Silu(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorSiLU(tensor);
+    }
+
+    Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Mish(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorMish(tensor);
+    }
+
+    Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Hardswish(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorHardSwish(tensor);
+    }
+
+    Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.LeakyRelu(gi,go,Convert.ToSingle(alpha),tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorLeakyReLU(tensor, alpha);
+    }
+
     #endregion
 
     public void Dispose()
