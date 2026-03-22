@@ -1489,6 +1489,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         if (K % 4 != 0)
             throw new ArgumentException("K must be a multiple of 4 for 2:4 structured sparsity.");
+        if (M <= 0 || K <= 0)
+            throw new ArgumentOutOfRangeException(nameof(M), "M and K must be positive.");
+        // Validate buffer sizes: dense is M*K, sparse values is M*(K/2), indices is M*(K/4)
+        if ((long)M * K > denseInput.Size)
+            throw new ArgumentOutOfRangeException(nameof(M), $"M*K ({(long)M * K}) exceeds denseInput length ({denseInput.Size}).");
+        if ((long)M * (K / 2) > sparseValues.Size)
+            throw new ArgumentOutOfRangeException(nameof(M), $"M*(K/2) ({(long)M * (K / 2)}) exceeds sparseValues length ({sparseValues.Size}).");
 
         if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: enforce_2x4_sparsity");
@@ -1504,7 +1511,8 @@ public sealed class CudaBackend : IAsyncGpuBackend
         args[2] = &idxPtr;
         args[3] = &mVal;
         args[4] = &kVal;
-        uint totalGroups = (uint)(M * (K / 4));
+        long totalGroupsLong = (long)M * (K / 4);
+        uint totalGroups = totalGroupsLong > uint.MaxValue ? uint.MaxValue : (uint)totalGroupsLong;
         uint grid = (totalGroups + DefaultBlockSize - 1) / DefaultBlockSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
@@ -8312,6 +8320,11 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (outerSize <= 0 || reduceSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outerSize), "outerSize and reduceSize must be positive.");
+        if ((long)outerSize * reduceSize > A.Size)
+            throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
+
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
 
