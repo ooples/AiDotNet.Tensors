@@ -837,22 +837,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[] FinishGpuOp<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, int elementCount)
     {
-        if (GpuScope.IsActive)
-        {
-            // Scope is active: download the data now so the CPU array has valid values,
-            // but also cache the GPU buffer so the next GPU op can reuse it without re-uploading.
-            float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(floatData);
-            CacheActivation(result, outputBuffer.Buffer, [elementCount], backend);
-            return result;
-        }
-        else
-        {
-            // No scope — download immediately and dispose the buffer
-            float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-            outputBuffer.Dispose();
-            return DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        }
+        // Download the result to CPU but keep the GPU buffer cached.
+        // This way, if the result is used as input to another GPU op,
+        // GetOrAllocateBuffer will find it in _activationCache and skip the re-upload.
+        // This eliminates the upload cost for chained GPU operations.
+        float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
+        var result = DirectGpuEngine.FromFloatArray<T>(floatData);
+        CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
+        return result;
     }
 
     /// <summary>
