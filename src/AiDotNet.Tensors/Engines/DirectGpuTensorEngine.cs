@@ -10854,6 +10854,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
     }
 
+    // --- Scalar reductions ---
+    T IEngine.Sum<T>(Vector<T> v)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Vector<float>)(object)v).ToArray());
+                using var go = b.AllocateBuffer(1);
+                b.Fill(go, 0f, 1);
+                b.SumAxis(gi, go, 1, v.Length);
+                return (T)(object)b.DownloadBuffer(go)[0];
+            }
+            catch { }
+        }
+        return base.Sum(v);
+    }
+
+    T IEngine.Mean<T>(Vector<T> v)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                using var gi = b.AllocateBuffer(((Vector<float>)(object)v).ToArray());
+                using var go = b.AllocateBuffer(1);
+                b.Fill(go, 0f, 1);
+                b.ReduceMean(gi, go, v.Length);
+                return (T)(object)b.DownloadBuffer(go)[0];
+            }
+            catch { }
+        }
+        return base.Mean(v);
+    }
+
     #endregion
 
     public void Dispose()
