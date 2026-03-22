@@ -461,6 +461,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, capsuleProgram, name);
                 }
+
+                // Compile broadcast/scalar kernels
+                var broadcastProgram = CompileOrLoadCached(BroadcastKernels.GetSource(), optimizationFlags, "Broadcast kernels");
+                _programs.Add(broadcastProgram);
+                foreach (var name in BroadcastKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, broadcastProgram, name);
+
+                // Compile gated activation kernels (GLU, GeGLU, ReGLU, SwiGLU, derivatives)
+                var gatedProgram = CompileOrLoadCached(GatedActivationKernels.GetSource(), optimizationFlags, "Gated activation kernels");
+                _programs.Add(gatedProgram);
+                foreach (var name in GatedActivationKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, gatedProgram, name);
+
+                // Compile shape/layout kernels
+                var shapeProgram = CompileOrLoadCached(ShapeKernels.GetSource(), optimizationFlags, "Shape kernels");
+                _programs.Add(shapeProgram);
+                foreach (var name in ShapeKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, shapeProgram, name);
+
+                // Compile loss forward kernels
+                var lossForwardProgram = CompileOrLoadCached(LossForwardKernels.GetSource(), optimizationFlags, "Loss forward kernels");
+                _programs.Add(lossForwardProgram);
+                foreach (var name in LossForwardKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, lossForwardProgram, name);
+
+                // Compile softmax variant + distance kernels
+                var softmaxVarProgram = CompileOrLoadCached(SoftmaxVariantKernels.GetSource(), optimizationFlags, "Softmax variant kernels");
+                _programs.Add(softmaxVarProgram);
+                foreach (var name in SoftmaxVariantKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
             }
             catch (Exception ex)
             {
