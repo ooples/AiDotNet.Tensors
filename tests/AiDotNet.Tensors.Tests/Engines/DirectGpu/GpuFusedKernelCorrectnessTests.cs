@@ -528,6 +528,107 @@ public class GpuFusedKernelCorrectnessTests
     }
 
     #endregion
+
+    #region Softmax and advanced ops
+
+    [Fact]
+    public void TensorSoftmax_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 4, 32 }, 110);
+        var cpuResult = _cpu.TensorSoftmax(input, -1);
+        var gpuResult = _gpu!.TensorSoftmax(input, -1);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
+    }
+
+    [Fact]
+    public void TensorLogSoftmax_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 4, 32 }, 111);
+        var cpuResult = _cpu.TensorLogSoftmax(input, -1);
+        var gpuResult = _gpu!.TensorLogSoftmax(input, -1);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
+    }
+
+    [Fact]
+    public void TensorBroadcastAdd_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var a = RandomTensor(new[] { 8, 16 }, 112);
+        var b = RandomTensor(new[] { 1, 16 }, 113);
+        var cpuResult = _cpu.TensorBroadcastAdd(a, b);
+        var gpuResult = _gpu!.TensorBroadcastAdd(a, b);
+        AssertTensorsClose(cpuResult, gpuResult);
+    }
+
+    [Fact]
+    public void TensorCumSum_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 4, 8 }, 114);
+        var cpuResult = _cpu.TensorCumSum(input, 1);
+        var gpuResult = _gpu!.TensorCumSum(input, 1);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
+    }
+
+    [Fact]
+    public void TensorRandomUniform_HasCorrectShape()
+    {
+        SkipIfNoGpu();
+        var result = _gpu!.TensorRandomUniform<float>(new[] { 4, 8 });
+        Assert.Equal(new[] { 4, 8 }, result.Shape);
+        Assert.Equal(32, result.Length);
+        // Values should be in [0, 1)
+        var data = result.GetDataArray();
+        foreach (var v in data)
+        {
+            Assert.True(v >= 0f && v < 1f, $"Value {v} out of range [0, 1)");
+        }
+    }
+
+    [Fact]
+    public void ReduceSum_SingleAxis_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 4, 8, 16 }, 116);
+        var cpuResult = _cpu.ReduceSum(input, new[] { 2 }, false);
+        var gpuResult = _gpu!.ReduceSum(input, new[] { 2 }, false);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
+    }
+
+    [Fact]
+    public void Upsample_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 1, 3, 4, 4 }, 117);
+        var cpuResult = _cpu.Upsample(input, 2, 2);
+        var gpuResult = _gpu!.Upsample(input, 2, 2);
+        AssertTensorsClose(cpuResult, gpuResult);
+    }
+
+    [Fact]
+    public void PixelShuffle_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 1, 12, 4, 4 }, 118); // 12 = 3 * 2^2
+        var cpuResult = _cpu.PixelShuffle(input, 2);
+        var gpuResult = _gpu!.PixelShuffle(input, 2);
+        AssertTensorsClose(cpuResult, gpuResult);
+    }
+
+    [Fact]
+    public void TensorBatchMatMul_GpuMatchesCpu()
+    {
+        SkipIfNoGpu();
+        var a = RandomTensor(new[] { 2, 4, 8 }, 119);
+        var b = RandomTensor(new[] { 2, 8, 6 }, 120);
+        var cpuResult = _cpu.TensorBatchMatMul(a, b);
+        var gpuResult = _gpu!.TensorBatchMatMul(a, b);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
+    }
+
+    #endregion
 }
 
 /// <summary>
