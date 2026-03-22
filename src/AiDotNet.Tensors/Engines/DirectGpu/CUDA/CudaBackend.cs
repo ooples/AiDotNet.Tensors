@@ -591,6 +591,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // Compile Specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
         _specializedModule = CompileKernelModule(device, CudaSpecializedKernels.GetSource(), "specialized_kernels", CudaSpecializedKernels.GetKernelNames());
 
+        // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
+        CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
+
         // Compile FP16 conversion kernels (half-precision float conversion)
         // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
         try
@@ -1463,24 +1466,115 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     #endregion
 
-    public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
+    public unsafe void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
     {
-        throw new NotSupportedException("CUDA sparse 2:4 kernels are not implemented yet.");
+        if (K % 4 != 0)
+            throw new ArgumentException("K must be a multiple of 4 for 2:4 structured sparsity.");
+
+        if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: enforce_2x4_sparsity");
+
+        using var _ = PushContext();
+        IntPtr densePtr = denseInput.Handle;
+        IntPtr valsPtr = sparseValues.Handle;
+        IntPtr idxPtr = sparseIndices.Handle;
+        int mVal = M, kVal = K;
+        void** args = stackalloc void*[5];
+        args[0] = &densePtr;
+        args[1] = &valsPtr;
+        args[2] = &idxPtr;
+        args[3] = &mVal;
+        args[4] = &kVal;
+        uint totalGroups = (uint)(M * (K / 4));
+        uint grid = (totalGroups + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
+    public unsafe void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
     {
-        throw new NotSupportedException("CUDA sparse 2:4 kernels are not implemented yet.");
+        if (K % 4 != 0)
+            throw new ArgumentException("K must be a multiple of 4 for 2:4 structured sparsity.");
+
+        if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: decompress_2x4_sparse");
+
+        using var _ = PushContext();
+        IntPtr valsPtr = sparseValues.Handle;
+        IntPtr idxPtr = sparseIndices.Handle;
+        IntPtr densePtr = denseOutput.Handle;
+        int mVal = M, kVal = K;
+        void** args = stackalloc void*[5];
+        args[0] = &valsPtr;
+        args[1] = &idxPtr;
+        args[2] = &densePtr;
+        args[3] = &mVal;
+        args[4] = &kVal;
+        uint total = (uint)(M * K);
+        uint grid = (total + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    public unsafe void SparseGemm(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
-        throw new NotSupportedException("CUDA sparse GEMM is not implemented yet.");
+        if (K % 4 != 0)
+            throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
+
+        if (!_kernelCache.TryGetValue("sparse_gemm_2x4", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_2x4");
+
+        using var _ = PushContext();
+        IntPtr valsPtr = sparseAValues.Handle;
+        IntPtr idxPtr = sparseAIndices.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr cPtr = C.Handle;
+        int mVal = M, nVal = N, kVal = K;
+        float alphaVal = alpha, betaVal = beta;
+        void** args = stackalloc void*[9];
+        args[0] = &valsPtr;
+        args[1] = &idxPtr;
+        args[2] = &bPtr;
+        args[3] = &cPtr;
+        args[4] = &mVal;
+        args[5] = &nVal;
+        args[6] = &kVal;
+        args[7] = &alphaVal;
+        args[8] = &betaVal;
+        const int blockDim = 16;
+        uint gridX = (uint)((N + blockDim - 1) / blockDim);
+        uint gridY = (uint)((M + blockDim - 1) / blockDim);
+        LaunchKernel2D(kernel, gridX, gridY, blockDim, blockDim, args);
     }
 
-    public IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
+    public unsafe IGpuBuffer SparseGemmBiasRelu(IGpuBuffer sparseAValues, IGpuBuffer sparseAIndices, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
     {
-        throw new NotSupportedException("CUDA sparse GEMM + bias + ReLU is not implemented yet.");
+        if (K % 4 != 0)
+            throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
+
+        if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_bias_relu");
+
+        var output = AllocateBuffer(M * N);
+        using var _ = PushContext();
+        IntPtr valsPtr = sparseAValues.Handle;
+        IntPtr idxPtr = sparseAIndices.Handle;
+        IntPtr bPtr = B.Handle;
+        IntPtr biasPtr = bias.Handle;
+        IntPtr outPtr = output.Handle;
+        int mVal = M, nVal = N, kVal = K;
+        void** args = stackalloc void*[8];
+        args[0] = &valsPtr;
+        args[1] = &idxPtr;
+        args[2] = &bPtr;
+        args[3] = &biasPtr;
+        args[4] = &outPtr;
+        args[5] = &mVal;
+        args[6] = &nVal;
+        args[7] = &kVal;
+        const int blockDim = 16;
+        uint gridX = (uint)((N + blockDim - 1) / blockDim);
+        uint gridY = (uint)((M + blockDim - 1) / blockDim);
+        LaunchKernel2D(kernel, gridX, gridY, blockDim, blockDim, args);
+        return output;
     }
 
     #region CSR Sparse Operations (General Sparsity)
@@ -8185,38 +8279,156 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        throw new NotImplementedException("Strided copy not implemented for CUDA backend yet.");
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        using var _ = PushContext();
+        IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
+        IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
+        ulong byteSize = (ulong)length * sizeof(float);
+        CuBlasNative.CheckCudaResult(
+            CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
+            "cuMemcpyDtoD(strided)");
     }
 
-    public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        throw new NotImplementedException("ArgMaxAxis not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
+
+        using var _ = PushContext();
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize;
+        int reduceSizeVal = reduceSize;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPtr;
+        args[1] = &indicesPtr;
+        args[2] = &outerSizeVal;
+        args[3] = &reduceSizeVal;
+        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
+    public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomUniform not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: generate_random_uniform");
+
+        using var _ = PushContext();
+        IntPtr outputPtr = output.Handle;
+        int sizeVal = size;
+        float minVal = min;
+        float maxVal = max;
+        ulong seedVal = seed;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr;
+        args[1] = &sizeVal;
+        args[2] = &minVal;
+        args[3] = &maxVal;
+        args[4] = &seedVal;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
+    public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomNormal not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: generate_random_normal");
+
+        using var _ = PushContext();
+        IntPtr outputPtr = output.Handle;
+        int sizeVal = size;
+        float meanVal = mean;
+        float stdDevVal = stdDev;
+        ulong seedVal = seed;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr;
+        args[1] = &sizeVal;
+        args[2] = &meanVal;
+        args[3] = &stdDevVal;
+        args[4] = &seedVal;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
+    public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
-        throw new NotImplementedException("RbfForward not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rbf_forward");
+
+        using var _ = PushContext();
+        IntPtr inputPtr = input.Handle;
+        IntPtr centersPtr = centers.Handle;
+        IntPtr epsilonsPtr = epsilons.Handle;
+        IntPtr outputPtr = output.Handle;
+        int batchSizeVal = batchSize;
+        int numCentersVal = numCenters;
+        int inputDimVal = inputDim;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPtr;
+        args[1] = &centersPtr;
+        args[2] = &epsilonsPtr;
+        args[3] = &outputPtr;
+        args[4] = &batchSizeVal;
+        args[5] = &numCentersVal;
+        args[6] = &inputDimVal;
+        uint totalWork = (uint)(batchSize * numCenters);
+        uint grid = (totalWork + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
+    public unsafe void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
-        throw new NotImplementedException("StdpUpdate not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("stdp_update", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: stdp_update");
+
+        using var _ = PushContext();
+        IntPtr wPtr = weights.Handle;
+        IntPtr preTPtr = preTrace.Handle;
+        IntPtr postTPtr = postTrace.Handle;
+        IntPtr preSPtr = preSpike.Handle;
+        IntPtr postSPtr = postSpike.Handle;
+        int numPreVal = numPre;
+        int numPostVal = numPost;
+        void** args = stackalloc void*[12];
+        args[0] = &wPtr;
+        args[1] = &preTPtr;
+        args[2] = &postTPtr;
+        args[3] = &preSPtr;
+        args[4] = &postSPtr;
+        args[5] = &ltpRate;
+        args[6] = &ltdRate;
+        args[7] = &homeostasisRate;
+        args[8] = &minWeight;
+        args[9] = &maxWeight;
+        args[10] = &numPreVal;
+        args[11] = &numPostVal;
+        uint totalWork = (uint)(numPre * numPost);
+        uint grid = (totalWork + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
+    public unsafe void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
-        throw new NotImplementedException("UpdateTraces not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("update_traces", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: update_traces");
+
+        using var _ = PushContext();
+        IntPtr tracesPtr = traces.Handle;
+        IntPtr spikesPtr = spikes.Handle;
+        IntPtr inputPtr = input.Handle;
+        int sizeVal = size;
+        void** args = stackalloc void*[6];
+        args[0] = &tracesPtr;
+        args[1] = &spikesPtr;
+        args[2] = &inputPtr;
+        args[3] = &decay;
+        args[4] = &threshold;
+        args[5] = &sizeVal;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     #endregion
