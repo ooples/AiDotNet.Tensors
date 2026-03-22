@@ -227,6 +227,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public GpuScope BeginGpuScope() => new GpuScope(this);
 
+    /// <summary>
+    /// Safely downloads GPU buffer data into a tensor, handling the case where
+    /// GetDataArray() returns a copy instead of the backing array.
+    /// Downloads into a fresh array and copies into the tensor's actual memory.
+    /// </summary>
+    private static void DownloadIntoTensor(IDirectGpuBackend backend, IGpuBuffer gpuBuffer, Tensor<float> tensor)
+    {
+        var downloaded = backend.DownloadBuffer(gpuBuffer);
+        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.Data.Span);
+    }
+
     private bool TryGetBackend(out IDirectGpuBackend backend)
     {
         // Check if there's an active DeferredScope - use its RecordingBackend for deferred execution
@@ -1320,7 +1331,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     batch, inChannels, inH, inW,
                     outChannels, outH, outW,
                     kH, kW, stride, stride, padding, padding, dilation, dilation);
-                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
             catch
@@ -1354,12 +1365,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 gpuBackend.GroupNorm(gpuIn, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
                     batch, numGroups, channels, spatial, (float)epsilon);
-                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
 
                 mean = new Tensor<T>(new int[] { batch, numGroups });
                 variance = new Tensor<T>(new int[] { batch, numGroups });
-                gpuBackend.DownloadBuffer(gpuMean, ((Tensor<float>)(object)mean).GetDataArray());
-                gpuBackend.DownloadBuffer(gpuVar, ((Tensor<float>)(object)variance).GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuMean, (Tensor<float>)(object)mean);
+                DownloadIntoTensor(gpuBackend, gpuVar, (Tensor<float>)(object)variance);
                 return;
             }
             catch
@@ -1388,7 +1399,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // GPU softmax kernel
                     int axisSize = input.Shape[axis < 0 ? input.Rank + axis : axis];
                     gpuBackend.Softmax(gpuIn, gpuOut, input.Length, axisSize);
-                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
                 {
@@ -1428,7 +1439,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // Softmax then Log
                     gpuBackend.Softmax(gpuIn, gpuSoftmax, outerSize, features);
                     gpuBackend.Log(gpuSoftmax, gpuOut, input.Length);
-                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                     return;
                 }
             }
@@ -1459,7 +1470,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     gpuBackend.Sigmoid(gpuIn, gpuSigmoid, size);
                     gpuBackend.Multiply(gpuIn, gpuSigmoid, gpuOut, size);
-                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
                 {
@@ -1493,7 +1504,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     gpuBackend.Gelu(gpuIn, gpuOut, size);
-                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
                 {
@@ -1526,7 +1537,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     gpuBackend.Tanh(gpuIn, gpuOut, size);
-                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
                 {
@@ -1556,7 +1567,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(size);
                 gpuBackend.Mish(gpuIn, gpuOut, size);
-                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
             catch
@@ -1581,7 +1592,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(size);
                 gpuBackend.LeakyRelu(gpuIn, gpuOut, alphaF, size);
-                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
             catch
@@ -1618,7 +1629,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Copy t0 data to start of output, t1 data to offset
                 gpuBackend.Copy(gpu0, gpuOut, t0.Length);
                 gpuBackend.Copy(gpu1, 0, gpuOut, t0.Length, t1.Length);
-                gpuBackend.DownloadBuffer(gpuOut, dstF.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, dstF);
                 return;
             }
             catch
@@ -1644,7 +1655,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(dest.Length);
                 gpuBackend.Transpose(gpuIn, gpuOut, rows, cols);
-                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 return;
             }
             catch
@@ -1681,7 +1692,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
                     batch, channels, spatial, numGroups, (float)epsilon);
                 gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
-                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
             catch
@@ -1720,7 +1731,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 gpuBackend.Add(gpuA, gpuB, gpuSum, a.Length);
                 gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
                     batch, channels, spatial, numGroups, (float)epsilon);
-                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
             catch
