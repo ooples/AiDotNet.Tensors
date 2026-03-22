@@ -28,15 +28,16 @@
     <ProjectReference Include="..\..\src\AiDotNet.Tensors\AiDotNet.Tensors.csproj" />
   </ItemGroup>
 
-  <!-- Ensure dnnl.dll is always copied to output (BenchmarkDotNet's isolated rebuild strips NuGet targets) -->
+  <!-- Resolve the installed OneDNN package version and copy dnnl.dll to output
+       (BenchmarkDotNet's isolated rebuild strips NuGet targets) -->
+  <PropertyGroup>
+    <OneDnnPackageVersion>0.12.0</OneDnnPackageVersion>
+  </PropertyGroup>
   <Target Name="CopyDnnlToBenchmarkOutput" AfterTargets="Build">
-    <ItemGroup>
-      <DnnlNativeFiles Include="$(NuGetPackageRoot)aidotnet.native.onednn\**\runtimes\win-x64\native\dnnl.dll" />
-    </ItemGroup>
-    <Copy SourceFiles="@(DnnlNativeFiles)"
+    <Copy SourceFiles="$(NuGetPackageRoot)aidotnet.native.onednn\$(OneDnnPackageVersion)\runtimes\win-x64\native\dnnl.dll"
           DestinationFolder="$(OutputPath)"
           SkipUnchangedFiles="true"
-          Condition="'@(DnnlNativeFiles)' != ''" />
+          Condition="Exists('$(NuGetPackageRoot)aidotnet.native.onednn\$(OneDnnPackageVersion)\runtimes\win-x64\native\dnnl.dll')" />
   </Target>
 
 </Project>

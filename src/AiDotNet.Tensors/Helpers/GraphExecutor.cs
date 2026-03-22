@@ -217,11 +217,11 @@ public sealed class GraphExecutor<T> : IDisposable
                     inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
                     n.Params?.Epsilon ?? 1e-5),
 
-            // Element-wise math — use AsSpan/AsWritableSpan to avoid GetDataArray() copy issues
-            [OpType.Exp] = (_, inp, o) => { var r = _engine.TensorExp(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
-            [OpType.Log] = (_, inp, o) => { var r = _engine.TensorLog(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
-            [OpType.Sqrt] = (_, inp, o) => { var r = _engine.TensorSqrt(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
-            [OpType.Abs] = (_, inp, o) => { var r = _engine.TensorAbs(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
+            // Element-wise math — use AsSpan/AsWritableSpan and return temporaries to pool
+            [OpType.Exp] = (_, inp, o) => { var r = _engine.TensorExp(inp[0]); CopyAndReturn(r, o); },
+            [OpType.Log] = (_, inp, o) => { var r = _engine.TensorLog(inp[0]); CopyAndReturn(r, o); },
+            [OpType.Sqrt] = (_, inp, o) => { var r = _engine.TensorSqrt(inp[0]); CopyAndReturn(r, o); },
+            [OpType.Abs] = (_, inp, o) => { var r = _engine.TensorAbs(inp[0]); CopyAndReturn(r, o); },
 
             // Linear algebra
             [OpType.MatMul] = (_, inp, o) => _engine.MatMulInto(o, inp[0], inp[1]),
@@ -252,9 +252,9 @@ public sealed class GraphExecutor<T> : IDisposable
             {
                 if (inp.Length >= 3)
                 {
-                    Tensor<T> stats;
-                    var result = _engine.FlashAttention(inp[0], inp[1], inp[2], scale: null, isCausal: false, softmaxStats: out stats);
-                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
+                    var result = _engine.FlashAttention(inp[0], inp[1], inp[2], scale: null, isCausal: false, softmaxStats: out var stats);
+                    CopyAndReturn(result, o);
+                    TensorAllocator.Return(stats);
                 }
             },
 
@@ -269,7 +269,7 @@ public sealed class GraphExecutor<T> : IDisposable
                         n.Params?.Padding ?? 0, n.Params?.Padding ?? 0,
                         n.Params?.Dilation ?? 1, n.Params?.Dilation ?? 1,
                         (Engines.FusedActivationType)(int)(n.Params?.FusedActivation ?? ComputationGraph.FusedActivationType.None));
-                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
+                    CopyAndReturn(result, o);
                 }
             },
 
@@ -280,7 +280,7 @@ public sealed class GraphExecutor<T> : IDisposable
                 {
                     var result = _engine.BatchNorm(inp[0], inp[1], inp[2],
                         n.Params?.Epsilon ?? 1e-5, out _, out _);
-                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
+                    CopyAndReturn(result, o);
                 }
             },
 
@@ -288,12 +288,21 @@ public sealed class GraphExecutor<T> : IDisposable
             [OpType.MaxPool2D] = (n, inp, o) =>
             {
                 var result = _engine.MaxPool2D(inp[0], n.Params?.Stride ?? 2, n.Params?.Stride ?? 2, n.Params?.Padding ?? 0);
-                result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
+                CopyAndReturn(result, o);
             },
 
             // Dropout (pass-through for inference)
             [OpType.Dropout] = (_, inp, o) => inp[0].AsSpan().Slice(0, Math.Min(inp[0].Length, o.Length)).CopyTo(o.AsWritableSpan()),
         };
+    }
+
+    /// <summary>
+    /// Copies result into the workspace output and returns the temporary to the pool.
+    /// </summary>
+    private static void CopyAndReturn(Tensor<T> result, Tensor<T> output)
+    {
+        result.AsSpan().Slice(0, Math.Min(result.Length, output.Length)).CopyTo(output.AsWritableSpan());
+        TensorAllocator.Return(result);
     }
 
     private Tensor<T> CreateOnes(int size)
