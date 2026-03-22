@@ -2522,6 +2522,23 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="totalElements">Total number of float elements needed.</param>
     /// <returns>A single GPU buffer large enough for all slots.</returns>
     #endregion
+    // Fused kernel methods for DirectGpuTensorEngine wiring
+    void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size);
+    void ClipKernel(IGpuBuffer input, IGpuBuffer output, float min, float max, int size);
+    void PowScalar(IGpuBuffer input, IGpuBuffer output, float exponent, int size);
+    void FracKernel(IGpuBuffer input, IGpuBuffer output, int size);
+    void EyeKernel(IGpuBuffer output, int n);
+    void OneHotKernel(IGpuBuffer indices, IGpuBuffer output, int batchSize, int numClasses);
+    void MaskedFillKernel(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, float fillValue, int size);
+    void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
+    void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
+    void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N);
+    void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim);
+    void GluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
+    void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
+    void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
+    void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
+    void BceLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int size);
 }
 
 /// <summary>
