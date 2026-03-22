@@ -493,6 +493,16 @@ public sealed class HipBackend : IAsyncGpuBackend
             CompileKernelModule(Kernels.HipSnnKernels.GetSource(), "snn", ref _snnModule,
                 Kernels.HipSnnKernels.GetKernelNames());
 
+            // Compile reduction, broadcast, gated activation, shape, loss, softmax variant kernels
+            IntPtr reductionMod = IntPtr.Zero, broadcastMod = IntPtr.Zero, gatedMod = IntPtr.Zero;
+            IntPtr shapeMod = IntPtr.Zero, lossMod = IntPtr.Zero, softmaxVarMod = IntPtr.Zero;
+            CompileKernelModule(Kernels.HipReductionKernels.GetSource(), "reduction", ref reductionMod, Kernels.HipReductionKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipBroadcastKernels.GetSource(), "broadcast", ref broadcastMod, Kernels.HipBroadcastKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipGatedActivationKernels.GetSource(), "gated_activation", ref gatedMod, Kernels.HipGatedActivationKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipShapeKernels.GetSource(), "shape", ref shapeMod, Kernels.HipShapeKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref lossMod, Kernels.HipLossForwardKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref softmaxVarMod, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
+
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
         }
