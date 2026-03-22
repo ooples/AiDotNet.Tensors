@@ -329,7 +329,7 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= rows * cols) return;
     uint row = idx / cols; uint col = idx % cols;
-    b[idx] = (col > row + uint(diagonal)) ? maskValue : 0.0;
+    b[idx] = (int(col) > int(row) + diagonal) ? maskValue : 0.0;
 }";
 
     // =====================================================================

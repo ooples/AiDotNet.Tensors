@@ -221,6 +221,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null) return;
 
+            // Note: This method is only called from the constructor, so _kernelCache
+            // mutations are safe (no concurrent access). If this ever becomes callable
+            // post-construction, switch to staging into a temp dictionary and swapping.
+
             // Aggressive optimization flags for maximum performance
             // -cl-fast-relaxed-math: Allows aggressive math optimizations (FMA, reordering)
             // -cl-mad-enable: Enables fused multiply-add instructions (critical for GEMM)

@@ -192,7 +192,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
     {
-        string cacheKey = $"{glslSource.GetHashCode()}_{bindingCount}_{pushConstantSize}";
+        // Use full source as key to avoid GetHashCode collisions (randomized per process)
+        string cacheKey = $"{glslSource}_{bindingCount}_{pushConstantSize}";
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
             return cached;
 
@@ -213,6 +214,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <summary>
     /// Executes a GLSL-compiled compute pipeline with 2 buffers + push constants.
     /// </summary>
+    // Note: pushConstantSize reserves pipeline layout space. RecordAndExecuteComputeUnlocked
+    // always pushes sizeof(uint) for the element count. Extra reserved space is available for
+    // future kernels that need additional push constant parameters beyond the element count.
     private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int size, uint pushConstantSize = sizeof(uint))
     {
         EnsureInitialized();
@@ -258,9 +262,16 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
-    // CPU fallback stubs (only used when shaderc is not available)
-    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size) { }
-    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { }
+    // CPU fallback when shaderc is not available — throw so callers know the operation didn't run
+    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        throw new InvalidOperationException("GLSL compute shader compilation is not available (shaderc not found). Cannot execute GPU operation.");
+    }
+
+    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        throw new InvalidOperationException("GLSL compute shader compilation is not available (shaderc not found). Cannot execute GPU operation.");
+    }
 
     /// <summary>
     /// Gets or creates a shader module for the specified kernel.
@@ -829,10 +840,17 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (!_inSecondaryStream)
             throw new InvalidOperationException("Not in a secondary stream.");
 
-        // Submit the secondary command buffer and wait for completion
-        var cmdBuffer = _secondaryThreadRes.CommandBuffer;
-        _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
-        _inSecondaryStream = false;
+        try
+        {
+            // Submit the secondary command buffer and wait for completion
+            var cmdBuffer = _secondaryThreadRes.CommandBuffer;
+            _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
+        }
+        finally
+        {
+            // Always clear state even if submit fails, preventing stuck state
+            _inSecondaryStream = false;
+        }
     }
 
     /// <summary>

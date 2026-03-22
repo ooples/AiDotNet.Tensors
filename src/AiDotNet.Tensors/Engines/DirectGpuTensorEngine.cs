@@ -1399,9 +1399,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gpuOut = gpuBackend.AllocateBuffer(input.Length);
                 try
                 {
-                    // GPU softmax kernel
+                    // GPU softmax kernel: batchSize = total / features, features = axisSize
                     int axisSize = input.Shape[axis < 0 ? input.Rank + axis : axis];
-                    gpuBackend.Softmax(gpuIn, gpuOut, input.Length, axisSize);
+                    int batchSize = input.Length / axisSize;
+                    gpuBackend.Softmax(gpuIn, gpuOut, batchSize, axisSize);
                     DownloadIntoTensor(gpuBackend, gpuOut, floatDest);
                 }
                 finally
@@ -1764,10 +1765,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
 
-        // Download result back into a's backing array
+        // Download result back into tensor a's actual memory (not via GetDataArray which may copy)
         float[] resultFloat = backend.DownloadBuffer(bufferA.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        Array.Copy(resultT, aData, aData.Length);
+        resultT.AsSpan(0, Math.Min(resultT.Length, a.Length)).CopyTo(a.Data.Span);
         return true;
     }
 
