@@ -1056,6 +1056,14 @@ __kernel void softmax_fused(
     const int lid = get_local_id(0);
     const int localSize = get_local_size(0);
 
+    // Thread 0 of WG 0 initializes scratch (avoids separate ZeroBuffer kernel launch)
+    if (gid == 0 && lid == 0) {
+        for (int i = 0; i < numGroups * 2 + 4; i++) scratch[i] = 0;
+    }
+    // All WGs must wait for scratch init via global memory fence
+    if (lid == 0) mem_fence(CLK_GLOBAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     __global const float* row = input + rowOffset;
     __global float* rowOut = output + rowOffset;
 

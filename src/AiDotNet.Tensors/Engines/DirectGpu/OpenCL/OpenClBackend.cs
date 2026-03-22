@@ -2838,9 +2838,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 int offset = b * features;
 
-                // Zero scratch (counter=0, readyFlag=0) — single memset, no kernel launch
-                ZeroBuffer(scratchBuf, scratchInts);
-
+                // Scratch is zeroed by thread 0 of WG 0 inside the kernel itself
                 k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
                 k.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
                 k.SetArg(2, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
