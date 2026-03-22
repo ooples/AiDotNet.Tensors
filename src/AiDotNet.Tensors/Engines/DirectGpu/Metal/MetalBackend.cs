@@ -1000,7 +1000,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// <summary>
     /// Helper to add a scalar: B = A + scalar
     /// </summary>
-    private void AddScalar(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
+    public void AddScalar(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer)
         {

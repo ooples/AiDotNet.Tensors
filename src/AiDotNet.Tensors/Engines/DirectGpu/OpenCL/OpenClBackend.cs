@@ -461,6 +461,44 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, gruProgram, name);
                 }
+
+                // Compile Capsule Network kernels
+                var capsuleProgram = CompileOrLoadCached(CapsuleKernels.GetSource(), optimizationFlags, "Capsule network kernels");
+                _programs.Add(capsuleProgram);
+                foreach (var name in CapsuleKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, capsuleProgram, name);
+                }
+
+                // Compile broadcast/scalar kernels
+                var broadcastProgram = CompileOrLoadCached(BroadcastKernels.GetSource(), optimizationFlags, "Broadcast kernels");
+                _programs.Add(broadcastProgram);
+                foreach (var name in BroadcastKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, broadcastProgram, name);
+
+                // Compile gated activation kernels (GLU, GeGLU, ReGLU, SwiGLU, derivatives)
+                var gatedProgram = CompileOrLoadCached(GatedActivationKernels.GetSource(), optimizationFlags, "Gated activation kernels");
+                _programs.Add(gatedProgram);
+                foreach (var name in GatedActivationKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, gatedProgram, name);
+
+                // Compile shape/layout kernels
+                var shapeProgram = CompileOrLoadCached(ShapeKernels.GetSource(), optimizationFlags, "Shape kernels");
+                _programs.Add(shapeProgram);
+                foreach (var name in ShapeKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, shapeProgram, name);
+
+                // Compile loss forward kernels
+                var lossForwardProgram = CompileOrLoadCached(LossForwardKernels.GetSource(), optimizationFlags, "Loss forward kernels");
+                _programs.Add(lossForwardProgram);
+                foreach (var name in LossForwardKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, lossForwardProgram, name);
+
+                // Compile softmax variant + distance kernels
+                var softmaxVarProgram = CompileOrLoadCached(SoftmaxVariantKernels.GetSource(), optimizationFlags, "Softmax variant kernels");
+                _programs.Add(softmaxVarProgram);
+                foreach (var name in SoftmaxVariantKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
             }
             catch (Exception ex)
             {
@@ -2800,25 +2838,83 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
             int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
         {
-            throw new NotImplementedException("CapsulePredictions kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_predictions"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, inputDim);
+            kernel.SetArg(6, outputCapsules);
+            kernel.SetArg(7, outputDim);
+
+            int total = batchSize * inputCapsules * outputCapsules * outputDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
             int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleTransform kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_transform"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, inputDim);
+            kernel.SetArg(6, numCapsules);
+            kernel.SetArg(7, capsuleDim);
+
+            int total = batchSize * inputCapsules * numCapsules * capsuleDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleWeightedSum kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_weighted_sum"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)coupling).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, outputCapsules);
+            kernel.SetArg(6, capsuleDim);
+
+            int total = batchSize * outputCapsules * capsuleDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleAgreement kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_agreement"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)agreement).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, outputCapsules);
+            kernel.SetArg(6, capsuleDim);
+
+            int total = batchSize * inputCapsules * outputCapsules;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
@@ -10037,6 +10133,29 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
             _disposed = true;
         }
+
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }
+    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if(_context==null)return; var k=_kernelCache["clip_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,mn); k.SetArg(3,mx); k.SetArg(4,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if(_context==null)return; var k=_kernelCache["pow_scalar"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,ex); k.SetArg(3,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }
+    public void EyeKernel(IGpuBuffer o, int n) { if(_context==null)return; var k=_kernelCache["eye_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(1,n); k.Execute1D(n*n,CalculateOptimalWorkGroupSize1D(n*n)); }
+    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(_context==null)return; var k=_kernelCache["one_hot_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)idx).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,bs); k.SetArg(3,nc); k.Execute1D(bs*nc,CalculateOptimalWorkGroupSize1D(bs*nc)); }
+    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(_context==null)return; var k=_kernelCache["masked_fill_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)m).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,fv); k.SetArg(4,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("equals_kernel", a, b, o, sz); }
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("not_equals_kernel", a, b, o, sz); }
+    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { if(_context==null)return; var k=_kernelCache["outer_product"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,M); k.SetArg(4,N); k.Execute1D(M*N,CalculateOptimalWorkGroupSize1D(M*N)); }
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { if(_context==null)return; var k=_kernelCache["batch_dot_product"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,bs); k.SetArg(4,dim); k.Execute1D(bs,CalculateOptimalWorkGroupSize1D(bs)); }
+    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["glu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["geglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["reglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["swiglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { ExecuteElementwise("bce_loss", p, t, l, sz); }
+    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { if(_context==null)return; var k=_kernelCache["add_scalar"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,sc); k.SetArg(3,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { if(_context==null)return; var k=_kernelCache["sub_scalar"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,sc); k.SetArg(3,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { if(_context==null)return; var k=_kernelCache["broadcast_add_last"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,os); k.SetArg(4,isz); k.Execute1D(os*isz,CalculateOptimalWorkGroupSize1D(os*isz)); }
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { if(_context==null)return; var k=_kernelCache["broadcast_sub_last"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,os); k.SetArg(4,isz); k.Execute1D(os*isz,CalculateOptimalWorkGroupSize1D(os*isz)); }
+    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { if(_context==null)return; var k=_kernelCache["broadcast_mul_last"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,os); k.SetArg(4,isz); k.Execute1D(os*isz,CalculateOptimalWorkGroupSize1D(os*isz)); }
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { if(_context==null)return; var k=_kernelCache["broadcast_div_last"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,os); k.SetArg(4,isz); k.Execute1D(os*isz,CalculateOptimalWorkGroupSize1D(os*isz)); }
     }
 
     /// <summary>

@@ -82,12 +82,10 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
-        // WebGPU buffers are always float32-addressed. A true byte-addressed buffer
-        // (e.g. for FP16 / mixed-precision) would require a WebGpuBuffer variant that
-        // tracks bytes and element size, which is not yet implemented.
-        throw new NotSupportedException(
-            "Byte-addressed GPU buffers (e.g., for FP16/mixed-precision) are not supported by the WebGpuBackend. " +
-            "Use float-based buffers or a backend that supports byte-addressed buffers.");
+        // WebGPU buffers are float32-addressed. Allocate enough floats to hold the byte count.
+        // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
+        int floatCount = (size + sizeof(float) - 1) / sizeof(float);
+        return new WebGpuBuffer(floatCount);
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)

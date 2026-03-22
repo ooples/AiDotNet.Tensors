@@ -2649,154 +2649,223 @@ kernel void dropout_mask(
 
     #endregion
 
-    #region Dot Product Kernels
+    #region Gated Activations + Derivatives
 
-    /// <summary>
-    /// Metal compute kernels for dot product operations using parallel reduction.
-    /// </summary>
-    public const string DotProductKernels = CommonHeader + @"
+    public static readonly string GatedActivationKernels = @"
+#include <metal_stdlib>
+using namespace metal;
 
-constant uint DOT_THREADGROUP_SIZE = 256;
-
-// Dot product: result = sum(A[i] * B[i])
-// Uses threadgroup reduction to compute partial sums per threadgroup,
-// then a second pass reduces across threadgroups.
-kernel void dot_product(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* partialSums [[buffer(2)]],
-    constant uint& size [[buffer(3)]],
-    threadgroup float* shared [[threadgroup(0)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint group_size [[threads_per_threadgroup]],
-    uint grid_size [[threads_per_grid]])
-{
-    float sum = 0.0f;
-    for (uint i = gid; i < size; i += grid_size) {
-        sum += A[i] * B[i];
-    }
-    shared[lid] = sum;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
-            shared[lid] += shared[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lid == 0) {
-        partialSums[group_id] = shared[0];
-    }
+kernel void glu_forward(device const float* input [[buffer(0)]],
+                        device float* output [[buffer(1)]],
+                        constant uint& outerSize [[buffer(2)]],
+                        constant uint& halfDim [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    uint total = outerSize * halfDim;
+    if (gid >= total) return;
+    uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
+    float value = input[outer * fullDim + d];
+    float gate = input[outer * fullDim + halfDim + d];
+    output[gid] = value * (1.0f / (1.0f + exp(-gate)));
 }
 
-// Strided dot product: result = sum(A[i] * B[bOffset + i * bStride])
-kernel void strided_dot_product(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* partialSums [[buffer(2)]],
-    constant uint& aSize [[buffer(3)]],
-    constant uint& bSize [[buffer(4)]],
-    constant int& bOffset [[buffer(5)]],
-    constant int& bStride [[buffer(6)]],
-    threadgroup float* shared [[threadgroup(0)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint group_id [[threadgroup_position_in_grid]],
-    uint group_size [[threads_per_threadgroup]],
-    uint grid_size [[threads_per_grid]])
-{
-    float sum = 0.0f;
-    for (uint i = gid; i < aSize; i += grid_size) {
-        int bIdx = bOffset + int(i) * bStride;
-        if (bIdx >= 0 && uint(bIdx) < bSize) {
-            sum += A[i] * B[bIdx];
-        }
-    }
-    shared[lid] = sum;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
-            shared[lid] += shared[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lid == 0) {
-        partialSums[group_id] = shared[0];
-    }
+kernel void geglu_forward(device const float* input [[buffer(0)]],
+                          device float* output [[buffer(1)]],
+                          constant uint& outerSize [[buffer(2)]],
+                          constant uint& halfDim [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    uint total = outerSize * halfDim;
+    if (gid >= total) return;
+    uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
+    float value = input[outer * fullDim + d];
+    float gate = input[outer * fullDim + halfDim + d];
+    float x3 = value * value * value;
+    float gelu = 0.5f * value * (1.0f + tanh(0.7978845608f * (value + 0.044715f * x3)));
+    output[gid] = gelu * gate;
 }
 
-// Batched dot product: result[batch] = sum(A[batch*vecSize + i] * B[batch*vecSize + i])
-kernel void batched_dot_product(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* result [[buffer(2)]],
-    constant uint& batchSize [[buffer(3)]],
-    constant uint& vecSize [[buffer(4)]],
-    threadgroup float* shared [[threadgroup(0)]],
-    uint2 gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint group_size [[threads_per_threadgroup]])
-{
-    uint batchIdx = gid.y;
-    if (batchIdx >= batchSize) return;
-
-    device const float* aRow = A + batchIdx * vecSize;
-    device const float* bRow = B + batchIdx * vecSize;
-
-    float sum = 0.0f;
-    for (uint i = lid; i < vecSize; i += group_size) {
-        sum += aRow[i] * bRow[i];
-    }
-    shared[lid] = sum;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
-            shared[lid] += shared[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lid == 0) {
-        result[batchIdx] = shared[0];
-    }
+kernel void reglu_forward(device const float* input [[buffer(0)]],
+                          device float* output [[buffer(1)]],
+                          constant uint& outerSize [[buffer(2)]],
+                          constant uint& halfDim [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    uint total = outerSize * halfDim;
+    if (gid >= total) return;
+    uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
+    float value = input[outer * fullDim + d];
+    float gate = input[outer * fullDim + halfDim + d];
+    output[gid] = max(value, 0.0f) * gate;
 }
 
-// Final reduction: reduces partial sums from dot_product/strided_dot_product
-kernel void reduce_partial_sums(
-    device const float* partialSums [[buffer(0)]],
-    device float* result [[buffer(1)]],
-    constant uint& count [[buffer(2)]],
-    threadgroup float* shared [[threadgroup(0)]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint group_size [[threads_per_threadgroup]])
-{
+kernel void swiglu_forward(device const float* input [[buffer(0)]],
+                           device float* output [[buffer(1)]],
+                           constant uint& outerSize [[buffer(2)]],
+                           constant uint& halfDim [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    uint total = outerSize * halfDim;
+    if (gid >= total) return;
+    uint outer = gid / halfDim; uint d = gid % halfDim; uint fullDim = halfDim * 2;
+    float value = input[outer * fullDim + d];
+    float gate = input[outer * fullDim + halfDim + d];
+    float sig = 1.0f / (1.0f + exp(-value));
+    output[gid] = value * sig * gate;
+}
+
+kernel void relu_derivative(device const float* input [[buffer(0)]],
+                            device float* output [[buffer(1)]],
+                            constant uint& size [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= size) return;
+    output[gid] = input[gid] > 0.0f ? 1.0f : 0.0f;
+}
+
+kernel void sigmoid_derivative(device const float* sig_out [[buffer(0)]],
+                               device float* output [[buffer(1)]],
+                               constant uint& size [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= size) return;
+    float s = sig_out[gid]; output[gid] = s * (1.0f - s);
+}
+
+kernel void tanh_derivative(device const float* tanh_out [[buffer(0)]],
+                            device float* output [[buffer(1)]],
+                            constant uint& size [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= size) return;
+    float t = tanh_out[gid]; output[gid] = 1.0f - t * t;
+}
+";
+
+    #endregion
+
+    #region Extended Reductions + Shape Ops
+
+    public static readonly string ExtendedReductionKernels = @"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void mean_axis(device const float* input [[buffer(0)]],
+                      device float* output [[buffer(1)]],
+                      constant uint& outerSize [[buffer(2)]],
+                      constant uint& reduceSize [[buffer(3)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
     float sum = 0.0f;
-    for (uint i = lid; i < count; i += group_size) {
-        sum += partialSums[i];
-    }
-    shared[lid] = sum;
+    uint base = gid * reduceSize;
+    for (uint j = 0; j < reduceSize; j++) sum += input[base + j];
+    output[gid] = sum / float(reduceSize);
+}
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+kernel void variance_axis(device const float* input [[buffer(0)]],
+                          device float* output [[buffer(1)]],
+                          constant uint& outerSize [[buffer(2)]],
+                          constant uint& reduceSize [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
+    uint base = gid * reduceSize;
+    float sum = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) sum += input[base + j];
+    float mean = sum / float(reduceSize);
+    float var_sum = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) { float d = input[base + j] - mean; var_sum += d * d; }
+    output[gid] = var_sum / float(reduceSize);
+}
 
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
-        if (lid < stride) {
-            shared[lid] += shared[lid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+kernel void std_axis(device const float* input [[buffer(0)]],
+                     device float* output [[buffer(1)]],
+                     constant uint& outerSize [[buffer(2)]],
+                     constant uint& reduceSize [[buffer(3)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
+    uint base = gid * reduceSize;
+    float sum = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) sum += input[base + j];
+    float mean = sum / float(reduceSize);
+    float var_sum = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) { float d = input[base + j] - mean; var_sum += d * d; }
+    output[gid] = sqrt(var_sum / float(reduceSize));
+}
 
-    if (lid == 0) {
-        result[0] = shared[0];
+kernel void norm_axis(device const float* input [[buffer(0)]],
+                      device float* output [[buffer(1)]],
+                      constant uint& outerSize [[buffer(2)]],
+                      constant uint& reduceSize [[buffer(3)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
+    uint base = gid * reduceSize;
+    float sum_sq = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) { float v = input[base + j]; sum_sq += v * v; }
+    output[gid] = sqrt(sum_sq);
+}
+
+kernel void logsumexp_axis(device const float* input [[buffer(0)]],
+                           device float* output [[buffer(1)]],
+                           constant uint& outerSize [[buffer(2)]],
+                           constant uint& reduceSize [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
+    uint base = gid * reduceSize;
+    float max_val = -INFINITY;
+    for (uint j = 0; j < reduceSize; j++) max_val = max(max_val, input[base + j]);
+    float sum_exp = 0.0f;
+    for (uint j = 0; j < reduceSize; j++) sum_exp += exp(input[base + j] - max_val);
+    output[gid] = max_val + log(sum_exp);
+}
+
+kernel void log_softmax(device const float* input [[buffer(0)]],
+                        device float* output [[buffer(1)]],
+                        constant uint& outerSize [[buffer(2)]],
+                        constant uint& innerSize [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= outerSize) return;
+    uint base = gid * innerSize;
+    float max_val = -INFINITY;
+    for (uint j = 0; j < innerSize; j++) max_val = max(max_val, input[base + j]);
+    float sum_exp = 0.0f;
+    for (uint j = 0; j < innerSize; j++) sum_exp += exp(input[base + j] - max_val);
+    float log_sum = log(sum_exp);
+    for (uint j = 0; j < innerSize; j++) output[base + j] = input[base + j] - max_val - log_sum;
+}
+
+kernel void eye_kernel(device float* output [[buffer(0)]],
+                       constant uint& n [[buffer(1)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= n * n) return;
+    output[gid] = (gid / n == gid % n) ? 1.0f : 0.0f;
+}
+
+kernel void one_hot_kernel(device const float* indices [[buffer(0)]],
+                           device float* output [[buffer(1)]],
+                           constant uint& batchSize [[buffer(2)]],
+                           constant uint& numClasses [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= batchSize * numClasses) return;
+    uint b = gid / numClasses; uint c = gid % numClasses;
+    output[gid] = (uint(indices[b]) == c) ? 1.0f : 0.0f;
+}
+
+kernel void outer_product(device const float* a [[buffer(0)]],
+                          device const float* b [[buffer(1)]],
+                          device float* output [[buffer(2)]],
+                          constant uint& M [[buffer(3)]],
+                          constant uint& N [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= M * N) return;
+    output[gid] = a[gid / N] * b[gid % N];
+}
+
+kernel void cosine_similarity(device const float* a [[buffer(0)]],
+                              device const float* b [[buffer(1)]],
+                              device float* output [[buffer(2)]],
+                              constant uint& batchSize [[buffer(3)]],
+                              constant uint& dim [[buffer(4)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= batchSize) return;
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (uint i = 0; i < dim; i++) {
+        float ai = a[gid * dim + i]; float bi = b[gid * dim + i];
+        dot += ai * bi; na += ai * ai; nb += bi * bi;
     }
+    output[gid] = dot / (sqrt(na) * sqrt(nb) + 1e-8f);
 }
 ";
 
