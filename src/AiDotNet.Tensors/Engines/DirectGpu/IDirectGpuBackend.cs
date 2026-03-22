@@ -1239,6 +1239,28 @@ public interface IDirectGpuBackend : IDisposable
 
     #endregion
 
+    #region Dot Product Operations
+
+    /// <summary>
+    /// Computes dot product of two GPU buffers: result = sum(a[i] * b[i]).
+    /// </summary>
+    void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size);
+
+    /// <summary>
+    /// Computes strided dot product: result = sum(a[i] * b[bOffset + i * bStride]).
+    /// </summary>
+    void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride);
+
+    /// <summary>
+    /// Computes batched dot products for multiple vector pairs.
+    /// a and b are [batchSize, vecSize], result is [batchSize].
+    /// </summary>
+    void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize);
+
+    #endregion
+
     #region Attention Operations
 
     void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,

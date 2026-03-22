@@ -39,6 +39,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _deformableConvModule;
     private IntPtr _capsuleModule;
     private IntPtr _specializedModule;
+    private IntPtr _dotProductModule;
     private IntPtr _lstmModule;
     private IntPtr _gruModule;
     private IntPtr _fp16Module;
@@ -578,6 +579,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
+        _dotProductModule = CompileKernelModule(device, CudaDotProductKernels.GetSource(), "dot_product_kernels", CudaDotProductKernels.GetKernelNames());
 
         // Compile Locally Connected kernels (unique weights per spatial position)
         _locallyConnectedModule = CompileKernelModule(device, CudaLocallyConnectedKernels.GetSource(), "locally_connected_kernels", CudaLocallyConnectedKernels.GetKernelNames());
@@ -4682,6 +4684,54 @@ public sealed class CudaBackend : IAsyncGpuBackend
     #endregion
 
 
+    #region Dot Product Operations
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    {
+        using var _ = PushContext();
+
+        // Zero the result buffer first (atomicAdd accumulates)
+        CudaNativeBindings.cuMemsetD32(result.DevicePointer, 0, 1);
+
+        int blockSize = 256;
+        int gridSize = Math.Min((size + blockSize - 1) / blockSize, 256);
+
+        LaunchKernel(_dotProductModule, "dot_product",
+            gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero,
+            a.DevicePointer, b.DevicePointer, result.DevicePointer, size);
+    }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+    {
+        using var _ = PushContext();
+
+        CudaNativeBindings.cuMemsetD32(result.DevicePointer, 0, 1);
+
+        int blockSize = 256;
+        int gridSize = Math.Min((aSize + blockSize - 1) / blockSize, 256);
+
+        LaunchKernel(_dotProductModule, "strided_dot_product",
+            gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero,
+            a.DevicePointer, b.DevicePointer, result.DevicePointer,
+            aSize, bSize, bOffset, bStride);
+    }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+    {
+        using var _ = PushContext();
+
+        int blockSize = Math.Min(256, vecSize);
+
+        LaunchKernel(_dotProductModule, "batched_dot_product",
+            1, batchSize, 1, blockSize, 1, 1, 0, IntPtr.Zero,
+            a.DevicePointer, b.DevicePointer, result.DevicePointer,
+            batchSize, vecSize);
+    }
+
+    #endregion
+
     #region Attention Operations
 
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -8185,38 +8235,263 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        throw new NotImplementedException("Strided copy not implemented for CUDA backend yet.");
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        using var _ = PushContext();
+        // cuMemcpyDtoD with pointer arithmetic for offsets (float = 4 bytes)
+        IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
+        IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
+        ulong byteSize = (ulong)length * sizeof(float);
+        CuBlasNative.CheckCudaResult(
+            CuBlasNative.cuMemcpyDtoD(dstPtr, srcPtr, byteSize),
+            "cuMemcpyDtoD(strided)");
     }
 
-    public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        throw new NotImplementedException("ArgMaxAxis not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
+
+        using var _ = PushContext();
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize;
+        int reduceSizeVal = reduceSize;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPtr;
+        args[1] = &indicesPtr;
+        args[2] = &outerSizeVal;
+        args[3] = &reduceSizeVal;
+        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
+    public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomUniform not implemented for CUDA backend yet.");
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        // Generate on CPU and upload — cuRAND requires separate library linkage
+        using var _ = PushContext();
+        var rng = new Random((int)(seed & 0x7FFFFFFF));
+        float range = max - min;
+        var data = new float[size];
+        for (int i = 0; i < size; i++)
+            data[i] = (float)(rng.NextDouble() * range + min);
+
+        unsafe
+        {
+            fixed (float* src = data)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)src, (ulong)size * sizeof(float)),
+                    "cuMemcpyHtoD(RandomUniform)");
+            }
+        }
     }
 
-    public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
+    public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomNormal not implemented for CUDA backend yet.");
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        // Generate on CPU and upload — cuRAND requires separate library linkage
+        using var _ = PushContext();
+        var rng = new Random((int)(seed & 0x7FFFFFFF));
+        var data = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            // Box-Muller transform for normal distribution
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = rng.NextDouble();
+            double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            data[i] = (float)(mean + stdDev * z);
+        }
+
+        fixed (float* src = data)
+        {
+            CuBlasNative.CheckCudaResult(
+                CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)src, (ulong)size * sizeof(float)),
+                "cuMemcpyHtoD(RandomNormal)");
+        }
     }
 
-    public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
+    public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
-        throw new NotImplementedException("RbfForward not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
+        {
+            // Fallback: download, compute on CPU, upload
+            float[] inputData = DownloadBuffer(input);
+            float[] centersData = DownloadBuffer(centers);
+            float[] epsilonsData = DownloadBuffer(epsilons);
+            float[] result = new float[batchSize * numCenters];
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                for (int c = 0; c < numCenters; c++)
+                {
+                    float distSq = 0;
+                    for (int d = 0; d < inputDim; d++)
+                    {
+                        float diff = inputData[b * inputDim + d] - centersData[c * inputDim + d];
+                        distSq += diff * diff;
+                    }
+                    result[b * numCenters + c] = MathF.Exp(-epsilonsData[c] * distSq);
+                }
+            }
+
+            using var _ = PushContext();
+            fixed (float* src = result)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(output.Handle, (IntPtr)src, (ulong)(batchSize * numCenters) * sizeof(float)),
+                    "cuMemcpyHtoD(RbfForward)");
+            }
+            return;
+        }
+
+        using var ctx = PushContext();
+        IntPtr inputPtr = input.Handle;
+        IntPtr centersPtr = centers.Handle;
+        IntPtr epsilonsPtr = epsilons.Handle;
+        IntPtr outputPtr = output.Handle;
+        int batchSizeVal = batchSize;
+        int numCentersVal = numCenters;
+        int inputDimVal = inputDim;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPtr;
+        args[1] = &centersPtr;
+        args[2] = &epsilonsPtr;
+        args[3] = &outputPtr;
+        args[4] = &batchSizeVal;
+        args[5] = &numCentersVal;
+        args[6] = &inputDimVal;
+        uint totalWork = (uint)(batchSize * numCenters);
+        uint grid = (totalWork + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
+    public unsafe void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
-        throw new NotImplementedException("StdpUpdate not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("stdp_update", out var kernel))
+        {
+            // Fallback: download, compute on CPU, upload
+            float[] w = DownloadBuffer(weights);
+            float[] preT = DownloadBuffer(preTrace);
+            float[] postT = DownloadBuffer(postTrace);
+            float[] preS = DownloadBuffer(preSpike);
+            float[] postS = DownloadBuffer(postSpike);
+
+            for (int i = 0; i < numPre; i++)
+            {
+                for (int j = 0; j < numPost; j++)
+                {
+                    int idx = i * numPost + j;
+                    float dw = 0;
+                    // LTP: pre fires before post
+                    if (preS[i] > 0.5f && postT[j] > 0)
+                        dw += ltpRate * postT[j];
+                    // LTD: post fires before pre
+                    if (postS[j] > 0.5f && preT[i] > 0)
+                        dw -= ltdRate * preT[i];
+                    // Homeostasis: pull toward center of range
+                    float center = (minWeight + maxWeight) * 0.5f;
+                    dw += homeostasisRate * (center - w[idx]);
+                    w[idx] = Math.Clamp(w[idx] + dw, minWeight, maxWeight);
+                }
+            }
+
+            using var _ = PushContext();
+            fixed (float* src = w)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(weights.Handle, (IntPtr)src, (ulong)(numPre * numPost) * sizeof(float)),
+                    "cuMemcpyHtoD(StdpUpdate)");
+            }
+            return;
+        }
+
+        using var ctx = PushContext();
+        IntPtr wPtr = weights.Handle;
+        IntPtr preTPtr = preTrace.Handle;
+        IntPtr postTPtr = postTrace.Handle;
+        IntPtr preSPtr = preSpike.Handle;
+        IntPtr postSPtr = postSpike.Handle;
+        int numPreVal = numPre;
+        int numPostVal = numPost;
+        void** args = stackalloc void*[12];
+        args[0] = &wPtr;
+        args[1] = &preTPtr;
+        args[2] = &postTPtr;
+        args[3] = &preSPtr;
+        args[4] = &postSPtr;
+        args[5] = &ltpRate;
+        args[6] = &ltdRate;
+        args[7] = &homeostasisRate;
+        args[8] = &minWeight;
+        args[9] = &maxWeight;
+        args[10] = &numPreVal;
+        args[11] = &numPostVal;
+        uint totalWork = (uint)(numPre * numPost);
+        uint grid = (totalWork + DefaultBlockSize - 1) / DefaultBlockSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
+    public unsafe void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
-        throw new NotImplementedException("UpdateTraces not implemented for CUDA backend yet.");
+        if (!_kernelCache.TryGetValue("update_traces", out var kernel))
+        {
+            // Fallback: download, compute on CPU, upload
+            float[] t = DownloadBuffer(traces);
+            float[] s = DownloadBuffer(spikes);
+            float[] inp = DownloadBuffer(input);
+
+            for (int i = 0; i < size; i++)
+            {
+                t[i] = decay * t[i];
+                if (inp[i] > threshold)
+                {
+                    s[i] = 1.0f;
+                    t[i] += 1.0f;
+                }
+                else
+                {
+                    s[i] = 0.0f;
+                }
+            }
+
+            using var _ = PushContext();
+            fixed (float* src = t)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(traces.Handle, (IntPtr)src, (ulong)size * sizeof(float)),
+                    "cuMemcpyHtoD(UpdateTraces)");
+            }
+            fixed (float* src = s)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CuBlasNative.cuMemcpyHtoD(spikes.Handle, (IntPtr)src, (ulong)size * sizeof(float)),
+                    "cuMemcpyHtoD(UpdateTraces-spikes)");
+            }
+            return;
+        }
+
+        using var ctx = PushContext();
+        IntPtr tracesPtr = traces.Handle;
+        IntPtr spikesPtr = spikes.Handle;
+        IntPtr inputPtr = input.Handle;
+        int sizeVal = size;
+        void** args = stackalloc void*[6];
+        args[0] = &tracesPtr;
+        args[1] = &spikesPtr;
+        args[2] = &inputPtr;
+        args[3] = &decay;
+        args[4] = &threshold;
+        args[5] = &sizeVal;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     #endregion

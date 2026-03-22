@@ -2648,4 +2648,155 @@ kernel void dropout_mask(
 ";
 
     #endregion
+
+    #region Dot Product Kernels
+
+    /// <summary>
+    /// Metal compute kernels for dot product operations using parallel reduction.
+    /// </summary>
+    public const string DotProductKernels = CommonHeader + @"
+
+constant uint DOT_THREADGROUP_SIZE = 256;
+
+// Dot product: result = sum(A[i] * B[i])
+// Uses threadgroup reduction to compute partial sums per threadgroup,
+// then a second pass reduces across threadgroups.
+kernel void dot_product(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* partialSums [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    float sum = 0.0f;
+    for (uint i = gid; i < size; i += group_size * gridDim.x) {
+        sum += A[i] * B[i];
+    }
+    shared[lid] = sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        partialSums[group_id] = shared[0];
+    }
+}
+
+// Strided dot product: result = sum(A[i] * B[bOffset + i * bStride])
+kernel void strided_dot_product(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* partialSums [[buffer(2)]],
+    constant uint& aSize [[buffer(3)]],
+    constant uint& bSize [[buffer(4)]],
+    constant int& bOffset [[buffer(5)]],
+    constant int& bStride [[buffer(6)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    float sum = 0.0f;
+    for (uint i = gid; i < aSize; i += group_size * gridDim.x) {
+        int bIdx = bOffset + int(i) * bStride;
+        if (bIdx >= 0 && uint(bIdx) < bSize) {
+            sum += A[i] * B[bIdx];
+        }
+    }
+    shared[lid] = sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        partialSums[group_id] = shared[0];
+    }
+}
+
+// Batched dot product: result[batch] = sum(A[batch*vecSize + i] * B[batch*vecSize + i])
+kernel void batched_dot_product(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* result [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& vecSize [[buffer(4)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint batchIdx = gid.y;
+    if (batchIdx >= batchSize) return;
+
+    device const float* aRow = A + batchIdx * vecSize;
+    device const float* bRow = B + batchIdx * vecSize;
+
+    float sum = 0.0f;
+    for (uint i = lid; i < vecSize; i += group_size) {
+        sum += aRow[i] * bRow[i];
+    }
+    shared[lid] = sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        result[batchIdx] = shared[0];
+    }
+}
+
+// Final reduction: reduces partial sums from dot_product/strided_dot_product
+kernel void reduce_partial_sums(
+    device const float* partialSums [[buffer(0)]],
+    device float* result [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += group_size) {
+        sum += partialSums[i];
+    }
+    shared[lid] = sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid == 0) {
+        result[0] = shared[0];
+    }
+}
+";
+
+    #endregion
 }

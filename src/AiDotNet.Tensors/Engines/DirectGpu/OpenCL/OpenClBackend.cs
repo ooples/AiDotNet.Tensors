@@ -257,6 +257,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, fusedProgram, name);
                 }
 
+                // Compile dot product kernels
+                var dotProductProgram = CompileOrLoadCached(DotProductKernels.GetSource(), optimizationFlags, "DotProduct kernels");
+                _programs.Add(dotProductProgram);
+                foreach (var name in DotProductKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, dotProductProgram, name);
+                }
+
                 // Compile reduction kernels
                 var reductionProgram = CompileOrLoadCached(ReductionKernels.GetSource(), optimizationFlags, "Reduction kernels");
                 _programs.Add(reductionProgram);
@@ -2369,6 +2377,99 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         {
             ExecuteElementwise("max_vectors", A, B, C, size);
+        }
+
+        public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (size <= 0) return;
+
+            var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
+            var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
+            var bufR = ((DirectOpenClGpuBuffer)result).Buffer;
+
+            int localSize = 256;
+            int numGroups = Math.Min((size + localSize - 1) / localSize, 256);
+
+            // Allocate partial sums buffer
+            using var partialBuf = _context.AllocateBuffer<float>(numGroups);
+
+            // Pass 1: dot product partial sums
+            var kernel = _kernelCache["dot_product"];
+            kernel.SetArg(0, bufA.Handle);
+            kernel.SetArg(1, bufB.Handle);
+            kernel.SetArg(2, partialBuf.Handle);
+            kernel.SetArg(3, size);
+            kernel.SetLocalArg(4, localSize * sizeof(float));
+            kernel.Execute1D(numGroups * localSize, localSize);
+
+            // Pass 2: reduce partial sums
+            var reduceKernel = _kernelCache["reduce_partial_sums"];
+            reduceKernel.SetArg(0, partialBuf.Handle);
+            reduceKernel.SetArg(1, bufR.Handle);
+            reduceKernel.SetArg(2, numGroups);
+            reduceKernel.SetLocalArg(3, Math.Min(localSize, numGroups) * sizeof(float));
+            reduceKernel.Execute1D(Math.Min(localSize, numGroups), Math.Min(localSize, numGroups));
+        }
+
+        public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+            int aSize, int bSize, int bOffset, int bStride)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (aSize <= 0) return;
+
+            var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
+            var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
+            var bufR = ((DirectOpenClGpuBuffer)result).Buffer;
+
+            int localSize = 256;
+            int numGroups = Math.Min((aSize + localSize - 1) / localSize, 256);
+
+            using var partialBuf = _context.AllocateBuffer<float>(numGroups);
+
+            var kernel = _kernelCache["strided_dot_product"];
+            kernel.SetArg(0, bufA.Handle);
+            kernel.SetArg(1, bufB.Handle);
+            kernel.SetArg(2, partialBuf.Handle);
+            kernel.SetArg(3, aSize);
+            kernel.SetArg(4, bSize);
+            kernel.SetArg(5, bOffset);
+            kernel.SetArg(6, bStride);
+            kernel.SetLocalArg(7, localSize * sizeof(float));
+            kernel.Execute1D(numGroups * localSize, localSize);
+
+            var reduceKernel = _kernelCache["reduce_partial_sums"];
+            reduceKernel.SetArg(0, partialBuf.Handle);
+            reduceKernel.SetArg(1, bufR.Handle);
+            reduceKernel.SetArg(2, numGroups);
+            reduceKernel.SetLocalArg(3, Math.Min(localSize, numGroups) * sizeof(float));
+            reduceKernel.Execute1D(Math.Min(localSize, numGroups), Math.Min(localSize, numGroups));
+        }
+
+        public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+            int batchSize, int vecSize)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (batchSize <= 0 || vecSize <= 0) return;
+
+            var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
+            var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
+            var bufR = ((DirectOpenClGpuBuffer)result).Buffer;
+
+            int localSize = Math.Min(256, vecSize);
+
+            var kernel = _kernelCache["batched_dot_product"];
+            kernel.SetArg(0, bufA.Handle);
+            kernel.SetArg(1, bufB.Handle);
+            kernel.SetArg(2, bufR.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, vecSize);
+            kernel.SetLocalArg(5, localSize * sizeof(float));
+            // 2D dispatch: localSize threads per batch, batchSize groups in Y
+            kernel.Execute2D(localSize, batchSize, localSize, 1);
         }
 
         public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)

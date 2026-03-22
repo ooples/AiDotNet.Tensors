@@ -1581,4 +1581,22 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     }
 
     #endregion
+
+    #region Dot Product Operations
+
+    public virtual void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+        => Inner.DotProduct(a, b, result, size);
+
+    public virtual void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+        => Inner.StridedDotProduct(a, b, result, aSize, bSize, bOffset, bStride);
+
+    public virtual void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+        => Inner.BatchedDotProduct(a, b, result, batchSize, vecSize);
+
+    #endregion
+
+    // Note: DotProduct operations use default interface implementations on IDirectGpuBackend
+    // unless overridden by the inner backend (e.g., CudaBackend has real CUDA kernels).
 }
