@@ -1690,7 +1690,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 // GroupNorm then Swish (sigmoid * x)
                 gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
@@ -1730,7 +1730,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Add then GroupNorm
                 gpuBackend.Add(gpuA, gpuB, gpuSum, a.Length);
                 gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }

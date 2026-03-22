@@ -11,8 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 internal static class ShadercNativeBindings
 {
     // shaderc ships as shaderc_shared.dll (Windows), libshaderc_shared.so (Linux), libshaderc_shared.dylib (macOS)
+    // .NET DllImport auto-prepends "lib" and appends ".so"/".dylib" on non-Windows platforms
     private const string ShadercWindows = "shaderc_shared";
-    private const string ShadercLinux = "libshaderc_shared";
+    private const string ShadercLinux = "shaderc_shared";
 
     // Shader kind for compute shaders
     public const int shaderc_compute_shader = 5;

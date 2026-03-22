@@ -44,21 +44,24 @@ __kernel void reglu_forward(__global const float* input, __global float* output,
     int idx = get_global_id(0); int total = outerSize * halfDim; if (idx >= total) return;
     int outer = idx / halfDim; int d = idx % halfDim; int fullDim = halfDim * 2;
     float value = input[outer * fullDim + d]; float gate = input[outer * fullDim + halfDim + d];
-    output[idx] = fmax(value, 0.0f) * gate;
+    // ReGLU: output = value * ReLU(gate)
+    output[idx] = value * fmax(gate, 0.0f);
 }
 __kernel void reglu_backward(__global const float* grad_output, __global const float* input, __global float* grad_input, int outerSize, int halfDim) {
     int idx = get_global_id(0); int total = outerSize * halfDim; if (idx >= total) return;
     int outer = idx / halfDim; int d = idx % halfDim; int fullDim = halfDim * 2;
     float value = input[outer * fullDim + d]; float gate = input[outer * fullDim + halfDim + d]; float grad = grad_output[idx];
-    grad_input[outer * fullDim + d] = grad * gate * ((value > 0.0f) ? 1.0f : 0.0f);
-    grad_input[outer * fullDim + halfDim + d] = grad * fmax(value, 0.0f);
+    // d/d_value = ReLU(gate), d/d_gate = value * (gate > 0 ? 1 : 0)
+    grad_input[outer * fullDim + d] = grad * fmax(gate, 0.0f);
+    grad_input[outer * fullDim + halfDim + d] = grad * value * ((gate > 0.0f) ? 1.0f : 0.0f);
 }
 __kernel void swiglu_forward(__global const float* input, __global float* output, int outerSize, int halfDim) {
     int idx = get_global_id(0); int total = outerSize * halfDim; if (idx >= total) return;
     int outer = idx / halfDim; int d = idx % halfDim; int fullDim = halfDim * 2;
     float value = input[outer * fullDim + d]; float gate = input[outer * fullDim + halfDim + d];
-    float sig = 1.0f / (1.0f + exp(-value));
-    output[idx] = value * sig * gate;
+    // SwiGLU: output = value * SiLU(gate) = value * gate * sigmoid(gate)
+    float sig = 1.0f / (1.0f + exp(-gate));
+    output[idx] = value * gate * sig;
 }
 __kernel void swiglu_backward(__global const float* grad_output, __global const float* input, __global float* grad_input, int outerSize, int halfDim) {
     int idx = get_global_id(0); int total = outerSize * halfDim; if (idx >= total) return;

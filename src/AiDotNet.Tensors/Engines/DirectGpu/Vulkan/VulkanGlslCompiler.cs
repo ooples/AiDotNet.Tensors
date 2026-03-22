@@ -95,7 +95,10 @@ internal sealed class VulkanGlslCompiler : IDisposable
 
             int wordCount = (int)byteLength / sizeof(uint);
             var spirv = new uint[wordCount];
-            Marshal.Copy(bytesPtr, (int[])(object)spirv, 0, wordCount);
+            int byteLen = (int)(ulong)byteLength;
+            var byteArray = new byte[byteLen];
+            Marshal.Copy(bytesPtr, byteArray, 0, byteLen);
+            Buffer.BlockCopy(byteArray, 0, spirv, 0, byteLen);
 
             _cache.TryAdd(glslSource, spirv);
             return spirv;

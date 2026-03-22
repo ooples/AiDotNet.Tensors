@@ -7610,7 +7610,7 @@ fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
     public const string GatedActivationSource = @"
 @group(0) @binding(0) var<storage, read> ga_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> ga_output: array<f32>;
-struct GaParams { outer_size: u32, half_dim: u32 }
+struct GaParams { outer_size: u32, half_dim: u32, }
 @group(0) @binding(2) var<uniform> ga_params: GaParams;
 
 @compute @workgroup_size(256)
@@ -7634,9 +7634,10 @@ fn geglu_forward(@builtin(global_invocation_id) gid: vec3u) {
     let full_dim = ga_params.half_dim * 2u;
     let value = ga_input[outer * full_dim + d];
     let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
-    let x3 = value * value * value;
-    let gelu = 0.5 * value * (1.0 + tanh(0.7978845608 * (value + 0.044715 * x3)));
-    ga_output[idx] = gelu * gate;
+    // GEGLU: output = value * GELU(gate)
+    let g3 = gate * gate * gate;
+    let gelu_gate = 0.5 * gate * (1.0 + tanh(0.7978845608 * (gate + 0.044715 * g3)));
+    ga_output[idx] = value * gelu_gate;
 }
 
 @compute @workgroup_size(256)
@@ -7648,7 +7649,8 @@ fn reglu_forward(@builtin(global_invocation_id) gid: vec3u) {
     let full_dim = ga_params.half_dim * 2u;
     let value = ga_input[outer * full_dim + d];
     let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
-    ga_output[idx] = max(value, 0.0) * gate;
+    // ReGLU: output = value * ReLU(gate)
+    ga_output[idx] = value * max(gate, 0.0);
 }
 
 @compute @workgroup_size(256)
@@ -7660,8 +7662,9 @@ fn swiglu_forward(@builtin(global_invocation_id) gid: vec3u) {
     let full_dim = ga_params.half_dim * 2u;
     let value = ga_input[outer * full_dim + d];
     let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
-    let sig = 1.0 / (1.0 + exp(-value));
-    ga_output[idx] = value * sig * gate;
+    // SwiGLU: output = value * SiLU(gate)
+    let sig = 1.0 / (1.0 + exp(-gate));
+    ga_output[idx] = value * gate * sig;
 }
 
 @compute @workgroup_size(256)
@@ -7695,7 +7698,7 @@ fn tanh_derivative(@builtin(global_invocation_id) gid: vec3u) {
     public const string SoftmaxVariantsSource = @"
 @group(0) @binding(0) var<storage, read> sv_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> sv_output: array<f32>;
-struct SvParams { outer_size: u32, inner_size: u32 }
+struct SvParams { outer_size: u32, inner_size: u32, }
 @group(0) @binding(2) var<uniform> sv_params: SvParams;
 
 @compute @workgroup_size(256)
@@ -7704,11 +7707,11 @@ fn log_softmax(@builtin(global_invocation_id) gid: vec3u) {
     if (row >= sv_params.outer_size) { return; }
     let base = row * sv_params.inner_size;
     var max_val: f32 = -1e38;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { max_val = max(max_val, sv_input[base + j]); }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { max_val = max(max_val, sv_input[base + j]); }
     var sum_exp: f32 = 0.0;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sum_exp += exp(sv_input[base + j] - max_val); }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sum_exp += exp(sv_input[base + j] - max_val); }
     let log_sum = log(sum_exp);
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sv_output[base + j] = sv_input[base + j] - max_val - log_sum; }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] = sv_input[base + j] - max_val - log_sum; }
 }
 
 @compute @workgroup_size(256)
@@ -7717,12 +7720,12 @@ fn taylor_softmax(@builtin(global_invocation_id) gid: vec3u) {
     if (row >= sv_params.outer_size) { return; }
     let base = row * sv_params.inner_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) {
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) {
         let x = sv_input[base + j]; let t = max(1.0 + x + 0.5 * x * x, 1e-10);
         sv_output[base + j] = t; sum += t;
     }
     let inv = 1.0 / sum;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sv_output[base + j] *= inv; }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] *= inv; }
 }
 ";
 
@@ -7733,7 +7736,7 @@ fn taylor_softmax(@builtin(global_invocation_id) gid: vec3u) {
     public const string ShapeOpsSource = @"
 @group(0) @binding(0) var<storage, read> shape_a: array<f32>;
 @group(0) @binding(1) var<storage, read_write> shape_out: array<f32>;
-struct ShapeParams { outer_size: u32, inner_size_a: u32, inner_size_b: u32, extra: u32 }
+struct ShapeParams { outer_size: u32, inner_size_a: u32, inner_size_b: u32, extra: u32, }
 @group(0) @binding(2) var<uniform> shape_params: ShapeParams;
 
 @compute @workgroup_size(256)
@@ -7776,7 +7779,7 @@ fn diag_kernel(@builtin(global_invocation_id) gid: vec3u) {
     public const string ReductionExtSource = @"
 @group(0) @binding(0) var<storage, read> rext_input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> rext_output: array<f32>;
-struct RextParams { outer_size: u32, reduce_size: u32 }
+struct RextParams { outer_size: u32, reduce_size: u32, }
 @group(0) @binding(2) var<uniform> rext_params: RextParams;
 
 @compute @workgroup_size(256)
@@ -7785,7 +7788,7 @@ fn mean_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     rext_output[idx] = sum / f32(rext_params.reduce_size);
 }
 
@@ -7795,10 +7798,10 @@ fn variance_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     let mean = sum / f32(rext_params.reduce_size);
     var var_sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
     rext_output[idx] = var_sum / f32(rext_params.reduce_size);
 }
 
@@ -7808,10 +7811,10 @@ fn std_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     let mean = sum / f32(rext_params.reduce_size);
     var var_sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
     rext_output[idx] = sqrt(var_sum / f32(rext_params.reduce_size));
 }
 
@@ -7821,7 +7824,7 @@ fn norm_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum_sq: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let v = rext_input[base + j]; sum_sq += v * v; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let v = rext_input[base + j]; sum_sq += v * v; }
     rext_output[idx] = sqrt(sum_sq);
 }
 
@@ -7831,9 +7834,9 @@ fn logsumexp_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var max_val: f32 = -1e38;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { max_val = max(max_val, rext_input[base + j]); }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { max_val = max(max_val, rext_input[base + j]); }
     var sum_exp: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum_exp += exp(rext_input[base + j] - max_val); }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum_exp += exp(rext_input[base + j] - max_val); }
     rext_output[idx] = max_val + log(sum_exp);
 }
 
@@ -7843,7 +7846,7 @@ fn cumsum_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var running: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { running += rext_input[base + j]; rext_output[base + j] = running; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { running += rext_input[base + j]; rext_output[base + j] = running; }
 }
 
 @compute @workgroup_size(256)
@@ -7852,7 +7855,7 @@ fn product_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var prod: f32 = 1.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { prod *= rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { prod *= rext_input[base + j]; }
     rext_output[idx] = prod;
 }
 ";
