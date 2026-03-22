@@ -3,33 +3,45 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend
 {
-    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { var d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]; UploadWebGpu(new[]{s/sz}, o); }
-    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { var d=DownloadBuffer(i); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=Math.Min(Math.Max(d[j],mn),mx); UploadWebGpu(r,o); }
-    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { var d=DownloadBuffer(i); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=MathF.Pow(d[j],ex); UploadWebGpu(r,o); }
-    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { var d=DownloadBuffer(i); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]-MathF.Floor(d[j]); UploadWebGpu(r,o); }
-    public void EyeKernel(IGpuBuffer o, int n) { var r=new float[n*n]; for(int j=0;j<n;j++) r[j*n+j]=1f; UploadWebGpu(r,o); }
-    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { var id=DownloadBuffer(idx); var r=new float[bs*nc]; for(int b=0;b<bs;b++) r[b*nc+(int)id[b]]=1f; UploadWebGpu(r,o); }
-    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { var d=DownloadBuffer(i); var md=DownloadBuffer(m); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=md[j]!=0?fv:d[j]; UploadWebGpu(r,o); }
-    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { var ad=DownloadBuffer(a); var bd=DownloadBuffer(b); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=ad[j]==bd[j]?1f:0f; UploadWebGpu(r,o); }
-    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { var ad=DownloadBuffer(a); var bd=DownloadBuffer(b); var r=new float[sz]; for(int j=0;j<sz;j++) r[j]=ad[j]!=bd[j]?1f:0f; UploadWebGpu(r,o); }
-    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { var ad=DownloadBuffer(a); var bd=DownloadBuffer(b); var r=new float[M*N]; for(int i2=0;i2<M;i2++) for(int j=0;j<N;j++) r[i2*N+j]=ad[i2]*bd[j]; UploadWebGpu(r,o); }
-    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { var ad=DownloadBuffer(a); var bd=DownloadBuffer(b); var r=new float[bs]; for(int i2=0;i2<bs;i2++){float s=0;for(int j=0;j<dim;j++)s+=ad[i2*dim+j]*bd[i2*dim+j];r[i2]=s;} UploadWebGpu(r,o); }
-    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { var d=DownloadBuffer(i); var r=new float[os*hd]; int fd=hd*2; for(int j=0;j<os;j++) for(int k=0;k<hd;k++){float v=d[j*fd+k];float g=d[j*fd+hd+k];r[j*hd+k]=v*(1f/(1f+MathF.Exp(-g)));} UploadWebGpu(r,o); }
-    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { var d=DownloadBuffer(i); var r=new float[os*hd]; int fd=hd*2; for(int j=0;j<os;j++) for(int k=0;k<hd;k++){float v=d[j*fd+k];float g=d[j*fd+hd+k];float x3=v*v*v;r[j*hd+k]=0.5f*v*(1f+MathF.Tanh(0.7978845608f*(v+0.044715f*x3)))*g;} UploadWebGpu(r,o); }
-    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { var d=DownloadBuffer(i); var r=new float[os*hd]; int fd=hd*2; for(int j=0;j<os;j++) for(int k=0;k<hd;k++) r[j*hd+k]=Math.Max(d[j*fd+k],0f)*d[j*fd+hd+k]; UploadWebGpu(r,o); }
-    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { var d=DownloadBuffer(i); var r=new float[os*hd]; int fd=hd*2; for(int j=0;j<os;j++) for(int k=0;k<hd;k++){float v=d[j*fd+k];float sig=1f/(1f+MathF.Exp(-v));r[j*hd+k]=v*sig*d[j*fd+hd+k];} UploadWebGpu(r,o); }
-    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { var pd=DownloadBuffer(p); var td=DownloadBuffer(t); var r=new float[sz]; for(int j=0;j<sz;j++){float pc=Math.Min(Math.Max(pd[j],1e-7f),1f-1e-7f);r[j]=-(td[j]*MathF.Log(pc)+(1f-td[j])*MathF.Log(1f-pc));} UploadWebGpu(r,l); }
+    // WebGPU fused kernel dispatch via WGSL compute pipelines.
+    // Dispatch2BufferAsync(module, source, kernel, inputBuf, outputBuf, uniforms, workSize)
 
-    private void UploadWebGpu(float[] data, IGpuBuffer buffer)
-    {
-        if (buffer is WebGpuBuffer wb)
-            wb.CopyFrom(data);
-    }
-    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]+sc; UploadWebGpu(r,o); }
-    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]-sc; UploadWebGpu(r,o); }
-    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]+bd[j%isz]; UploadWebGpu(r,o); }
-    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]-bd[j%isz]; UploadWebGpu(r,o); }
-    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]*bd[j%isz]; UploadWebGpu(r,o); }
-    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]/(bd[j%isz]+1e-12f); UploadWebGpu(r,o); }
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz)
+    { try { Dispatch2BufferAsync("ReductionExt", WebGpuKernels.ReductionExtSource, "mean_axis", i, o, new float[]{BitConverter.Int32BitsToSingle(1),BitConverter.Int32BitsToSingle(sz),0,0}, 1).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++)s+=d[j]; ((WebGpuBuffer)o).CopyFrom(new[]{s/sz}); } }
+    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz)
+    { try { Dispatch2BufferAsync("UnaryMath", WebGpuKernels.UnaryMathSource, "clip_op", i, o, new float[]{mn,mx,BitConverter.Int32BitsToSingle(sz),0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=Math.Min(Math.Max(d[j],mn),mx);((WebGpuBuffer)o).CopyFrom(r); } }
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz)
+    { try { Dispatch2BufferAsync("ScalarOps", WebGpuKernels.ScalarOpsSource, "pow_op", i, o, new float[]{ex,0,BitConverter.Int32BitsToSingle(sz),0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=MathF.Pow(d[j],ex);((WebGpuBuffer)o).CopyFrom(r); } }
+    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz)
+    { try { Dispatch2BufferAsync("UnaryMath", WebGpuKernels.UnaryMathSource, "frac_op", i, o, new float[]{BitConverter.Int32BitsToSingle(sz),0,0,0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]-MathF.Floor(d[j]);((WebGpuBuffer)o).CopyFrom(r); } }
+    public void EyeKernel(IGpuBuffer o, int n) { float[] r=new float[n*n]; for(int j=0;j<n;j++) r[j*n+j]=1f; ((WebGpuBuffer)o).CopyFrom(r); }
+    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { float[] id=DownloadBuffer(idx); float[] r=new float[bs*nc]; for(int b=0;b<bs;b++) r[b*nc+(int)id[b]]=1f; ((WebGpuBuffer)o).CopyFrom(r); }
+    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { float[] d=DownloadBuffer(i); float[] md=DownloadBuffer(m); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=md[j]!=0?fv:d[j]; ((WebGpuBuffer)o).CopyFrom(r); }
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz)
+    { try { Dispatch2BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "eq_op", a, o, new float[]{BitConverter.Int32BitsToSingle(sz),0,0,0}, sz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]==bd[j]?1f:0f;((WebGpuBuffer)o).CopyFrom(r); } }
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz)
+    { try { Dispatch2BufferAsync("Comparison", WebGpuKernels.ComparisonSource, "neq_op", a, o, new float[]{BitConverter.Int32BitsToSingle(sz),0,0,0}, sz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=ad[j]!=bd[j]?1f:0f;((WebGpuBuffer)o).CopyFrom(r); } }
+    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[M*N]; for(int i2=0;i2<M;i2++) for(int j=0;j<N;j++) r[i2*N+j]=ad[i2]*bd[j]; ((WebGpuBuffer)o).CopyFrom(r); }
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[bs]; for(int i2=0;i2<bs;i2++){float s=0;for(int j=0;j<dim;j++)s+=ad[i2*dim+j]*bd[i2*dim+j];r[i2]=s;} ((WebGpuBuffer)o).CopyFrom(r); }
+    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd)
+    { try { Dispatch2BufferAsync("GatedActivation", WebGpuKernels.GatedActivationSource, "glu_forward", i, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(hd),0,0}, os*hd).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int k=0;k<hd;k++){float v=d[j*fd+k];float g=d[j*fd+hd+k];r[j*hd+k]=v*(1f/(1f+MathF.Exp(-g)));}((WebGpuBuffer)o).CopyFrom(r); } }
+    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd)
+    { try { Dispatch2BufferAsync("GatedActivation", WebGpuKernels.GatedActivationSource, "geglu_forward", i, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(hd),0,0}, os*hd).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int k=0;k<hd;k++){float v=d[j*fd+k];float g=d[j*fd+hd+k];float x3=v*v*v;r[j*hd+k]=0.5f*v*(1f+MathF.Tanh(0.7978845608f*(v+0.044715f*x3)))*g;}((WebGpuBuffer)o).CopyFrom(r); } }
+    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd)
+    { try { Dispatch2BufferAsync("GatedActivation", WebGpuKernels.GatedActivationSource, "reglu_forward", i, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(hd),0,0}, os*hd).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int k=0;k<hd;k++)r[j*hd+k]=Math.Max(d[j*fd+k],0f)*d[j*fd+hd+k];((WebGpuBuffer)o).CopyFrom(r); } }
+    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd)
+    { try { Dispatch2BufferAsync("GatedActivation", WebGpuKernels.GatedActivationSource, "swiglu_forward", i, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(hd),0,0}, os*hd).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[os*hd];int fd=hd*2;for(int j=0;j<os;j++)for(int k=0;k<hd;k++){float v=d[j*fd+k];float sig=1f/(1f+MathF.Exp(-v));r[j*hd+k]=v*sig*d[j*fd+hd+k];}((WebGpuBuffer)o).CopyFrom(r); } }
+    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz)
+    { try { Dispatch2BufferAsync("Loss", WebGpuKernels.LossSource, "bce_op", p, l, new float[]{BitConverter.Int32BitsToSingle(sz),0,0,0}, sz).GetAwaiter().GetResult(); } catch { float[] pd=DownloadBuffer(p);float[] td=DownloadBuffer(t);float[] r=new float[sz];for(int j=0;j<sz;j++){float pc=Math.Min(Math.Max(pd[j],1e-7f),1f-1e-7f);r[j]=-(td[j]*MathF.Log(pc)+(1f-td[j])*MathF.Log(1f-pc));}((WebGpuBuffer)l).CopyFrom(r); } }
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz)
+    { try { Dispatch2BufferAsync("ScalarOps", WebGpuKernels.ScalarOpsSource, "sub_op", i, o, new float[]{sc,0,BitConverter.Int32BitsToSingle(sz),0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]-sc;((WebGpuBuffer)o).CopyFrom(r); } }
+    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz)
+    { try { Dispatch2BufferAsync("ScalarOps", WebGpuKernels.ScalarOpsSource, "add_op", i, o, new float[]{sc,0,BitConverter.Int32BitsToSingle(sz),0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=d[j]+sc;((WebGpuBuffer)o).CopyFrom(r); } }
+    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz)
+    { try { Dispatch2BufferAsync("Broadcast", WebGpuKernels.BroadcastSource, "broadcast_add", a, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(isz),0,0}, os*isz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]+bd[j%isz];((WebGpuBuffer)o).CopyFrom(r); } }
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]-bd[j%isz];((WebGpuBuffer)o).CopyFrom(r); }
+    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz)
+    { try { Dispatch2BufferAsync("Broadcast", WebGpuKernels.BroadcastSource, "broadcast_mul", a, o, new float[]{BitConverter.Int32BitsToSingle(os),BitConverter.Int32BitsToSingle(isz),0,0}, os*isz).GetAwaiter().GetResult(); } catch { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]*bd[j%isz];((WebGpuBuffer)o).CopyFrom(r); } }
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a);float[] bd=DownloadBuffer(b);float[] r=new float[os*isz];for(int j=0;j<os*isz;j++)r[j]=ad[j]/(bd[j%isz]+1e-12f);((WebGpuBuffer)o).CopyFrom(r); }
 }
 #endif
