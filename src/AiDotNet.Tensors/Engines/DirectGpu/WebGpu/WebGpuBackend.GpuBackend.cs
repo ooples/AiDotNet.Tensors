@@ -266,10 +266,15 @@ public sealed partial class WebGpuBackend
     public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
-        if (batchSize <= 0 || vecSize <= 0) return;
+        if (batchSize <= 0 || vecSize <= 0)
+        {
+            if (batchSize > 0) Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
         long totalElements = (long)batchSize * vecSize;
-        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
-        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
+        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A ({a.Size}).");
+        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B ({b.Size}).");
+        if (batchSize > result.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize ({batchSize}) exceeds result buffer ({result.Size}).");
         if (totalElements > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batchSize), "batchSize*vecSize exceeds int.MaxValue.");
 
         using var temp = AllocateBuffer((int)totalElements);

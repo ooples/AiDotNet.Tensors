@@ -730,6 +730,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         ThrowIfDisposed();
         if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        if (aSize <= 0) { Scale(result, result, 0f, Math.Max(1, result.Size)); return; }
+        if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
+        if (bStride == 0) throw new ArgumentException("bStride must be non-zero.", nameof(bStride));
 
         uint threadgroupSize = 256;
         uint numGroups = (uint)Math.Min((aSize + threadgroupSize - 1) / threadgroupSize, 256);
@@ -775,8 +778,13 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         ThrowIfDisposed();
         if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        if (batchSize <= 0 || vecSize <= 0) return;
+        long totalElements = (long)batchSize * vecSize;
+        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A ({a.Size}).");
+        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B ({b.Size}).");
+        if (batchSize > result.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize ({batchSize}) exceeds result buffer ({result.Size}).");
 
-        uint threadgroupSize = (uint)Math.Min(256, vecSize);
+        uint threadgroupSize = (uint)Math.Max(1, Math.Min(256, vecSize));
 
         var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "batched_dot_product");
         using var encoder = _commandQueue.CreateScopedComputeEncoder();

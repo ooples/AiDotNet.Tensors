@@ -2385,8 +2385,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException("OpenCL context not available");
             if (size <= 0)
             {
-                // Zero result for empty input
-                Scale(result, result, 0f, Math.Max(1, result.Size));
+                ZeroBuffer(result, Math.Max(1, result.Size));
                 return;
             }
             if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
@@ -2426,7 +2425,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-            if (aSize <= 0) return;
+            if (aSize <= 0) { ZeroBuffer(result, Math.Max(1, result.Size)); return; }
+            if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A ({a.Size}).");
+            if (bStride == 0) throw new ArgumentException("bStride must be non-zero.", nameof(bStride));
 
             var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
             var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
@@ -2467,6 +2468,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             long totalElements = (long)batchSize * vecSize;
             if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
             if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
+            if (batchSize > result.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize ({batchSize}) exceeds result buffer ({result.Size}).");
 
             var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
             var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
