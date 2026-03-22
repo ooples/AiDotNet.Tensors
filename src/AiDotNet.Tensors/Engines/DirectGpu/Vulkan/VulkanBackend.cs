@@ -54,6 +54,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private int _batchOwnerThreadId;
     private ThreadCommandResources _batchThreadRes;
     private int _batchDispatchCount;
+    private bool _inSecondaryStream;
+    private ThreadCommandResources _secondaryThreadRes;
 
     /// <summary>
     /// Gets the singleton backend instance.
@@ -732,15 +734,25 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void BeginSecondaryStream()
     {
-        // Vulkan multi-stream requires separate command pools per thread/stream.
-        // Not yet implemented — would need a secondary VkCommandPool + VkQueue.
-        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+        if (_inSecondaryStream)
+            throw new InvalidOperationException("Already in a secondary stream.");
+
+        // Acquire a separate set of thread resources (command pool + command buffer + fence)
+        // for concurrent recording. This allows overlapping compute dispatches.
+        _secondaryThreadRes = _device.AcquireThreadResources();
+        _inSecondaryStream = true;
     }
 
     /// <inheritdoc/>
     public void EndSecondaryStream()
     {
-        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+        if (!_inSecondaryStream)
+            throw new InvalidOperationException("Not in a secondary stream.");
+
+        // Submit the secondary command buffer and wait for completion
+        var cmdBuffer = _secondaryThreadRes.CommandBuffer;
+        _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
+        _inSecondaryStream = false;
     }
 
     /// <summary>
