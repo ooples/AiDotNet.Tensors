@@ -4918,53 +4918,46 @@ public sealed class HipBackend : IAsyncGpuBackend
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
         // Zero result buffer (atomicAdd accumulates)
-        HipNativeBindings.hipMemsetD32(result.DevicePointer, 0, 1);
+        HipNativeBindings.CheckError(
+            HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
 
-        int blockSize = 256;
-        int gridSize = Math.Min((size + blockSize - 1) / blockSize, 256);
-
-        var kernel = GetKernel(_dotProductModule, "dot_product");
-        var args = stackalloc void*[4];
-        var pA = a.DevicePointer; args[0] = &pA;
-        var pB = b.DevicePointer; args[1] = &pB;
-        var pR = result.DevicePointer; args[2] = &pR;
-        args[3] = &size;
-        LaunchKernel(kernel, (uint)gridSize, (uint)blockSize, args);
+        var kernel = _kernelCache["dot_product"];
+        uint gridSize = (uint)Math.Min((size + 255) / 256, 256);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR; args[3] = &size;
+        LaunchKernel(kernel, gridSize, 256, args);
     }
 
     public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
-        HipNativeBindings.hipMemsetD32(result.DevicePointer, 0, 1);
+        HipNativeBindings.CheckError(
+            HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
 
-        int blockSize = 256;
-        int gridSize = Math.Min((aSize + blockSize - 1) / blockSize, 256);
-
-        var kernel = GetKernel(_dotProductModule, "strided_dot_product");
-        var args = stackalloc void*[7];
-        var pA = a.DevicePointer; args[0] = &pA;
-        var pB = b.DevicePointer; args[1] = &pB;
-        var pR = result.DevicePointer; args[2] = &pR;
+        var kernel = _kernelCache["strided_dot_product"];
+        uint gridSize = (uint)Math.Min((aSize + 255) / 256, 256);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR;
         args[3] = &aSize; args[4] = &bSize; args[5] = &bOffset; args[6] = &bStride;
-        LaunchKernel(kernel, (uint)gridSize, (uint)blockSize, args);
+        LaunchKernel(kernel, gridSize, 256, args);
     }
 
     public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
-        int blockSize = Math.Min(256, vecSize);
-        // Use 2D grid: x for parallelism within a vector, y for batch
-        var kernel = GetKernel(_dotProductModule, "batched_dot_product");
-        var args = stackalloc void*[5];
-        var pA = a.DevicePointer; args[0] = &pA;
-        var pB = b.DevicePointer; args[1] = &pB;
-        var pR = result.DevicePointer; args[2] = &pR;
+        var kernel = _kernelCache["batched_dot_product"];
+        uint blockSize = (uint)Math.Min(256, vecSize);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR;
         args[3] = &batchSize; args[4] = &vecSize;
 
-        var result2 = HipNativeBindings.hipModuleLaunchKernel(
-            kernel, 1, (uint)batchSize, 1, (uint)blockSize, 1, 1,
+        var launchResult = HipNativeBindings.hipModuleLaunchKernel(
+            kernel, 1, (uint)batchSize, 1, blockSize, 1, 1,
             0, _stream, (IntPtr)args, IntPtr.Zero);
-        HipNativeBindings.CheckError(result2, "hipModuleLaunchKernel(batched_dot_product)");
+        HipNativeBindings.CheckError(launchResult, "hipModuleLaunchKernel(batched_dot_product)");
     }
 
     #endregion

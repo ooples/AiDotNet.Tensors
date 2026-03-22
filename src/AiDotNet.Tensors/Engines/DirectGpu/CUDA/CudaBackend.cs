@@ -4686,48 +4686,51 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     #region Dot Product Operations
 
-    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
         using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
 
-        // Zero the result buffer first (atomicAdd accumulates)
-        CudaNativeBindings.cuMemsetD32(result.DevicePointer, 0, 1);
+        if (!_kernelCache.TryGetValue("dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: dot_product");
 
-        int blockSize = 256;
-        int gridSize = Math.Min((size + blockSize - 1) / blockSize, 256);
-
-        LaunchKernel(_dotProductModule, "dot_product",
-            gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero,
-            a.DevicePointer, b.DevicePointer, result.DevicePointer, size);
+        uint gridSize = (uint)Math.Min((size + 255) / 256, 256);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR; args[3] = &size;
+        LaunchKernel(kernel, gridSize, DefaultBlockSize, args);
     }
 
-    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
         using var _ = PushContext();
+        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
 
-        CudaNativeBindings.cuMemsetD32(result.DevicePointer, 0, 1);
+        if (!_kernelCache.TryGetValue("strided_dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: strided_dot_product");
 
-        int blockSize = 256;
-        int gridSize = Math.Min((aSize + blockSize - 1) / blockSize, 256);
-
-        LaunchKernel(_dotProductModule, "strided_dot_product",
-            gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero,
-            a.DevicePointer, b.DevicePointer, result.DevicePointer,
-            aSize, bSize, bOffset, bStride);
+        uint gridSize = (uint)Math.Min((aSize + 255) / 256, 256);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR;
+        args[3] = &aSize; args[4] = &bSize; args[5] = &bOffset; args[6] = &bStride;
+        LaunchKernel(kernel, gridSize, DefaultBlockSize, args);
     }
 
-    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+    public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
         using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("batched_dot_product", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: batched_dot_product");
 
-        int blockSize = Math.Min(256, vecSize);
-
-        LaunchKernel(_dotProductModule, "batched_dot_product",
-            1, batchSize, 1, blockSize, 1, 1, 0, IntPtr.Zero,
-            a.DevicePointer, b.DevicePointer, result.DevicePointer,
-            batchSize, vecSize);
+        uint blockSize = (uint)Math.Min(DefaultBlockSize, vecSize);
+        IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pA; args[1] = &pB; args[2] = &pR;
+        args[3] = &batchSize; args[4] = &vecSize;
+        LaunchKernel2D(kernel, 1, (uint)batchSize, blockSize, 1, args);
     }
 
     #endregion
