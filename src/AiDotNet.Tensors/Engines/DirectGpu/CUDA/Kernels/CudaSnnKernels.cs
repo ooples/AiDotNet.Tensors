@@ -129,8 +129,9 @@ extern ""C"" __global__ __launch_bounds__(256) void generate_random_uniform(
     // Philox 2-round counter-based PRNG
     unsigned int counter = (unsigned int)idx;
     unsigned int key = (unsigned int)(seed ^ (seed >> 32));
-    counter = philox_round(counter, key);
-    counter = philox_round(counter, key + 1u);
+    // Standard Philox uses 10 rounds for good statistical properties
+    for (int r = 0; r < 10; r++)
+        counter = philox_round(counter, key + (unsigned int)r);
 
     float u = uint_to_float01(counter);
     output[idx] = minVal + u * (maxVal - minVal);
@@ -143,13 +144,13 @@ extern ""C"" __global__ __launch_bounds__(256) void generate_random_normal(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
 
-    // Two independent Philox rounds for Box-Muller
+    // Two independent Philox streams for Box-Muller, 10 rounds each
     unsigned int key = (unsigned int)(seed ^ (seed >> 32));
 
-    unsigned int c1 = philox_round((unsigned int)(2 * idx), key);
-    c1 = philox_round(c1, key + 1u);
-    unsigned int c2 = philox_round((unsigned int)(2 * idx + 1), key + 2u);
-    c2 = philox_round(c2, key + 3u);
+    unsigned int c1 = (unsigned int)(2 * (unsigned int)idx);
+    for (int r = 0; r < 10; r++) c1 = philox_round(c1, key + (unsigned int)r);
+    unsigned int c2 = (unsigned int)(2 * (unsigned int)idx + 1u);
+    for (int r = 0; r < 10; r++) c2 = philox_round(c2, key + 10u + (unsigned int)r);
 
     float u1 = uint_to_float01(c1);
     float u2 = uint_to_float01(c2);

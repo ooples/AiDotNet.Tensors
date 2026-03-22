@@ -102,8 +102,10 @@ extern ""C"" __global__ __launch_bounds__(256) void sparsemax(
     float* out_row = output + row * innerSize;
 
     // Sort descending using insertion sort (ok for small innerSize typical in classification)
-    // For large innerSize, a parallel sort would be needed
-    float sorted[1024]; // Stack limit — innerSize must be <= 1024
+    // For large innerSize, a parallel sort would be needed.
+    // IMPORTANT: Host code MUST validate innerSize <= 1024 before launching this kernel.
+    // If innerSize > 1024, only the first 1024 elements are considered for tau computation.
+    float sorted[1024];
     int n = innerSize < 1024 ? innerSize : 1024;
     for (int j = 0; j < n; j++) sorted[j] = in_row[j];
 

@@ -311,7 +311,7 @@ extern ""C"" __global__ __launch_bounds__(256) void extract_diag_kernel(
     int n, int cols)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= n || idx >= cols) return;
     output[idx] = input[idx * cols + idx];
 }
 

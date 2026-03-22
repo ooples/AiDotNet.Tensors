@@ -21,7 +21,7 @@ __kernel void mse_loss(__global const float* predictions, __global const float* 
     int b = get_global_id(0); if (b >= batchSize) return;
     float sum_sq = 0.0f;
     for (int f = 0; f < numFeatures; f++) { float d = predictions[b * numFeatures + f] - targets[b * numFeatures + f]; sum_sq += d * d; }
-    loss[b] = sum_sq / (float)numFeatures;
+    loss[b] = (numFeatures > 0) ? (sum_sq / (float)numFeatures) : 0.0f;
 }
 __kernel void bce_loss(__global const float* predictions, __global const float* targets, __global float* loss, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
@@ -36,7 +36,8 @@ __kernel void dropout_mask(__global float* mask, int size, float keepProb, ulong
     prod = (ulong)counter * 0xCD9E8D57u;
     counter = (uint)(prod >> 32) ^ (key + 1u) ^ (uint)prod;
     float u = (float)(counter >> 8) * (1.0f / 16777216.0f);
-    mask[idx] = (u < keepProb) ? (1.0f / keepProb) : 0.0f;
+    float safe_keep = fmax(keepProb, 1e-7f);
+    mask[idx] = (u < keepProb) ? (1.0f / safe_keep) : 0.0f;
 }
 __kernel void gaussian_noise(__global float* output, int size, float mean, float stdDev, ulong seed) {
     int idx = get_global_id(0); if (idx >= size) return;

@@ -42,7 +42,8 @@ __kernel void sub_scalar(__global const float* input, __global float* output, fl
 }
 __kernel void div_scalar(__global const float* input, __global float* output, float scalar, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = input[idx] / scalar;
+    float safe_scalar = (scalar == 0.0f) ? 1e-10f : scalar;
+    output[idx] = input[idx] / safe_scalar;
 }
 __kernel void pow_scalar(__global const float* input, __global float* output, float exponent, int size) {
     int idx = get_global_id(0); if (idx >= size) return;

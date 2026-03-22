@@ -27,7 +27,8 @@ __kernel void gumbel_softmax(__global const float* logits, __global float* outpu
         ulong prod = (ulong)counter * 0xCD9E8D57u; counter = (uint)(prod >> 32) ^ key ^ (uint)prod;
         prod = (ulong)counter * 0xCD9E8D57u; counter = (uint)(prod >> 32) ^ (key + 1u) ^ (uint)prod;
         float u = (float)(counter >> 8) * (1.0f / 16777216.0f) + (0.5f / 16777216.0f);
-        float perturbed = (logits[base_idx + j] + (-log(-log(u)))) / temperature;
+        float safe_temp = fmax(temperature, 1e-10f);
+        float perturbed = (logits[base_idx + j] + (-log(-log(u)))) / safe_temp;
         output[base_idx + j] = perturbed; max_val = fmax(max_val, perturbed);
     }
     float sum_exp = 0.0f;
