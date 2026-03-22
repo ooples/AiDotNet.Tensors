@@ -396,6 +396,31 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public T DotProduct<T>(Vector<T> a, Vector<T> b, int bOffset, int bStride)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T result = numOps.Zero;
+
+        var aSpan = a.AsSpan();
+        var bSpan = b.AsSpan();
+        int len = a.Length;
+
+        for (int i = 0; i < len; i++)
+        {
+            int bIdx = bOffset + i * bStride;
+            if (bIdx >= 0 && bIdx < b.Length)
+            {
+                result = numOps.Add(result, numOps.Multiply(aSpan[i], bSpan[bIdx]));
+            }
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
     public unsafe T Mean<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));

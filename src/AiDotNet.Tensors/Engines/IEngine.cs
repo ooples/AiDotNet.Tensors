@@ -317,6 +317,22 @@ public interface IEngine
     T DotProduct<T>(Vector<T> a, Vector<T> b);
 
     /// <summary>
+    /// Computes the dot product of vector a with a strided window of vector b.
+    /// </summary>
+    /// <typeparam name="T">The numeric type.</typeparam>
+    /// <param name="a">The first vector (contiguous).</param>
+    /// <param name="b">The source vector to read from with stride.</param>
+    /// <param name="bOffset">Starting index in b.</param>
+    /// <param name="bStride">Step between elements in b (e.g., -1 for reverse).</param>
+    /// <returns>The dot product sum(a[i] * b[bOffset + i * bStride]).</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This is like a normal dot product, but reads elements from b
+    /// at non-contiguous positions. A stride of -1 reads backwards (useful for AR/MA models).
+    /// A stride of 2 reads every other element. The length is determined by a.Length.</para>
+    /// </remarks>
+    T DotProduct<T>(Vector<T> a, Vector<T> b, int bOffset, int bStride);
+
+    /// <summary>
     /// Computes the mean (average) of all elements in the vector.
     /// </summary>
     /// <typeparam name="T">The numeric type of the vector.</typeparam>
@@ -2111,12 +2127,15 @@ public interface IEngine
 
     /// <summary>
     /// Multiplies two tensors element-wise (Hadamard product).
+    /// When shapes match exactly, performs direct element-wise multiplication.
+    /// When shapes differ but are broadcast-compatible (NumPy/PyTorch rules),
+    /// broadcasts the smaller tensor to match.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="a">The first tensor.</param>
     /// <param name="b">The second tensor.</param>
     /// <returns>A new tensor containing the element-wise product.</returns>
-    /// <exception cref="ArgumentException">Thrown when tensor shapes don't match.</exception>
+    /// <exception cref="ArgumentException">Thrown when tensor shapes are not broadcast-compatible.</exception>
     /// <remarks>
     /// <para><b>US-GPU-014: Tensor Element-Wise Operations</b></para>
     /// </remarks>

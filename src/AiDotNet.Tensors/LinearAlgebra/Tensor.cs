@@ -1215,7 +1215,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int newTotal = newShape.Aggregate(1, (a, b) => a * b);
         if (newTotal != Length)
             throw new ArgumentException(
-                $"Cannot reshape tensor with {Length} elements to shape [{string.Join(",", newShape)}] ({newTotal} elements).");
+                $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
         var reshaped = new Tensor<T>(newShape);
         // Use vectorized Copy operation for SIMD acceleration (5-15x faster with AVX2)
@@ -1861,7 +1861,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             else
             {
-                throw new ArgumentException("Tensors cannot be broadcast to a single shape.");
+                throw new ArgumentException(
+                    $"Tensors with shapes [{string.Join(", ", shape1)}] and [{string.Join(", ", shape2)}] cannot be broadcast: dimension {maxRank - 1 - i} has sizes {dim1} and {dim2} (must be equal or one must be 1).");
             }
         }
 
@@ -2128,6 +2129,135 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Extracts a 1D vector along a specified axis, with all other dimensions fixed.
+    /// </summary>
+    /// <param name="axis">The axis (dimension) along which to extract the vector.</param>
+    /// <param name="fixedIndices">Indices for all dimensions except the extraction axis.
+    /// Must contain exactly (Rank - 1) values, in order, skipping the axis dimension.</param>
+    /// <returns>A Vector&lt;T&gt; containing the extracted slice.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This extracts a 1D "line" from a multi-dimensional tensor.
+    /// You specify which dimension to "walk along" and fix all the other dimensions.
+    ///
+    /// For example, in a 3D tensor with shape [batch, features, dims]:
+    /// - GetVectorAlongAxis(2, batch: 0, feature: 3) extracts all dims for batch 0, feature 3
+    /// - GetVectorAlongAxis(1, batch: 0, dim: 5) extracts all features for batch 0, dim 5
+    /// </para>
+    /// <para><b>Performance:</b> When the extraction axis is the last (innermost) dimension,
+    /// the data is contiguous in memory and this uses a fast bulk copy. For other axes,
+    /// elements are gathered with strided access.</para>
+    /// </remarks>
+    public Vector<T> GetVectorAlongAxis(int axis, params int[] fixedIndices)
+    {
+        if (axis < 0 || axis >= Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis),
+                $"Axis {axis} is out of range for tensor with {Rank} dimensions.");
+        if (fixedIndices.Length != Rank - 1)
+            throw new ArgumentException(
+                $"Expected {Rank - 1} fixed indices for a rank-{Rank} tensor, but got {fixedIndices.Length}.",
+                nameof(fixedIndices));
+
+        int axisSize = Shape[axis];
+
+        // Compute strides
+        int[] strides = new int[Rank];
+        strides[Rank - 1] = 1;
+        for (int d = Rank - 2; d >= 0; d--)
+            strides[d] = strides[d + 1] * Shape[d + 1];
+
+        // Compute base flat index from fixed indices
+        int baseIndex = 0;
+        int fi = 0;
+        for (int d = 0; d < Rank; d++)
+        {
+            if (d == axis) continue;
+            int idx = fixedIndices[fi++];
+            if (idx < 0 || idx >= Shape[d])
+                throw new ArgumentOutOfRangeException(nameof(fixedIndices),
+                    $"Index {idx} is out of range for dimension {d} with size {Shape[d]}.");
+            baseIndex += idx * strides[d];
+        }
+
+        int axisStride = strides[axis];
+
+        // Fast path: if axis is the last dimension, data is contiguous
+        if (axis == Rank - 1)
+        {
+            return GetSlice(baseIndex, axisSize);
+        }
+
+        // General path: gather strided elements
+        var result = new Vector<T>(axisSize);
+        var srcSpan = _data.AsSpan();
+        for (int i = 0; i < axisSize; i++)
+        {
+            result[i] = srcSpan[baseIndex + i * axisStride];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Sets a 1D vector along a specified axis, with all other dimensions fixed.
+    /// </summary>
+    /// <param name="values">The vector of values to write.</param>
+    /// <param name="axis">The axis (dimension) along which to write the vector.</param>
+    /// <param name="fixedIndices">Indices for all dimensions except the target axis.
+    /// Must contain exactly (Rank - 1) values, in order, skipping the axis dimension.</param>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This is the counterpart to GetVectorAlongAxis - it writes
+    /// a 1D vector back into the tensor at the specified position.</para>
+    /// </remarks>
+    public void SetVectorAlongAxis(Vector<T> values, int axis, params int[] fixedIndices)
+    {
+        if (axis < 0 || axis >= Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis),
+                $"Axis {axis} is out of range for tensor with {Rank} dimensions.");
+        if (fixedIndices.Length != Rank - 1)
+            throw new ArgumentException(
+                $"Expected {Rank - 1} fixed indices for a rank-{Rank} tensor, but got {fixedIndices.Length}.",
+                nameof(fixedIndices));
+
+        int axisSize = Shape[axis];
+        if (values.Length != axisSize)
+            throw new ArgumentException(
+                $"Vector length {values.Length} does not match axis size {axisSize}.",
+                nameof(values));
+
+        // Compute strides
+        int[] strides = new int[Rank];
+        strides[Rank - 1] = 1;
+        for (int d = Rank - 2; d >= 0; d--)
+            strides[d] = strides[d + 1] * Shape[d + 1];
+
+        // Compute base flat index from fixed indices
+        int baseIndex = 0;
+        int fi = 0;
+        for (int d = 0; d < Rank; d++)
+        {
+            if (d == axis) continue;
+            int idx = fixedIndices[fi++];
+            baseIndex += idx * strides[d];
+        }
+
+        int axisStride = strides[axis];
+
+        // Fast path: contiguous write for last dimension
+        if (axis == Rank - 1)
+        {
+            SetSlice(baseIndex, values);
+            return;
+        }
+
+        // General path: scatter strided elements
+        var destSpan = _data.AsWritableSpan();
+        var srcSpan = values.AsSpan();
+        for (int i = 0; i < axisSize; i++)
+        {
+            destSpan[baseIndex + i * axisStride] = srcSpan[i];
+        }
+    }
+
+    /// <summary>
     /// Creates a tensor with all elements initialized to the specified value.
     /// </summary>
     /// <param name="shape">The shape of the tensor to create.</param>
@@ -2135,7 +2265,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <returns>A new tensor filled with the specified value.</returns>
     /// <remarks>
     /// <para><b>For Beginners:</b> This method creates a new tensor where every element has the same value.</para>
-    /// 
+    ///
     /// <para>For example, CreateDefault([2, 3], 1.0) would create a 2ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â3 tensor filled with the value 1.0, like this:
     /// [[1.0, 1.0, 1.0],
     ///  [1.0, 1.0, 1.0]]</para>
