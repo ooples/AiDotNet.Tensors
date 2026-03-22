@@ -86,14 +86,7 @@ public sealed partial class VulkanBackend
 
     public void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int ais, int bis) => GlslBinaryOp(VulkanGlslKernels.ConcatAxisGlsl, a, b, o, os * (ais + bis), 3 * sizeof(uint));
     public void SliceLastAxis(IGpuBuffer i, IGpuBuffer o, int os, int iis, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SliceLastAxisGlsl, i, o, os * ss, 4 * sizeof(uint));
-    public void SetSliceLastAxis(IGpuBuffer o, IGpuBuffer v, int os, int ois, int st, int ss)
-    {
-        // SetSlice writes into specific positions of output — 2-pass: read output, write slice regions
-        // Use CPU path since this requires read-modify-write on same buffer
-        float[] od = DownloadBuffer(o), vd = DownloadBuffer(v);
-        for (int j = 0; j < os; j++) Array.Copy(vd, j * ss, od, j * ois + st, ss);
-        UploadToBuffer(od, o);
-    }
+    public void SetSliceLastAxis(IGpuBuffer o, IGpuBuffer v, int os, int ois, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SetSliceLastAxisGlsl, v, o, os * ss, 4 * sizeof(uint));
     public void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.Stack2Glsl, a, b, o, sz * 2, sizeof(uint));
     public void Pad2D(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl, float pv) => GlslUnaryOp(VulkanGlslKernels.Pad2DGlsl, i, o, ba * ch * oh * ow, 8 * sizeof(uint));
     public void Pad2DBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl) => GlslUnaryOp(VulkanGlslKernels.Pad2DBackwardGlsl, go, gi, ba * ch * ih * iw, 8 * sizeof(uint));

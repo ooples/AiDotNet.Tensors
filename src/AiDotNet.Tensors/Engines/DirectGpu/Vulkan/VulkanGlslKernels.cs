@@ -610,14 +610,15 @@ void main() {
     // Additional Shape / Layout kernels
     // =====================================================================
 
-    public static string SetSliceLastAxisGlsl => Header + TwoBufferLayout + @"
+    public static string SetSliceLastAxisGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer B { float b[]; };
 layout(push_constant) uniform Params { uint outerSize; uint outputInnerSize; uint start; uint sliceSize; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= outerSize * sliceSize) return;
     uint outer = idx / sliceSize; uint inner = idx % sliceSize;
-    // a = value buffer (read), b = output buffer (read-write, but treated as write here)
-    // Note: output buffer already has data; we overwrite the slice region
+    b[outer * outputInnerSize + start + inner] = a[outer * sliceSize + inner];
 }";
 
     public static string Stack2Glsl => Header + ThreeBufferLayout + @"
