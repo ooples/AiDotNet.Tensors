@@ -8396,31 +8396,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated CrossEntropy loss computation.
     /// </summary>
-    T IEngine.CrossEntropyLoss<T>(Tensor<T> predictions, Tensor<T> targets)
-    {
-        if (!TryGetBackend(out var backend))
-            return base.CrossEntropyLoss(predictions, targets);
-
-        try
-        {
-            // Assume predictions: [batch, numClasses], targets: [batch] or [batch, numClasses]
-            if (predictions.Rank != 2)
-                return base.CrossEntropyLoss(predictions, targets);
-
-            int batchSize = predictions.Shape[0];
-            int numClasses = predictions.Shape[1];
-
-            using var predBuffer = GetOrAllocateBuffer(backend, predictions.GetDataArray());
-            using var targetBuffer = GetOrAllocateBuffer(backend, targets.GetDataArray());
-
-            float loss = backend.CrossEntropyLoss(predBuffer.Buffer, targetBuffer.Buffer, batchSize, numClasses);
-            return DirectGpuEngine.FromFloatArray<T>(new[] { loss })[0];
-        }
-        catch
-        {
-            return base.CrossEntropyLoss(predictions, targets);
-        }
-    }
 
     /// <summary>
     /// GPU-accelerated CrossEntropy backward computation.
@@ -10957,6 +10932,144 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
         { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.LeakyRelu(gi,go,Convert.ToSingle(alpha),tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
         return base.TensorLeakyReLU(tensor, alpha);
+    }
+
+
+    Tensor<T> IEngine.TensorRandomUniform<T>(int[] shape)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int total = 1;
+                foreach (var d in shape) total *= d;
+                using var go = b.AllocateBuffer(total);
+                b.GenerateRandomUniform(go, total, 0f, 1f, (ulong)(ulong)Environment.TickCount);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), shape);
+            }
+            catch { }
+        }
+        return base.TensorRandomUniform<T>(shape);
+    }
+
+    Tensor<T> IEngine.TensorRandomNormal<T>(int[] shape, T mean, T stddev)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        {
+            try
+            {
+                int total = 1;
+                foreach (var d in shape) total *= d;
+                using var go = b.AllocateBuffer(total);
+                b.GenerateRandomNormal(go, total, Convert.ToSingle(mean), Convert.ToSingle(stddev), (ulong)(ulong)Environment.TickCount);
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), shape);
+            }
+            catch { }
+        }
+        return base.TensorRandomNormal(shape, mean, stddev);
+    }
+
+    Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes is not null && axes.Length == 1)
+        {
+            try
+            {
+                int rank = tensor.Rank;
+                int axis = axes[0] < 0 ? rank + axes[0] : axes[0];
+                if (axis >= 0 && axis < rank)
+                {
+                    int outerSize = 1;
+                    for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
+                    int reduceSize = tensor.Shape[axis];
+                    int innerSize = 1;
+                    for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape[i];
+                    int totalOuter = outerSize * innerSize;
+                    using var gi = b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
+                    using var go = b.AllocateBuffer(totalOuter);
+                    b.SumAxis(gi, go, totalOuter, reduceSize);
+                    float[] result = b.DownloadBuffer(go);
+                    int[] outShape;
+                    if (keepDims)
+                    {
+                        outShape = (int[])tensor.Shape.Clone();
+                        outShape[axis] = 1;
+                    }
+                    else
+                    {
+                        outShape = new int[rank - 1];
+                        for (int i = 0, j = 0; i < rank; i++)
+                            if (i != axis) outShape[j++] = tensor.Shape[i];
+                    }
+                    return new Tensor<T>((T[])(object)result, outShape);
+                }
+            }
+            catch { }
+        }
+        return base.ReduceSum(tensor, axes, keepDims);
+    }
+
+    Tensor<T> IEngine.ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes.Length == 1)
+        {
+            try
+            {
+                int rank = input.Rank;
+                int axis = axes[0] < 0 ? rank + axes[0] : axes[0];
+                if (axis >= 0 && axis < rank)
+                {
+                    int outerSize = 1;
+                    for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+                    int reduceSize = input.Shape[axis];
+                    int innerSize = 1;
+                    for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+                    int totalOuter = outerSize * innerSize;
+                    using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+                    using var go = b.AllocateBuffer(totalOuter);
+                    b.MeanAxis(gi, go, totalOuter, reduceSize);
+                    float[] result = b.DownloadBuffer(go);
+                    int[] outShape;
+                    if (keepDims)
+                    {
+                        outShape = (int[])input.Shape.Clone();
+                        outShape[axis] = 1;
+                    }
+                    else
+                    {
+                        outShape = new int[rank - 1];
+                        for (int i = 0, j = 0; i < rank; i++)
+                            if (i != axis) outShape[j++] = input.Shape[i];
+                    }
+                    return new Tensor<T>((T[])(object)result, outShape);
+                }
+            }
+            catch { }
+        }
+        return base.ReduceMean(input, axes, keepDims);
+    }
+
+    Tensor<T> IEngine.TensorBatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank >= 3 && b2.Rank >= 3)
+        {
+            try
+            {
+                int batchSize = a.Shape[0];
+                int M = a.Shape[a.Rank - 2];
+                int K = a.Shape[a.Rank - 1];
+                int N = b2.Shape[b2.Rank - 1];
+                using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
+                using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
+                using var go = b.AllocateBuffer(batchSize * M * N);
+                b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
+                int[] outShape = (int[])a.Shape.Clone();
+                outShape[a.Rank - 1] = N;
+                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+            }
+            catch { }
+        }
+        return base.TensorBatchMatMul(a, b2);
     }
 
     #endregion
