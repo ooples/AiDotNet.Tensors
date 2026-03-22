@@ -468,10 +468,21 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size <= 0) return;
 
-        // Compose existing GPU operations: temp = A * B, result = sum(temp)
-        using var temp = AllocateBuffer(size);
-        Multiply(a, b, temp, size);
-        SumAxis(temp, result, 1, size);
+        // Direct GPU dispatch using pre-compiled DotProduct SPIR-V kernel
+        var vbA = AsVulkan(a);
+        var vbB = AsVulkan(b);
+        var vbR = AsVulkan(result);
+
+        var pipeline = GetOrCreatePipeline(VulkanKernelType.DotProduct, 3, sizeof(uint));
+        if (pipeline is null)
+            throw new InvalidOperationException("Failed to create DotProduct pipeline.");
+
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbR.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
     }
 
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,

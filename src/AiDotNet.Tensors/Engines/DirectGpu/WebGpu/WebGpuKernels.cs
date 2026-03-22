@@ -7554,6 +7554,82 @@ fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    public const string DotProductSource = @"
+// Dot product with workgroup reduction
+// Computes partial sums per workgroup, then a second dispatch reduces them.
+@group(0) @binding(0) var<storage, read> dp_a: array<f32>;
+@group(0) @binding(1) var<storage, read> dp_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dp_partials: array<f32>;
+
+struct DpParams {
+    size: u32,
+}
+@group(0) @binding(3) var<uniform> dp_params: DpParams;
+
+var<workgroup> dp_shared: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn dot_product(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>,
+               @builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    var sum: f32 = 0.0;
+    let grid_size = nwg.x * 256u;
+    var i = gid.x;
+    while (i < dp_params.size) {
+        sum = sum + dp_a[i] * dp_b[i];
+        i = i + grid_size;
+    }
+    dp_shared[lid.x] = sum;
+    workgroupBarrier();
+
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid.x < stride) {
+            dp_shared[lid.x] = dp_shared[lid.x] + dp_shared[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid.x == 0u) {
+        dp_partials[wid.x] = dp_shared[0];
+    }
+}
+
+// Final reduction of partial sums
+@group(0) @binding(0) var<storage, read> rp_partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> rp_result: array<f32>;
+
+struct RpParams {
+    count: u32,
+}
+@group(0) @binding(2) var<uniform> rp_params: RpParams;
+
+var<workgroup> rp_shared: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
+    var sum: f32 = 0.0;
+    var i = lid.x;
+    while (i < rp_params.count) {
+        sum = sum + rp_partials[i];
+        i = i + 256u;
+    }
+    rp_shared[lid.x] = sum;
+    workgroupBarrier();
+
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid.x < stride) {
+            rp_shared[lid.x] = rp_shared[lid.x] + rp_shared[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid.x == 0u) {
+        rp_result[0] = rp_shared[0];
+    }
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +

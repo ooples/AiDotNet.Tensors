@@ -2670,10 +2670,11 @@ kernel void dot_product(
     uint gid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint group_id [[threadgroup_position_in_grid]],
-    uint group_size [[threads_per_threadgroup]])
+    uint group_size [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
 {
     float sum = 0.0f;
-    for (uint i = gid; i < size; i += group_size * gridDim.x) {
+    for (uint i = gid; i < size; i += grid_size) {
         sum += A[i] * B[i];
     }
     shared[lid] = sum;
@@ -2705,10 +2706,11 @@ kernel void strided_dot_product(
     uint gid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint group_id [[threadgroup_position_in_grid]],
-    uint group_size [[threads_per_threadgroup]])
+    uint group_size [[threads_per_threadgroup]],
+    uint grid_size [[threads_per_grid]])
 {
     float sum = 0.0f;
-    for (uint i = gid; i < aSize; i += group_size * gridDim.x) {
+    for (uint i = gid; i < aSize; i += grid_size) {
         int bIdx = bOffset + int(i) * bStride;
         if (bIdx >= 0 && uint(bIdx) < bSize) {
             sum += A[i] * B[bIdx];
