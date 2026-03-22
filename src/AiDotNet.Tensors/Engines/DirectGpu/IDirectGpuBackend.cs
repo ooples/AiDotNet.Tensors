@@ -258,6 +258,21 @@ public interface IDirectGpuBackend : IDisposable
     void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
 
     /// <summary>
+    /// Fused Add + ReLU: C = max(0, A + B). Saves one full memory round-trip.
+    /// </summary>
+    void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+
+    /// <summary>
+    /// Fused Add + Sigmoid: C = sigmoid(A + B). Saves one full memory round-trip.
+    /// </summary>
+    void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+
+    /// <summary>
+    /// Fused Add + GELU: C = GELU(A + B). Saves one full memory round-trip.
+    /// </summary>
+    void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+
+    /// <summary>
     /// Element-wise subtraction: C = A - B
     /// </summary>
     void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);

@@ -1175,6 +1175,62 @@ __kernel void softmax_div_scalar(
         for (int i = idx4; i < size; i++) B[offset + i] *= scalar;
     }
 }
+
+
+// ===========================================================================
+// FUSED ELEMENT-WISE OPERATIONS
+// These eliminate one full memory round-trip by combining two ops in one pass.
+// ===========================================================================
+
+// Fused Add + ReLU: C = max(0, A + B) — saves 8MB memory traffic at 1M floats
+__kernel void add_relu(__global const float* A, __global const float* B, __global float* C, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A); float4 b = vload4(idx, B);
+        vstore4(fmax((float4)(0.0f), a + b), idx, C);
+    } else { for (int i = idx4; i < size; i++) C[i] = fmax(0.0f, A[i] + B[i]); }
+}
+
+// Fused Add + Sigmoid: C = sigmoid(A + B)
+__kernel void add_sigmoid(__global const float* A, __global const float* B, __global float* C, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 s = vload4(idx, A) + vload4(idx, B);
+        vstore4((float4)(1.0f) / ((float4)(1.0f) + fast_exp4(-s)), idx, C);
+    } else { for (int i = idx4; i < size; i++) { float s = A[i] + B[i]; C[i] = 1.0f / (1.0f + fast_exp1(-s)); } }
+}
+
+// Fused Multiply + Add (FMA): C = A * B + D — common in residual/normalization
+__kernel void fused_mul_add(__global const float* A, __global const float* B, __global const float* D, __global float* C, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        vstore4(fma(vload4(idx, A), vload4(idx, B), vload4(idx, D)), idx, C);
+    } else { for (int i = idx4; i < size; i++) C[i] = fma(A[i], B[i], D[i]); }
+}
+
+// Fused Add + GELU: C = GELU(A + B) — common in transformer FFN residuals
+__kernel void add_gelu(__global const float* A, __global const float* B, __global float* C, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, A) + vload4(idx, B);
+        float4 x3 = x * x * x;
+        float4 inner = 0.7978845608f * (x + 0.044715f * x3);
+        vstore4(0.5f * x * ((float4)(1.0f) + tanh(inner)), idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) {
+            float x = A[i] + B[i]; float x3 = x * x * x;
+            C[i] = 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x3)));
+        }
+    }
+}
+
+// Fused Scale + Add (bias): C = A * scalar + B — common in normalization
+__kernel void scale_add(__global const float* A, __global const float* B, __global float* C, const float scalar, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        vstore4(fma(vload4(idx, A), (float4)(scalar), vload4(idx, B)), idx, C);
+    } else { for (int i = idx4; i < size; i++) C[i] = fma(A[i], scalar, B[i]); }
+}
 ";
         }
 
@@ -1197,6 +1253,8 @@ __kernel void softmax_div_scalar(
                 // Element-wise binary
                 "add_vectors", "subtract_vectors", "multiply_vectors",
                 "divide_vectors", "min_vectors", "max_vectors",
+                // Fused element-wise
+                "add_relu", "add_sigmoid", "add_gelu", "fused_mul_add", "scale_add",
                 // Scalar ops
                 "scale_vector", "power_scalar",
                 // Unary math

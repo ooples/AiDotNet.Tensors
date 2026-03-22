@@ -2392,6 +2392,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ExecuteElementwise("add_vectors", A, B, C, size);
         }
 
+        public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        {
+            ExecuteElementwise("add_relu", A, B, C, size);
+        }
+
+        public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        {
+            ExecuteElementwise("add_sigmoid", A, B, C, size);
+        }
+
+        public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+        {
+            ExecuteElementwise("add_gelu", A, B, C, size);
+        }
+
         public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         {
             ExecuteElementwise("subtract_vectors", A, B, C, size);
