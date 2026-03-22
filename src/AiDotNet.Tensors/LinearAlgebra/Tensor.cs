@@ -1215,7 +1215,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int newTotal = newShape.Aggregate(1, (a, b) => a * b);
         if (newTotal != Length)
             throw new ArgumentException(
-                $"Cannot reshape tensor with {Length} elements to shape [{string.Join(",", newShape)}] ({newTotal} elements).");
+                $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
         var reshaped = new Tensor<T>(newShape);
         // Use vectorized Copy operation for SIMD acceleration (5-15x faster with AVX2)
@@ -1861,7 +1861,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             else
             {
-                throw new ArgumentException("Tensors cannot be broadcast to a single shape.");
+                throw new ArgumentException(
+                    $"Tensors with shapes [{string.Join(", ", shape1)}] and [{string.Join(", ", shape2)}] cannot be broadcast: dimension {maxRank - 1 - i} has sizes {dim1} and {dim2} (must be equal or one must be 1).");
             }
         }
 

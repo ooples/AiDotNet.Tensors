@@ -2111,12 +2111,15 @@ public interface IEngine
 
     /// <summary>
     /// Multiplies two tensors element-wise (Hadamard product).
+    /// When shapes match exactly, performs direct element-wise multiplication.
+    /// When shapes differ but are broadcast-compatible (NumPy/PyTorch rules),
+    /// broadcasts the smaller tensor to match.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="a">The first tensor.</param>
     /// <param name="b">The second tensor.</param>
     /// <returns>A new tensor containing the element-wise product.</returns>
-    /// <exception cref="ArgumentException">Thrown when tensor shapes don't match.</exception>
+    /// <exception cref="ArgumentException">Thrown when tensor shapes are not broadcast-compatible.</exception>
     /// <remarks>
     /// <para><b>US-GPU-014: Tensor Element-Wise Operations</b></para>
     /// </remarks>
