@@ -679,106 +679,49 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        int threadgroupSize = 256;
-        int numGroups = Math.Min((size + threadgroupSize - 1) / threadgroupSize, 256);
+        // Strategy: element-wise multiply into temp buffer, then reduce-sum
+        using var temp = AllocateBuffer(size);
+        var tempBuffer = (MetalGpuBuffer)temp;
 
-        // Allocate partial sums buffer
-        using var partialSums = new MetalGpuBuffer(_device, numGroups * sizeof(float));
+        // Step 1: temp = A * B (element-wise)
+        Multiply(a, b, temp, size);
 
-        // Pass 1: compute partial dot products per threadgroup
-        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "dot_product");
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
-        {
-            encoder.SetPipelineState(pipeline.Handle);
-            encoder.SetBuffer(aBuffer, 0);
-            encoder.SetBuffer(bBuffer, 1);
-            encoder.SetBuffer(partialSums, 2);
-            encoder.SetBytes((uint)size, 3);
-            encoder.SetThreadgroupMemory((uint)(threadgroupSize * sizeof(float)), 0);
-            encoder.DispatchThreadgroups(
-                new MetalSize(numGroups, 1, 1),
-                new MetalSize(threadgroupSize, 1, 1));
-        }
-
-        // Pass 2: reduce partial sums to final result
-        var reducePipeline = GetPipeline("DotProduct", _dotProductLibrary, "reduce_partial_sums");
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
-        {
-            encoder.SetPipelineState(reducePipeline.Handle);
-            encoder.SetBuffer(partialSums, 0);
-            encoder.SetBuffer(resultBuffer, 1);
-            encoder.SetBytes((uint)numGroups, 2);
-            encoder.SetThreadgroupMemory((uint)(threadgroupSize * sizeof(float)), 0);
-            encoder.DispatchThreadgroups(
-                new MetalSize(1, 1, 1),
-                new MetalSize(Math.Min(threadgroupSize, numGroups), 1, 1));
-        }
+        // Step 2: result = sum(temp) using SumAxis with outerSize=1, reduceSize=size
+        SumAxis(temp, result, 1, size);
     }
 
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
         ThrowIfDisposed();
-        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
-            throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        int threadgroupSize = 256;
-        int numGroups = Math.Min((aSize + threadgroupSize - 1) / threadgroupSize, 256);
+        // Extract strided window into contiguous buffer, then standard DotProduct
+        var bData = DownloadBuffer(b);
 
-        using var partialSums = new MetalGpuBuffer(_device, numGroups * sizeof(float));
-
-        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "strided_dot_product");
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        var window = new float[aSize];
+        for (int i = 0; i < aSize; i++)
         {
-            encoder.SetPipelineState(pipeline.Handle);
-            encoder.SetBuffer(aBuffer, 0);
-            encoder.SetBuffer(bBuffer, 1);
-            encoder.SetBuffer(partialSums, 2);
-            encoder.SetBytes((uint)aSize, 3);
-            encoder.SetBytes((uint)bSize, 4);
-            encoder.SetBytes(bOffset, 5);
-            encoder.SetBytes(bStride, 6);
-            encoder.SetThreadgroupMemory((uint)(threadgroupSize * sizeof(float)), 0);
-            encoder.DispatchThreadgroups(
-                new MetalSize(numGroups, 1, 1),
-                new MetalSize(threadgroupSize, 1, 1));
+            int bIdx = bOffset + i * bStride;
+            window[i] = (bIdx >= 0 && bIdx < bSize) ? bData[bIdx] : 0f;
         }
 
-        var reducePipeline = GetPipeline("DotProduct", _dotProductLibrary, "reduce_partial_sums");
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
-        {
-            encoder.SetPipelineState(reducePipeline.Handle);
-            encoder.SetBuffer(partialSums, 0);
-            encoder.SetBuffer(resultBuffer, 1);
-            encoder.SetBytes((uint)numGroups, 2);
-            encoder.SetThreadgroupMemory((uint)(threadgroupSize * sizeof(float)), 0);
-            encoder.DispatchThreadgroups(
-                new MetalSize(1, 1, 1),
-                new MetalSize(Math.Min(threadgroupSize, numGroups), 1, 1));
-        }
+        using var windowBuf = AllocateBuffer(window);
+        DotProduct(a, windowBuf, result, aSize);
     }
 
     public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
         ThrowIfDisposed();
-        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
-            throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        int threadgroupSize = Math.Min(256, vecSize);
+        // Each batch: temp = A_slice * B_slice, result[batch] = sum(temp)
+        using var temp = AllocateBuffer(batchSize * vecSize);
 
-        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "batched_dot_product");
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(bBuffer, 1);
-        encoder.SetBuffer(resultBuffer, 2);
-        encoder.SetBytes((uint)batchSize, 3);
-        encoder.SetBytes((uint)vecSize, 4);
-        encoder.SetThreadgroupMemory((uint)(threadgroupSize * sizeof(float)), 0);
-        encoder.DispatchThreadgroups(
-            new MetalSize(1, batchSize, 1),
-            new MetalSize(threadgroupSize, 1, 1));
+        // Step 1: element-wise multiply entire batched vectors
+        Multiply(a, b, temp, batchSize * vecSize);
+
+        // Step 2: reduce each batch's products. SumAxis with outerSize=batchSize, reduceSize=vecSize
+        SumAxis(temp, result, batchSize, vecSize);
     }
 
     #endregion

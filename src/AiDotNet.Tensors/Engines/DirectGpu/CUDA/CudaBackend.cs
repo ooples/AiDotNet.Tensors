@@ -8402,7 +8402,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
                     // Homeostasis: pull toward center of range
                     float center = (minWeight + maxWeight) * 0.5f;
                     dw += homeostasisRate * (center - w[idx]);
-                    w[idx] = Math.Clamp(w[idx] + dw, minWeight, maxWeight);
+                    w[idx] = Math.Max(minWeight, Math.Min(maxWeight, w[idx] + dw));
                 }
             }
 

@@ -468,28 +468,10 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size <= 0) return;
 
-        var vbA = AsVulkan(a);
-        var vbB = AsVulkan(b);
-        var vbR = AsVulkan(result);
-
-        // Use the pre-compiled DotProduct SPIR-V kernel
-        // DotProduct kernel takes 3 buffers (A, B, result) and push constant (size)
-        var pipeline = GetOrCreatePipeline(VulkanKernelType.DotProduct, 3, sizeof(uint));
-        if (pipeline is null)
-            throw new InvalidOperationException("Failed to create DotProduct pipeline.");
-
-        uint wgCount = VulkanKernels.CalculateWorkgroupCount(size);
-
-        using var batchCmd = BeginBatchDispatch();
-        pipeline.Bind(batchCmd);
-        pipeline.BindBuffers(batchCmd, vbA.Buffer, vbB.Buffer, vbR.Buffer);
-
-        Span<byte> pushData = stackalloc byte[sizeof(uint)];
-        BitConverter.TryWriteBytes(pushData, (uint)size);
-        pipeline.PushConstants(batchCmd, pushData);
-
-        VulkanNativeBindings.vkCmdDispatch(batchCmd, wgCount, 1, 1);
-        EndBatchDispatch(batchCmd);
+        // Compose existing GPU operations: temp = A * B, result = sum(temp)
+        using var temp = AllocateBuffer(size);
+        Multiply(a, b, temp, size);
+        SumAxis(temp, result, 1, size);
     }
 
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
@@ -498,23 +480,17 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (aSize <= 0) return;
 
-        // For strided access, extract the window on CPU then dispatch contiguous DotProduct on GPU
-        // This is the production-correct approach for Vulkan until a dedicated SPIR-V kernel is added
-        var aData = new float[aSize];
-        var bWindow = new float[aSize];
-        a.Download((byte[])(object)aData);
-        var bFull = new float[bSize];
-        b.Download((byte[])(object)bFull);
+        // Extract strided window into contiguous buffer then standard DotProduct
+        var bFull = DownloadBuffer(b);
 
+        var window = new float[aSize];
         for (int i = 0; i < aSize; i++)
         {
             int bIdx = bOffset + i * bStride;
-            bWindow[i] = (bIdx >= 0 && bIdx < bSize) ? bFull[bIdx] : 0f;
+            window[i] = (bIdx >= 0 && bIdx < bSize) ? bFull[bIdx] : 0f;
         }
 
-        // Upload the contiguous window and dispatch standard DotProduct
-        using var windowBuf = AllocateBuffer(aSize);
-        windowBuf.Upload((byte[])(object)bWindow);
+        using var windowBuf = AllocateBuffer(window);
         DotProduct(a, windowBuf, result, aSize);
     }
 
@@ -524,25 +500,10 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (batchSize <= 0 || vecSize <= 0) return;
 
-        // Launch DotProduct for each batch element
-        // Each batch uses a slice of the a/b buffers
-        for (int batch = 0; batch < batchSize; batch++)
-        {
-            // Create buffer views for this batch (offset into a and b)
-            // For now, use sub-buffer dispatch
-            using var sliceA = AllocateBuffer(vecSize);
-            using var sliceB = AllocateBuffer(vecSize);
-            using var sliceR = AllocateBuffer(1);
-
-            // Copy batch slice to temp buffers
-            CopyBufferRegion(a, batch * vecSize, sliceA, 0, vecSize);
-            CopyBufferRegion(b, batch * vecSize, sliceB, 0, vecSize);
-
-            DotProduct(sliceA, sliceB, sliceR, vecSize);
-
-            // Copy scalar result back
-            CopyBufferRegion(sliceR, 0, result, batch, 1);
-        }
+        // Compose: temp = A * B for all batches, then reduce each batch
+        using var temp = AllocateBuffer(batchSize * vecSize);
+        Multiply(a, b, temp, batchSize * vecSize);
+        SumAxis(temp, result, batchSize, vecSize);
     }
 
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)

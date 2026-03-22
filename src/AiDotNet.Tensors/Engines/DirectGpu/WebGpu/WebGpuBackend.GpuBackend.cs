@@ -227,6 +227,39 @@ public sealed partial class WebGpuBackend
     public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MinimumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MaximumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => ScaleAsync(A, B, scalar, size).GetAwaiter().GetResult();
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    {
+        if (size <= 0) return;
+        // Compose: temp = A * B, result = sum(temp)
+        using var temp = AllocateBuffer(size);
+        Multiply(a, b, temp, size);
+        SumAxis(temp, result, 1, size);
+    }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+    {
+        if (aSize <= 0) return;
+        var bData = DownloadBuffer(b);
+        var window = new float[aSize];
+        for (int i = 0; i < aSize; i++)
+        {
+            int bIdx = bOffset + i * bStride;
+            window[i] = (bIdx >= 0 && bIdx < bSize) ? bData[bIdx] : 0f;
+        }
+        using var windowBuf = AllocateBuffer(window);
+        DotProduct(a, windowBuf, result, aSize);
+    }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+    {
+        if (batchSize <= 0 || vecSize <= 0) return;
+        using var temp = AllocateBuffer(batchSize * vecSize);
+        Multiply(a, b, temp, batchSize * vecSize);
+        SumAxis(temp, result, batchSize, vecSize);
+    }
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => AbsAsync(A, B, size).GetAwaiter().GetResult();
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => ExpAsync(A, B, size).GetAwaiter().GetResult();
