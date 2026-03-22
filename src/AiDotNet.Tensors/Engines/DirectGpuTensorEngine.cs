@@ -11574,5 +11574,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.UpsampleBackward(gradOutput,inputShape,scaleH,scaleW);
     }
 
+    Tensor<T> IEngine.TensorSoftmax<T>(Tensor<T> tensor, int axis)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape[ea]; int outerSize=tensor.Length/features; using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorSoftmax(tensor,axis);
+    }
+
+    Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape[ea]; int outerSize=tensor.Length/features; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.LogSoftmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorLogSoftmax(tensor,axis);
+    }
+
+    Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        { try { using var gso=b.AllocateBuffer(((Tensor<float>)(object)softmaxOutput).GetDataArray()); using var ggo=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput.Shape[ea]; int outerSize=softmaxOutput.Length/features; b.SoftmaxBackward(gso,ggo,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),softmaxOutput.Shape.ToArray()); } catch{} }
+        return base.TensorSoftmaxBackward(softmaxOutput,gradOutput,axis);
+    }
+
     #endregion
 }
