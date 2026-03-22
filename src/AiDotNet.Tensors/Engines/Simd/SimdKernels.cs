@@ -552,9 +552,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vCoeff = Vector256.Create(0.044715f);
                 var vHalf = Vector256.Create(0.5f);
                 var vOne = Vector256.Create(1.0f);
-                var vNegOne = Vector256.Create(-1.0f);
-                var v27 = Vector256.Create(27.0f);
-                var v9 = Vector256.Create(9.0f);
+                var vTwo = Vector256.Create(2.0f);
 
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
@@ -562,16 +560,12 @@ namespace AiDotNet.Tensors.Engines.Simd
                     for (int k = 0; k < 32; k += 8)
                     {
                         var x = Avx.LoadVector256(input + i + k);
-                        var x_squared = Avx.Multiply(x, x);
-                        var x_cubed = Avx.Multiply(x_squared, x);
+                        var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
                         var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
                         var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                        var tanh_arg_sq = Avx.Multiply(tanh_arg, tanh_arg);
-                        var numerator = Avx.Add(v27, tanh_arg_sq);
-                        var denominator = Fma.MultiplyAdd(v9, tanh_arg_sq, v27);
-                        var tanh_approx = Avx.Divide(Avx.Multiply(tanh_arg, numerator), denominator);
-                        tanh_approx = Avx.Max(vNegOne, Avx.Min(vOne, tanh_approx));
-                        Avx.Store(output + i + k, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_approx))));
+                        // tanh(z) = 2*sigmoid(2z) - 1 using FastSigmoid256 (Cephes exp, ~0.01% error)
+                        var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
+                        Avx.Store(output + i + k, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
                     }
                 }
             }
@@ -581,24 +575,17 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vCoeff = Vector256.Create(0.044715f);
                 var vHalf = Vector256.Create(0.5f);
                 var vOne = Vector256.Create(1.0f);
-                var vNegOne = Vector256.Create(-1.0f);
-                var v27 = Vector256.Create(27.0f);
-                var v9 = Vector256.Create(9.0f);
+                var vTwo = Vector256.Create(2.0f);
 
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
                     var x = Avx.LoadVector256(input + i);
-                    var x_squared = Avx.Multiply(x, x);
-                    var x_cubed = Avx.Multiply(x_squared, x);
+                    var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
                     var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
                     var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-                    var tanh_arg_sq = Avx.Multiply(tanh_arg, tanh_arg);
-                    var numerator = Avx.Add(v27, tanh_arg_sq);
-                    var denominator = Fma.MultiplyAdd(v9, tanh_arg_sq, v27);
-                    var tanh_approx = Avx.Divide(Avx.Multiply(tanh_arg, numerator), denominator);
-                    tanh_approx = Avx.Max(vNegOne, Avx.Min(vOne, tanh_approx));
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_approx))));
+                    var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
+                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
                 }
             }
 #endif
@@ -2305,38 +2292,18 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vCoeff = Vector256.Create(coeff);
                 var vHalf = Vector256.Create(half);
                 var vOne = Vector256.Create(1.0f);
-                var vNegOne = Vector256.Create(-1.0f);
-                // Constants for rational tanh approximation: tanh(x) ≈ x * (27 + x²) / (27 + 9*x²)
-                // Accurate to ~0.001 for |x| < 3, which covers typical GELU input ranges
-                var v27 = Vector256.Create(27.0f);
-                var v9 = Vector256.Create(9.0f);
+                var vTwo = Vector256.Create(2.0f);
 
                 int simdLength = length & ~7;
                 for (; i < simdLength; i += 8)
                 {
                     var x = ReadVector256(input, i);
-                    // x^3
-                    var x_squared = Avx.Multiply(x, x);
-                    var x_cubed = Avx.Multiply(x_squared, x);
-                    // x + 0.044715 * x^3
+                    var x_cubed = Avx.Multiply(Avx.Multiply(x, x), x);
                     var inner = Fma.MultiplyAdd(vCoeff, x_cubed, x);
-                    // sqrt(2/pi) * inner = tanh argument
                     var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
-
-                    // Vectorized tanh approximation using rational function
-                    // tanh(x) ≈ x * (27 + x²) / (27 + 9*x²) for |x| ≤ 3
-                    var tanh_arg_sq = Avx.Multiply(tanh_arg, tanh_arg);
-                    var numerator = Avx.Add(v27, tanh_arg_sq); // 27 + x²
-                    var denominator = Fma.MultiplyAdd(v9, tanh_arg_sq, v27); // 27 + 9*x²
-                    var tanh_approx = Avx.Divide(Avx.Multiply(tanh_arg, numerator), denominator);
-
-                    // Clamp to [-1, 1] for |x| > 3 (where approximation is less accurate)
-                    tanh_approx = Avx.Max(vNegOne, Avx.Min(vOne, tanh_approx));
-
-                    // GELU = 0.5 * x * (1 + tanh)
-                    var one_plus_tanh = Avx.Add(vOne, tanh_approx);
-                    var result = Avx.Multiply(vHalf, Avx.Multiply(x, one_plus_tanh));
-                    WriteVector256(output, i, result);
+                    // tanh(z) = 2*sigmoid(2z) - 1 using FastSigmoid256 (Cephes exp, ~0.01% error)
+                    var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
+                    WriteVector256(output, i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
                 }
             }
 #endif
