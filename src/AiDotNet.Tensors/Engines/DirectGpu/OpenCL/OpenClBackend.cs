@@ -2464,6 +2464,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
             if (batchSize <= 0 || vecSize <= 0) return;
+            long totalElements = (long)batchSize * vecSize;
+            if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
+            if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
 
             var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
             var bufB = ((DirectOpenClGpuBuffer)b).Buffer;

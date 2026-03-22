@@ -466,7 +466,11 @@ public sealed unsafe partial class VulkanBackend
     public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (size <= 0)
+        {
+            Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
 
         if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
         if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");

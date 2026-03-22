@@ -678,6 +678,14 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         ThrowIfDisposed();
         if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        if (size <= 0)
+        {
+            // Zero result for empty input
+            Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
 
         uint threadgroupSize = 256;
         uint numGroups = (uint)Math.Min((size + threadgroupSize - 1) / threadgroupSize, 256);
