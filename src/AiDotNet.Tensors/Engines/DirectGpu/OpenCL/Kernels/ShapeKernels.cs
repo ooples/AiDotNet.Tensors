@@ -93,9 +93,14 @@ __kernel void masked_fill_kernel(__global const float* input, __global const flo
     int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = (mask[idx] != 0.0f) ? fillValue : input[idx];
 }
-__kernel void index_select(__global const float* input, __global const float* indices, __global float* output, int numIndices, int innerSize) {
+__kernel void index_select(__global const float* input, __global const float* indices, __global float* output, int numIndices, int innerSize, int inputRows) {
     int idx = get_global_id(0); if (idx >= numIndices * innerSize) return;
-    output[idx] = input[(int)indices[idx / innerSize] * innerSize + (idx % innerSize)];
+    int selectedRow = (int)indices[idx / innerSize];
+    if (selectedRow >= 0 && selectedRow < inputRows) {
+        output[idx] = input[selectedRow * innerSize + (idx % innerSize)];
+    } else {
+        output[idx] = 0.0f;
+    }
 }
 ";
     }

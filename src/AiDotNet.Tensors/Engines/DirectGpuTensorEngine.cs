@@ -1353,7 +1353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
 
                 gpuBackend.GroupNorm(gpuIn, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, channels, spatial, numGroups, (float)epsilon);
+                    batch, numGroups, channels, spatial, (float)epsilon);
                 gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
 
                 mean = new Tensor<T>(new int[] { batch, numGroups });

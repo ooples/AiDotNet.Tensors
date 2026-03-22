@@ -190,7 +190,7 @@ extern ""C"" __global__ __launch_bounds__(256) void spherical_softmax(
     float max_val = -INFINITY;
     for (int j = 0; j < innerSize; j++) {
         float normalized = in_row[j] / norm;
-        out_row[j] = normalized * norm; // Scale by original norm
+        out_row[j] = normalized; // Spherical normalization (L2-normalized input to softmax)
         max_val = fmaxf(max_val, out_row[j]);
     }
 

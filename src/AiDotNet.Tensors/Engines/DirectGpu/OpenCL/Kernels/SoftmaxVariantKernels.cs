@@ -53,7 +53,7 @@ __kernel void spherical_softmax(__global const float* input, __global float* out
     for (int j = 0; j < innerSize; j++) norm_sq += input[base_idx + j] * input[base_idx + j];
     float norm = sqrt(norm_sq + 1e-12f);
     float max_val = -INFINITY;
-    for (int j = 0; j < innerSize; j++) { float v = input[base_idx + j] / norm * norm; output[base_idx + j] = v; max_val = fmax(max_val, v); }
+    for (int j = 0; j < innerSize; j++) { float v = input[base_idx + j] / norm; output[base_idx + j] = v; max_val = fmax(max_val, v); }
     float sum_exp = 0.0f;
     for (int j = 0; j < innerSize; j++) { output[base_idx + j] = exp(output[base_idx + j] - max_val); sum_exp += output[base_idx + j]; }
     float inv = 1.0f / (sum_exp + 1e-10f);
