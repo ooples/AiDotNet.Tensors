@@ -82,6 +82,7 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
         // WebGPU buffers are float32-addressed. Allocate enough floats to hold the byte count.
         // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
         int floatCount = (size + sizeof(float) - 1) / sizeof(float);

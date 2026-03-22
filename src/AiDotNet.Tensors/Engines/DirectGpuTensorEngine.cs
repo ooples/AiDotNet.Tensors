@@ -235,7 +235,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void DownloadIntoTensor(IDirectGpuBackend backend, IGpuBuffer gpuBuffer, Tensor<float> tensor)
     {
         var downloaded = backend.DownloadBuffer(gpuBuffer);
-        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.Data.Span);
+        int copyLen = Math.Min(downloaded.Length, tensor.Length);
+        System.Diagnostics.Debug.Assert(downloaded.Length >= tensor.Length,
+            $"GPU buffer download ({downloaded.Length}) is shorter than tensor ({tensor.Length}) — data will be truncated.");
+        downloaded.AsSpan(0, copyLen).CopyTo(tensor.Data.Span);
     }
 
     private bool TryGetBackend(out IDirectGpuBackend backend)

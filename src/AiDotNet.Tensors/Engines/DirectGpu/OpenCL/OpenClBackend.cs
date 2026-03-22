@@ -2738,7 +2738,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(6, outputCapsules);
             kernel.SetArg(7, outputDim);
 
-            int total = batchSize * inputCapsules * outputCapsules * outputDim;
+            long totalLong = (long)batchSize * inputCapsules * outputCapsules * outputDim;
+            if (totalLong > int.MaxValue) throw new OverflowException($"Capsule prediction total ({totalLong}) exceeds int.MaxValue.");
+            int total = (int)totalLong;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             kernel.Execute1D(total, localSize);
         }
