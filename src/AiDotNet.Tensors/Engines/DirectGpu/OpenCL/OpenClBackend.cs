@@ -2802,51 +2802,42 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
-        /// Online softmax for large feature dimensions using ALL GPU CUs.
-        /// Phase 1: multiple workgroups compute tile-local max + sum, last WG merges via atomic counter.
-        /// Phase 2: all work items normalize in parallel using global max/sum.
-        /// Only 2 kernel launches, no data copies, full GPU utilization.
+        /// Single-kernel fused softmax for large feature dimensions.
+        /// ONE kernel launch does: tile max + exp+sum + atomic merge + spin-wait + normalize.
+        /// Eliminates: ZeroBuffer call, Finish() sync, second kernel launch.
         /// </summary>
         private void SoftmaxLargeRow(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
         {
             if (_context == null) return;
 
             int localSize = 256;
-            int numGroups = Math.Max(1, ComputeUnits * 4); // 4 workgroups per CU
-            int scratchSize = numGroups * 2 + 3; // max[], sum[], counter, globalMax, globalSum
+            int numGroups = Math.Max(2, ComputeUnits * 4); // 4 workgroups per CU, min 2
+            int scratchInts = numGroups * 2 + 4; // maxBits[nG], sumBits[nG], counter, readyFlag, globalMaxBits, globalSumBits
 
-            using var scratchBuf = AllocateBuffer(scratchSize);
+            // Allocate scratch as int buffer (used with atomic_add and as_float/as_int)
+            using var scratchBuf = AllocateBuffer(scratchInts);
+
+            var k = _kernelCache["softmax_fused"];
 
             for (int b = 0; b < batchSize; b++)
             {
                 int offset = b * features;
 
-                // Zero scratch buffer (counter must be 0)
-                ZeroBuffer(scratchBuf, scratchSize);
+                // Zero scratch (counter=0, readyFlag=0) — single memset, no kernel launch
+                ZeroBuffer(scratchBuf, scratchInts);
 
-                // Phase 1: tile-parallel max + sum with atomic merge
-                var k1 = _kernelCache["softmax_online_phase1"];
-                k1.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
-                k1.SetArg(1, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
-                k1.SetArg(2, offset);
-                k1.SetArg(3, features);
-                k1.SetArg(4, numGroups);
-                k1.SetLocalArg(5, localSize * sizeof(float));
-                k1.Execute1D(numGroups * localSize, localSize);
-                _context.Finish();
+                k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+                k.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+                k.SetArg(2, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
+                k.SetArg(3, offset);
+                k.SetArg(4, features);
+                k.SetArg(5, numGroups);
+                k.SetLocalArg(6, localSize * sizeof(float));
 
-                // Phase 2: normalize with full GPU parallelism
-                var k2 = _kernelCache["softmax_online_phase2"];
-                k2.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
-                k2.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-                k2.SetArg(2, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
-                k2.SetArg(3, offset);
-                k2.SetArg(4, features);
-                k2.SetArg(5, numGroups);
-                int workItems = (features + 3) / 4;
-                k2.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
+                // Single kernel launch — all phases happen inside the kernel
+                k.Execute1D(numGroups * localSize, localSize);
             }
-            _context.Finish();
+            _context?.Finish();
         }
 
         public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)

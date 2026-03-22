@@ -1036,19 +1036,17 @@ __kernel void hardtanh_backward(
 }
 
 // ============================================================================
-// Online softmax: two-phase approach using ALL workgroups for large rows.
-// Phase 1: each workgroup computes tile-local max + sum(exp(x-max)).
-//          Results go to scratch[groupId] = {max, sum}.
-//          The last workgroup (via atomic counter) computes the global result:
-//          global_max, global_sum = correct_and_merge(all tile results)
-// Phase 2: each work item computes output[i] = exp(input[i] - global_max) / global_sum
+// Single-kernel fused softmax for large rows.
+// All workgroups cooperate within ONE kernel launch:
+//   Step 1: Each WG computes tile max + sum(exp(x-tileMax)) in local memory
+//   Step 2: Last WG (via atomic counter) merges tile results to global max/sum
+//   Step 3: All WGs spin-wait on ready flag, then normalize their tile in-place
+// Zero kernel-launch overhead between phases. Only 1 clEnqueueNDRange call.
 // ============================================================================
-
-// Phase 1: compute per-tile max and sum, last workgroup merges all tiles
-// scratch layout: [numGroups floats for max | numGroups floats for sum | 1 int counter | 1 float globalMax | 1 float globalSum]
-__kernel void softmax_online_phase1(
+__kernel void softmax_fused(
     __global const float* input,
-    __global float* scratch, // size: numGroups*2 + 3 (max[], sum[], counter, globalMax, globalSum)
+    __global float* output,
+    __global volatile int* scratch, // layout: [maxBits[nG] | sumBits[nG] | counter | readyFlag | globalMaxBits | globalSumBits]
     const int rowOffset,
     const int features,
     const int numGroups,
@@ -1059,17 +1057,18 @@ __kernel void softmax_online_phase1(
     const int localSize = get_local_size(0);
 
     __global const float* row = input + rowOffset;
+    __global float* rowOut = output + rowOffset;
 
-    // Each thread finds max over its strided elements within this tile
-    int tileStart = gid * ((features + numGroups - 1) / numGroups);
-    int tileEnd = min(tileStart + ((features + numGroups - 1) / numGroups), features);
+    // Tile bounds for this workgroup
+    int tileSize = (features + numGroups - 1) / numGroups;
+    int tileStart = gid * tileSize;
+    int tileEnd = min(tileStart + tileSize, features);
 
+    // --- Step 1: Tile-local max ---
     float threadMax = -INFINITY;
-    for (int f = tileStart + lid; f < tileEnd; f += localSize) {
+    for (int f = tileStart + lid; f < tileEnd; f += localSize)
         threadMax = fmax(threadMax, row[f]);
-    }
 
-    // Reduce max within workgroup
     localBuf[lid] = threadMax;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int s = localSize >> 1; s > 0; s >>= 1) {
@@ -1079,13 +1078,11 @@ __kernel void softmax_online_phase1(
     float tileMax = localBuf[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Each thread computes partial exp sum
+    // --- Step 1b: Tile-local exp sum ---
     float threadSum = 0.0f;
-    for (int f = tileStart + lid; f < tileEnd; f += localSize) {
+    for (int f = tileStart + lid; f < tileEnd; f += localSize)
         threadSum += fast_exp1(row[f] - tileMax);
-    }
 
-    // Reduce sum within workgroup
     localBuf[lid] = threadSum;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int s = localSize >> 1; s > 0; s >>= 1) {
@@ -1094,60 +1091,52 @@ __kernel void softmax_online_phase1(
     }
     float tileSum = localBuf[0];
 
-    // Thread 0 writes tile results
+    // --- Step 2: Thread 0 publishes tile results and last WG merges ---
     if (lid == 0) {
-        scratch[gid] = tileMax;
-        scratch[numGroups + gid] = tileSum;
+        // Store as int bits to use atomic-visible scratch (volatile int*)
+        scratch[gid] = as_int(tileMax);
+        scratch[numGroups + gid] = as_int(tileSum);
 
-        // Atomic increment counter; last workgroup to finish does the merge
-        __global int* counter = (__global int*)(scratch + numGroups * 2);
-        int old = atomic_add(counter, 1);
+        // Memory fence to ensure all WGs see the writes
+        mem_fence(CLK_GLOBAL_MEM_FENCE);
+
+        // Atomic increment — last WG to arrive does the merge
+        int counterIdx = numGroups * 2;
+        int old = atomic_add(&scratch[counterIdx], 1);
+
         if (old == numGroups - 1) {
             // Last workgroup: merge all tile results
-            float globalMax = scratch[0];
-            for (int i = 1; i < numGroups; i++) globalMax = fmax(globalMax, scratch[i]);
+            float globalMax = as_float(scratch[0]);
+            for (int i = 1; i < numGroups; i++)
+                globalMax = fmax(globalMax, as_float(scratch[i]));
 
             float globalSum = 0.0f;
-            for (int i = 0; i < numGroups; i++) {
-                // Correct each tile's sum to the global max: sum_i * exp(tileMax_i - globalMax)
-                globalSum += scratch[numGroups + i] * fast_exp1(scratch[i] - globalMax);
-            }
+            for (int i = 0; i < numGroups; i++)
+                globalSum += as_float(scratch[numGroups + i]) * fast_exp1(as_float(scratch[i]) - globalMax);
 
-            // Store global results for phase 2
-            __global float* globalResults = scratch + numGroups * 2;
-            // globalResults[0] is the counter (int), skip it
-            // Store at fixed offset after counter
-            scratch[numGroups * 2 + 1] = globalMax;
-            scratch[numGroups * 2 + 2] = globalSum;
+            // Publish global results
+            scratch[counterIdx + 2] = as_int(globalMax);
+            scratch[counterIdx + 3] = as_int(globalSum);
 
-            // Reset counter for potential reuse
-            *counter = 0;
+            // Memory fence then set ready flag (all WGs will see this)
+            mem_fence(CLK_GLOBAL_MEM_FENCE);
+            scratch[counterIdx + 1] = 1; // readyFlag = 1
         }
     }
-}
 
-// Phase 2: normalize all elements using global max and sum (full GPU parallelism)
-__kernel void softmax_online_phase2(
-    __global const float* input,
-    __global float* output,
-    __global const float* scratch, // scratch[numGroups*2+1] = globalMax, scratch[numGroups*2+2] = globalSum
-    const int rowOffset,
-    const int features,
-    const int numGroups)
-{
-    const int idx = get_global_id(0);
-    const int idx4 = idx * 4;
-
-    float globalMax = scratch[numGroups * 2 + 1];
-    float invSum = 1.0f / scratch[numGroups * 2 + 2];
-
-    if (idx4 + 3 < features) {
-        float4 v = vload4(0, input + rowOffset + idx4);
-        vstore4(fast_exp4(v - (float4)(globalMax)) * invSum, 0, output + rowOffset + idx4);
-    } else {
-        for (int i = idx4; i < features; i++)
-            output[rowOffset + i] = fast_exp1(input[rowOffset + i] - globalMax) * invSum;
+    // --- Step 3: All threads spin-wait for ready flag, then normalize ---
+    if (lid == 0) {
+        int readyIdx = numGroups * 2 + 1;
+        while (scratch[readyIdx] == 0) { /* spin */ }
     }
+    barrier(CLK_LOCAL_MEM_FENCE); // broadcast ready to all threads in WG
+
+    float globalMax = as_float(scratch[numGroups * 2 + 2]);
+    float invSum = 1.0f / as_float(scratch[numGroups * 2 + 3]);
+
+    // Normalize this tile with full thread parallelism
+    for (int f = tileStart + lid; f < tileEnd; f += localSize)
+        rowOut[f] = fast_exp1(row[f] - globalMax) * invSum;
 }
 
 // Softmax helper: B[offset + idx*4..+3] = exp(A[offset + idx*4..+3] - scalar)
@@ -1199,7 +1188,7 @@ __kernel void softmax_div_scalar(
                 // Activations (forward)
                 "relu", "leaky_relu", "sigmoid", "tanh_activation",
                 "gelu", "swish", "softmax", "softmax_exp_sub", "softmax_div_scalar",
-                "softmax_online_phase1", "softmax_online_phase2",
+                "softmax_fused",
                 "mish", "softplus", "hardswish", "selu", "hardsigmoid", "hardtanh",
                 // Activation backward kernels
                 "relu_backward", "leaky_relu_backward", "sigmoid_backward", "tanh_backward",
