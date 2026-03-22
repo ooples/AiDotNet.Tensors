@@ -217,11 +217,11 @@ public sealed class GraphExecutor<T> : IDisposable
                     inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
                     n.Params?.Epsilon ?? 1e-5),
 
-            // Element-wise math
-            [OpType.Exp] = (_, inp, o) => { var r = _engine.TensorExp(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
-            [OpType.Log] = (_, inp, o) => { var r = _engine.TensorLog(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
-            [OpType.Sqrt] = (_, inp, o) => { var r = _engine.TensorSqrt(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
-            [OpType.Abs] = (_, inp, o) => { var r = _engine.TensorAbs(inp[0]); Array.Copy(r.GetDataArray(), o.GetDataArray(), Math.Min(r.Length, o.Length)); },
+            // Element-wise math — use AsSpan/AsWritableSpan to avoid GetDataArray() copy issues
+            [OpType.Exp] = (_, inp, o) => { var r = _engine.TensorExp(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
+            [OpType.Log] = (_, inp, o) => { var r = _engine.TensorLog(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
+            [OpType.Sqrt] = (_, inp, o) => { var r = _engine.TensorSqrt(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
+            [OpType.Abs] = (_, inp, o) => { var r = _engine.TensorAbs(inp[0]); r.AsSpan().Slice(0, Math.Min(r.Length, o.Length)).CopyTo(o.AsWritableSpan()); },
 
             // Linear algebra
             [OpType.MatMul] = (_, inp, o) => _engine.MatMulInto(o, inp[0], inp[1]),
@@ -254,7 +254,7 @@ public sealed class GraphExecutor<T> : IDisposable
                 {
                     Tensor<T> stats;
                     var result = _engine.FlashAttention(inp[0], inp[1], inp[2], scale: null, isCausal: false, softmaxStats: out stats);
-                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
                 }
             },
 
@@ -269,7 +269,7 @@ public sealed class GraphExecutor<T> : IDisposable
                         n.Params?.Padding ?? 0, n.Params?.Padding ?? 0,
                         n.Params?.Dilation ?? 1, n.Params?.Dilation ?? 1,
                         (Engines.FusedActivationType)(int)(n.Params?.FusedActivation ?? ComputationGraph.FusedActivationType.None));
-                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
                 }
             },
 
@@ -280,7 +280,7 @@ public sealed class GraphExecutor<T> : IDisposable
                 {
                     var result = _engine.BatchNorm(inp[0], inp[1], inp[2],
                         n.Params?.Epsilon ?? 1e-5, out _, out _);
-                    Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                    result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
                 }
             },
 
@@ -288,11 +288,11 @@ public sealed class GraphExecutor<T> : IDisposable
             [OpType.MaxPool2D] = (n, inp, o) =>
             {
                 var result = _engine.MaxPool2D(inp[0], n.Params?.Stride ?? 2, n.Params?.Stride ?? 2, n.Params?.Padding ?? 0);
-                Array.Copy(result.GetDataArray(), o.GetDataArray(), Math.Min(result.Length, o.Length));
+                result.AsSpan().Slice(0, Math.Min(result.Length, o.Length)).CopyTo(o.AsWritableSpan());
             },
 
             // Dropout (pass-through for inference)
-            [OpType.Dropout] = (_, inp, o) => Array.Copy(inp[0].GetDataArray(), o.GetDataArray(), Math.Min(inp[0].Length, o.Length)),
+            [OpType.Dropout] = (_, inp, o) => inp[0].AsSpan().Slice(0, Math.Min(inp[0].Length, o.Length)).CopyTo(o.AsWritableSpan()),
         };
     }
 

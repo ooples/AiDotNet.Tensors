@@ -82,6 +82,20 @@ public class Issue42Tests
         Assert.Equal(360.0, result[2, 3], Tolerance);  // 12 * 30
     }
 
+    [Fact]
+    public void TensorMultiply_NonBroadcastableShapes_Throws()
+    {
+        // [3,4] * [2,3] → incompatible dimensions, should throw
+        var a = new Tensor<double>(new double[12], new[] { 3, 4 });
+        var b = new Tensor<double>(new double[6], new[] { 2, 3 });
+
+        var ex = Assert.Throws<ArgumentException>(() => _engine.TensorMultiply(a, b));
+
+        // Error message should include the shapes for diagnostic clarity
+        Assert.Contains("3, 4", ex.Message);
+        Assert.Contains("2, 3", ex.Message);
+    }
+
     #endregion
 
     #region Reshape error message
