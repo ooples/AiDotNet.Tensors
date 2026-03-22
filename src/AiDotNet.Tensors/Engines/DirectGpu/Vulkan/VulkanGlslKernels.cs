@@ -361,4 +361,140 @@ void main() {
     }
     c[batch] = sum_sq / float(numFeatures);
 }";
+
+    // Shape ops
+    public static string ConcatAxisGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint aInnerSize; uint bInnerSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint totalInner = aInnerSize + bInnerSize;
+    if (idx >= outerSize * totalInner) return;
+    uint outer = idx / totalInner; uint inner = idx % totalInner;
+    c[idx] = (inner < aInnerSize) ? a[outer * aInnerSize + inner] : bdata[outer * bInnerSize + (inner - aInnerSize)];
+}";
+
+    public static string SliceLastAxisGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint inputInnerSize; uint start; uint sliceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize * sliceSize) return;
+    b[idx] = a[(idx / sliceSize) * inputInnerSize + start + (idx % sliceSize)];
+}";
+
+    public static string Pad2DGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint outH; uint outW; uint padTop; uint padLeft; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= batch * channels * outH * outW) return;
+    uint w = idx % outW; uint temp = idx / outW; uint h = temp % outH; temp /= outH; uint ch = temp % channels; uint ba = temp / channels;
+    int srcH = int(h) - int(padTop); int srcW = int(w) - int(padLeft);
+    b[idx] = (srcH >= 0 && srcH < int(inH) && srcW >= 0 && srcW < int(inW)) ? a[((ba * channels + ch) * inH + uint(srcH)) * inW + uint(srcW)] : 0.0;
+}";
+
+    public static string TileLastAxisGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint innerSize; uint repeats; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint tiledInner = innerSize * repeats;
+    if (idx >= outerSize * tiledInner) return;
+    b[idx] = a[(idx / tiledInner) * innerSize + ((idx % tiledInner) % innerSize)];
+}";
+
+    public static string PixelShuffleGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint scale; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint outH = inH * scale; uint outW = inW * scale;
+    if (idx >= batch * channels * outH * outW) return;
+    uint ow = idx % outW; uint temp = idx / outW; uint oh = temp % outH; temp /= outH; uint oc = temp % channels; uint ba = temp / channels;
+    uint srcC = oc * scale * scale + (oh % scale) * scale + (ow % scale);
+    b[idx] = a[((ba * channels * scale * scale + srcC) * inH + oh / scale) * inW + ow / scale];
+}";
+
+    public static string EyeKernelGlsl => Header + @"
+layout(set = 0, binding = 0) writeonly buffer B { float b[]; };
+layout(push_constant) uniform Params { uint n; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n * n) return;
+    b[idx] = (idx / n == idx % n) ? 1.0 : 0.0;
+}";
+
+    public static string LinspaceKernelGlsl => Header + @"
+layout(set = 0, binding = 0) writeonly buffer B { float b[]; };
+layout(push_constant) uniform Params { float start; float step; uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    b[idx] = start + step * float(idx);
+}";
+
+    public static string DiagKernelGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint n; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n * n) return;
+    b[idx] = (idx / n == idx % n) ? a[idx / n] : 0.0;
+}";
+
+    public static string TriangularMaskGlsl => Header + @"
+layout(set = 0, binding = 0) writeonly buffer B { float b[]; };
+layout(push_constant) uniform Params { uint rows; uint cols; int diagonal; float maskValue; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= rows * cols) return;
+    b[idx] = (int(idx % cols) > int(idx / cols) + diagonal) ? maskValue : 0.0;
+}";
+
+    public static string IndexSelectGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint numIndices; uint innerSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numIndices * innerSize) return;
+    c[idx] = a[uint(bdata[idx / innerSize]) * innerSize + (idx % innerSize)];
+}";
+
+    public static string BatchDotProductGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint dim; };
+void main() {
+    uint batch = gl_GlobalInvocationID.x;
+    if (batch >= batchSize) return;
+    float sum = 0.0;
+    for (uint i = 0; i < dim; i++) sum += a[batch * dim + i] * bdata[batch * dim + i];
+    c[batch] = sum;
+}";
+
+    public static string PairwiseDistanceGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint M; uint N; uint dim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= M * N) return;
+    uint i = idx / N; uint j = idx % N;
+    float d = 0.0;
+    for (uint k = 0; k < dim; k++) { float diff = a[i*dim+k] - bdata[j*dim+k]; d += diff*diff; }
+    c[idx] = sqrt(d);
+}";
+
+    public static string BceLossGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float p = clamp(a[idx], 1e-7, 1.0 - 1e-7);
+    float t = bdata[idx];
+    c[idx] = -(t * log(p) + (1.0 - t) * log(1.0 - p));
+}";
+
+    public static string CrossEntropyLossGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main() {
+    uint batch = gl_GlobalInvocationID.x;
+    if (batch >= batchSize) return;
+    float loss = 0.0;
+    for (uint cls = 0; cls < numClasses; cls++) {
+        float target = bdata[batch * numClasses + cls];
+        if (target > 0.0) loss -= target * log(max(a[batch * numClasses + cls], 1e-7));
+    }
+    c[batch] = loss;
+}";
 }

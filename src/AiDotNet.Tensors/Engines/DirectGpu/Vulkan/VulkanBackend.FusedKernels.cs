@@ -10,13 +10,13 @@ public sealed partial class VulkanBackend
 {
     #region Fused Reductions
 
-    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]; float[] r={s/sz}; UploadToBuffer(r,o); }
-    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float p=1; for(int j=0;j<sz;j++) p*=d[j]; float[] r={p}; UploadToBuffer(r,o); }
-    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]*d[j]; float[] r={s}; UploadToBuffer(r,o); }
-    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]*d[j]; float[] r={s}; UploadToBuffer(r,o); }
-    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float m=0; for(int j=0;j<sz;j++) m=Math.Max(m,Math.Abs(d[j])); float[] r={m}; UploadToBuffer(r,o); }
-    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float m=float.MaxValue; for(int j=0;j<sz;j++) m=Math.Min(m,Math.Abs(d[j])); float[] r={m}; UploadToBuffer(r,o); }
-    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=MathF.Exp(d[j]-mx); float[] r={s}; UploadToBuffer(r,o); }
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, 1, 2*sizeof(uint));
     public void VarianceAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, 2 * sizeof(uint));
     public void StdAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.StdAxis, i, o, os, 2 * sizeof(uint));
     public void ProductAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, os, 2 * sizeof(uint));
@@ -203,7 +203,7 @@ public sealed partial class VulkanBackend
     public void EyeKernel(IGpuBuffer o, int n) { float[] r = new float[n * n]; for (int i = 0; i < n; i++) r[i * n + i] = 1f; UploadToBuffer(r, o); }
     public void LinspaceKernel(IGpuBuffer o, float st, float sp, int sz) { float[] r = new float[sz]; for (int i = 0; i < sz; i++) r[i] = st + sp * i; UploadToBuffer(r, o); }
     public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { float[] id = DownloadBuffer(idx); float[] r = new float[bs * nc]; for (int b = 0; b < bs; b++) r[b * nc + (int)id[b]] = 1f; UploadToBuffer(r, o); }
-    public void DiagKernel(IGpuBuffer i, IGpuBuffer o, int n) { float[] d = DownloadBuffer(i); float[] r = new float[n * n]; for (int j = 0; j < n; j++) r[j * n + j] = d[j]; UploadToBuffer(r, o); }
+    public void DiagKernel(IGpuBuffer i, IGpuBuffer o, int n) => GlslUnaryOp(VulkanGlslKernels.DiagKernelGlsl, i, o, n*n, sizeof(uint));
     public void ExtractDiagKernel(IGpuBuffer i, IGpuBuffer o, int n, int cols) { float[] d = DownloadBuffer(i); float[] r = new float[n]; for (int j = 0; j < n; j++) r[j] = d[j * cols + j]; UploadToBuffer(r, o); }
     public void TriangularMask(IGpuBuffer o, int rows, int cols, int diag, float mv) { float[] r = new float[rows * cols]; for (int i = 0; i < rows; i++) for (int j = 0; j < cols; j++) if (j > i + diag) r[i * cols + j] = mv; UploadToBuffer(r, o); }
     public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { float[] d = DownloadBuffer(i); float[] md = DownloadBuffer(m); float[] r = new float[sz]; for (int j = 0; j < sz; j++) r[j] = md[j] != 0 ? fv : d[j]; UploadToBuffer(r, o); }
