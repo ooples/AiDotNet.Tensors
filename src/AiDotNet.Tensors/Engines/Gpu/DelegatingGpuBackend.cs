@@ -1600,4 +1600,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.SwiGluForward(i, o, os, hd);
     public virtual void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) => Inner.BceLoss(p, t, l, sz);
 
+
+    public virtual void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => Inner.AddScalar(i, o, sc, sz);
+    public virtual void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => Inner.SubScalar(i, o, sc, sz);
+    public virtual void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastAddLast(a, b, o, os, isz);
+    public virtual void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastSubLast(a, b, o, os, isz);
+    public virtual void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastMulLast(a, b, o, os, isz);
+    public virtual void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastDivLast(a, b, o, os, isz);
+
 }

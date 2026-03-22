@@ -33,4 +33,10 @@ public sealed partial class HipBackend
             }
         }
     }
+    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]+sc; UploadToExistingHip(r,o); }
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]-sc; UploadToExistingHip(r,o); }
+    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]+bd[j%isz]; UploadToExistingHip(r,o); }
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]-bd[j%isz]; UploadToExistingHip(r,o); }
+    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]*bd[j%isz]; UploadToExistingHip(r,o); }
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]/(bd[j%isz]+1e-12f); UploadToExistingHip(r,o); }
 }

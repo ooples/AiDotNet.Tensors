@@ -2539,6 +2539,12 @@ public interface IDirectGpuBackend : IDisposable
     void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void BceLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int size);
+    void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+    void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+    void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+    void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
+    void AddScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
+    void SubScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
 }
 
 /// <summary>
@@ -2594,14 +2600,8 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     // =====================================================================
     // Fused Broadcast / Scalar Kernels
     // =====================================================================
-    void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
-    void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
-    void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
-    void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
     void BroadcastAddFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
     void BroadcastMulFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
-    void AddScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
-    void SubScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void DivScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void RsqrtKernel(IGpuBuffer input, IGpuBuffer output, int size);
     void SinCosKernel(IGpuBuffer input, IGpuBuffer sinOutput, IGpuBuffer cosOutput, int size);
