@@ -594,6 +594,24 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
         CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
 
+        // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
+        CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
+
+        // Compile broadcast/scalar/element-wise utility kernels
+        CompileKernelModule(device, CudaBroadcastKernels.GetSource(), "broadcast_kernels", CudaBroadcastKernels.GetKernelNames());
+
+        // Compile gated activation kernels (GLU, GeGLU, ReGLU, SwiGLU, derivatives)
+        CompileKernelModule(device, CudaGatedActivationKernels.GetSource(), "gated_activation_kernels", CudaGatedActivationKernels.GetKernelNames());
+
+        // Compile shape/layout kernels (concat, slice, pad, tile, pixel shuffle, utility)
+        CompileKernelModule(device, CudaShapeKernels.GetSource(), "shape_kernels", CudaShapeKernels.GetKernelNames());
+
+        // Compile loss forward kernels (cross-entropy, MSE, BCE, dropout mask, gaussian noise)
+        CompileKernelModule(device, CudaLossForwardKernels.GetSource(), "loss_forward_kernels", CudaLossForwardKernels.GetKernelNames());
+
+        // Compile softmax variant + GEMM extension kernels
+        CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
+
         // Compile FP16 conversion kernels (half-precision float conversion)
         // May fail if NVRTC doesn't have cuda_fp16.h (minimal CUDA Toolkit install).
         try
