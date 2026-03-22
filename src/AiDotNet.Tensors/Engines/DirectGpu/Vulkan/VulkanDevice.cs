@@ -700,11 +700,28 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// <summary>
     /// Submits a command buffer and waits for completion using per-thread fence.
     /// </summary>
+    private volatile bool _deviceWarmedUp;
+
     public void SubmitAndWait(IntPtr commandBuffer, IntPtr fence)
     {
         if (_device == IntPtr.Zero || _computeQueue == IntPtr.Zero || fence == IntPtr.Zero)
         {
             return;
+        }
+
+        // On first submit, wait for the device to be fully idle to avoid cold-start race
+        // conditions with AMD Vulkan drivers that return VK_ERROR_DEVICE_LOST (-2) on
+        // the first queue submit if the driver hasn't finished internal initialization.
+        if (!_deviceWarmedUp)
+        {
+            lock (_submitLock)
+            {
+                if (!_deviceWarmedUp)
+                {
+                    VulkanNativeBindings.vkDeviceWaitIdle(_device);
+                    _deviceWarmedUp = true;
+                }
+            }
         }
 
         // Vulkan spec requires external synchronization for vkQueueSubmit on the same queue
@@ -734,7 +751,16 @@ public sealed unsafe class VulkanDevice : IDisposable
             var submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, fence);
             if (submitResult != VulkanNativeBindings.VK_SUCCESS)
             {
-                throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
+                // Retry once after a short wait — AMD drivers sometimes need extra
+                // time on first submit after device creation
+                VulkanNativeBindings.vkDeviceWaitIdle(_device);
+                fencePtr = fence;
+                VulkanNativeBindings.vkResetFences(_device, 1, &fencePtr);
+                submitResult = VulkanNativeBindings.vkQueueSubmit(_computeQueue, 1, &submitInfo, fence);
+                if (submitResult != VulkanNativeBindings.VK_SUCCESS)
+                {
+                    throw new InvalidOperationException($"vkQueueSubmit failed with error code {submitResult}");
+                }
             }
         }
 
