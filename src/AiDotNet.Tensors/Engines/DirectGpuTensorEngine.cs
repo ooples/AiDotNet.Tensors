@@ -11502,5 +11502,63 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // FillZero returns Vector<T>(length), not void — handled in base
 
+    Tensor<T> IEngine.BatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank>=2 && b2.Rank>=2)
+        { try { int M=a.Shape[a.Rank-2],K=a.Shape[a.Rank-1],N=b2.Shape[b2.Rank-1]; int batchSize=a.Length/(M*K); using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(batchSize*M*N); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a.Shape.Clone(); outShape[a.Rank-1]=N; return new Tensor<T>((T[])(object)b.DownloadBuffer(go),outShape); } catch{} }
+        return base.BatchMatMul(a,b2);
+    }
+
+    Tensor<T> IEngine.TensorTriangularMask<T>(int size, bool upper, int diagonal)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { using var go=bb.AllocateBuffer(size*size); bb.TriangularMask(go,size,size,diagonal,upper?-1e9f:0f); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{size,size}); } catch{} }
+        return base.TensorTriangularMask<T>(size,upper,diagonal);
+    }
+
+    Tensor<T> IEngine.TensorDropoutMask<T>(int[] shape, T dropoutRate, T scale, int? seed)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { int total=1; foreach(var d in shape) total*=d; float keepProb=1f-Convert.ToSingle(dropoutRate); ulong s=seed.HasValue?(ulong)seed.Value:(ulong)Environment.TickCount; using var go=bb.AllocateBuffer(total); bb.DropoutMask(go,total,keepProb,s); float[] result=bb.DownloadBuffer(go); float sc=Convert.ToSingle(scale); for(int i=0;i<total;i++) result[i]*=sc; return new Tensor<T>((T[])(object)result,shape); } catch{} }
+        return base.TensorDropoutMask(shape,dropoutRate,scale,seed);
+    }
+
+    Tensor<T> IEngine.TensorAddMany<T>(params Tensor<T>[] tensors)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && tensors.Length>=2)
+        {
+            try
+            {
+                var result = ((IEngine)this).TensorAdd(tensors[0], tensors[1]);
+                for (int i = 2; i < tensors.Length; i++)
+                {
+                    var prev = result;
+                    result = ((IEngine)this).TensorAdd(result, tensors[i]);
+                }
+                return result;
+            }
+            catch { }
+        }
+        return base.TensorAddMany(tensors);
+    }
+
+    Tensor<T> IEngine.TensorMultiplyMany<T>(params Tensor<T>[] tensors)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && tensors.Length>=2)
+        {
+            try
+            {
+                var result = ((IEngine)this).TensorMultiply(tensors[0], tensors[1]);
+                for (int i = 2; i < tensors.Length; i++)
+                {
+                    result = ((IEngine)this).TensorMultiply(result, tensors[i]);
+                }
+                return result;
+            }
+            catch { }
+        }
+        return base.TensorMultiplyMany(tensors);
+    }
+
     #endregion
 }
