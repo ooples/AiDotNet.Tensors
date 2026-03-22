@@ -260,6 +260,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             IntPtr eventOut);
 
+        // clCreateSubBuffer — creates a buffer object from a region of an existing buffer
+        public static IntPtr CreateSubBuffer(IntPtr buffer, int byteOffset, int byteSize)
+        {
+            // CL_BUFFER_CREATE_TYPE_REGION = 0x1220
+            var region = new BufferRegion { Origin = (UIntPtr)byteOffset, Size = (UIntPtr)byteSize };
+            int err;
+            IntPtr subBuf = clCreateSubBuffer(buffer, 0 /* CL_MEM_READ_WRITE */, 0x1220, ref region, out err);
+            return err == 0 ? subBuf : IntPtr.Zero;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct BufferRegion { public UIntPtr Origin; public UIntPtr Size; }
+
+        [DllImport(OpenClLibrary, EntryPoint = "clCreateSubBuffer")]
+        private static extern IntPtr clCreateSubBuffer(
+            IntPtr buffer, uint flags, uint bufferCreateType,
+            ref BufferRegion bufferCreateInfo, out int errCode);
+
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueCopyBuffer")]
         public static extern int EnqueueCopyBuffer(
             IntPtr commandQueue,

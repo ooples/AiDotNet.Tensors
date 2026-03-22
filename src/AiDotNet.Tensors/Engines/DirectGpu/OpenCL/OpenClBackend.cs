@@ -2780,21 +2780,97 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
 
+            // For large feature dimensions with small batch, use element-wise 3-pass approach
+            // to fully utilize all GPU CUs instead of 1 workgroup per row
+            if (batchSize <= 4 && features > 131072)
+            {
+                SoftmaxLargeRow(A, B, batchSize, features);
+                return;
+            }
+
             var kernel = _kernelCache["softmax"];
             kernel.SetArg(0, bufferA.Handle);
             kernel.SetArg(1, bufferB.Handle);
             kernel.SetArg(2, batchSize);
             kernel.SetArg(3, features);
 
-            // Workgroup-parallel: 1 workgroup per batch row, 256 threads cooperate
             int localSize = Math.Min(256, features);
-            // Round to power of 2 for efficient reduction
             localSize = (int)Math.Pow(2, Math.Floor(Math.Log(localSize, 2)));
             localSize = Math.Max(1, localSize);
             kernel.SetLocalArg(4, localSize * sizeof(float));
-            // Global size = batchSize * localSize, local size = localSize
             kernel.Execute1D(batchSize * localSize, localSize);
-            // No sync - can be chained asynchronously
+        }
+
+        /// <summary>
+        /// Multi-pass softmax for large feature dimensions.
+        /// Uses full GPU parallelism across all CUs instead of 1 workgroup per row.
+        /// Pass 1: find max per row using sub-buffer GPU reduction (all CUs)
+        /// Pass 2: compute exp(x - max) with all CUs (element-wise, full parallelism)
+        /// Pass 3: sum the exp values using sub-buffer GPU reduction (all CUs)
+        /// Pass 4: divide by sum with all CUs (element-wise, full parallelism)
+        /// </summary>
+        private void SoftmaxLargeRow(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
+        {
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * features;
+
+                // Pass 1: Find max using OpenCL sub-buffer + existing GPU reduce_max
+                float rowMax;
+                using (var subA = CreateSubBuffer(A, offset, features))
+                {
+                    rowMax = Max(subA, features);
+                }
+
+                // Pass 2: exp(x - max) using GPU kernel with full parallelism
+                {
+                    var k = _kernelCache["softmax_exp_sub"];
+                    k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+                    k.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+                    k.SetArg(2, rowMax);
+                    k.SetArg(3, offset);
+                    k.SetArg(4, features);
+                    int workItems = (features + 3) / 4;
+                    k.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
+                    _context?.Finish();
+                }
+
+                // Pass 3: Sum exp values using sub-buffer + existing GPU reduce_sum
+                float rowSum;
+                using (var subB = CreateSubBuffer(B, offset, features))
+                {
+                    rowSum = Sum(subB, features);
+                }
+
+                // Pass 4: Divide by sum using GPU kernel with full parallelism
+                {
+                    var k = _kernelCache["softmax_div_scalar"];
+                    k.SetArg(0, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+                    k.SetArg(1, 1.0f / rowSum);
+                    k.SetArg(2, offset);
+                    k.SetArg(3, features);
+                    int workItems = (features + 3) / 4;
+                    k.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
+                }
+            }
+            _context?.Finish();
+        }
+
+        /// <summary>
+        /// Creates a GPU buffer containing a copy of a region from a parent buffer.
+        /// Uses device-to-device copy (no CPU round-trip) for GPU reduction on sub-ranges.
+        /// </summary>
+        private IGpuBuffer CreateSubBuffer(IGpuBuffer parent, int floatOffset, int floatCount)
+        {
+            var parentBuf = ((DirectOpenClGpuBuffer)parent).Buffer;
+            var tmpBuf = AllocateBuffer(floatCount);
+            OpenClNativeBindings.EnqueueCopyBuffer(_context!.CommandQueue,
+                parentBuf.Handle, ((DirectOpenClGpuBuffer)tmpBuf).Buffer.Handle,
+                (UIntPtr)(floatOffset * sizeof(float)), UIntPtr.Zero,
+                (UIntPtr)(floatCount * sizeof(float)),
+                0, IntPtr.Zero, IntPtr.Zero);
+            _context?.Finish();
+            return tmpBuf;
         }
 
         public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)

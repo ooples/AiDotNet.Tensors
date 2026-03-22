@@ -124,8 +124,9 @@ __kernel void swish(
     }
 }
 
-// Softmax (per batch row) — workgroup-parallel with local memory reduction
-// Each workgroup handles one batch row, threads cooperate on max/sum reduction
+// Softmax (per batch row) — multi-workgroup for large feature dimensions
+// For features <= 4096: single workgroup per row (low overhead)
+// For features > 4096: multiple workgroups per row with global max/sum scratch
 __kernel void softmax(
     __global const float* input,
     __global float* output,
@@ -142,48 +143,58 @@ __kernel void softmax(
     __global const float* rowIn = input + batch * features;
     __global float* rowOut = output + batch * features;
 
-    // Phase 1: Each thread finds max over its strided elements
+    // Phase 1: Each thread finds max over its strided elements (float4 vectorized)
     float threadMax = -INFINITY;
-    for (int f = lid; f < features; f += localSize) {
-        threadMax = fmax(threadMax, rowIn[f]);
+    int f = lid * 4;
+    for (; f + 3 < features; f += localSize * 4) {
+        float4 v = vload4(0, rowIn + f);
+        threadMax = fmax(threadMax, fmax(fmax(v.x, v.y), fmax(v.z, v.w)));
+    }
+    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+        if (i < features) threadMax = fmax(threadMax, rowIn[i]);
     }
 
     // Reduce max across workgroup
     localBuf[lid] = threadMax;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            localBuf[lid] = fmax(localBuf[lid], localBuf[lid + stride]);
-        }
+        if (lid < stride) localBuf[lid] = fmax(localBuf[lid], localBuf[lid + stride]);
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     float rowMax = localBuf[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Phase 2: Each thread computes exp and partial sum
+    // Phase 2: Each thread computes exp and partial sum (float4 vectorized)
     float threadSum = 0.0f;
-    for (int f = lid; f < features; f += localSize) {
-        float e = exp(rowIn[f] - rowMax);
-        rowOut[f] = e;
-        threadSum += e;
+    f = lid * 4;
+    for (; f + 3 < features; f += localSize * 4) {
+        float4 v = vload4(0, rowIn + f);
+        float4 e = exp(v - (float4)(rowMax));
+        vstore4(e, 0, rowOut + f);
+        threadSum += e.x + e.y + e.z + e.w;
+    }
+    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+        if (i < features) { float e = exp(rowIn[i] - rowMax); rowOut[i] = e; threadSum += e; }
     }
 
     // Reduce sum across workgroup
     localBuf[lid] = threadSum;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int stride = localSize >> 1; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            localBuf[lid] += localBuf[lid + stride];
-        }
+        if (lid < stride) localBuf[lid] += localBuf[lid + stride];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     float rowSum = localBuf[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Phase 3: Normalize
+    // Phase 3: Normalize (float4 vectorized)
     float invSum = 1.0f / rowSum;
-    for (int f = lid; f < features; f += localSize) {
-        rowOut[f] *= invSum;
+    f = lid * 4;
+    for (; f + 3 < features; f += localSize * 4) {
+        vstore4(vload4(0, rowOut + f) * invSum, 0, rowOut + f);
+    }
+    for (int i = f / 4 * 4 + lid % (localSize); i < features; i += localSize) {
+        if (i < features) rowOut[i] *= invSum;
     }
 }
 
@@ -976,6 +987,43 @@ __kernel void hardtanh_backward(
     float grad = (x > -1.0f && x < 1.0f) ? 1.0f : 0.0f;
     gradInput[idx] = gradOutput[idx] * grad;
 }
+
+// Softmax helper: B[offset + idx*4..+3] = exp(A[offset + idx*4..+3] - scalar)
+// Full GPU parallelism for large-row softmax pass 2
+__kernel void softmax_exp_sub(
+    __global const float* A,
+    __global float* B,
+    const float scalar,
+    const int offset,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 v = vload4(0, A + offset + idx4);
+        vstore4(exp(v - (float4)(scalar)), 0, B + offset + idx4);
+    } else {
+        for (int i = idx4; i < size; i++) B[offset + i] = exp(A[offset + i] - scalar);
+    }
+}
+
+// Softmax helper: B[offset + idx*4..+3] *= scalar
+// Full GPU parallelism for large-row softmax pass 4
+__kernel void softmax_div_scalar(
+    __global float* B,
+    const float scalar,
+    const int offset,
+    const int size)
+{
+    const int idx = get_global_id(0);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 v = vload4(0, B + offset + idx4);
+        vstore4(v * scalar, 0, B + offset + idx4);
+    } else {
+        for (int i = idx4; i < size; i++) B[offset + i] *= scalar;
+    }
+}
 ";
         }
 
@@ -988,7 +1036,7 @@ __kernel void hardtanh_backward(
             {
                 // Activations (forward)
                 "relu", "leaky_relu", "sigmoid", "tanh_activation",
-                "gelu", "swish", "softmax",
+                "gelu", "swish", "softmax", "softmax_exp_sub", "softmax_div_scalar",
                 "mish", "softplus", "hardswish", "selu", "hardsigmoid", "hardtanh",
                 // Activation backward kernels
                 "relu_backward", "leaky_relu_backward", "sigmoid_backward", "tanh_backward",
