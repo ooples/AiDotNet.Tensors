@@ -5,6 +5,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 /// </summary>
 public static class HipGatedActivationKernels
 {
-    public static string GetSource() => CUDA.Kernels.CudaGatedActivationKernels.GetSource();
-    public static string[] GetKernelNames() => CUDA.Kernels.CudaGatedActivationKernels.GetKernelNames();
+    public static string GetSource() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedActivationKernels.GetSource();
+    public static string[] GetKernelNames() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedActivationKernels.GetKernelNames();
 }

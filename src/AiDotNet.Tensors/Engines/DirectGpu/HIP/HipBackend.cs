@@ -71,6 +71,13 @@ public sealed class HipBackend : IAsyncGpuBackend
     private IntPtr _gruModule;
     private IntPtr _capsuleModule;
     private IntPtr _snnModule;
+    private IntPtr _dotProductModule;
+    private IntPtr _reductionModule2;
+    private IntPtr _broadcastModule;
+    private IntPtr _gatedModule;
+    private IntPtr _shapeModule;
+    private IntPtr _lossModule;
+    private IntPtr _softmaxVarModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -494,14 +501,13 @@ public sealed class HipBackend : IAsyncGpuBackend
                 Kernels.HipSnnKernels.GetKernelNames());
 
             // Compile reduction, broadcast, gated activation, shape, loss, softmax variant kernels
-            IntPtr reductionMod = IntPtr.Zero, broadcastMod = IntPtr.Zero, gatedMod = IntPtr.Zero;
-            IntPtr shapeMod = IntPtr.Zero, lossMod = IntPtr.Zero, softmaxVarMod = IntPtr.Zero;
-            CompileKernelModule(Kernels.HipReductionKernels.GetSource(), "reduction", ref reductionMod, Kernels.HipReductionKernels.GetKernelNames());
-            CompileKernelModule(Kernels.HipBroadcastKernels.GetSource(), "broadcast", ref broadcastMod, Kernels.HipBroadcastKernels.GetKernelNames());
-            CompileKernelModule(Kernels.HipGatedActivationKernels.GetSource(), "gated_activation", ref gatedMod, Kernels.HipGatedActivationKernels.GetKernelNames());
-            CompileKernelModule(Kernels.HipShapeKernels.GetSource(), "shape", ref shapeMod, Kernels.HipShapeKernels.GetKernelNames());
-            CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref lossMod, Kernels.HipLossForwardKernels.GetKernelNames());
-            CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref softmaxVarMod, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
+            // Module handles stored in fields for proper Dispose cleanup
+            CompileKernelModule(Kernels.HipReductionKernels.GetSource(), "reduction", ref _reductionModule2, Kernels.HipReductionKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipBroadcastKernels.GetSource(), "broadcast", ref _broadcastModule, Kernels.HipBroadcastKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipGatedActivationKernels.GetSource(), "gated_activation", ref _gatedModule, Kernels.HipGatedActivationKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipShapeKernels.GetSource(), "shape", ref _shapeModule, Kernels.HipShapeKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref _lossModule, Kernels.HipLossForwardKernels.GetKernelNames());
+            CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref _softmaxVarModule, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
@@ -9443,6 +9449,14 @@ public sealed class HipBackend : IAsyncGpuBackend
             HipNativeBindings.hipModuleUnload(_snnModule);
             _snnModule = IntPtr.Zero;
         }
+
+        // Unload all additional kernel modules
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule })
+        {
+            if (modField != IntPtr.Zero)
+                HipNativeBindings.hipModuleUnload(modField);
+        }
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

@@ -5,6 +5,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 /// </summary>
 public static class HipSoftmaxVariantKernels
 {
-    public static string GetSource() => CUDA.Kernels.CudaSoftmaxVariantKernels.GetSource();
-    public static string[] GetKernelNames() => CUDA.Kernels.CudaSoftmaxVariantKernels.GetKernelNames();
+    public static string GetSource() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSoftmaxVariantKernels.GetSource();
+    public static string[] GetKernelNames() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSoftmaxVariantKernels.GetKernelNames();
 }

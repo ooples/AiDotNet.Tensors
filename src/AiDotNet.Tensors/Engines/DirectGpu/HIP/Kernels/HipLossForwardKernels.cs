@@ -5,6 +5,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 /// </summary>
 public static class HipLossForwardKernels
 {
-    public static string GetSource() => CUDA.Kernels.CudaLossForwardKernels.GetSource();
-    public static string[] GetKernelNames() => CUDA.Kernels.CudaLossForwardKernels.GetKernelNames();
+    public static string GetSource() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaLossForwardKernels.GetSource();
+    public static string[] GetKernelNames() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaLossForwardKernels.GetKernelNames();
 }

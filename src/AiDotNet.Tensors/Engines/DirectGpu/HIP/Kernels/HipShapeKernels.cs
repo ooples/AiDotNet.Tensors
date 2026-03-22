@@ -5,6 +5,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 /// </summary>
 public static class HipShapeKernels
 {
-    public static string GetSource() => CUDA.Kernels.CudaShapeKernels.GetSource();
-    public static string[] GetKernelNames() => CUDA.Kernels.CudaShapeKernels.GetKernelNames();
+    public static string GetSource() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaShapeKernels.GetSource();
+    public static string[] GetKernelNames() => AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaShapeKernels.GetKernelNames();
 }

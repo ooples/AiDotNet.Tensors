@@ -8,11 +8,11 @@ internal static class HipSnnKernels
 {
     public static string GetSource()
     {
-        return CUDA.Kernels.CudaSnnKernels.GetSource();
+        return AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSnnKernels.GetSource();
     }
 
     public static string[] GetKernelNames()
     {
-        return CUDA.Kernels.CudaSnnKernels.GetKernelNames();
+        return AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSnnKernels.GetKernelNames();
     }
 }
