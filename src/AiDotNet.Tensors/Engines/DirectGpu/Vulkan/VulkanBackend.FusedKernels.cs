@@ -10,13 +10,13 @@ public sealed partial class VulkanBackend
 {
     #region Fused Reductions
 
-    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, sz, 2 * sizeof(uint));
-    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, sz, 2 * sizeof(uint));
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]; float[] r={s/sz}; UploadToBuffer(r,o); }
+    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float p=1; for(int j=0;j<sz;j++) p*=d[j]; float[] r={p}; UploadToBuffer(r,o); }
+    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]*d[j]; float[] r={s}; UploadToBuffer(r,o); }
+    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=d[j]*d[j]; float[] r={s}; UploadToBuffer(r,o); }
+    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float m=0; for(int j=0;j<sz;j++) m=Math.Max(m,Math.Abs(d[j])); float[] r={m}; UploadToBuffer(r,o); }
+    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float m=float.MaxValue; for(int j=0;j<sz;j++) m=Math.Min(m,Math.Abs(d[j])); float[] r={m}; UploadToBuffer(r,o); }
+    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++) s+=MathF.Exp(d[j]-mx); float[] r={s}; UploadToBuffer(r,o); }
     public void VarianceAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, 2 * sizeof(uint));
     public void StdAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.StdAxis, i, o, os, 2 * sizeof(uint));
     public void ProductAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, os, 2 * sizeof(uint));
@@ -25,8 +25,8 @@ public sealed partial class VulkanBackend
     public void CumSumAxis(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.CumSumAxis, i, o, os, 2 * sizeof(uint));
     public void ScalarMinusTensor(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.ScalarMinusTensor, i, o, sz, sizeof(float) + sizeof(uint));
     public void NormalizeL2(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.NormalizeL2, i, o, os, 2 * sizeof(uint));
-    public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, go, gi, os * rs, 2 * sizeof(uint));
-    public void ReduceMeanBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, go, gi, os * rs, 2 * sizeof(uint));
+    public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) { float[] goD=DownloadBuffer(go); float[] giD=new float[os*rs]; for(int j=0;j<os*rs;j++) giD[j]=goD[j/rs]; UploadToBuffer(giD,gi); }
+    public void ReduceMeanBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) { float[] goD=DownloadBuffer(go); float[] giD=new float[os*rs]; for(int j=0;j<os*rs;j++) giD[j]=goD[j/rs]/rs; UploadToBuffer(giD,gi); }
 
     public void ReduceMaxBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer mx, IGpuBuffer gi, int os, int rs)
     {
@@ -60,16 +60,16 @@ public sealed partial class VulkanBackend
     #region Fused Broadcast / Scalar
 
     public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, os * isz, 2 * sizeof(uint));
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]-bd[j%isz]; UploadToBuffer(r,o); }
     public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastAddFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastMulFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulLast, a, b, o, os * isz, 2 * sizeof(uint));
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j]/(bd[j%isz]+1e-12f); UploadToBuffer(r,o); }
+    public void BroadcastAddFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j/isz]+bd[j]; UploadToBuffer(r,o); }
+    public void BroadcastMulFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[os*isz]; for(int j=0;j<os*isz;j++) r[j]=ad[j/isz]*bd[j]; UploadToBuffer(r,o); }
     public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void DivScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.RsqrtKernel, i, o, sz);
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]-sc; UploadToBuffer(r,o); }
+    public void DivScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]/sc; UploadToBuffer(r,o); }
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=MathF.Pow(d[j],ex); UploadToBuffer(r,o); }
+    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { float[] d=DownloadBuffer(i); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=d[j]-MathF.Floor(d[j]); UploadToBuffer(r,o); }
     public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.ClipKernel, i, o, sz, 2 * sizeof(float) + sizeof(uint));
     public void RsqrtKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.RsqrtKernel, i, o, sz);
 
@@ -80,8 +80,8 @@ public sealed partial class VulkanBackend
         UploadToBuffer(s, so); UploadToBuffer(c, co);
     }
 
-    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, sz);
-    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, sz);
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=ad[j]==bd[j]?1f:0f; UploadToBuffer(r,o); }
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { float[] ad=DownloadBuffer(a); float[] bd=DownloadBuffer(b); float[] r=new float[sz]; for(int j=0;j<sz;j++) r[j]=ad[j]!=bd[j]?1f:0f; UploadToBuffer(r,o); }
 
     #endregion
 

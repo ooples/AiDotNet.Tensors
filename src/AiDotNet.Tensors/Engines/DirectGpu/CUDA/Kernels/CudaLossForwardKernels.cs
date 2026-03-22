@@ -90,7 +90,9 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_mask(
 
     float u = (float)(counter >> 8) * (1.0f / 16777216.0f);
     // Inverted dropout: scale by 1/keepProb so test-time doesn't need scaling
-    mask[idx] = (u < keepProb) ? (1.0f / keepProb) : 0.0f;
+    // Guard against keepProb==0 (full dropout) to avoid division by zero
+    float invKeep = (keepProb > 1e-7f) ? (1.0f / keepProb) : 0.0f;
+    mask[idx] = (u < keepProb) ? invKeep : 0.0f;
 }
 
 // ============================================================================

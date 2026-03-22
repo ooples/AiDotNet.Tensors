@@ -7704,11 +7704,11 @@ fn log_softmax(@builtin(global_invocation_id) gid: vec3u) {
     if (row >= sv_params.outer_size) { return; }
     let base = row * sv_params.inner_size;
     var max_val: f32 = -1e38;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { max_val = max(max_val, sv_input[base + j]); }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { max_val = max(max_val, sv_input[base + j]); }
     var sum_exp: f32 = 0.0;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sum_exp += exp(sv_input[base + j] - max_val); }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sum_exp += exp(sv_input[base + j] - max_val); }
     let log_sum = log(sum_exp);
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sv_output[base + j] = sv_input[base + j] - max_val - log_sum; }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] = sv_input[base + j] - max_val - log_sum; }
 }
 
 @compute @workgroup_size(256)
@@ -7717,12 +7717,12 @@ fn taylor_softmax(@builtin(global_invocation_id) gid: vec3u) {
     if (row >= sv_params.outer_size) { return; }
     let base = row * sv_params.inner_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) {
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) {
         let x = sv_input[base + j]; let t = max(1.0 + x + 0.5 * x * x, 1e-10);
         sv_output[base + j] = t; sum += t;
     }
     let inv = 1.0 / sum;
-    for (var j: u32 = 0u; j < sv_params.inner_size; j++) { sv_output[base + j] *= inv; }
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] *= inv; }
 }
 ";
 
@@ -7785,7 +7785,7 @@ fn mean_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     rext_output[idx] = sum / f32(rext_params.reduce_size);
 }
 
@@ -7795,10 +7795,10 @@ fn variance_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     let mean = sum / f32(rext_params.reduce_size);
     var var_sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
     rext_output[idx] = var_sum / f32(rext_params.reduce_size);
 }
 
@@ -7808,10 +7808,10 @@ fn std_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum += rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
     let mean = sum / f32(rext_params.reduce_size);
     var var_sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
     rext_output[idx] = sqrt(var_sum / f32(rext_params.reduce_size));
 }
 
@@ -7821,7 +7821,7 @@ fn norm_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var sum_sq: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { let v = rext_input[base + j]; sum_sq += v * v; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let v = rext_input[base + j]; sum_sq += v * v; }
     rext_output[idx] = sqrt(sum_sq);
 }
 
@@ -7831,9 +7831,9 @@ fn logsumexp_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var max_val: f32 = -1e38;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { max_val = max(max_val, rext_input[base + j]); }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { max_val = max(max_val, rext_input[base + j]); }
     var sum_exp: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { sum_exp += exp(rext_input[base + j] - max_val); }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum_exp += exp(rext_input[base + j] - max_val); }
     rext_output[idx] = max_val + log(sum_exp);
 }
 
@@ -7843,7 +7843,7 @@ fn cumsum_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var running: f32 = 0.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { running += rext_input[base + j]; rext_output[base + j] = running; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { running += rext_input[base + j]; rext_output[base + j] = running; }
 }
 
 @compute @workgroup_size(256)
@@ -7852,7 +7852,7 @@ fn product_axis(@builtin(global_invocation_id) gid: vec3u) {
     if (idx >= rext_params.outer_size) { return; }
     let base = idx * rext_params.reduce_size;
     var prod: f32 = 1.0;
-    for (var j: u32 = 0u; j < rext_params.reduce_size; j++) { prod *= rext_input[base + j]; }
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { prod *= rext_input[base + j]; }
     rext_output[idx] = prod;
 }
 ";

@@ -70,7 +70,8 @@ extern ""C"" __global__ __launch_bounds__(256) void gumbel_softmax(
         float u = (float)(counter >> 8) * (1.0f / 16777216.0f) + (0.5f / 16777216.0f);
         float gumbel = -logf(-logf(u));
 
-        float perturbed = (in_row[j] + gumbel) / temperature;
+        float safe_temp = fmaxf(temperature, 1e-7f);
+        float perturbed = (in_row[j] + gumbel) / safe_temp;
         out_row[j] = perturbed;
         max_val = fmaxf(max_val, perturbed);
     }
