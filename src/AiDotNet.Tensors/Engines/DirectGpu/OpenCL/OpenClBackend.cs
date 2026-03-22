@@ -2802,75 +2802,51 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
-        /// Multi-pass softmax for large feature dimensions.
-        /// Uses full GPU parallelism across all CUs instead of 1 workgroup per row.
-        /// Pass 1: find max per row using sub-buffer GPU reduction (all CUs)
-        /// Pass 2: compute exp(x - max) with all CUs (element-wise, full parallelism)
-        /// Pass 3: sum the exp values using sub-buffer GPU reduction (all CUs)
-        /// Pass 4: divide by sum with all CUs (element-wise, full parallelism)
+        /// Online softmax for large feature dimensions using ALL GPU CUs.
+        /// Phase 1: multiple workgroups compute tile-local max + sum, last WG merges via atomic counter.
+        /// Phase 2: all work items normalize in parallel using global max/sum.
+        /// Only 2 kernel launches, no data copies, full GPU utilization.
         /// </summary>
         private void SoftmaxLargeRow(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
         {
+            if (_context == null) return;
+
+            int localSize = 256;
+            int numGroups = Math.Max(1, ComputeUnits * 4); // 4 workgroups per CU
+            int scratchSize = numGroups * 2 + 3; // max[], sum[], counter, globalMax, globalSum
+
+            using var scratchBuf = AllocateBuffer(scratchSize);
+
             for (int b = 0; b < batchSize; b++)
             {
                 int offset = b * features;
 
-                // Pass 1: Find max using OpenCL sub-buffer + existing GPU reduce_max
-                float rowMax;
-                using (var subA = CreateSubBuffer(A, offset, features))
-                {
-                    rowMax = Max(subA, features);
-                }
+                // Zero scratch buffer (counter must be 0)
+                ZeroBuffer(scratchBuf, scratchSize);
 
-                // Pass 2: exp(x - max) using GPU kernel with full parallelism
-                {
-                    var k = _kernelCache["softmax_exp_sub"];
-                    k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
-                    k.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-                    k.SetArg(2, rowMax);
-                    k.SetArg(3, offset);
-                    k.SetArg(4, features);
-                    int workItems = (features + 3) / 4;
-                    k.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
-                    _context?.Finish();
-                }
+                // Phase 1: tile-parallel max + sum with atomic merge
+                var k1 = _kernelCache["softmax_online_phase1"];
+                k1.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+                k1.SetArg(1, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
+                k1.SetArg(2, offset);
+                k1.SetArg(3, features);
+                k1.SetArg(4, numGroups);
+                k1.SetLocalArg(5, localSize * sizeof(float));
+                k1.Execute1D(numGroups * localSize, localSize);
+                _context.Finish();
 
-                // Pass 3: Sum exp values using sub-buffer + existing GPU reduce_sum
-                float rowSum;
-                using (var subB = CreateSubBuffer(B, offset, features))
-                {
-                    rowSum = Sum(subB, features);
-                }
-
-                // Pass 4: Divide by sum using GPU kernel with full parallelism
-                {
-                    var k = _kernelCache["softmax_div_scalar"];
-                    k.SetArg(0, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
-                    k.SetArg(1, 1.0f / rowSum);
-                    k.SetArg(2, offset);
-                    k.SetArg(3, features);
-                    int workItems = (features + 3) / 4;
-                    k.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
-                }
+                // Phase 2: normalize with full GPU parallelism
+                var k2 = _kernelCache["softmax_online_phase2"];
+                k2.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+                k2.SetArg(1, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
+                k2.SetArg(2, ((DirectOpenClGpuBuffer)scratchBuf).Buffer.Handle);
+                k2.SetArg(3, offset);
+                k2.SetArg(4, features);
+                k2.SetArg(5, numGroups);
+                int workItems = (features + 3) / 4;
+                k2.Execute1D(workItems, CalculateOptimalWorkGroupSize1D(workItems));
             }
-            _context?.Finish();
-        }
-
-        /// <summary>
-        /// Creates a GPU buffer containing a copy of a region from a parent buffer.
-        /// Uses device-to-device copy (no CPU round-trip) for GPU reduction on sub-ranges.
-        /// </summary>
-        private IGpuBuffer CreateSubBuffer(IGpuBuffer parent, int floatOffset, int floatCount)
-        {
-            var parentBuf = ((DirectOpenClGpuBuffer)parent).Buffer;
-            var tmpBuf = AllocateBuffer(floatCount);
-            OpenClNativeBindings.EnqueueCopyBuffer(_context!.CommandQueue,
-                parentBuf.Handle, ((DirectOpenClGpuBuffer)tmpBuf).Buffer.Handle,
-                (UIntPtr)(floatOffset * sizeof(float)), UIntPtr.Zero,
-                (UIntPtr)(floatCount * sizeof(float)),
-                0, IntPtr.Zero, IntPtr.Zero);
-            _context?.Finish();
-            return tmpBuf;
+            _context.Finish();
         }
 
         public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)

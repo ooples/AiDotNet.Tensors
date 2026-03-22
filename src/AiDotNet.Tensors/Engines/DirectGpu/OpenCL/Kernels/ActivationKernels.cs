@@ -988,6 +988,121 @@ __kernel void hardtanh_backward(
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
+// ============================================================================
+// Online softmax: two-phase approach using ALL workgroups for large rows.
+// Phase 1: each workgroup computes tile-local max + sum(exp(x-max)).
+//          Results go to scratch[groupId] = {max, sum}.
+//          The last workgroup (via atomic counter) computes the global result:
+//          global_max, global_sum = correct_and_merge(all tile results)
+// Phase 2: each work item computes output[i] = exp(input[i] - global_max) / global_sum
+// ============================================================================
+
+// Phase 1: compute per-tile max and sum, last workgroup merges all tiles
+// scratch layout: [numGroups floats for max | numGroups floats for sum | 1 int counter | 1 float globalMax | 1 float globalSum]
+__kernel void softmax_online_phase1(
+    __global const float* input,
+    __global float* scratch, // size: numGroups*2 + 3 (max[], sum[], counter, globalMax, globalSum)
+    const int rowOffset,
+    const int features,
+    const int numGroups,
+    __local float* localBuf)
+{
+    const int gid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int localSize = get_local_size(0);
+
+    __global const float* row = input + rowOffset;
+
+    // Each thread finds max over its strided elements within this tile
+    int tileStart = gid * ((features + numGroups - 1) / numGroups);
+    int tileEnd = min(tileStart + ((features + numGroups - 1) / numGroups), features);
+
+    float threadMax = -INFINITY;
+    for (int f = tileStart + lid; f < tileEnd; f += localSize) {
+        threadMax = fmax(threadMax, row[f]);
+    }
+
+    // Reduce max within workgroup
+    localBuf[lid] = threadMax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = localSize >> 1; s > 0; s >>= 1) {
+        if (lid < s) localBuf[lid] = fmax(localBuf[lid], localBuf[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float tileMax = localBuf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Each thread computes partial exp sum
+    float threadSum = 0.0f;
+    for (int f = tileStart + lid; f < tileEnd; f += localSize) {
+        threadSum += exp(row[f] - tileMax);
+    }
+
+    // Reduce sum within workgroup
+    localBuf[lid] = threadSum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = localSize >> 1; s > 0; s >>= 1) {
+        if (lid < s) localBuf[lid] += localBuf[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float tileSum = localBuf[0];
+
+    // Thread 0 writes tile results
+    if (lid == 0) {
+        scratch[gid] = tileMax;
+        scratch[numGroups + gid] = tileSum;
+
+        // Atomic increment counter; last workgroup to finish does the merge
+        __global int* counter = (__global int*)(scratch + numGroups * 2);
+        int old = atomic_add(counter, 1);
+        if (old == numGroups - 1) {
+            // Last workgroup: merge all tile results
+            float globalMax = scratch[0];
+            for (int i = 1; i < numGroups; i++) globalMax = fmax(globalMax, scratch[i]);
+
+            float globalSum = 0.0f;
+            for (int i = 0; i < numGroups; i++) {
+                // Correct each tile's sum to the global max: sum_i * exp(tileMax_i - globalMax)
+                globalSum += scratch[numGroups + i] * exp(scratch[i] - globalMax);
+            }
+
+            // Store global results for phase 2
+            __global float* globalResults = scratch + numGroups * 2;
+            // globalResults[0] is the counter (int), skip it
+            // Store at fixed offset after counter
+            scratch[numGroups * 2 + 1] = globalMax;
+            scratch[numGroups * 2 + 2] = globalSum;
+
+            // Reset counter for potential reuse
+            *counter = 0;
+        }
+    }
+}
+
+// Phase 2: normalize all elements using global max and sum (full GPU parallelism)
+__kernel void softmax_online_phase2(
+    __global const float* input,
+    __global float* output,
+    __global const float* scratch, // scratch[numGroups*2+1] = globalMax, scratch[numGroups*2+2] = globalSum
+    const int rowOffset,
+    const int features,
+    const int numGroups)
+{
+    const int idx = get_global_id(0);
+    const int idx4 = idx * 4;
+
+    float globalMax = scratch[numGroups * 2 + 1];
+    float invSum = 1.0f / scratch[numGroups * 2 + 2];
+
+    if (idx4 + 3 < features) {
+        float4 v = vload4(0, input + rowOffset + idx4);
+        vstore4(exp(v - (float4)(globalMax)) * invSum, 0, output + rowOffset + idx4);
+    } else {
+        for (int i = idx4; i < features; i++)
+            output[rowOffset + i] = exp(input[rowOffset + i] - globalMax) * invSum;
+    }
+}
+
 // Softmax helper: B[offset + idx*4..+3] = exp(A[offset + idx*4..+3] - scalar)
 // Full GPU parallelism for large-row softmax pass 2
 __kernel void softmax_exp_sub(
@@ -1037,6 +1152,7 @@ __kernel void softmax_div_scalar(
                 // Activations (forward)
                 "relu", "leaky_relu", "sigmoid", "tanh_activation",
                 "gelu", "swish", "softmax", "softmax_exp_sub", "softmax_div_scalar",
+                "softmax_online_phase1", "softmax_online_phase2",
                 "mish", "softplus", "hardswish", "selu", "hardsigmoid", "hardtanh",
                 // Activation backward kernels
                 "relu_backward", "leaky_relu_backward", "sigmoid_backward", "tanh_backward",
