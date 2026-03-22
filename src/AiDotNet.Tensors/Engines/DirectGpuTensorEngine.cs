@@ -11560,5 +11560,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorMultiplyMany(tensors);
     }
 
+    Tensor<T> IEngine.Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && input.Rank==4 && scaleH==scaleW)
+        { try { int ba=input.Shape[0],ch=input.Shape[1],ih=input.Shape[2],iw=input.Shape[3]; int oh=ih*scaleH,ow=iw*scaleW; using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=b.AllocateBuffer(ba*ch*oh*ow); b.NearestNeighborUpsample(gi,go,ba*ch,ih,iw,scaleH); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),new[]{ba,ch,oh,ow}); } catch{} }
+        return base.Upsample(input,scaleH,scaleW);
+    }
+
+    Tensor<T> IEngine.UpsampleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int scaleH, int scaleW)
+    {
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && inputShape.Length==4 && scaleH==scaleW)
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; using var gi=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(ba*ch*ih*iw); b.NearestNeighborUpsampleBackward(gi,go,ba*ch,ih,iw,scaleH); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),inputShape); } catch{} }
+        return base.UpsampleBackward(gradOutput,inputShape,scaleH,scaleW);
+    }
+
     #endregion
 }
