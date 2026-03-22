@@ -2722,9 +2722,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(2, bufferC.Handle);
             kernel.SetArg(3, size);
 
-            int localSize = CalculateOptimalWorkGroupSize1D(size);
-            kernel.Execute1D(size, localSize);
-            // No sync - element-wise ops can be chained asynchronously
+            // Kernels are float4-vectorized: each work item processes 4 elements
+            int workItems = (size + 3) / 4;
+            int localSize = CalculateOptimalWorkGroupSize1D(workItems);
+            kernel.Execute1D(workItems, localSize);
         }
 
         private void ExecuteUnary(string kernelName, IGpuBuffer A, IGpuBuffer B, int size)
@@ -2765,9 +2766,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(1, bufferB.Handle);
             kernel.SetArg(2, size);
 
-            int localSize = CalculateOptimalWorkGroupSize1D(size);
-            kernel.Execute1D(size, localSize);
-            // No sync - activations can be chained asynchronously
+            // Kernels are float4-vectorized: each work item processes 4 elements
+            int workItems = (size + 3) / 4;
+            int localSize = CalculateOptimalWorkGroupSize1D(workItems);
+            kernel.Execute1D(workItems, localSize);
         }
 
         public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)

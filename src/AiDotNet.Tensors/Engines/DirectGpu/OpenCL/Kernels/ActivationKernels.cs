@@ -26,9 +26,13 @@ __kernel void relu(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    output[idx] = fmax(0.0f, input[idx]);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4(fmax((float4)(0.0f), x), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) output[i] = fmax(0.0f, input[i]);
+    }
 }
 
 // Leaky ReLU: x > 0 ? x : alpha * x
@@ -39,10 +43,13 @@ __kernel void leaky_relu(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float x = input[idx];
-    output[idx] = x > 0.0f ? x : alpha * x;
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4(select(x * alpha, x, isgreater(x, (float4)(0.0f))), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) { float x = input[i]; output[i] = x > 0.0f ? x : alpha * x; }
+    }
 }
 
 // Sigmoid: 1 / (1 + exp(-x))
@@ -52,24 +59,29 @@ __kernel void sigmoid(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    output[idx] = 1.0f / (1.0f + exp(-input[idx]));
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4((float4)(1.0f) / ((float4)(1.0f) + exp(-x)), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) output[i] = 1.0f / (1.0f + exp(-input[i]));
+    }
 }
 
-// Tanh: (exp(x) - exp(-x)) / (exp(x) + exp(-x))
-// Clamp input to [-20, 20] to avoid NaN on some GPU drivers for extreme values.
-// tanh saturates to +/-1 for |x| > ~10, so clamping preserves correctness.
+// Tanh: clamp to [-20, 20] to avoid NaN, then use hardware tanh
 __kernel void tanh_activation(
     __global const float* input,
     __global float* output,
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float x = clamp(input[idx], -20.0f, 20.0f);
-    output[idx] = tanh(x);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = clamp(vload4(idx, input), (float4)(-20.0f), (float4)(20.0f));
+        vstore4(tanh(x), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) output[i] = tanh(clamp(input[i], -20.0f, 20.0f));
+    }
 }
 
 // GELU (Gaussian Error Linear Unit) - approximation
@@ -80,28 +92,36 @@ __kernel void gelu(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
+    const int idx4 = idx * 4;
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float COEFF = 0.044715f;
-
-    float x = input[idx];
-    float x3 = x * x * x;
-    float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
-    output[idx] = 0.5f * x * (1.0f + tanh(inner));
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        float4 x3 = x * x * x;
+        float4 inner = SQRT_2_OVER_PI * (x + COEFF * x3);
+        vstore4(0.5f * x * ((float4)(1.0f) + tanh(inner)), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) {
+            float x = input[i]; float x3 = x * x * x;
+            output[i] = 0.5f * x * (1.0f + tanh(SQRT_2_OVER_PI * (x + COEFF * x3)));
+        }
+    }
 }
 
-// Swish: x * sigmoid(x)
+// Swish: x * sigmoid(x) = x / (1 + exp(-x))
 __kernel void swish(
     __global const float* input,
     __global float* output,
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float x = input[idx];
-    output[idx] = x / (1.0f + exp(-x));
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, input);
+        vstore4(x / ((float4)(1.0f) + exp(-x)), idx, output);
+    } else {
+        for (int i = idx4; i < size; i++) { float x = input[i]; output[i] = x / (1.0f + exp(-x)); }
+    }
 }
 
 // Softmax (per batch row) — workgroup-parallel with local memory reduction
@@ -168,7 +188,9 @@ __kernel void softmax(
 }
 
 // ===========================================================================
-// ELEMENT-WISE OPERATIONS
+// ELEMENT-WISE OPERATIONS (float4-vectorized for 4x memory throughput)
+// Each work item processes 4 floats via 128-bit loads/stores.
+// Scalar tail handles sizes not divisible by 4.
 // ===========================================================================
 
 // Vector addition: C = A + B
@@ -179,9 +201,14 @@ __kernel void add_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = A[idx] + B[idx];
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(a + b, idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = A[i] + B[i];
+    }
 }
 
 // Vector subtraction: C = A - B
@@ -192,9 +219,14 @@ __kernel void subtract_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = A[idx] - B[idx];
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(a - b, idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = A[i] - B[i];
+    }
 }
 
 // Vector multiplication: C = A * B (element-wise)
@@ -205,9 +237,14 @@ __kernel void multiply_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = A[idx] * B[idx];
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(a * b, idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = A[i] * B[i];
+    }
 }
 
 // Vector division: C = A / B (element-wise)
@@ -218,9 +255,14 @@ __kernel void divide_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = A[idx] / B[idx];
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(a / b, idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = A[i] / B[i];
+    }
 }
 
 // Vector min: C = min(A, B)
@@ -231,9 +273,14 @@ __kernel void min_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = fmin(A[idx], B[idx]);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(fmin(a, b), idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = fmin(A[i], B[i]);
+    }
 }
 
 // Vector max: C = max(A, B)
@@ -244,9 +291,14 @@ __kernel void max_vectors(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    C[idx] = fmax(A[idx], B[idx]);
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        float4 b = vload4(idx, B);
+        vstore4(fmax(a, b), idx, C);
+    } else {
+        for (int i = idx4; i < size; i++) C[i] = fmax(A[i], B[i]);
+    }
 }
 
 // Scalar multiplication: B = A * scalar
@@ -257,130 +309,85 @@ __kernel void scale_vector(
     const int size)
 {
     const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = A[idx] * scalar;
+    const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 a = vload4(idx, A);
+        vstore4(a * scalar, idx, B);
+    } else {
+        for (int i = idx4; i < size; i++) B[i] = A[i] * scalar;
+    }
 }
 
 // Absolute value
-__kernel void abs_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = fabs(A[idx]);
+__kernel void abs_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(fabs(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = fabs(A[i]); }
 }
 
 // Exponential
-__kernel void exp_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = exp(A[idx]);
+__kernel void exp_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(exp(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = exp(A[i]); }
 }
 
 // Natural log
-__kernel void log_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = log(A[idx]);
+__kernel void log_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(log(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = log(A[i]); }
 }
 
 // Base-2 log
-__kernel void log2_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = log2(A[idx]);
+__kernel void log2_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(log2(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = log2(A[i]); }
 }
 
 // Base-2 exp
-__kernel void exp2_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = exp2(A[idx]);
+__kernel void exp2_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(exp2(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = exp2(A[i]); }
 }
 
 // Base-10 exp
-__kernel void exp10_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = pow(10.0f, A[idx]);
+__kernel void exp10_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { float4 a = vload4(idx, A); vstore4(exp(a * (float4)(2.302585093f)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = exp(A[i] * 2.302585093f); }
 }
 
 // exp(x) - 1
-__kernel void expm1_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = exp(A[idx]) - 1.0f;
+__kernel void expm1_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(exp(vload4(idx, A)) - (float4)(1.0f), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = exp(A[i]) - 1.0f; }
 }
 
 // log(1 + x)
-__kernel void log1p_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = log(1.0f + A[idx]);
+__kernel void log1p_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(log((float4)(1.0f) + vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = log(1.0f + A[i]); }
 }
 
 // Square root
-__kernel void sqrt_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    B[idx] = sqrt(A[idx]);
+__kernel void sqrt_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) { vstore4(sqrt(vload4(idx, A)), idx, B); }
+    else { for (int i = idx4; i < size; i++) B[i] = sqrt(A[i]); }
 }
 
 // Sign
-__kernel void sign_vector(
-    __global const float* A,
-    __global float* B,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float x = A[idx];
-    B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
+__kernel void sign_vector(__global const float* A, __global float* B, const int size) {
+    const int idx = get_global_id(0); const int idx4 = idx * 4;
+    if (idx4 + 3 < size) {
+        float4 x = vload4(idx, A);
+        vstore4(select(select((float4)(0.0f), (float4)(-1.0f), isless(x, (float4)(0.0f))), (float4)(1.0f), isgreater(x, (float4)(0.0f))), idx, B);
+    } else { for (int i = idx4; i < size; i++) { float x = A[i]; B[i] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f); } }
 }
 
 // Power with scalar exponent
