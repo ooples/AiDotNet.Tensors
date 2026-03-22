@@ -329,7 +329,11 @@ public interface IEngine
     /// <para><b>For Beginners:</b> This is like a normal dot product, but reads elements from b
     /// at non-contiguous positions. A stride of -1 reads backwards (useful for AR/MA models).
     /// A stride of 2 reads every other element. The length is determined by a.Length.</para>
+    /// <para><b>Out-of-range semantics:</b> If bOffset + i * bStride falls outside [0, b.Length),
+    /// that element contributes 0 to the sum (boundary clamping). This is intentional for
+    /// time series AR/MA models where the lag window may extend before the start of the series.</para>
     /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when a or b is null.</exception>
     T DotProduct<T>(Vector<T> a, Vector<T> b, int bOffset, int bStride);
 
     /// <summary>

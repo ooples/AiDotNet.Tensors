@@ -2383,7 +2383,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
-            if (size <= 0) return;
+            if (size <= 0)
+            {
+                // Zero result for empty input
+                Scale(result, result, 0f, Math.Max(1, result.Size));
+                return;
+            }
+            if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+            if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
 
             var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
             var bufB = ((DirectOpenClGpuBuffer)b).Buffer;

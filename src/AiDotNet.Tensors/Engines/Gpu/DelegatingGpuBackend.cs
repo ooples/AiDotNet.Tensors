@@ -1596,7 +1596,4 @@ public class DelegatingGpuBackend : IDirectGpuBackend
         => Inner.BatchedDotProduct(a, b, result, batchSize, vecSize);
 
     #endregion
-
-    // Note: DotProduct operations use default interface implementations on IDirectGpuBackend
-    // unless overridden by the inner backend (e.g., CudaBackend has real CUDA kernels).
 }

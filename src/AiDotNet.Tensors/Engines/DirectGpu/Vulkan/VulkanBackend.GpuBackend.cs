@@ -468,6 +468,12 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (size <= 0) return;
 
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
+        // Zero result first to ensure deterministic output
+        Scale(result, result, 0f, Math.Max(1, result.Size));
+
         // Direct GPU dispatch using pre-compiled DotProduct SPIR-V kernel
         var vbA = AsVulkan(a);
         var vbB = AsVulkan(b);
@@ -510,10 +516,14 @@ public sealed unsafe partial class VulkanBackend
     {
         EnsureInitialized();
         if (batchSize <= 0 || vecSize <= 0) return;
+        if ((long)batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
+        if ((long)batchSize * vecSize > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer B length ({b.Size}).");
 
-        // Compose: temp = A * B for all batches, then reduce each batch
+        // Element-wise multiply all batches, then reduce each batch
         using var temp = AllocateBuffer(batchSize * vecSize);
         Multiply(a, b, temp, batchSize * vecSize);
+        // Synchronize to ensure Multiply completes before SumAxis reads temp
+        Synchronize();
         SumAxis(temp, result, batchSize, vecSize);
     }
 

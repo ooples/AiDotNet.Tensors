@@ -400,6 +400,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (bStride == 0) throw new ArgumentException("bStride must be non-zero.", nameof(bStride));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T result = numOps.Zero;
@@ -407,11 +408,13 @@ public class CpuEngine : ITensorLevelEngine
         var aSpan = a.AsSpan();
         var bSpan = b.AsSpan();
         int len = a.Length;
+        int bLen = b.Length;
 
         for (int i = 0; i < len; i++)
         {
             int bIdx = bOffset + i * bStride;
-            if (bIdx >= 0 && bIdx < b.Length)
+            // Out-of-range elements contribute 0 (boundary clamping for time series AR/MA)
+            if (bIdx >= 0 && bIdx < bLen)
             {
                 result = numOps.Add(result, numOps.Multiply(aSpan[i], bSpan[bIdx]));
             }

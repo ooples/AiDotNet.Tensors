@@ -241,12 +241,16 @@ public sealed partial class WebGpuBackend
         int aSize, int bSize, int bOffset, int bStride)
     {
         if (aSize <= 0) return;
+        if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
+        if (bSize < 0) throw new ArgumentOutOfRangeException(nameof(bSize), "bSize must be non-negative.");
+
         var bData = DownloadBuffer(b);
+        int bLen = bData.Length;
         var window = new float[aSize];
         for (int i = 0; i < aSize; i++)
         {
             int bIdx = bOffset + i * bStride;
-            window[i] = (bIdx >= 0 && bIdx < bSize) ? bData[bIdx] : 0f;
+            window[i] = (bIdx >= 0 && bIdx < bLen) ? bData[bIdx] : 0f;
         }
         using var windowBuf = AllocateBuffer(window);
         DotProduct(a, windowBuf, result, aSize);

@@ -2229,13 +2229,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         for (int d = Rank - 2; d >= 0; d--)
             strides[d] = strides[d + 1] * Shape[d + 1];
 
-        // Compute base flat index from fixed indices
+        // Compute base flat index from fixed indices (with bounds validation)
         int baseIndex = 0;
         int fi = 0;
         for (int d = 0; d < Rank; d++)
         {
             if (d == axis) continue;
             int idx = fixedIndices[fi++];
+            if (idx < 0 || idx >= Shape[d])
+                throw new ArgumentOutOfRangeException(nameof(fixedIndices),
+                    $"Index {idx} is out of range for dimension {d} with size {Shape[d]}.");
             baseIndex += idx * strides[d];
         }
 

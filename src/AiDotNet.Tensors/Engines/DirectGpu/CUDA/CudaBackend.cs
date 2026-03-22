@@ -4688,6 +4688,16 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
+        if (size <= 0)
+        {
+            // Zero result for empty input
+            using var z = PushContext();
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
+            return;
+        }
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
 
@@ -4704,6 +4714,14 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
+        if (aSize <= 0)
+        {
+            using var z = PushContext();
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
+            return;
+        }
+        if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
+
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(result.Handle, 0, 1UL));
 
@@ -4721,11 +4739,15 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
+        if (batchSize <= 0 || vecSize <= 0) return;
+        if (batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
+        if (batchSize * vecSize > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({batchSize * vecSize}) exceeds buffer B length ({b.Size}).");
+
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("batched_dot_product", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: batched_dot_product");
 
-        uint blockSize = (uint)Math.Min(DefaultBlockSize, vecSize);
+        uint blockSize = (uint)Math.Max(1, Math.Min(DefaultBlockSize, vecSize));
         IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
         void** args = stackalloc void*[5];
         args[0] = &pA; args[1] = &pB; args[2] = &pR;
@@ -8240,6 +8262,17 @@ public sealed class CudaBackend : IAsyncGpuBackend
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), "Length must be non-negative.");
+        if (sourceOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceOffset), "Source offset must be non-negative.");
+        if (destinationOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(destinationOffset), "Destination offset must be non-negative.");
+        if (sourceOffset + length > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(length), $"Source offset ({sourceOffset}) + length ({length}) exceeds source buffer size ({source.Size}).");
+        if (destinationOffset + length > destination.Size)
+            throw new ArgumentOutOfRangeException(nameof(length), $"Destination offset ({destinationOffset}) + length ({length}) exceeds destination buffer size ({destination.Size}).");
+        if (length == 0) return;
 
         using var _ = PushContext();
         // cuMemcpyDtoD with pointer arithmetic for offsets (float = 4 bytes)
@@ -9383,6 +9416,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_specializedModule);
             _specializedModule = IntPtr.Zero;
+        }
+
+        if (_dotProductModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_dotProductModule);
+            _dotProductModule = IntPtr.Zero;
         }
 
         if (_fp16Module != IntPtr.Zero)

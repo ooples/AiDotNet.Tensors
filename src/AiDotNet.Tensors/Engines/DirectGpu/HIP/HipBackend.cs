@@ -4917,21 +4917,40 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
+        if (size <= 0)
+        {
+            HipNativeBindings.CheckError(
+                HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
+            return;
+        }
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
         // Zero result buffer (atomicAdd accumulates)
         HipNativeBindings.CheckError(
             HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
 
         var kernel = _kernelCache["dot_product"];
+        // Use 256 (multiple of wave64=64) for AMD GPU compatibility
         uint gridSize = (uint)Math.Min((size + 255) / 256, 256);
         IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pA; args[1] = &pB; args[2] = &pR; args[3] = &size;
         LaunchKernel(kernel, gridSize, 256, args);
+        Synchronize();
     }
 
     public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
+        if (aSize <= 0)
+        {
+            HipNativeBindings.CheckError(
+                HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
+            return;
+        }
+        if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
+
         HipNativeBindings.CheckError(
             HipNativeBindings.hipMemset(result.Handle, 0, (UIntPtr)sizeof(float)), "hipMemset");
 
@@ -4942,13 +4961,18 @@ public sealed class HipBackend : IAsyncGpuBackend
         args[0] = &pA; args[1] = &pB; args[2] = &pR;
         args[3] = &aSize; args[4] = &bSize; args[5] = &bOffset; args[6] = &bStride;
         LaunchKernel(kernel, gridSize, 256, args);
+        Synchronize();
     }
 
     public unsafe void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int batchSize, int vecSize)
     {
+        if (batchSize <= 0 || vecSize <= 0) return;
+        if (batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
+
         var kernel = _kernelCache["batched_dot_product"];
-        uint blockSize = (uint)Math.Min(256, vecSize);
+        // Block size must be multiple of wave64 for AMD GPUs
+        uint blockSize = (uint)Math.Max(64, Math.Min(256, (vecSize + 63) / 64 * 64));
         IntPtr pA = a.Handle, pB = b.Handle, pR = result.Handle;
         void** args = stackalloc void*[5];
         args[0] = &pA; args[1] = &pB; args[2] = &pR;
@@ -4958,6 +4982,7 @@ public sealed class HipBackend : IAsyncGpuBackend
             kernel, 1, (uint)batchSize, 1, blockSize, 1, 1,
             0, _stream, (IntPtr)args, IntPtr.Zero);
         HipNativeBindings.CheckError(launchResult, "hipModuleLaunchKernel(batched_dot_product)");
+        Synchronize();
     }
 
     #endregion
@@ -9358,6 +9383,11 @@ public sealed class HipBackend : IAsyncGpuBackend
         {
             HipNativeBindings.hipModuleUnload(_specializedModule);
             _specializedModule = IntPtr.Zero;
+        }
+        if (_dotProductModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_dotProductModule);
+            _dotProductModule = IntPtr.Zero;
         }
         if (_fp16Module != IntPtr.Zero)
         {
