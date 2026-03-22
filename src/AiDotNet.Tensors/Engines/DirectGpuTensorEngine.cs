@@ -254,6 +254,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Tries to get the batch execution backend (which has the fused kernel methods).
+    /// Returns false if GPU is not available or backend doesn't support batch execution.
+    /// </summary>
+    private bool TryGetBatchBackend(out DirectGpu.IGpuBatchExecution batchBackend)
+    {
+        if (TryGetBackend(out var backend) && backend is DirectGpu.IGpuBatchExecution batch)
+        {
+            batchBackend = batch;
+            return true;
+        }
+        batchBackend = null!;
+        return false;
+    }
+
+    /// <summary>
     /// Gets the GPU backend if available.
     /// </summary>
     /// <returns>The GPU backend, or null if not available.</returns>
@@ -11070,6 +11085,85 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch { }
         }
         return base.TensorBatchMatMul(a, b2);
+    }
+
+    // --- Ops using IGpuBatchExecution (fused kernel methods) ---
+
+    T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(1); bb.Fill(go,0f,1); bb.ReduceSumOfSquares(gi,go,tensor.Length); return (T)(object)bb.DownloadBuffer(go)[0]; } catch{} }
+        return base.TensorSumOfSquares(tensor);
+    }
+
+    Tensor<T> IEngine.TensorDiag<T>(Tensor<T> diagonal)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { int n=diagonal.Length; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)diagonal).GetDataArray()); using var go=bb.AllocateBuffer(n*n); bb.DiagKernel(gi,go,n); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n,n}); } catch{} }
+        return base.TensorDiag(diagonal);
+    }
+
+    Tensor<T> IEngine.TensorDiagonal<T>(Tensor<T> tensor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2)
+        { try { int n=Math.Min(tensor.Shape[0],tensor.Shape[1]); using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(n); bb.ExtractDiagKernel(gi,go,n,tensor.Shape[1]); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n}); } catch{} }
+        return base.TensorDiagonal(tensor);
+    }
+
+    Tensor<T> IEngine.TensorLinspace<T>(T start, T end, int count)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && count>1)
+        { try { float s=Convert.ToSingle(start),e=Convert.ToSingle(end); float step=(e-s)/(count-1); using var go=bb.AllocateBuffer(count); bb.LinspaceKernel(go,s,step,count); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{count}); } catch{} }
+        return base.TensorLinspace(start,end,count);
+    }
+
+    Tensor<T> IEngine.PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
+        { try { int ba=input.Shape[0],ch=input.Shape[1]/(upscaleFactor*upscaleFactor),ih=input.Shape[2],iw=input.Shape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*upscaleFactor*iw*upscaleFactor); bb.PixelShuffle(gi,go,ba,ch,ih,iw,upscaleFactor); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,ih*upscaleFactor,iw*upscaleFactor}); } catch{} }
+        return base.PixelShuffle(input,upscaleFactor);
+    }
+
+    Tensor<T> IEngine.PixelShuffleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int upscaleFactor)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
+        { try { int ba=inputShape[0],ch=inputShape[1]/(upscaleFactor*upscaleFactor),ih=inputShape[2],iw=inputShape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(inputShape[0]*inputShape[1]*inputShape[2]*inputShape[3]); bb.PixelShuffleBackward(gi,go,ba,ch,ih,iw,upscaleFactor); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        return base.PixelShuffleBackward(gradOutput,inputShape,upscaleFactor);
+    }
+
+    Tensor<T> IEngine.Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
+        { try { int ba=input.Shape[0],ch=input.Shape[1],ih=input.Shape[2],iw=input.Shape[3]; int oh=ih+padTop+padBottom,ow=iw+padLeft+padRight; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*oh*ow); bb.Pad2D(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft,Convert.ToSingle(padValue)); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,oh,ow}); } catch{} }
+        return base.Pad(input,padTop,padBottom,padLeft,padRight,padValue);
+    }
+
+    Tensor<T> IEngine.PadBackward<T>(Tensor<T> gradOutput, int padTop, int padLeft, int[] inputShape)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int oh=gradOutput.Shape[2],ow=gradOutput.Shape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*iw); bb.Pad2DBackward(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        return base.PadBackward(gradOutput,padTop,padLeft,inputShape);
+    }
+
+    Tensor<T> IEngine.Crop<T>(Tensor<T> input, int top, int left, int height, int width)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
+        { try { int ba=input.Shape[0],ch=input.Shape[1],ih=input.Shape[2],iw=input.Shape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*height*width); bb.Crop2D(gi,go,ba,ch,ih,iw,height,width,top,left); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,height,width}); } catch{} }
+        return base.Crop(input,top,left,height,width);
+    }
+
+    Tensor<T> IEngine.CropBackward<T>(Tensor<T> gradOutput, int[] inputShape, int top, int left)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int oh=gradOutput.Shape[2],ow=gradOutput.Shape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*iw); bb.Fill(go,0f,ba*ch*ih*iw); bb.Crop2DBackward(gi,go,ba,ch,ih,iw,oh,ow,top,left); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        return base.CropBackward(gradOutput,inputShape,top,left);
+    }
+
+    Tensor<T> IEngine.TensorCumSum<T>(Tensor<T> tensor, int axis)
+    {
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape[i]; int innerSize=tensor.Shape[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.CumSumAxis(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        return base.TensorCumSum(tensor,axis);
     }
 
     #endregion
