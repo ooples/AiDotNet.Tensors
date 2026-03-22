@@ -10902,7 +10902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(input.Length);
-                b.ClipKernel(gi, go, (float)(object)min, (float)(object)max, input.Length);
+                b.ClipKernel(gi, go, Convert.ToSingle(min), Convert.ToSingle(max), input.Length);
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
             }
             catch { }
@@ -10918,7 +10918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(input.Length);
-                b.PowScalar(gi, go, (float)(object)exponent, input.Length);
+                b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
             }
             catch { }

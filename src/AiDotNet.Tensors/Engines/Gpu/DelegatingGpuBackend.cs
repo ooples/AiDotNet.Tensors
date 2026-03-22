@@ -1581,4 +1581,23 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     }
 
     #endregion
+
+    // Fused kernel delegation
+    public virtual void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => Inner.ReduceMean(i, o, sz);
+    public virtual void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => Inner.ClipKernel(i, o, mn, mx, sz);
+    public virtual void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => Inner.PowScalar(i, o, ex, sz);
+    public virtual void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) => Inner.FracKernel(i, o, sz);
+    public virtual void EyeKernel(IGpuBuffer o, int n) => Inner.EyeKernel(o, n);
+    public virtual void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => Inner.OneHotKernel(idx, o, bs, nc);
+    public virtual void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) => Inner.MaskedFillKernel(i, m, o, fv, sz);
+    public virtual void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.EqualsKernel(a, b, o, sz);
+    public virtual void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.NotEqualsKernel(a, b, o, sz);
+    public virtual void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => Inner.OuterProduct(a, b, o, M, N);
+    public virtual void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => Inner.BatchDotProduct(a, b, o, bs, dim);
+    public virtual void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.GluForward(i, o, os, hd);
+    public virtual void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.GeGluForward(i, o, os, hd);
+    public virtual void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.ReGluForward(i, o, os, hd);
+    public virtual void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.SwiGluForward(i, o, os, hd);
+    public virtual void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) => Inner.BceLoss(p, t, l, sz);
+
 }

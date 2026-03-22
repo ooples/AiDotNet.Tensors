@@ -2571,7 +2571,6 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     // =====================================================================
     // Fused Reduction Kernels
     // =====================================================================
-    void ReduceMean(IGpuBuffer input, IGpuBuffer output, int size);
     void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size);
     void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size);
     void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size);
@@ -2587,7 +2586,6 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
     void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize);
-    void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize);
     void ReduceMaxBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer maxValues, IGpuBuffer gradInput, int outerSize, int reduceSize);
     void ReduceVarianceBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer means, IGpuBuffer gradInput, int outerSize, int reduceSize);
     void ReduceLogVariance(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize);
@@ -2605,24 +2603,15 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void AddScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void SubScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void DivScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
-    void PowScalar(IGpuBuffer input, IGpuBuffer output, float exponent, int size);
-    void FracKernel(IGpuBuffer input, IGpuBuffer output, int size);
-    void ClipKernel(IGpuBuffer input, IGpuBuffer output, float min, float max, int size);
     void RsqrtKernel(IGpuBuffer input, IGpuBuffer output, int size);
     void SinCosKernel(IGpuBuffer input, IGpuBuffer sinOutput, IGpuBuffer cosOutput, int size);
-    void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
-    void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
 
     // =====================================================================
     // Fused Gated Activation Kernels
     // =====================================================================
-    void GluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void GluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim);
-    void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void GeGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim);
-    void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void ReGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim);
-    void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim);
     void SwiGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim);
     void ReluDerivative(IGpuBuffer input, IGpuBuffer output, int size);
     void SigmoidDerivative(IGpuBuffer sigmoidOutput, IGpuBuffer output, int size);
@@ -2643,13 +2632,10 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int scale);
     void Crop2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW);
     void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW);
-    void EyeKernel(IGpuBuffer output, int n);
     void LinspaceKernel(IGpuBuffer output, float start, float step, int size);
-    void OneHotKernel(IGpuBuffer indices, IGpuBuffer output, int batchSize, int numClasses);
     void DiagKernel(IGpuBuffer input, IGpuBuffer output, int n);
     void ExtractDiagKernel(IGpuBuffer input, IGpuBuffer output, int n, int cols);
     void TriangularMask(IGpuBuffer output, int rows, int cols, int diagonal, float maskValue);
-    void MaskedFillKernel(IGpuBuffer input, IGpuBuffer mask, IGpuBuffer output, float fillValue, int size);
     void IndexSelect(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int numIndices, int innerSize);
 
     // =====================================================================
@@ -2657,7 +2643,6 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     // =====================================================================
     void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses);
     void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures);
-    void BceLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int size);
     void DropoutMask(IGpuBuffer mask, int size, float keepProb, ulong seed);
     void GaussianNoise(IGpuBuffer output, int size, float mean, float stdDev, ulong seed);
 
@@ -2669,8 +2654,6 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void Sparsemax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
     void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
     void SphericalSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
-    void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim);
-    void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N);
     void BatchOuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int M, int N);
     void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int dim);
     void PairwiseDistance(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int M, int N, int dim);

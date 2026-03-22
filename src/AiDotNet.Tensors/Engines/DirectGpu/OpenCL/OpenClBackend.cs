@@ -10020,6 +10020,23 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
             _disposed = true;
         }
+
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }
+    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if(_context==null)return; var k=_kernelCache["clip_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,mn); k.SetArg(3,mx); k.SetArg(4,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if(_context==null)return; var k=_kernelCache["pow_scalar"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,ex); k.SetArg(3,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }
+    public void EyeKernel(IGpuBuffer o, int n) { if(_context==null)return; var k=_kernelCache["eye_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(1,n); k.Execute1D(n*n,CalculateOptimalWorkGroupSize1D(n*n)); }
+    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(_context==null)return; var k=_kernelCache["one_hot_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)idx).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,bs); k.SetArg(3,nc); k.Execute1D(bs*nc,CalculateOptimalWorkGroupSize1D(bs*nc)); }
+    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(_context==null)return; var k=_kernelCache["masked_fill_kernel"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)m).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,fv); k.SetArg(4,sz); k.Execute1D(sz,CalculateOptimalWorkGroupSize1D(sz)); }
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("equals_kernel", a, b, o, sz); }
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { ExecuteElementwise("not_equals_kernel", a, b, o, sz); }
+    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { if(_context==null)return; var k=_kernelCache["outer_product"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,M); k.SetArg(4,N); k.Execute1D(M*N,CalculateOptimalWorkGroupSize1D(M*N)); }
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { if(_context==null)return; var k=_kernelCache["batch_dot_product"]; k.SetArg(0,((DirectOpenClGpuBuffer)a).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)b).Buffer.Handle); k.SetArg(2,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(3,bs); k.SetArg(4,dim); k.Execute1D(bs,CalculateOptimalWorkGroupSize1D(bs)); }
+    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["glu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["geglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["reglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { if(_context==null)return; var k=_kernelCache["swiglu_forward"]; k.SetArg(0,((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1,((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2,os); k.SetArg(3,hd); k.Execute1D(os*hd,CalculateOptimalWorkGroupSize1D(os*hd)); }
+    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { ExecuteElementwise("bce_loss", p, t, l, sz); }
     }
 
     /// <summary>
