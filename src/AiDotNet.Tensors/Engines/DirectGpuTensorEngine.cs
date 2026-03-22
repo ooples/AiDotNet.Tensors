@@ -1575,12 +1575,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                float alphaF = (float)(object)alpha;
+                float alphaF = alpha is float f ? f : Convert.ToSingle(alpha);
                 int size = input.Length;
 
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(size);
-                gpuBackend.LeakyRelu(gpuIn, gpuOut, size, alphaF);
+                gpuBackend.LeakyRelu(gpuIn, gpuOut, alphaF, size);
                 gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
                 return;
             }
@@ -1601,7 +1601,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && tensors.Length == 2)
+        // Only use GPU flat copy for axis=0 concat (leading axis — data is contiguous)
+        if (typeof(T) == typeof(float) && axis == 0 && TryGetBackend(out var gpuBackend) && tensors.Length == 2)
         {
             try
             {
@@ -1630,7 +1631,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TransposeInto<T>(Tensor<T> dest, Tensor<T> input, int[] axes)
     {
-        if (typeof(T) == typeof(float) && input.Rank == 2 && TryGetBackend(out var gpuBackend))
+        // Only use GPU fast path for standard 2D transpose (axes == [1, 0])
+        bool isStandardTranspose = input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0;
+        if (typeof(T) == typeof(float) && isStandardTranspose && TryGetBackend(out var gpuBackend))
         {
             try
             {

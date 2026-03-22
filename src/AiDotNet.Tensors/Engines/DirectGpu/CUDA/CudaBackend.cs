@@ -41,6 +41,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     private IntPtr _specializedModule;
     private IntPtr _lstmModule;
     private IntPtr _gruModule;
+    private IntPtr _snnModule;
     private IntPtr _fp16Module;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
@@ -592,7 +593,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         _specializedModule = CompileKernelModule(device, CudaSpecializedKernels.GetSource(), "specialized_kernels", CudaSpecializedKernels.GetKernelNames());
 
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
-        CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
+        _snnModule = CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
 
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
@@ -9353,6 +9354,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         {
             CudaNativeBindings.cuModuleUnload(_gruModule);
             _gruModule = IntPtr.Zero;
+        }
+
+        if (_snnModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_snnModule);
+            _snnModule = IntPtr.Zero;
         }
 
         if (_wmmaModule != IntPtr.Zero)

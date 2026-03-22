@@ -9432,6 +9432,18 @@ public sealed class HipBackend : IAsyncGpuBackend
             _gruModule = IntPtr.Zero;
         }
 
+        if (_capsuleModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_capsuleModule);
+            _capsuleModule = IntPtr.Zero;
+        }
+
+        if (_snnModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_snnModule);
+            _snnModule = IntPtr.Zero;
+        }
+
         if (_hipblasHandle != IntPtr.Zero)
         {
             HipBlasNative.hipblasDestroy(_hipblasHandle); // lgtm[cs/call-to-unmanaged-code] HIP BLAS uses native bindings.

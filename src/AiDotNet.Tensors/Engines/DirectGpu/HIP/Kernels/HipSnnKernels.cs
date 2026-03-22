@@ -4,7 +4,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 /// HIP kernels for SNN, RBF, PRNG, and structured sparsity operations.
 /// HIP is API-compatible with CUDA — kernel source is identical.
 /// </summary>
-public static class HipSnnKernels
+internal static class HipSnnKernels
 {
     public static string GetSource()
     {

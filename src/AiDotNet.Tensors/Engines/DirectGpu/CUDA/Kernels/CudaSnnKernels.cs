@@ -4,7 +4,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// CUDA kernels for Spiking Neural Networks (SNN), Radial Basis Functions (RBF),
 /// random number generation, and miscellaneous utility operations.
 /// </summary>
-public static class CudaSnnKernels
+internal static class CudaSnnKernels
 {
     public static string GetSource()
     {
