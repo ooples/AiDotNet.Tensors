@@ -837,14 +837,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[] FinishGpuOp<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, int elementCount)
     {
-        // Download the result to CPU but keep the GPU buffer cached.
-        // This way, if the result is used as input to another GPU op,
-        // GetOrAllocateBuffer will find it in _activationCache and skip the re-upload.
-        // This eliminates the upload cost for chained GPU operations.
-        float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
-        var result = DirectGpuEngine.FromFloatArray<T>(floatData);
-        CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
-        return result;
+        // Always cache the GPU buffer so chained GPU ops can reuse it
+        // without re-uploading (GetOrAllocateBuffer checks _activationCache).
+        //
+        // When GpuScope is active: defer the download entirely.
+        // Return an empty placeholder array and register it for lazy materialization.
+        // The data only gets downloaded when CPU code actually reads the array
+        // (via MaterializeIfDeferred at scope exit or when the engine detects access).
+        //
+        // Without GpuScope: download immediately for CPU correctness.
+        if (GpuScope.IsActive)
+        {
+            var result = new T[elementCount];
+            CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
+            _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer.Buffer, backend, elementCount));
+            return result;
+        }
+        else
+        {
+            float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
+            var result = DirectGpuEngine.FromFloatArray<T>(floatData);
+            CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
+            return result;
+        }
     }
 
     /// <summary>
