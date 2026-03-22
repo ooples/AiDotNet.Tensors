@@ -453,6 +453,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, gruProgram, name);
                 }
+
+                // Compile Capsule Network kernels
+                var capsuleProgram = CompileOrLoadCached(CapsuleKernels.GetSource(), optimizationFlags, "Capsule network kernels");
+                _programs.Add(capsuleProgram);
+                foreach (var name in CapsuleKernels.GetKernelNames())
+                {
+                    _kernelCache[name] = new DirectOpenClKernel(_context, capsuleProgram, name);
+                }
             }
             catch (Exception ex)
             {
@@ -2687,25 +2695,83 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
             int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
         {
-            throw new NotImplementedException("CapsulePredictions kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_predictions"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, inputDim);
+            kernel.SetArg(6, outputCapsules);
+            kernel.SetArg(7, outputDim);
+
+            int total = batchSize * inputCapsules * outputCapsules * outputDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
             int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleTransform kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_transform"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, inputDim);
+            kernel.SetArg(6, numCapsules);
+            kernel.SetArg(7, capsuleDim);
+
+            int total = batchSize * inputCapsules * numCapsules * capsuleDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleWeightedSum kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_weighted_sum"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)coupling).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, outputCapsules);
+            kernel.SetArg(6, capsuleDim);
+
+            int total = batchSize * outputCapsules * capsuleDim;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
-            throw new NotImplementedException("CapsuleAgreement kernel not yet implemented for OpenCL backend");
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var kernel = _kernelCache["capsule_agreement"];
+            kernel.SetArg(0, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
+            kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(2, ((DirectOpenClGpuBuffer)agreement).Buffer.Handle);
+            kernel.SetArg(3, batchSize);
+            kernel.SetArg(4, inputCapsules);
+            kernel.SetArg(5, outputCapsules);
+            kernel.SetArg(6, capsuleDim);
+
+            int total = batchSize * inputCapsules * outputCapsules;
+            int localSize = CalculateOptimalWorkGroupSize1D(total);
+            kernel.Execute1D(total, localSize);
         }
 
         public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
