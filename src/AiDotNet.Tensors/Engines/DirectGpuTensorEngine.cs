@@ -1261,7 +1261,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        // GPU broadcast requires same shapes; fall back to CPU for broadcasting
+        // If shapes match, use GPU element-wise add in-place
+        if (ShapesMatch(a.Shape, b.Shape) && TryRunBinaryInPlace(a, b,
+            static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
+            return;
+        // Shapes differ — CPU handles broadcasting logic
         base.TensorBroadcastAddInPlace(a, b);
     }
 
@@ -1295,12 +1299,74 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.Conv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        // Conv2D is not safe for in-place (output != input shape), use CPU path
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatKernel = (Tensor<float>)(object)kernel;
+                var floatOutput = (Tensor<float>)(object)output;
+
+                int batch = input.Shape[0], inChannels = input.Shape[1];
+                int inH = input.Shape[2], inW = input.Shape[3];
+                int outChannels = kernel.Shape[0], kH = kernel.Shape[2], kW = kernel.Shape[3];
+                int outH = output.Shape[2], outW = output.Shape[3];
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuK = gpuBackend.AllocateBuffer(floatKernel.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(output.Length);
+
+                gpuBackend.Conv2D(gpuIn, gpuK, gpuOut,
+                    batch, inChannels, inH, inW,
+                    outChannels, outH, outW,
+                    kH, kW, stride, stride, padding, padding, dilation, dilation);
+                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.Conv2DInto(output, input, kernel, stride, padding, dilation);
     }
 
     void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatOutput = (Tensor<float>)(object)output;
+                var floatGamma = (Tensor<float>)(object)gamma;
+                var floatBeta = (Tensor<float>)(object)beta;
+
+                int batch = input.Shape[0], channels = input.Shape[1];
+                int spatial = input.Length / (batch * channels);
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
+                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
+                using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
+                using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
+
+                gpuBackend.GroupNorm(gpuIn, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
+                    batch, channels, spatial, numGroups, (float)epsilon);
+                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+
+                mean = new Tensor<T>(new int[] { batch, numGroups });
+                variance = new Tensor<T>(new int[] { batch, numGroups });
+                gpuBackend.DownloadBuffer(gpuMean, ((Tensor<float>)(object)mean).GetDataArray());
+                gpuBackend.DownloadBuffer(gpuVar, ((Tensor<float>)(object)variance).GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
     }
 
@@ -1341,6 +1407,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatDest = (Tensor<float>)(object)destination;
+                int rank = input.Rank;
+                int effectiveAxis = axis < 0 ? rank + axis : axis;
+
+                if (effectiveAxis >= 0 && effectiveAxis < rank && effectiveAxis == rank - 1)
+                {
+                    int features = input.Shape[rank - 1];
+                    int outerSize = input.Length / features;
+
+                    using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                    using var gpuSoftmax = gpuBackend.AllocateBuffer(input.Length);
+                    using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
+
+                    // Softmax then Log
+                    gpuBackend.Softmax(gpuIn, gpuSoftmax, outerSize, features);
+                    gpuBackend.Log(gpuSoftmax, gpuOut, input.Length);
+                    gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                    return;
+                }
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.LogSoftmaxInto(destination, input, axis);
     }
 
@@ -1449,11 +1545,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.MishInto<T>(Tensor<T> dest, Tensor<T> input)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatDest = (Tensor<float>)(object)dest;
+                int size = input.Length;
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(size);
+                gpuBackend.Mish(gpuIn, gpuOut, size);
+                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.MishInto(dest, input);
     }
 
     void IEngine.LeakyReLUInto<T>(Tensor<T> dest, Tensor<T> input, T alpha)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatDest = (Tensor<float>)(object)dest;
+                float alphaF = (float)(object)alpha;
+                int size = input.Length;
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(size);
+                gpuBackend.LeakyRelu(gpuIn, gpuOut, size, alphaF);
+                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.LeakyReLUInto(dest, input, alpha);
     }
 
@@ -1466,21 +1601,130 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && tensors.Length == 2)
+        {
+            try
+            {
+                // For 2-tensor concat along last axis, copy each tensor's data sequentially
+                var t0 = (Tensor<float>)(object)tensors[0];
+                var t1 = (Tensor<float>)(object)tensors[1];
+                var dstF = (Tensor<float>)(object)dest;
+
+                using var gpu0 = gpuBackend.AllocateBuffer(t0.GetDataArray());
+                using var gpu1 = gpuBackend.AllocateBuffer(t1.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(dest.Length);
+
+                // Copy t0 data to start of output, t1 data to offset
+                gpuBackend.Copy(gpu0, gpuOut, t0.Length);
+                gpuBackend.Copy(gpu1, 0, gpuOut, t0.Length, t1.Length);
+                gpuBackend.DownloadBuffer(gpuOut, dstF.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU — axis-aware concat is complex
+            }
+        }
         base.ConcatInto(dest, tensors, axis);
     }
 
     void IEngine.TransposeInto<T>(Tensor<T> dest, Tensor<T> input, int[] axes)
     {
+        if (typeof(T) == typeof(float) && input.Rank == 2 && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatDest = (Tensor<float>)(object)dest;
+                int rows = input.Shape[0], cols = input.Shape[1];
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(dest.Length);
+                gpuBackend.Transpose(gpuIn, gpuOut, rows, cols);
+                gpuBackend.DownloadBuffer(gpuOut, floatDest.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU for higher-rank transposes
+            }
+        }
         base.TransposeInto(dest, input, axes);
     }
 
     void IEngine.GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
+        {
+            try
+            {
+                var floatInput = (Tensor<float>)(object)input;
+                var floatOutput = (Tensor<float>)(object)output;
+                var floatGamma = (Tensor<float>)(object)gamma;
+                var floatBeta = (Tensor<float>)(object)beta;
+
+                int batch = input.Shape[0], channels = input.Shape[1];
+                int spatial = input.Length / (batch * channels);
+
+                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
+                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
+                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuNorm = gpuBackend.AllocateBuffer(input.Length);
+                using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
+                using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
+                using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
+
+                // GroupNorm then Swish (sigmoid * x)
+                gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
+                    batch, channels, spatial, numGroups, (float)epsilon);
+                gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
+                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.GroupNormSwishInto(output, input, numGroups, gamma, beta, epsilon);
     }
 
     void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape, b.Shape))
+        {
+            try
+            {
+                var floatA = (Tensor<float>)(object)a;
+                var floatB = (Tensor<float>)(object)b;
+                var floatOutput = (Tensor<float>)(object)output;
+                var floatGamma = (Tensor<float>)(object)gamma;
+                var floatBeta = (Tensor<float>)(object)beta;
+
+                int batch = a.Shape[0], channels = a.Shape[1];
+                int spatial = a.Length / (batch * channels);
+
+                using var gpuA = gpuBackend.AllocateBuffer(floatA.GetDataArray());
+                using var gpuB = gpuBackend.AllocateBuffer(floatB.GetDataArray());
+                using var gpuSum = gpuBackend.AllocateBuffer(a.Length);
+                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
+                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuOut = gpuBackend.AllocateBuffer(a.Length);
+                using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
+                using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
+
+                // Add then GroupNorm
+                gpuBackend.Add(gpuA, gpuB, gpuSum, a.Length);
+                gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
+                    batch, channels, spatial, numGroups, (float)epsilon);
+                gpuBackend.DownloadBuffer(gpuOut, floatOutput.GetDataArray());
+                return;
+            }
+            catch
+            {
+                // Fall through to CPU
+            }
+        }
         base.AddGroupNormInto(output, a, b, numGroups, gamma, beta, epsilon);
     }
 
