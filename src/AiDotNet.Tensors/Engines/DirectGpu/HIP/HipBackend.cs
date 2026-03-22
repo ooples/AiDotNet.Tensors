@@ -69,6 +69,8 @@ public sealed class HipBackend : IAsyncGpuBackend
     private IntPtr _spatialTransformerModule;
     private IntPtr _lstmModule;
     private IntPtr _gruModule;
+    private IntPtr _capsuleModule;
+    private IntPtr _snnModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -482,6 +484,14 @@ public sealed class HipBackend : IAsyncGpuBackend
             // Compile GRU sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipGruKernels.GetSource(), "gru", ref _gruModule,
                 HipGruKernels.GetKernelNames());
+
+            // Compile Capsule Network kernels
+            CompileKernelModule(Kernels.HipCapsuleKernels.GetSource(), "capsule", ref _capsuleModule,
+                Kernels.HipCapsuleKernels.GetKernelNames());
+
+            // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
+            CompileKernelModule(Kernels.HipSnnKernels.GetSource(), "snn", ref _snnModule,
+                Kernels.HipSnnKernels.GetKernelNames());
 
             Console.WriteLine($"[HipBackend] Kernel compilation complete. Available kernels: {_kernelCache.Count}");
             System.Diagnostics.Debug.WriteLine($"HIP kernels compiled successfully for {_architecture}. Total: {_kernelCache.Count}");
@@ -2126,28 +2136,62 @@ public sealed class HipBackend : IAsyncGpuBackend
             }
     }
 
-    public void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+    public unsafe void CapsulePredictions(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
-        throw new NotImplementedException("CapsulePredictions kernel not yet implemented for HIP backend");
+        if (!_kernelCache.TryGetValue("capsule_predictions", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: capsule_predictions");
+
+        IntPtr inPtr = input.Handle, wPtr = weights.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inPtr; args[1] = &wPtr; args[2] = &outPtr;
+        args[3] = &batchSize; args[4] = &inputCapsules; args[5] = &inputDim;
+        args[6] = &outputCapsules; args[7] = &outputDim;
+        uint total = (uint)(batchSize * inputCapsules * outputCapsules * outputDim);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
+    public unsafe void CapsuleTransform(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer output,
         int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
     {
-        throw new NotImplementedException("CapsuleTransform kernel not yet implemented for HIP backend");
+        if (!_kernelCache.TryGetValue("capsule_transform", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: capsule_transform");
+
+        IntPtr inPtr = input.Handle, wPtr = weights.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &inPtr; args[1] = &wPtr; args[2] = &outPtr;
+        args[3] = &batchSize; args[4] = &inputCapsules; args[5] = &inputDim;
+        args[6] = &numCapsules; args[7] = &capsuleDim;
+        uint total = (uint)(batchSize * inputCapsules * numCapsules * capsuleDim);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
+    public unsafe void CapsuleWeightedSum(IGpuBuffer coupling, IGpuBuffer predictions, IGpuBuffer output,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        throw new NotImplementedException("CapsuleWeightedSum kernel not yet implemented for HIP backend");
+        if (!_kernelCache.TryGetValue("capsule_weighted_sum", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: capsule_weighted_sum");
+
+        IntPtr cPtr = coupling.Handle, pPtr = predictions.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &cPtr; args[1] = &pPtr; args[2] = &outPtr;
+        args[3] = &batchSize; args[4] = &inputCapsules; args[5] = &outputCapsules; args[6] = &capsuleDim;
+        uint total = (uint)(batchSize * outputCapsules * capsuleDim);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
+    public unsafe void CapsuleAgreement(IGpuBuffer predictions, IGpuBuffer output, IGpuBuffer agreement,
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
-        throw new NotImplementedException("CapsuleAgreement kernel not yet implemented for HIP backend");
+        if (!_kernelCache.TryGetValue("capsule_agreement", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: capsule_agreement");
+
+        IntPtr pPtr = predictions.Handle, outPtr = output.Handle, agPtr = agreement.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pPtr; args[1] = &outPtr; args[2] = &agPtr;
+        args[3] = &batchSize; args[4] = &inputCapsules; args[5] = &outputCapsules; args[6] = &capsuleDim;
+        uint total = (uint)(batchSize * inputCapsules * outputCapsules);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
     public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
@@ -8304,38 +8348,93 @@ public sealed class HipBackend : IAsyncGpuBackend
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        throw new NotImplementedException("Strided copy not implemented for HIP backend yet.");
+        IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
+        IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
+        var sizeBytes = (UIntPtr)(length * sizeof(float));
+        var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
+        HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
     }
 
-    public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        throw new NotImplementedException("ArgMaxAxis not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: argmax_axis");
+
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPtr; args[1] = &indicesPtr; args[2] = &outerSize; args[3] = &reduceSize;
+        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
+    public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomUniform not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: generate_random_uniform");
+
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr; args[1] = &size; args[2] = &min; args[3] = &max; args[4] = &seed;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
+    public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
-        throw new NotImplementedException("GenerateRandomNormal not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: generate_random_normal");
+
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &outputPtr; args[1] = &size; args[2] = &mean; args[3] = &stdDev; args[4] = &seed;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
+    public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
-        throw new NotImplementedException("RbfForward not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: rbf_forward");
+
+        IntPtr inputPtr = input.Handle, centersPtr = centers.Handle;
+        IntPtr epsilonsPtr = epsilons.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPtr; args[1] = &centersPtr; args[2] = &epsilonsPtr; args[3] = &outputPtr;
+        args[4] = &batchSize; args[5] = &numCenters; args[6] = &inputDim;
+        uint total = (uint)(batchSize * numCenters);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
+    public unsafe void StdpUpdate(IGpuBuffer weights, IGpuBuffer preTrace, IGpuBuffer postTrace, IGpuBuffer preSpike, IGpuBuffer postSpike,
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
-        throw new NotImplementedException("StdpUpdate not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("stdp_update", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: stdp_update");
+
+        IntPtr wPtr = weights.Handle, preTPtr = preTrace.Handle, postTPtr = postTrace.Handle;
+        IntPtr preSPtr = preSpike.Handle, postSPtr = postSpike.Handle;
+        void** args = stackalloc void*[12];
+        args[0] = &wPtr; args[1] = &preTPtr; args[2] = &postTPtr;
+        args[3] = &preSPtr; args[4] = &postSPtr;
+        args[5] = &ltpRate; args[6] = &ltdRate; args[7] = &homeostasisRate;
+        args[8] = &minWeight; args[9] = &maxWeight;
+        args[10] = &numPre; args[11] = &numPost;
+        uint total = (uint)(numPre * numPost);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
+    public unsafe void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
-        throw new NotImplementedException("UpdateTraces not implemented for HIP backend yet.");
+        if (!_kernelCache.TryGetValue("update_traces", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: update_traces");
+
+        IntPtr tracesPtr = traces.Handle, spikesPtr = spikes.Handle, inputPtr = input.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &tracesPtr; args[1] = &spikesPtr; args[2] = &inputPtr;
+        args[3] = &decay; args[4] = &threshold; args[5] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     #region Hyperbolic Geometry Operations
