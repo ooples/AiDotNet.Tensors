@@ -7932,5 +7932,103 @@ fn product_axis(@builtin(global_invocation_id) gid: vec3u) {
     rext_output[idx] = prod;
 }
 ";
+    // ============================================================================
+    // Extended Broadcast Operations (3-buffer: A, B -> C)
+    // ============================================================================
+
+    public const string BroadcastExtSource = @"
+@group(0) @binding(0) var<storage, read> bx_a: array<f32>;
+@group(0) @binding(1) var<storage, read> bx_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> bx_c: array<f32>;
+struct BxParams { outer_size: u32, inner_size: u32 }
+@group(0) @binding(3) var<uniform> bx_params: BxParams;
+
+@compute @workgroup_size(256)
+fn broadcast_add_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] + bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_sub_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] - bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_mul_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] * bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_div_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] / (bx_b[idx % bx_params.inner_size] + 1e-12);
+}
+";
+
+    // ============================================================================
+    // OuterProduct, BatchDotProduct, MaskedFill (3-buffer ops)
+    // ============================================================================
+
+    public const string OuterProductSource = @"
+@group(0) @binding(0) var<storage, read> op_a: array<f32>;
+@group(0) @binding(1) var<storage, read> op_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> op_c: array<f32>;
+struct OpParams { M: u32, N: u32 }
+@group(0) @binding(3) var<uniform> op_params: OpParams;
+
+@compute @workgroup_size(256)
+fn outer_product(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = op_params.M * op_params.N;
+    if (idx >= total) { return; }
+    op_c[idx] = op_a[idx / op_params.N] * op_b[idx % op_params.N];
+}
+";
+
+    public const string BatchDotProductSource = @"
+@group(0) @binding(0) var<storage, read> bdp_a: array<f32>;
+@group(0) @binding(1) var<storage, read> bdp_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> bdp_c: array<f32>;
+struct BdpParams { batch_size: u32, dim: u32 }
+@group(0) @binding(3) var<uniform> bdp_params: BdpParams;
+
+@compute @workgroup_size(256)
+fn batch_dot_product(@builtin(global_invocation_id) gid: vec3u) {
+    let batch = gid.x;
+    if (batch >= bdp_params.batch_size) { return; }
+    var sum: f32 = 0.0;
+    let base = batch * bdp_params.dim;
+    for (var j: u32 = 0u; j < bdp_params.dim; j = j + 1u) {
+        sum = sum + bdp_a[base + j] * bdp_b[base + j];
+    }
+    bdp_c[batch] = sum;
+}
+";
+
+    public const string MaskedFillSource = @"
+@group(0) @binding(0) var<storage, read> mf_input: array<f32>;
+@group(0) @binding(1) var<storage, read> mf_mask: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mf_output: array<f32>;
+struct MfParams { fill_value: f32, size: u32 }
+@group(0) @binding(3) var<uniform> mf_params: MfParams;
+
+@compute @workgroup_size(256)
+fn masked_fill(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= mf_params.size) { return; }
+    mf_output[idx] = select(mf_input[idx], mf_params.fill_value, mf_mask[idx] != 0.0);
+}
+";
 }
 #endif
