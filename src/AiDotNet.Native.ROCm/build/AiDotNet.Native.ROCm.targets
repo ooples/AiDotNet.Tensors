@@ -3,7 +3,7 @@
 
   <!-- Copy ROCm native libraries to output directory based on runtime -->
 
-  <!-- Windows: rocBLAS + MIOpen + HIP runtime -->
+  <!-- Windows: rocBLAS + hipBLAS + HIP runtime -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' == 'Windows_NT')">
     <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\rocblas.dll"
              Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\rocblas.dll')">
@@ -11,49 +11,21 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
     </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hipblas.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hipblas.dll')">
+      <Link>hipblas.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64_6.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64_6.dll')">
+      <Link>amdhip64_6.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\MIOpen.dll"
              Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\MIOpen.dll')">
       <Link>MIOpen.dll</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64.dll"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64.dll')">
-      <Link>amdhip64.dll</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hiprtc.dll"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hiprtc.dll')">
-      <Link>hiprtc.dll</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-  </ItemGroup>
-
-  <!-- Linux: rocBLAS + MIOpen + HIP runtime (primary ROCm platform) -->
-  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or ('$(RuntimeIdentifier)' == '' And '$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true')">
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\librocblas.so"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\librocblas.so')">
-      <Link>librocblas.so</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libMIOpen.so"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libMIOpen.so')">
-      <Link>libMIOpen.so</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libamdhip64.so"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libamdhip64.so')">
-      <Link>libamdhip64.so</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-    </Content>
-    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libhiprtc.so"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\linux-x64\native\libhiprtc.so')">
-      <Link>libhiprtc.so</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
     </Content>
