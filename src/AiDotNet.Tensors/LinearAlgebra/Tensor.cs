@@ -106,6 +106,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor for creating a VIEW that shares the parent's TensorStorage.
+    /// Uses AddRef on the shared storage instead of creating a new one.
+    /// </summary>
+    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset, TensorStorage<T> storage)
+        : base(data, shape, strides, storageOffset, isView: true, storage: storage)
+    {
+    }
+
+    /// <summary>
     /// Returns a contiguous tensor with the same data. If already contiguous, returns this
     /// (zero-copy). Otherwise, materializes a new tensor with data in row-major order.
     /// </summary>
@@ -188,7 +197,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -221,7 +230,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -253,7 +262,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -560,7 +569,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newOffset += indices[i] * _strides[i];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -952,7 +961,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Array.Copy(_strides, 1, newStrides, 0, newRank);
         int newOffset = _storageOffset + index * _strides[0];
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -1084,7 +1093,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newStrides[i] = _strides[permutation[i]];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -1278,7 +1287,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+            return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
         }
 
         // Non-contiguous view: must materialize first, then reshape the contiguous result
@@ -2421,7 +2430,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int newOffset = _storageOffset + index * _strides[dimension];
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -3247,7 +3256,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.
-            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset);
+            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset, _storage);
         }
         else if (_shape.Length == 2)
         {
@@ -3493,7 +3502,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         newShape[axis] = sliceSize;
         int newOffset = _storageOffset + start * _strides[axis];
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>

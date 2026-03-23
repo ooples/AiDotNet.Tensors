@@ -200,6 +200,16 @@ public abstract class TensorBase<T>
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
+        : this(data, shape, strides, storageOffset, isView, storage: null)
+    {
+    }
+
+    /// <summary>
+    /// Internal constructor for creating views that share the parent's TensorStorage.
+    /// When storage is provided, AddRef is called on the shared storage (no new allocation).
+    /// When storage is null (backward compat), a new TensorStorage is created.
+    /// </summary>
+    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView, TensorStorage<T>? storage)
     {
         if (strides.Length != shape.Length)
             throw new ArgumentException($"Strides length ({strides.Length}) must match shape length ({shape.Length}).");
@@ -228,8 +238,20 @@ public abstract class TensorBase<T>
         _storageOffset = storageOffset;
         IsView = isView;
         _data = data;
-        _storage = new TensorStorage<T>(_data);
-        if (isView) _storage.AddRef();
+
+        if (storage != null)
+        {
+            // Share parent's storage — single AddRef on the shared instance
+            _storage = storage;
+            _storage.AddRef();
+        }
+        else
+        {
+            // Backward compat: create new storage (non-view or legacy path)
+            _storage = new TensorStorage<T>(_data);
+            if (isView) _storage.AddRef();
+        }
+
         Length = totalElements;
         IsContiguous = CheckContiguous(shape, strides);
     }
@@ -262,6 +284,39 @@ public abstract class TensorBase<T>
     {
         get => GetFlat(flatIndex);
         set => SetFlat(flatIndex, value);
+    }
+
+    // ================================================================
+    // Typed indexer overloads — eliminate params int[] heap allocation
+    // Each call to this[i,j] with the params overload allocates a new int[].
+    // These overloads compile to direct arithmetic — zero allocation, JIT-inlined.
+    // ================================================================
+
+    /// <summary>
+    /// Gets or sets the value at the specified 2D indices. Zero-allocation.
+    /// </summary>
+    public T this[int i0, int i1]
+    {
+        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]];
+        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]] = value;
+    }
+
+    /// <summary>
+    /// Gets or sets the value at the specified 3D indices. Zero-allocation.
+    /// </summary>
+    public T this[int i0, int i1, int i2]
+    {
+        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]];
+        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]] = value;
+    }
+
+    /// <summary>
+    /// Gets or sets the value at the specified 4D indices. Zero-allocation.
+    /// </summary>
+    public T this[int i0, int i1, int i2, int i3]
+    {
+        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]];
+        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]] = value;
     }
 
     // ================================================================
