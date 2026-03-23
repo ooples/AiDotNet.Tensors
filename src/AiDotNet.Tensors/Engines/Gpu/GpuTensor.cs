@@ -162,7 +162,7 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     public Tensor<T> ToTensor()
     {
         var data = GetCpuData();
-        return new Tensor<T>(data, Shape);
+        return new Tensor<T>(data, _shape);
     }
 
     /// <inheritdoc/>
@@ -329,7 +329,7 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
 
     public Tensor<T> ToTensor()
     {
-        return new Tensor<T>(GetCpuData(), Shape);
+        return new Tensor<T>(GetCpuData(), _shape);
     }
 
     public void Synchronize()

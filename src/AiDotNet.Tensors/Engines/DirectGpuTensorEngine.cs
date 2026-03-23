@@ -600,7 +600,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrAllocateBiasBuffer<T>(IDirectGpuBackend backend, Tensor<T> attentionBias,
         int batch, int heads, int seqQ, int seqK, out int biasBatchStride)
     {
-        var biasShape = attentionBias._shape;
+        var biasShape = attentionBias.Shape._dims;
 
         if (biasShape.Length == 4)
         {
@@ -1222,44 +1222,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Add(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorAdd(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorAdd(a, b);
     }
 
     Tensor<T> IEngine.TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorSubtract(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Subtract(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorSubtract(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorSubtract(a, b);
     }
 
     Tensor<T> IEngine.TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMultiply(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Multiply(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorMultiply(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMultiply(a, b);
     }
 
     Tensor<T> IEngine.TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorDivide(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Divide(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorDivide(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorDivide(a, b);
     }
 
     Tensor<T> IEngine.TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
     {
         var result = TryRunScalar(tensor.GetDataArray(), scalar, static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorMultiplyScalar(tensor, scalar);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorMultiplyScalar(tensor, scalar);
     }
 
     // GPU-accelerated in-place operations.
@@ -1268,7 +1268,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (ShapesMatch(a._shape, b._shape) && TryRunBinaryInPlace(a, b,
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
         base.TensorAddInPlace(a, b);
@@ -1283,7 +1283,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (ShapesMatch(a._shape, b._shape) && TryRunBinaryInPlace(a, b,
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Multiply(bufA, bufB, bufA, size)))
             return;
         base.TensorMultiplyInPlace(a, b);
@@ -1298,7 +1298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         // If shapes match, use GPU element-wise add in-place
-        if (ShapesMatch(a._shape, b._shape) && TryRunBinaryInPlace(a, b,
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Add(bufA, bufB, bufA, size)))
             return;
         // Shapes differ — CPU handles broadcasting logic
@@ -1345,8 +1345,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1];
                 int inH = input.Shape._dims[2], inW = input.Shape._dims[3];
-                int outChannels = kernel._shape[0], kH = kernel._shape[2], kW = kernel._shape[3];
-                int outH = output._shape[2], outW = output._shape[3];
+                int outChannels = kernel.Shape._dims[0], kH = kernel.Shape._dims[2], kW = kernel.Shape._dims[3];
+                int outH = output.Shape._dims[2], outW = output.Shape._dims[3];
 
                 using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
                 using var gpuK = gpuBackend.AllocateBuffer(floatKernel.GetDataArray());
@@ -1730,7 +1730,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a._shape, b._shape))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend) && ShapesMatch(a.Shape._dims, b.Shape._dims))
         {
             try
             {
@@ -1740,7 +1740,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var floatGamma = (Tensor<float>)(object)gamma;
                 var floatBeta = (Tensor<float>)(object)beta;
 
-                int batch = a._shape[0], channels = a._shape[1];
+                int batch = a.Shape._dims[0], channels = a.Shape._dims[1];
                 int spatial = a.Length / (batch * channels);
 
                 using var gpuA = gpuBackend.AllocateBuffer(floatA.GetDataArray());
@@ -1821,85 +1821,85 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorDivideScalar(tensor, scalar);
 
         var result = TryRunScalar(tensor.GetDataArray(), scalar, static (backend, input, output, value, size) => backend.Scale(input, output, 1.0f / value, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorDivideScalar(tensor, scalar);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorDivideScalar(tensor, scalar);
     }
 
     Tensor<T> IEngine.TensorAbs<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Abs(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorAbs(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorAbs(tensor);
     }
 
     Tensor<T> IEngine.TensorExp<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Exp(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorExp(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorExp(tensor);
     }
 
     Tensor<T> IEngine.TensorLog<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Log(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorLog(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorLog(tensor);
     }
 
     Tensor<T> IEngine.TensorSqrt<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sqrt(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorSqrt(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSqrt(tensor);
     }
 
     Tensor<T> IEngine.TensorNegate<T>(Tensor<T> tensor)
     {
         var result = TryRunScalar(tensor.GetDataArray(), FromFloatScalar<T>(-1.0f), static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorNegate(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorNegate(tensor);
     }
 
     Tensor<T> IEngine.TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         var result = TryRunScalar(tensor.GetDataArray(), exponent, static (backend, input, output, value, size) => backend.Power(input, output, value, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorPower(tensor, exponent);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorPower(tensor, exponent);
     }
 
     Tensor<T> IEngine.TensorMax<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMax(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Max(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorMax(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMax(a, b);
     }
 
     Tensor<T> IEngine.TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (!ShapesMatch(a._shape, b._shape))
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMin(a, b);
 
         var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Min(left, right, output, size));
-        return result != null ? new Tensor<T>(result, a._shape) : base.TensorMin(a, b);
+        return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMin(a, b);
     }
 
     Tensor<T> IEngine.Tanh<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.Tanh(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Tanh(tensor);
     }
 
     Tensor<T> IEngine.Sigmoid<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.Sigmoid(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Sigmoid(tensor);
     }
 
     Tensor<T> IEngine.ReLU<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.ReLU(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.ReLU(tensor);
     }
 
     Tensor<T> IEngine.GELU<T>(Tensor<T> tensor)
     {
         var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
-        return result != null ? new Tensor<T>(result, tensor._shape) : base.GELU(tensor);
+        return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.GELU(tensor);
     }
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
@@ -1940,8 +1940,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.FusedLinear(input, weights, bias, activation);
 
         int batchSize = input.Shape._dims[0];
-        int inputFeatures = weights._shape[0];
-        int outputFeatures = weights._shape[1];
+        int inputFeatures = weights.Shape._dims[0];
+        int outputFeatures = weights.Shape._dims[1];
 
         // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
         using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
@@ -2041,8 +2041,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException("Invalid tensor dimensions for FusedLinearGpu");
 
         int batchSize = input.Shape._dims[0];
-        int inputFeatures = weights._shape[0];
-        int outputFeatures = weights._shape[1];
+        int inputFeatures = weights.Shape._dims[0];
+        int outputFeatures = weights.Shape._dims[1];
 
         // Upload input to GPU (activations are not cached persistently)
         using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
@@ -2080,12 +2080,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedLinearGpu");
 
-        if (input._shape.Length < 1 || weights.Rank != 2)
+        if (input.Shape._dims.Length < 1 || weights.Rank != 2)
             throw new ArgumentException("Invalid tensor dimensions for FusedLinearGpu");
 
         int batchSize = input.Shape._dims[0];
-        int inputFeatures = weights._shape[0];
-        int outputFeatures = weights._shape[1];
+        int inputFeatures = weights.Shape._dims[0];
+        int outputFeatures = weights.Shape._dims[1];
 
         // Input is already on GPU - use its buffer directly
         // Auto-cache weights and biases so they stay on GPU for subsequent calls
@@ -2409,7 +2409,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // Return new GPU tensor
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -2441,8 +2441,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Dropout(input.Buffer, outputBuffer, maskBuffer, size, dropoutRate, seed, isTraining);
 
         // Return GPU tensors
-        var output = new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
-        var mask = new GpuTensor<T>(backend, maskBuffer, input._shape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        var output = new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        var mask = new GpuTensor<T>(backend, maskBuffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: true);
 
         return (output, mask);
     }
@@ -2469,7 +2469,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.DropoutBackward(gradOutput.Buffer, mask.Buffer, gradInputBuffer, size, dropoutRate);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, gradOutput._shape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return new GpuTensor<T>(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
     /// <summary>
@@ -2490,7 +2490,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool2DGpu");
 
-        if (input._shape.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
+        if (input.Shape._dims.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
             throw new ArgumentException("Input must be 4D [batch, channels, height, width] with 2D poolSize and stride");
 
         int batch = input.Shape._dims[0];
@@ -2540,7 +2540,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool2DBackwardGpu");
 
-        if (gradOutput._shape.Length != 4 || inputShape.Length != 4)
+        if (gradOutput.Shape._dims.Length != 4 || inputShape.Length != 4)
             throw new ArgumentException("GradOutput and inputShape must be 4D");
 
         int batch = inputShape[0];
@@ -2578,7 +2578,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool3DGpu");
 
-        if (input._shape.Length != 5 || poolSize.Length != 3 || stride.Length != 3)
+        if (input.Shape._dims.Length != 5 || poolSize.Length != 3 || stride.Length != 3)
             throw new ArgumentException("Input must be 5D [batch, channels, depth, height, width] with 3D poolSize and stride");
 
         int batch = input.Shape._dims[0];
@@ -2629,7 +2629,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxPool3DBackwardGpu");
 
-        if (gradOutput._shape.Length != 5 || inputShape.Length != 5)
+        if (gradOutput.Shape._dims.Length != 5 || inputShape.Length != 5)
             throw new ArgumentException("GradOutput and inputShape must be 5D");
 
         int batch = inputShape[0];
@@ -2667,7 +2667,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for NearestNeighborUpsample3DGpu");
 
-        if (input._shape.Length != 5)
+        if (input.Shape._dims.Length != 5)
             throw new ArgumentException("Input must be 5D [batch, channels, depth, height, width]");
 
         if (scaleDepth <= 0 || scaleHeight <= 0 || scaleWidth <= 0)
@@ -2715,7 +2715,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for NearestNeighborUpsample3DBackwardGpu");
 
-        if (gradOutput._shape.Length != 5 || inputShape.Length != 5)
+        if (gradOutput.Shape._dims.Length != 5 || inputShape.Length != 5)
             throw new ArgumentException("GradOutput and inputShape must be 5D");
 
         int batch = inputShape[0];
@@ -2751,7 +2751,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AvgPool2DGpu");
 
-        if (input._shape.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
+        if (input.Shape._dims.Length != 4 || poolSize.Length != 2 || stride.Length != 2)
             throw new ArgumentException("Input must be 4D [batch, channels, height, width] with 2D poolSize and stride");
 
         int batch = input.Shape._dims[0];
@@ -2797,7 +2797,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AvgPool2DBackwardGpu");
 
-        if (gradOutput._shape.Length != 4 || inputShape.Length != 4)
+        if (gradOutput.Shape._dims.Length != 4 || inputShape.Length != 4)
             throw new ArgumentException("GradOutput and inputShape must be 4D");
 
         int batch = inputShape[0];
@@ -2845,9 +2845,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         // Calculate output dimensions with dilation
         int effectiveKernelH = kernelH + (kernelH - 1) * (dilationH - 1);
@@ -2973,7 +2973,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Expected input shape: [batch, inChannels, height, width]
         // Expected kernel shape: [outChannels, inChannels, kernelH, kernelW]
-        if (input._shape.Length != 4 || kernel.Rank != 4)
+        if (input.Shape._dims.Length != 4 || kernel.Rank != 4)
             throw new ArgumentException("FusedConv2DGpu requires 4D input and kernel tensors");
 
         int batch = input.Shape._dims[0];
@@ -2981,9 +2981,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         // Calculate output dimensions with dilation
         int effectiveKernelH = kernelH + (kernelH - 1) * (dilationH - 1);
@@ -3063,10 +3063,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[3];
         int inWidth = input.Shape._dims[4];
 
-        int outChannels = kernel._shape[0];
-        int kernelD = kernel._shape[2];
-        int kernelH = kernel._shape[3];
-        int kernelW = kernel._shape[4];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelD = kernel.Shape._dims[2];
+        int kernelH = kernel.Shape._dims[3];
+        int kernelW = kernel.Shape._dims[4];
 
         // Calculate output dimensions with dilation
         int effectiveKernelD = kernelD + (kernelD - 1) * (dilationD - 1);
@@ -3192,7 +3192,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Expected input shape: [batch, inChannels, depth, height, width]
         // Expected kernel shape: [outChannels, inChannels, kernelD, kernelH, kernelW]
-        if (input._shape.Length != 5 || kernel.Rank != 5)
+        if (input.Shape._dims.Length != 5 || kernel.Rank != 5)
             throw new ArgumentException("FusedConv3DGpu requires 5D input and kernel tensors");
 
         int batch = input.Shape._dims[0];
@@ -3201,10 +3201,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[3];
         int inWidth = input.Shape._dims[4];
 
-        int outChannels = kernel._shape[0];
-        int kernelD = kernel._shape[2];
-        int kernelH = kernel._shape[3];
-        int kernelW = kernel._shape[4];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelD = kernel.Shape._dims[2];
+        int kernelH = kernel.Shape._dims[3];
+        int kernelW = kernel.Shape._dims[4];
 
         // Calculate output dimensions with dilation
         int effectiveKernelD = kernelD + (kernelD - 1) * (dilationD - 1);
@@ -3286,9 +3286,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[1];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[1];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         // Calculate output dimensions for transposed convolution
         int outHeight = (inHeight - 1) * strideH - 2 * padH + kernelH + outputPadH;
@@ -3406,7 +3406,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Expected input shape: [batch, inChannels, height, width]
         // Expected kernel shape: [inChannels, outChannels, kernelH, kernelW]
-        if (input._shape.Length != 4 || kernel.Rank != 4)
+        if (input.Shape._dims.Length != 4 || kernel.Rank != 4)
             throw new ArgumentException("FusedConvTranspose2DGpu requires 4D input and kernel tensors");
 
         int batch = input.Shape._dims[0];
@@ -3414,9 +3414,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[1];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[1];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         // Calculate output dimensions for transposed convolution
         int outHeight = (inHeight - 1) * strideH - 2 * padH + kernelH + outputPadH;
@@ -3820,8 +3820,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int kernelH = kernel.Rank == 4 ? kernel._shape[2] : kernel._shape[1];
-        int kernelW = kernel.Rank == 4 ? kernel._shape[3] : kernel._shape[2];
+        int kernelH = kernel.Rank == 4 ? kernel.Shape._dims[2] : kernel.Shape._dims[1];
+        int kernelW = kernel.Rank == 4 ? kernel.Shape._dims[3] : kernel.Shape._dims[2];
 
         int strideH = stride.Length >= 1 ? stride[0] : 1;
         int strideW = stride.Length >= 2 ? stride[1] : strideH;
@@ -3887,7 +3887,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Expected input shape: [batch, channels, height, width]
         // Expected kernel shape: [channels, 1, kernelH, kernelW] or [channels, kernelH, kernelW]
-        if (input._shape.Length != 4)
+        if (input.Shape._dims.Length != 4)
             throw new ArgumentException("DepthwiseConv2DGpu requires 4D input tensor");
 
         int batch = input.Shape._dims[0];
@@ -3895,8 +3895,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int kernelH = kernel.Rank == 4 ? kernel._shape[2] : kernel._shape[1];
-        int kernelW = kernel.Rank == 4 ? kernel._shape[3] : kernel._shape[2];
+        int kernelH = kernel.Rank == 4 ? kernel.Shape._dims[2] : kernel.Shape._dims[1];
+        int kernelW = kernel.Rank == 4 ? kernel.Shape._dims[3] : kernel.Shape._dims[2];
 
         int outHeight = (inHeight + 2 * padH - kernelH) / strideH + 1;
         int outWidth = (inWidth + 2 * padW - kernelW) / strideW + 1;
@@ -3971,11 +3971,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outHeight = weights._shape[0];
-        int outWidth = weights._shape[1];
-        int outChannels = weights._shape[2];
-        int kernelH = weights._shape[4];
-        int kernelW = weights._shape[5];
+        int outHeight = weights.Shape._dims[0];
+        int outWidth = weights.Shape._dims[1];
+        int outChannels = weights.Shape._dims[2];
+        int kernelH = weights.Shape._dims[4];
+        int kernelW = weights.Shape._dims[5];
 
         if (outHeight <= 0 || outWidth <= 0)
             return base.LocallyConnectedConv2D(input, weights, bias, stride);
@@ -4049,11 +4049,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = inputShape[2];
         int inWidth = inputShape[3];
 
-        int outHeight = weights._shape[0];
-        int outWidth = weights._shape[1];
-        int outChannels = weights._shape[2];
-        int kernelH = weights._shape[4];
-        int kernelW = weights._shape[5];
+        int outHeight = weights.Shape._dims[0];
+        int outWidth = weights.Shape._dims[1];
+        int outChannels = weights.Shape._dims[2];
+        int kernelH = weights.Shape._dims[4];
+        int kernelW = weights.Shape._dims[5];
 
         int inputSize = batch * inChannels * inHeight * inWidth;
 
@@ -4198,7 +4198,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Expected input shape: [batch, inChannels, height, width]
         // Expected weights shape: [outH, outW, outC, inC, kH, kW]
-        if (input._shape.Length != 4)
+        if (input.Shape._dims.Length != 4)
             throw new ArgumentException("LocallyConnectedConv2DGpu requires 4D input tensor");
         if (weights.Rank != 6)
             throw new ArgumentException("LocallyConnectedConv2DGpu requires 6D weights tensor [outH, outW, outC, inC, kH, kW]");
@@ -4208,11 +4208,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outHeight = weights._shape[0];
-        int outWidth = weights._shape[1];
-        int outChannels = weights._shape[2];
-        int kernelH = weights._shape[4];
-        int kernelW = weights._shape[5];
+        int outHeight = weights.Shape._dims[0];
+        int outWidth = weights.Shape._dims[1];
+        int outChannels = weights.Shape._dims[2];
+        int kernelH = weights.Shape._dims[4];
+        int kernelW = weights.Shape._dims[5];
 
         if (outHeight <= 0 || outWidth <= 0)
             throw new ArgumentException($"Invalid locally connected convolution parameters result in non-positive output dimensions: {outHeight}x{outWidth}");
@@ -4279,9 +4279,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = (inHeight + 2 * padding[0] - dilation[0] * (kernelH - 1) - 1) / stride[0] + 1;
         int outWidth = (inWidth + 2 * padding[1] - dilation[1] * (kernelW - 1) - 1) / stride[1] + 1;
@@ -4290,7 +4290,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.DeformableConv2D(input, kernel, offsets, mask, stride, padding, dilation);
 
         // Calculate deformGroups from offsets shape: [batch, deformGroups*2*kH*kW, outH, outW]
-        int offsetChannels = offsets._shape[1];
+        int offsetChannels = offsets.Shape._dims[1];
         int deformGroups = offsetChannels / (2 * kernelH * kernelW);
         int groups = 1; // Standard deformable conv uses groups=1
 
@@ -4356,14 +4356,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = inputShape[2];
         int inWidth = inputShape[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
 
-        int offsetChannels = offsets._shape[1];
+        int offsetChannels = offsets.Shape._dims[1];
         int deformGroups = offsetChannels / (2 * kernelH * kernelW);
         int groups = 1;
 
@@ -4435,7 +4435,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
 
-        int offsetChannels = offsets._shape[1];
+        int offsetChannels = offsets.Shape._dims[1];
         int deformGroups = offsetChannels / (2 * kernelH * kernelW);
         int groups = 1;
 
@@ -4500,14 +4500,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
 
-        int offsetChannels = offsets._shape[1];
+        int offsetChannels = offsets.Shape._dims[1];
         int deformGroups = offsetChannels / (2 * kernelH * kernelW);
         int groups = 1;
 
@@ -4535,7 +4535,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 backend.DownloadBuffer(gradOffsetBuffer.Buffer, resultFloat);
 
                 T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-                return new Tensor<T>(resultData, offsets._shape);
+                return new Tensor<T>(resultData, offsets.Shape._dims);
             }
             finally
             {
@@ -4577,14 +4577,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
 
-        int offsetChannels = offsets._shape[1];
+        int offsetChannels = offsets.Shape._dims[1];
         int deformGroups = offsetChannels / (2 * kernelH * kernelW);
         int maskChannels = deformGroups * kernelH * kernelW;
         int groups = 1;
@@ -4610,7 +4610,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.DownloadBuffer(gradMaskBuffer.Buffer, resultFloat);
 
             T[] resultData = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            return new Tensor<T>(resultData, mask._shape);
+            return new Tensor<T>(resultData, mask.Shape._dims);
         }
         catch
         {
@@ -4655,7 +4655,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Expected input shape: [batch, inChannels, height, width]
         // Expected weights shape: [outChannels, inChannels/groups, kH, kW]
         // Expected offsets shape: [batch, deformGroups*2*kH*kW, outH, outW]
-        if (input._shape.Length != 4)
+        if (input.Shape._dims.Length != 4)
             throw new ArgumentException("DeformableConv2DGpu requires 4D input tensor");
         if (weights.Rank != 4)
             throw new ArgumentException("DeformableConv2DGpu requires 4D weights tensor [outC, inC/groups, kH, kW]");
@@ -4665,9 +4665,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
 
-        int outChannels = weights._shape[0];
-        int kernelH = weights._shape[2];
-        int kernelW = weights._shape[3];
+        int outChannels = weights.Shape._dims[0];
+        int kernelH = weights.Shape._dims[2];
+        int kernelW = weights.Shape._dims[3];
 
         int outHeight = (inHeight + 2 * padH - dilationH * (kernelH - 1) - 1) / strideH + 1;
         int outWidth = (inWidth + 2 * padW - dilationW * (kernelW - 1) - 1) / strideW + 1;
@@ -4824,11 +4824,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
-        int batch = query._shape[0];
-        int heads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int heads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int seqK = key.Shape._dims[2];
 
         // Compute scale if not provided
         float scaleFloat = (float)(scale ?? (1.0 / Math.Sqrt(headDim)));
@@ -4899,11 +4899,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.FlashAttentionBackward(gradOutput, query, key, value, output, softmaxStats, scale, isCausal,
                 out gradQuery, out gradKey, out gradValue, attentionBias);
 
-        int batch = query._shape[0];
-        int heads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int heads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int seqK = key.Shape._dims[2];
 
         // Use cache-aware buffer allocation
         using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
@@ -4974,12 +4974,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
             return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
 
-        int batch = query._shape[0];
-        int numQHeads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int numKVHeads = key._shape[1];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int numQHeads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int numKVHeads = key.Shape._dims[1];
+        int seqK = key.Shape._dims[2];
 
         float scaleFloat = (float)(scale ?? (1.0 / Math.Sqrt(headDim)));
 
@@ -5039,12 +5039,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.GroupedQueryAttentionBackward(gradOutput, query, key, value, attentionWeights, numQueriesPerKV, scale,
                 out gradQuery, out gradKey, out gradValue);
 
-        int batch = query._shape[0];
-        int numQHeads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int numKVHeads = key._shape[1];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int numQHeads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int numKVHeads = key.Shape._dims[1];
+        int seqK = key.Shape._dims[2];
 
         // Use cache-aware buffer allocation
         using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
@@ -5108,14 +5108,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionGpu");
 
         // Validate 4D tensor shapes
-        if (query._shape.Length != 4 || key._shape.Length != 4 || value._shape.Length != 4)
+        if (query.Shape._dims.Length != 4 || key.Shape._dims.Length != 4 || value.Shape._dims.Length != 4)
             throw new ArgumentException("Query, Key, Value must be 4D tensors [batch, heads, seq, headDim]");
 
-        int batch = query._shape[0];
-        int heads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int heads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int seqK = key.Shape._dims[2];
 
         // Allocate output and attention weights buffers
         var outputBuffer = backend.AllocateBuffer(batch * heads * seqQ * headDim);
@@ -5159,14 +5159,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionGpu");
 
         // Validate 4D tensor shapes
-        if (query._shape.Length != 4 || key._shape.Length != 4 || value._shape.Length != 4)
+        if (query.Shape._dims.Length != 4 || key.Shape._dims.Length != 4 || value.Shape._dims.Length != 4)
             throw new ArgumentException("Query, Key, Value must be 4D tensors [batch, heads, seq, headDim]");
 
-        int batch = query._shape[0];
-        int heads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int seqK = key._shape[2];
+        int batch = query.Shape._dims[0];
+        int heads = query.Shape._dims[1];
+        int seqQ = query.Shape._dims[2];
+        int headDim = query.Shape._dims[3];
+        int seqK = key.Shape._dims[2];
 
         // Allocate output and attention weights buffers
         var outputBuffer = backend.AllocateBuffer(batch * heads * seqQ * headDim);
@@ -5212,7 +5212,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for ScaledDotProductAttentionBackwardGpu");
 
         // Extract dimensions from query tensor (all tensors share same shape except attn weights)
-        int[] qShape = query._shape;
+        int[] qShape = query.Shape._dims;
         if (qShape.Length != 4)
             throw new ArgumentException("Query tensor must be 4D [batch, heads, seqLen, headDim]");
 
@@ -5272,20 +5272,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for PermuteGpu");
 
-        if (permutation.Length != input._shape.Length)
+        if (permutation.Length != input.Shape._dims.Length)
             throw new ArgumentException("Permutation length must match input rank");
 
         // Compute output shape
-        int[] outputShape = new int[input._shape.Length];
+        int[] outputShape = new int[input.Shape._dims.Length];
         for (int i = 0; i < permutation.Length; i++)
             outputShape[i] = input.Shape._dims[permutation[i]];
 
         int totalElements = 1;
-        foreach (int dim in input._shape)
+        foreach (int dim in input.Shape._dims)
             totalElements *= dim;
 
         var outputBuffer = backend.AllocateBuffer(totalElements);
-        backend.Permute(input.Buffer, outputBuffer, input._shape, permutation);
+        backend.Permute(input.Buffer, outputBuffer, input.Shape._dims, permutation);
 
         return new GpuTensor<T>(backend, outputBuffer, outputShape,
             GpuTensorRole.Activation, ownsBuffer: true);
@@ -5307,12 +5307,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weights.Rank != 2)
             throw new ArgumentException("Weights must be 2D tensor [inputDim, outputDim]");
 
-        int inputDim = weights._shape[0];
-        int outputDim = weights._shape[1];
+        int inputDim = weights.Shape._dims[0];
+        int outputDim = weights.Shape._dims[1];
 
         // Flatten input to 2D for MatMul: [batch*seq, inputDim]
         int flatBatch = 1;
-        for (int i = 0; i < input._shape.Length - 1; i++)
+        for (int i = 0; i < input.Shape._dims.Length - 1; i++)
             flatBatch *= input.Shape._dims[i];
         int lastDim = input.Shape._dims[^1];
 
@@ -5326,8 +5326,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var resultBuffer = backend.MatMul(input.Buffer, weightsBuffer.Buffer, flatBatch, outputDim, inputDim);
 
         // Compute output shape (same leading dimensions, last dim = outputDim)
-        int[] outputShape = new int[input._shape.Length];
-        for (int i = 0; i < input._shape.Length - 1; i++)
+        int[] outputShape = new int[input.Shape._dims.Length];
+        for (int i = 0; i < input.Shape._dims.Length - 1; i++)
             outputShape[i] = input.Shape._dims[i];
         outputShape[^1] = outputDim;
 
@@ -5393,7 +5393,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException($"Bias length {bias.Length} doesn't match input last dimension {lastDim}");
 
         int totalElements = 1;
-        foreach (int dim in input._shape)
+        foreach (int dim in input.Shape._dims)
             totalElements *= dim;
 
         // Upload bias
@@ -5424,7 +5424,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleGpu");
 
-        if (input._shape.Length < 2)
+        if (input.Shape._dims.Length < 2)
             throw new ArgumentException("Input must have at least 2 dimensions for upsampling");
 
         // Parameter validation guard
@@ -5432,8 +5432,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(scaleFactor), "Scale factor must be positive");
 
         // Compute output shape (scale last two dimensions)
-        int[] outputShape = new int[input._shape.Length];
-        for (int i = 0; i < input._shape.Length - 2; i++)
+        int[] outputShape = new int[input.Shape._dims.Length];
+        for (int i = 0; i < input.Shape._dims.Length - 2; i++)
             outputShape[i] = input.Shape._dims[i];
 
         int inHeight = input.Shape._dims[^2];
@@ -5445,7 +5445,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Compute total elements
         int batchChannels = 1;
-        for (int i = 0; i < input._shape.Length - 2; i++)
+        for (int i = 0; i < input.Shape._dims.Length - 2; i++)
             batchChannels *= input.Shape._dims[i];
 
         int inputSize = batchChannels * inHeight * inWidth;
@@ -5477,7 +5477,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleBackwardGpu");
 
-        if (gradOutput._shape.Length < 2)
+        if (gradOutput.Shape._dims.Length < 2)
             throw new ArgumentException("Gradient output must have at least 2 dimensions for upsampling backward");
 
         // Parameter validation guards
@@ -5505,8 +5505,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"Gradient output width ({actualOutputWidth}) does not match expected width ({expectedOutputWidth}) based on inputWidth ({inputWidth}) and scaleFactor ({scaleFactor})");
 
         // Compute input shape (original shape before upsampling)
-        int[] inputShape = new int[gradOutput._shape.Length];
-        for (int i = 0; i < gradOutput._shape.Length - 2; i++)
+        int[] inputShape = new int[gradOutput.Shape._dims.Length];
+        for (int i = 0; i < gradOutput.Shape._dims.Length - 2; i++)
             inputShape[i] = gradOutput.Shape._dims[i];
 
         inputShape[^2] = inputHeight;
@@ -5514,7 +5514,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Compute total elements
         int batchChannels = 1;
-        for (int i = 0; i < gradOutput._shape.Length - 2; i++)
+        for (int i = 0; i < gradOutput.Shape._dims.Length - 2; i++)
             batchChannels *= gradOutput.Shape._dims[i];
 
         int inputSize = batchChannels * inputHeight * inputWidth;
@@ -5664,7 +5664,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
 
-        int n = inputReal._shape[^1];
+        int n = inputReal.Shape._dims[^1];
         if ((n & (n - 1)) != 0) // Not power of 2
         {
             base.FFT(inputReal, inputImag, out outputReal, out outputImag);
@@ -5706,7 +5706,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
 
-        int n = inputReal._shape[^1];
+        int n = inputReal.Shape._dims[^1];
         if ((n & (n - 1)) != 0)
         {
             base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
@@ -5748,8 +5748,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
 
-        int height = inputReal._shape[^2];
-        int width = inputReal._shape[^1];
+        int height = inputReal.Shape._dims[^2];
+        int width = inputReal.Shape._dims[^1];
 
         if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
@@ -5792,8 +5792,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
 
-        int height = inputReal._shape[^2];
-        int width = inputReal._shape[^1];
+        int height = inputReal.Shape._dims[^2];
+        int width = inputReal.Shape._dims[^1];
 
         if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
@@ -5946,8 +5946,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            int numFrames = magnitude._shape[^2];
-            int numFreqs = magnitude._shape[^1];
+            int numFrames = magnitude.Shape._dims[^2];
+            int numFreqs = magnitude.Shape._dims[^1];
 
             float[] magnitudeFloat = DirectGpuEngine.ToFloatArray(magnitude.GetDataArray());
             float[] phaseFloat = DirectGpuEngine.ToFloatArray(phase.GetDataArray());
@@ -6068,8 +6068,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // First compute STFT
             ((IEngine)this).STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var _);
 
-            int numFrames = magnitude._shape[^2];
-            int numFreqs = magnitude._shape[^1];
+            int numFrames = magnitude.Shape._dims[^2];
+            int numFreqs = magnitude.Shape._dims[^1];
 
             // Create Mel filterbank
             var filterbank = ((IEngine)this).CreateMelFilterbank<T>(nMels, nFft, sampleRate, fMin, fMax);
@@ -6145,8 +6145,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            int numFrames = magnitude._shape[^2];
-            int numFreqs = magnitude._shape[^1];
+            int numFrames = magnitude.Shape._dims[^2];
+            int numFreqs = magnitude.Shape._dims[^1];
 
             float[] magnitudeFloat = DirectGpuEngine.ToFloatArray(magnitude.GetDataArray());
 
@@ -6275,7 +6275,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var permutedInput = PermuteImpl(input, permutation);
 
                 // Now apply softmax over the last axis
-                int features = permutedInput._shape[rank - 1];
+                int features = permutedInput.Shape._dims[rank - 1];
                 int outerSize = permutedInput.Length / features;
 
                 using var inputBuffer = GetOrAllocateBuffer(backend, permutedInput.GetDataArray());
@@ -6322,7 +6322,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // For softmax backward over the last dimension
             if (axis == rank - 1)
             {
-                int features = output._shape[rank - 1];
+                int features = output.Shape._dims[rank - 1];
                 int outerSize = output.Length / features;
 
                 using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
@@ -6351,7 +6351,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var permutedGradOutput = PermuteImpl(gradOutput, permutation);
                 var permutedOutput = PermuteImpl(output, permutation);
 
-                int features = permutedOutput._shape[rank - 1];
+                int features = permutedOutput.Shape._dims[rank - 1];
                 int outerSize = permutedOutput.Length / features;
 
                 using var gradOutBuffer = GetOrAllocateBuffer(backend, permutedGradOutput.GetDataArray());
@@ -6398,7 +6398,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // For squash over the last dimension
             if (axis == rank - 1)
             {
-                int capsuleDim = tensor._shape[rank - 1];
+                int capsuleDim = tensor.Shape._dims[rank - 1];
                 int numCapsules = tensor.Length / capsuleDim;
 
                 using var inputBuffer = GetOrAllocateBuffer(backend, tensor.GetDataArray());
@@ -6424,7 +6424,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 var permutedInput = PermuteImpl(tensor, permutation);
 
-                int capsuleDim = permutedInput._shape[rank - 1];
+                int capsuleDim = permutedInput.Shape._dims[rank - 1];
                 int numCapsules = permutedInput.Length / capsuleDim;
 
                 using var inputBuffer = GetOrAllocateBuffer(backend, permutedInput.GetDataArray());
@@ -6497,7 +6497,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var permutedGradOutput = PermuteImpl(gradOutput, permutation);
                 var permutedInput = PermuteImpl(input, permutation);
 
-                int capsuleDim = permutedInput._shape[rank - 1];
+                int capsuleDim = permutedInput.Shape._dims[rank - 1];
                 int numCapsules = permutedInput.Length / capsuleDim;
 
                 using var gradOutputBuffer = GetOrAllocateBuffer(backend, permutedGradOutput.GetDataArray());
@@ -6542,9 +6542,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int innerSize = input.ElementCount / batchSize;
         int outputTotalSize = repeats * batchSize * innerSize;
 
-        int[] outputShape = new int[input._shape.Length];
+        int[] outputShape = new int[input.Shape._dims.Length];
         outputShape[0] = repeats * batchSize;
-        for (int i = 1; i < input._shape.Length; i++)
+        for (int i = 1; i < input.Shape._dims.Length; i++)
             outputShape[i] = input.Shape._dims[i];
 
         var outputBuffer = backend.AllocateBuffer(outputTotalSize);
@@ -6565,7 +6565,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (repeats <= 0)
             throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be positive");
 
-        int rank = input._shape.Length;
+        int rank = input.Shape._dims.Length;
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis), "Axis out of range");
@@ -6597,7 +6597,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMeanPoolGpu");
 
-        int rank = input._shape.Length;
+        int rank = input.Shape._dims.Length;
 
         // Get reduction axes (all except first and last)
         int[] axes = rank switch
@@ -6613,7 +6613,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axes.Length == 0)
         {
             // No reduction needed - return input with new shape
-            return new GpuTensor<T>(backend, input.Buffer, input._shape, GpuTensorRole.Intermediate, ownsBuffer: false);
+            return new GpuTensor<T>(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
         }
 
         // Calculate output shape and sizes
@@ -6687,7 +6687,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMaxPoolGpu");
 
-        int rank = input._shape.Length;
+        int rank = input.Shape._dims.Length;
 
         // Get reduction axes (all except first and last)
         int[] axes = rank switch
@@ -6703,7 +6703,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axes.Length == 0)
         {
             gpuIndices = null;
-            return new GpuTensor<T>(backend, input.Buffer, input._shape, GpuTensorRole.Intermediate, ownsBuffer: false);
+            return new GpuTensor<T>(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
         }
 
         // Calculate output shape and sizes
@@ -6871,7 +6871,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ArgMaxGpu");
 
-        int rank = input._shape.Length;
+        int rank = input.Shape._dims.Length;
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor with {rank} dimensions");
@@ -7188,7 +7188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedBatchNormGpu");
 
-        int[] shape = input._shape;
+        int[] shape = input.Shape._dims;
         int batch = shape[0];
         int channels = shape.Length > 1 ? shape[1] : shape[0];
         int spatialSize = 1;
@@ -7263,7 +7263,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LayerNormGpu");
 
-        int[] shape = input._shape;
+        int[] shape = input.Shape._dims;
         int batchSize = shape[0];
         int normalizedSize = shape.Length > 1 ? shape[1] : shape[0];
 
@@ -7322,7 +7322,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LayerNormBackwardGpu");
 
-        int[] shape = gradOutput._shape;
+        int[] shape = gradOutput.Shape._dims;
         int batchSize = shape[0];
         int normalizedSize = shape.Length > 1 ? shape[1] : shape[0];
 
@@ -7420,7 +7420,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Add(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7440,7 +7440,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Multiply(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7460,7 +7460,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Scale(input.Buffer, outputBuffer, scalar, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7476,13 +7476,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Assuming 2D input [batch, features]
         int batchSize = input.Shape._dims[0];
-        int features = input._shape.Length > 1 ? input.Shape._dims[1] : input.Shape._dims[0];
+        int features = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : input.Shape._dims[0];
 
         var outputBuffer = backend.AllocateBuffer(input.ElementCount);
 
         backend.Softmax(input.Buffer, outputBuffer, batchSize, features);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7501,7 +7501,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Assuming 2D input [batch, features]
         int outerSize = input.Shape._dims[0];
-        int reduceSize = input._shape.Length > 1 ? input.Shape._dims[1] : input.Shape._dims[0];
+        int reduceSize = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : input.Shape._dims[0];
 
         // Allocate output buffers
         var valuesBuffer = backend.AllocateBuffer(outerSize * k);
@@ -7510,7 +7510,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.TopK(input.Buffer, valuesBuffer, indicesBuffer, outerSize, reduceSize, k, sorted);
 
         // Create output shape [batch, k]
-        int[] outputShape = input._shape.Length > 1 ? [outerSize, k] : [k];
+        int[] outputShape = input.Shape._dims.Length > 1 ? [outerSize, k] : [k];
 
         indices = new GpuTensor<int>(backend, indicesBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
         return new GpuTensor<T>(backend, valuesBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
@@ -7536,7 +7536,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.BroadcastMultiplyFirstAxis(input.Buffer, weights.Buffer, outputBuffer, outerSize, innerSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7553,7 +7553,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for SliceColumnGpu");
 
         int batchSize = input.Shape._dims[0];
-        int features = input._shape.Length > 1 ? input.Shape._dims[1] : 1;
+        int features = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : 1;
 
         if (columnIndex < 0 || columnIndex >= features)
             throw new ArgumentOutOfRangeException(nameof(columnIndex));
@@ -7592,7 +7592,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SliceGpu");
 
-        int rank = input._shape.Length;
+        int rank = input.Shape._dims.Length;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
@@ -7603,7 +7603,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Calculate output shape
         int[] outputShape = new int[rank];
-        Array.Copy(input._shape, outputShape, rank);
+        Array.Copy(input.Shape._dims, outputShape, rank);
         outputShape[axis] = sliceSize;
 
         int totalOutputSize = outputShape.Aggregate(1, (a, b) => a * b);
@@ -7661,8 +7661,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for PowerIterationGpu");
 
-        int rows = weights._shape[0];
-        int cols = weights._shape[1];
+        int rows = weights.Shape._dims[0];
+        int cols = weights.Shape._dims[1];
 
         // Allocate transpose buffer
         var wTransposeBuffer = backend.AllocateBuffer(rows * cols);
@@ -7743,7 +7743,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         float invScalar = 1.0f / scalar;
         backend.Scale(input.Buffer, outputBuffer, invScalar, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7792,8 +7792,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inWidth = input.Shape._dims[3];
 
         // Grid: [batch, outHeight, outWidth, 2]
-        int outHeight = grid._shape[1];
-        int outWidth = grid._shape[2];
+        int outHeight = grid.Shape._dims[1];
+        int outWidth = grid.Shape._dims[2];
 
         // Output shape: [batch, channels, outHeight, outWidth]
         int outputSize = batch * channels * outHeight * outWidth;
@@ -7837,8 +7837,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inWidth = input.Shape._dims[3];
 
         // Grid: [batch, outHeight, outWidth, 2]
-        int outHeight = grid._shape[1];
-        int outWidth = grid._shape[2];
+        int outHeight = grid.Shape._dims[1];
+        int outWidth = grid.Shape._dims[2];
 
         // Allocate gradient buffers
         var gradInputBuffer = backend.AllocateBuffer(input.ElementCount);
@@ -7852,8 +7852,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batch, channels, inHeight, inWidth, outHeight, outWidth,
             paddingMode, alignCorners);
 
-        gradInput = new GpuTensor<T>(backend, gradInputBuffer, input._shape, GpuTensorRole.Gradient, ownsBuffer: true);
-        gradGrid = new GpuTensor<T>(backend, gradGridBuffer, grid._shape, GpuTensorRole.Gradient, ownsBuffer: true);
+        gradInput = new GpuTensor<T>(backend, gradInputBuffer, input.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
+        gradGrid = new GpuTensor<T>(backend, gradGridBuffer, grid.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7872,7 +7872,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Relu(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7891,7 +7891,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Tanh(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7910,11 +7910,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axis < 0 || axis > 1)
             throw new ArgumentOutOfRangeException(nameof(axis), axis, "SumAxisGpu only supports axis 0 (sum over rows) or axis 1 (sum over columns) for 2D tensors.");
 
-        if (input._shape.Length < 1)
+        if (input.Shape._dims.Length < 1)
             throw new ArgumentException("Input tensor must have at least one dimension.", nameof(input));
 
         int outerSize = input.Shape._dims[0];
-        int innerSize = input._shape.Length > 1 ? input.Shape._dims[1] : 1;
+        int innerSize = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : 1;
 
         int outputSize;
         int[] outputShape;
@@ -8037,7 +8037,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DivideByBroadcastGpu");
 
-        int outerSize = a._shape[0];
+        int outerSize = a.Shape._dims[0];
         int innerSize = a.ElementCount / outerSize;
         int bSize = b.ElementCount;
 
@@ -8052,7 +8052,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Clean up intermediate buffer
         reciprocalBuffer.Dispose();
 
-        return new GpuTensor<T>(backend, outputBuffer, a._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     #endregion
@@ -8131,9 +8131,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <returns>Result tensor with bias added and dropout applied.</returns>
     public Tensor<T> FusedBiasDropout<T>(Tensor<T> input, Tensor<T> bias, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (input._shape.Length == 0)
+        if (input.Shape._dims.Length == 0)
             throw new ArgumentException("Input tensor must have at least one dimension.", nameof(input));
-        if (bias._shape.Length != 1)
+        if (bias.Shape._dims.Length != 1)
             throw new ArgumentException("Bias tensor must be 1-dimensional.", nameof(bias));
         if (bias.Length != input.Shape._dims[^1])
             throw new ArgumentException($"Bias length {bias.Length} must match input's last dimension {input.Shape._dims[^1]}.", nameof(bias));
@@ -8247,7 +8247,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             int numIndices = indices.Length;
-            int embeddingDim = embeddingTable._shape[^1];
+            int embeddingDim = embeddingTable.Shape._dims[^1];
 
             using var indicesBuffer = backend.AllocateIntBuffer(indices.GetDataArray());
             using var tableBuffer = GetOrCacheWeightBuffer(backend, embeddingTable.GetDataArray(), PersistentTensorRole.Embeddings);
@@ -8258,9 +8258,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             float[] outputFloat = backend.DownloadBuffer(outputBuffer.Buffer);
 
             // Output shape: indices.Shape + [embeddingDim]
-            int[] outputShape = new int[indices._shape.Length + 1];
-            for (int i = 0; i < indices._shape.Length; i++)
-                outputShape[i] = indices._shape[i];
+            int[] outputShape = new int[indices.Shape._dims.Length + 1];
+            for (int i = 0; i < indices.Shape._dims.Length; i++)
+                outputShape[i] = indices.Shape._dims[i];
             outputShape[^1] = embeddingDim;
 
             return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(outputFloat), outputShape);
@@ -8327,7 +8327,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for EmbeddingLookupGpu");
 
         int numIndices = indices.Length;
-        int embeddingDim = embeddingTable._shape[^1];
+        int embeddingDim = embeddingTable.Shape._dims[^1];
 
         // Upload indices and embedding table to GPU
         using var indicesBuffer = backend.AllocateIntBuffer(indices.GetDataArray());
@@ -8340,9 +8340,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Embedding(indicesBuffer, tableBuffer.Buffer, outputBuffer, numIndices, embeddingDim);
 
         // Calculate output shape: indices.Shape + [embeddingDim]
-        int[] outputShape = new int[indices._shape.Length + 1];
-        for (int i = 0; i < indices._shape.Length; i++)
-            outputShape[i] = indices._shape[i];
+        int[] outputShape = new int[indices.Shape._dims.Length + 1];
+        for (int i = 0; i < indices.Shape._dims.Length; i++)
+            outputShape[i] = indices.Shape._dims[i];
         outputShape[^1] = embeddingDim;
 
         return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
@@ -8375,9 +8375,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Embedding(indicesBuffer, embeddingTableGpu.Buffer, outputBuffer, numIndices, embeddingDim);
 
         // Calculate output shape: indices.Shape + [embeddingDim]
-        int[] outputShape = new int[indices._shape.Length + 1];
-        for (int i = 0; i < indices._shape.Length; i++)
-            outputShape[i] = indices._shape[i];
+        int[] outputShape = new int[indices.Shape._dims.Length + 1];
+        for (int i = 0; i < indices.Shape._dims.Length; i++)
+            outputShape[i] = indices.Shape._dims[i];
         outputShape[^1] = embeddingDim;
 
         return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
@@ -8435,8 +8435,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (predictions.Rank != 2)
                 return base.CrossEntropyBackward(predictions, targets);
 
-            int batchSize = predictions._shape[0];
-            int numClasses = predictions._shape[1];
+            int batchSize = predictions.Shape._dims[0];
+            int numClasses = predictions.Shape._dims[1];
 
             using var predBuffer = GetOrAllocateBuffer(backend, predictions.GetDataArray());
             using var targetBuffer = GetOrAllocateBuffer(backend, targets.GetDataArray());
@@ -8815,8 +8815,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int inHeight = inputShape[2];
             int inWidth = inputShape[3];
 
-            int kernelH = kernel._shape[2];
-            int kernelW = kernel._shape[3];
+            int kernelH = kernel.Shape._dims[2];
+            int kernelW = kernel.Shape._dims[3];
 
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput.GetDataArray());
             using var kernelBuffer = GetOrCacheWeightBuffer(backend, kernel.GetDataArray(), PersistentTensorRole.Weights);
@@ -9098,7 +9098,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T> ReduceAxisGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
         IDirectGpuBackend backend, ReduceOperation op)
     {
-        var inputShape = input._shape;
+        var inputShape = input.Shape._dims;
         int inputRank = inputShape.Length;
 
         // Compute output shape
@@ -9185,7 +9185,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static Tensor<T> PermuteImpl<T>(Tensor<T> input, int[] permutation)
     {
-        var inputShape = input._shape;
+        var inputShape = input.Shape._dims;
         int rank = inputShape.Length;
 
         // Compute output shape
@@ -9248,7 +9248,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorBroadcastMultiply(a, b);
 
         // Fast path: same shape - use element-wise multiply
-        if (a._shape.SequenceEqual(b._shape))
+        if (a.Shape._dims.SequenceEqual(b.Shape._dims))
         {
             try
             {
@@ -9260,7 +9260,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 float[] resultFloat = new float[a.Length];
                 backend.DownloadBuffer(bufferC.Buffer, resultFloat);
-                return new Tensor<T>(a._shape, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
+                return new Tensor<T>(a.Shape._dims, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
             }
             catch
             {
@@ -9272,9 +9272,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             // Pattern 1: (outer, inner) * (inner,) -> broadcast along last axis
-            if (b.Rank == 1 && a._shape[a.Rank - 1] == b._shape[0])
+            if (b.Rank == 1 && a.Shape._dims[a.Rank - 1] == b.Shape._dims[0])
             {
-                int innerSize = b._shape[0];
+                int innerSize = b.Shape._dims[0];
                 int outerSize = a.Length / innerSize;
 
                 using var bufferA = GetOrAllocateBuffer(backend, a.GetDataArray());
@@ -9285,14 +9285,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 float[] resultFloat = new float[a.Length];
                 backend.DownloadBuffer(bufferC.Buffer, resultFloat);
-                return new Tensor<T>(a._shape, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
+                return new Tensor<T>(a.Shape._dims, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
             }
 
             // Pattern 2: (outer, inner) * (outer, 1) -> broadcast along first axis (column broadcast)
-            if (a.Rank == 2 && b.Rank == 2 && b._shape[0] == a._shape[0] && b._shape[1] == 1)
+            if (a.Rank == 2 && b.Rank == 2 && b.Shape._dims[0] == a.Shape._dims[0] && b.Shape._dims[1] == 1)
             {
-                int outerSize = a._shape[0];
-                int innerSize = a._shape[1];
+                int outerSize = a.Shape._dims[0];
+                int innerSize = a.Shape._dims[1];
 
                 // Extract first column from b as 1D array
                 T[] bFlatData = new T[outerSize];
@@ -9307,7 +9307,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 float[] resultFloat = new float[a.Length];
                 backend.DownloadBuffer(bufferC.Buffer, resultFloat);
-                return new Tensor<T>(a._shape, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
+                return new Tensor<T>(a.Shape._dims, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
             }
 
             // Pattern 3: (batch, seq, features) * (1, 1, features) -> common in attention/normalization
@@ -9317,15 +9317,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bool isLastAxisBroadcast = true;
                 for (int i = 0; i < a.Rank - 1; i++)
                 {
-                    if (b._shape[i] != 1)
+                    if (b.Shape._dims[i] != 1)
                     {
                         isLastAxisBroadcast = false;
                         break;
                     }
                 }
-                if (isLastAxisBroadcast && a._shape[a.Rank - 1] == b._shape[b.Rank - 1])
+                if (isLastAxisBroadcast && a.Shape._dims[a.Rank - 1] == b.Shape._dims[b.Rank - 1])
                 {
-                    int innerSize = a._shape[a.Rank - 1];
+                    int innerSize = a.Shape._dims[a.Rank - 1];
                     int outerSize = a.Length / innerSize;
 
                     // Extract last dimension from b as 1D array
@@ -9341,7 +9341,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                     float[] resultFloat = new float[a.Length];
                     backend.DownloadBuffer(bufferC.Buffer, resultFloat);
-                    return new Tensor<T>(a._shape, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
+                    return new Tensor<T>(a.Shape._dims, new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat)));
                 }
             }
 
@@ -9375,15 +9375,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (denseB is null) throw new ArgumentNullException(nameof(denseB));
 
         // Validate dimensions: A[M,K] @ B[K,N] -> C[M,N]
-        if (denseB._shape.Length != 2)
+        if (denseB.Shape._dims.Length != 2)
             throw new ArgumentException("Dense tensor B must be 2D [K, N]");
 
         int M = sparseA.Rows;
         int K = sparseA.Cols;
-        int N = denseB._shape[1];
+        int N = denseB.Shape._dims[1];
 
-        if (denseB._shape[0] != K)
-            throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB._shape[0]} rows");
+        if (denseB.Shape._dims[0] != K)
+            throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB.Shape._dims[0]} rows");
 
         // Allocate output buffer
         var outputBuffer = backend.AllocateBuffer(M * N);
@@ -9420,15 +9420,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (bias is null) throw new ArgumentNullException(nameof(bias));
 
         // Validate dimensions
-        if (denseB._shape.Length != 2)
+        if (denseB.Shape._dims.Length != 2)
             throw new ArgumentException("Dense tensor B must be 2D [K, N]");
 
         int M = sparseA.Rows;
         int K = sparseA.Cols;
-        int N = denseB._shape[1];
+        int N = denseB.Shape._dims[1];
 
-        if (denseB._shape[0] != K)
-            throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB._shape[0]} rows");
+        if (denseB.Shape._dims[0] != K)
+            throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB.Shape._dims[0]} rows");
 
         if (bias.Length != N)
             throw new ArgumentException($"Bias length {bias.Length} must match output columns {N}");
@@ -9476,14 +9476,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (sourceIndices is null) throw new ArgumentNullException(nameof(sourceIndices));
         if (targetIndices is null) throw new ArgumentNullException(nameof(targetIndices));
 
-        if (nodeFeatures._shape.Length != 2)
+        if (nodeFeatures.Shape._dims.Length != 2)
             throw new ArgumentException("Node features must be 2D [numNodes, features]");
 
         if (sourceIndices.Length != targetIndices.Length)
             throw new ArgumentException("Source and target indices must have the same length");
 
-        int numNodes = nodeFeatures._shape[0];
-        int features = nodeFeatures._shape[1];
+        int numNodes = nodeFeatures.Shape._dims[0];
+        int features = nodeFeatures.Shape._dims[1];
         int numEdges = sourceIndices.Length;
 
         // Upload indices as float buffers (GPU kernels use float for everything)
@@ -9570,7 +9570,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Exp(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> SubtractGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
@@ -9582,7 +9582,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Subtract(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> BroadcastMultiplyRowGpu<T>(IGpuTensor<T> input, IGpuTensor<T> weights)
@@ -9596,7 +9596,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(input.ElementCount);
         backend.BroadcastMultiplyLastAxis(input.Buffer, weights.Buffer, outputBuffer, outerSize, innerSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> SinGpu<T>(IGpuTensor<T> input)
@@ -9608,7 +9608,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Sin(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> CosGpu<T>(IGpuTensor<T> input)
@@ -9620,7 +9620,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Cos(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> GreaterThanScalarGpu<T>(IGpuTensor<T> input, float scalar)
@@ -9636,7 +9636,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.GreaterThan(input.Buffer, scalarBuffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     public IGpuTensor<T> ConcatGpu<T>(IGpuTensor<T>[] inputs, int axis)
@@ -9647,7 +9647,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (inputs.Length == 0) throw new ArgumentException("No inputs to concatenate");
 
         var input0 = inputs[0];
-        int rank = input0._shape.Length;
+        int rank = input0.Shape._dims.Length;
         int actualAxis = axis < 0 ? rank + axis : axis;
 
         int[] outputShape = input0.Shape.ToArray();
@@ -9685,7 +9685,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // 2. Flatten to 2D [Outer, AxisDim] for strided copy
         long outerSize = 1;
         for (int i = 0; i < rank - 1; i++)
-            outerSize *= (needsPermute ? inputs[0]._shape[permutation![i]] : inputs[0]._shape[i]);
+            outerSize *= (needsPermute ? inputs[0].Shape._dims[permutation![i]] : inputs[0].Shape._dims[i]);
 
         int totalAxisDim = outputShape[actualAxis];
         int totalSize = (int)(outerSize * totalAxisDim);
@@ -9737,7 +9737,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // For CRF, axis is usually 1 (after reshape).
         // Let's implement generic axis handling via Permute if needed.
 
-        var inputShape = input._shape;
+        var inputShape = input.Shape._dims;
         int inputRank = inputShape.Length;
         int outerSize = 1;
         int reduceSize = inputShape[axis];
@@ -9788,7 +9788,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxAxisGpu");
 
-        var inputShape = input._shape;
+        var inputShape = input.Shape._dims;
         int inputRank = inputShape.Length;
         int outerSize = 1;
         int reduceSize = inputShape[axis];
@@ -9849,7 +9849,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Add(a.Buffer, b.Buffer, outputBuffer, size);
-        return new GpuTensor<T>(backend, outputBuffer, a._shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
     }
 
 
@@ -9953,13 +9953,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for RbfKernelGpu");
 
         int batch = input.Shape._dims[0];
-        int inputDim = input._shape.Length > 1 ? input.Shape._dims[1] : 1;
-        int numCenters = centers._shape[0];
+        int inputDim = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : 1;
+        int numCenters = centers.Shape._dims[0];
 
         // Compute epsilons on CPU (small calculation)
         // epsilon = 1 / (2 * width^2)
         var ops = MathHelper.GetNumericOperations<T>();
-        var epsilons = new Tensor<T>(widths._shape);
+        var epsilons = new Tensor<T>(widths.Shape._dims);
         var two = ops.FromDouble(2.0);
         for (int i = 0; i < numCenters; i++)
         {
@@ -10006,8 +10006,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for StdpUpdateGpu");
 
-        int numPre = weights._shape[0];
-        int numPost = weights._shape[1]; // Correct shape for fully connected?
+        int numPre = weights.Shape._dims[0];
+        int numPost = weights.Shape._dims[1]; // Correct shape for fully connected?
                                         // SynapticPlasticityLayer weights are [size, size] so Pre x Post.
 
         // Weights are modified in-place on GPU, then need to be invalidating CPU cache or vice-versa.
@@ -10067,7 +10067,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TransposeGpu");
 
-        if (input._shape.Length != 2)
+        if (input.Shape._dims.Length != 2)
             throw new ArgumentException("TransposeGpu requires 2D tensor [rows, cols]");
 
         int rows = input.Shape._dims[0];
@@ -10093,15 +10093,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MatMulGpuTensors");
 
-        if (A._shape.Length != 2 || B._shape.Length != 2)
+        if (A.Shape._dims.Length != 2 || B.Shape._dims.Length != 2)
             throw new ArgumentException("MatMulGpuTensors requires 2D tensors");
 
-        int M = A._shape[0];
-        int K = A._shape[1];
-        int N = B._shape[1];
+        int M = A.Shape._dims[0];
+        int K = A.Shape._dims[1];
+        int N = B.Shape._dims[1];
 
-        if (B._shape[0] != K)
-            throw new ArgumentException($"Dimension mismatch: A has {K} columns, but B has {B._shape[0]} rows");
+        if (B.Shape._dims[0] != K)
+            throw new ArgumentException($"Dimension mismatch: A has {K} columns, but B has {B.Shape._dims[0]} rows");
 
         var resultBuffer = backend.MatMul(A.Buffer, B.Buffer, M, N, K);
 
@@ -10127,7 +10127,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.ReluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10149,7 +10149,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.SigmoidBackward(gradOutput.Buffer, output.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10171,7 +10171,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.TanhBackward(gradOutput.Buffer, output.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10194,7 +10194,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.LeakyReluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, alpha, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10215,7 +10215,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.GeluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10232,13 +10232,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for SoftmaxBackwardGpu");
 
         int batchSize = gradOutput.Shape._dims[0];
-        int features = gradOutput._shape.Length > 1 ? gradOutput.Shape._dims[1] : 1;
+        int features = gradOutput.Shape._dims.Length > 1 ? gradOutput.Shape._dims[1] : 1;
         int size = gradOutput.ElementCount;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.SoftmaxBackward(gradOutput.Buffer, output.Buffer, outputBuffer, batchSize, features);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10259,7 +10259,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.SwishBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10282,7 +10282,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.EluBackward(gradOutput.Buffer, input.Buffer, output.Buffer, outputBuffer, alpha, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput._shape,
+        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
             GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
@@ -10315,14 +10315,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Determine dimensions
         int batch, channels, spatialSize;
-        if (gradOutput._shape.Length == 2)
+        if (gradOutput.Shape._dims.Length == 2)
         {
             // [B, C] - fully connected
             batch = gradOutput.Shape._dims[0];
             channels = gradOutput.Shape._dims[1];
             spatialSize = 1;
         }
-        else if (gradOutput._shape.Length == 4)
+        else if (gradOutput.Shape._dims.Length == 4)
         {
             // [B, C, H, W] - convolutional
             batch = gradOutput.Shape._dims[0];
@@ -10331,7 +10331,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         else
         {
-            throw new ArgumentException($"BatchNormBackwardGpu expects 2D [B, C] or 4D [B, C, H, W] tensor, got {gradOutput._shape.Length}D");
+            throw new ArgumentException($"BatchNormBackwardGpu expects 2D [B, C] or 4D [B, C, H, W] tensor, got {gradOutput.Shape._dims.Length}D");
         }
 
         // Validate parameter lengths match channels to prevent out-of-bounds kernel access
@@ -10357,7 +10357,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batch, channels, spatialSize, epsilon);
 
         return (
-            new GpuTensor<T>(backend, gradInputBuffer, gradOutput._shape, GpuTensorRole.Gradient, ownsBuffer: true),
+            new GpuTensor<T>(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true),
             new GpuTensor<T>(backend, gradGammaBuffer, [channels], GpuTensorRole.Gradient, ownsBuffer: true),
             new GpuTensor<T>(backend, gradBetaBuffer, [channels], GpuTensorRole.Gradient, ownsBuffer: true)
         );
@@ -10395,17 +10395,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException($"inputShape must be 4D [B, inC, inH, inW], got {inputShape.Length}D.", nameof(inputShape));
         if (kernel.Rank != 4)
             throw new ArgumentException($"kernel must be 4D [outC, inC, kH, kW], got {kernel.Rank}D.", nameof(kernel));
-        if (gradOutput._shape.Length != 4)
-            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput._shape.Length}D.", nameof(gradOutput));
+        if (gradOutput.Shape._dims.Length != 4)
+            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput.Shape._dims.Length}D.", nameof(gradOutput));
 
         int batch = inputShape[0];
         int inChannels = inputShape[1];
         int inHeight = inputShape[2];
         int inWidth = inputShape[3];
 
-        int outChannels = kernel._shape[0];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[0];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
@@ -10452,12 +10452,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardKernelGpu");
 
         // Validate shape lengths to prevent index out of bounds
-        if (input._shape.Length != 4)
-            throw new ArgumentException($"input must be 4D [B, inC, inH, inW], got {input._shape.Length}D.", nameof(input));
+        if (input.Shape._dims.Length != 4)
+            throw new ArgumentException($"input must be 4D [B, inC, inH, inW], got {input.Shape._dims.Length}D.", nameof(input));
         if (kernelShape.Length != 4)
             throw new ArgumentException($"kernelShape must be 4D [outC, inC, kH, kW], got {kernelShape.Length}D.", nameof(kernelShape));
-        if (gradOutput._shape.Length != 4)
-            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput._shape.Length}D.", nameof(gradOutput));
+        if (gradOutput.Shape._dims.Length != 4)
+            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput.Shape._dims.Length}D.", nameof(gradOutput));
 
         int batch = input.Shape._dims[0];
         int inChannels = input.Shape._dims[1];
@@ -10500,8 +10500,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardBiasGpu");
 
         // Validate shape length to prevent index out of bounds
-        if (gradOutput._shape.Length != 4)
-            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput._shape.Length}D.", nameof(gradOutput));
+        if (gradOutput.Shape._dims.Length != 4)
+            throw new ArgumentException($"gradOutput must be 4D [B, outC, outH, outW], got {gradOutput.Shape._dims.Length}D.", nameof(gradOutput));
 
         int batch = gradOutput.Shape._dims[0];
         int outChannels = gradOutput.Shape._dims[1];
@@ -10566,9 +10566,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inWidth = inputShape[3];
 
         // For transposed conv: kernel shape is [inC, outC, kH, kW]
-        int outChannels = kernel._shape[1];
-        int kernelH = kernel._shape[2];
-        int kernelW = kernel._shape[3];
+        int outChannels = kernel.Shape._dims[1];
+        int kernelH = kernel.Shape._dims[2];
+        int kernelW = kernel.Shape._dims[3];
 
         int outHeight = gradOutput.Shape._dims[2];
         int outWidth = gradOutput.Shape._dims[3];
@@ -10652,7 +10652,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorSigmoid(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSigmoid(tensor);
         }
         catch (Exception)
         {
@@ -10665,7 +10665,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorReLU(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorReLU(tensor);
         }
         catch (Exception)
         {
@@ -10678,7 +10678,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorGELU(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorGELU(tensor);
         }
         catch (Exception)
         {
@@ -10691,7 +10691,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorSiLU(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSiLU(tensor);
         }
         catch (Exception)
         {
@@ -10704,7 +10704,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorTanh(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorTanh(tensor);
         }
         catch (Exception)
         {
@@ -10725,7 +10725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
             float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
             var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            return new Tensor<T>(result, tensor._shape);
+            return new Tensor<T>(result, tensor.Shape._dims);
         }
         catch (Exception)
         {
@@ -10738,7 +10738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorMish(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorMish(tensor);
         }
         catch (Exception)
         {
@@ -10751,7 +10751,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor._shape) : base.TensorHardSwish(tensor);
+            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorHardSwish(tensor);
         }
         catch (Exception)
         {
@@ -10766,7 +10766,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
     {
         // Single fused GPU kernel: output[i] = a[i] + t * (b[i] - a[i])
-        if (!TryGetBackend(out var backend) || !ShapesMatch(a._shape, b._shape))
+        if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorLerp(a, b, t);
 
         try
@@ -10781,7 +10781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Lerp(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, tFloat, size);
 
             float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
-            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a._shape);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape._dims);
         }
         catch (Exception)
         {
@@ -10792,7 +10792,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
     {
         // Single fused GPU kernel: output[i] = scaleA * a[i] + scaleB * b[i]
-        if (!TryGetBackend(out var backend) || !ShapesMatch(a._shape, b._shape))
+        if (!TryGetBackend(out var backend) || !ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAddScaled(a, b, scaleA, scaleB);
 
         try
@@ -10808,7 +10808,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.AddScaled(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, scaleAFloat, scaleBFloat, size);
 
             float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
-            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a._shape);
+            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape._dims);
         }
         catch (Exception)
         {
@@ -10985,10 +10985,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (axis >= 0 && axis < rank)
                 {
                     int outerSize = 1;
-                    for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
-                    int reduceSize = tensor._shape[axis];
+                    for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
+                    int reduceSize = tensor.Shape._dims[axis];
                     int innerSize = 1;
-                    for (int i = axis + 1; i < rank; i++) innerSize *= tensor._shape[i];
+                    for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape._dims[i];
                     int totalOuter = outerSize * innerSize;
                     using var gi = b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
                     using var go = b.AllocateBuffer(totalOuter);
@@ -10997,14 +10997,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     int[] outShape;
                     if (keepDims)
                     {
-                        outShape = (int[])tensor._shape.Clone();
+                        outShape = (int[])tensor.Shape._dims.Clone();
                         outShape[axis] = 1;
                     }
                     else
                     {
                         outShape = new int[rank - 1];
                         for (int i = 0, j = 0; i < rank; i++)
-                            if (i != axis) outShape[j++] = tensor._shape[i];
+                            if (i != axis) outShape[j++] = tensor.Shape._dims[i];
                     }
                     return new Tensor<T>((T[])(object)result, outShape);
                 }
@@ -11037,7 +11037,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     int[] outShape;
                     if (keepDims)
                     {
-                        outShape = (int[])input._shape.Clone();
+                        outShape = (int[])input.Shape._dims.Clone();
                         outShape[axis] = 1;
                     }
                     else
@@ -11060,15 +11060,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                int batchSize = a._shape[0];
-                int M = a._shape[a.Rank - 2];
-                int K = a._shape[a.Rank - 1];
-                int N = b2._shape[b2.Rank - 1];
+                int batchSize = a.Shape._dims[0];
+                int M = a.Shape._dims[a.Rank - 2];
+                int K = a.Shape._dims[a.Rank - 1];
+                int N = b2.Shape._dims[b2.Rank - 1];
                 using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
                 using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
                 using var go = b.AllocateBuffer(batchSize * M * N);
                 b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
-                int[] outShape = (int[])a._shape.Clone();
+                int[] outShape = (int[])a.Shape._dims.Clone();
                 outShape[a.Rank - 1] = N;
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
             }
@@ -11096,7 +11096,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorDiagonal<T>(Tensor<T> tensor)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2)
-        { try { int n=Math.Min(tensor._shape[0],tensor._shape[1]); using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(n); bb.ExtractDiagKernel(gi,go,n,tensor._shape[1]); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n}); } catch{} }
+        { try { int n=Math.Min(tensor.Shape._dims[0],tensor.Shape._dims[1]); using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(n); bb.ExtractDiagKernel(gi,go,n,tensor.Shape._dims[1]); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n}); } catch{} }
         return base.TensorDiagonal(tensor);
     }
 
@@ -11152,49 +11152,49 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor._shape[i]; int innerSize=tensor._shape[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.CumSumAxis(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.CumSumAxis(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
         return base.TensorCumSum(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor._shape[i]; int reduceSize=tensor._shape[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor._shape.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor._shape[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
         return base.TensorLogSumExp(tensor,axis,keepDims);
     }
 
     Tensor<T> IEngine.TensorNorm<T>(Tensor<T> tensor, int axis, bool keepDims)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor._shape[i]; int reduceSize=tensor._shape[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.NormAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor._shape.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor._shape[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.NormAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
         return base.TensorNorm(tensor,axis,keepDims);
     }
 
     Tensor<T> IEngine.TensorNormalize<T>(Tensor<T> tensor, int axis, T epsilon)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor._shape[i]; int innerSize=tensor._shape[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.NormalizeL2(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.NormalizeL2(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
         return base.TensorNormalize(tensor,axis,epsilon);
     }
 
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a._shape[i]; int aInner=a._shape[lastAxis],bInner=b2._shape[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a._shape.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
         return base.TensorConcatenate(tensors,axis);
     }
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2 && start.Length==2 && length.Length==2 && start[0]==0 && length[0]==tensor._shape[0])
-        { try { int outerSize=tensor._shape[0]; int inputInner=tensor._shape[1]; int sliceStart=start[1]; int sliceSize=length[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*sliceSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{outerSize,sliceSize}); } catch{} }
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2 && start.Length==2 && length.Length==2 && start[0]==0 && length[0]==tensor.Shape._dims[0])
+        { try { int outerSize=tensor.Shape._dims[0]; int inputInner=tensor.Shape._dims[1]; int sliceStart=start[1]; int sliceSize=length[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*sliceSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{outerSize,sliceSize}); } catch{} }
         return base.TensorSlice(tensor,start,length);
     }
 
     Tensor<T> IEngine.TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && multiples.Length==tensor.Rank && multiples[multiples.Length-1]>1)
-        { try { int lastAxis=tensor.Rank-1; bool onlyLastTiled=true; for(int i=0;i<lastAxis;i++) if(multiples[i]!=1) onlyLastTiled=false; if(onlyLastTiled){ int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=tensor._shape[i]; int innerSize=tensor._shape[lastAxis]; int repeats=multiples[lastAxis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*innerSize*repeats); bb.TileLastAxis(gi,go,outerSize,innerSize,repeats); int[] outShape=(int[])tensor._shape.Clone(); outShape[lastAxis]*=repeats; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } } catch{} }
+        { try { int lastAxis=tensor.Rank-1; bool onlyLastTiled=true; for(int i=0;i<lastAxis;i++) if(multiples[i]!=1) onlyLastTiled=false; if(onlyLastTiled){ int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[lastAxis]; int repeats=multiples[lastAxis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*innerSize*repeats); bb.TileLastAxis(gi,go,outerSize,innerSize,repeats); int[] outShape=(int[])tensor.Shape._dims.Clone(); outShape[lastAxis]*=repeats; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } } catch{} }
         return base.TensorTile(tensor,multiples);
     }
 
@@ -11215,14 +11215,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis==tensor.Rank-1)
-        { try { int outerSize=1; for(int i=0;i<axis;i++)outerSize*=tensor._shape[i]; int inputInner=tensor._shape[axis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,index,1); int[] outShape=new int[tensor.Rank-1]; for(int i=0,j=0;i<tensor.Rank;i++) if(i!=axis) outShape[j++]=tensor._shape[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { int outerSize=1; for(int i=0;i<axis;i++)outerSize*=tensor.Shape._dims[i]; int inputInner=tensor.Shape._dims[axis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,index,1); int[] outShape=new int[tensor.Rank-1]; for(int i=0,j=0;i<tensor.Rank;i++) if(i!=axis) outShape[j++]=tensor.Shape._dims[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
         return base.TensorSliceAxis(tensor,axis,index);
     }
 
     Tensor<T> IEngine.TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && axis==0)
-        { try { var a=tensors[0]; var b2=tensors[1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(a.Length*2); bb.Stack2(ga,gb,go,a.Length); int[] outShape=new int[a.Rank+1]; outShape[0]=2; for(int i=0;i<a.Rank;i++) outShape[i+1]=a._shape[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(a.Length*2); bb.Stack2(ga,gb,go,a.Length); int[] outShape=new int[a.Rank+1]; outShape[0]=2; for(int i=0;i<a.Rank;i++) outShape[i+1]=a.Shape._dims[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
         return base.TensorStack(tensors,axis);
     }
 
@@ -11230,14 +11230,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSetSlice<T>(Tensor<T> destination, Tensor<T> source, int[] start)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && destination.Rank==2 && start.Length==2 && start[0]==0)
-        { try { int outerSize=destination._shape[0]; int outputInner=destination._shape[1]; int sliceStart=start[1]; int sliceSize=source._shape[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)destination).GetDataArray()); using var gv=bb.AllocateBuffer(((Tensor<float>)(object)source).GetDataArray()); bb.SetSliceLastAxis(gi,gv,outerSize,outputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(gi),destination.Shape.ToArray()); } catch{} }
+        { try { int outerSize=destination.Shape._dims[0]; int outputInner=destination.Shape._dims[1]; int sliceStart=start[1]; int sliceSize=source.Shape._dims[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)destination).GetDataArray()); using var gv=bb.AllocateBuffer(((Tensor<float>)(object)source).GetDataArray()); bb.SetSliceLastAxis(gi,gv,outerSize,outputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(gi),destination.Shape.ToArray()); } catch{} }
         return base.TensorSetSlice(destination,source,start);
     }
 
     Tensor<T> IEngine.Concat<T>(IReadOnlyList<Tensor<T>> tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Count==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a._shape[i]; int aInner=a._shape[lastAxis],bInner=b2._shape[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a._shape.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
         return base.Concat(tensors,axis);
     }
 
@@ -11349,7 +11349,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a._shape, b2._shape))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
@@ -11366,7 +11366,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a._shape, b2._shape))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
@@ -11433,7 +11433,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(outputLen);
                 b.GluForward(gi, go, outerSize, halfDim);
-                int[] outShape = (int[])input._shape.Clone();
+                int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
             }
@@ -11457,7 +11457,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(outputLen);
                 b.GeGluForward(gi, go, outerSize, halfDim);
-                int[] outShape = (int[])input._shape.Clone();
+                int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
             }
@@ -11479,7 +11479,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(outerSize * halfDim);
                 b.ReGluForward(gi, go, outerSize, halfDim);
-                int[] outShape = (int[])input._shape.Clone();
+                int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
             }
@@ -11501,7 +11501,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
                 using var go = b.AllocateBuffer(outerSize * halfDim);
                 b.SwiGluForward(gi, go, outerSize, halfDim);
-                int[] outShape = (int[])input._shape.Clone();
+                int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
                 return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
             }
@@ -11515,7 +11515,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.BatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank>=2 && b2.Rank>=2)
-        { try { int M=a._shape[a.Rank-2],K=a._shape[a.Rank-1],N=b2._shape[b2.Rank-1]; int batchSize=a.Length/(M*K); using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(batchSize*M*N); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a._shape.Clone(); outShape[a.Rank-1]=N; return new Tensor<T>((T[])(object)b.DownloadBuffer(go),outShape); } catch{} }
+        { try { int M=a.Shape._dims[a.Rank-2],K=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; int batchSize=a.Length/(M*K); using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(batchSize*M*N); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[a.Rank-1]=N; return new Tensor<T>((T[])(object)b.DownloadBuffer(go),outShape); } catch{} }
         return base.BatchMatMul(a,b2);
     }
 
@@ -11587,21 +11587,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor._shape[ea]; int outerSize=tensor.Length/features; using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
         return base.TensorSoftmax(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor._shape[ea]; int outerSize=tensor.Length/features; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.LogSoftmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.LogSoftmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
         return base.TensorLogSoftmax(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gso=b.AllocateBuffer(((Tensor<float>)(object)softmaxOutput).GetDataArray()); using var ggo=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput._shape[ea]; int outerSize=softmaxOutput.Length/features; b.SoftmaxBackward(gso,ggo,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),softmaxOutput.Shape.ToArray()); } catch{} }
+        { try { using var gso=b.AllocateBuffer(((Tensor<float>)(object)softmaxOutput).GetDataArray()); using var ggo=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput.Shape._dims[ea]; int outerSize=softmaxOutput.Length/features; b.SoftmaxBackward(gso,ggo,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),softmaxOutput.Shape.ToArray()); } catch{} }
         return base.TensorSoftmaxBackward(softmaxOutput,gradOutput,axis);
     }
 
@@ -11635,15 +11635,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.PairwiseDistance<T>(Tensor<T> x, Tensor<T> y)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && x.Rank==2 && y.Rank==2 && x._shape[1]==y._shape[1])
-        { try { int M=x._shape[0],N=y._shape[0],dim=x._shape[1]; using var gx=bb.AllocateBuffer(((Tensor<float>)(object)x).GetDataArray()); using var gy=bb.AllocateBuffer(((Tensor<float>)(object)y).GetDataArray()); using var go=bb.AllocateBuffer(M*N); bb.PairwiseDistance(gx,gy,go,M,N,dim); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{M,N}); } catch{} }
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && x.Rank==2 && y.Rank==2 && x.Shape._dims[1]==y.Shape._dims[1])
+        { try { int M=x.Shape._dims[0],N=y.Shape._dims[0],dim=x.Shape._dims[1]; using var gx=bb.AllocateBuffer(((Tensor<float>)(object)x).GetDataArray()); using var gy=bb.AllocateBuffer(((Tensor<float>)(object)y).GetDataArray()); using var go=bb.AllocateBuffer(M*N); bb.PairwiseDistance(gx,gy,go,M,N,dim); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{M,N}); } catch{} }
         return base.PairwiseDistance(x,y);
     }
 
     Tensor<T> IEngine.TensorBatchOuterProduct<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && a.Rank>=2 && b2.Rank>=2)
-        { try { int batchSize=a._shape[0],M=a._shape[a.Rank-1],N=b2._shape[b2.Rank-1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(batchSize*M*N); bb.BatchOuterProduct(ga,gb,go,batchSize,M,N); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{batchSize,M,N}); } catch{} }
+        { try { int batchSize=a.Shape._dims[0],M=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(batchSize*M*N); bb.BatchOuterProduct(ga,gb,go,batchSize,M,N); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{batchSize,M,N}); } catch{} }
         return base.TensorBatchOuterProduct(a,b2);
     }
 
