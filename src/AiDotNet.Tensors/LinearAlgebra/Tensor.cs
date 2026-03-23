@@ -796,11 +796,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
-        // SIMD fast path: both operands contiguous with zero offset
-        if (IsContiguous && _storageOffset == 0 && other.IsContiguous && other._storageOffset == 0)
+        // SIMD fast path: both operands contiguous
+        if (IsContiguous && other.IsContiguous)
         {
             var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
             return result;
         }
 
@@ -1458,9 +1458,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void MultiplyInPlace(T scalar)
     {
-        if (IsContiguous && _storageOffset == 0)
+        if (IsContiguous)
         {
-            _numOps.MultiplyScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
+            _numOps.MultiplyScalar(AsSpan(), scalar, AsWritableSpan());
         }
         else
         {
@@ -1729,11 +1729,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (ShapeEquals(this._shape, other._shape))
         {
-            // SIMD fast path: both contiguous with zero offset
-            if (IsContiguous && _storageOffset == 0 && other.IsContiguous && other._storageOffset == 0)
+            // SIMD fast path: both contiguous
+            if (IsContiguous && other.IsContiguous)
             {
                 var result = TensorAllocator.Rent<T>(this._shape);
-                _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+                _numOps.Multiply(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
                 return result;
             }
             // View-safe: materialize first
