@@ -23,7 +23,7 @@ public class BatchMatMulAndAttentionTests
         var result = _engine.TensorBatchMatMul(a, identity);
         var data = result.GetDataArray();
 
-        Assert.Equal(new[] { 2, 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2, 2 }, result.Shape.ToArray());
         Assert.Equal(1f, data[0], 1e-5f);
         Assert.Equal(2f, data[1], 1e-5f);
         Assert.Equal(3f, data[2], 1e-5f);
@@ -136,7 +136,7 @@ public class BatchMatMulAndAttentionTests
         var b = new Tensor<float>(bData, new[] { 4, 2 });
         var result = _engine.TensorBatchMatMul(a, b);
 
-        Assert.Equal(new[] { 2, 3, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 3, 2 }, result.Shape.ToArray());
 
         var resultData = result.GetDataArray();
         for (int batch = 0; batch < 2; batch++)
@@ -196,9 +196,9 @@ public class BatchMatMulAndAttentionTests
         AssertNotUniform(dKData, "dK");
         AssertNotUniform(dVData, "dV");
 
-        Assert.Equal(Q.Shape, dQ.Shape);
-        Assert.Equal(K.Shape, dK.Shape);
-        Assert.Equal(V.Shape, dV.Shape);
+        Assert.Equal(Q.Shape.ToArray(), dQ.Shape.ToArray());
+        Assert.Equal(K.Shape.ToArray(), dK.Shape.ToArray());
+        Assert.Equal(V.Shape.ToArray(), dV.Shape.ToArray());
 
         Assert.True(dQData.Any(x => Math.Abs(x) > 1e-7f), "dQ is all zeros");
         Assert.True(dKData.Any(x => Math.Abs(x) > 1e-7f), "dK is all zeros");

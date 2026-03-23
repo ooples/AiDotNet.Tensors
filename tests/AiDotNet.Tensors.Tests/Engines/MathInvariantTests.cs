@@ -30,7 +30,7 @@ public class MathInvariantTests
     private Tensor<float> C(float v, int n) => Const(v, n); // shorthand alias
 
     /// <summary>Asserts two tensors are element-wise close within tolerance.</summary>
-    private void AssertClose(Tensor<float> a, Tensor<float> b, float tol = 1e-4f, string msg = "") { Assert.Equal(a.Shape, b.Shape); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < tol, $"{msg} [{i}]: {ad[i]} vs {bd[i]}"); }
+    private void AssertClose(Tensor<float> a, Tensor<float> b, float tol = 1e-4f, string msg = "") { Assert.Equal(a.Shape.ToArray(), b.Shape.ToArray()); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < tol, $"{msg} [{i}]: {ad[i]} vs {bd[i]}"); }
     private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") => AssertClose(a, b, t, m); // shorthand alias
 
     /// <summary>Asserts all elements are near zero.</summary>
@@ -50,7 +50,7 @@ public class MathInvariantTests
     [Fact] public void Add_Inverse() => AZ(E.TensorAdd(R([64], 1), E.TensorMultiplyScalar(R([64], 1), -1f)));
     [Fact] public void AddScalar_Correct() { var a = R([64], 1); var r = E.TensorAddScalar(a, 5f); var ad = a.GetDataArray(); var rd = r.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(ad[i] + 5f, rd[i], Tol); }
     [Fact] public void Add_LargeArray() => Assert.Equal(10000, E.TensorAdd(R([10000], 1), R([10000], 2)).Length);
-    [Fact] public void BroadcastAdd_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastAdd(R([4, 8], 1), R([1, 8], 2)).Shape);
+    [Fact] public void BroadcastAdd_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastAdd(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
     [Fact] public void AddInPlace_Modifies() { var a = R([64], 1); var b = R([64], 2); var orig = (float[])a.GetDataArray().Clone(); E.TensorAddInPlace(a, b); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(orig[i] + bd[i], ad[i], Tol); }
 
     // ================================================================
@@ -69,7 +69,7 @@ public class MathInvariantTests
     [Fact] public void Multiply_Zero() => AZ(E.TensorMultiplyScalar(R([64], 1), 0f));
     [Fact] public void Multiply_Negate() => AE(E.TensorMultiplyScalar(R([64], 1), -1f), E.TensorNegate(R([64], 1)));
     [Fact] public void Distributive() { var a = R([64], 1); var b = R([64], 2); var c = R([64], 3); AE(E.TensorMultiply(a, E.TensorAdd(b, c)), E.TensorAdd(E.TensorMultiply(a, b), E.TensorMultiply(a, c)), 1e-3f); }
-    [Fact] public void BroadcastMultiply_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastMultiply(R([4, 8], 1), R([1, 8], 2)).Shape);
+    [Fact] public void BroadcastMultiply_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastMultiply(R([4, 8], 1), R([1, 8], 2)).Shape.ToArray());
 
     // ================================================================
     // DIVISION (4)
@@ -77,7 +77,7 @@ public class MathInvariantTests
     [Fact] public void Divide_BySelf() { var a = RP([64], 1); var r = E.TensorDivide(a, a).GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(1f, r[i], 1e-3f); }
     [Fact] public void DivideScalar_IsMultiplyInverse() => AE(E.TensorDivideScalar(R([64], 1), 2f), E.TensorMultiplyScalar(R([64], 1), 0.5f), 1e-3f);
     [Fact] public void Divide_ByOne() => AE(E.TensorDivideScalar(R([64], 1), 1f), R([64], 1));
-    [Fact] public void BroadcastDivide_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastDivide(R([4, 8], 1), RP([1, 8], 2)).Shape);
+    [Fact] public void BroadcastDivide_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorBroadcastDivide(R([4, 8], 1), RP([1, 8], 2)).Shape.ToArray());
 
     // ================================================================
     // UNARY MATH (12)
@@ -158,7 +158,7 @@ public class MathInvariantTests
     [Fact] public void Max_GreaterAll() { var x = R([64], 53); float mx = E.TensorMaxValue(x); var d = x.GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(mx >= d[i] - Tol); }
     [Fact] public void Min_LessAll() { var x = R([64], 54); float mn = E.TensorMinValue(x); var d = x.GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(mn <= d[i] + Tol); }
     [Fact] public void ArgMax_MatchesMax() { var x = R([64], 55); var idx = E.TensorArgMax(x, 0); Assert.Equal(E.TensorMaxValue(x), x.GetDataArray()[(int)idx.GetDataArray()[0]], Tol); }
-    [Fact] public void ReduceSum_Axis() { var x = R([4, 8], 56); var r = E.ReduceSum(x, new[] { 1 }, false); Assert.Equal(new[] { 4 }, r.Shape); var xd = x.GetDataArray(); var rd = r.GetDataArray(); for (int i = 0; i < 4; i++) { float s = 0; for (int j = 0; j < 8; j++) s += xd[i * 8 + j]; Assert.True(Math.Abs(rd[i] - s) < 0.01f); } }
+    [Fact] public void ReduceSum_Axis() { var x = R([4, 8], 56); var r = E.ReduceSum(x, new[] { 1 }, false); Assert.Equal(new[] { 4 }, r.Shape.ToArray()); var xd = x.GetDataArray(); var rd = r.GetDataArray(); for (int i = 0; i < 4; i++) { float s = 0; for (int j = 0; j < 8; j++) s += xd[i * 8 + j]; Assert.True(Math.Abs(rd[i] - s) < 0.01f); } }
     [Fact] public void SumOfSquares_NonNeg() => Assert.True(E.TensorSumOfSquares(R([64], 57)) >= 0f);
 
     // ================================================================
@@ -180,8 +180,8 @@ public class MathInvariantTests
     [Fact] public void Linspace_EvenSpacing() { var d = E.TensorLinspace(0f, 1f, 5).GetDataArray(); for (int i = 1; i < 5; i++) Assert.True(Math.Abs((d[i] - d[i - 1]) - 0.25f) < Tol); }
     [Fact] public void Diag_Correct() { var d = E.TensorDiag(new Tensor<float>(new float[] { 1, 2, 3 }, [3])).GetDataArray(); Assert.Equal(1f, d[0], Tol); Assert.Equal(0f, d[1], Tol); Assert.Equal(2f, d[4], Tol); Assert.Equal(3f, d[8], Tol); }
     [Fact] public void CumSum_LastEqualsSum() { var x = R([32], 91); var cs = E.TensorCumSum(x, 0).GetDataArray(); Assert.True(Math.Abs(cs[31] - E.TensorSum(x)) < 1e-2f); }
-    [Fact] public void Outer_Correct() { var r = E.TensorOuter(new Tensor<float>(new float[] { 1, 2, 3 }, [3]), new Tensor<float>(new float[] { 4, 5 }, [2])); Assert.Equal(new[] { 3, 2 }, r.Shape); Assert.Equal(4f, r.GetDataArray()[0], Tol); Assert.Equal(10f, r.GetDataArray()[3], Tol); }
-    [Fact] public void TriangularMask_Shape() => Assert.Equal(new[] { 4, 4 }, E.TensorTriangularMask<float>(4, true, 0).Shape);
+    [Fact] public void Outer_Correct() { var r = E.TensorOuter(new Tensor<float>(new float[] { 1, 2, 3 }, [3]), new Tensor<float>(new float[] { 4, 5 }, [2])); Assert.Equal(new[] { 3, 2 }, r.Shape.ToArray()); Assert.Equal(4f, r.GetDataArray()[0], Tol); Assert.Equal(10f, r.GetDataArray()[3], Tol); }
+    [Fact] public void TriangularMask_Shape() => Assert.Equal(new[] { 4, 4 }, E.TensorTriangularMask<float>(4, true, 0).Shape.ToArray());
 
     // ================================================================
     // NORMALIZATION (4)
@@ -195,9 +195,9 @@ public class MathInvariantTests
     // CONV / POOLING (4)
     // ================================================================
     [Fact] public void Conv2D_IdentityKernel() => AE(E.Conv2D(R([1, 1, 4, 4], 80), new Tensor<float>(new float[] { 1f }, [1, 1, 1, 1]), 1, 0, 1), R([1, 1, 4, 4], 80), 1e-3f);
-    [Fact] public void Conv2D_OutputShape() => Assert.Equal(new[] { 1, 16, 8, 8 }, E.Conv2D(R([1, 3, 8, 8], 81), R([16, 3, 3, 3], 82), 1, 1, 1).Shape);
-    [Fact] public void MaxPool_Shape() => Assert.Equal(new[] { 1, 1, 2, 2 }, E.MaxPool2D(R([1, 1, 4, 4], 83), 2, 2, 0).Shape);
-    [Fact] public void AvgPool_Shape() => Assert.Equal(new[] { 1, 1, 2, 2 }, E.AvgPool2D(R([1, 1, 4, 4], 84), 2, 2, 0).Shape);
+    [Fact] public void Conv2D_OutputShape() => Assert.Equal(new[] { 1, 16, 8, 8 }, E.Conv2D(R([1, 3, 8, 8], 81), R([16, 3, 3, 3], 82), 1, 1, 1).Shape.ToArray());
+    [Fact] public void MaxPool_Shape() => Assert.Equal(new[] { 1, 1, 2, 2 }, E.MaxPool2D(R([1, 1, 4, 4], 83), 2, 2, 0).Shape.ToArray());
+    [Fact] public void AvgPool_Shape() => Assert.Equal(new[] { 1, 1, 2, 2 }, E.AvgPool2D(R([1, 1, 4, 4], 84), 2, 2, 0).Shape.ToArray());
 
     // ================================================================
     // ATTENTION (4)
@@ -211,10 +211,10 @@ public class MathInvariantTests
     // ================================================================
     // GATED ACTIVATIONS (4)
     // ================================================================
-    [Fact] public void GLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.GLU(R([4, 16], 100), -1).Shape);
-    [Fact] public void GeGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.GeGLU(R([4, 16], 101), -1).Shape);
-    [Fact] public void SwiGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.SwiGLU(R([4, 16], 102), -1).Shape);
-    [Fact] public void ReGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.ReGLU(R([4, 16], 103), -1).Shape);
+    [Fact] public void GLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.GLU(R([4, 16], 100), -1).Shape.ToArray());
+    [Fact] public void GeGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.GeGLU(R([4, 16], 101), -1).Shape.ToArray());
+    [Fact] public void SwiGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.SwiGLU(R([4, 16], 102), -1).Shape.ToArray());
+    [Fact] public void ReGLU_HalfDim() => Assert.Equal(new[] { 4, 8 }, E.ReGLU(R([4, 16], 103), -1).Shape.ToArray());
 
     // ================================================================
     // LOSS / COMPARISON (4)
