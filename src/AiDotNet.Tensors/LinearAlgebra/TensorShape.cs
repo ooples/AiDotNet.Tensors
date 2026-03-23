@@ -78,10 +78,13 @@ public readonly struct TensorShape : IEquatable<TensorShape>
 
     public override int GetHashCode()
     {
-        var hash = new HashCode();
-        for (int i = 0; i < _dims.Length; i++)
-            hash.Add(_dims[i]);
-        return hash.ToHashCode();
+        unchecked
+        {
+            int hash = 17;
+            for (int i = 0; i < _dims.Length; i++)
+                hash = hash * 31 + _dims[i];
+            return hash;
+        }
     }
 
     public static bool operator ==(TensorShape left, TensorShape right) => left.Equals(right);

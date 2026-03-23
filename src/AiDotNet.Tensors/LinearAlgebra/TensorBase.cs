@@ -201,37 +201,52 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        if (strides == null) throw new ArgumentNullException(nameof(strides));
         if (strides.Length != shape.Length)
             throw new ArgumentException($"Strides length ({strides.Length}) must match shape length ({shape.Length}).");
         if (storageOffset < 0)
             throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
 
-        int totalElements = ComputeProduct(shape);
+        // Defensive copy — prevent caller from mutating our metadata
+        var shapeCopy = new int[shape.Length];
+        var stridesCopy = new int[strides.Length];
+        Array.Copy(shape, shapeCopy, shape.Length);
+        Array.Copy(strides, stridesCopy, strides.Length);
 
-        // Validate bounds — skip for zero-size tensors (no elements to address)
+        int totalElements = ComputeProduct(shapeCopy);
+
+        // Validate bounds — compute actual min/max indices accounting for negative strides
         if (totalElements > 0)
         {
+            int minIndex = storageOffset;
             int maxIndex = storageOffset;
-            for (int i = 0; i < shape.Length; i++)
+            for (int i = 0; i < shapeCopy.Length; i++)
             {
-                if (shape[i] > 1)
-                    maxIndex += (shape[i] - 1) * Math.Abs(strides[i]);
+                if (shapeCopy[i] > 1)
+                {
+                    int extent = (shapeCopy[i] - 1) * stridesCopy[i];
+                    if (extent >= 0)
+                        maxIndex += extent;
+                    else
+                        minIndex += extent;
+                }
             }
-            if (maxIndex >= data.Length)
+            if (minIndex < 0 || maxIndex >= data.Length)
                 throw new ArgumentException(
-                    $"View exceeds storage bounds: max index {maxIndex} >= storage length {data.Length}.");
+                    $"View exceeds storage bounds: index range [{minIndex}, {maxIndex}] outside storage [0, {data.Length - 1}].");
         }
 
-        _shape = shape;
-        Shape = new TensorShape(shape);
-        _strides = strides;
+        _shape = shapeCopy;
+        Shape = new TensorShape(shapeCopy);
+        _strides = stridesCopy;
         _storageOffset = storageOffset;
         IsView = isView;
         _data = data;
         _storage = new TensorStorage<T>(_data);
         if (isView) _storage.AddRef();
         Length = totalElements;
-        IsContiguous = CheckContiguous(shape, strides);
+        IsContiguous = CheckContiguous(shapeCopy, stridesCopy);
     }
 
     // ================================================================
@@ -528,10 +543,14 @@ public abstract class TensorBase<T>
     private static int ComputeProduct(int[] shape)
     {
         if (shape.Length == 0) return 1; // Scalar
-        int product = 1;
+        long product = 1;
         for (int i = 0; i < shape.Length; i++)
+        {
             product *= shape[i];
-        return product;
+            if (product > int.MaxValue)
+                throw new ArgumentException($"Shape product overflow: shape [{string.Join(", ", shape)}] exceeds int.MaxValue.");
+        }
+        return (int)product;
     }
 
     /// <summary>
