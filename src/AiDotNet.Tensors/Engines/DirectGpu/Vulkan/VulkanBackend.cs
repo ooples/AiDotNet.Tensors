@@ -316,24 +316,21 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     // CPU fallback when GLSL pipeline creation fails (shaderc unavailable or compilation error).
-    // These copy input to output unchanged since we cannot determine the intended operation.
-    // Callers should check pipeline availability before dispatching performance-critical work.
+    // When GLSL pipeline creation fails (shaderc unavailable or compilation error),
+    // throw instead of silently returning wrong results. An identity copy would produce
+    // incorrect data (e.g., sigmoid returning raw input values) with no indication of failure.
     private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — unary op falling back to identity copy");
-        float[] input = DownloadBuffer(A);
-        float[] output = new float[size];
-        Array.Copy(input, output, Math.Min(input.Length, size));
-        UploadToBuffer(output, B);
+        throw new InvalidOperationException(
+            "Vulkan GLSL pipeline unavailable — cannot execute compute shader. " +
+            "Install libshaderc to enable runtime GLSL compilation, or use a different GPU backend.");
     }
 
     private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
-        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — binary op falling back to identity copy of A");
-        float[] a = DownloadBuffer(A);
-        float[] output = new float[size];
-        Array.Copy(a, output, Math.Min(a.Length, size));
-        UploadToBuffer(output, C);
+        throw new InvalidOperationException(
+            "Vulkan GLSL pipeline unavailable — cannot execute compute shader. " +
+            "Install libshaderc to enable runtime GLSL compilation, or use a different GPU backend.");
     }
 
     /// <summary>

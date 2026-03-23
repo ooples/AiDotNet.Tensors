@@ -885,6 +885,8 @@ void main() {
     for (uint j = 0; j < innerSize; j++) b[base_idx + j] /= sum;
 }";
 
+    // Spherical softmax: normalize by exp-weighted L2 norm (not regular softmax)
+    // output[i] = exp(x[i]) / sqrt(sum(exp(2*x[j])))
     public static string SphericalSoftmaxGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
 void main() {
@@ -893,9 +895,14 @@ void main() {
     uint base_idx = row * innerSize;
     float max_val = a[base_idx];
     for (uint j = 1; j < innerSize; j++) max_val = max(max_val, a[base_idx + j]);
-    float sum_exp = 0.0;
-    for (uint j = 0; j < innerSize; j++) { b[base_idx + j] = exp(a[base_idx + j] - max_val); sum_exp += b[base_idx + j]; }
-    for (uint j = 0; j < innerSize; j++) b[base_idx + j] /= (sum_exp + 1e-10);
+    float sum_sq = 0.0;
+    for (uint j = 0; j < innerSize; j++) {
+        float e = exp(a[base_idx + j] - max_val);
+        b[base_idx + j] = e;
+        sum_sq += e * e;
+    }
+    float inv_norm = 1.0 / (sqrt(sum_sq) + 1e-10);
+    for (uint j = 0; j < innerSize; j++) b[base_idx + j] *= inv_norm;
 }";
 
     // =====================================================================
@@ -1017,28 +1024,28 @@ void main() {
 
     public static string SparsemaxGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
-shared float s_sorted[256]; // max innerSize supported in shared memory
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= outerSize) return;
+    if (innerSize > 256) return; // Safety: skip rows with too many classes
     uint base_idx = row * innerSize;
 
-    // Copy to local and sort (bubble sort for small innerSize — GPU-friendly)
-    for (uint j = 0; j < innerSize; j++) s_sorted[j] = a[base_idx + j];
-    // Sort descending
+    // Copy to output and sort in-place (each thread owns its row — no shared memory race)
+    for (uint j = 0; j < innerSize; j++) b[base_idx + j] = a[base_idx + j];
+    // Sort descending (bubble sort — OK for small innerSize typical in sparsemax)
     for (uint i = 0; i < innerSize; i++) {
         for (uint j = i + 1; j < innerSize; j++) {
-            if (s_sorted[j] > s_sorted[i]) { float tmp = s_sorted[i]; s_sorted[i] = s_sorted[j]; s_sorted[j] = tmp; }
+            if (b[base_idx + j] > b[base_idx + i]) { float tmp = b[base_idx + i]; b[base_idx + i] = b[base_idx + j]; b[base_idx + j] = tmp; }
         }
     }
-    // Find tau
+    // Find tau using sorted values (now in b[base_idx..])
     float cs = 0.0, tau = 0.0;
     for (uint k = 0; k < innerSize; k++) {
-        cs += s_sorted[k];
+        cs += b[base_idx + k];
         float cand = (cs - 1.0) / float(k + 1);
-        if (s_sorted[k] > cand) tau = cand;
+        if (b[base_idx + k] > cand) tau = cand;
     }
-    // Apply sparsemax
+    // Apply sparsemax using original unsorted values
     for (uint j = 0; j < innerSize; j++) b[base_idx + j] = max(a[base_idx + j] - tau, 0.0);
 }";
 }
