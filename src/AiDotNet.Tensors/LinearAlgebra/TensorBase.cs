@@ -609,7 +609,7 @@ public abstract class TensorBase<T> : IDisposable
     /// Releases the tensor's reference to shared storage.
     /// When the last tensor/view sharing this storage is disposed, the storage can be reclaimed.
     /// </summary>
-    public void Dispose()
+    public virtual void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
