@@ -6054,6 +6054,12 @@ public interface IEngine
     Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value);
 
     /// <summary>
+    /// Masked fill using a <see cref="Bit"/> mask tensor. A Bit.True entry fills the corresponding
+    /// position in the output with <paramref name="value"/>; Bit.False leaves it unchanged.
+    /// </summary>
+    Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value);
+
+    /// <summary>
     /// Where operation: selects elements from two tensors based on a condition.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -6068,6 +6074,12 @@ public interface IEngine
     /// </para>
     /// </remarks>
     Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y);
+
+    /// <summary>
+    /// Where operation using a <see cref="Bit"/> condition tensor.
+    /// Bit.True selects from <paramref name="x"/>; Bit.False selects from <paramref name="y"/>.
+    /// </summary>
+    Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y);
 
     #endregion
 
