@@ -2875,15 +2875,46 @@ kernel void cosine_similarity(device const float* a [[buffer(0)]],
 #include <metal_stdlib>
 using namespace metal;
 
+// Pass 1: each threadgroup computes a partial dot product using shared memory reduction.
+// output[threadgroup_id] = partial sum for that group's range of elements.
 kernel void dot_product(device const float* a [[buffer(0)]],
                         device const float* b [[buffer(1)]],
                         device float* output [[buffer(2)]],
                         constant uint& size [[buffer(3)]],
-                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= 1) return;
+                        threadgroup float* shared [[threadgroup(0)]],
+                        uint gid [[thread_position_in_grid]],
+                        uint lid [[thread_position_in_threadgroup]],
+                        uint tgSize [[threads_per_threadgroup]],
+                        uint tgId [[threadgroup_position_in_grid]]) {
     float sum = 0.0f;
-    for (uint i = 0; i < size; i++) sum += a[i] * b[i];
-    output[0] = sum;
+    for (uint i = gid; i < size; i += tgSize * ((size + tgSize - 1) / tgSize)) {
+        if (i < size) sum += a[i] * b[i];
+    }
+    shared[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) output[tgId] = shared[0];
+}
+
+// Pass 2: reduce partial sums from Pass 1 into a single scalar.
+kernel void reduce_partial_sums(device const float* partials [[buffer(0)]],
+                                device float* output [[buffer(1)]],
+                                constant uint& count [[buffer(2)]],
+                                threadgroup float* shared [[threadgroup(0)]],
+                                uint lid [[thread_position_in_threadgroup]],
+                                uint tgSize [[threads_per_threadgroup]]) {
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgSize) sum += partials[i];
+    shared[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) output[0] = shared[0];
 }
 
 kernel void batched_dot_product(device const float* a [[buffer(0)]],
@@ -2898,18 +2929,23 @@ kernel void batched_dot_product(device const float* a [[buffer(0)]],
     output[gid] = sum;
 }
 
+// Strided dot product: computes dot(a[0..aSize-1], b[bOffset + i*bStride]) for windowed access.
 kernel void strided_dot_product(device const float* a [[buffer(0)]],
                                 device const float* b [[buffer(1)]],
                                 device float* output [[buffer(2)]],
-                                constant uint& size [[buffer(3)]],
-                                constant uint& strideA [[buffer(4)]],
-                                constant uint& strideB [[buffer(5)]],
-                                constant uint& count [[buffer(6)]],
+                                constant uint& aSize [[buffer(3)]],
+                                constant uint& bSize [[buffer(4)]],
+                                constant uint& bOffset [[buffer(5)]],
+                                constant uint& bStride [[buffer(6)]],
                                 uint gid [[thread_position_in_grid]]) {
-    if (gid >= count) return;
+    if (gid >= 1) return;
     float sum = 0.0f;
-    for (uint i = 0; i < size; i++) sum += a[gid * strideA + i] * b[gid * strideB + i];
-    output[gid] = sum;
+    for (uint i = 0; i < aSize; i++) {
+        uint bIdx = bOffset + i * bStride;
+        float bVal = (bIdx < bSize) ? b[bIdx] : 0.0f;
+        sum += a[i] * bVal;
+    }
+    output[0] = sum;
 }
 ";
 }

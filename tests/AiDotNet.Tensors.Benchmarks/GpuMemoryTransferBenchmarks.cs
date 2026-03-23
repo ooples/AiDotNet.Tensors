@@ -25,7 +25,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <item>Synchronization overhead</item>
 /// </list>
 /// </remarks>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class GpuMemoryTransferBenchmarks
 {

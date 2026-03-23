@@ -1641,9 +1641,12 @@ void sgemm(
         ulong maxWorkGroupSize = _context.MaxWorkGroupSize;
 
         // With WPT=4 register blocking, workgroup = (TS/4)^2 threads
-        // TS=64:  WG = 16x16 = 256 threads (max occupancy, 33KB LDS)
-        // TS=32:  WG = 8x8   = 64 threads (8.4KB LDS, multiple wavefronts)
-        if (maxWorkGroupSize >= 256)
+        // TS=64:  WG = 16x16 = 256 threads, needs 2 * 64*(64+1)*4 = ~33KB LDS
+        // TS=32:  WG = 8x8   = 64 threads, needs 2 * 32*(32+1)*4 = ~8.4KB LDS
+        ulong localMemSize = _context.LocalMemSize;
+        // LDS required: 2 tiles of TS*(TS+1) floats (padding to avoid bank conflicts)
+        ulong lds64 = 2UL * 64 * 65 * sizeof(float); // ~33KB
+        if (maxWorkGroupSize >= 256 && localMemSize >= lds64)
             _tileSize = 64;  // 16x16 = 256 threads, 33KB LDS
         else if (maxWorkGroupSize >= 64)
             _tileSize = 32;  // 8x8 = 64 threads, 8.4KB LDS

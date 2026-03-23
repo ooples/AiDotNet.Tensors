@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// Cross-library benchmarks comparing GPU operations against popular .NET libraries.
 /// Goal: Identify where our GPU implementation is faster/slower than alternatives.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class CrossLibraryGpuBenchmarks
