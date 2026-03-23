@@ -124,7 +124,7 @@ public class MathInvariantTests
     [Fact] public void Tanh_Range() { AR(E.TensorTanh(R([256], 22)), -1f, 1f, "Tanh"); }
     [Fact] public void Tanh_Odd() { var x = R([64], 23); var t = E.TensorTanh(x).GetDataArray(); var tn = E.TensorTanh(E.TensorNegate(x)).GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(Math.Abs(tn[i] + t[i]) < Tol); }
     [Fact] public void Tanh_Zero() => Assert.True(Math.Abs(E.TensorTanh(C(0, 1)).GetDataArray()[0]) < Tol);
-    [Fact] public void ReLU_NonNeg() { var d = E.TensorReLU(R([256], 24)).GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= 0f); }
+    [Fact] public void ReLU_NonNeg() { var t = E.TensorReLU(R([256], 24)); var d = t.GetDataArray(); for (int i = 0; i < t.Length; i++) Assert.True(d[i] >= 0f); }
     [Fact] public void ReLU_Positive() => AE(E.TensorReLU(new Tensor<float>(new float[] { 1, 2, 3 }, [3])), new Tensor<float>(new float[] { 1, 2, 3 }, [3]));
     [Fact] public void ReLU_Negative() => AZ(E.TensorReLU(new Tensor<float>(new float[] { -1, -2, -3 }, [3])));
     [Fact] public void ReLU_Idempotent() => AE(E.TensorReLU(E.TensorReLU(R([64], 24))), E.TensorReLU(R([64], 24)));

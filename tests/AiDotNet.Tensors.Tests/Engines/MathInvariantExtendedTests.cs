@@ -24,7 +24,7 @@ public class MathInvariantExtendedTests
     private Tensor<float> C(float v, int[] s) => new(Enumerable.Repeat(v, s.Aggregate(1, (a, b) => a * b)).ToArray(), s);
     private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") { Assert.Equal(a.Shape, b.Shape); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < t, $"{m} [{i}]: {ad[i]} vs {bd[i]}"); }
     private void AZ(Tensor<float> a, string m = "") { var d = a.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{m} [{i}]={d[i]}"); }
-    private void AR(float[] d, float lo, float hi, string m) { for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{m} [{i}]={d[i]}"); }
+    private void AR(Tensor<float> t, float lo, float hi, string m) { var d = t.GetDataArray(); for (int i = 0; i < t.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{m} [{i}]={d[i]}"); }
 
     // ================================================================
     // TensorAddMany (3)
@@ -73,7 +73,7 @@ public class MathInvariantExtendedTests
     // ================================================================
     // TensorClamp (vs TensorClip) (2)
     // ================================================================
-    [Fact] public void Clamp_InRange() { var r = E.TensorClamp(R([256], 1), -0.5f, 0.5f).GetDataArray(); AR(r, -0.5f, 0.5f, "Clamp"); }
+    [Fact] public void Clamp_InRange() { AR(E.TensorClamp(R([256], 1), -0.5f, 0.5f), -0.5f, 0.5f, "Clamp"); }
     [Fact] public void Clamp_MatchesClip() => AE(E.TensorClamp(R([64], 1), -0.5f, 0.5f), E.TensorClip(R([64], 1), -0.5f, 0.5f));
 
     // ================================================================
@@ -204,7 +204,7 @@ public class MathInvariantExtendedTests
     [Fact] public void RandomNormal_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorRandomNormal<float>(new[] { 4, 8 }, 0f, 1f).Shape);
     [Fact] public void RandomNormal_ApproxMean() { var d = E.TensorRandomNormal<float>(new[] { 1024 }, 5f, 1f).GetDataArray(); Assert.True(Math.Abs(d.Average() - 5f) < 0.2f); }
     [Fact] public void RandomUniform_Shape() => Assert.Equal(new[] { 4, 8 }, E.TensorRandomUniform<float>(new[] { 4, 8 }).Shape);
-    [Fact] public void RandomUniformRange_InRange() { var d = E.TensorRandomUniformRange<float>(new[] { 256 }, 2f, 5f, 42).GetDataArray(); AR(d, 2f, 5f, "UniformRange"); }
+    [Fact] public void RandomUniformRange_InRange() { AR(E.TensorRandomUniformRange<float>(new[] { 256 }, 2f, 5f, 42), 2f, 5f, "UniformRange"); }
 
     // ================================================================
     // TensorRepeatElements / TensorTile (3)
@@ -403,7 +403,7 @@ public class MathInvariantExtendedTests
     // PositionalEncoding (2)
     // ================================================================
     [Fact] public void PositionalEncoding_Shape() { var pos = new Tensor<float>(new float[] { 0, 1, 2, 3, 0, 1, 2, 3 }, [4, 2]); var enc = E.PositionalEncoding(pos, 4); Assert.Equal(2, enc.Shape.Length); Assert.Equal(4, enc.Shape[0]); }
-    [Fact] public void PositionalEncoding_Bounded() { var posData = Enumerable.Range(0, 8).Select(i => (float)i).ToArray(); var pos = new Tensor<float>(posData, [4, 2]); var enc = E.PositionalEncoding(pos, 4).GetDataArray(); AR(enc, -1.1f, 1.1f, "PosEnc"); }
+    [Fact] public void PositionalEncoding_Bounded() { var posData = Enumerable.Range(0, 8).Select(i => (float)i).ToArray(); var pos = new Tensor<float>(posData, [4, 2]); AR(E.PositionalEncoding(pos, 4), -1.1f, 1.1f, "PosEnc"); }
 
     // ================================================================
     // ELU activation (2)
