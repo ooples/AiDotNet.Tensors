@@ -573,10 +573,14 @@ public abstract class TensorBase<T> : IDisposable
     private static int ComputeProduct(int[] shape)
     {
         if (shape.Length == 0) return 1; // Scalar
-        int product = 1;
+        long product = 1;
         for (int i = 0; i < shape.Length; i++)
+        {
             product *= shape[i];
-        return product;
+            if (product > int.MaxValue)
+                throw new ArgumentException($"Shape product overflow: shape [{string.Join(", ", shape)}] exceeds int.MaxValue.");
+        }
+        return (int)product;
     }
 
     /// <summary>
