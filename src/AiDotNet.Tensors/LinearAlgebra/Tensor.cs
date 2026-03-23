@@ -790,9 +790,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
+        var a = this.Contiguous();
+        var b = other.Contiguous();
         var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Subtract(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
 
         return result;
     }
@@ -808,6 +809,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Vector<T> vector)
     {
+        var src = this.Contiguous();
         // Support both 2D and 3D tensors
         // For 2D: [batch, features] + [features] -> broadcasts vector across batch
         // For 3D: [batch, seq, features] + [features] -> broadcasts vector across batch and seq
@@ -818,15 +820,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             var result = TensorAllocator.Rent<T>(this._shape);
             int rowLength = this._shape[1];
-            // Use vectorized Add for each row (5-15x faster with AVX2)
-            var srcSpan = _data.AsSpan();
+            var srcSpan = src._data.AsSpan();
             var destSpan = result._data.AsWritableSpan();
             for (int i = 0; i < this._shape[0]; i++)
             {
                 int offset = i * rowLength;
-                var sourceRow = srcSpan.Slice(offset, rowLength);
-                var destRow = destSpan.Slice(offset, rowLength);
-                _numOps.Add(sourceRow, vector.AsSpan(), destRow);
+                _numOps.Add(srcSpan.Slice(offset, rowLength), vector.AsSpan(), destSpan.Slice(offset, rowLength));
             }
             return result;
         }
@@ -838,17 +837,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             var result = TensorAllocator.Rent<T>(this._shape);
             int lastDimLength = this._shape[2];
             int sliceSize = this._shape[1] * this._shape[2];
-            // Use vectorized Add for each row in the last dimension (5-15x faster with AVX2)
-            var srcSpan = _data.AsSpan();
+            var srcSpan = src._data.AsSpan();
             var destSpan = result._data.AsWritableSpan();
             for (int i = 0; i < this._shape[0]; i++)
             {
                 for (int j = 0; j < this._shape[1]; j++)
                 {
                     int offset = i * sliceSize + j * lastDimLength;
-                    var sourceSlice = srcSpan.Slice(offset, lastDimLength);
-                    var destSlice = destSpan.Slice(offset, lastDimLength);
-                    _numOps.Add(sourceSlice, vector.AsSpan(), destSlice);
+                    _numOps.Add(srcSpan.Slice(offset, lastDimLength), vector.AsSpan(), destSpan.Slice(offset, lastDimLength));
                 }
             }
             return result;
@@ -882,19 +878,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public void SetSlice(int index, Tensor<T> slice)
     {
         if (index < 0 || index >= Shape[0])
-        {
             throw new ArgumentOutOfRangeException(nameof(index));
-        }
 
-        // TensorValidator.ValidateShape(slice, [.._shape.Skip(1)]);
-
-        int sliceSize = slice.Length;
-        int offset = index * sliceSize;
-
-        // Use vectorized Copy operation for SIMD acceleration (5-15x faster with AVX2)
-        // Use internal AsWritableSpan to get writable span - do NOT use implicit T[] conversion
-        var destSpan = _data.AsWritableSpan().Slice(offset, sliceSize);
-        _numOps.Copy(slice._data.AsSpan(), destSpan);
+        // View-safe: get a view into target location, then copy data through CopyFromArray
+        var target = this.Slice(index);
+        target.CopyFromArray(slice.Contiguous().ToArray());
     }
 
     /// <summary>
@@ -917,8 +905,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
-        // Use vectorized Dot product for SIMD acceleration (10-15x faster with AVX2)
-        return _numOps.Dot(_data.AsSpan(), other._data.AsSpan());
+        var a = this.Contiguous();
+        var b = other.Contiguous();
+        return _numOps.Dot(a._data.AsSpan(), b._data.AsSpan());
     }
 
     /// <summary>
@@ -932,7 +921,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void Fill(T value)
     {
-        _numOps.Fill(_data.AsWritableSpan(), value);
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            _numOps.Fill(_data.AsWritableSpan(), value);
+        }
+        else
+        {
+            // View-safe: fill element by element through strides
+            for (int i = 0; i < Length; i++)
+                SetFlat(i, value);
+        }
     }
 
     /// <summary>
@@ -1013,8 +1011,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Scale(T factor)
     {
+        var src = this.Contiguous();
         var result = TensorAllocator.Rent<T>(this._shape);
-        _numOps.MultiplyScalar(_data.AsSpan(), factor, result._data.AsWritableSpan());
+        _numOps.MultiplyScalar(src._data.AsSpan(), factor, result._data.AsWritableSpan());
         return result;
     }
 
@@ -1189,9 +1188,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
+        var a = this.Contiguous();
+        var b = other.Contiguous();
         var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Subtract(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
 
         return result;
     }
@@ -1209,7 +1209,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
-        _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
+        var b = other.Contiguous();
+        _numOps.Subtract(this.AsSpan(), b._data.AsSpan(), this.AsWritableSpan());
     }
 
     /// <summary>
@@ -1232,8 +1233,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (axes == null || axes.Length == 0)
         {
-            // Sum all elements using vectorized Sum operation for SIMD acceleration (5-15x faster with AVX2)
-            T sum = _numOps.Sum(_data.AsSpan());
+            var src = this.Contiguous();
+            T sum = _numOps.Sum(src._data.AsSpan());
             return new Tensor<T>([1], new Vector<T>([sum]));
         }
 
@@ -1273,15 +1274,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetSlice(int start, int length)
     {
-        if (start < 0 || start >= _data.Length)
+        if (start < 0 || start >= Length)
             throw new ArgumentOutOfRangeException(nameof(start), "Start index must be within bounds of the tensor data.");
-        if (length < 0 || start + length > _data.Length)
+        if (length < 0 || start + length > Length)
             throw new ArgumentOutOfRangeException(nameof(length), "Length must not exceed remaining elements from start.");
 
+        var src = this.Contiguous();
         var result = new Vector<T>(length);
-        var sourceSpan = _data.AsSpan().Slice(start, length);
-        var destSpan = result.AsWritableSpan();
-        _numOps.Copy(sourceSpan, destSpan);
+        var sourceSpan = src._data.AsSpan().Slice(start, length);
+        _numOps.Copy(sourceSpan, result.AsWritableSpan());
         return result;
     }
 
@@ -1306,14 +1307,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public (T maxVal, int maxIndex) Max()
     {
-        // Use vectorized Max to find the value quickly (5-15x faster with AVX2)
-        T maxVal = _numOps.Max(_data.AsSpan());
+        var src = this.Contiguous();
+        T maxVal = _numOps.Max(src._data.AsSpan());
 
-        // Find the index of the max value (requires linear scan)
+        // Find the logical index of the max value
         int maxIndex = 0;
-        for (int i = 0; i < _data.Length; i++)
+        for (int i = 0; i < Length; i++)
         {
-            if (_numOps.Equals(_data[i], maxVal))
+            if (_numOps.Equals(src._data[i], maxVal))
             {
                 maxIndex = i;
                 break;
@@ -1435,7 +1436,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(T scalar)
     {
-        return new Tensor<T>(_shape, _data.Multiply(scalar));
+        var src = this.Contiguous();
+        return new Tensor<T>(_shape, src._data.Multiply(scalar));
     }
 
     /// <summary>
@@ -1447,7 +1449,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void MultiplyInPlace(T scalar)
     {
-        _numOps.MultiplyScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
+        _numOps.MultiplyScalar(this.AsSpan(), scalar, this.AsWritableSpan());
     }
 
     /// <summary>
@@ -1460,8 +1462,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Divide(T scalar)
     {
+        var src = this.Contiguous();
         var result = TensorAllocator.Rent<T>(_shape);
-        _numOps.DivideScalar(_data.AsSpan(), scalar, result._data.AsWritableSpan());
+        _numOps.DivideScalar(src._data.AsSpan(), scalar, result._data.AsWritableSpan());
         return result;
     }
 
@@ -1474,7 +1477,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void DivideInPlace(T scalar)
     {
-        _numOps.DivideScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
+        _numOps.DivideScalar(this.AsSpan(), scalar, this.AsWritableSpan());
     }
 
     /// <summary>
@@ -1703,10 +1706,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (ShapeEquals(this._shape, other._shape))
         {
-            // Simple case: tensors have the same shape
+            var a = this.Contiguous();
+            var b = other.Contiguous();
             var result = TensorAllocator.Rent<T>(this._shape);
-            // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
-            _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+            _numOps.Multiply(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
             return result;
         }
         else
@@ -2028,10 +2031,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T Mean()
     {
-        // Use vectorized Sum for SIMD acceleration (8-12x speedup with AVX2)
-        T sum = _numOps.Sum(_data.AsSpan());
+        var src = this.Contiguous();
+        T sum = _numOps.Sum(src._data.AsSpan());
 
-        return _numOps.Divide(sum, _numOps.FromDouble(_data.Length));
+        return _numOps.Divide(sum, _numOps.FromDouble(Length));
     }
 
     /// <summary>
@@ -2239,25 +2242,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Vector<T> GetRow(int rowIndex)
     {
         if (rowIndex < 0 || rowIndex >= Shape[0])
-        {
             throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index is out of range.");
-        }
 
-        int rowLength = 1;
-        for (int i = 1; i < Shape.Length; i++)
-        {
-            rowLength *= Shape[i];
-        }
-
-        Vector<T> row = new Vector<T>(rowLength);
-        int startIndex = rowIndex * rowLength;
-
-        for (int i = 0; i < rowLength; i++)
-        {
-            row[i] = _data[startIndex + i];
-        }
-
-        return row;
+        // View-safe: use Slice to get a view of the row, then materialize
+        var rowTensor = this.Slice(rowIndex).Contiguous();
+        return new Vector<T>(rowTensor.ToArray());
     }
 
     /// <summary>
@@ -2436,11 +2425,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> ElementwiseMultiply(Tensor<T> a, Tensor<T> b)
     {
-        // TensorValidator.ValidateShape(a, b._shape);
-
+        var ac = a.Contiguous();
+        var bc = b.Contiguous();
         Tensor<T> result = new Tensor<T>(a._shape);
-        // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Multiply(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Multiply(ac._data.AsSpan(), bc._data.AsSpan(), result._data.AsWritableSpan());
 
         return result;
     }
@@ -2828,11 +2816,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
-        // TensorValidator.ValidateShape(this, other._shape);
-
+        var a = this.Contiguous();
+        var b = other.Contiguous();
         var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Add(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Add(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
         return result;
     }
 
@@ -2849,7 +2836,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
-        _numOps.Add(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
+        var b = other.Contiguous();
+        _numOps.Add(this.AsSpan(), b._data.AsSpan(), this.AsWritableSpan());
     }
 
     /// <summary>
@@ -3013,10 +3001,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Check if shapes are already identical - use fast path (element-wise multiply)
         if (ShapeEquals(_shape, other._shape))
         {
-            // Element-wise multiplication, not matrix multiplication
+            var a = this.Contiguous();
+            var b = other.Contiguous();
             var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = _data.AsSpan();
-            var otherSpan = other._data.AsSpan();
+            var srcSpan = a._data.AsSpan();
+            var otherSpan = b._data.AsSpan();
             var destSpan = fastResult._data.AsWritableSpan();
             for (int i = 0; i < Length; i++)
             {
@@ -3091,9 +3080,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Check if shapes are already identical - use fast path (element-wise divide)
         if (ShapeEquals(_shape, other._shape))
         {
+            var a = this.Contiguous();
+            var b = other.Contiguous();
             var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = _data.AsSpan();
-            var otherSpan = other._data.AsSpan();
+            var srcSpan = a._data.AsSpan();
+            var otherSpan = b._data.AsSpan();
             var destSpan = fastResult._data.AsWritableSpan();
             for (int i = 0; i < Length; i++)
             {
@@ -3560,9 +3551,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSlice(int start, Vector<T> slice)
     {
+        // View-safe: use SetFlat which respects strides and offset
         for (int i = 0; i < slice.Length; i++)
         {
-            _data[start + i] = slice[i];
+            SetFlat(start + i, slice[i]);
         }
     }
 
@@ -3594,54 +3586,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (index < 0 || index >= Shape[dimension])
             throw new ArgumentOutOfRangeException(nameof(index), "Index is out of range for the specified dimension.");
 
-        // Check if the slice shape matches the expected shape
-        int[] expectedSliceShape = new int[Rank - 1];
-        for (int i = 0, j = 0; i < Rank; i++)
-        {
-            if (i != dimension)
-                expectedSliceShape[j++] = Shape[i];
-        }
-
-        // TensorValidator.ValidateShape(slice, expectedSliceShape);
-
-        // Calculate strides for source tensor
-        int[] strides = new int[Rank];
-        strides[Rank - 1] = 1;
-        for (int d = Rank - 2; d >= 0; d--)
-            strides[d] = strides[d + 1] * Shape[d + 1];
-
-        // Use recursive helper to copy elements
-        // Get data as array, modify it, then copy back
-        T[] destArray = _data.ToArray();
-        int sliceIdx = 0;
-        SetSliceRecursive(destArray, slice._data.ToArray(), _shape, expectedSliceShape, strides, dimension, index, 0, 0, ref sliceIdx);
-        CopyFromArray(destArray);
-    }
-
-    private void SetSliceRecursive(T[] dest, T[] source, int[] destShape, int[] sourceShape,
-        int[] destStrides, int sliceDim, int sliceIdx, int currentDim, int destOffset, ref int sourceIdx)
-    {
-        if (currentDim == destShape.Length)
-        {
-            dest[destOffset] = source[sourceIdx++];
-            return;
-        }
-
-        if (currentDim == sliceDim)
-        {
-            // Skip to the specific index in the slice dimension
-            int newDestOffset = destOffset + sliceIdx * destStrides[currentDim];
-            SetSliceRecursive(dest, source, destShape, sourceShape, destStrides, sliceDim, sliceIdx, currentDim + 1, newDestOffset, ref sourceIdx);
-        }
-        else
-        {
-            // Iterate through all indices in non-slice dimensions
-            for (int i = 0; i < destShape[currentDim]; i++)
-            {
-                int newDestOffset = destOffset + i * destStrides[currentDim];
-                SetSliceRecursive(dest, source, destShape, sourceShape, destStrides, sliceDim, sliceIdx, currentDim + 1, newDestOffset, ref sourceIdx);
-            }
-        }
+        // View-safe: get a view into the target location and copy data through it
+        var target = this.GetSliceAlongDimension(index, dimension);
+        target.CopyFromArray(slice.Contiguous().ToArray());
     }
 
     /// <summary>
@@ -3701,16 +3648,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
+        var src = this.Contiguous();
         var newShape = _shape.ToList();
         newShape.RemoveAt(axis);
         var result = new Tensor<T>([.. newShape]);
         int axisSize = Shape[axis];
 
-        // Use vectorized Sum for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
+        var srcSpan = src._data.AsSpan();
+        for (int i = 0; i < Length; i += axisSize)
         {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            result._data[i / axisSize] = _numOps.Sum(slice);
+            result._data[i / axisSize] = _numOps.Sum(srcSpan.Slice(i, axisSize));
         }
 
         return result;
@@ -3734,16 +3681,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
+        var src = this.Contiguous();
         var newShape = _shape.ToList();
         newShape.RemoveAt(axis);
         var result = new Tensor<T>([.. newShape]);
         int axisSize = Shape[axis];
 
-        // Use vectorized Max for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
+        var srcSpan = src._data.AsSpan();
+        for (int i = 0; i < Length; i += axisSize)
         {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            result._data[i / axisSize] = _numOps.Max(slice);
+            result._data[i / axisSize] = _numOps.Max(srcSpan.Slice(i, axisSize));
         }
 
         return result;
@@ -3767,17 +3714,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
+        var src = this.Contiguous();
         var newShape = _shape.ToList();
         newShape.RemoveAt(axis);
         var result = new Tensor<T>([.. newShape]);
         int axisSize = Shape[axis];
         T divisor = _numOps.FromDouble(axisSize);
 
-        // Use vectorized Sum for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
+        var srcSpan = src._data.AsSpan();
+        for (int i = 0; i < Length; i += axisSize)
         {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            T sum = _numOps.Sum(slice);
+            T sum = _numOps.Sum(srcSpan.Slice(i, axisSize));
             result._data[i / axisSize] = _numOps.Divide(sum, divisor);
         }
 
