@@ -41,6 +41,19 @@ public static class TensorAllocator
             return new Tensor<T>(shape);
         }
 
+        // Tier 0: Arena allocation — zero GC during training loops.
+        var arena = TensorArena.Current;
+        if (arena != null)
+        {
+            T[]? arenaArray = arena.TryAllocate<T>(totalSize);
+            if (arenaArray != null)
+            {
+                var memory = new Memory<T>(arenaArray, 0, totalSize);
+                return Tensor<T>.FromMemory(memory, shape);
+            }
+            // Arena full — fall through to other tiers
+        }
+
 #if NET5_0_OR_GREATER
         // Tier 1: Thread-local cache — zero allocation after warmup.
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
