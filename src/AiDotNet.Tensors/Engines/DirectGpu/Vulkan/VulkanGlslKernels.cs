@@ -308,8 +308,15 @@ void main() {
     float value = bdata[outer * fullDim + d];
     float gate = bdata[outer * fullDim + halfDim + d];
     float x3 = value * value * value;
-    float gelu = 0.5 * value * (1.0 + tanh(0.7978845608 * (value + 0.044715 * x3)));
-    c[outer * fullDim + d] = grad * gate;
+    float z = 0.7978845608 * (value + 0.044715 * x3);
+    float tanh_z = tanh(z);
+    float gelu = 0.5 * value * (1.0 + tanh_z);
+    // GELU derivative: 0.5*(1+tanh(z)) + 0.5*x*sech^2(z)*z'
+    // where z' = 0.7978845608 * (1 + 3*0.044715*x^2)
+    float sech2 = 1.0 - tanh_z * tanh_z;
+    float z_deriv = 0.7978845608 * (1.0 + 3.0 * 0.044715 * value * value);
+    float gelu_deriv = 0.5 * (1.0 + tanh_z) + 0.5 * value * sech2 * z_deriv;
+    c[outer * fullDim + d] = grad * gate * gelu_deriv;
     c[outer * fullDim + halfDim + d] = grad * gelu;
 }";
 

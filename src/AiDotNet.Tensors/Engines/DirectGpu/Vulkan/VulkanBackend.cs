@@ -192,7 +192,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
     {
-        string cacheKey = $"{glslSource.GetHashCode()}_{bindingCount}_{pushConstantSize}";
+        // Use SHA256 instead of GetHashCode to prevent cache key collisions
+        string sourceHash;
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        {
+            var hashBytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(glslSource));
+            sourceHash = BitConverter.ToString(hashBytes, 0, 8).Replace("-", "");
+        }
+        string cacheKey = $"{sourceHash}_{bindingCount}_{pushConstantSize}";
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
             return cached;
 
@@ -267,7 +274,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (size <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 1, pushConstantSize);
-        if (pipeline is null) return;
+        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbO = AsVulkan(O);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -286,7 +293,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (size <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
-        if (pipeline is null) return;
+        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -305,7 +312,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (size <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 5, pushConstantSize);
-        if (pipeline is null) return;
+        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D); var vbE = AsVulkan(E);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
