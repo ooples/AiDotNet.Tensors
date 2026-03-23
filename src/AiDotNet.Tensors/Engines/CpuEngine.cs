@@ -57,6 +57,8 @@ public class CpuEngine : ITensorLevelEngine
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static int[] RemoveAxis(int[] shape, int axis)
     {
+        if (axis < 0 || axis >= shape.Length)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for shape with {shape.Length} dimensions.");
         if (shape.Length <= 1) return new[] { 1 };
         var result = new int[shape.Length - 1];
         int dst = 0;
@@ -16946,6 +16948,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor.Shape.SequenceEqual(mask.Shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor.Shape)}] must match mask shape [{string.Join(", ", mask.Shape)}].");
 
         var result = tensor.Clone();
         var maskSpan = mask.AsSpan();
@@ -16986,8 +16990,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
-        if (tensor.Length != mask.Length)
-            throw new ArgumentException($"Tensor length ({tensor.Length}) must match mask length ({mask.Length}).");
+        if (!tensor.Shape.SequenceEqual(mask.Shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor.Shape)}] must match mask shape [{string.Join(", ", mask.Shape)}].");
 
         var result = tensor.Clone();
         var maskSpan = mask.AsSpan();

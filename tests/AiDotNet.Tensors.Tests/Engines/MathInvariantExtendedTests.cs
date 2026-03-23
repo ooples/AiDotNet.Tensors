@@ -549,7 +549,7 @@ public class MathInvariantExtendedTests
         var x = R([64], 220);
         var sig = E.TensorSigmoid(x);
         var grad = R([64], 221);
-        var dSig = E.SigmoidBackward(sig, grad);
+        var dSig = E.SigmoidBackward(grad, sig);
         Assert.Equal(new[] { 64 }, dSig.Shape);
         // Result should be non-zero since grad is non-zero
         Assert.True(dSig.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "SigmoidBackward all zeros");
@@ -560,7 +560,7 @@ public class MathInvariantExtendedTests
         var x = R([64], 222);
         var th = E.TensorTanh(x);
         var grad = R([64], 223);
-        var dTanh = E.TanhBackward(th, grad);
+        var dTanh = E.TanhBackward(grad, th);
         Assert.Equal(new[] { 64 }, dTanh.Shape);
         Assert.True(dTanh.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "TanhBackward all zeros");
     }
@@ -579,7 +579,7 @@ public class MathInvariantExtendedTests
         var x = R([4, 16], 222);
         var sm = E.Softmax(x, -1);
         var grad = R([4, 16], 223);
-        var dSm = E.SoftmaxBackward(sm, grad, -1);
+        var dSm = E.SoftmaxBackward(grad, sm, -1);
         Assert.Equal(new[] { 4, 16 }, dSm.Shape);
     }
 
