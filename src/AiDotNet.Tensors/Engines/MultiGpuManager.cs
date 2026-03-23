@@ -172,7 +172,7 @@ public class MultiGpuManager : IDisposable
     public Dictionary<int, Tensor<T>> DistributeTensor<T>(Tensor<T> tensor)
     {
         var result = new Dictionary<int, Tensor<T>>();
-        var data = tensor.AsSpan().ToArray();
+        var data = tensor.ToArray();
         var batchSize = tensor._shape[0];
         int chunkSize = batchSize / _devices.Count;
 

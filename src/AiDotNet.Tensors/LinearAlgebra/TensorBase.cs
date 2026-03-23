@@ -8,8 +8,9 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T>
+public abstract class TensorBase<T> : IDisposable
 {
+    private bool _disposed;
     // ================================================================
     // Core storage and metadata
     // ================================================================
@@ -261,8 +262,8 @@ public abstract class TensorBase<T>
         }
         else
         {
+            // New storage starts at refCount=1 — no extra AddRef needed
             _storage = new TensorStorage<T>(_data);
-            if (isView) _storage.AddRef();
         }
 
         Length = totalElements;
@@ -600,5 +601,12 @@ public abstract class TensorBase<T>
     public override string ToString()
     {
         return $"Tensor<{typeof(T).Name}> with shape {Shape}";
+    }
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _storage.Release();
+        GC.SuppressFinalize(this);
     }
 }
