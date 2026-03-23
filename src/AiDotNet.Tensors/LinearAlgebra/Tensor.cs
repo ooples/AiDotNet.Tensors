@@ -96,6 +96,57 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor for creating a VIEW into existing data with custom strides.
+    /// No data is copied — the view shares the same underlying memory.
+    /// This enables O(1) Transpose, Reshape, and Slice operations.
+    /// </summary>
+    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset)
+        : base(data, shape, strides, storageOffset, isView: true)
+    {
+    }
+
+    /// <summary>
+    /// Returns a contiguous tensor with the same data. If already contiguous, returns this
+    /// (zero-copy). Otherwise, materializes a new tensor with data in row-major order.
+    /// </summary>
+    /// <remarks>
+    /// <para>This follows the PyTorch .contiguous() pattern — call before passing to
+    /// BLAS/SIMD operations that require contiguous memory layout.</para>
+    /// <para><b>Performance:</b> O(1) when already contiguous (just returns this).
+    /// O(n) only when the tensor is a non-contiguous view (e.g., from Transpose).</para>
+    /// </remarks>
+    public Tensor<T> Contiguous()
+    {
+        if (IsContiguous) return this;
+
+        // Materialize: copy data from strided layout to contiguous row-major
+        var result = new Tensor<T>(Shape);
+        var srcData = _data.GetDataArray();
+        var dstData = result._data.AsWritableSpan();
+        var indices = new int[Rank];
+
+        for (int i = 0; i < Length; i++)
+        {
+            // Compute strided source index
+            int srcIdx = _storageOffset;
+            int remaining = i;
+            for (int d = 0; d < Rank; d++)
+            {
+                int dimSize = 1;
+                for (int dd = d + 1; dd < Rank; dd++)
+                    dimSize *= Shape[dd];
+                indices[d] = remaining / dimSize;
+                remaining %= dimSize;
+                srcIdx += indices[d] * _strides[d];
+            }
+
+            dstData[i] = srcData[srcIdx];
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Creates a new tensor from existing memory without copying data.
     /// </summary>
     /// <param name="memory">The memory to use as the tensor's backing store.</param>
