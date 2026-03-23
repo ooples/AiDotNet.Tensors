@@ -9,9 +9,9 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// <remarks>
 /// <para>This follows the PyTorch Storage model where the actual data lives in a Storage object
 /// and Tensor is a view into that storage with shape/stride metadata.</para>
-/// <para>Thread-safe reference counting tracks how many views share this storage.
-/// Currently used for diagnostics and future pool integration. Storage lifetime
-/// is managed by the GC; views increment/decrement the count for bookkeeping.</para>
+/// <para>Thread-safe reference counting tracks how many tensors/views share this storage.
+/// When a tensor is disposed, it calls Release() to decrement the count. When the count
+/// reaches zero the storage is eligible for GC (future: pool return).</para>
 /// </remarks>
 /// <typeparam name="T">The numeric type of the stored elements.</typeparam>
 internal sealed class TensorStorage<T>
@@ -32,10 +32,10 @@ internal sealed class TensorStorage<T>
     /// <summary>
     /// Creates a new storage with the specified size.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">Thrown when size is not positive.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when size is negative.</exception>
     internal TensorStorage(int size)
     {
-        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be positive.");
+        if (size < 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be non-negative.");
         _data = new Vector<T>(size);
         _refCount = 1;
     }

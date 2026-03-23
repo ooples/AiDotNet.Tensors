@@ -69,8 +69,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-        _shape = shape ?? throw new ArgumentNullException(nameof(shape));
-        Shape = new TensorShape(_shape);
+        _shape = (int[])(shape ?? throw new ArgumentNullException(nameof(shape))).Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
         Role = role;
         _ownsBuffer = ownsBuffer;
         _numOps = MathHelper.GetNumericOperations<T>();
@@ -101,8 +101,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     public GpuTensor(IDirectGpuBackend backend, T[] data, int[] shape, GpuTensorRole role)
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-        _shape = shape ?? throw new ArgumentNullException(nameof(shape));
-        Shape = new TensorShape(_shape);
+        _shape = (int[])(shape ?? throw new ArgumentNullException(nameof(shape))).Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
         Role = role;
         _ownsBuffer = true;
         _numOps = MathHelper.GetNumericOperations<T>();

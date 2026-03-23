@@ -760,7 +760,7 @@ internal sealed class GpuTensorWrapper : IGpuTensor
     {
         Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
         _shape = new[] { buffer.Size };
-        Shape = new TensorShape(_shape);
+        Shape = TensorShape.WrapUnsafe(_shape);
         Role = role;
     }
 

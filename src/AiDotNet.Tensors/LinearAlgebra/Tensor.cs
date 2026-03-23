@@ -2877,12 +2877,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
-        // TensorValidator.ValidateShape(this, other._shape);
+        if (!ShapeEquals(_shape, other._shape))
+            throw new ArgumentException("Tensors must have the same shape for addition.");
 
-        var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Add(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
-        return result;
+        if (IsContiguous && other.IsContiguous)
+        {
+            var result = TensorAllocator.Rent<T>(_shape);
+            _numOps.Add(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
+            return result;
+        }
+
+        return Contiguous().Add(other.Contiguous());
     }
 
     /// <summary>
