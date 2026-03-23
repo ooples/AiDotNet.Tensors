@@ -35,7 +35,7 @@ public class TensorLevelOpsTests
         var tensor = new Tensor<float>(new[] { 2, 3 });
         var result = _engine.TensorSigmoid(tensor);
 
-        Assert.Equal(new[] { 2, 3 }, result._shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
     }
 
     #endregion
@@ -216,7 +216,7 @@ public class TensorLevelOpsTests
 
         var result = _engine.TensorLayerNorm(input, gamma, beta, 1e-5);
 
-        Assert.Equal(new[] { 2, 3 }, result._shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
         // After normalization with identity gamma and zero beta,
         // each row should have mean ~0 and std ~1
 
@@ -281,7 +281,7 @@ public class TensorLevelOpsTests
         // Std along axis 0: std of [1,4], [2,5], [3,6]
         // Each pair has variance = ((x-mean)^2 + (y-mean)^2) / 2 = (1.5^2 + 1.5^2) / 2 = 2.25
         // Std = sqrt(2.25) = 1.5
-        Assert.Equal(new[] { 3 }, result._shape);
+        Assert.Equal(new[] { 3 }, result.Shape.ToArray());
         Assert.Equal(1.5f, result[0], Tolerance);
         Assert.Equal(1.5f, result[1], Tolerance);
         Assert.Equal(1.5f, result[2], Tolerance);
@@ -337,7 +337,7 @@ public class TensorLevelOpsTests
 
         var result = _engine.TensorLerp(a, b, 0.5f);
 
-        Assert.Equal(new[] { 2, 3 }, result._shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
     }
 
     #endregion
@@ -389,7 +389,7 @@ public class TensorLevelOpsTests
 
         var result = _engine.TensorAddScaled(a, b, 1f, 1f);
 
-        Assert.Equal(new[] { 2, 3 }, result._shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
     }
 
     #endregion
@@ -511,7 +511,7 @@ public class TensorLevelOpsTests
 
         var result = engine.TensorConv2D(input, kernel, stride: 1, padding: 0);
 
-        Assert.Equal(new[] { 1, 1, 2, 2 }, result._shape);
+        Assert.Equal(new[] { 1, 1, 2, 2 }, result.Shape.ToArray());
         for (int i = 0; i < result.Length; i++)
             Assert.Equal(9.0, result.AsSpan()[i], 1e-10);
     }
@@ -534,7 +534,7 @@ public class TensorLevelOpsTests
         var result = engine.TensorConv2D(input, kernel, stride: 1, padding: 0);
 
         // Output: [2, 1, 1, 1] — each batch produces a single value
-        Assert.Equal(new[] { 2, 1, 1, 1 }, result._shape);
+        Assert.Equal(new[] { 2, 1, 1, 1 }, result.Shape.ToArray());
         // batch 0: sum of 9 ones = 9
         Assert.Equal(9.0, result.AsSpan()[0], 1e-10);
         // batch 1: sum of 9 twos = 18
@@ -553,7 +553,7 @@ public class TensorLevelOpsTests
 
         var expected = engine.Conv2D(input, kernel, stride: 1, padding: 1);
 
-        var output = new Tensor<double>(expected._shape);
+        var output = new Tensor<double>(expected.Shape.ToArray());
         engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
 
         Assert.Equal(expected.Shape, output.Shape);
@@ -574,7 +574,7 @@ public class TensorLevelOpsTests
 
         var expected = engine.Conv2D(input, kernel, stride: 1, padding: 1);
 
-        var output = new Tensor<float>(expected._shape);
+        var output = new Tensor<float>(expected.Shape.ToArray());
         engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
 
         for (int i = 0; i < expected.Length; i++)

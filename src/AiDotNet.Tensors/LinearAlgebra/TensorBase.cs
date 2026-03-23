@@ -256,9 +256,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -274,9 +275,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -297,9 +299,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -389,8 +392,8 @@ public abstract class TensorBase<T>
         }
         set
         {
-            EnsureWritable();
             ValidateIndices(indices);
+            EnsureWritable();
             _data[GetFlatIndex(indices)] = value;
         }
     }
@@ -415,9 +418,16 @@ public abstract class TensorBase<T>
     /// </summary>
     public T this[int i0, int i1]
     {
-        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]];
+        get
+        {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1}] out of range for shape [{_shape[0]},{_shape[1]}].");
+            return _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]];
+        }
         set
         {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1}] out of range for shape [{_shape[0]},{_shape[1]}].");
             EnsureWritable();
             _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]] = value;
         }
@@ -428,9 +438,16 @@ public abstract class TensorBase<T>
     /// </summary>
     public T this[int i0, int i1, int i2]
     {
-        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]];
+        get
+        {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1] || (uint)i2 >= (uint)_shape[2])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1},{i2}] out of range for shape [{_shape[0]},{_shape[1]},{_shape[2]}].");
+            return _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]];
+        }
         set
         {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1] || (uint)i2 >= (uint)_shape[2])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1},{i2}] out of range for shape [{_shape[0]},{_shape[1]},{_shape[2]}].");
             EnsureWritable();
             _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]] = value;
         }
@@ -441,9 +458,16 @@ public abstract class TensorBase<T>
     /// </summary>
     public T this[int i0, int i1, int i2, int i3]
     {
-        get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]];
+        get
+        {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1] || (uint)i2 >= (uint)_shape[2] || (uint)i3 >= (uint)_shape[3])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1},{i2},{i3}] out of range for shape [{_shape[0]},{_shape[1]},{_shape[2]},{_shape[3]}].");
+            return _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]];
+        }
         set
         {
+            if ((uint)i0 >= (uint)_shape[0] || (uint)i1 >= (uint)_shape[1] || (uint)i2 >= (uint)_shape[2] || (uint)i3 >= (uint)_shape[3])
+                throw new ArgumentOutOfRangeException($"Index [{i0},{i1},{i2},{i3}] out of range for shape [{_shape[0]},{_shape[1]},{_shape[2]},{_shape[3]}].");
             EnsureWritable();
             _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]] = value;
         }

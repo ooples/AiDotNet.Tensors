@@ -171,6 +171,9 @@ public class MultiGpuManager : IDisposable
     /// <returns>Dictionary mapping device ID to its tensor portion.</returns>
     public Dictionary<int, Tensor<T>> DistributeTensor<T>(Tensor<T> tensor)
     {
+        if (_devices.Count == 0)
+            throw new InvalidOperationException("No GPU devices are available for tensor distribution.");
+
         var result = new Dictionary<int, Tensor<T>>();
         var data = tensor.AsSpan().ToArray();
         var batchSize = tensor._shape[0];

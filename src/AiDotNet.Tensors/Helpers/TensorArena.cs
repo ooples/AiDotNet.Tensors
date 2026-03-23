@@ -33,26 +33,28 @@ public sealed class TensorArena : IDisposable
     private static TensorArena? _current;
 
     /// <summary>
-    /// Pool of arrays allocated during warmup, keyed by element count.
-    /// Each size bucket holds a list of arrays available for reuse.
+    /// Pool of arrays allocated during warmup, keyed by (element type, element count).
+    /// Each bucket holds a list of arrays available for reuse.
     /// </summary>
-    private readonly Dictionary<int, List<Array>> _pool = new();
+    private readonly Dictionary<(Type, int), List<Array>> _pool = new();
 
     /// <summary>
-    /// Tracks the reuse cursor per size bucket — how many arrays of each size
+    /// Tracks the reuse cursor per bucket — how many arrays of each (type, size)
     /// have been handed out since the last Reset().
     /// </summary>
-    private readonly Dictionary<int, int> _cursor = new();
+    private readonly Dictionary<(Type, int), int> _cursor = new();
 
     private bool _disposed;
+    private readonly TensorArena? _previous;
 
     /// <summary>
     /// Gets the currently active arena for this thread, or null if none.
     /// </summary>
     internal static TensorArena? Current => _current;
 
-    private TensorArena()
+    private TensorArena(TensorArena? previous)
     {
+        _previous = previous;
     }
 
     /// <summary>
@@ -63,7 +65,7 @@ public sealed class TensorArena : IDisposable
     /// <returns>An arena that must be disposed to deactivate.</returns>
     public static TensorArena Create()
     {
-        var arena = new TensorArena();
+        var arena = new TensorArena(_current);
         _current = arena;
         return arena;
     }
@@ -79,20 +81,21 @@ public sealed class TensorArena : IDisposable
     {
         if (_disposed) return null;
 
-        if (!_pool.TryGetValue(elementCount, out var bucket))
+        var key = (typeof(T), elementCount);
+        if (!_pool.TryGetValue(key, out var bucket))
         {
             bucket = new List<Array>(4);
-            _pool[elementCount] = bucket;
-            _cursor[elementCount] = 0;
+            _pool[key] = bucket;
+            _cursor[key] = 0;
         }
 
-        int cursor = _cursor[elementCount];
+        int cursor = _cursor[key];
 
         if (cursor < bucket.Count)
         {
             // Reuse path: return existing array, advance cursor
             var existing = (T[])bucket[cursor];
-            _cursor[elementCount] = cursor + 1;
+            _cursor[key] = cursor + 1;
             // Zero the reused array for correctness
             Array.Clear(existing, 0, elementCount);
             return existing;
@@ -101,7 +104,7 @@ public sealed class TensorArena : IDisposable
         // Warmup path: allocate new array and track it
         var arr = new T[elementCount];
         bucket.Add(arr);
-        _cursor[elementCount] = cursor + 1;
+        _cursor[key] = cursor + 1;
         return arr;
     }
 
@@ -136,7 +139,7 @@ public sealed class TensorArena : IDisposable
         _disposed = true;
 
         if (_current == this)
-            _current = null;
+            _current = _previous; // restore outer arena if nested
 
         _pool.Clear();
         _cursor.Clear();
