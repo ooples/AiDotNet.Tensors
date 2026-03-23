@@ -18,7 +18,7 @@ public interface IGpuTensor<T> : IDisposable
     /// <summary>
     /// Gets the shape of the tensor.
     /// </summary>
-    int[] Shape { get; }
+    TensorShape Shape { get; }
 
     /// <summary>
     /// Gets the total number of elements in the tensor.
@@ -90,7 +90,7 @@ public interface IGpuTensor : IDisposable
     /// <summary>
     /// Gets the shape of the tensor.
     /// </summary>
-    int[] Shape { get; }
+    TensorShape Shape { get; }
 
     /// <summary>
     /// Gets the total number of elements in the tensor.

@@ -17,7 +17,6 @@ internal sealed class TensorStorage<T>
 {
     private readonly Vector<T> _data;
     private int _refCount;
-    private volatile bool _disposed;
 
     /// <summary>
     /// Creates a new storage wrapping an existing Vector (zero-copy).
@@ -85,10 +84,8 @@ internal sealed class TensorStorage<T>
             Interlocked.Increment(ref _refCount);
             throw new InvalidOperationException("TensorStorage released more times than it was acquired.");
         }
-        if (newCount == 0)
-        {
-            _disposed = true;
-        }
+        // When refCount reaches 0, storage can be reclaimed.
+        // Future: integrate with TensorAllocator pool return.
     }
 
     /// <summary>

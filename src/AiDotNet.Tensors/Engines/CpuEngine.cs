@@ -15419,7 +15419,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var shape = tensor.Shape.ToList();
+        var shape = tensor._shape.ToList();
 
         if (axis == -1)
         {
@@ -16152,7 +16152,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Build output shape (remove axis dimension)
-        var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
+        var outputShape = tensor._shape.Where((_, i) => i != axis).ToArray();
         if (outputShape.Length == 0) outputShape = new[] { 1 };
         var result = new Tensor<int>(outputShape);
 
@@ -16203,7 +16203,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Build output shape (remove axis dimension)
-        var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
+        var outputShape = tensor._shape.Where((_, i) => i != axis).ToArray();
         if (outputShape.Length == 0) outputShape = new[] { 1 };
         var result = new Tensor<int>(outputShape);
 
@@ -17325,7 +17325,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Calculate output shape (same as input but with axis dimension = k)
-        var outputShape = (int[])input.Shape.Clone();
+        var outputShape = (int[])input._shape.Clone();
         outputShape[axis] = k;
 
         var values = TensorAllocator.Rent<T>(outputShape);

@@ -34,8 +34,13 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     /// <inheritdoc/>
     public IGpuBuffer Buffer { get; }
 
+    /// <summary>
+    /// Internal shape array for direct access by same-assembly code.
+    /// </summary>
+    internal readonly int[] _shape;
+
     /// <inheritdoc/>
-    public int[] Shape { get; }
+    public TensorShape Shape { get; }
 
     /// <inheritdoc/>
     public int ElementCount { get; }
@@ -64,7 +69,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-        Shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        _shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        Shape = new TensorShape(_shape);
         Role = role;
         _ownsBuffer = ownsBuffer;
         _numOps = MathHelper.GetNumericOperations<T>();
@@ -95,7 +101,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     public GpuTensor(IDirectGpuBackend backend, T[] data, int[] shape, GpuTensorRole role)
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-        Shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        _shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        Shape = new TensorShape(_shape);
         Role = role;
         _ownsBuffer = true;
         _numOps = MathHelper.GetNumericOperations<T>();
@@ -287,7 +294,8 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
     private bool _disposed;
 
     public IGpuBuffer Buffer => _parent.Buffer;
-    public int[] Shape { get; }
+    internal readonly int[] _shape;
+    public TensorShape Shape { get; }
     public int ElementCount { get; }
     public GpuTensorRole Role => _parent.Role;
     public GpuSyncPoint? LastWriteSync => _parent.LastWriteSync;
@@ -298,7 +306,8 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
     {
         _parent = parent;
         _offset = offset;
-        Shape = shape;
+        _shape = shape;
+        Shape = new TensorShape(shape);
 
         ElementCount = 1;
         foreach (var dim in shape)

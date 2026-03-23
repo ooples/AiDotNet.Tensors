@@ -1,5 +1,6 @@
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu.Graph;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
 
@@ -729,8 +730,10 @@ internal sealed class GpuTensorWrapper : IGpuTensor
     /// <inheritdoc/>
     public IGpuBuffer Buffer { get; }
 
+    internal readonly int[] _shape;
+
     /// <inheritdoc/>
-    public int[] Shape { get; }
+    public TensorShape Shape { get; }
 
     /// <inheritdoc/>
     public GpuTensorRole Role { get; }
@@ -756,7 +759,8 @@ internal sealed class GpuTensorWrapper : IGpuTensor
     public GpuTensorWrapper(IGpuBuffer buffer, GpuTensorRole role)
     {
         Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-        Shape = new[] { buffer.Size };
+        _shape = new[] { buffer.Size };
+        Shape = new TensorShape(_shape);
         Role = role;
     }
 

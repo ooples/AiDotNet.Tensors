@@ -182,7 +182,7 @@ public class MultiGpuManager : IDisposable
         for (int i = 0; i < _devices.Count; i++)
         {
             int samples = chunkSize + (i < batchSize % _devices.Count ? 1 : 0);
-            var newShape = (int[])tensor.Shape.Clone();
+            var newShape = (int[])tensor._shape.Clone();
             newShape[0] = samples;
 
             var chunk = new Tensor<T>(newShape);
