@@ -150,8 +150,8 @@ public class MathInvariantExtendedTests
     // ================================================================
     // TensorMaskedFill (2)
     // ================================================================
-    [SkippableFact] public void MaskedFill_FillsTrue() { Skip.If(Environment.Version.Major < 5, "Tensor<bool> requires .NET 5+");  var x = R([4, 4], 1); var mask = new Tensor<bool>(Enumerable.Repeat(true, 16).ToArray(), [4, 4]); var r = E.TensorMaskedFill(x, mask, 99f).GetDataArray(); for (int i = 0; i < r.Length; i++) Assert.Equal(99f, r[i], Tol); }
-    [SkippableFact] public void MaskedFill_PreservesFalse() { Skip.If(Environment.Version.Major < 5, "Tensor<bool> requires .NET 5+");  var x = R([4, 4], 1); var mask = new Tensor<bool>(Enumerable.Repeat(false, 16).ToArray(), [4, 4]); AE(E.TensorMaskedFill(x, mask, 99f), x); }
+    [Fact] public void MaskedFill_FillsTrue() { var x = R([4, 4], 1); var mask = new Tensor<Bit>(Enumerable.Repeat(Bit.True, 16).ToArray(), [4, 4]); var r = E.TensorMaskedFill(x, mask, 99f).GetDataArray(); for (int i = 0; i < r.Length; i++) Assert.Equal(99f, r[i], Tol); }
+    [Fact] public void MaskedFill_PreservesFalse() { var x = R([4, 4], 1); var mask = new Tensor<Bit>(Enumerable.Repeat(Bit.False, 16).ToArray(), [4, 4]); AE(E.TensorMaskedFill(x, mask, 99f), x); }
 
     // ================================================================
     // TensorMatMul (2D) (2)
@@ -230,9 +230,9 @@ public class MathInvariantExtendedTests
     // ================================================================
     // TensorWhere (3)
     // ================================================================
-    [SkippableFact] public void Where_AllTrue_IsX() { Skip.If(Environment.Version.Major < 5, "Tensor<bool> requires .NET 5+");  var x = R([64], 1); var y = R([64], 2); var mask = new Tensor<bool>(Enumerable.Repeat(true, 64).ToArray(), [64]); AE(E.TensorWhere(mask, x, y), x); }
-    [SkippableFact] public void Where_AllFalse_IsY() { Skip.If(Environment.Version.Major < 5, "Tensor<bool> requires .NET 5+");  var x = R([64], 1); var y = R([64], 2); var mask = new Tensor<bool>(Enumerable.Repeat(false, 64).ToArray(), [64]); AE(E.TensorWhere(mask, x, y), y); }
-    [SkippableFact] public void Where_Shape() { Skip.If(Environment.Version.Major < 5, "Tensor<bool> requires .NET 5+");  var x = R([4, 8], 1); var y = R([4, 8], 2); var mask = new Tensor<bool>(Enumerable.Repeat(true, 32).ToArray(), [4, 8]); Assert.Equal(x.Shape, E.TensorWhere(mask, x, y).Shape); }
+    [Fact] public void Where_AllTrue_IsX() { var x = R([64], 1); var y = R([64], 2); var mask = new Tensor<Bit>(Enumerable.Repeat(Bit.True, 64).ToArray(), [64]); AE(E.TensorWhere(mask, x, y), x); }
+    [Fact] public void Where_AllFalse_IsY() { var x = R([64], 1); var y = R([64], 2); var mask = new Tensor<Bit>(Enumerable.Repeat(Bit.False, 64).ToArray(), [64]); AE(E.TensorWhere(mask, x, y), y); }
+    [Fact] public void Where_Shape() { var x = R([4, 8], 1); var y = R([4, 8], 2); var mask = new Tensor<Bit>(Enumerable.Repeat(Bit.True, 32).ToArray(), [4, 8]); Assert.Equal(x.Shape, E.TensorWhere(mask, x, y).Shape); }
 
     // ================================================================
     // TensorTopK (2)
