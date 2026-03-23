@@ -15569,8 +15569,8 @@ public class CpuEngine : ITensorLevelEngine
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
 
-        // Compute exp(x - max)
-        var shifted = TensorSubtract(tensor, maxVals);
+        // Compute exp(x - max) — broadcast subtract since maxVals has reduced axis
+        var shifted = TensorBroadcastSubtract(tensor, maxVals);
         var expShifted = TensorExp(shifted);
 
         // Sum along axis
@@ -16070,8 +16070,8 @@ public class CpuEngine : ITensorLevelEngine
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
-        // Divide
-        return TensorDivide(tensor, norm);
+        // Divide — broadcast since norm has reduced axis
+        return TensorBroadcastDivide(tensor, norm);
     }
 
     /// <inheritdoc/>
