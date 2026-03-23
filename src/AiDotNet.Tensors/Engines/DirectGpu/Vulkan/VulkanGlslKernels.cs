@@ -276,6 +276,74 @@ void main() {
     b[idx] = value * sig * gate;
 }";
 
+    // Backward gated activation GLSL kernels.
+    // a[] = gradOutput [outerSize * halfDim]
+    // bdata[] = original input [outerSize * halfDim * 2]  (first half = value, second half = gate)
+    // c[] = gradInput [outerSize * halfDim * 2]  (first half = dValue, second half = dGate)
+    // Each thread computes ONE output pair (dValue[idx], dGate[idx]) from gradOutput[idx] and input.
+
+    public static string GluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float sig = 1.0 / (1.0 + exp(-gate));
+    c[outer * fullDim + d] = grad * sig;
+    c[outer * fullDim + halfDim + d] = grad * value * sig * (1.0 - sig);
+}";
+
+    public static string GeGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float x3 = value * value * value;
+    float gelu = 0.5 * value * (1.0 + tanh(0.7978845608 * (value + 0.044715 * x3)));
+    c[outer * fullDim + d] = grad * gate;
+    c[outer * fullDim + halfDim + d] = grad * gelu;
+}";
+
+    public static string ReGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    c[outer * fullDim + d] = grad * gate * (value > 0.0 ? 1.0 : 0.0);
+    c[outer * fullDim + halfDim + d] = grad * max(value, 0.0);
+}";
+
+    public static string SwiGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float sig = 1.0 / (1.0 + exp(-value));
+    float swish = value * sig;
+    float swish_deriv = sig + value * sig * (1.0 - sig);
+    c[outer * fullDim + d] = grad * gate * swish_deriv;
+    c[outer * fullDim + halfDim + d] = grad * swish;
+}";
+
     public static string ReluDerivative => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {
