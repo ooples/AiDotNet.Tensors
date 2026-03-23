@@ -32,7 +32,7 @@ public class Issue42Tests
 
         var result = _engine.TensorMultiply(a, b);
 
-        Assert.Equal(new[] { 1, 4, 4, 4 }, result.Shape);
+        Assert.Equal(new[] { 1, 4, 4, 4 }, result.Shape.ToArray());
         // Channel 0 should be scaled by 2, channel 3 by 5
         Assert.Equal(2.0, result[0, 0, 0, 0], Tolerance);
         Assert.Equal(5.0, result[0, 0, 0, 3], Tolerance);
@@ -47,7 +47,7 @@ public class Issue42Tests
 
         var result = _engine.TensorMultiply(a, b);
 
-        Assert.Equal(new[] { 4, 2 }, result.Shape);
+        Assert.Equal(new[] { 4, 2 }, result.Shape.ToArray());
         Assert.Equal(10.0, result[0, 0], Tolerance);
         Assert.Equal(80.0, result[3, 1], Tolerance);
     }
@@ -61,7 +61,7 @@ public class Issue42Tests
 
         var result = _engine.TensorMultiply(a, b);
 
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         Assert.Equal(5f, result[0, 0], FloatTolerance);
         Assert.Equal(32f, result[1, 1], FloatTolerance);
     }
@@ -75,7 +75,7 @@ public class Issue42Tests
 
         var result = _engine.TensorMultiply(a, b);
 
-        Assert.Equal(new[] { 3, 4 }, result.Shape);
+        Assert.Equal(new[] { 3, 4 }, result.Shape.ToArray());
         Assert.Equal(10.0, result[0, 0], Tolerance);   // 1 * 10
         Assert.Equal(40.0, result[0, 3], Tolerance);   // 4 * 10
         Assert.Equal(100.0, result[1, 0], Tolerance);  // 5 * 20

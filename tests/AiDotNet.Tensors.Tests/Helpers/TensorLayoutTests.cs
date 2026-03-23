@@ -11,7 +11,7 @@ public class TensorLayoutTests
     {
         var nchw = new Tensor<float>(new[] { 2, 3, 4, 5 });
         var nhwc = TensorLayout.ToNHWC(nchw);
-        Assert.Equal(new[] { 2, 4, 5, 3 }, nhwc.Shape);
+        Assert.Equal(new[] { 2, 4, 5, 3 }, nhwc.Shape.ToArray());
     }
 
     [Fact]
@@ -19,7 +19,7 @@ public class TensorLayoutTests
     {
         var nhwc = new Tensor<float>(new[] { 2, 4, 5, 3 });
         var nchw = TensorLayout.ToNCHW(nhwc);
-        Assert.Equal(new[] { 2, 3, 4, 5 }, nchw.Shape);
+        Assert.Equal(new[] { 2, 3, 4, 5 }, nchw.Shape.ToArray());
     }
 
     [Fact]

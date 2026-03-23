@@ -535,6 +535,20 @@ public abstract class TensorBase<T>
     }
 
     /// <summary>
+    /// Compares two shape arrays for equality without LINQ allocation.
+    /// Replaces SequenceEqual which allocates an enumerator per call.
+    /// </summary>
+    internal static bool ShapeEquals(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Validates that shape dimensions are non-negative.
     /// Zero-size dimensions are allowed (empty tensors for empty batches, masks, etc.).
     /// Negative dimensions are rejected.

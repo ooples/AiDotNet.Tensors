@@ -152,6 +152,111 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Inserts a size-1 dimension at the specified axis. O(1) view — no data copy.
+    /// </summary>
+    /// <param name="axis">The position at which to insert the new dimension (0 to Rank inclusive).</param>
+    /// <returns>A new tensor view with one additional dimension of size 1.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This adds a "trivial" dimension to your tensor. For example,
+    /// a tensor with shape [3, 4] becomes [1, 3, 4] with axis=0, or [3, 1, 4] with axis=1,
+    /// or [3, 4, 1] with axis=2. The data doesn't change — only the metadata does.</para>
+    /// <para>This is the inverse of <see cref="Squeeze(int)"/>.</para>
+    /// </remarks>
+    public Tensor<T> ExpandDims(int axis)
+    {
+        if (axis < 0 || axis > Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis must be between 0 and {Rank}.");
+
+        int newRank = Rank + 1;
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+
+        for (int i = 0, src = 0; i < newRank; i++)
+        {
+            if (i == axis)
+            {
+                newShape[i] = 1;
+                // stride for size-1 dim is irrelevant (never used in index calc), but
+                // set it to the stride of the next dim for contiguity checks.
+                newStrides[i] = src < Rank ? _strides[src] : 1;
+            }
+            else
+            {
+                newShape[i] = _shape[src];
+                newStrides[i] = _strides[src];
+                src++;
+            }
+        }
+
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+    }
+
+    /// <summary>
+    /// Removes a size-1 dimension at the specified axis. O(1) view — no data copy.
+    /// </summary>
+    /// <param name="axis">The dimension to remove (must have size 1).</param>
+    /// <returns>A new tensor view with that dimension removed.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This removes a "trivial" dimension from your tensor. For example,
+    /// a tensor with shape [1, 3, 4] becomes [3, 4] when you squeeze axis 0.</para>
+    /// <para>This is the inverse of <see cref="ExpandDims(int)"/>.</para>
+    /// </remarks>
+    public Tensor<T> Squeeze(int axis)
+    {
+        if (axis < 0 || axis >= Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis must be between 0 and {Rank - 1}.");
+        if (_shape[axis] != 1)
+            throw new ArgumentException($"Can only squeeze dimensions of size 1, but dimension {axis} has size {_shape[axis]}.");
+
+        int newRank = Rank - 1;
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+        for (int i = 0, dst = 0; i < Rank; i++)
+        {
+            if (i != axis)
+            {
+                newShape[dst] = _shape[i];
+                newStrides[dst] = _strides[i];
+                dst++;
+            }
+        }
+
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+    }
+
+    /// <summary>
+    /// Removes all size-1 dimensions. O(1) view — no data copy.
+    /// </summary>
+    /// <returns>A new tensor view with all size-1 dimensions removed.</returns>
+    public Tensor<T> Squeeze()
+    {
+        // Count non-one dimensions
+        int newRank = 0;
+        for (int i = 0; i < Rank; i++)
+        {
+            if (_shape[i] != 1)
+                newRank++;
+        }
+
+        if (newRank == Rank)
+            return this; // No size-1 dims to squeeze
+
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+        for (int i = 0, dst = 0; i < Rank; i++)
+        {
+            if (_shape[i] != 1)
+            {
+                newShape[dst] = _shape[i];
+                newStrides[dst] = _strides[i];
+                dst++;
+            }
+        }
+
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+    }
+
+    /// <summary>
     /// Creates a new tensor from existing memory without copying data.
     /// </summary>
     /// <param name="memory">The memory to use as the tensor's backing store.</param>
@@ -273,7 +378,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public IEnumerator<T> GetEnumerator()
     {
-        return ((IEnumerable<T>)_data).GetEnumerator();
+        // View-safe: iterate logical elements via GetFlat, not raw storage
+        for (int i = 0; i < Length; i++)
+            yield return GetFlat(i);
     }
 
     /// <summary>
@@ -439,50 +546,26 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> SubTensor(params int[] indices)
     {
-        if (indices.Length > Shape.Length)
+        if (indices.Length > Rank)
             throw new ArgumentException("Number of indices exceeds tensor dimensions.");
 
-        int[] newShape = new int[Shape.Length - indices.Length];
-        for (int i = 0; i < newShape.Length; i++)
+        // O(1) view: fix leading dimensions by advancing offset, drop those dimensions.
+        int newRank = Rank - indices.Length;
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+        Array.Copy(_shape, indices.Length, newShape, 0, newRank);
+        Array.Copy(_strides, indices.Length, newStrides, 0, newRank);
+
+        int newOffset = _storageOffset;
+        for (int i = 0; i < indices.Length; i++)
         {
-            newShape[i] = Shape[indices.Length + i];
+            if (indices[i] < 0 || indices[i] >= _shape[i])
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {indices[i]} is out of range for dimension {i} with size {_shape[i]}.");
+            newOffset += indices[i] * _strides[i];
         }
 
-        Tensor<T> subTensor = new Tensor<T>(newShape);
-        int[] currentIndices = new int[Shape.Length];
-        Array.Copy(indices, currentIndices, indices.Length);
-        CopySubTensorData(this, subTensor, currentIndices, indices.Length, indices.Length);
-
-        return subTensor;
-    }
-
-    /// <summary>
-    /// Helper method to recursively copy data from a source tensor to a destination sub-tensor.
-    /// </summary>
-    /// <param name="source">The source tensor to copy from.</param>
-    /// <param name="destination">The destination tensor to copy to.</param>
-    /// <param name="currentIndices">The current indices being processed.</param>
-    /// <param name="fixedDimensions">The number of dimensions that were originally fixed in SubTensor call.</param>
-    /// <param name="currentDimension">The current dimension being iterated (starts at fixedDimensions).</param>
-    private static void CopySubTensorData(Tensor<T> source, Tensor<T> destination, int[] currentIndices, int fixedDimensions, int currentDimension)
-    {
-        if (currentDimension == source._shape.Length)
-        {
-            // Extract destination indices from the unfixed portion of currentIndices
-            int[] destIndices = new int[destination._shape.Length];
-            for (int i = 0; i < destIndices.Length; i++)
-            {
-                destIndices[i] = currentIndices[fixedDimensions + i];
-            }
-            destination[destIndices] = source[currentIndices];
-            return;
-        }
-
-        for (int i = 0; i < source._shape[currentDimension]; i++)
-        {
-            currentIndices[currentDimension] = i;
-            CopySubTensorData(source, destination, currentIndices, fixedDimensions, currentDimension + 1);
-        }
+        return new Tensor<T>(_data, newShape, newStrides, newOffset);
     }
 
     /// <summary>
@@ -704,7 +787,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseSubtract(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
         var result = TensorAllocator.Rent<T>(_shape);
@@ -831,7 +914,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T DotProduct(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
         // Use vectorized Dot product for SIMD acceleration (10-15x faster with AVX2)
@@ -900,14 +983,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int index)
     {
+        if (Rank == 0)
+            throw new InvalidOperationException("Cannot slice a scalar (rank-0) tensor.");
         if (index < 0 || index >= _shape[0])
-        {
             throw new ArgumentOutOfRangeException(nameof(index));
-        }
 
         // O(1) view: adjust offset by index * stride[0], drop first dimension.
-        var newShape = _shape[1..];
-        var newStrides = _strides[1..];
+        int newRank = Rank - 1;
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+        Array.Copy(_shape, 1, newShape, 0, newRank);
+        Array.Copy(_strides, 1, newStrides, 0, newRank);
         int newOffset = _storageOffset + index * _strides[0];
 
         return new Tensor<T>(_data, newShape, newStrides, newOffset);
@@ -1002,7 +1088,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Validate that all tensors have the same shape
         for (int i = 1; i < tensors.Length; i++)
         {
-            if (!tensors[i]._shape.SequenceEqual(tensors[0]._shape))
+            if (!ShapeEquals(tensors[i]._shape, tensors[0]._shape))
                 throw new ArgumentException("All tensors must have the same shape for stacking.");
         }
 
@@ -1060,8 +1146,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (permutation.Length != Rank)
             throw new ArgumentException("Permutation array length must match tensor rank.");
 
-        if (!permutation.OrderBy(x => x).SequenceEqual(Enumerable.Range(0, Rank)))
-            throw new ArgumentException("Invalid permutation array.");
+        // Validate permutation is a valid bijection [0..Rank) — O(Rank), zero allocation.
+        // Uses a single int as a bitmask for Rank <= 32 (covers all practical tensor ranks).
+        int seen = 0;
+        for (int i = 0; i < Rank; i++)
+        {
+            int p = permutation[i];
+            if (p < 0 || p >= Rank || (seen & (1 << p)) != 0)
+                throw new ArgumentException("Invalid permutation array.");
+            seen |= (1 << p);
+        }
 
         // O(1) view: permute shape and strides, share storage. Zero data movement.
         var newShape = new int[Rank];
@@ -1092,7 +1186,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Subtract(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
         var result = TensorAllocator.Rent<T>(_shape);
@@ -1112,7 +1206,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SubtractInPlace(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
@@ -1251,7 +1345,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
-        int newTotal = newShape.Aggregate(1, (a, b) => a * b);
+        int newTotal = 1;
+        for (int i = 0; i < newShape.Length; i++)
+            newTotal *= newShape[i];
+
         if (newTotal != Length)
             throw new ArgumentException(
                 $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
@@ -1604,7 +1701,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> PointwiseMultiply(Tensor<T> other)
     {
-        if (this._shape.SequenceEqual(other._shape))
+        if (ShapeEquals(this._shape, other._shape))
         {
             // Simple case: tensors have the same shape
             var result = TensorAllocator.Rent<T>(this._shape);
@@ -2054,9 +2151,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T GetFlatIndexValue(int flatIndex)
     {
-        int[] indices = new int[Rank];
-        GetIndicesFromFlatIndex(flatIndex, indices);
-        return this[indices];
+        return GetFlat(flatIndex);
     }
 
     /// <summary>
@@ -2098,12 +2193,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetFlatIndex(int flatIndex, T value)
     {
-        if (flatIndex < 0 || flatIndex >= _data.Length)
-        {
-            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        }
-
-        _data[flatIndex] = value;
+        SetFlat(flatIndex, value);
     }
 
     /// <summary>
@@ -2126,9 +2216,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetFlatIndexValue(int flatIndex, T value)
     {
-        int[] indices = new int[Rank];
-        GetIndicesFromFlatIndex(flatIndex, indices);
-        this[indices] = value;
+        SetFlat(flatIndex, value);
     }
 
     /// <summary>
@@ -2377,7 +2465,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseMultiply(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same dimensions for element-wise multiplication.");
 
         // Use the Vector's ElementwiseMultiply method to perform the operation
@@ -2401,13 +2489,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transform(Func<T, int, T> transformer)
     {
-        var result = new Vector<T>(_data.Length);
-        for (int i = 0; i < _data.Length; i++)
+        // View-safe: iterate logical elements via GetFlat
+        var result = new Tensor<T>(_shape);
+        for (int i = 0; i < Length; i++)
         {
-            result[i] = transformer(_data[i], i);
+            result.SetFlat(i, transformer(GetFlat(i), i));
         }
 
-        return new Tensor<T>(_shape, result);
+        return result;
     }
 
     /// <summary>
@@ -2429,15 +2518,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> GetSlice(int batchIndex)
     {
-        int[] newShape = new int[Shape.Length - 1];
-        Array.Copy(_shape, 1, newShape, 0, Shape.Length - 1);
-
-        Tensor<T> slice = new Tensor<T>(newShape);
-
-        int sliceSize = slice.Length;
-        Array.Copy(_data, batchIndex * sliceSize, slice._data, 0, sliceSize);
-
-        return slice;
+        // O(1) view — delegates to stride-based Slice
+        return Slice(batchIndex);
     }
 
     /// <summary>
@@ -2465,70 +2547,27 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> GetSliceAlongDimension(int index, int dimension)
     {
-        if (dimension < 0 || dimension >= Shape.Length)
-            throw new ArgumentOutOfRangeException(nameof(dimension), $"Dimension {dimension} is out of range for tensor with {Shape.Length} dimensions.");
-        if (index < 0 || index >= Shape[dimension])
-            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for dimension {dimension} with size {Shape[dimension]}.");
+        if (dimension < 0 || dimension >= Rank)
+            throw new ArgumentOutOfRangeException(nameof(dimension), $"Dimension {dimension} is out of range for tensor with {Rank} dimensions.");
+        if (index < 0 || index >= _shape[dimension])
+            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for dimension {dimension} with size {_shape[dimension]}.");
 
-        // Create new shape without the sliced dimension
-        int[] newShape = new int[Shape.Length - 1];
-        for (int d = 0, nd = 0; d < Shape.Length; d++)
+        // O(1) view: fix dimension at index (advance offset), drop that dimension from shape/strides.
+        int newRank = Rank - 1;
+        var newShape = new int[newRank];
+        var newStrides = new int[newRank];
+        for (int d = 0, nd = 0; d < Rank; d++)
         {
             if (d != dimension)
-                newShape[nd++] = Shape[d];
-        }
-
-        var result = new Tensor<T>(newShape);
-
-        // Calculate strides for source tensor
-        int[] strides = new int[Shape.Length];
-        strides[Shape.Length - 1] = 1;
-        for (int d = Shape.Length - 2; d >= 0; d--)
-            strides[d] = strides[d + 1] * Shape[d + 1];
-
-        // Calculate strides for destination tensor
-        int[] resultStrides = new int[newShape.Length];
-        if (newShape.Length > 0)
-        {
-            resultStrides[newShape.Length - 1] = 1;
-            for (int d = newShape.Length - 2; d >= 0; d--)
-                resultStrides[d] = resultStrides[d + 1] * newShape[d + 1];
-        }
-
-        // Copy elements into temporary array, then copy to result
-        int resultLength = newShape.Length > 0 ? newShape.Aggregate(1, (a, b) => a * b) : 1;
-        T[] destArray = new T[resultLength];
-        int resultIdx = 0;
-        CopySliceRecursive(_data.ToArray(), destArray, _shape, newShape, strides, dimension, index, 0, 0, ref resultIdx);
-        result.CopyFromArray(destArray);
-
-        return result;
-    }
-
-    private void CopySliceRecursive(T[] source, T[] dest, int[] shape, int[] newShape,
-        int[] strides, int sliceDim, int sliceIdx, int currentDim, int sourceOffset, ref int destIdx)
-    {
-        if (currentDim == shape.Length)
-        {
-            dest[destIdx++] = source[sourceOffset];
-            return;
-        }
-
-        if (currentDim == sliceDim)
-        {
-            // Skip to the specific index in the slice dimension
-            int newSourceOffset = sourceOffset + sliceIdx * strides[currentDim];
-            CopySliceRecursive(source, dest, shape, newShape, strides, sliceDim, sliceIdx, currentDim + 1, newSourceOffset, ref destIdx);
-        }
-        else
-        {
-            // Iterate through all indices in non-slice dimensions
-            for (int i = 0; i < shape[currentDim]; i++)
             {
-                int newSourceOffset = sourceOffset + i * strides[currentDim];
-                CopySliceRecursive(source, dest, shape, newShape, strides, sliceDim, sliceIdx, currentDim + 1, newSourceOffset, ref destIdx);
+                newShape[nd] = _shape[d];
+                newStrides[nd] = _strides[d];
+                nd++;
             }
         }
+
+        int newOffset = _storageOffset + index * _strides[dimension];
+        return new Tensor<T>(_data, newShape, newStrides, newOffset);
     }
 
     /// <summary>
@@ -2807,7 +2846,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void AddInPlace(Tensor<T> other)
     {
-        if (!_shape.SequenceEqual(other._shape))
+        if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
         _numOps.Add(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
@@ -2837,7 +2876,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path
-        if (_shape.SequenceEqual(other._shape))
+        if (ShapeEquals(_shape, other._shape))
         {
             return Add(other);
         }
@@ -2906,7 +2945,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastSubtract(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path
-        if (_shape.SequenceEqual(other._shape))
+        if (ShapeEquals(_shape, other._shape))
         {
             return Subtract(other);
         }
@@ -2972,7 +3011,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastMultiply(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path (element-wise multiply)
-        if (_shape.SequenceEqual(other._shape))
+        if (ShapeEquals(_shape, other._shape))
         {
             // Element-wise multiplication, not matrix multiplication
             var fastResult = TensorAllocator.Rent<T>(_shape);
@@ -3050,7 +3089,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastDivide(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path (element-wise divide)
-        if (_shape.SequenceEqual(other._shape))
+        if (ShapeEquals(_shape, other._shape))
         {
             var fastResult = TensorAllocator.Rent<T>(_shape);
             var srcSpan = _data.AsSpan();
@@ -3361,7 +3400,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         else
         {
             // N-dimensional tensor: reverse all dimensions. O(1) view.
-            var permutation = Enumerable.Range(0, Rank).Reverse().ToArray();
+            var permutation = new int[Rank];
+            for (int i = 0; i < Rank; i++)
+                permutation[i] = Rank - 1 - i;
             return Transpose(permutation);
         }
     }
@@ -3380,12 +3421,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> TransposeLast2D()
     {
         if (Rank < 2)
-        {
             throw new InvalidOperationException("Tensor must have at least 2 dimensions to transpose last 2D.");
-        }
 
-        // Create permutation that swaps only the last two dimensions
-        var permutation = Enumerable.Range(0, Rank).ToArray();
+        // Create permutation that swaps only the last two dimensions — zero LINQ
+        var permutation = new int[Rank];
+        for (int i = 0; i < Rank; i++)
+            permutation[i] = i;
         permutation[Rank - 2] = Rank - 1;
         permutation[Rank - 1] = Rank - 2;
 
@@ -3631,9 +3672,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int sliceSize = actualEnd - start;
 
         // O(1) view: adjust offset by start * stride[axis], narrow shape on axis.
-        var newShape = (int[])_shape.Clone();
+        // Copy shape/strides directly — avoids Clone() boxing overhead.
+        var newShape = new int[Rank];
+        var newStrides = new int[Rank];
+        Array.Copy(_shape, newShape, Rank);
+        Array.Copy(_strides, newStrides, Rank);
         newShape[axis] = sliceSize;
-        var newStrides = (int[])_strides.Clone();
         int newOffset = _storageOffset + start * _strides[axis];
 
         return new Tensor<T>(_data, newShape, newStrides, newOffset);

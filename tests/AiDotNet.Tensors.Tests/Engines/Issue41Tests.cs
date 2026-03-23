@@ -25,7 +25,7 @@ public class Issue41Tests
 
         var result = _engine.TensorMatMul(a, b);
 
-        Assert.Equal(new[] { 3, 1 }, result.Shape);
+        Assert.Equal(new[] { 3, 1 }, result.Shape.ToArray());
         Assert.Equal(6f, result[0, 0], Tolerance);   // 1+2+3
         Assert.Equal(15f, result[1, 0], Tolerance);   // 4+5+6
         Assert.Equal(24f, result[2, 0], Tolerance);   // 7+8+9
@@ -45,7 +45,7 @@ public class Issue41Tests
 
         var result = _engine.TensorMatMul(a, b);
 
-        Assert.Equal(new[] { 100, 1 }, result.Shape);
+        Assert.Equal(new[] { 100, 1 }, result.Shape.ToArray());
         // Result should NOT be all zeros
         float sum = 0;
         for (int i = 0; i < 100; i++) sum += result[i, 0];
@@ -61,7 +61,7 @@ public class Issue41Tests
 
         var result = _engine.TensorMatMul(a, b);
 
-        Assert.Equal(new[] { 1, 2 }, result.Shape);
+        Assert.Equal(new[] { 1, 2 }, result.Shape.ToArray());
         Assert.Equal(4f, result[0, 0], Tolerance);   // 1*1+2*0+3*1
         Assert.Equal(5f, result[0, 1], Tolerance);   // 1*0+2*1+3*1
     }
@@ -75,7 +75,7 @@ public class Issue41Tests
 
         var result = _engine.TensorMatMul(a, b);
 
-        Assert.Equal(new[] { 3, 3 }, result.Shape);
+        Assert.Equal(new[] { 3, 3 }, result.Shape.ToArray());
         Assert.Equal(4f, result[0, 0], Tolerance);
         Assert.Equal(12f, result[2, 0], Tolerance);
         Assert.Equal(18f, result[2, 2], Tolerance);
