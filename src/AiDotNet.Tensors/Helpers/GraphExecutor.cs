@@ -208,13 +208,13 @@ public sealed class GraphExecutor<T> : IDisposable
             // Normalization
             [OpType.GroupNorm] = (n, inp, o) =>
                 _engine.GroupNormInto(o, inp[0], n.Params?.Groups ?? 32,
-                    inp.Length > 1 ? inp[1] : CreateOnes(o.Shape[1]),
-                    inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
+                    inp.Length > 1 ? inp[1] : CreateOnes(o._shape[1]),
+                    inp.Length > 2 ? inp[2] : CreateZeros(o._shape[1]),
                     n.Params?.Epsilon ?? 1e-5, out _, out _),
             [OpType.FusedGroupNormActivation] = (n, inp, o) =>
                 _engine.GroupNormSwishInto(o, inp[0], n.Params?.Groups ?? 32,
-                    inp.Length > 1 ? inp[1] : CreateOnes(o.Shape[1]),
-                    inp.Length > 2 ? inp[2] : CreateZeros(o.Shape[1]),
+                    inp.Length > 1 ? inp[1] : CreateOnes(o._shape[1]),
+                    inp.Length > 2 ? inp[2] : CreateZeros(o._shape[1]),
                     n.Params?.Epsilon ?? 1e-5),
 
             // Element-wise math — use AsSpan/AsWritableSpan and return temporaries to pool

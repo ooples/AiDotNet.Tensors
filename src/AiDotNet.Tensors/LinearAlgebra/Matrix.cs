@@ -850,7 +850,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Add(Tensor<T> tensor)
     {
-        if (tensor.Shape.Length != 2 || tensor.Shape[0] != Rows || tensor.Shape[1] != Columns)
+        if (tensor._shape.Length != 2 || tensor._shape[0] != Rows || tensor._shape[1] != Columns)
         {
             throw new ArgumentException("Tensor dimensions must match matrix dimensions for addition.");
         }

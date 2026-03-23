@@ -1796,10 +1796,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         int rank = a.Rank;
-        int m = a.Shape[rank - 2];  // Second-to-last dimension
-        int k = a.Shape[rank - 1];  // Last dimension of a
-        int k2 = b.Shape[rank - 2]; // Second-to-last dimension of b
-        int n = b.Shape[rank - 1];  // Last dimension of b
+        int m = a._shape[rank - 2];  // Second-to-last dimension
+        int k = a._shape[rank - 1];  // Last dimension of a
+        int k2 = b._shape[rank - 2]; // Second-to-last dimension of b
+        int n = b._shape[rank - 1];  // Last dimension of b
 
         // Verify inner dimensions match for matrix multiplication
         if (k != k2)
@@ -1814,10 +1814,10 @@ public class CpuEngine : ITensorLevelEngine
         // Verify batch dimensions match
         for (int i = 0; i < rank - 2; i++)
         {
-            if (a.Shape[i] != b.Shape[i])
+            if (a._shape[i] != b._shape[i])
             {
                 throw new ArgumentException(
-                    $"Batch dimensions must match. Got {a.Shape[i]} vs {b.Shape[i]} at dimension {i}.");
+                    $"Batch dimensions must match. Got {a._shape[i]} vs {b._shape[i]} at dimension {i}.");
             }
         }
 
@@ -1825,14 +1825,14 @@ public class CpuEngine : ITensorLevelEngine
         int batchSize = 1;
         for (int i = 0; i < rank - 2; i++)
         {
-            batchSize *= a.Shape[i];
+            batchSize *= a._shape[i];
         }
 
         // Build output shape: [...batch dims..., m, n]
         var outputShape = new int[rank];
         for (int i = 0; i < rank - 2; i++)
         {
-            outputShape[i] = a.Shape[i];
+            outputShape[i] = a._shape[i];
         }
         outputShape[rank - 2] = m;
         outputShape[rank - 1] = n;
@@ -1908,13 +1908,13 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2014,10 +2014,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         int length = a.Length;
@@ -2085,7 +2085,7 @@ public class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape) || !ShapesMatch(a.Shape, destination.Shape))
+        if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
         {
             throw new ArgumentException("All tensor shapes must match.");
         }
@@ -2145,7 +2145,7 @@ public class CpuEngine : ITensorLevelEngine
         var bSpan = b.Data.Span;
 
         // Fast path: same shape — no broadcasting needed
-        if (ShapesMatch(a.Shape, b.Shape))
+        if (ShapesMatch(a._shape, b._shape))
         {
             for (int i = 0; i < aSpan.Length; i++)
                 aSpan[i] = numOps.Add(aSpan[i], bSpan[i]);
@@ -2154,12 +2154,12 @@ public class CpuEngine : ITensorLevelEngine
 
         // Conv bias pattern: a=[B,C,H,W], b=[1,C,1,1] — most common case
         if (a.Rank == 4 && b.Rank == 4 &&
-            b.Shape[0] == 1 && b.Shape[2] == 1 && b.Shape[3] == 1 &&
-            a.Shape[1] == b.Shape[1])
+            b._shape[0] == 1 && b._shape[2] == 1 && b._shape[3] == 1 &&
+            a._shape[1] == b._shape[1])
         {
-            int batch = a.Shape[0];
-            int channels = a.Shape[1];
-            int spatial = a.Shape[2] * a.Shape[3];
+            int batch = a._shape[0];
+            int channels = a._shape[1];
+            int spatial = a._shape[2] * a._shape[3];
 
             for (int n = 0; n < batch; n++)
             {
@@ -2186,9 +2186,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // 1D bias along last dimension: a=[..., N], b=[N]
-        if (b.Rank == 1 && a.Shape[^1] == b.Shape[0])
+        if (b.Rank == 1 && a._shape[^1] == b._shape[0])
         {
-            int lastDim = b.Shape[0];
+            int lastDim = b._shape[0];
             int outerSize = a.Length / lastDim;
             for (int outer = 0; outer < outerSize; outer++)
             {
@@ -2318,12 +2318,12 @@ public class CpuEngine : ITensorLevelEngine
 
         if (a.Rank == 2 && b.Rank == 2)
         {
-            int m = a.Shape[0];
-            int n = a.Shape[1];
-            int p = b.Shape[1];
+            int m = a._shape[0];
+            int n = a._shape[1];
+            int p = b._shape[1];
 
-            if (n != b.Shape[0])
-                throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
+            if (n != b._shape[0])
+                throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b._shape[0]},{p}]");
 
             // Try BLAS directly into destination memory (true zero-alloc)
             if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, destination.Data, 0, m, n, p))
@@ -2382,7 +2382,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // General ND permutation: map each destination coord back to source
-        var srcShape = input.Shape;
+        var srcShape = input._shape;
         var srcSpan = input.AsSpan();
         var dstSpan = destination.AsWritableSpan();
         int rank = srcShape.Length;
@@ -2393,7 +2393,7 @@ public class CpuEngine : ITensorLevelEngine
             srcStrides[d] = srcStrides[d + 1] * srcShape[d + 1];
 
         var dstStrides = new int[rank];
-        var dstShape = destination.Shape;
+        var dstShape = destination._shape;
         dstStrides[rank - 1] = 1;
         for (int d = rank - 2; d >= 0; d--)
             dstStrides[d] = dstStrides[d + 1] * dstShape[d + 1];
@@ -2427,9 +2427,9 @@ public class CpuEngine : ITensorLevelEngine
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
 
-        int outerSize = 1, axisSize = input.Shape[axis], innerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
-        for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+        int outerSize = 1, axisSize = input._shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= input._shape[i];
 
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
@@ -2519,14 +2519,14 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("TensorAddMany requires at least 2 tensors.", nameof(tensors));
 
         // Validate all shapes match the first tensor
-        var referenceShape = tensors[0].Shape;
+        var referenceShape = tensors[0]._shape;
         for (int t = 1; t < tensors.Length; t++)
         {
-            if (!ShapesMatch(referenceShape, tensors[t].Shape))
+            if (!ShapesMatch(referenceShape, tensors[t]._shape))
             {
                 throw new ArgumentException(
                     $"All tensor shapes must match. Tensor 0 has shape {FormatShape(referenceShape)}, " +
-                    $"but tensor {t} has shape {FormatShape(tensors[t].Shape)}.");
+                    $"but tensor {t} has shape {FormatShape(tensors[t]._shape)}.");
             }
         }
 
@@ -2552,13 +2552,13 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2618,13 +2618,13 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
             return TensorBroadcastMultiply(a, b);
         }
 
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -2686,10 +2686,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         int length = a.Length;
@@ -2758,7 +2758,7 @@ public class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape) || !ShapesMatch(a.Shape, destination.Shape))
+        if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
         {
             throw new ArgumentException("All tensor shapes must match.");
         }
@@ -2775,14 +2775,14 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("TensorMultiplyMany requires at least 2 tensors.", nameof(tensors));
 
         // Validate all shapes match the first tensor
-        var referenceShape = tensors[0].Shape;
+        var referenceShape = tensors[0]._shape;
         for (int t = 1; t < tensors.Length; t++)
         {
-            if (!ShapesMatch(referenceShape, tensors[t].Shape))
+            if (!ShapesMatch(referenceShape, tensors[t]._shape))
             {
                 throw new ArgumentException(
                     $"All tensor shapes must match. Tensor 0 has shape {FormatShape(referenceShape)}, " +
-                    $"but tensor {t} has shape {FormatShape(tensors[t].Shape)}.");
+                    $"but tensor {t} has shape {FormatShape(tensors[t]._shape)}.");
             }
         }
 
@@ -2806,7 +2806,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -2817,13 +2817,13 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
         if (typeof(T) == typeof(float))
@@ -2880,7 +2880,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2895,14 +2895,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2919,7 +2919,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2934,14 +2934,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2957,14 +2957,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -2981,7 +2981,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -2996,14 +2996,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3020,7 +3020,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3039,7 +3039,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -3064,7 +3064,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -3089,7 +3089,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -3114,7 +3114,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -3142,7 +3142,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3154,7 +3154,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3169,11 +3169,11 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
-        if (!bases.Shape.SequenceEqual(exponents.Shape))
+        if (!bases._shape.SequenceEqual(exponents._shape))
             throw new ArgumentException("Tensors must have the same shape for element-wise power.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(bases.Shape);
+        var result = TensorAllocator.Rent<T>(bases._shape);
         var srcB = bases.AsSpan();
         var srcE = exponents.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3190,7 +3190,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3206,7 +3206,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3222,7 +3222,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3238,7 +3238,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3250,7 +3250,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
         return result;
@@ -3261,17 +3261,17 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (grid == null) throw new ArgumentNullException(nameof(grid));
         if (positions == null) throw new ArgumentNullException(nameof(positions));
-        if (grid.Shape.Length != 4)
+        if (grid._shape.Length != 4)
             throw new ArgumentException("Grid must be 4D tensor of shape [D, H, W, C]", nameof(grid));
-        if (positions.Shape.Length != 2 || positions.Shape[1] != 3)
+        if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int depth = grid.Shape[0];
-        int height = grid.Shape[1];
-        int width = grid.Shape[2];
-        int channels = grid.Shape[3];
-        int numPositions = positions.Shape[0];
+        int depth = grid._shape[0];
+        int height = grid._shape[1];
+        int width = grid._shape[2];
+        int channels = grid._shape[3];
+        int numPositions = positions._shape[0];
 
         var result = TensorAllocator.Rent<T>(new[] { numPositions, channels });
 
@@ -3337,20 +3337,20 @@ public class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
         if (positions == null) throw new ArgumentNullException(nameof(positions));
-        if (grid.Shape.Length != 4)
+        if (grid._shape.Length != 4)
             throw new ArgumentException("Grid must be 4D tensor of shape [D, H, W, C]", nameof(grid));
-        if (positions.Shape.Length != 2 || positions.Shape[1] != 3)
+        if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int depth = grid.Shape[0];
-        int height = grid.Shape[1];
-        int width = grid.Shape[2];
-        int channels = grid.Shape[3];
-        int numPositions = positions.Shape[0];
+        int depth = grid._shape[0];
+        int height = grid._shape[1];
+        int width = grid._shape[2];
+        int channels = grid._shape[3];
+        int numPositions = positions._shape[0];
 
         // Initialize gradient grid with zeros
-        var gradGrid = TensorAllocator.Rent<T>(grid.Shape);
+        var gradGrid = TensorAllocator.Rent<T>(grid._shape);
 
         // Use thread-local gradients to avoid contention, then combine
         int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -3445,7 +3445,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3460,11 +3460,11 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
-            throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        if (!ShapesMatch(a._shape, b._shape))
+            throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3485,7 +3485,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3503,11 +3503,11 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
-            throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+        if (!ShapesMatch(a._shape, b._shape))
+            throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3528,7 +3528,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3547,7 +3547,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3654,7 +3654,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                outputShape.Add(tensor.Shape[i]);
+                outputShape.Add(tensor._shape[i]);
             }
         }
 
@@ -4011,10 +4011,10 @@ public class CpuEngine : ITensorLevelEngine
         if (stride == 0) stride = poolSize; // Default stride equals pool size
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
         int outputWidth = (width + 2 * padding - poolSize) / stride + 1;
@@ -4109,10 +4109,10 @@ public class CpuEngine : ITensorLevelEngine
         if (stride == 0) stride = poolSize; // Default stride equals pool size
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
         int outputWidth = (width + 2 * padding - poolSize) / stride + 1;
@@ -4227,15 +4227,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelInChannels = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         if (inChannels != kernelInChannels)
         {
@@ -4327,15 +4327,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelInChannels = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         if (inChannels != kernelInChannels)
         {
@@ -4357,11 +4357,11 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Validate output shape matches expected dimensions
-        if (output.Shape[0] != batch || output.Shape[1] != outChannels ||
-            output.Shape[2] != outputHeight || output.Shape[3] != outputWidth)
+        if (output._shape[0] != batch || output._shape[1] != outChannels ||
+            output._shape[2] != outputHeight || output._shape[3] != outputWidth)
         {
             throw new ArgumentException(
-                $"Output tensor shape [{string.Join(", ", output.Shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
+                $"Output tensor shape [{string.Join(", ", output._shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
         }
 
         // Use im2col + GEMM for float (significantly faster)
@@ -4846,7 +4846,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -4870,7 +4870,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -5127,7 +5127,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (!ShapesMatch(destination.Shape, input.Shape))
+        if (!ShapesMatch(destination._shape, input._shape))
         {
             throw new ArgumentException("Tensor shapes must match.");
         }
@@ -5141,7 +5141,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -5277,7 +5277,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (!ShapesMatch(destination.Shape, input.Shape))
+        if (!ShapesMatch(destination._shape, input._shape))
         {
             throw new ArgumentException("Tensor shapes must match.");
         }
@@ -5323,7 +5323,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -5347,7 +5347,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -5373,7 +5373,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized Swish (SiLU) - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -5387,7 +5387,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Use SIMD-optimized ELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
@@ -5400,7 +5400,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -5459,7 +5459,7 @@ public class CpuEngine : ITensorLevelEngine
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {input.Rank}");
 
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
             throw new ArgumentException($"Dimension {actualDim} must have even size for GLU, got {dimSize}");
 
@@ -5475,11 +5475,11 @@ public class CpuEngine : ITensorLevelEngine
         // Calculate strides for the dimension
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // Apply GLU: output = a * sigmoid(b)
         Parallel.For(0, outerSize, outer =>
@@ -5516,7 +5516,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
         var inputData = input.GetDataArray();
@@ -5525,11 +5525,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // Gradient: d/da = sigmoid(b) * gradOut, d/db = a * sigmoid(b) * (1 - sigmoid(b)) * gradOut
         Parallel.For(0, outerSize, outer =>
@@ -5555,7 +5555,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5574,7 +5574,7 @@ public class CpuEngine : ITensorLevelEngine
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {input.Rank}");
 
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
             throw new ArgumentException($"Dimension {actualDim} must have even size for GeGLU, got {dimSize}");
 
@@ -5588,11 +5588,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         double sqrtTwoOverPi = Math.Sqrt(2.0 / Math.PI);
@@ -5634,7 +5634,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
         var inputData = input.GetDataArray();
@@ -5643,11 +5643,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         double sqrtTwoOverPi = Math.Sqrt(2.0 / Math.PI);
 
@@ -5682,7 +5682,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5702,7 +5702,7 @@ public class CpuEngine : ITensorLevelEngine
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {input.Rank}");
 
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
             throw new ArgumentException($"Dimension {actualDim} must have even size for SwiGLU, got {dimSize}");
 
@@ -5716,11 +5716,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // SwiGLU: a * (b * sigmoid(b))
         Parallel.For(0, outerSize, outer =>
@@ -5760,7 +5760,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
         var inputData = input.GetDataArray();
@@ -5769,11 +5769,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // d/da = Swish(b) * gradOut
         // d/db = a * d_Swish(b) * gradOut where d_Swish(b) = sigmoid(b) + b * sigmoid(b) * (1 - sigmoid(b))
@@ -5802,7 +5802,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <summary>
@@ -5821,7 +5821,7 @@ public class CpuEngine : ITensorLevelEngine
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {input.Rank}");
 
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
             throw new ArgumentException($"Dimension {actualDim} must have even size for ReGLU, got {dimSize}");
 
@@ -5835,11 +5835,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // ReGLU: a * ReLU(b) = a * max(0, b)
         Parallel.For(0, outerSize, outer =>
@@ -5878,7 +5878,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
-        int dimSize = input.Shape[actualDim];
+        int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
         var inputData = input.GetDataArray();
@@ -5887,11 +5887,11 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < input.Rank; i++)
-            innerSize *= input.Shape[i];
+            innerSize *= input._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= input.Shape[i];
+            outerSize *= input._shape[i];
 
         // d/da = ReLU(b) * gradOut
         // d/db = a * (b > 0 ? 1 : 0) * gradOut
@@ -5918,7 +5918,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
 
@@ -5933,8 +5933,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.Rank != 2)
             throw new ArgumentException($"TensorTranspose requires a 2D tensor. Got rank {tensor.Rank}.");
 
-        int rows = tensor.Shape[0];
-        int cols = tensor.Shape[1];
+        int rows = tensor._shape[0];
+        int cols = tensor._shape[1];
         var result = TensorAllocator.Rent<T>(new[] { cols, rows });
 
         var srcData = tensor.GetDataArray();
@@ -6000,12 +6000,12 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> TensorMatMul2D<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
-        int m = a.Shape[0];
-        int n = a.Shape[1];
-        int p = b.Shape[1];
+        int m = a._shape[0];
+        int n = a._shape[1];
+        int p = b._shape[1];
 
-        if (n != b.Shape[0])
-            throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b.Shape[0]},{p}]");
+        if (n != b._shape[0])
+            throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b._shape[0]},{p}]");
 
         var result = TensorAllocator.Rent<T>(new[] { m, p });
 
@@ -6043,27 +6043,27 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> TensorMatMulBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
         int aRank = a.Rank;
-        int m = a.Shape[aRank - 2];  // Second to last dim
-        int n = a.Shape[aRank - 1];  // Last dim
-        int p = b.Shape[1];          // Output features
+        int m = a._shape[aRank - 2];  // Second to last dim
+        int n = a._shape[aRank - 1];  // Last dim
+        int p = b._shape[1];          // Output features
 
-        if (n != b.Shape[0])
-            throw new ArgumentException($"Matrix dimensions incompatible for batched matmul: last dim of a is {n}, first dim of b is {b.Shape[0]}");
+        if (n != b._shape[0])
+            throw new ArgumentException($"Matrix dimensions incompatible for batched matmul: last dim of a is {n}, first dim of b is {b._shape[0]}");
 
         // Calculate batch size (product of all dimensions except last 2)
         int batchSize = 1;
         var batchShape = new int[aRank - 2];
         for (int i = 0; i < aRank - 2; i++)
         {
-            batchSize *= a.Shape[i];
-            batchShape[i] = a.Shape[i];
+            batchSize *= a._shape[i];
+            batchShape[i] = a._shape[i];
         }
 
         // Output shape: [...batch dims..., m, p]
         var outputShape = new int[aRank];
         for (int i = 0; i < aRank - 2; i++)
         {
-            outputShape[i] = a.Shape[i];
+            outputShape[i] = a._shape[i];
         }
         outputShape[aRank - 2] = m;
         outputShape[aRank - 1] = p;
@@ -6112,32 +6112,32 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> TensorMatMulFullBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
         int rank = a.Rank;
-        int m = a.Shape[rank - 2];
-        int n = a.Shape[rank - 1];
-        int p = b.Shape[rank - 1];
+        int m = a._shape[rank - 2];
+        int n = a._shape[rank - 1];
+        int p = b._shape[rank - 1];
 
-        if (n != b.Shape[rank - 2])
-            throw new ArgumentException($"Matrix dimensions incompatible for batched matmul: [{m},{n}] x [{b.Shape[rank - 2]},{p}]");
+        if (n != b._shape[rank - 2])
+            throw new ArgumentException($"Matrix dimensions incompatible for batched matmul: [{m},{n}] x [{b._shape[rank - 2]},{p}]");
 
         // Verify batch dimensions match
         for (int i = 0; i < rank - 2; i++)
         {
-            if (a.Shape[i] != b.Shape[i])
-                throw new ArgumentException($"Batch dimensions must match. Got {a.Shape[i]} vs {b.Shape[i]} at dimension {i}");
+            if (a._shape[i] != b._shape[i])
+                throw new ArgumentException($"Batch dimensions must match. Got {a._shape[i]} vs {b._shape[i]} at dimension {i}");
         }
 
         // Calculate batch size
         int batchSize = 1;
         for (int i = 0; i < rank - 2; i++)
         {
-            batchSize *= a.Shape[i];
+            batchSize *= a._shape[i];
         }
 
         // Output shape
         var outputShape = new int[rank];
         for (int i = 0; i < rank - 2; i++)
         {
-            outputShape[i] = a.Shape[i];
+            outputShape[i] = a._shape[i];
         }
         outputShape[rank - 2] = m;
         outputShape[rank - 1] = p;
@@ -6193,7 +6193,7 @@ public class CpuEngine : ITensorLevelEngine
         if (padding == null || padding.Length != 2) throw new ArgumentException("Padding must be array of 2 elements", nameof(padding));
         if (dilation == null || dilation.Length != 2) throw new ArgumentException("Dilation must be array of 2 elements", nameof(dilation));
         if (dilation[0] <= 0 || dilation[1] <= 0) throw new ArgumentException("Dilation elements must be positive", nameof(dilation));
-        if (input.Shape[1] != kernel.Shape[1]) throw new ArgumentException($"Input channels ({input.Shape[1]}) must match kernel in_channels ({kernel.Shape[1]})");
+        if (input._shape[1] != kernel._shape[1]) throw new ArgumentException($"Input channels ({input._shape[1]}) must match kernel in_channels ({kernel._shape[1]})");
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
@@ -6201,14 +6201,14 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int effectiveKernelH = dilationH * (kernelHeight - 1) + 1;
         int effectiveKernelW = dilationW * (kernelWidth - 1) + 1;
@@ -6276,9 +6276,9 @@ public class CpuEngine : ITensorLevelEngine
         if (padding == null || padding.Length != 2) throw new ArgumentException("Padding must be array of 2 elements", nameof(padding));
         if (dilation == null || dilation.Length != 2) throw new ArgumentException("Dilation must be array of 2 elements", nameof(dilation));
         if (dilation[0] <= 0 || dilation[1] <= 0) throw new ArgumentException("Dilation elements must be positive", nameof(dilation));
-        if (gradOutput.Shape[0] != inputShape[0]) throw new ArgumentException($"gradOutput batch size ({gradOutput.Shape[0]}) must match inputShape batch size ({inputShape[0]})");
-        if (gradOutput.Shape[1] != kernel.Shape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput.Shape[1]}) must match kernel outChannels ({kernel.Shape[0]})");
-        if (inputShape[1] != kernel.Shape[1]) throw new ArgumentException($"inputShape inChannels ({inputShape[1]}) must match kernel inChannels ({kernel.Shape[1]})");
+        if (gradOutput._shape[0] != inputShape[0]) throw new ArgumentException($"gradOutput batch size ({gradOutput._shape[0]}) must match inputShape batch size ({inputShape[0]})");
+        if (gradOutput._shape[1] != kernel._shape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernel outChannels ({kernel._shape[0]})");
+        if (inputShape[1] != kernel._shape[1]) throw new ArgumentException($"inputShape inChannels ({inputShape[1]}) must match kernel inChannels ({kernel._shape[1]})");
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = inputShape[0];
@@ -6286,16 +6286,16 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[2];
         int width = inputShape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var gradInput = new T[batch * inChannels * height * width];
         var gradOutputData = gradOutput.GetDataArray();
@@ -6356,16 +6356,16 @@ public class CpuEngine : ITensorLevelEngine
         if (padding == null || padding.Length != 2) throw new ArgumentException("Padding must be array of 2 elements", nameof(padding));
         if (dilation == null || dilation.Length != 2) throw new ArgumentException("Dilation must be array of 2 elements", nameof(dilation));
         if (dilation[0] <= 0 || dilation[1] <= 0) throw new ArgumentException("Dilation elements must be positive", nameof(dilation));
-        if (gradOutput.Shape[0] != input.Shape[0]) throw new ArgumentException($"gradOutput batch size ({gradOutput.Shape[0]}) must match input batch size ({input.Shape[0]})");
-        if (gradOutput.Shape[1] != kernelShape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput.Shape[1]}) must match kernelShape outChannels ({kernelShape[0]})");
-        if (input.Shape[1] != kernelShape[1]) throw new ArgumentException($"input inChannels ({input.Shape[1]}) must match kernelShape inChannels ({kernelShape[1]})");
+        if (gradOutput._shape[0] != input._shape[0]) throw new ArgumentException($"gradOutput batch size ({gradOutput._shape[0]}) must match input batch size ({input._shape[0]})");
+        if (gradOutput._shape[1] != kernelShape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernelShape outChannels ({kernelShape[0]})");
+        if (input._shape[1] != kernelShape[1]) throw new ArgumentException($"input inChannels ({input._shape[1]}) must match kernelShape inChannels ({kernelShape[1]})");
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outChannels = kernelShape[0];
         int kernelHeight = kernelShape[2];
@@ -6375,8 +6375,8 @@ public class CpuEngine : ITensorLevelEngine
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
@@ -6431,10 +6431,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int poolH = poolSize[0], poolW = poolSize[1];
         int strideH = stride[0], strideW = stride[1];
@@ -6511,8 +6511,8 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[2];
         int width = inputShape[3];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var result = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = result.GetDataArray();
@@ -6554,10 +6554,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int poolH = poolSize[0], poolW = poolSize[1];
         int strideH = stride[0], strideW = stride[1];
@@ -6621,8 +6621,8 @@ public class CpuEngine : ITensorLevelEngine
         int poolH = poolSize[0], poolW = poolSize[1];
         int strideH = stride[0], strideW = stride[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var result = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = result.GetDataArray();
@@ -6673,14 +6673,14 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int multiplier = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int multiplier = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
@@ -6744,15 +6744,15 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[2];
         int width = inputShape[3];
 
-        int multiplier = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int multiplier = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
         int outChannels = inChannels * multiplier;
 
         var gradInput = new T[batch * inChannels * height * width];
@@ -6807,10 +6807,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int multiplier = kernelShape[1];
         int kernelHeight = kernelShape[2];
@@ -6819,8 +6819,8 @@ public class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var gradKernel = new T[inChannels * multiplier * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
@@ -6883,18 +6883,18 @@ public class CpuEngine : ITensorLevelEngine
         if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative", nameof(padding));
         if (outputPadding == null || outputPadding.Length != 2) throw new ArgumentException("OutputPadding must be array of 2 elements", nameof(outputPadding));
         if (outputPadding[0] < 0 || outputPadding[1] < 0) throw new ArgumentException("OutputPadding elements must be non-negative", nameof(outputPadding));
-        if (input.Shape[1] != kernel.Shape[0]) throw new ArgumentException($"Input inChannels ({input.Shape[1]}) must match kernel inChannels ({kernel.Shape[0]})");
+        if (input._shape[1] != kernel._shape[0]) throw new ArgumentException($"Input inChannels ({input._shape[1]}) must match kernel inChannels ({kernel._shape[0]})");
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int outChannels = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
@@ -6974,11 +6974,11 @@ public class CpuEngine : ITensorLevelEngine
         var result = Conv2D(gradOutput, kernel, stride, padding, [1, 1]);
 
         // Validate that the result matches expected input shape
-        if (result.Shape[0] != inputShape[0] || result.Shape[1] != inputShape[1] ||
-            result.Shape[2] != inputShape[2] || result.Shape[3] != inputShape[3])
+        if (result._shape[0] != inputShape[0] || result._shape[1] != inputShape[1] ||
+            result._shape[2] != inputShape[2] || result._shape[3] != inputShape[3])
         {
             throw new InvalidOperationException(
-                $"ConvTranspose2DBackwardInput result shape [{string.Join(",", result.Shape)}] " +
+                $"ConvTranspose2DBackwardInput result shape [{string.Join(",", result._shape)}] " +
                 $"does not match expected inputShape [{string.Join(",", inputShape)}]. " +
                 "This may occur with non-standard stride/padding configurations.");
         }
@@ -6994,10 +6994,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outChannels = kernelShape[1];
         int kernelHeight = kernelShape[2];
@@ -7006,8 +7006,8 @@ public class CpuEngine : ITensorLevelEngine
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var gradKernel = new T[inChannels * outChannels * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
@@ -7078,15 +7078,15 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelInChannels = kernel.Shape[1];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelInChannels = kernel._shape[1];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         // Validate input/kernel channel compatibility
         if (inChannels != kernelInChannels)
@@ -7120,22 +7120,22 @@ public class CpuEngine : ITensorLevelEngine
         // Validate offset shape: [batch, 2*kernel_h*kernel_w, out_h, out_w]
         if (offset.Rank != 4)
             throw new ArgumentException($"Offset tensor must be 4D. Got rank {offset.Rank}.", nameof(offset));
-        if (offset.Shape[0] != batch || offset.Shape[1] != 2 * numKernelPositions ||
-            offset.Shape[2] != outputHeight || offset.Shape[3] != outputWidth)
+        if (offset._shape[0] != batch || offset._shape[1] != 2 * numKernelPositions ||
+            offset._shape[2] != outputHeight || offset._shape[3] != outputWidth)
             throw new ArgumentException(
                 $"Offset tensor must have shape [{batch}, {2 * numKernelPositions}, {outputHeight}, {outputWidth}]. " +
-                $"Got [{string.Join(",", offset.Shape)}].", nameof(offset));
+                $"Got [{string.Join(",", offset._shape)}].", nameof(offset));
 
         // Validate mask shape if provided: [batch, kernel_h*kernel_w, out_h, out_w]
         if (mask != null)
         {
             if (mask.Rank != 4)
                 throw new ArgumentException($"Mask tensor must be 4D. Got rank {mask.Rank}.", nameof(mask));
-            if (mask.Shape[0] != batch || mask.Shape[1] != numKernelPositions ||
-                mask.Shape[2] != outputHeight || mask.Shape[3] != outputWidth)
+            if (mask._shape[0] != batch || mask._shape[1] != numKernelPositions ||
+                mask._shape[2] != outputHeight || mask._shape[3] != outputWidth)
                 throw new ArgumentException(
                     $"Mask tensor must have shape [{batch}, {numKernelPositions}, {outputHeight}, {outputWidth}]. " +
-                    $"Got [{string.Join(",", mask.Shape)}].", nameof(mask));
+                    $"Got [{string.Join(",", mask._shape)}].", nameof(mask));
         }
 
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
@@ -7292,16 +7292,16 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[2];
         int width = inputShape[3];
 
-        int outChannels = kernel.Shape[0];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradInput = TensorAllocator.Rent<T>(inputShape);
@@ -7454,10 +7454,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         int outChannels = kernelShape[0];
         int kernelHeight = kernelShape[2];
@@ -7467,8 +7467,8 @@ public class CpuEngine : ITensorLevelEngine
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradKernel = TensorAllocator.Rent<T>(kernelShape);
@@ -7570,29 +7570,29 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         // Validate batch consistency
-        if (gradOutput.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput.Shape[0]}.", nameof(gradOutput));
-        if (offset.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, offset has {offset.Shape[0]}.", nameof(offset));
-        if (mask != null && mask.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, mask has {mask.Shape[0]}.", nameof(mask));
+        if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
+        if (offset._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, offset has {offset._shape[0]}.", nameof(offset));
+        if (mask != null && mask._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, mask has {mask._shape[0]}.", nameof(mask));
 
-        int outChannels = kernel.Shape[0];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradOffset = TensorAllocator.Rent<T>(offset.Shape);
+        var gradOffset = TensorAllocator.Rent<T>(offset._shape);
         var gradOffsetData = gradOffset.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -7882,26 +7882,26 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
 
         // Validate batch consistency
-        if (gradOutput.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput.Shape[0]}.", nameof(gradOutput));
-        if (offset.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, offset has {offset.Shape[0]}.", nameof(offset));
-        if (mask != null && mask.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, mask has {mask.Shape[0]}.", nameof(mask));
+        if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
+        if (offset._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, offset has {offset._shape[0]}.", nameof(offset));
+        if (mask != null && mask._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, mask has {mask._shape[0]}.", nameof(mask));
 
-        int outChannels = kernel.Shape[0];
-        int kernelHeight = kernel.Shape[2];
-        int kernelWidth = kernel.Shape[3];
+        int outChannels = kernel._shape[0];
+        int kernelHeight = kernel._shape[2];
+        int kernelWidth = kernel._shape[3];
 
         int strideH = stride[0], strideW = stride[1];
         int padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
 
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
         // Mask shape: [batch, kernel_h*kernel_w, out_h, out_w]
@@ -7988,16 +7988,16 @@ public class CpuEngine : ITensorLevelEngine
         int width = inputShape[2];
         int channels = inputShape[3];
 
-        int outHeight = grid.Shape[1];
-        int outWidth = grid.Shape[2];
+        int outHeight = grid._shape[1];
+        int outWidth = grid._shape[2];
 
         // Validate shape consistency
-        if (grid.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, grid has {grid.Shape[0]}.", nameof(grid));
-        if (grid.Shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid.Shape[3]}.", nameof(grid));
-        if (gradOutput.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, gradOutput has {gradOutput.Shape[0]}.", nameof(gradOutput));
-        if (gradOutput.Shape[1] != outHeight || gradOutput.Shape[2] != outWidth)
-            throw new ArgumentException($"gradOutput spatial dims [{gradOutput.Shape[1]},{gradOutput.Shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
-        if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
+        if (grid._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, grid has {grid._shape[0]}.", nameof(grid));
+        if (grid._shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid._shape[3]}.", nameof(grid));
+        if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: inputShape has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
+        if (gradOutput._shape[1] != outHeight || gradOutput._shape[2] != outWidth)
+            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
+        if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
 
         var gradInput = TensorAllocator.Rent<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
@@ -8054,23 +8054,23 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // NHWC layout: [batch, height, width, channels]
-        int batch = input.Shape[0];
-        int height = input.Shape[1];
-        int width = input.Shape[2];
-        int channels = input.Shape[3];
+        int batch = input._shape[0];
+        int height = input._shape[1];
+        int width = input._shape[2];
+        int channels = input._shape[3];
 
-        int outHeight = grid.Shape[1];
-        int outWidth = grid.Shape[2];
+        int outHeight = grid._shape[1];
+        int outWidth = grid._shape[2];
 
         // Validate shape consistency
-        if (grid.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, grid has {grid.Shape[0]}.", nameof(grid));
-        if (grid.Shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid.Shape[3]}.", nameof(grid));
-        if (gradOutput.Shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput.Shape[0]}.", nameof(gradOutput));
-        if (gradOutput.Shape[1] != outHeight || gradOutput.Shape[2] != outWidth)
-            throw new ArgumentException($"gradOutput spatial dims [{gradOutput.Shape[1]},{gradOutput.Shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
-        if (gradOutput.Shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput.Shape[3]}.", nameof(gradOutput));
+        if (grid._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, grid has {grid._shape[0]}.", nameof(grid));
+        if (grid._shape[3] != 2) throw new ArgumentException($"Grid last dimension must be 2 (x,y coordinates). Got {grid._shape[3]}.", nameof(grid));
+        if (gradOutput._shape[0] != batch) throw new ArgumentException($"Batch size mismatch: input has {batch}, gradOutput has {gradOutput._shape[0]}.", nameof(gradOutput));
+        if (gradOutput._shape[1] != outHeight || gradOutput._shape[2] != outWidth)
+            throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
+        if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
 
-        var gradGrid = TensorAllocator.Rent<T>(grid.Shape);
+        var gradGrid = TensorAllocator.Rent<T>(grid._shape);
         var gradGridData = gradGrid.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -8143,7 +8143,7 @@ public class CpuEngine : ITensorLevelEngine
         if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must be array of 3 elements [padD, padH, padW].", nameof(padding));
         if (dilation == null || dilation.Length != 3) throw new ArgumentException("Dilation must be array of 3 elements [dilationD, dilationH, dilationW].", nameof(dilation));
         if (dilation[0] <= 0 || dilation[1] <= 0 || dilation[2] <= 0) throw new ArgumentException("Dilation elements must be positive.", nameof(dilation));
-        if (input.Shape[1] != kernel.Shape[1]) throw new ArgumentException($"Input channels ({input.Shape[1]}) must match kernel in_channels ({kernel.Shape[1]}).");
+        if (input._shape[1] != kernel._shape[1]) throw new ArgumentException($"Input channels ({input._shape[1]}) must match kernel in_channels ({kernel._shape[1]}).");
 
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
@@ -8151,16 +8151,16 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
-        int outChannels = kernel.Shape[0];
-        int kernelDepth = kernel.Shape[2];
-        int kernelHeight = kernel.Shape[3];
-        int kernelWidth = kernel.Shape[4];
+        int outChannels = kernel._shape[0];
+        int kernelDepth = kernel._shape[2];
+        int kernelHeight = kernel._shape[3];
+        int kernelWidth = kernel._shape[4];
 
         int effectiveKernelD = dilationD * (kernelDepth - 1) + 1;
         int effectiveKernelH = dilationH * (kernelHeight - 1) + 1;
@@ -8253,26 +8253,26 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[3];
         int width = inputShape[4];
 
-        int outChannels = kernel.Shape[0];
-        int kernelDepth = kernel.Shape[2];
-        int kernelHeight = kernel.Shape[3];
-        int kernelWidth = kernel.Shape[4];
+        int outChannels = kernel._shape[0];
+        int kernelDepth = kernel._shape[2];
+        int kernelHeight = kernel._shape[3];
+        int kernelWidth = kernel._shape[4];
 
         // Validate shape consistency
-        if (gradOutput.Shape[0] != batch)
-            throw new ArgumentException($"gradOutput batch size ({gradOutput.Shape[0]}) must match inputShape batch size ({batch}).", nameof(gradOutput));
-        if (gradOutput.Shape[1] != outChannels)
-            throw new ArgumentException($"gradOutput outChannels ({gradOutput.Shape[1]}) must match kernel out_channels ({outChannels}).", nameof(gradOutput));
-        if (inputShape[1] != kernel.Shape[1])
-            throw new ArgumentException($"inputShape in_channels ({inputShape[1]}) must match kernel in_channels ({kernel.Shape[1]}).", nameof(inputShape));
+        if (gradOutput._shape[0] != batch)
+            throw new ArgumentException($"gradOutput batch size ({gradOutput._shape[0]}) must match inputShape batch size ({batch}).", nameof(gradOutput));
+        if (gradOutput._shape[1] != outChannels)
+            throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernel out_channels ({outChannels}).", nameof(gradOutput));
+        if (inputShape[1] != kernel._shape[1])
+            throw new ArgumentException($"inputShape in_channels ({inputShape[1]}) must match kernel in_channels ({kernel._shape[1]}).", nameof(inputShape));
 
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
         int dilationD = dilation[0], dilationH = dilation[1], dilationW = dilation[2];
 
-        int outputDepth = gradOutput.Shape[2];
-        int outputHeight = gradOutput.Shape[3];
-        int outputWidth = gradOutput.Shape[4];
+        int outputDepth = gradOutput._shape[2];
+        int outputHeight = gradOutput._shape[3];
+        int outputWidth = gradOutput._shape[4];
 
         var gradInputData = new T[batch * inChannels * depth * height * width];
         var gradOutputData = gradOutput.GetDataArray();
@@ -8346,11 +8346,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
         int outChannels = kernelShape[0];
         int kernelDepth = kernelShape[2];
@@ -8358,20 +8358,20 @@ public class CpuEngine : ITensorLevelEngine
         int kernelWidth = kernelShape[4];
 
         // Validate shape consistency
-        if (gradOutput.Shape[0] != batch)
-            throw new ArgumentException($"gradOutput batch size ({gradOutput.Shape[0]}) must match input batch size ({batch}).", nameof(gradOutput));
-        if (gradOutput.Shape[1] != outChannels)
-            throw new ArgumentException($"gradOutput outChannels ({gradOutput.Shape[1]}) must match kernelShape out_channels ({outChannels}).", nameof(gradOutput));
-        if (input.Shape[1] != kernelShape[1])
-            throw new ArgumentException($"input in_channels ({input.Shape[1]}) must match kernelShape in_channels ({kernelShape[1]}).", nameof(input));
+        if (gradOutput._shape[0] != batch)
+            throw new ArgumentException($"gradOutput batch size ({gradOutput._shape[0]}) must match input batch size ({batch}).", nameof(gradOutput));
+        if (gradOutput._shape[1] != outChannels)
+            throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernelShape out_channels ({outChannels}).", nameof(gradOutput));
+        if (input._shape[1] != kernelShape[1])
+            throw new ArgumentException($"input in_channels ({input._shape[1]}) must match kernelShape in_channels ({kernelShape[1]}).", nameof(input));
 
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
         int dilationD = dilation[0], dilationH = dilation[1], dilationW = dilation[2];
 
-        int outputDepth = gradOutput.Shape[2];
-        int outputHeight = gradOutput.Shape[3];
-        int outputWidth = gradOutput.Shape[4];
+        int outputDepth = gradOutput._shape[2];
+        int outputHeight = gradOutput._shape[3];
+        int outputWidth = gradOutput._shape[4];
 
         var gradKernelData = new T[outChannels * inChannels * kernelDepth * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
@@ -8457,11 +8457,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
         int poolD = poolSize[0], poolH = poolSize[1], poolW = poolSize[2];
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
@@ -8543,11 +8543,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
         int poolD = poolSize[0], poolH = poolSize[1], poolW = poolSize[2];
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
@@ -8642,9 +8642,9 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputShape[3];
         int width = inputShape[4];
 
-        int outputDepth = gradOutput.Shape[2];
-        int outputHeight = gradOutput.Shape[3];
-        int outputWidth = gradOutput.Shape[4];
+        int outputDepth = gradOutput._shape[2];
+        int outputHeight = gradOutput._shape[3];
+        int outputWidth = gradOutput._shape[4];
 
         var gradInputData = new T[batch * channels * depth * height * width];
         var gradOutputData = gradOutput.GetDataArray();
@@ -8701,11 +8701,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
         int poolD = poolSize[0], poolH = poolSize[1], poolW = poolSize[2];
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
@@ -8794,9 +8794,9 @@ public class CpuEngine : ITensorLevelEngine
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
 
-        int outputDepth = gradOutput.Shape[2];
-        int outputHeight = gradOutput.Shape[3];
-        int outputWidth = gradOutput.Shape[4];
+        int outputDepth = gradOutput._shape[2];
+        int outputHeight = gradOutput._shape[3];
+        int outputWidth = gradOutput._shape[4];
 
         var gradInputData = new T[batch * channels * depth * height * width];
         var gradOutputData = gradOutput.GetDataArray();
@@ -8878,11 +8878,11 @@ public class CpuEngine : ITensorLevelEngine
         if (input.Rank != 5) throw new ArgumentException($"Upsample3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0) throw new ArgumentException("Scale factors must be positive.");
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int depth = input.Shape[2];
-        int height = input.Shape[3];
-        int width = input.Shape[4];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int depth = input._shape[2];
+        int height = input._shape[3];
+        int width = input._shape[4];
 
         int outDepth = depth * scaleD;
         int outHeight = height * scaleH;
@@ -8991,17 +8991,17 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int inDepth = input.Shape[2];
-        int inHeight = input.Shape[3];
-        int inWidth = input.Shape[4];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int inDepth = input._shape[2];
+        int inHeight = input._shape[3];
+        int inWidth = input._shape[4];
 
-        int kernelInChannels = kernel.Shape[0];
-        int outChannels = kernel.Shape[1];
-        int kD = kernel.Shape[2];
-        int kH = kernel.Shape[3];
-        int kW = kernel.Shape[4];
+        int kernelInChannels = kernel._shape[0];
+        int outChannels = kernel._shape[1];
+        int kD = kernel._shape[2];
+        int kH = kernel._shape[3];
+        int kW = kernel._shape[4];
 
         if (inChannels != kernelInChannels)
             throw new ArgumentException($"Kernel's input channels ({kernelInChannels}) must match input tensor's channels ({inChannels}).");
@@ -9105,16 +9105,16 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int inDepth = input.Shape[2];
-        int inHeight = input.Shape[3];
-        int inWidth = input.Shape[4];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int inDepth = input._shape[2];
+        int inHeight = input._shape[3];
+        int inWidth = input._shape[4];
 
-        int outChannels = gradOutput.Shape[1];
-        int outDepth = gradOutput.Shape[2];
-        int outHeight = gradOutput.Shape[3];
-        int outWidth = gradOutput.Shape[4];
+        int outChannels = gradOutput._shape[1];
+        int outDepth = gradOutput._shape[2];
+        int outHeight = gradOutput._shape[3];
+        int outWidth = gradOutput._shape[4];
 
         int kD = kernelShape[2], kH = kernelShape[3], kW = kernelShape[4];
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
@@ -9206,17 +9206,17 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int inputHeight = input.Shape[2];
-        int inputWidth = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int inputHeight = input._shape[2];
+        int inputWidth = input._shape[3];
 
-        int outputHeight = weights.Shape[0];
-        int outputWidth = weights.Shape[1];
-        int outChannels = weights.Shape[2];
-        int kernelInChannels = weights.Shape[3]; // in_channels in the weights tensor definition
-        int kernelHeight = weights.Shape[4];
-        int kernelWidth = weights.Shape[5];
+        int outputHeight = weights._shape[0];
+        int outputWidth = weights._shape[1];
+        int outChannels = weights._shape[2];
+        int kernelInChannels = weights._shape[3]; // in_channels in the weights tensor definition
+        int kernelHeight = weights._shape[4];
+        int kernelWidth = weights._shape[5];
 
         int strideH = stride[0], strideW = stride[1];
 
@@ -9299,12 +9299,12 @@ public class CpuEngine : ITensorLevelEngine
         int inputHeight = inputShape[2];
         int inputWidth = inputShape[3];
 
-        int outputHeight = weights.Shape[0];
-        int outputWidth = weights.Shape[1];
-        int outChannels = weights.Shape[2];
-        int kernelInChannels = weights.Shape[3];
-        int kernelHeight = weights.Shape[4];
-        int kernelWidth = weights.Shape[5];
+        int outputHeight = weights._shape[0];
+        int outputWidth = weights._shape[1];
+        int outChannels = weights._shape[2];
+        int kernelInChannels = weights._shape[3];
+        int kernelHeight = weights._shape[4];
+        int kernelWidth = weights._shape[5];
 
         int strideH = stride[0], strideW = stride[1];
 
@@ -9359,10 +9359,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = input.Shape[0];
-        int inChannels = input.Shape[1];
-        int inputHeight = input.Shape[2];
-        int inputWidth = input.Shape[3];
+        int batch = input._shape[0];
+        int inChannels = input._shape[1];
+        int inputHeight = input._shape[2];
+        int inputWidth = input._shape[3];
 
         int outputHeight = weightsShape[0];
         int outputWidth = weightsShape[1];
@@ -9425,10 +9425,10 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = gradOutput.Shape[0];
-        int outChannels = gradOutput.Shape[1];
-        int outputHeight = gradOutput.Shape[2];
-        int outputWidth = gradOutput.Shape[3];
+        int batch = gradOutput._shape[0];
+        int outChannels = gradOutput._shape[1];
+        int outputHeight = gradOutput._shape[2];
+        int outputWidth = gradOutput._shape[3];
 
         var gradBias = new T[outChannels]; // Bias gradient is 1D [outChannels]
         var gradOutputData = gradOutput.GetDataArray();
@@ -9470,15 +9470,15 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
         // Compute outer and inner sizes
-        int outerSize = 1, axisSize = input.Shape[axis], innerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
-        for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape[i];
+        int outerSize = 1, axisSize = input._shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= input._shape[i];
 
         // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
-            var result = TensorAllocator.Rent<T>(input.Shape);
+            var result = TensorAllocator.Rent<T>(input._shape);
             using var pinIn = input.Data.Pin();
             using var pinOut = result.Data.Pin();
             unsafe
@@ -9491,7 +9491,7 @@ public class CpuEngine : ITensorLevelEngine
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var result2 = TensorAllocator.Rent<T>(input.Shape);
+        var result2 = TensorAllocator.Rent<T>(input._shape);
         var outputDataGeneric = result2.GetDataArray();
 
         Parallel.For(0, outerSize * innerSize, idx =>
@@ -9733,9 +9733,9 @@ public class CpuEngine : ITensorLevelEngine
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
 
-        int outerSize = 1, axisSize = output.Shape[axis], innerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= output.Shape[i];
-        for (int i = axis + 1; i < rank; i++) innerSize *= output.Shape[i];
+        int outerSize = 1, axisSize = output._shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= output._shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= output._shape[i];
 
 #if NET5_0_OR_GREATER
         // Float SIMD fast path for last-axis softmax backward (innerSize == 1)
@@ -9745,7 +9745,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var gInF = new float[outF.Length];
             SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output.Shape, new Vector<T>((T[])(object)gInF));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, new Vector<T>((T[])(object)gInF));
         }
 #endif
 
@@ -9774,7 +9774,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradInputData));
     }
 
 #if NET5_0_OR_GREATER
@@ -9890,7 +9890,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var inputData = input.GetDataArray();
-        var shape = input.Shape;
+        var shape = input._shape;
         const double eps = 1e-10;
 
         // Add Gumbel noise: -log(-log(U)) where U ~ Uniform(0, 1)
@@ -9968,7 +9968,7 @@ public class CpuEngine : ITensorLevelEngine
             gradData[i] = numOps.Multiply(gradData[i], scale);
         }
 
-        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradData));
     }
 
     /// <inheritdoc/>
@@ -9983,7 +9983,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var inputData = input.GetDataArray();
-        var shape = input.Shape;
+        var shape = input._shape;
         var outputData = new T[input.Length];
 
         // Precompute factorials
@@ -10066,7 +10066,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
-        var shape = output.Shape;
+        var shape = output._shape;
         var gradInputData = new T[outputData.Length];
 
         // Precompute factorials for derivative
@@ -10147,7 +10147,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var inputData = input.GetDataArray();
-        var shape = input.Shape;
+        var shape = input._shape;
         var outputData = new T[input.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
@@ -10216,7 +10216,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var gradOutputData = gradOutput.GetDataArray();
         var outputData = output.GetDataArray();
-        var shape = output.Shape;
+        var shape = output._shape;
         var gradInputData = new T[outputData.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
@@ -10269,7 +10269,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var inputData = input.GetDataArray();
-        var shape = input.Shape;
+        var shape = input._shape;
         var normalizedData = new T[input.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
@@ -10320,7 +10320,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var inputData = input.GetDataArray();
-        var shape = input.Shape;
+        var shape = input._shape;
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -10402,25 +10402,25 @@ public class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
 
         // Handle 1D [features] - treat as single sample [1, features]
-        bool was1D = input.Shape.Length == 1;
-        Tensor<T> workingInput = was1D ? input.Reshape([1, input.Shape[0]]) : input;
+        bool was1D = input._shape.Length == 1;
+        Tensor<T> workingInput = was1D ? input.Reshape([1, input._shape[0]]) : input;
 
         // Handle 2D [batch, features], 3D [channels, height, width], and 4D [batch, channels, height, width] tensors
-        if (workingInput.Shape.Length == 4)
+        if (workingInput._shape.Length == 4)
         {
             var result4D = BatchNorm4D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
-            return was1D ? result4D.Reshape([result4D.Shape[1]]) : result4D;
+            return was1D ? result4D.Reshape([result4D._shape[1]]) : result4D;
         }
 
-        if (workingInput.Shape.Length == 3)
+        if (workingInput._shape.Length == 3)
         {
             var result3D = BatchNorm3D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
             return was1D ? result3D.Reshape([result3D.Length]) : result3D;
         }
 
         // 2D case: [batch, features]
-        int batch = workingInput.Shape[0];
-        int features = workingInput.Shape[1];
+        int batch = workingInput._shape[0];
+        int features = workingInput._shape[1];
 
         var inputData = workingInput.GetDataArray();
         var gammaData = gamma.GetDataArray();
@@ -10469,7 +10469,7 @@ public class CpuEngine : ITensorLevelEngine
         variance = TensorAllocator.Rent<T>([features], new Vector<T>(varData));
 
         // Return with original shape (restore 1D if input was 1D)
-        var result = TensorAllocator.Rent<T>(workingInput.Shape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(workingInput._shape, new Vector<T>(outputData));
         return was1D ? result.Reshape([features]) : result;
     }
 
@@ -10479,9 +10479,9 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> BatchNorm3D<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, T eps, INumericOperations<T> numOps, out Tensor<T> mean, out Tensor<T> variance)
     {
-        int channels = input.Shape[0];
-        int height = input.Shape[1];
-        int width = input.Shape[2];
+        int channels = input._shape[0];
+        int height = input._shape[1];
+        int width = input._shape[2];
         int spatialSize = height * width;
 
         var inputData = input.GetDataArray();
@@ -10536,7 +10536,7 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([channels], new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>([channels], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
     }
 
 
@@ -10546,10 +10546,10 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> BatchNorm4D<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, T eps, INumericOperations<T> numOps, out Tensor<T> mean, out Tensor<T> variance)
     {
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
         int spatialSize = height * width;
         int elementsPerChannel = batch * spatialSize;
 
@@ -10571,7 +10571,7 @@ public class CpuEngine : ITensorLevelEngine
             BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outF);
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input.Shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
         }
 
         var meanData = new T[channels];
@@ -10618,7 +10618,7 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>(new[] { channels }, new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
     }
 
     private static unsafe void BatchNorm4DFloat(float[] input, float[] gamma, float[] beta, float eps,
@@ -10867,14 +10867,14 @@ public class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
 
         // Handle both 2D [batch, features] and 4D [batch, channels, height, width] tensors
-        if (input.Shape.Length == 4)
+        if (input._shape.Length == 4)
         {
             return BatchNormBackward4D(gradOutput, input, gamma, mean, variance, eps, numOps, out gradGamma, out gradBeta);
         }
 
         // 2D case: [batch, features]
-        int batch = input.Shape[0];
-        int features = input.Shape[1];
+        int batch = input._shape[0];
+        int features = input._shape[1];
         T batchT = numOps.FromDouble(batch);
 
         var gradOutputData = gradOutput.GetDataArray();
@@ -10943,7 +10943,7 @@ public class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([features], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([features], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
 
@@ -10952,10 +10952,10 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private Tensor<T> BatchNormBackward4D<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, T eps, INumericOperations<T> numOps, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
         int spatialSize = height * width;
         int elementsPerChannel = batch * spatialSize;
         T elementsT = numOps.FromDouble(elementsPerChannel);
@@ -11040,7 +11040,7 @@ public class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -11055,21 +11055,21 @@ public class CpuEngine : ITensorLevelEngine
 
         // Determine normalized dimensions from gamma shape
         // gamma.Shape defines which trailing dimensions to normalize over
-        int normalizedDims = gamma.Shape.Length;
-        int inputRank = input.Shape.Length;
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
 
         if (normalizedDims > inputRank)
         {
-            throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma.Shape)}) has more dimensions than input shape ({string.Join(", ", input.Shape)})");
+            throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma._shape)}) has more dimensions than input shape ({string.Join(", ", input._shape)})");
         }
 
         // Verify that gamma shape matches the last N dimensions of input
         for (int i = 0; i < normalizedDims; i++)
         {
             int inputDimIdx = inputRank - normalizedDims + i;
-            if (gamma.Shape[i] != input.Shape[inputDimIdx])
+            if (gamma._shape[i] != input._shape[inputDimIdx])
             {
-                throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma.Shape)}) does not match the last {normalizedDims} dimensions of input shape ({string.Join(", ", input.Shape)})");
+                throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma._shape)}) does not match the last {normalizedDims} dimensions of input shape ({string.Join(", ", input._shape)})");
             }
         }
 
@@ -11081,8 +11081,8 @@ public class CpuEngine : ITensorLevelEngine
 
         for (int i = 0; i < batchDims; i++)
         {
-            batchSize *= input.Shape[i];
-            batchShape[i] = input.Shape[i];
+            batchSize *= input._shape[i];
+            batchShape[i] = input._shape[i];
         }
 
         // Handle case where all dimensions are normalized (batchDims = 0)
@@ -11137,7 +11137,7 @@ public class CpuEngine : ITensorLevelEngine
         // Create mean and variance tensors with batch shape
         mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>(batchShape, new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -11150,15 +11150,15 @@ public class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
 
         // Determine normalized dimensions from gamma shape (same as forward pass)
-        int normalizedDims = gamma.Shape.Length;
-        int inputRank = input.Shape.Length;
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
         int batchDims = inputRank - normalizedDims;
 
         // Calculate batch size and feature size
         int batchSize = 1;
         for (int i = 0; i < batchDims; i++)
         {
-            batchSize *= input.Shape[i];
+            batchSize *= input._shape[i];
         }
         if (batchDims == 0) batchSize = 1;
 
@@ -11222,9 +11222,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradGammaData));
-        gradBeta = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
+        gradBeta = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradBetaData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -11239,8 +11239,8 @@ public class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
 
         // Input shape: [batch, channels, ...spatial]
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
 
         if (channels % numGroups != 0)
         {
@@ -11251,9 +11251,9 @@ public class CpuEngine : ITensorLevelEngine
 
         // Compute spatial size (product of all dimensions after batch and channels)
         int spatialSize = 1;
-        for (int i = 2; i < input.Shape.Length; i++)
+        for (int i = 2; i < input._shape.Length; i++)
         {
-            spatialSize *= input.Shape[i];
+            spatialSize *= input._shape[i];
         }
 
         int groupSize = channelsPerGroup * spatialSize;  // Elements per group
@@ -11261,7 +11261,7 @@ public class CpuEngine : ITensorLevelEngine
         // Fast float path: Pin() for NativeMemory compatibility
         if (typeof(T) == typeof(float))
         {
-            var result = TensorAllocator.Rent<T>(input.Shape);
+            var result = TensorAllocator.Rent<T>(input._shape);
             // Pin all memory to get float* pointers (works with both managed and NativeMemory)
             using var pinIn = input.Data.Pin();
             using var pinOut = result.Data.Pin();
@@ -11290,7 +11290,7 @@ public class CpuEngine : ITensorLevelEngine
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
-        var outputData = TensorAllocator.Rent<T>(input.Shape).GetDataArray();
+        var outputData = TensorAllocator.Rent<T>(input._shape).GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
         Parallel.For(0, batch * numGroups, idx =>
@@ -11342,7 +11342,7 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -11357,15 +11357,15 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
 
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
         int channelsPerGroup = channels / numGroups;
 
         // Compute spatial size
         int spatialSize = 1;
-        for (int i = 2; i < input.Shape.Length; i++)
+        for (int i = 2; i < input._shape.Length; i++)
         {
-            spatialSize *= input.Shape[i];
+            spatialSize *= input._shape[i];
         }
 
         int groupSize = channelsPerGroup * spatialSize;
@@ -11455,7 +11455,7 @@ public class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
 
@@ -11467,8 +11467,8 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
-        int normalizedDims = gamma.Shape.Length;
-        int inputRank = input.Shape.Length;
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
 
         if (normalizedDims > inputRank)
             throw new ArgumentException("Gamma shape has more dimensions than input shape");
@@ -11476,7 +11476,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < normalizedDims; i++)
         {
             int inputDimIdx = inputRank - normalizedDims + i;
-            if (gamma.Shape[i] != input.Shape[inputDimIdx])
+            if (gamma._shape[i] != input._shape[inputDimIdx])
                 throw new ArgumentException("Gamma shape does not match input trailing dimensions");
         }
 
@@ -11485,8 +11485,8 @@ public class CpuEngine : ITensorLevelEngine
         var batchShape = new int[Math.Max(1, batchDims)];
         for (int i = 0; i < batchDims; i++)
         {
-            batchSize *= input.Shape[i];
-            batchShape[i] = input.Shape[i];
+            batchSize *= input._shape[i];
+            batchShape[i] = input._shape[i];
         }
         if (batchDims == 0) { batchSize = 1; batchShape = [1]; }
 
@@ -11518,7 +11518,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         rms = TensorAllocator.Rent<T>(batchShape, new Vector<T>(rmsData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
     }
 
     /// <inheritdoc/>
@@ -11530,11 +11530,11 @@ public class CpuEngine : ITensorLevelEngine
         if (rms == null) throw new ArgumentNullException(nameof(rms));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int normalizedDims = gamma.Shape.Length;
-        int inputRank = input.Shape.Length;
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
         int batchDims = inputRank - normalizedDims;
         int batchSize = 1;
-        for (int i = 0; i < batchDims; i++) batchSize *= input.Shape[i];
+        for (int i = 0; i < batchDims; i++) batchSize *= input._shape[i];
         if (batchDims == 0) batchSize = 1;
 
         int featureSize = gamma.Length;
@@ -11575,8 +11575,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradGamma = TensorAllocator.Rent<T>(gamma.Shape, new Vector<T>(gradGammaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        gradGamma = TensorAllocator.Rent<T>(gamma._shape, new Vector<T>(gradGammaData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     #endregion
@@ -11609,17 +11609,17 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int heads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int d_k = query.Shape[3];
-        int seqK = key.Shape[2];
-        int d_v = value.Shape[3];
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int d_k = query._shape[3];
+        int seqK = key._shape[2];
+        int d_v = value._shape[3];
 
         // Validate shapes
-        if (key.Shape[0] != batch || key.Shape[1] != heads || key.Shape[3] != d_k)
+        if (key._shape[0] != batch || key._shape[1] != heads || key._shape[3] != d_k)
             throw new ArgumentException("Key shape mismatch with Query");
-        if (value.Shape[0] != batch || value.Shape[1] != heads || value.Shape[2] != seqK)
+        if (value._shape[0] != batch || value._shape[1] != heads || value._shape[2] != seqK)
             throw new ArgumentException("Value shape mismatch with Key");
 
         // Compute scale factor
@@ -11755,12 +11755,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int heads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int d_k = query.Shape[3];
-        int seqK = key.Shape[2];
-        int d_v = value.Shape[3];
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int d_k = query._shape[3];
+        int seqK = key._shape[2];
+        int d_v = value._shape[3];
 
         T scaleFactor = numOps.FromDouble(scale);
 
@@ -11858,9 +11858,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -11889,11 +11889,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int heads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int headDim = query.Shape[3];
-        int seqK = key.Shape[2];
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int headDim = query._shape[3];
+        int seqK = key._shape[2];
 
         // Extract and validate bias data if provided
         T[]? biasData = null;
@@ -11901,21 +11901,21 @@ public class CpuEngine : ITensorLevelEngine
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
         {
-            int biasRank = attentionBias.Shape.Length;
+            int biasRank = attentionBias._shape.Length;
             if (biasRank == 4)
             {
-                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
-                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                if (attentionBias._shape[0] != batch || attentionBias._shape[1] != heads ||
+                    attentionBias._shape[2] != seqQ || attentionBias._shape[3] != seqK)
                     throw new ArgumentException(
-                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        $"4D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
                         nameof(attentionBias));
                 biasBroadcastBatch = false;
             }
             else if (biasRank == 3)
             {
-                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                if (attentionBias._shape[0] != heads || attentionBias._shape[1] != seqQ || attentionBias._shape[2] != seqK)
                     throw new ArgumentException(
-                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        $"3D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
                         nameof(attentionBias));
                 biasBroadcastBatch = true;
             }
@@ -12104,11 +12104,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int heads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int headDim = query.Shape[3];
-        int seqK = key.Shape[2];
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int headDim = query._shape[3];
+        int seqK = key._shape[2];
 
         T scaleFactor = numOps.FromDouble(scale);
 
@@ -12132,21 +12132,21 @@ public class CpuEngine : ITensorLevelEngine
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
         {
-            int biasRank = attentionBias.Shape.Length;
+            int biasRank = attentionBias._shape.Length;
             if (biasRank == 4)
             {
-                if (attentionBias.Shape[0] != batch || attentionBias.Shape[1] != heads ||
-                    attentionBias.Shape[2] != seqQ || attentionBias.Shape[3] != seqK)
+                if (attentionBias._shape[0] != batch || attentionBias._shape[1] != heads ||
+                    attentionBias._shape[2] != seqQ || attentionBias._shape[3] != seqK)
                     throw new ArgumentException(
-                        $"4D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        $"4D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
                         nameof(attentionBias));
                 biasBroadcastBatch = false;
             }
             else if (biasRank == 3)
             {
-                if (attentionBias.Shape[0] != heads || attentionBias.Shape[1] != seqQ || attentionBias.Shape[2] != seqK)
+                if (attentionBias._shape[0] != heads || attentionBias._shape[1] != seqQ || attentionBias._shape[2] != seqK)
                     throw new ArgumentException(
-                        $"3D attention bias shape [{string.Join(",", attentionBias.Shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        $"3D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
                         nameof(attentionBias));
                 biasBroadcastBatch = true;
             }
@@ -12274,9 +12274,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -12304,12 +12304,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int numQHeads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int headDim = query.Shape[3];
-        int numKVHeads = key.Shape[1];
-        int seqK = key.Shape[2];
+        int batch = query._shape[0];
+        int numQHeads = query._shape[1];
+        int seqQ = query._shape[2];
+        int headDim = query._shape[3];
+        int numKVHeads = key._shape[1];
+        int seqK = key._shape[2];
 
         if (numQHeads != numKVHeads * numQueriesPerKV)
             throw new ArgumentException($"Query heads ({numQHeads}) must equal KV heads ({numKVHeads}) * numQueriesPerKV ({numQueriesPerKV})");
@@ -12431,12 +12431,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batch = query.Shape[0];
-        int numQHeads = query.Shape[1];
-        int seqQ = query.Shape[2];
-        int headDim = query.Shape[3];
-        int numKVHeads = key.Shape[1];
-        int seqK = key.Shape[2];
+        int batch = query._shape[0];
+        int numQHeads = query._shape[1];
+        int seqQ = query._shape[2];
+        int headDim = query._shape[3];
+        int numKVHeads = key._shape[1];
+        int seqK = key._shape[2];
 
         T scaleFactor = numOps.FromDouble(scale);
 
@@ -12548,9 +12548,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        gradQuery = TensorAllocator.Rent<T>(query.Shape, new Vector<T>(gradQData));
-        gradKey = TensorAllocator.Rent<T>(key.Shape, new Vector<T>(gradKData));
-        gradValue = TensorAllocator.Rent<T>(value.Shape, new Vector<T>(gradVData));
+        gradQuery = TensorAllocator.Rent<T>(query._shape, new Vector<T>(gradQData));
+        gradKey = TensorAllocator.Rent<T>(key._shape, new Vector<T>(gradKData));
+        gradValue = TensorAllocator.Rent<T>(value._shape, new Vector<T>(gradVData));
 
         return gradOutput;
     }
@@ -12569,10 +12569,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batchSize = nodeFeatures.Shape[0];
-        int numNodes = nodeFeatures.Shape[1];
-        int features = nodeFeatures.Shape[2];
-        int numEdges = edgeSourceIndices.Shape[0];
+        int batchSize = nodeFeatures._shape[0];
+        int numNodes = nodeFeatures._shape[1];
+        int features = nodeFeatures._shape[2];
+        int numEdges = edgeSourceIndices._shape[0];
 
         var nodeData = nodeFeatures.AsSpan();
         var srcIndices = edgeSourceIndices.AsSpan();
@@ -12681,7 +12681,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         attentionCoeffs = TensorAllocator.Rent<T>(new[] { batchSize, numEdges }, new Vector<T>(coeffsData));
-        return TensorAllocator.Rent<T>(nodeFeatures.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -12702,10 +12702,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batchSize = nodeFeatures.Shape[0];
-        int numNodes = nodeFeatures.Shape[1];
-        int features = nodeFeatures.Shape[2];
-        int numEdges = edgeSourceIndices.Shape[0];
+        int batchSize = nodeFeatures._shape[0];
+        int numNodes = nodeFeatures._shape[1];
+        int features = nodeFeatures._shape[2];
+        int numEdges = edgeSourceIndices._shape[0];
 
         var nodeData = nodeFeatures.AsSpan();
         var gradOutData = gradOutput.AsSpan();
@@ -12838,9 +12838,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        gradNodeFeatures = TensorAllocator.Rent<T>(nodeFeatures.Shape, new Vector<T>(gradNodeData));
-        gradAttentionWeightSource = TensorAllocator.Rent<T>(attentionWeightSource.Shape, new Vector<T>(gradAttnSrc));
-        gradAttentionWeightTarget = TensorAllocator.Rent<T>(attentionWeightTarget.Shape, new Vector<T>(gradAttnTgt));
+        gradNodeFeatures = TensorAllocator.Rent<T>(nodeFeatures._shape, new Vector<T>(gradNodeData));
+        gradAttentionWeightSource = TensorAllocator.Rent<T>(attentionWeightSource._shape, new Vector<T>(gradAttnSrc));
+        gradAttentionWeightTarget = TensorAllocator.Rent<T>(attentionWeightTarget._shape, new Vector<T>(gradAttnTgt));
 
         return gradOutput;
     }
@@ -12861,12 +12861,12 @@ public class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int batchSize = nodeFeatures.Shape[0];
-        int numNodes = nodeFeatures.Shape[1];
-        int inFeatures = nodeFeatures.Shape[2];
-        int numHeads = headWeights.Shape[0];
-        int headDim = headWeights.Shape[2];
-        int numEdges = edgeSourceIndices.Shape[0];
+        int batchSize = nodeFeatures._shape[0];
+        int numNodes = nodeFeatures._shape[1];
+        int inFeatures = nodeFeatures._shape[2];
+        int numHeads = headWeights._shape[0];
+        int headDim = headWeights._shape[2];
+        int numEdges = edgeSourceIndices._shape[0];
 
         var nodeData = nodeFeatures.AsSpan();
         var weightData = headWeights.AsSpan();
@@ -13030,13 +13030,13 @@ public class CpuEngine : ITensorLevelEngine
         // Calculate strides
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
-            innerSize *= source.Shape[i];
+            innerSize *= source._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= source.Shape[i];
+            outerSize *= source._shape[i];
 
-        int srcDimSize = source.Shape[actualDim];
+        int srcDimSize = source._shape[actualDim];
 
         // Scatter add
         for (int outer = 0; outer < outerSize; outer++)
@@ -13085,7 +13085,7 @@ public class CpuEngine : ITensorLevelEngine
             outerSize *= sourceShape[i];
 
         int srcDimSize = sourceShape[actualDim];
-        int outDimSize = gradOutput.Shape[actualDim];
+        int outDimSize = gradOutput._shape[actualDim];
 
         // Gather gradients back
         for (int outer = 0; outer < outerSize; outer++)
@@ -13142,13 +13142,13 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
-            innerSize *= source.Shape[i];
+            innerSize *= source._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= source.Shape[i];
+            outerSize *= source._shape[i];
 
-        int srcDimSize = source.Shape[actualDim];
+        int srcDimSize = source._shape[actualDim];
 
         // Sum and count
         for (int outer = 0; outer < outerSize; outer++)
@@ -13220,7 +13220,7 @@ public class CpuEngine : ITensorLevelEngine
             outerSize *= sourceShape[i];
 
         int srcDimSize = sourceShape[actualDim];
-        int outDimSize = gradOutput.Shape[actualDim];
+        int outDimSize = gradOutput._shape[actualDim];
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -13284,13 +13284,13 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
-            innerSize *= source.Shape[i];
+            innerSize *= source._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= source.Shape[i];
+            outerSize *= source._shape[i];
 
-        int srcDimSize = source.Shape[actualDim];
+        int srcDimSize = source._shape[actualDim];
 
         // Find max
         for (int outer = 0; outer < outerSize; outer++)
@@ -13349,7 +13349,7 @@ public class CpuEngine : ITensorLevelEngine
             outerSize *= sourceShape[i];
 
         int srcDimSize = sourceShape[actualDim];
-        int outDimSize = gradOutput.Shape[actualDim];
+        int outDimSize = gradOutput._shape[actualDim];
 
         // Route gradients to argmax positions
         for (int outer = 0; outer < outerSize; outer++)
@@ -13399,13 +13399,13 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < source.Rank; i++)
-            innerSize *= source.Shape[i];
+            innerSize *= source._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= source.Shape[i];
+            outerSize *= source._shape[i];
 
-        int srcDimSize = source.Shape[actualDim];
+        int srcDimSize = source._shape[actualDim];
 
         // For each outer/inner position, compute softmax per group
         for (int outer = 0; outer < outerSize; outer++)
@@ -13456,7 +13456,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(source.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(source._shape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -13489,13 +13489,13 @@ public class CpuEngine : ITensorLevelEngine
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < output.Rank; i++)
-            innerSize *= output.Shape[i];
+            innerSize *= output._shape[i];
 
         int outerSize = 1;
         for (int i = 0; i < actualDim; i++)
-            outerSize *= output.Shape[i];
+            outerSize *= output._shape[i];
 
-        int srcDimSize = output.Shape[actualDim];
+        int srcDimSize = output._shape[actualDim];
 
         // Softmax backward: grad_input = output * (grad_output - sum(output * grad_output))
         for (int outer = 0; outer < outerSize; outer++)
@@ -13529,7 +13529,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(output.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(output._shape, new Vector<T>(gradInputData));
     }
 
     #endregion
@@ -13576,7 +13576,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputShape = input.Shape;
+        var inputShape = input._shape;
         var inputData = input.GetDataArray();
 
         // Validate and normalize axes
@@ -13669,7 +13669,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var inputShape = input.Shape;
+        var inputShape = input._shape;
         var inputData = input.GetDataArray();
 
         // Validate and normalize axes
@@ -13757,7 +13757,7 @@ public class CpuEngine : ITensorLevelEngine
         T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
 
         var gradOutputData = gradOutput.GetDataArray();
-        var gradOutputShape = gradOutput.Shape;
+        var gradOutputShape = gradOutput._shape;
         var inputStrides = ComputeStrides(inputShape);
         var outputStrides = ComputeStrides(gradOutputShape);
 
@@ -13810,12 +13810,12 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var inputShape = input.Shape;
+        var inputShape = input._shape;
 
         // First compute the mean
         var mean = ReduceMean(input, axes, keepDims: true);
         var meanData = mean.GetDataArray();
-        var meanShape = mean.Shape;
+        var meanShape = mean._shape;
 
         // Normalize axes
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
@@ -13910,11 +13910,11 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var inputShape = input.Shape;
+        var inputShape = input._shape;
         var meanData = mean.GetDataArray();
-        var meanShape = mean.Shape;
+        var meanShape = mean._shape;
         var gradOutputData = gradOutput.GetDataArray();
-        var gradOutputShape = gradOutput.Shape;
+        var gradOutputShape = gradOutput._shape;
 
         int inputSize = input.Length;
         var gradInputData = new T[inputSize];
@@ -13967,7 +13967,7 @@ public class CpuEngine : ITensorLevelEngine
             varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
         }
 
-        return TensorAllocator.Rent<T>(variance.Shape, new Vector<T>(varianceData));
+        return TensorAllocator.Rent<T>(variance._shape, new Vector<T>(varianceData));
     }
 
     /// <inheritdoc/>
@@ -13984,13 +13984,13 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
-        var inputShape = input.Shape;
+        var inputShape = input._shape;
         var meanData = mean.GetDataArray();
-        var meanShape = mean.Shape;
+        var meanShape = mean._shape;
         var varianceData = variance.GetDataArray();
-        var varianceShape = variance.Shape;
+        var varianceShape = variance._shape;
         var gradOutputData = gradOutput.GetDataArray();
-        var gradOutputShape = gradOutput.Shape;
+        var gradOutputShape = gradOutput._shape;
 
         int inputSize = input.Length;
         var gradInputData = new T[inputSize];
@@ -14157,7 +14157,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
-        var shape = input.Shape;
+        var shape = input._shape;
         if (shape.Length < 2)
             throw new ArgumentException("Upsample requires tensor with at least 2 dimensions for height and width.");
 
@@ -14264,7 +14264,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
-        var shape = input.Shape;
+        var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
 
@@ -14353,10 +14353,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
     {
         if (theta == null) throw new ArgumentNullException(nameof(theta));
-        if (theta.Shape.Length != 3 || theta.Shape[1] != 2 || theta.Shape[2] != 3)
+        if (theta._shape.Length != 3 || theta._shape[1] != 2 || theta._shape[2] != 3)
             throw new ArgumentException("AffineGrid expects theta shape [batch, 2, 3]");
 
-        int batchSize = theta.Shape[0];
+        int batchSize = theta._shape[0];
         var grid = TensorAllocator.Rent<T>([batchSize, outputHeight, outputWidth, 2]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -14400,20 +14400,20 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
 
-        if (input.Shape.Length != 4)
+        if (input._shape.Length != 4)
             throw new ArgumentException("GridSample expects input shape [batch, height, width, channels]");
-        if (grid.Shape.Length != 4 || grid.Shape[3] != 2)
+        if (grid._shape.Length != 4 || grid._shape[3] != 2)
             throw new ArgumentException("GridSample expects grid shape [batch, outH, outW, 2]");
-        if (input.Shape[0] != grid.Shape[0])
+        if (input._shape[0] != grid._shape[0])
             throw new ArgumentException("GridSample batch size mismatch between input and grid");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int inH = input.Shape[1];
-        int inW = input.Shape[2];
-        int channels = input.Shape[3];
-        int outH = grid.Shape[1];
-        int outW = grid.Shape[2];
+        int batch = input._shape[0];
+        int inH = input._shape[1];
+        int inW = input._shape[2];
+        int channels = input._shape[3];
+        int outH = grid._shape[1];
+        int outW = grid._shape[2];
 
         var output = TensorAllocator.Rent<T>([batch, outH, outW, channels]);
 
@@ -14472,8 +14472,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (aReal == null || aImag == null || bReal == null || bImag == null)
             throw new ArgumentNullException("ComplexMatMul inputs cannot be null");
-        var aShape = aReal.Shape;
-        var bShape = bReal.Shape;
+        var aShape = aReal._shape;
+        var bShape = bReal._shape;
         if (aShape.Length != 2 || bShape.Length != 2 || aShape[1] != bShape[0])
             throw new ArgumentException("ComplexMatMul expects shapes [M,K] x [K,N]");
 
@@ -14514,11 +14514,11 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (real == null || imag == null)
             throw new ArgumentNullException("ComplexMagnitudeSquared inputs cannot be null");
-        if (!real.Shape.SequenceEqual(imag.Shape))
+        if (!real._shape.SequenceEqual(imag._shape))
             throw new ArgumentException("Real and imaginary parts must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var output = TensorAllocator.Rent<T>(real.Shape);
+        var output = TensorAllocator.Rent<T>(real._shape);
         for (int idx = 0; idx < real.Length; idx++)
         {
             var r = real[idx];
@@ -14536,7 +14536,7 @@ public class CpuEngine : ITensorLevelEngine
         if (numOps.Equals(total, numOps.Zero))
             return (real.Clone(), imag.Clone());
         var denom = numOps.Sqrt(total);
-        var denomTensor = TensorAllocator.Rent<T>(magSq.Shape);
+        var denomTensor = TensorAllocator.Rent<T>(magSq._shape);
         denomTensor.Fill(denom);
         var realNorm = TensorDivide(real, denomTensor);
         var imagNorm = TensorDivide(imag, denomTensor);
@@ -14546,7 +14546,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
-        var shape = input.Shape;
+        var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
 
@@ -14592,7 +14592,7 @@ public class CpuEngine : ITensorLevelEngine
         int inputHeight = inputShape[2];
         int inputWidth = inputShape[3];
 
-        var gradOutputShape = gradOutput.Shape;
+        var gradOutputShape = gradOutput._shape;
         int cropHeight = gradOutputShape[2];
         int cropWidth = gradOutputShape[3];
 
@@ -14626,7 +14626,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
-        var shape = input.Shape;
+        var shape = input._shape;
         if (shape.Length < 2)
             throw new ArgumentException("Pad expects at least 2D tensor");
 
@@ -14680,7 +14680,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < rank - 2; i++)
             batchSize *= inputShape[i];
 
-        var gradOutputShape = gradOutput.Shape;
+        var gradOutputShape = gradOutput._shape;
         int paddedHeight = gradOutputShape[rank - 2];
         int paddedWidth = gradOutputShape[rank - 1];
 
@@ -14711,7 +14711,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensors == null || tensors.Count == 0)
             throw new ArgumentException("At least one tensor required for concatenation");
 
-        var firstShape = tensors[0].Shape;
+        var firstShape = tensors[0]._shape;
         int rank = firstShape.Length;
 
         if (axis < 0) axis = rank + axis;
@@ -14721,16 +14721,16 @@ public class CpuEngine : ITensorLevelEngine
         int totalAxisSize = 0;
         foreach (var tensor in tensors)
         {
-            if (tensor.Shape.Length != rank)
+            if (tensor._shape.Length != rank)
                 throw new ArgumentException("All tensors must have the same number of dimensions");
 
             for (int i = 0; i < rank; i++)
             {
-                if (i != axis && tensor.Shape[i] != firstShape[i])
+                if (i != axis && tensor._shape[i] != firstShape[i])
                     throw new ArgumentException($"All tensors must have the same shape except along axis {axis}");
             }
 
-            totalAxisSize += tensor.Shape[axis];
+            totalAxisSize += tensor._shape[axis];
         }
 
         var outputShape = (int[])firstShape.Clone();
@@ -14745,7 +14745,7 @@ public class CpuEngine : ITensorLevelEngine
         foreach (var tensor in tensors)
         {
             var tensorData = tensor.GetDataArray();
-            var tensorShape = tensor.Shape;
+            var tensorShape = tensor._shape;
             var tensorStrides = ComputeStrides(tensorShape);
 
             for (int i = 0; i < tensor.Length; i++)
@@ -14756,7 +14756,7 @@ public class CpuEngine : ITensorLevelEngine
                 outputData[outputIdx] = tensorData[i];
             }
 
-            axisOffset += tensor.Shape[axis];
+            axisOffset += tensor._shape[axis];
         }
 
         return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
@@ -14843,15 +14843,15 @@ public class CpuEngine : ITensorLevelEngine
         if (embeddings.Rank != 2)
             throw new ArgumentException($"Embeddings must be a 2D tensor [vocab_size, embedding_dim]. Got rank {embeddings.Rank}.");
 
-        int vocabSize = embeddings.Shape[0];
-        int embeddingDim = embeddings.Shape[1];
+        int vocabSize = embeddings._shape[0];
+        int embeddingDim = embeddings._shape[1];
         int numIndices = indices.Length;
 
         // Output shape is [*indices.shape, embedding_dim]
         var outputShape = new int[indices.Rank + 1];
         for (int i = 0; i < indices.Rank; i++)
         {
-            outputShape[i] = indices.Shape[i];
+            outputShape[i] = indices._shape[i];
         }
         outputShape[indices.Rank] = embeddingDim;
 
@@ -14937,14 +14937,14 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"epsilons must be 1D [numCenters], got rank {epsilons.Rank}", nameof(epsilons));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = input.Shape[0];
-        int features = input.Shape[1];
-        int numCenters = centers.Shape[0];
+        int batchSize = input._shape[0];
+        int features = input._shape[1];
+        int numCenters = centers._shape[0];
 
-        if (centers.Shape[1] != features)
-            throw new ArgumentException($"centers features dimension ({centers.Shape[1]}) must match input features ({features})", nameof(centers));
-        if (epsilons.Shape[0] != numCenters)
-            throw new ArgumentException($"epsilons length ({epsilons.Shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
+        if (centers._shape[1] != features)
+            throw new ArgumentException($"centers features dimension ({centers._shape[1]}) must match input features ({features})", nameof(centers));
+        if (epsilons._shape[0] != numCenters)
+            throw new ArgumentException($"epsilons length ({epsilons._shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
 
         var output = TensorAllocator.Rent<T>([batchSize, numCenters]);
         var inputData = input.GetDataArray();
@@ -14998,22 +14998,22 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"output must be 2D [batch, numCenters], got rank {output.Rank}", nameof(output));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = input.Shape[0];
-        int features = input.Shape[1];
-        int numCenters = centers.Shape[0];
+        int batchSize = input._shape[0];
+        int features = input._shape[1];
+        int numCenters = centers._shape[0];
 
-        if (centers.Shape[1] != features)
-            throw new ArgumentException($"centers features dimension ({centers.Shape[1]}) must match input features ({features})", nameof(centers));
-        if (epsilons.Shape[0] != numCenters)
-            throw new ArgumentException($"epsilons length ({epsilons.Shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
-        if (gradOutput.Shape[0] != batchSize || gradOutput.Shape[1] != numCenters)
-            throw new ArgumentException($"gradOutput shape [{gradOutput.Shape[0]}, {gradOutput.Shape[1]}] must be [{batchSize}, {numCenters}]", nameof(gradOutput));
-        if (output.Shape[0] != batchSize || output.Shape[1] != numCenters)
-            throw new ArgumentException($"output shape [{output.Shape[0]}, {output.Shape[1]}] must be [{batchSize}, {numCenters}]", nameof(output));
+        if (centers._shape[1] != features)
+            throw new ArgumentException($"centers features dimension ({centers._shape[1]}) must match input features ({features})", nameof(centers));
+        if (epsilons._shape[0] != numCenters)
+            throw new ArgumentException($"epsilons length ({epsilons._shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
+        if (gradOutput._shape[0] != batchSize || gradOutput._shape[1] != numCenters)
+            throw new ArgumentException($"gradOutput shape [{gradOutput._shape[0]}, {gradOutput._shape[1]}] must be [{batchSize}, {numCenters}]", nameof(gradOutput));
+        if (output._shape[0] != batchSize || output._shape[1] != numCenters)
+            throw new ArgumentException($"output shape [{output._shape[0]}, {output._shape[1]}] must be [{batchSize}, {numCenters}]", nameof(output));
 
-        var gradInput = TensorAllocator.Rent<T>(input.Shape);
-        var gradCenters = TensorAllocator.Rent<T>(centers.Shape);
-        var gradEpsilons = TensorAllocator.Rent<T>(epsilons.Shape);
+        var gradInput = TensorAllocator.Rent<T>(input._shape);
+        var gradCenters = TensorAllocator.Rent<T>(centers._shape);
+        var gradEpsilons = TensorAllocator.Rent<T>(epsilons._shape);
 
         var inputData = input.GetDataArray();
         var centersData = centers.GetDataArray();
@@ -15084,12 +15084,12 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be at least 1");
-        if (axis < 0 || axis >= tensor.Shape.Length)
-            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {tensor.Shape.Length} dimensions");
+        if (axis < 0 || axis >= tensor._shape.Length)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {tensor._shape.Length} dimensions");
 
         // Calculate output shape
-        var outputShape = new int[tensor.Shape.Length];
-        Array.Copy(tensor.Shape, outputShape, tensor.Shape.Length);
+        var outputShape = new int[tensor._shape.Length];
+        Array.Copy(tensor._shape, outputShape, tensor._shape.Length);
         outputShape[axis] *= repeats;
 
         var result = TensorAllocator.Rent<T>(outputShape);
@@ -15097,12 +15097,12 @@ public class CpuEngine : ITensorLevelEngine
         // Calculate strides for the tensor
         int outerSize = 1;
         for (int i = 0; i < axis; i++)
-            outerSize *= tensor.Shape[i];
+            outerSize *= tensor._shape[i];
 
-        int axisSize = tensor.Shape[axis];
+        int axisSize = tensor._shape[axis];
         int innerSize = 1;
-        for (int i = axis + 1; i < tensor.Shape.Length; i++)
-            innerSize *= tensor.Shape[i];
+        for (int i = axis + 1; i < tensor._shape.Length; i++)
+            innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -15131,20 +15131,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (multiples == null) throw new ArgumentNullException(nameof(multiples));
-        if (multiples.Length != tensor.Shape.Length)
-            throw new ArgumentException($"Multiples length ({multiples.Length}) must match tensor dimensions ({tensor.Shape.Length})");
+        if (multiples.Length != tensor._shape.Length)
+            throw new ArgumentException($"Multiples length ({multiples.Length}) must match tensor dimensions ({tensor._shape.Length})");
 
         // Calculate output shape
-        var outputShape = new int[tensor.Shape.Length];
-        for (int i = 0; i < tensor.Shape.Length; i++)
+        var outputShape = new int[tensor._shape.Length];
+        for (int i = 0; i < tensor._shape.Length; i++)
         {
             if (multiples[i] < 1)
                 throw new ArgumentOutOfRangeException(nameof(multiples), $"Multiple at index {i} must be at least 1");
-            outputShape[i] = tensor.Shape[i] * multiples[i];
+            outputShape[i] = tensor._shape[i] * multiples[i];
         }
 
         var result = TensorAllocator.Rent<T>(outputShape);
-        int totalElements = result.Shape.Aggregate(1, (a, b) => a * b);
+        int totalElements = result._shape.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
 
@@ -15163,10 +15163,10 @@ public class CpuEngine : ITensorLevelEngine
             // Map to input indices (modulo original size)
             int inputFlat = 0;
             int stride = 1;
-            for (int d = tensor.Shape.Length - 1; d >= 0; d--)
+            for (int d = tensor._shape.Length - 1; d >= 0; d--)
             {
-                inputFlat += (outputIndices[d] % tensor.Shape[d]) * stride;
-                stride *= tensor.Shape[d];
+                inputFlat += (outputIndices[d] % tensor._shape[d]) * stride;
+                stride *= tensor._shape[d];
             }
 
             resultData[flatIdx] = tensorData[inputFlat];
@@ -15181,18 +15181,18 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (start == null) throw new ArgumentNullException(nameof(start));
         if (length == null) throw new ArgumentNullException(nameof(length));
-        if (start.Length != tensor.Shape.Length)
-            throw new ArgumentException($"Start length ({start.Length}) must match tensor dimensions ({tensor.Shape.Length})");
-        if (length.Length != tensor.Shape.Length)
-            throw new ArgumentException($"Length length ({length.Length}) must match tensor dimensions ({tensor.Shape.Length})");
+        if (start.Length != tensor._shape.Length)
+            throw new ArgumentException($"Start length ({start.Length}) must match tensor dimensions ({tensor._shape.Length})");
+        if (length.Length != tensor._shape.Length)
+            throw new ArgumentException($"Length length ({length.Length}) must match tensor dimensions ({tensor._shape.Length})");
 
         // Validate bounds
-        for (int i = 0; i < tensor.Shape.Length; i++)
+        for (int i = 0; i < tensor._shape.Length; i++)
         {
-            if (start[i] < 0 || start[i] >= tensor.Shape[i])
-                throw new ArgumentOutOfRangeException(nameof(start), $"Start index {start[i]} out of range for axis {i} with size {tensor.Shape[i]}");
-            if (length[i] < 1 || start[i] + length[i] > tensor.Shape[i])
-                throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor.Shape[i]}");
+            if (start[i] < 0 || start[i] >= tensor._shape[i])
+                throw new ArgumentOutOfRangeException(nameof(start), $"Start index {start[i]} out of range for axis {i} with size {tensor._shape[i]}");
+            if (length[i] < 1 || start[i] + length[i] > tensor._shape[i])
+                throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor._shape[i]}");
         }
 
         var result = TensorAllocator.Rent<T>(length);
@@ -15207,12 +15207,12 @@ public class CpuEngine : ITensorLevelEngine
             int remaining = flatIdx;
             int inputFlat = 0;
             int stride = 1;
-            for (int d = tensor.Shape.Length - 1; d >= 0; d--)
+            for (int d = tensor._shape.Length - 1; d >= 0; d--)
             {
                 int outputIdx = remaining % length[d];
                 remaining /= length[d];
                 inputFlat += (start[d] + outputIdx) * stride;
-                stride *= tensor.Shape[d];
+                stride *= tensor._shape[d];
             }
 
             resultData[flatIdx] = tensorData[inputFlat];
@@ -15227,25 +15227,25 @@ public class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (start == null) throw new ArgumentNullException(nameof(start));
-        if (start.Length != destination.Shape.Length)
-            throw new ArgumentException($"Start length ({start.Length}) must match destination dimensions ({destination.Shape.Length})");
-        if (source.Shape.Length != destination.Shape.Length)
-            throw new ArgumentException($"Source dimensions ({source.Shape.Length}) must match destination dimensions ({destination.Shape.Length})");
+        if (start.Length != destination._shape.Length)
+            throw new ArgumentException($"Start length ({start.Length}) must match destination dimensions ({destination._shape.Length})");
+        if (source._shape.Length != destination._shape.Length)
+            throw new ArgumentException($"Source dimensions ({source._shape.Length}) must match destination dimensions ({destination._shape.Length})");
 
         // Validate bounds
-        for (int i = 0; i < destination.Shape.Length; i++)
+        for (int i = 0; i < destination._shape.Length; i++)
         {
-            if (start[i] < 0 || start[i] + source.Shape[i] > destination.Shape[i])
-                throw new ArgumentOutOfRangeException(nameof(start), $"Slice starting at {start[i]} with size {source.Shape[i]} exceeds destination axis {i} size {destination.Shape[i]}");
+            if (start[i] < 0 || start[i] + source._shape[i] > destination._shape[i])
+                throw new ArgumentOutOfRangeException(nameof(start), $"Slice starting at {start[i]} with size {source._shape[i]} exceeds destination axis {i} size {destination._shape[i]}");
         }
 
         // Create a copy of destination to avoid modifying the original
-        var result = TensorAllocator.Rent<T>(destination.Shape);
+        var result = TensorAllocator.Rent<T>(destination._shape);
         var destData = destination.GetDataArray();
         var resultData = result.GetDataArray();
         Array.Copy(destData, resultData, destData.Length);
 
-        int sourceTotal = source.Shape.Aggregate(1, (a, b) => a * b);
+        int sourceTotal = source._shape.Aggregate(1, (a, b) => a * b);
         var sourceData = source.GetDataArray();
 
         // Set the slice values
@@ -15255,12 +15255,12 @@ public class CpuEngine : ITensorLevelEngine
             int remaining = flatIdx;
             int destFlat = 0;
             int stride = 1;
-            for (int d = destination.Shape.Length - 1; d >= 0; d--)
+            for (int d = destination._shape.Length - 1; d >= 0; d--)
             {
-                int srcIdx = remaining % source.Shape[d];
-                remaining /= source.Shape[d];
+                int srcIdx = remaining % source._shape[d];
+                remaining /= source._shape[d];
                 destFlat += (start[d] + srcIdx) * stride;
-                stride *= destination.Shape[d];
+                stride *= destination._shape[d];
             }
 
             resultData[destFlat] = sourceData[flatIdx];
@@ -15277,11 +15277,11 @@ public class CpuEngine : ITensorLevelEngine
         if (y == null) throw new ArgumentNullException(nameof(y));
 
         // All tensors must have the same shape (or be broadcastable, but we'll require same shape for simplicity)
-        if (!condition.Shape.SequenceEqual(x.Shape) || !condition.Shape.SequenceEqual(y.Shape))
+        if (!condition._shape.SequenceEqual(x._shape) || !condition._shape.SequenceEqual(y._shape))
             throw new ArgumentException("All tensors must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(condition.Shape);
+        var result = TensorAllocator.Rent<T>(condition._shape);
         var condSpan = condition.AsSpan();
         var xSpan = x.AsSpan();
         var ySpan = y.AsSpan();
@@ -15354,14 +15354,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (a.Shape.Length != 2 || b.Shape.Length != 2)
+        if (a._shape.Length != 2 || b._shape.Length != 2)
             throw new ArgumentException("Both tensors must be 2D [batch, features]");
-        if (a.Shape[0] != b.Shape[0])
+        if (a._shape[0] != b._shape[0])
             throw new ArgumentException("Batch sizes must match");
 
-        int batch = a.Shape[0];
-        int n = a.Shape[1];
-        int m = b.Shape[1];
+        int batch = a._shape[0];
+        int n = a._shape[1];
+        int m = b._shape[1];
         var result = TensorAllocator.Rent<T>([batch, n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -15385,7 +15385,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (axes == null) throw new ArgumentNullException(nameof(axes));
-        if (axes.Length != tensor.Shape.Length)
+        if (axes.Length != tensor._shape.Length)
             throw new ArgumentException("Axes length must match tensor rank");
 
         // Use tensor's built-in Transpose method
@@ -15398,7 +15398,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         // Normalize negative axis
-        int rank = tensor.Shape.Length;
+        int rank = tensor._shape.Length;
         if (axis < 0) axis = rank + 1 + axis;
         if (axis < 0 || axis > rank)
             throw new ArgumentOutOfRangeException(nameof(axis), "Axis out of range");
@@ -15406,10 +15406,10 @@ public class CpuEngine : ITensorLevelEngine
         // Build new shape with 1 inserted at axis
         var newShape = new int[rank + 1];
         for (int i = 0; i < axis; i++)
-            newShape[i] = tensor.Shape[i];
+            newShape[i] = tensor._shape[i];
         newShape[axis] = 1;
         for (int i = axis; i < rank; i++)
-            newShape[i + 1] = tensor.Shape[i];
+            newShape[i + 1] = tensor._shape[i];
 
         return tensor.Reshape(newShape);
     }
@@ -15450,20 +15450,20 @@ public class CpuEngine : ITensorLevelEngine
         if (updates == null) throw new ArgumentNullException(nameof(updates));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(destination.Shape);
+        var result = TensorAllocator.Rent<T>(destination._shape);
         TensorCopy(destination, result);
 
         // Simple 1D scatter-add for now (most common use case: embeddings)
-        if (axis == 0 && destination.Shape.Length == 2)
+        if (axis == 0 && destination._shape.Length == 2)
         {
-            int embeddingDim = destination.Shape[1];
+            int embeddingDim = destination._shape[1];
             var indicesData = indices.GetDataArray();
             var resultData = result.GetDataArray();
             var updatesData = updates.GetDataArray();
             for (int i = 0; i < indices.Length; i++)
             {
                 int idx = indicesData[i];
-                if (idx >= 0 && idx < destination.Shape[0])
+                if (idx >= 0 && idx < destination._shape[0])
                 {
                     int resultOffset = idx * embeddingDim;
                     int updateOffset = i * embeddingDim;
@@ -15491,9 +15491,9 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Simple 1D gather for embedding lookups
-        if (axis == 0 && source.Shape.Length == 2)
+        if (axis == 0 && source._shape.Length == 2)
         {
-            int embeddingDim = source.Shape[1];
+            int embeddingDim = source._shape[1];
             int numIndices = indices.Length;
             var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
 
@@ -15503,7 +15503,7 @@ public class CpuEngine : ITensorLevelEngine
             Parallel.For(0, numIndices, i =>
             {
                 int idx = indicesData[i];
-                if (idx >= 0 && idx < source.Shape[0])
+                if (idx >= 0 && idx < source._shape[0])
                 {
                     Array.Copy(sourceData, idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
                 }
@@ -15523,18 +15523,18 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
+        for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
 
-        int axisSize = tensor.Shape[axis];
+        int axisSize = tensor._shape[axis];
 
         int innerSize = 1;
-        for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
+        for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -15564,7 +15564,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
@@ -15743,7 +15743,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
@@ -15794,10 +15794,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorDiagonal<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (tensor.Shape.Length != 2)
+        if (tensor._shape.Length != 2)
             throw new ArgumentException("Tensor must be 2D");
 
-        int n = Math.Min(tensor.Shape[0], tensor.Shape[1]);
+        int n = Math.Min(tensor._shape[0], tensor._shape[1]);
         var result = TensorAllocator.Rent<T>([n]);
 
         for (int i = 0; i < n; i++)
@@ -15853,8 +15853,8 @@ public class CpuEngine : ITensorLevelEngine
             // Batched dot: bi,bi->b
             if (subscripts == "bi,bi->b")
             {
-                int batch = tensors[0].Shape[0];
-                int n = tensors[0].Shape[1];
+                int batch = tensors[0]._shape[0];
+                int n = tensors[0]._shape[1];
                 var result = TensorAllocator.Rent<T>([batch]);
                 Parallel.For(0, batch, b =>
                 {
@@ -15879,7 +15879,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -15891,7 +15891,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -15903,7 +15903,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
 
         return result;
@@ -15915,7 +15915,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tanhOutput == null) throw new ArgumentNullException(nameof(tanhOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tanhOutput.Shape);
+        var result = TensorAllocator.Rent<T>(tanhOutput._shape);
 
         // d/dx tanh(x) = 1 - tanh(x)^2: compute y*y then subtract from 1
         // Use span-based: result = 1 - y*y
@@ -15934,8 +15934,8 @@ public class CpuEngine : ITensorLevelEngine
         if (sigmoidOutput == null) throw new ArgumentNullException(nameof(sigmoidOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(sigmoidOutput.Shape);
-        var temp = TensorAllocator.Rent<T>(sigmoidOutput.Shape);
+        var result = TensorAllocator.Rent<T>(sigmoidOutput._shape);
+        var temp = TensorAllocator.Rent<T>(sigmoidOutput._shape);
 
         // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
         var y = sigmoidOutput.AsSpan();
@@ -15953,7 +15953,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         int totalElements = input.Length;
 
         // ReLU derivative: 1 if x > 0, else 0
@@ -15995,21 +15995,21 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Compute squared norm along axis
         var squared = TensorMultiply(tensor, tensor);
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
 
         // Compute scale factor: ||v||^2 / (1 + ||v||^2)
-        var one = TensorAllocator.Rent<T>(normSquared.Shape);
+        var one = TensorAllocator.Rent<T>(normSquared._shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(normSquared, denom);
 
         // Compute ||v||
         var norm = TensorSqrt(normSquared);
-        var epsilon = TensorAllocator.Rent<T>(norm.Shape);
+        var epsilon = TensorAllocator.Rent<T>(norm._shape);
         epsilon.Fill(numOps.FromDouble(1e-8));
         norm = TensorAdd(norm, epsilon);
 
@@ -16030,13 +16030,13 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Normalize axis
-        if (axis < 0) axis = input.Shape.Length + axis;
+        if (axis < 0) axis = input._shape.Length + axis;
 
         // This is a simplified gradient - full implementation would require proper Jacobian
         // For now, approximate with element-wise gradient scaling
         var squared = TensorMultiply(input, input);
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
-        var one = TensorAllocator.Rent<T>(normSquared.Shape);
+        var one = TensorAllocator.Rent<T>(normSquared._shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(one, denom);
@@ -16066,7 +16066,7 @@ public class CpuEngine : ITensorLevelEngine
         var norm = TensorNorm(tensor, axis, keepDims: true);
 
         // Add epsilon for numerical stability
-        var epsArray = TensorAllocator.Rent<T>(norm.Shape);
+        var epsArray = TensorAllocator.Rent<T>(norm._shape);
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
@@ -16097,9 +16097,9 @@ public class CpuEngine : ITensorLevelEngine
         if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
-        int axisSize = tensor.Shape[axis];
+        int axisSize = tensor._shape[axis];
         if (axisSize % numSplits != 0)
             throw new ArgumentException($"Cannot split axis of size {axisSize} into {numSplits} equal parts");
 
@@ -16149,7 +16149,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Build output shape (remove axis dimension)
         var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
@@ -16157,12 +16157,12 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<int>(outputShape);
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
+        for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
 
-        int axisSize = tensor.Shape[axis];
+        int axisSize = tensor._shape[axis];
 
         int innerSize = 1;
-        for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
+        for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -16200,7 +16200,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Normalize axis
-        if (axis < 0) axis = tensor.Shape.Length + axis;
+        if (axis < 0) axis = tensor._shape.Length + axis;
 
         // Build output shape (remove axis dimension)
         var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
@@ -16208,12 +16208,12 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<int>(outputShape);
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
+        for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
 
-        int axisSize = tensor.Shape[axis];
+        int axisSize = tensor._shape[axis];
 
         int innerSize = 1;
-        for (int i = axis + 1; i < tensor.Shape.Length; i++) innerSize *= tensor.Shape[i];
+        for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
@@ -16250,7 +16250,7 @@ public class CpuEngine : ITensorLevelEngine
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions._shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -16289,7 +16289,7 @@ public class CpuEngine : ITensorLevelEngine
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions._shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -16356,9 +16356,9 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 3) throw new ArgumentException("TensorSliceAxis currently only supports 3D tensors.");
 
-        int dim0 = tensor.Shape[0];
-        int dim1 = tensor.Shape[1];
-        int dim2 = tensor.Shape[2];
+        int dim0 = tensor._shape[0];
+        int dim1 = tensor._shape[1];
+        int dim2 = tensor._shape[2];
 
         Tensor<T> result;
         var tensorData = tensor.GetDataArray();
@@ -16447,15 +16447,15 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // a: [batch, M, K], b: [K, N]
-        int batch = a.Shape[0];
-        int M = a.Shape[1];
-        int K = a.Shape[2];
-        int N = b.Shape[1];
+        int batch = a._shape[0];
+        int M = a._shape[1];
+        int K = a._shape[2];
+        int N = b._shape[1];
 
-        if (b.Shape[0] != K)
+        if (b._shape[0] != K)
         {
             throw new ArgumentException(
-                $"Matrix dimensions incompatible. a has shape [{batch}, {M}, {K}], b has shape [{b.Shape[0]}, {N}]. Inner dimensions must match.");
+                $"Matrix dimensions incompatible. a has shape [{batch}, {M}, {K}], b has shape [{b._shape[0]}, {N}]. Inner dimensions must match.");
         }
 
         var result = TensorAllocator.Rent<T>([batch, M, N]);
@@ -16493,9 +16493,9 @@ public class CpuEngine : ITensorLevelEngine
         // For 3D tensors
         if (destination.Rank == 3)
         {
-            int dim0 = destination.Shape[0];
-            int dim1 = destination.Shape[1];
-            int dim2 = destination.Shape[2];
+            int dim0 = destination._shape[0];
+            int dim1 = destination._shape[1];
+            int dim2 = destination._shape[2];
 
             switch (axis)
             {
@@ -16565,15 +16565,15 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
         // Compute outer and inner sizes relative to the axis
-        int outerSize = 1, axisSize = tensor.Shape[axis], innerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= tensor.Shape[i];
-        for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape[i];
+        int outerSize = 1, axisSize = tensor._shape[axis], innerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
+        for (int i = axis + 1; i < rank; i++) innerSize *= tensor._shape[i];
 
         // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility
-            var result = TensorAllocator.Rent<T>(tensor.Shape);
+            var result = TensorAllocator.Rent<T>(tensor._shape);
             using var pinIn = tensor.Data.Pin();
             using var pinOut = result.Data.Pin();
             unsafe
@@ -16621,7 +16621,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(tensor.Shape, new Vector<T>(outputData));
+        return TensorAllocator.Rent<T>(tensor._shape, new Vector<T>(outputData));
     }
 
     /// <summary>
@@ -16672,8 +16672,8 @@ public class CpuEngine : ITensorLevelEngine
         // For simplicity, handle 2D case: [batch, features]
         if (tensor.Rank == 2 && axis == 1)
         {
-            int batch = tensor.Shape[0];
-            int features = tensor.Shape[1];
+            int batch = tensor._shape[0];
+            int features = tensor._shape[1];
             k = Math.Min(k, features);
 
             var resultValues = TensorAllocator.Rent<T>([batch, k]);
@@ -16725,8 +16725,8 @@ public class CpuEngine : ITensorLevelEngine
         // For 2D with axis=1: result[b, indices[b, i]] = source[b, i]
         if (result.Rank == 2 && axis == 1)
         {
-            int batch = result.Shape[0];
-            int numIndices = indices.Shape[1];
+            int batch = result._shape[0];
+            int numIndices = indices._shape[1];
 
             Parallel.For(0, batch, b =>
             {
@@ -16757,7 +16757,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.Rank == 2 && axis == 0)
         {
             int numIndices = indices.Length;
-            int cols = tensor.Shape[1];
+            int cols = tensor._shape[1];
             var result = TensorAllocator.Rent<T>([numIndices, cols]);
 
             var indicesData = indices.GetDataArray();
@@ -16773,7 +16773,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         else if (tensor.Rank == 2 && axis == 1)
         {
-            int rows = tensor.Shape[0];
+            int rows = tensor._shape[0];
             int numIndices = indices.Length;
             var result = TensorAllocator.Rent<T>([rows, numIndices]);
             var indicesData = indices.GetDataArray();
@@ -16783,7 +16783,7 @@ public class CpuEngine : ITensorLevelEngine
             Parallel.For(0, rows, i =>
             {
                 int rowOffset = i * numIndices;
-                int tensorRowOffset = i * tensor.Shape[1];
+                int tensorRowOffset = i * tensor._shape[1];
                 for (int j = 0; j < numIndices; j++)
                 {
                     resultData[rowOffset + j] = tensorData[tensorRowOffset + indicesData[j]];
@@ -16805,12 +16805,12 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensors array must not be empty.", nameof(tensors));
 
         int numTensors = tensors.Length;
-        var firstShape = tensors[0].Shape;
+        var firstShape = tensors[0]._shape;
 
         // Validate all tensors have same shape
         for (int i = 1; i < numTensors; i++)
         {
-            if (!tensors[i].Shape.SequenceEqual(firstShape))
+            if (!tensors[i]._shape.SequenceEqual(firstShape))
                 throw new ArgumentException("All tensors must have the same shape.");
         }
 
@@ -16855,14 +16855,14 @@ public class CpuEngine : ITensorLevelEngine
 
         if (axis < 0) axis = tensor.Rank + axis;
 
-        int numSlices = tensor.Shape[axis];
+        int numSlices = tensor._shape[axis];
         var result = new Tensor<T>[numSlices];
 
         // New shape: remove the axis dimension
         var newShape = new int[tensor.Rank - 1];
         for (int i = 0, j = 0; i < tensor.Rank; i++)
         {
-            if (i != axis) newShape[j++] = tensor.Shape[i];
+            if (i != axis) newShape[j++] = tensor._shape[i];
         }
 
         Parallel.For(0, numSlices, i =>
@@ -16879,7 +16879,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         try
         {
             var src = tensor.AsSpan();
@@ -16923,7 +16923,7 @@ public class CpuEngine : ITensorLevelEngine
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
 
-        var result = TensorAllocator.Rent<T>(x.Shape);
+        var result = TensorAllocator.Rent<T>(x._shape);
         var condData = condition.GetDataArray();
         var xData = x.GetDataArray();
         var yData = y.GetDataArray();
@@ -17244,14 +17244,14 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PairwiseDistanceSquared<T>(Tensor<T> x, Tensor<T> y)
     {
-        if (x.Shape.Length != 2 || y.Shape.Length != 2)
+        if (x._shape.Length != 2 || y._shape.Length != 2)
             throw new ArgumentException("Input tensors must be 2D [N, D]");
-        if (x.Shape[1] != y.Shape[1])
+        if (x._shape[1] != y._shape[1])
             throw new ArgumentException("Input tensors must have the same dimensionality");
 
-        int n = x.Shape[0];
-        int m = y.Shape[0];
-        int d = x.Shape[1];
+        int n = x._shape[0];
+        int m = y._shape[0];
+        int d = x._shape[1];
 
         var result = TensorAllocator.Rent<T>([n, m]);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -17314,11 +17314,11 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public (Tensor<T> values, Tensor<int> indices) TopK<T>(Tensor<T> input, int k, int axis = -1, bool largest = true)
     {
-        if (axis < 0) axis = input.Shape.Length + axis;
-        if (axis < 0 || axis >= input.Shape.Length)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
+        if (axis < 0) axis = input._shape.Length + axis;
+        if (axis < 0 || axis >= input._shape.Length)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
-        int axisSize = input.Shape[axis];
+        int axisSize = input._shape[axis];
         if (k > axisSize)
             throw new ArgumentException($"k ({k}) cannot be greater than axis size ({axisSize})");
 
@@ -17336,9 +17336,9 @@ public class CpuEngine : ITensorLevelEngine
 
         // Calculate strides for axis iteration
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
         int innerSize = 1;
-        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
         // Process each "slice" along the axis
         for (int outer = 0; outer < outerSize; outer++)
@@ -17379,20 +17379,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
-        if (axis < 0) axis = input.Shape.Length + axis;
-        if (axis < 0 || axis >= input.Shape.Length)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
+        if (axis < 0) axis = input._shape.Length + axis;
+        if (axis < 0 || axis >= input._shape.Length)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<int>(input.Shape);
+        var result = new Tensor<int>(input._shape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
 
-        int axisSize = input.Shape[axis];
+        int axisSize = input._shape[axis];
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
         int innerSize = 1;
-        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -17428,15 +17428,15 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
     {
-        if (axis < 0) axis = input.Shape.Length + axis;
-        if (axis < 0 || axis >= input.Shape.Length)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
+        if (axis < 0) axis = input._shape.Length + axis;
+        if (axis < 0 || axis >= input._shape.Length)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
         // Output shape: input.Shape with axis dimension replaced by indices.Length
-        var outputShape = new int[input.Shape.Length];
-        for (int i = 0; i < input.Shape.Length; i++)
+        var outputShape = new int[input._shape.Length];
+        for (int i = 0; i < input._shape.Length; i++)
         {
-            outputShape[i] = i == axis ? indices.Length : input.Shape[i];
+            outputShape[i] = i == axis ? indices.Length : input._shape[i];
         }
 
         var result = TensorAllocator.Rent<T>(outputShape);
@@ -17445,10 +17445,10 @@ public class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
-        int axisSize = input.Shape[axis];
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
+        int axisSize = input._shape[axis];
         int innerSize = 1;
-        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -17470,12 +17470,12 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
-        if (axis < 0) axis = input.Shape.Length + axis;
-        if (axis < 0 || axis >= input.Shape.Length)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
+        if (axis < 0) axis = input._shape.Length + axis;
+        if (axis < 0 || axis >= input._shape.Length)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
         // Create a copy of input
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
         Array.Copy(inputData, resultData, input.Length);
@@ -17484,10 +17484,10 @@ public class CpuEngine : ITensorLevelEngine
         var valuesData = values.GetDataArray();
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
-        int axisSize = input.Shape[axis];
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
+        int axisSize = input._shape[axis];
         int innerSize = 1;
-        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -17509,14 +17509,14 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScatterAdd<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
-        if (axis < 0) axis = input.Shape.Length + axis;
-        if (axis < 0 || axis >= input.Shape.Length)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {input.Shape.Length} dimensions");
+        if (axis < 0) axis = input._shape.Length + axis;
+        if (axis < 0 || axis >= input._shape.Length)
+            throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Create a copy of input
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         var inputData = input.GetDataArray();
         var resultData = result.GetDataArray();
         Array.Copy(inputData, resultData, input.Length);
@@ -17525,10 +17525,10 @@ public class CpuEngine : ITensorLevelEngine
         var valuesData = values.GetDataArray();
 
         int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
-        int axisSize = input.Shape[axis];
+        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
+        int axisSize = input._shape[axis];
         int innerSize = 1;
-        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -17554,7 +17554,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -17571,7 +17571,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor.Shape);
+        var result = TensorAllocator.Rent<T>(tensor._shape);
         var srcData = tensor.GetDataArray();
         var dstData = result.GetDataArray();
 
@@ -17587,11 +17587,11 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorOuter<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (a.Shape.Length != 1 || b.Shape.Length != 1)
+        if (a._shape.Length != 1 || b._shape.Length != 1)
             throw new ArgumentException("Both inputs must be 1D tensors");
 
-        int n = a.Shape[0];
-        int m = b.Shape[0];
+        int n = a._shape[0];
+        int m = b._shape[0];
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>([n, m]);
 
@@ -17620,12 +17620,12 @@ public class CpuEngine : ITensorLevelEngine
         // For 2D inputs (batch x features), use optimized fused GEMM for float/double
         if (input.Rank == 2 && weights.Rank == 2)
         {
-            int M = input.Shape[0];  // Batch size
-            int K = input.Shape[1];  // Input features
-            int N = weights.Shape[1]; // Output features
+            int M = input._shape[0];  // Batch size
+            int K = input._shape[1];  // Input features
+            int N = weights._shape[1]; // Output features
 
-            if (weights.Shape[0] != K)
-                throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights.Shape[0]}, {weights.Shape[1]}]");
+            if (weights._shape[0] != K)
+                throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
 
             var result = TensorAllocator.Rent<T>([M, N]);
 
@@ -17701,10 +17701,10 @@ public class CpuEngine : ITensorLevelEngine
         var gradActivation = ApplyFusedActivationBackward(gradOutput, preActivation, activation);
 
         // Step 2: Compute bias gradient (sum along batch dimension)
-        if (gradActivation.Shape.Length == 2)
+        if (gradActivation._shape.Length == 2)
         {
-            int batchSize = gradActivation.Shape[0];
-            int outputSize = gradActivation.Shape[1];
+            int batchSize = gradActivation._shape[0];
+            int outputSize = gradActivation._shape[1];
             var biasGrad = TensorAllocator.Rent<T>([outputSize]);
 
             for (int j = 0; j < outputSize; j++)
@@ -17786,7 +17786,7 @@ public class CpuEngine : ITensorLevelEngine
         // Step 2: Add bias if provided (reshape to [1, outChannels, 1, 1, 1] for NCDHW broadcast)
         if (bias != null)
         {
-            var biasExpanded = bias.Reshape(1, bias.Shape[0], 1, 1, 1);
+            var biasExpanded = bias.Reshape(1, bias._shape[0], 1, 1, 1);
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
@@ -17816,7 +17816,7 @@ public class CpuEngine : ITensorLevelEngine
         // Step 2: Add bias if provided (reshape to [1, outChannels, 1, 1] for NCHW broadcast)
         if (bias != null)
         {
-            var biasExpanded = bias.Reshape(1, bias.Shape[0], 1, 1);
+            var biasExpanded = bias.Reshape(1, bias._shape[0], 1, 1);
             result = TensorBroadcastAdd(result, biasExpanded);
         }
 
@@ -17907,7 +17907,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> SwishDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -17928,7 +17928,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> LeakyReLUDerivative<T>(Tensor<T> input, T alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -17944,7 +17944,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> GELUDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(input.Shape);
+        var result = TensorAllocator.Rent<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -18008,7 +18008,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int n = input.Shape[^1]; // Last dimension is the signal length
+        int n = input._shape[^1]; // Last dimension is the signal length
 
         // Pad to next power of 2 if needed
         int nFft = NextPowerOf2(n);
@@ -18057,7 +18057,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numFreqs = input.Shape[^1] / 2; // Interleaved real/imag
+        int numFreqs = input._shape[^1] / 2; // Interleaved real/imag
         int nFft = (numFreqs - 1) * 2;
 
         // Output shape
@@ -18111,14 +18111,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
-        if (!inputReal.Shape.SequenceEqual(inputImag.Shape))
+        if (!inputReal._shape.SequenceEqual(inputImag._shape))
             throw new ArgumentException("Input real and imaginary parts must have the same shape");
 
-        int n = inputReal.Shape[^1];
+        int n = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
-        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal._shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag._shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -18156,15 +18156,15 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
-        if (!inputReal.Shape.SequenceEqual(inputImag.Shape))
+        if (!inputReal._shape.SequenceEqual(inputImag._shape))
             throw new ArgumentException("Input real and imaginary parts must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputReal.Shape[^1];
+        int n = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
-        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal._shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag._shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -18203,19 +18203,19 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
-        if (inputReal.Shape.Length < 2)
+        if (inputReal._shape.Length < 2)
             throw new ArgumentException("Input must be at least 2D");
 
         // FFT along last dimension (columns)
         FFT(inputReal, inputImag, out var tempReal, out var tempImag);
 
         // Transpose, FFT along rows, transpose back
-        int height = inputReal.Shape[^2];
-        int width = inputReal.Shape[^1];
+        int height = inputReal._shape[^2];
+        int width = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
-        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal._shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag._shape);
         var tempRealData = tempReal.GetDataArray();
         var tempImagData = tempImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -18259,19 +18259,19 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
-        if (inputReal.Shape.Length < 2)
+        if (inputReal._shape.Length < 2)
             throw new ArgumentException("Input must be at least 2D");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int height = inputReal.Shape[^2];
-        int width = inputReal.Shape[^1];
+        int height = inputReal._shape[^2];
+        int width = inputReal._shape[^1];
 
-        var tempReal = TensorAllocator.Rent<T>(inputReal.Shape);
-        var tempImag = TensorAllocator.Rent<T>(inputImag.Shape);
+        var tempReal = TensorAllocator.Rent<T>(inputReal._shape);
+        var tempImag = TensorAllocator.Rent<T>(inputImag._shape);
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.Rent<T>(inputReal.Shape);
-        var outImag = TensorAllocator.Rent<T>(inputImag.Shape);
+        var outReal = TensorAllocator.Rent<T>(inputReal._shape);
+        var outImag = TensorAllocator.Rent<T>(inputImag._shape);
         var inputRealData = inputReal.GetDataArray();
         var inputImagData = inputImag.GetDataArray();
         var tempRealData = tempReal.GetDataArray();
@@ -18350,7 +18350,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Window length {window.Length} must equal nFft {nFft}");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int signalLength = input.Shape[^1];
+        int signalLength = input._shape[^1];
 
         // Apply centering (reflection padding)
         Tensor<T> paddedInput;
@@ -18461,8 +18461,8 @@ public class CpuEngine : ITensorLevelEngine
         if (window == null) throw new ArgumentNullException(nameof(window));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numFreqs = magnitude.Shape[^2];
-        int numFrames = magnitude.Shape[^1];
+        int numFreqs = magnitude._shape[^2];
+        int numFrames = magnitude._shape[^1];
 
         // Calculate output length
         int outputLength = length ?? (numFrames - 1) * hopLength + nFft;
@@ -18470,7 +18470,7 @@ public class CpuEngine : ITensorLevelEngine
             outputLength -= nFft; // Remove padding
 
         // Output shape
-        var outputShape = magnitude.Shape.Take(magnitude.Shape.Length - 2).ToArray();
+        var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
         outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
         var result = TensorAllocator.Rent<T>(outputShape);
         var windowSum = TensorAllocator.Rent<T>(outputShape);
@@ -18574,7 +18574,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Apply filterbank: [nMels, numFreqs] @ [numFreqs, numFrames] -> [nMels, numFrames]
         int numFreqs = nFft / 2 + 1;
-        int numFrames = magnitude.Shape[^1];
+        int numFrames = magnitude._shape[^1];
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
         var melShape = magnitude.Shape.ToArray();
@@ -18638,12 +18638,12 @@ public class CpuEngine : ITensorLevelEngine
         if (window == null) throw new ArgumentNullException(nameof(window));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numFreqs = magnitude.Shape[^2];
-        int numFrames = magnitude.Shape[^1];
+        int numFreqs = magnitude._shape[^2];
+        int numFrames = magnitude._shape[^1];
 
         // Initialize with random phase
         var random = RandomHelper.ThreadSafeRandom;
-        var phase = TensorAllocator.Rent<T>(magnitude.Shape);
+        var phase = TensorAllocator.Rent<T>(magnitude._shape);
         var phaseData = phase.GetDataArray();
         for (int i = 0; i < phase.Length; i++)
         {
@@ -18991,7 +18991,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -19021,7 +19021,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -19046,7 +19046,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -19066,7 +19066,7 @@ public class CpuEngine : ITensorLevelEngine
             var resultArr = new float[length];
 #endif
             SigmoidBackwardFloat(gF, oF, resultArr);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
         var result = new T[length];
@@ -19078,7 +19078,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * s * (1.0 - s));
         }
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
     }
 
     private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result)
@@ -19134,7 +19134,7 @@ public class CpuEngine : ITensorLevelEngine
             var resultArr = new float[length];
 #endif
             TanhBackwardFloat(gF, oF, resultArr);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput.Shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
         var result = new T[length];
@@ -19146,7 +19146,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(grad * (1.0 - t * t));
         }
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
     }
 
     private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result)
@@ -19225,7 +19225,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
@@ -19252,17 +19252,17 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(result));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
     }
 
     /// <inheritdoc/>
     public Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
         int spatialSize = 1;
-        for (int i = 2; i < input.Rank; i++) spatialSize *= input.Shape[i];
+        for (int i = 2; i < input.Rank; i++) spatialSize *= input._shape[i];
 
         var inputData = input.GetDataArray();
         var gammaData = gamma.GetDataArray();
@@ -19339,17 +19339,17 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
     public Tensor<T> InstanceNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
         int spatialSize = 1;
-        for (int i = 2; i < input.Rank; i++) spatialSize *= input.Shape[i];
+        for (int i = 2; i < input.Rank; i++) spatialSize *= input._shape[i];
 
         var gradOutData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -19410,7 +19410,7 @@ public class CpuEngine : ITensorLevelEngine
 
         gradGamma = TensorAllocator.Rent<T>([channels], new Vector<T>(gradGammaData));
         gradBeta = TensorAllocator.Rent<T>([channels], new Vector<T>(gradBetaData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(gradInputData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(gradInputData));
     }
 
     /// <inheritdoc/>
@@ -19446,8 +19446,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        mask = TensorAllocator.Rent<T>(input.Shape, new Vector<T>(maskData));
-        return TensorAllocator.Rent<T>(input.Shape, new Vector<T>(resultData));
+        mask = TensorAllocator.Rent<T>(input._shape, new Vector<T>(maskData));
+        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -19461,14 +19461,14 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradOutput.Length; i++)
             resultData[i] = numOps.Multiply(gradData[i], maskData[i]);
 
-        return TensorAllocator.Rent<T>(gradOutput.Shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
     public Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
-        int vocabSize = embeddingTable.Shape[0];
-        int embeddingDim = embeddingTable.Shape[^1];
+        int vocabSize = embeddingTable._shape[0];
+        int embeddingDim = embeddingTable._shape[^1];
         int numIndices = indices.Length;
         var tableData = embeddingTable.GetDataArray();
         var indicesData = indices.GetDataArray();
@@ -19490,9 +19490,9 @@ public class CpuEngine : ITensorLevelEngine
                 resultData[dstOffset + j] = tableData[srcOffset + j];
         }
 
-        var outputShape = new int[indices.Shape.Length + 1];
-        for (int i = 0; i < indices.Shape.Length; i++)
-            outputShape[i] = indices.Shape[i];
+        var outputShape = new int[indices._shape.Length + 1];
+        for (int i = 0; i < indices._shape.Length; i++)
+            outputShape[i] = indices._shape[i];
         outputShape[^1] = embeddingDim;
 
         return TensorAllocator.Rent<T>(outputShape, new Vector<T>(resultData));
@@ -19529,8 +19529,8 @@ public class CpuEngine : ITensorLevelEngine
     public T CrossEntropyLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = predictions.Shape[0];
-        int numClasses = predictions.Shape[1];
+        int batchSize = predictions._shape[0];
+        int numClasses = predictions._shape[1];
 
         var predData = predictions.GetDataArray();
         var targetData = targets.GetDataArray();
@@ -19604,8 +19604,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = predictions.Shape[0];
-        int numClasses = predictions.Shape[1];
+        int batchSize = predictions._shape[0];
+        int numClasses = predictions._shape[1];
 
         var predData = predictions.GetDataArray();
         var targetData = targets.GetDataArray();
@@ -19666,7 +19666,7 @@ public class CpuEngine : ITensorLevelEngine
             for (int b = 0; b < batchSize; b++) processBatch(b);
         }
 
-        return TensorAllocator.Rent<T>(predictions.Shape, new Vector<T>(gradData));
+        return TensorAllocator.Rent<T>(predictions._shape, new Vector<T>(gradData));
     }
 
     /// <inheritdoc/>
@@ -19676,7 +19676,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
-        var diff = TensorAllocator.Rent<T>(predictions.Shape);
+        var diff = TensorAllocator.Rent<T>(predictions._shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpan());
         T sumSq = numOps.Dot(diff.AsSpan(), diff.AsSpan());
 
@@ -19689,7 +19689,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // grad = 2 * (pred - target) / N
-        var result = TensorAllocator.Rent<T>(predictions.Shape);
+        var result = TensorAllocator.Rent<T>(predictions._shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpan());
         T scale = numOps.FromDouble(2.0 / predictions.Length);
         numOps.MultiplyScalar(result.AsSpan(), scale, result.AsWritableSpan());
@@ -19701,10 +19701,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> GlobalAvgPool2D<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
         int spatialSize = height * width;
 
         var inputData = input.GetDataArray();
@@ -19733,10 +19733,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> GlobalMaxPool2D<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int height = input.Shape[2];
-        int width = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
         int spatialSize = height * width;
 
         var inputData = input.GetDataArray();
@@ -19767,10 +19767,10 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input.Shape[0];
-        int channels = input.Shape[1];
-        int inHeight = input.Shape[2];
-        int inWidth = input.Shape[3];
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int inHeight = input._shape[2];
+        int inWidth = input._shape[3];
 
         var inputData = input.GetDataArray();
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
@@ -19994,7 +19994,7 @@ public class CpuEngine : ITensorLevelEngine
             resultData[i] = numOps.Sqrt(v);
         }
 
-        return TensorAllocator.Rent<T>(variance.Shape, new Vector<T>(resultData));
+        return TensorAllocator.Rent<T>(variance._shape, new Vector<T>(resultData));
     }
 
     /// <inheritdoc/>
@@ -20002,10 +20002,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         // lerp(a, b, t) = a + t * (b - a) = (1-t)*a + t*b
@@ -20020,14 +20020,14 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (!ShapesMatch(a.Shape, b.Shape))
+        if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a.Shape)} and {FormatShape(b.Shape)}.");
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(a.Shape);
+        var result = TensorAllocator.Rent<T>(a._shape);
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();

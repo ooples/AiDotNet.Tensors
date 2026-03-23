@@ -31,7 +31,7 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SquashGpu");
 
-        int rank = input.Shape.Length;
+        int rank = input._shape.Length;
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis), "Axis out of range");
@@ -39,13 +39,13 @@ public partial class DirectGpuTensorEngine
         // For squash over the last dimension (most common case)
         if (axis == rank - 1)
         {
-            int capsuleDim = input.Shape[rank - 1];
+            int capsuleDim = input._shape[rank - 1];
             int numCapsules = input.ElementCount / capsuleDim;
 
             var outputBuffer = backend.AllocateBuffer(input.ElementCount);
             backend.Squash(input.Buffer, outputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, outputBuffer, input.Shape, GpuTensorRole.Activation, ownsBuffer: true);
+            return new GpuTensor<T>(backend, outputBuffer, input._shape, GpuTensorRole.Activation, ownsBuffer: true);
         }
 
         // For squash over a non-last axis, we need to permute the tensor
@@ -61,13 +61,13 @@ public partial class DirectGpuTensorEngine
         // Permute input to move axis to end
         var permutedInput = PermuteGpu(input, permutation);
 
-        int permutedCapsuleDim = permutedInput.Shape[rank - 1];
+        int permutedCapsuleDim = permutedInput._shape[rank - 1];
         int permutedNumCapsules = permutedInput.ElementCount / permutedCapsuleDim;
 
         var permutedOutputBuffer = backend.AllocateBuffer(permutedInput.ElementCount);
         backend.Squash(permutedInput.Buffer, permutedOutputBuffer, permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedOutput = new GpuTensor<T>(backend, permutedOutputBuffer, permutedInput.Shape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        var permutedOutput = new GpuTensor<T>(backend, permutedOutputBuffer, permutedInput._shape, GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back
         var inversePermutation = new int[rank];
@@ -104,7 +104,7 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SquashBackwardGpu");
 
-        int rank = input.Shape.Length;
+        int rank = input._shape.Length;
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentOutOfRangeException(nameof(axis), "Axis out of range");
@@ -112,13 +112,13 @@ public partial class DirectGpuTensorEngine
         // For squash backward over the last dimension
         if (axis == rank - 1)
         {
-            int capsuleDim = input.Shape[rank - 1];
+            int capsuleDim = input._shape[rank - 1];
             int numCapsules = input.ElementCount / capsuleDim;
 
             var gradInputBuffer = backend.AllocateBuffer(input.ElementCount);
             backend.SquashBackward(gradOutput.Buffer, input.Buffer, gradInputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, gradInputBuffer, input.Shape, GpuTensorRole.Gradient, ownsBuffer: true);
+            return new GpuTensor<T>(backend, gradInputBuffer, input._shape, GpuTensorRole.Gradient, ownsBuffer: true);
         }
 
         // For squash backward over a non-last axis, permute to move axis to end
@@ -133,14 +133,14 @@ public partial class DirectGpuTensorEngine
         var permutedGradOutput = PermuteGpu(gradOutput, permutation);
         var permutedInput = PermuteGpu(input, permutation);
 
-        int permutedCapsuleDim = permutedInput.Shape[rank - 1];
+        int permutedCapsuleDim = permutedInput._shape[rank - 1];
         int permutedNumCapsules = permutedInput.ElementCount / permutedCapsuleDim;
 
         var permutedGradInputBuffer = backend.AllocateBuffer(permutedInput.ElementCount);
         backend.SquashBackward(permutedGradOutput.Buffer, permutedInput.Buffer, permutedGradInputBuffer,
             permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedGradInput = new GpuTensor<T>(backend, permutedGradInputBuffer, permutedInput.Shape,
+        var permutedGradInput = new GpuTensor<T>(backend, permutedGradInputBuffer, permutedInput._shape,
             GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back
@@ -179,13 +179,13 @@ public partial class DirectGpuTensorEngine
             throw new InvalidOperationException("No GPU backend available for DynamicRoutingGpu");
 
         // predictions shape: [batch, inputCapsules, outputCapsules, capsuleDim]
-        if (predictions.Shape.Length != 4)
+        if (predictions._shape.Length != 4)
             throw new ArgumentException("Predictions must be 4D [batch, inputCapsules, outputCapsules, capsuleDim]");
 
-        int batchSize = predictions.Shape[0];
-        int inputCapsules = predictions.Shape[1];
-        int outputCapsules = predictions.Shape[2];
-        int capsuleDim = predictions.Shape[3];
+        int batchSize = predictions._shape[0];
+        int inputCapsules = predictions._shape[1];
+        int outputCapsules = predictions._shape[2];
+        int capsuleDim = predictions._shape[3];
 
         // Initialize coupling logits (b_ij) to zero: [batch, inputCapsules, outputCapsules]
         int couplingsSize = batchSize * inputCapsules * outputCapsules;
@@ -269,20 +269,20 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
 
-        if (input.Shape.Length != 3)
+        if (input._shape.Length != 3)
             throw new ArgumentException("Input must be 3D [batch, inputCapsules, inputDim]", nameof(input));
 
-        if (weights.Shape.Length != 4)
+        if (weights._shape.Length != 4)
             throw new ArgumentException("Weights must be 4D [inputCapsules, outputCapsules, inputDim, outputDim]", nameof(weights));
 
-        int batchSize = input.Shape[0];
-        int inputCapsules = input.Shape[1];
-        int inputDim = input.Shape[2];
+        int batchSize = input._shape[0];
+        int inputCapsules = input._shape[1];
+        int inputDim = input._shape[2];
 
-        int weightsInputCapsules = weights.Shape[0];
-        int outputCapsules = weights.Shape[1];
-        int weightsInputDim = weights.Shape[2];
-        int outputDim = weights.Shape[3];
+        int weightsInputCapsules = weights._shape[0];
+        int outputCapsules = weights._shape[1];
+        int weightsInputDim = weights._shape[2];
+        int outputDim = weights._shape[3];
 
         if (inputCapsules != weightsInputCapsules)
             throw new ArgumentException($"Input capsules mismatch: input has {inputCapsules}, weights has {weightsInputCapsules}");
@@ -324,12 +324,12 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
 
-        if (input.Shape.Length != 3)
+        if (input._shape.Length != 3)
             throw new ArgumentException("Input must be 3D [batch, inputCapsules, inputDim]", nameof(input));
 
-        int batchSize = input.Shape[0];
-        int inputCapsules = input.Shape[1];
-        int inputDim = input.Shape[2];
+        int batchSize = input._shape[0];
+        int inputCapsules = input._shape[1];
+        int inputDim = input._shape[2];
 
         // Allocate output: [batch, inputCapsules, outputCapsules, outputDim]
         int outputSize = batchSize * inputCapsules * outputCapsules * outputDim;
@@ -363,20 +363,20 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
 
-        if (input.Shape.Length != 3)
+        if (input._shape.Length != 3)
             throw new ArgumentException("Input must be 3D [batch, inputCapsules, inputDim]", nameof(input));
 
-        if (weights.Shape.Length != 4)
+        if (weights._shape.Length != 4)
             throw new ArgumentException("Weights must be 4D [inputCapsules, inputDim, numCapsules, capsuleDim]", nameof(weights));
 
-        int batchSize = input.Shape[0];
-        int inputCapsules = input.Shape[1];
-        int inputDim = input.Shape[2];
+        int batchSize = input._shape[0];
+        int inputCapsules = input._shape[1];
+        int inputDim = input._shape[2];
 
-        int weightsInputCapsules = weights.Shape[0];
-        int weightsInputDim = weights.Shape[1];
-        int numCapsules = weights.Shape[2];
-        int capsuleDim = weights.Shape[3];
+        int weightsInputCapsules = weights._shape[0];
+        int weightsInputDim = weights._shape[1];
+        int numCapsules = weights._shape[2];
+        int capsuleDim = weights._shape[3];
 
         if (inputCapsules != weightsInputCapsules)
             throw new ArgumentException($"Input capsules mismatch: input has {inputCapsules}, weights has {weightsInputCapsules}");
@@ -418,12 +418,12 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
 
-        if (input.Shape.Length != 3)
+        if (input._shape.Length != 3)
             throw new ArgumentException("Input must be 3D [batch, inputCapsules, inputDim]", nameof(input));
 
-        int batchSize = input.Shape[0];
-        int inputCapsules = input.Shape[1];
-        int inputDim = input.Shape[2];
+        int batchSize = input._shape[0];
+        int inputCapsules = input._shape[1];
+        int inputDim = input._shape[2];
 
         // Allocate output: [batch, inputCapsules, numCapsules, capsuleDim]
         int outputSize = batchSize * inputCapsules * numCapsules * capsuleDim;
@@ -457,13 +457,13 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleRoutingGpu");
 
-        if (transformedInput.Shape.Length != 4)
+        if (transformedInput._shape.Length != 4)
             throw new ArgumentException("Transformed input must be 4D [batch, inputCapsules, numCapsules, capsuleDim]");
 
-        int batchSize = transformedInput.Shape[0];
-        int inputCapsules = transformedInput.Shape[1];
-        int numCapsules = transformedInput.Shape[2];
-        int capsuleDim = transformedInput.Shape[3];
+        int batchSize = transformedInput._shape[0];
+        int inputCapsules = transformedInput._shape[1];
+        int numCapsules = transformedInput._shape[2];
+        int capsuleDim = transformedInput._shape[3];
 
         // Initialize coupling coefficients to uniform: [batch, inputCapsules, numCapsules]
         int couplingsSize = batchSize * inputCapsules * numCapsules;
@@ -552,7 +552,7 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxAxisGpu");
 
-        int rank = input.Shape.Length;
+        int rank = input._shape.Length;
         if (axis < 0) axis = rank + axis;
 
         // If softmax is over the last axis, use the standard softmax

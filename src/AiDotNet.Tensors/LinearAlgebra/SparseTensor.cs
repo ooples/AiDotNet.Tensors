@@ -124,8 +124,8 @@ public sealed class SparseTensor<T>
         var colIndices = new List<int>();
         var values = new List<T>();
 
-        int rows = dense.Shape[0];
-        int cols = dense.Shape[1];
+        int rows = dense._shape[0];
+        int cols = dense._shape[1];
         for (int i = 0; i < rows; i++)
         {
             for (int j = 0; j < cols; j++)

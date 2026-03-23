@@ -19,14 +19,14 @@ public static class NeRFOperations
     public static Tensor<T> PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
     {
         if (positions == null) throw new ArgumentNullException(nameof(positions));
-        if (positions.Shape.Length != 2)
+        if (positions._shape.Length != 2)
             throw new ArgumentException("Positions must be 2D tensor [N, D].", nameof(positions));
         if (numFrequencies <= 0)
             throw new ArgumentOutOfRangeException(nameof(numFrequencies), "Number of frequencies must be positive.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numPoints = positions.Shape[0];
-        int inputDim = positions.Shape[1];
+        int numPoints = positions._shape[0];
+        int inputDim = positions._shape[1];
         int outputDim = inputDim * 2 * numFrequencies;
 
         var result = new T[numPoints * outputDim];
@@ -74,11 +74,11 @@ public static class NeRFOperations
         if (encodedGradient == null) throw new ArgumentNullException(nameof(encodedGradient));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numPoints = positions.Shape[0];
-        int inputDim = positions.Shape[1];
+        int numPoints = positions._shape[0];
+        int inputDim = positions._shape[1];
         int outputDim = inputDim * 2 * numFrequencies;
 
-        if (encodedGradient.Shape[1] != outputDim)
+        if (encodedGradient._shape[1] != outputDim)
             throw new ArgumentException("Encoded gradient dimension mismatch.", nameof(encodedGradient));
 
         var result = new T[numPoints * inputDim];
@@ -144,16 +144,16 @@ public static class NeRFOperations
 
         // Infer dimensions from input shapes
         int numRays, numSamples;
-        if (rgbSamples.Shape.Length == 3)
+        if (rgbSamples._shape.Length == 3)
         {
-            numRays = rgbSamples.Shape[0];
-            numSamples = rgbSamples.Shape[1];
+            numRays = rgbSamples._shape[0];
+            numSamples = rgbSamples._shape[1];
         }
-        else if (rgbSamples.Shape.Length == 2)
+        else if (rgbSamples._shape.Length == 2)
         {
             // Flat format: [numRays * numSamples, 3]
-            int totalSamples = rgbSamples.Shape[0];
-            numSamples = tValues.Shape[1];
+            int totalSamples = rgbSamples._shape[0];
+            numSamples = tValues._shape[1];
             numRays = totalSamples / numSamples;
         }
         else
@@ -187,7 +187,7 @@ public static class NeRFOperations
 
                 // Get RGB values
                 int rgbBaseIdx;
-                if (rgbSamples.Shape.Length == 3)
+                if (rgbSamples._shape.Length == 3)
                 {
                     rgbBaseIdx = (r * numSamples + s) * 3;
                 }
@@ -239,8 +239,8 @@ public static class NeRFOperations
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        int numRays = tValues.Shape[0];
-        int numSamples = tValues.Shape[1];
+        int numRays = tValues._shape[0];
+        int numSamples = tValues._shape[1];
 
         var rgbGrad = new T[numRays * numSamples * 3];
         var densityGrad = new T[numRays * numSamples];
@@ -356,7 +356,7 @@ public static class NeRFOperations
             throw new ArgumentOutOfRangeException(nameof(numSamples), "Number of samples must be positive.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numRays = rayOrigins.Shape[0];
+        int numRays = rayOrigins._shape[0];
 
         double near = numOps.ToDouble(nearBound);
         double far = numOps.ToDouble(farBound);
@@ -428,8 +428,8 @@ public static class NeRFOperations
             throw new ArgumentOutOfRangeException(nameof(numFineSamples), "Number of fine samples must be positive.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numRays = tValuesCoarse.Shape[0];
-        int numCoarseSamples = tValuesCoarse.Shape[1];
+        int numRays = tValuesCoarse._shape[0];
+        int numCoarseSamples = tValuesCoarse._shape[1];
 
         var fineTValues = new T[numRays * numFineSamples];
 

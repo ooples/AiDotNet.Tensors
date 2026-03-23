@@ -88,7 +88,7 @@ public static class Quantization
             throw new ArgumentException("Scale must be positive.", nameof(qparams));
 
         var src = input.AsSpan();
-        var result = new Tensor<sbyte>(input.Shape);
+        var result = new Tensor<sbyte>(input._shape);
         var dst = result.AsWritableSpan();
         float invScale = 1f / qparams.Scale;
         int zp = qparams.ZeroPoint;
@@ -111,7 +111,7 @@ public static class Quantization
     public static Tensor<float> DequantizeInt8(Tensor<sbyte> input, QuantizationParams qparams)
     {
         var src = input.AsSpan();
-        var result = new Tensor<float>(input.Shape);
+        var result = new Tensor<float>(input._shape);
         var dst = result.AsWritableSpan();
         float scale = qparams.Scale;
         int zp = qparams.ZeroPoint;
@@ -130,7 +130,7 @@ public static class Quantization
     public static Tensor<Half> QuantizeFP16(Tensor<float> input)
     {
         var src = input.AsSpan();
-        var result = new Tensor<Half>(input.Shape);
+        var result = new Tensor<Half>(input._shape);
         var dst = result.AsWritableSpan();
 
         for (int i = 0; i < src.Length; i++)
@@ -147,7 +147,7 @@ public static class Quantization
     public static Tensor<float> DequantizeFP16(Tensor<Half> input)
     {
         var src = input.AsSpan();
-        var result = new Tensor<float>(input.Shape);
+        var result = new Tensor<float>(input._shape);
         var dst = result.AsWritableSpan();
 
         for (int i = 0; i < src.Length; i++)

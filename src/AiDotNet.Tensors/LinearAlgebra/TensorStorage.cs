@@ -51,14 +51,23 @@ internal sealed class TensorStorage<T>
     internal int RefCount => Volatile.Read(ref _refCount);
 
     /// <summary>
-    /// Increments the reference count. Called when a new view is created from this storage.
+    /// Increments the reference count atomically. Called when a new view is created from this storage.
+    /// Uses compare-and-swap loop to prevent TOCTOU race between disposal check and increment.
     /// </summary>
     /// <exception cref="ObjectDisposedException">Thrown when storage has been fully released.</exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void AddRef()
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(TensorStorage<T>));
-        Interlocked.Increment(ref _refCount);
+        while (true)
+        {
+            int current = Volatile.Read(ref _refCount);
+            if (current <= 0)
+                throw new ObjectDisposedException(nameof(TensorStorage<T>),
+                    "Cannot acquire reference to released storage.");
+            if (Interlocked.CompareExchange(ref _refCount, current + 1, current) == current)
+                return;
+            // CAS failed — another thread modified refCount, retry
+        }
     }
 
     /// <summary>

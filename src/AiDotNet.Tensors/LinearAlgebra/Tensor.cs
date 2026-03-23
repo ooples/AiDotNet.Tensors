@@ -120,7 +120,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (IsContiguous && _storageOffset == 0) return this;
 
         // Materialize: copy data from strided layout to contiguous row-major
-        var result = new Tensor<T>(Shape);
+        var result = new Tensor<T>(_shape);
         var srcData = _data.GetDataArray();
         var dstData = result._data.AsWritableSpan();
 
@@ -422,7 +422,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<TOut>(this.Shape, resultData);
+        return new Tensor<TOut>(this._shape, resultData);
     }
 
     /// <summary>
@@ -466,10 +466,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="currentDimension">The current dimension being iterated (starts at fixedDimensions).</param>
     private static void CopySubTensorData(Tensor<T> source, Tensor<T> destination, int[] currentIndices, int fixedDimensions, int currentDimension)
     {
-        if (currentDimension == source.Shape.Length)
+        if (currentDimension == source._shape.Length)
         {
             // Extract destination indices from the unfixed portion of currentIndices
-            int[] destIndices = new int[destination.Shape.Length];
+            int[] destIndices = new int[destination._shape.Length];
             for (int i = 0; i < destIndices.Length; i++)
             {
                 destIndices[i] = currentIndices[fixedDimensions + i];
@@ -478,7 +478,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return;
         }
 
-        for (int i = 0; i < source.Shape[currentDimension]; i++)
+        for (int i = 0; i < source._shape[currentDimension]; i++)
         {
             currentIndices[currentDimension] = i;
             CopySubTensorData(source, destination, currentIndices, fixedDimensions, currentDimension + 1);
@@ -704,7 +704,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseSubtract(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
         var result = TensorAllocator.Rent<T>(Shape);
@@ -730,15 +730,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // For 3D: [batch, seq, features] + [features] -> broadcasts vector across batch and seq
         if (this.Rank == 2)
         {
-            if (this.Shape[1] != vector.Length)
-                throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this.Shape[1]}).");
+            if (this._shape[1] != vector.Length)
+                throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this._shape[1]}).");
 
-            var result = TensorAllocator.Rent<T>(this.Shape);
-            int rowLength = this.Shape[1];
+            var result = TensorAllocator.Rent<T>(this._shape);
+            int rowLength = this._shape[1];
             // Use vectorized Add for each row (5-15x faster with AVX2)
             var srcSpan = _data.AsSpan();
             var destSpan = result._data.AsWritableSpan();
-            for (int i = 0; i < this.Shape[0]; i++)
+            for (int i = 0; i < this._shape[0]; i++)
             {
                 int offset = i * rowLength;
                 var sourceRow = srcSpan.Slice(offset, rowLength);
@@ -749,18 +749,18 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else if (this.Rank == 3)
         {
-            if (this.Shape[2] != vector.Length)
-                throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this.Shape[2]}).");
+            if (this._shape[2] != vector.Length)
+                throw new ArgumentException($"Vector length ({vector.Length}) must match the last dimension of the tensor ({this._shape[2]}).");
 
-            var result = TensorAllocator.Rent<T>(this.Shape);
-            int lastDimLength = this.Shape[2];
-            int sliceSize = this.Shape[1] * this.Shape[2];
+            var result = TensorAllocator.Rent<T>(this._shape);
+            int lastDimLength = this._shape[2];
+            int sliceSize = this._shape[1] * this._shape[2];
             // Use vectorized Add for each row in the last dimension (5-15x faster with AVX2)
             var srcSpan = _data.AsSpan();
             var destSpan = result._data.AsWritableSpan();
-            for (int i = 0; i < this.Shape[0]; i++)
+            for (int i = 0; i < this._shape[0]; i++)
             {
-                for (int j = 0; j < this.Shape[1]; j++)
+                for (int j = 0; j < this._shape[1]; j++)
                 {
                     int offset = i * sliceSize + j * lastDimLength;
                     var sourceSlice = srcSpan.Slice(offset, lastDimLength);
@@ -803,7 +803,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentOutOfRangeException(nameof(index));
         }
 
-        // TensorValidator.ValidateShape(slice, [..Shape.Skip(1)]);
+        // TensorValidator.ValidateShape(slice, [.._shape.Skip(1)]);
 
         int sliceSize = slice.Length;
         int offset = index * sliceSize;
@@ -831,7 +831,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T DotProduct(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
         // Use vectorized Dot product for SIMD acceleration (10-15x faster with AVX2)
@@ -878,7 +878,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return;
         }
 
-        for (int i = 0; i < subTensor.Shape[dimension]; i++)
+        for (int i = 0; i < subTensor._shape[dimension]; i++)
         {
             indices[indices.Length - subTensor.Rank + dimension] = i;
             SetSubTensorRecursive(subTensor, indices, dimension + 1);
@@ -931,7 +931,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Scale(T factor)
     {
-        var result = TensorAllocator.Rent<T>(this.Shape);
+        var result = TensorAllocator.Rent<T>(this._shape);
         _numOps.MultiplyScalar(_data.AsSpan(), factor, result._data.AsWritableSpan());
         return result;
     }
@@ -1006,7 +1006,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Validate that all tensors have the same shape
         for (int i = 1; i < tensors.Length; i++)
         {
-            if (!tensors[i].Shape.SequenceEqual(tensors[0].Shape))
+            if (!tensors[i]._shape.SequenceEqual(tensors[0]._shape))
                 throw new ArgumentException("All tensors must have the same shape for stacking.");
         }
 
@@ -1021,7 +1021,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             else
             {
-                newShape[i] = tensors[0].Shape[shapeIndex];
+                newShape[i] = tensors[0]._shape[shapeIndex];
                 shapeIndex++;
             }
         }
@@ -1109,7 +1109,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Subtract(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
         var result = TensorAllocator.Rent<T>(Shape);
@@ -1129,7 +1129,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SubtractInPlace(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
         _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
@@ -1410,22 +1410,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(Matrix<T> matrix)
     {
-        if (this.Rank != 3 || this.Shape[2] != matrix.Rows)
+        if (this.Rank != 3 || this._shape[2] != matrix.Rows)
             throw new ArgumentException("Matrix rows must match the last dimension of the tensor.");
 
-        var result = new Tensor<T>([this.Shape[0], this.Shape[1], matrix.Columns]);
-        int lastDim = this.Shape[2];
+        var result = new Tensor<T>([this._shape[0], this._shape[1], matrix.Columns]);
+        int lastDim = this._shape[2];
 
         // Extract a row vector and matrix column for vectorized dot product
         T[] tensorRow = new T[lastDim];
         T[] matrixCol = new T[lastDim];
 
-        for (int i = 0; i < this.Shape[0]; i++)
+        for (int i = 0; i < this._shape[0]; i++)
         {
-            for (int j = 0; j < this.Shape[1]; j++)
+            for (int j = 0; j < this._shape[1]; j++)
             {
                 // Extract tensor row [i,j,:] for this position
-                int tensorOffset = (i * this.Shape[1] + j) * lastDim;
+                int tensorOffset = (i * this._shape[1] + j) * lastDim;
                 for (int l = 0; l < lastDim; l++)
                 {
                     tensorRow[l] = _data[tensorOffset + l];
@@ -1470,7 +1470,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetRow(int rowIndex, Vector<T> vector)
     {
-        if (Shape.Length < 2)
+        if (_shape.Length < 2)
             throw new InvalidOperationException("Tensor must have at least 2 dimensions to set a row.");
 
         if (vector.Length != Shape[1])
@@ -1512,7 +1512,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
 
             int destDepth = depth < stackAxis ? depth : depth + 1;
-            for (int i = 0; i < source.Shape[depth]; i++)
+            for (int i = 0; i < source._shape[depth]; i++)
             {
                 _sourceIndices[depth] = i;
                 destIndices[destDepth] = i;
@@ -1586,7 +1586,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetVector(int index)
     {
-        if (Shape.Length < 2)
+        if (_shape.Length < 2)
             throw new InvalidOperationException("Tensor must have at least 2 dimensions to get a vector.");
 
         int vectorSize = Shape[1];
@@ -1616,10 +1616,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> PointwiseMultiply(Tensor<T> other)
     {
-        if (this.Shape.SequenceEqual(other.Shape))
+        if (this._shape.SequenceEqual(other._shape))
         {
             // Simple case: tensors have the same shape
-            var result = TensorAllocator.Rent<T>(this.Shape);
+            var result = TensorAllocator.Rent<T>(this._shape);
             // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
             _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
             return result;
@@ -1647,7 +1647,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     private Tensor<T> BroadcastPointwiseMultiply(Tensor<T> other)
     {
-        int[] broadcastShape = GetBroadcastShape(this.Shape, other.Shape);
+        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
         // Create index arrays for both tensors
@@ -1660,13 +1660,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // Map result index to this tensor's index
             for (int i = 0; i < this.Rank; i++)
             {
-                thisIndices[i] = this.Shape[i] == 1 ? 0 : index[i];
+                thisIndices[i] = this._shape[i] == 1 ? 0 : index[i];
             }
 
             // Map result index to other tensor's index
             for (int i = 0; i < other.Rank; i++)
             {
-                otherIndices[i] = other.Shape[i] == 1 ? 0 : index[i];
+                otherIndices[i] = other._shape[i] == 1 ? 0 : index[i];
             }
 
             // Perform multiplication
@@ -1715,10 +1715,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         // Get matrix dimensions (last 2 dims)
-        int M = this.Shape[^2];
-        int K1 = this.Shape[^1];
-        int K2 = other.Shape[^2];
-        int N = other.Shape[^1];
+        int M = this._shape[^2];
+        int K1 = this._shape[^1];
+        int K2 = other._shape[^2];
+        int N = other._shape[^1];
 
         if (K1 != K2)
         {
@@ -1742,13 +1742,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <returns>The result of batched matrix multiplication.</returns>
     private Tensor<T> BatchedMatrixMultiply(Tensor<T> other)
     {
-        int M = this.Shape[^2];
-        int K = this.Shape[^1];
-        int N = other.Shape[^1];
+        int M = this._shape[^2];
+        int K = this._shape[^1];
+        int N = other._shape[^1];
 
         // Calculate batch dimensions (all but last 2)
-        var thisBatchShape = this.Shape.Take(this.Rank - 2).ToArray();
-        var otherBatchShape = other.Shape.Take(other.Rank - 2).ToArray();
+        var thisBatchShape = this._shape.Take(this.Rank - 2).ToArray();
+        var otherBatchShape = other._shape.Take(other.Rank - 2).ToArray();
 
         // Calculate broadcasted batch shape
         var maxBatchRank = Math.Max(thisBatchShape.Length, otherBatchShape.Length);
@@ -1874,7 +1874,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // Update index
             for (int j = this.Rank - 1; j >= 0; j--)
             {
-                if (++index[j] < this.Shape[j])
+                if (++index[j] < this._shape[j])
                     break;
                 index[j] = 0;
             }
@@ -1972,7 +1972,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new InvalidOperationException("This Slice method is only applicable for 2D tensors.");
         }
 
-        if (startRow < 0 || startCol < 0 || endRow > this.Shape[0] || endCol > this.Shape[1] || startRow >= endRow || startCol >= endCol)
+        if (startRow < 0 || startCol < 0 || endRow > this._shape[0] || endCol > this._shape[1] || startRow >= endRow || startCol >= endCol)
         {
             throw new ArgumentException("Invalid slice parameters.");
         }
@@ -1984,7 +1984,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Tensor<T> result = new Tensor<T>(newShape);
 
         // Use vectorized Copy operation per row when slicing full width, otherwise element-by-element
-        int sourceCols = this.Shape[1];
+        int sourceCols = this._shape[1];
         if (startCol == 0 && endCol == sourceCols)
         {
             // Full width slice - use vectorized Copy per row (5-10x faster)
@@ -2360,9 +2360,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> ElementwiseMultiply(Tensor<T> a, Tensor<T> b)
     {
-        // TensorValidator.ValidateShape(a, b.Shape);
+        // TensorValidator.ValidateShape(a, b._shape);
 
-        Tensor<T> result = new Tensor<T>(a.Shape);
+        Tensor<T> result = new Tensor<T>(a._shape);
         // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
         _numOps.Multiply(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
 
@@ -2389,7 +2389,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseMultiply(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same dimensions for element-wise multiplication.");
 
         // Use the Vector's ElementwiseMultiply method to perform the operation
@@ -2801,7 +2801,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
-        // TensorValidator.ValidateShape(this, other.Shape);
+        // TensorValidator.ValidateShape(this, other._shape);
 
         var result = TensorAllocator.Rent<T>(Shape);
         // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
@@ -2819,7 +2819,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void AddInPlace(Tensor<T> other)
     {
-        if (!Shape.SequenceEqual(other.Shape))
+        if (!_shape.SequenceEqual(other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
         _numOps.Add(_data.AsSpan(), other._data.AsSpan(), _data.AsWritableSpan());
@@ -2849,13 +2849,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path
-        if (Shape.SequenceEqual(other.Shape))
+        if (_shape.SequenceEqual(other._shape))
         {
             return Add(other);
         }
 
         // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this.Shape, other.Shape);
+        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
         // Pad shapes to same rank for easier indexing
@@ -2869,8 +2869,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         for (int i = 0; i < maxRank; i++)
         {
-            thisShape[i] = i < thisOffset ? 1 : this.Shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other.Shape[i - otherOffset];
+            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
+            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
         }
 
         // Iterate over the result tensor
@@ -2918,13 +2918,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastSubtract(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path
-        if (Shape.SequenceEqual(other.Shape))
+        if (_shape.SequenceEqual(other._shape))
         {
             return Subtract(other);
         }
 
         // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this.Shape, other.Shape);
+        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
         // Pad shapes to same rank for easier indexing
@@ -2938,8 +2938,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         for (int i = 0; i < maxRank; i++)
         {
-            thisShape[i] = i < thisOffset ? 1 : this.Shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other.Shape[i - otherOffset];
+            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
+            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
         }
 
         // Iterate over the result tensor
@@ -2984,7 +2984,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastMultiply(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path (element-wise multiply)
-        if (Shape.SequenceEqual(other.Shape))
+        if (_shape.SequenceEqual(other._shape))
         {
             // Element-wise multiplication, not matrix multiplication
             var fastResult = TensorAllocator.Rent<T>(Shape);
@@ -2999,7 +2999,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this.Shape, other.Shape);
+        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
         // Pad shapes to same rank for easier indexing
@@ -3013,8 +3013,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         for (int i = 0; i < maxRank; i++)
         {
-            thisShape[i] = i < thisOffset ? 1 : this.Shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other.Shape[i - otherOffset];
+            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
+            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
         }
 
         // Iterate over the result tensor
@@ -3062,7 +3062,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> BroadcastDivide(Tensor<T> other)
     {
         // Check if shapes are already identical - use fast path (element-wise divide)
-        if (Shape.SequenceEqual(other.Shape))
+        if (_shape.SequenceEqual(other._shape))
         {
             var fastResult = TensorAllocator.Rent<T>(Shape);
             var srcSpan = _data.AsSpan();
@@ -3076,7 +3076,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this.Shape, other.Shape);
+        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = new Tensor<T>(broadcastShape);
 
         // Pad shapes to same rank for easier indexing
@@ -3090,8 +3090,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         for (int i = 0; i < maxRank; i++)
         {
-            thisShape[i] = i < thisOffset ? 1 : this.Shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other.Shape[i - otherOffset];
+            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
+            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
         }
 
         // Iterate over the result tensor
@@ -3139,16 +3139,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> Multiply(Tensor<T> other)
     {
         // Support 2D matrix multiplication and 3D batch matrix multiplication
-        if (Shape.Length == 2 && other.Shape.Length == 2)
+        if (_shape.Length == 2 && other._shape.Length == 2)
         {
             // Standard 2D matrix multiplication
-            if (Shape[1] != other.Shape[0])
+            if (Shape[1] != other._shape[0])
             {
                 throw new ArgumentException("The number of columns in the first tensor must equal the number of rows in the second tensor.");
             }
 
             int resultRows = Shape[0];
-            int resultCols = other.Shape[1];
+            int resultCols = other._shape[1];
             int commonDim = Shape[1];
 
             var result = new Tensor<T>(new[] { resultRows, resultCols });
@@ -3168,22 +3168,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             return result;
         }
-        else if (Shape.Length == 3 && other.Shape.Length == 3)
+        else if (_shape.Length == 3 && other._shape.Length == 3)
         {
             // 3D batch matrix multiplication: (batch, m, k) @ (batch, k, n) -> (batch, m, n)
-            if (Shape[0] != other.Shape[0])
+            if (Shape[0] != other._shape[0])
             {
                 throw new ArgumentException("Batch dimensions must match for batch matrix multiplication.");
             }
 
-            if (Shape[2] != other.Shape[1])
+            if (Shape[2] != other._shape[1])
             {
                 throw new ArgumentException("The number of columns in the first tensor must equal the number of rows in the second tensor for each batch.");
             }
 
             int batchSize = Shape[0];
             int resultRows = Shape[1];
-            int resultCols = other.Shape[2];
+            int resultCols = other._shape[2];
             int commonDim = Shape[2];
 
             var result = new Tensor<T>(new[] { batchSize, resultRows, resultCols });
@@ -3206,18 +3206,18 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             return result;
         }
-        else if (Shape.Length == 3 && other.Shape.Length == 2)
+        else if (_shape.Length == 3 && other._shape.Length == 2)
         {
             // 3D @ 2D with broadcasting: (batch, m, k) @ (k, n) -> (batch, m, n)
             // The 2D matrix is broadcast across the batch dimension
-            if (Shape[2] != other.Shape[0])
+            if (Shape[2] != other._shape[0])
             {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: ({Shape[1]}, {Shape[2]}) @ ({other.Shape[0]}, {other.Shape[1]})");
+                throw new ArgumentException($"Matrix dimensions don't match for multiplication: ({Shape[1]}, {Shape[2]}) @ ({other._shape[0]}, {other._shape[1]})");
             }
 
             int batchSize = Shape[0];
             int resultRows = Shape[1];
-            int resultCols = other.Shape[1];
+            int resultCols = other._shape[1];
             int commonDim = Shape[2];
 
             var result = new Tensor<T>(new[] { batchSize, resultRows, resultCols });
@@ -3240,29 +3240,29 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             return result;
         }
-        else if (Shape.Length == 4 && other.Shape.Length == 4)
+        else if (_shape.Length == 4 && other._shape.Length == 4)
         {
             // 4D batch-head matrix multiplication for multi-head attention:
             // (batch, heads, m, k) @ (batch, heads, k, n) -> (batch, heads, m, n)
-            if (Shape[0] != other.Shape[0])
+            if (Shape[0] != other._shape[0])
             {
-                throw new ArgumentException($"Batch dimensions must match: {Shape[0]} vs {other.Shape[0]}");
+                throw new ArgumentException($"Batch dimensions must match: {Shape[0]} vs {other._shape[0]}");
             }
 
-            if (Shape[1] != other.Shape[1])
+            if (Shape[1] != other._shape[1])
             {
-                throw new ArgumentException($"Head dimensions must match: {Shape[1]} vs {other.Shape[1]}");
+                throw new ArgumentException($"Head dimensions must match: {Shape[1]} vs {other._shape[1]}");
             }
 
-            if (Shape[3] != other.Shape[2])
+            if (Shape[3] != other._shape[2])
             {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dims {Shape[3]} vs {other.Shape[2]}");
+                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dims {Shape[3]} vs {other._shape[2]}");
             }
 
             int batchSize = Shape[0];
             int numHeads = Shape[1];
             int resultRows = Shape[2];
-            int resultCols = other.Shape[3];
+            int resultCols = other._shape[3];
             int commonDim = Shape[3];
 
             var result = new Tensor<T>(new[] { batchSize, numHeads, resultRows, resultCols });
@@ -3288,19 +3288,19 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             return result;
         }
-        else if (Shape.Length == 4 && other.Shape.Length == 2)
+        else if (_shape.Length == 4 && other._shape.Length == 2)
         {
             // 4D @ 2D with broadcasting: (batch, heads, m, k) @ (k, n) -> (batch, heads, m, n)
             // The 2D matrix is broadcast across batch and head dimensions
-            if (Shape[3] != other.Shape[0])
+            if (Shape[3] != other._shape[0])
             {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dim {Shape[3]} vs {other.Shape[0]}");
+                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dim {Shape[3]} vs {other._shape[0]}");
             }
 
             int batchSize = Shape[0];
             int numHeads = Shape[1];
             int resultRows = Shape[2];
-            int resultCols = other.Shape[1];
+            int resultCols = other._shape[1];
             int commonDim = Shape[3];
 
             var result = new Tensor<T>(new[] { batchSize, numHeads, resultRows, resultCols });
@@ -3328,7 +3328,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else
         {
-            throw new NotSupportedException($"Multiplication is not supported for tensors with shapes {string.Join("x", Shape)} and {string.Join("x", other.Shape)}. Supported: 2D×2D, 3D×3D, 3D×2D, 4D×4D, 4D×2D.");
+            throw new NotSupportedException($"Multiplication is not supported for tensors with shapes {string.Join("x", Shape)} and {string.Join("x", other._shape)}. Supported: 2D×2D, 3D×3D, 3D×2D, 4D×4D, 4D×2D.");
         }
     }
 
@@ -3360,12 +3360,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transpose()
     {
-        if (Shape.Length == 1)
+        if (_shape.Length == 1)
         {
             // 1D tensor: return a copy (transpose has no effect)
             return Clone();
         }
-        else if (Shape.Length == 2)
+        else if (_shape.Length == 2)
         {
             // 2D tensor: swap rows and columns
             var result = new Tensor<T>([Shape[1], Shape[0]]);
@@ -3458,17 +3458,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             for (int j = 0; j < rank; j++)
             {
-                if (j != axis && tensors[i].Shape[j] != tensors[0].Shape[j])
+                if (j != axis && tensors[i]._shape[j] != tensors[0]._shape[j])
                     throw new ArgumentException("All tensors must have the same shape except for the concatenation axis.");
             }
         }
 
         // Calculate the new shape
         int[] newShape = new int[rank];
-        Array.Copy(tensors[0].Shape, newShape, rank);
+        Array.Copy(tensors[0]._shape, newShape, rank);
         for (int i = 1; i < tensors.Length; i++)
         {
-            newShape[axis] += tensors[i].Shape[axis];
+            newShape[axis] += tensors[i]._shape[axis];
         }
 
         // Create the new tensor
@@ -3479,7 +3479,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         for (int i = 0; i < tensors.Length; i++)
         {
             CopyTensorSlice(tensors[i], result, axis, offset);
-            offset += tensors[i].Shape[axis];
+            offset += tensors[i]._shape[axis];
         }
 
         return result;
@@ -3514,7 +3514,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 return;
             }
 
-            int limit = depth == axis ? source.Shape[depth] : destination.Shape[depth];
+            int limit = depth == axis ? source._shape[depth] : destination._shape[depth];
             for (int i = 0; i < limit; i++)
             {
                 sourceIndices[depth] = i;

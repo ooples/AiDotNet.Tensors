@@ -51,7 +51,7 @@ public static class GaussianSplattingOperations
         if (projMatrix == null) throw new ArgumentNullException(nameof(projMatrix));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = means3D.Shape[0];
+        int numGaussians = means3D._shape[0];
 
         // Validate against integer overflow for large datasets
         // Maximum safe size is int.MaxValue / 9 (for 3x3 covariance matrix indexing)
@@ -124,7 +124,7 @@ public static class GaussianSplattingOperations
             // Get 3D covariance (assume upper triangular storage: c00, c01, c02, c11, c12, c22)
             int covOffset = i * 6;
             double c00, c01, c02, c11, c12, c22;
-            if (covariances3D.Shape[1] == 6)
+            if (covariances3D._shape[1] == 6)
             {
                 c00 = numOps.ToDouble(covariances3D.GetFlat(covOffset));
                 c01 = numOps.ToDouble(covariances3D.GetFlat(covOffset + 1));
@@ -133,7 +133,7 @@ public static class GaussianSplattingOperations
                 c12 = numOps.ToDouble(covariances3D.GetFlat(covOffset + 4));
                 c22 = numOps.ToDouble(covariances3D.GetFlat(covOffset + 5));
             }
-            else if (covariances3D.Shape.Length == 3) // [N, 3, 3] format
+            else if (covariances3D._shape.Length == 3) // [N, 3, 3] format
             {
                 c00 = numOps.ToDouble(covariances3D.GetFlat(i * 9));
                 c01 = numOps.ToDouble(covariances3D.GetFlat(i * 9 + 1));
@@ -145,7 +145,7 @@ public static class GaussianSplattingOperations
             else
             {
                 throw new ArgumentException(
-                    $"Unsupported covariance shape: expected [N, 6] or [N, 3, 3], got [{string.Join(", ", covariances3D.Shape)}]",
+                    $"Unsupported covariance shape: expected [N, 6] or [N, 3, 3], got [{string.Join(", ", covariances3D._shape)}]",
                     nameof(covariances3D));
             }
 
@@ -214,8 +214,8 @@ public static class GaussianSplattingOperations
         if (depths == null) throw new ArgumentNullException(nameof(depths));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = means2D.Shape[0];
-        int numChannels = colors.Shape[1];
+        int numGaussians = means2D._shape[0];
+        int numChannels = colors._shape[1];
 
         // Validate against integer overflow for large datasets
         const int maxSafeGaussians = int.MaxValue / 9;
@@ -373,8 +373,8 @@ public static class GaussianSplattingOperations
         if (outputGradient == null) throw new ArgumentNullException(nameof(outputGradient));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = means2D.Shape[0];
-        int numChannels = colors.Shape[1];
+        int numGaussians = means2D._shape[0];
+        int numChannels = colors._shape[1];
 
         // Validate against integer overflow for large datasets
         const int maxSafeGaussians = int.MaxValue / 9;
@@ -568,11 +568,11 @@ public static class GaussianSplattingOperations
             throw new ArgumentOutOfRangeException(nameof(degree), "Degree must be between 0 and 3.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = shCoefficients.Shape[0];
+        int numGaussians = shCoefficients._shape[0];
         int basisCount = (degree + 1) * (degree + 1);
-        int numChannels = shCoefficients.Shape[2]; // Typically 3 for RGB
+        int numChannels = shCoefficients._shape[2]; // Typically 3 for RGB
 
-        bool broadcastDir = viewDirections.Shape[0] == 1;
+        bool broadcastDir = viewDirections._shape[0] == 1;
         var colors = new T[numGaussians * numChannels];
 
         Parallel.For(0, numGaussians, i =>
@@ -625,11 +625,11 @@ public static class GaussianSplattingOperations
         if (outputGradient == null) throw new ArgumentNullException(nameof(outputGradient));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = shCoefficients.Shape[0];
+        int numGaussians = shCoefficients._shape[0];
         int basisCount = (degree + 1) * (degree + 1);
-        int numChannels = shCoefficients.Shape[2];
+        int numChannels = shCoefficients._shape[2];
 
-        bool broadcastDir = viewDirections.Shape[0] == 1;
+        bool broadcastDir = viewDirections._shape[0] == 1;
         var shGrad = new T[numGaussians * basisCount * numChannels];
 
         Parallel.For(0, numGaussians, i =>
@@ -676,7 +676,7 @@ public static class GaussianSplattingOperations
             }
         });
 
-        return new Tensor<T>(shGrad, shCoefficients.Shape);
+        return new Tensor<T>(shGrad, shCoefficients._shape);
     }
 
     /// <summary>
@@ -688,7 +688,7 @@ public static class GaussianSplattingOperations
         if (scales == null) throw new ArgumentNullException(nameof(scales));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = rotations.Shape[0];
+        int numGaussians = rotations._shape[0];
 
         // Output: upper triangular covariance [N, 6] = c00, c01, c02, c11, c12, c22
         var covariances = new T[numGaussians * 6];
@@ -787,7 +787,7 @@ public static class GaussianSplattingOperations
         if (covarianceGradient == null) throw new ArgumentNullException(nameof(covarianceGradient));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numGaussians = rotations.Shape[0];
+        int numGaussians = rotations._shape[0];
 
         var rotGrad = new T[numGaussians * 4];
         var scaleGrad = new T[numGaussians * 3];
