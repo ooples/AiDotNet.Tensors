@@ -7,7 +7,7 @@ public sealed partial class WebGpuBackend
     // Dispatch2BufferAsync(module, source, kernel, inputBuf, outputBuf, uniforms, workSize)
 
     public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz)
-    { try { Dispatch2BufferAsync("ReductionExt", WebGpuKernels.ReductionExtSource, "mean_axis", i, o, new float[]{BitConverter.Int32BitsToSingle(1),BitConverter.Int32BitsToSingle(sz),0,0}, 1).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++)s+=d[j]; ((WebGpuBuffer)o).CopyFrom(new[]{s/sz}); } }
+    { if (sz <= 0) { ((WebGpuBuffer)o).CopyFrom(new[]{ 0f }); return; } try { Dispatch2BufferAsync("ReductionExt", WebGpuKernels.ReductionExtSource, "mean_axis", i, o, new float[]{BitConverter.Int32BitsToSingle(1),BitConverter.Int32BitsToSingle(sz),0,0}, 1).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i); float s=0; for(int j=0;j<sz;j++)s+=d[j]; ((WebGpuBuffer)o).CopyFrom(new[]{s/sz}); } }
     public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz)
     { try { Dispatch2BufferAsync("UnaryMath", WebGpuKernels.UnaryMathSource, "clip_op", i, o, new float[]{mn,mx,BitConverter.Int32BitsToSingle(sz),0}, sz).GetAwaiter().GetResult(); } catch { float[] d=DownloadBuffer(i);float[] r=new float[sz];for(int j=0;j<sz;j++)r[j]=Math.Min(Math.Max(d[j],mn),mx);((WebGpuBuffer)o).CopyFrom(r); } }
     public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz)

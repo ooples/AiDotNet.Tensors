@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <item>GPU vs CPU breakeven point on Apple Silicon</item>
 /// </list>
 /// </remarks>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class MetalBackendBenchmarks
@@ -304,7 +304,7 @@ public class MetalBackendBenchmarks
 /// <summary>
 /// Matrix operation benchmarks for Metal backend.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class MetalGemmBenchmarks
 {
