@@ -415,13 +415,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ToVector()
     {
-        var vector = new Vector<T>(this.Length);
-        int index = 0;
-
-        // Use a recursive helper method to traverse all dimensions
-        FlattenHelper(new int[Shape.Length], 0, ref index, vector);
-
-        return vector;
+        // Delegate to view-safe ToArray() which uses SIMD bulk copy for contiguous tensors
+        return new Vector<T>(ToArray());
     }
 
     /// <summary>
@@ -582,16 +577,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSubTensor(int[] indices, Tensor<T> subTensor)
     {
-        // indices.Length specifies how many dimensions to fix
-        // subTensor.Rank is the remaining dimensions
-        // Together they must equal the parent tensor's rank
         if (indices.Length + subTensor.Rank != Rank)
             throw new ArgumentException($"Number of indices ({indices.Length}) plus sub-tensor rank ({subTensor.Rank}) must equal tensor rank ({Rank}).");
 
-        int[] currentIndices = new int[Rank];
-        Array.Copy(indices, currentIndices, indices.Length);
-
-        SetSubTensorRecursive(subTensor, currentIndices, 0);
+        // Get a view into the target location using SubTensor, then copy data through it
+        var target = this.SubTensor(indices);
+        target.CopyFromArray(subTensor.Contiguous().ToArray());
     }
 
     /// <summary>
@@ -934,39 +925,6 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Recursively sets values from a sub-tensor into this tensor at the specified position.
-    /// </summary>
-    /// <param name="subTensor">The smaller tensor whose values will be copied into this tensor.</param>
-    /// <param name="indices">The current position in this tensor where values should be placed.</param>
-    /// <param name="dimension">The current dimension being processed in the recursion.</param>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This is a helper method that works through each dimension of the sub-tensor
-    /// one by one, copying its values to the correct positions in the larger tensor.</para>
-    /// 
-    /// <para>Think of it like placing a small sticker (sub-tensor) onto the correct position of a larger
-    /// sheet of paper (the main tensor). The indices tell us where to start placing the sticker,
-    /// and this method makes sure each part of the sticker goes to the right spot.</para>
-    /// 
-    /// <para>The recursion works by:
-    /// 1. If we've processed all dimensions, copy the single value
-    /// 2. Otherwise, loop through the current dimension and recursively process the next dimension</para>
-    /// </remarks>
-    private void SetSubTensorRecursive(Tensor<T> subTensor, int[] indices, int dimension)
-    {
-        if (dimension == subTensor.Rank)
-        {
-            this[indices] = subTensor.GetFlat(0);
-            return;
-        }
-
-        for (int i = 0; i < subTensor._shape[dimension]; i++)
-        {
-            indices[indices.Length - subTensor.Rank + dimension] = i;
-            SetSubTensorRecursive(subTensor, indices, dimension + 1);
-        }
-    }
-
-    /// <summary>
     /// Extracts a slice along the first dimension of the tensor.
     /// </summary>
     /// <param name="index">The index to slice at.</param>
@@ -1015,45 +973,6 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var result = TensorAllocator.Rent<T>(this._shape);
         _numOps.MultiplyScalar(src._data.AsSpan(), factor, result._data.AsWritableSpan());
         return result;
-    }
-
-    /// <summary>
-    /// Helper method for flattening a multi-dimensional tensor into a one-dimensional vector.
-    /// </summary>
-    /// <param name="indices">An array to keep track of the current position in the tensor.</param>
-    /// <param name="dimension">The current dimension being processed.</param>
-    /// <param name="index">A reference to the current index in the output vector.</param>
-    /// <param name="vector">The output vector to store the flattened tensor.</param>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This method uses recursion to navigate through all dimensions of the tensor.
-    /// Recursion means the method calls itself, each time moving deeper into the tensor's structure.
-    /// </para>
-    /// <para>
-    /// Here's how it works:
-    /// 1. If we've reached the deepest level (all dimensions processed), we add the current element to the vector.
-    /// 2. If not, we loop through the current dimension and recursively process the next dimension.
-    /// 3. This continues until all elements have been added to the vector in the correct order.
-    /// </para>
-    /// <para>
-    /// This approach allows us to flatten tensors of any number of dimensions, making it very flexible.
-    /// </para>
-    /// </remarks>
-    private void FlattenHelper(int[] indices, int dimension, ref int index, Vector<T> vector)
-    {
-        if (dimension == Shape.Length)
-        {
-            // We've reached the deepest level, add the element to the vector
-            vector[index++] = this[indices];
-        }
-        else
-        {
-            // Recursively traverse the current dimension
-            for (int i = 0; i < Shape[dimension]; i++)
-            {
-                indices[dimension] = i;
-                FlattenHelper(indices, dimension + 1, ref index, vector);
-            }
-        }
     }
 
     /// <summary>
@@ -2154,15 +2073,6 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, in a 3ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â4 tensor, the flat index 5 would correspond to position [1,1] 
     /// (second row, second column).</para>
     /// </remarks>
-    private void GetIndicesFromFlatIndex(int flatIndex, int[] indices)
-    {
-        for (int i = Rank - 1; i >= 0; i--)
-        {
-            indices[i] = flatIndex % Shape[i];
-            flatIndex /= Shape[i];
-        }
-    }
-
     /// <summary>
     /// Sets the value at the specified flat index in the tensor.
     /// </summary>
