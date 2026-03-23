@@ -220,7 +220,7 @@ public class TorchSharpCpuComparisonBenchmarks
         // Without this, the first benchmark iteration pays the cold-start, skewing the mean.
         if (_aiDoubleVectorA is not null)
         {
-            var warmupDbl = TensorAllocator.Rent<double>(_aiDoubleVectorA.Shape);
+            var warmupDbl = TensorAllocator.Rent<double>(_aiDoubleVectorA._shape);
             TensorPool.Return(_cpuEngine.TensorExp(warmupDbl));
             TensorPool.Return(_cpuEngine.TensorLog(warmupDbl));
             TensorPool.Return(_cpuEngine.TensorTanh(warmupDbl));
@@ -769,7 +769,7 @@ public class TorchSharpCpuComparisonBenchmarks
     public void AiDotNet_Softmax_ZeroAlloc()
     {
         if (_aiSoftmaxInput is null) throw new InvalidOperationException("Setup not called");
-        var output = TensorAllocator.Rent<float>(_aiSoftmaxInput.Shape);
+        var output = TensorAllocator.Rent<float>(_aiSoftmaxInput._shape);
         _cpuEngine.SoftmaxInto(output, _aiSoftmaxInput, axis: 1);
         TensorAllocator.Return(output);
     }
@@ -864,7 +864,7 @@ public class TorchSharpCpuComparisonBenchmarks
     {
         if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
             throw new InvalidOperationException("Setup not called");
-        var output = TensorAllocator.Rent<float>(_aiNormInput.Shape);
+        var output = TensorAllocator.Rent<float>(_aiNormInput._shape);
         _cpuEngine.GroupNormSwishInto(output, _aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5);
         TensorAllocator.Return(output);
     }

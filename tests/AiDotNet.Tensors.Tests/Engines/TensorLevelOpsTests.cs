@@ -556,7 +556,7 @@ public class TensorLevelOpsTests
         var output = new Tensor<double>(expected._shape);
         engine.Conv2DInto(output, input, kernel, stride: 1, padding: 1);
 
-        Assert.Equal(expected.Shape, output.Shape);
+        Assert.Equal(expected.Shape.ToArray(), output.Shape.ToArray());
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], output[i]);
     }

@@ -126,7 +126,7 @@ public class TensorMatMulTransposeTests
         var doubleTransposed = engine.TensorTranspose(transposed);
 
         // Assert
-        Assert.Equal(input.Shape, doubleTransposed.Shape);
+        Assert.Equal(input.Shape.ToArray(), doubleTransposed.Shape.ToArray());
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 4; j++)
                 Assert.Equal(input[i, j], doubleTransposed[i, j], FloatTolerance);
@@ -401,7 +401,7 @@ public class TensorMatMulTransposeTests
         var btAt = engine.TensorMatMul(bTranspose, aTranspose);
 
         // Assert
-        Assert.Equal(abTranspose.Shape, btAt.Shape);
+        Assert.Equal(abTranspose.Shape.ToArray(), btAt.Shape.ToArray());
         for (int i = 0; i < abTranspose.Shape[0]; i++)
             for (int j = 0; j < abTranspose.Shape[1]; j++)
                 Assert.Equal(abTranspose[i, j], btAt[i, j], FloatTolerance);
