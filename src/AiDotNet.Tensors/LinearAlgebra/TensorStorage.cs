@@ -33,10 +33,10 @@ internal sealed class TensorStorage<T>
     /// <summary>
     /// Creates a new storage with the specified size.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">Thrown when size is not positive.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when size is negative.</exception>
     internal TensorStorage(int size)
     {
-        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be positive.");
+        if (size < 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be non-negative.");
         _data = new Vector<T>(size);
         _refCount = 1;
     }

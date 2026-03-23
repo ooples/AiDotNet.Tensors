@@ -306,8 +306,8 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
     {
         _parent = parent;
         _offset = offset;
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
 
         ElementCount = 1;
         foreach (var dim in shape)
