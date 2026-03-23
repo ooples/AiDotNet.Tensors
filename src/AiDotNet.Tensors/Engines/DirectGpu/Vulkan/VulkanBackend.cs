@@ -56,8 +56,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private int _batchOwnerThreadId;
     private ThreadCommandResources _batchThreadRes;
     private int _batchDispatchCount;
-    private bool _inSecondaryStream;
+    private volatile bool _inSecondaryStream;
     private ThreadCommandResources _secondaryThreadRes;
+    private int _secondaryStreamOwnerThreadId;
 
     /// <summary>
     /// Gets the singleton backend instance.
@@ -210,11 +211,18 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (shader is null)
             return null;
 
-        var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
-        if (pipeline is not null)
-            _glslPipelineCache.TryAdd(cacheKey, pipeline);
-
-        return pipeline;
+        try
+        {
+            var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
+            if (pipeline is not null)
+                _glslPipelineCache.TryAdd(cacheKey, pipeline);
+            return pipeline;
+        }
+        finally
+        {
+            // Vulkan spec allows destroying shader modules after pipeline creation
+            shader.Dispose();
+        }
     }
 
     /// <summary>
@@ -284,8 +292,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslGenerateOp(string glslSource, IGpuBuffer O, int size, uint pushConstantSize = sizeof(uint))
     {
+        GlslGenerateOp(glslSource, O, size, new uint[] { (uint)size }, pushConstantSize);
+    }
+
+    private void GlslGenerateOp(string glslSource, IGpuBuffer O, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 1, pushConstantSize);
         if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbO = AsVulkan(O);
@@ -293,7 +306,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbO.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
     }
 
@@ -303,8 +316,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuadOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size, uint pushConstantSize = sizeof(uint))
     {
+        GlslQuadOp(glslSource, A, B, C, D, size, new uint[] { (uint)size }, pushConstantSize);
+    }
+
+    private void GlslQuadOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
         if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
@@ -312,7 +330,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
     }
 
@@ -322,8 +340,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuintOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, int size, uint pushConstantSize = sizeof(uint))
     {
+        GlslQuintOp(glslSource, A, B, C, D, E, size, new uint[] { (uint)size }, pushConstantSize);
+    }
+
+    private void GlslQuintOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 5, pushConstantSize);
         if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D); var vbE = AsVulkan(E);
@@ -331,7 +354,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage, vbE.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
     }
 
@@ -653,6 +676,32 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void RecordAndExecuteWithPushData(VulkanComputePipeline pipeline, int dispatchSize, uint[] pushConstants, uint pushConstantSize, ThreadCommandResources threadRes)
     {
+        // Batch mode: record into batch command buffer without immediate submit
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
+        {
+            var batchCmd = _batchThreadRes.CommandBuffer;
+            if (_batchDispatchCount > 0)
+            {
+                VulkanNativeBindings.vkCmdPipelineBarrier(
+                    batchCmd,
+                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, IntPtr.Zero, 0, null, 0, IntPtr.Zero);
+            }
+            VulkanNativeBindings.vkCmdBindPipeline(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
+            var batchDs = pipeline.DescriptorSet;
+            VulkanNativeBindings.vkCmdBindDescriptorSets(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &batchDs, 0, null);
+            fixed (uint* ptr = pushConstants)
+            {
+                VulkanNativeBindings.vkCmdPushConstants(batchCmd, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
+            }
+            uint batchWgCount = VulkanKernels.CalculateWorkgroupCount(dispatchSize);
+            VulkanNativeBindings.vkCmdDispatch(batchCmd, batchWgCount, 1, 1);
+            _batchDispatchCount++;
+            return;
+        }
+
+        // Immediate submit path
         var cmdBuffer = threadRes.CommandBuffer;
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
         var beginInfo = new VkCommandBufferBeginInfo
@@ -938,8 +987,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void BeginSecondaryStream()
     {
-        if (_inSecondaryStream)
-            throw new InvalidOperationException("Already in a secondary stream.");
+        int currentThread = Environment.CurrentManagedThreadId;
+        if (Interlocked.CompareExchange(ref _secondaryStreamOwnerThreadId, currentThread, 0) != 0)
+            throw new InvalidOperationException("Secondary stream is already owned by another thread.");
 
         // Acquire a separate set of thread resources (command pool + command buffer + fence)
         // for concurrent recording. This allows overlapping compute dispatches.
@@ -950,13 +1000,15 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void EndSecondaryStream()
     {
-        if (!_inSecondaryStream)
-            throw new InvalidOperationException("Not in a secondary stream.");
+        int currentThread = Environment.CurrentManagedThreadId;
+        if (!_inSecondaryStream || _secondaryStreamOwnerThreadId != currentThread)
+            throw new InvalidOperationException("Not in a secondary stream on this thread.");
 
         // Submit the secondary command buffer and wait for completion
         var cmdBuffer = _secondaryThreadRes.CommandBuffer;
         _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
         _inSecondaryStream = false;
+        Interlocked.Exchange(ref _secondaryStreamOwnerThreadId, 0);
     }
 
     /// <summary>
@@ -983,12 +1035,22 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
         _pipelineCache.Clear();
 
+        // Dispose GLSL-compiled pipelines
+        foreach (var pipeline in _glslPipelineCache.Values)
+        {
+            pipeline.Dispose();
+        }
+        _glslPipelineCache.Clear();
+
         // Dispose shaders
         foreach (var shader in _shaderCache.Values)
         {
             shader.Dispose();
         }
         _shaderCache.Clear();
+
+        // Dispose GLSL compiler
+        _glslCompiler?.Dispose();
 
         // Dispose transfer
         _transfer?.Dispose();

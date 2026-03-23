@@ -511,7 +511,7 @@ public sealed unsafe partial class VulkanBackend
         for (int i = 0; i < aSize; i++)
         {
             int bIdx = bOffset + i * bStride;
-            window[i] = (bIdx >= 0 && bIdx < bSize) ? bFull[bIdx] : 0f;
+            window[i] = (bIdx >= 0 && bIdx < bSize && bIdx < bFull.Length) ? bFull[bIdx] : 0f;
         }
 
         using var windowBuf = AllocateBuffer(window);

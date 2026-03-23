@@ -102,7 +102,12 @@ public sealed partial class VulkanBackend
     public void PixelShuffle(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleGlsl, i, o, ba * ch * ih * sc * iw * sc, 5 * sizeof(uint));
     public void PixelShuffleBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleBackwardGlsl, go, gi, ba * ch * sc * sc * ih * iw, 5 * sizeof(uint));
     public void Crop2D(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int oh, int ow, int ofh, int ofw) => GlslUnaryOp(VulkanGlslKernels.Crop2DGlsl, i, o, ba * ch * oh * ow, 8 * sizeof(uint));
-    public void Crop2DBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int oh, int ow, int ofh, int ofw) => GlslUnaryOp(VulkanGlslKernels.Crop2DBackwardGlsl, go, gi, ba * ch * oh * ow, 8 * sizeof(uint));
+    public void Crop2DBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int oh, int ow, int ofh, int ofw)
+    {
+        // Zero gradInput first — backward only writes to the cropped window, positions outside must be zero
+        Scale(gi, gi, 0f, ba * ch * ih * iw);
+        GlslUnaryOp(VulkanGlslKernels.Crop2DBackwardGlsl, go, gi, ba * ch * oh * ow, 8 * sizeof(uint));
+    }
     public void EyeKernel(IGpuBuffer o, int n) => GlslGenerateOp(VulkanGlslKernels.EyeKernelGlsl, o, n * n, sizeof(uint));
     public void LinspaceKernel(IGpuBuffer o, float st, float sp, int sz) => GlslGenerateOp(VulkanGlslKernels.LinspaceKernelGlsl, o, sz, 2 * sizeof(float) + sizeof(uint));
     public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => GlslUnaryOp(VulkanGlslKernels.OneHotKernel, idx, o, bs * nc, 2 * sizeof(uint));
@@ -119,15 +124,24 @@ public sealed partial class VulkanBackend
     public void CrossEntropyLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nc) => GlslBinaryOp(VulkanGlslKernels.CrossEntropyLossGlsl, p, t, l, bs, 2 * sizeof(uint));
     public void MseLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nf) => GlslBinaryOp(VulkanGlslKernels.MseLossGlsl, p, t, l, bs, 2 * sizeof(uint));
     public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) => GlslBinaryOp(VulkanGlslKernels.BceLossGlsl, p, t, l, sz, sizeof(uint));
-    public void DropoutMask(IGpuBuffer m, int sz, float kp, ulong seed) => GlslGenerateOp(VulkanGlslKernels.DropoutMaskGlsl, m, sz, sizeof(uint) + sizeof(float) + 2 * sizeof(uint));
-    public void GaussianNoise(IGpuBuffer o, int sz, float mn, float sd, ulong seed) => GlslGenerateOp(VulkanGlslKernels.GaussianNoiseGlsl, o, sz, sizeof(uint) + 2 * sizeof(float) + 2 * sizeof(uint));
+    public void DropoutMask(IGpuBuffer m, int sz, float kp, ulong seed) => GlslGenerateOp(
+        VulkanGlslKernels.DropoutMaskGlsl, m, sz,
+        new uint[] { (uint)sz, FloatBits(kp), (uint)(seed & 0xFFFFFFFF), (uint)(seed >> 32) },
+        4 * sizeof(uint));
+    public void GaussianNoise(IGpuBuffer o, int sz, float mn, float sd, ulong seed) => GlslGenerateOp(
+        VulkanGlslKernels.GaussianNoiseGlsl, o, sz,
+        new uint[] { (uint)sz, FloatBits(mn), FloatBits(sd), (uint)(seed & 0xFFFFFFFF), (uint)(seed >> 32) },
+        5 * sizeof(uint));
 
     #endregion
 
     #region Fused Softmax Variants + Distance
 
     public void LogSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.LogSoftmax, i, o, os, 2 * sizeof(uint));
-    public void GumbelSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz, float temp, ulong seed) => GlslUnaryOp(VulkanGlslKernels.GumbelSoftmaxGlsl, i, o, os, 2 * sizeof(uint) + sizeof(float) + 2 * sizeof(uint));
+    public void GumbelSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz, float temp, ulong seed) => GlslUnaryOp(
+        VulkanGlslKernels.GumbelSoftmaxGlsl, i, o, os,
+        new uint[] { (uint)os, (uint)isz, FloatBits(temp), (uint)(seed & 0xFFFFFFFF), (uint)(seed >> 32) },
+        5 * sizeof(uint));
     public void Sparsemax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.SparsemaxGlsl, i, o, os, 2 * sizeof(uint));
     public void TaylorSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.TaylorSoftmaxGlsl, i, o, os, 2 * sizeof(uint));
     public void SphericalSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.SphericalSoftmaxGlsl, i, o, os, 2 * sizeof(uint));
