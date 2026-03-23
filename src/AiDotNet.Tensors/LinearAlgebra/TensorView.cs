@@ -91,27 +91,42 @@ public readonly ref struct TensorView<T>
     /// <summary>
     /// Slices along the first dimension, returning a view with one fewer rank. O(1), zero allocation.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when index is out of bounds.</exception>
     public TensorView<T> Slice(int index)
     {
+        if (index < 0 || index >= _shape[0])
+            throw new ArgumentOutOfRangeException(nameof(index),
+                $"Index {index} is out of range for dimension 0 with size {_shape[0]}.");
+
         int newOffset = _offset + index * _strides[0];
-        return new TensorView<T>(_data, _shape.Slice(1), _strides.Slice(1), newOffset, _length / _shape[0]);
+        // Compute exact length from remaining shape dimensions
+        int newLength = 1;
+        for (int d = 1; d < _shape.Length; d++)
+            newLength *= _shape[d];
+        return new TensorView<T>(_data, _shape.Slice(1), _strides.Slice(1), newOffset, newLength);
     }
 
     /// <summary>
-    /// Gets the value at a logical flat index (row-major order).
+    /// Gets the value at a logical flat index (row-major order). O(Rank) per call.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when flatIndex is out of range.</exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T GetFlat(int flatIndex)
     {
+        if (flatIndex < 0 || flatIndex >= _length)
+            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
+
+        // O(Rank) decomposition using strides — compute row-major strides inline
         int idx = _offset;
         int remaining = flatIndex;
         for (int d = 0; d < _shape.Length; d++)
         {
-            int stride = 1;
+            // Compute row-major stride for this dimension: product of shape[d+1..end]
+            int rmStride = 1;
             for (int dd = d + 1; dd < _shape.Length; dd++)
-                stride *= _shape[dd];
-            int dimIndex = remaining / stride;
-            remaining -= dimIndex * stride;
+                rmStride *= _shape[dd];
+            int dimIndex = remaining / rmStride;
+            remaining -= dimIndex * rmStride;
             idx += dimIndex * _strides[d];
         }
         return _data[idx];
@@ -119,14 +134,37 @@ public readonly ref struct TensorView<T>
 
     /// <summary>
     /// Copies the view's data to a destination span in row-major order.
+    /// For contiguous views, uses direct span copy for maximum performance.
     /// </summary>
     public void CopyTo(Span<T> destination)
     {
         if (destination.Length < _length)
             throw new ArgumentException("Destination span is too small.");
 
-        for (int i = 0; i < _length; i++)
-            destination[i] = GetFlat(i);
+        // Check if view is contiguous (strides match row-major)
+        bool isContiguous = true;
+        int expected = 1;
+        for (int d = _shape.Length - 1; d >= 0; d--)
+        {
+            if (_shape[d] != 1 && _strides[d] != expected)
+            {
+                isContiguous = false;
+                break;
+            }
+            expected *= _shape[d];
+        }
+
+        if (isContiguous)
+        {
+            // Fast path: direct memory copy
+            _data.Slice(_offset, _length).CopyTo(destination);
+        }
+        else
+        {
+            // Slow path: element-by-element through strides
+            for (int i = 0; i < _length; i++)
+                destination[i] = GetFlat(i);
+        }
     }
 }
 

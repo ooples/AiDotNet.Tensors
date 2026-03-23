@@ -139,7 +139,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
     public Tensor<T> Contiguous()
     {
-        if (IsContiguous && _storageOffset == 0) return this;
+        if (IsContiguous && _storageOffset == 0 && !IsCowShared) return this;
 
         // Materialize: copy data from strided layout to contiguous row-major
         var result = new Tensor<T>(_shape);
@@ -2381,6 +2381,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 $"Vector length {values.Length} does not match axis size {axisSize}.",
                 nameof(values));
 
+        EnsureWritable(); // COW materialization before write
+
         // Use the tensor's actual strides (view-safe), not manually computed row-major strides
         int baseIndex = _storageOffset;
         int fi = 0;
@@ -3483,9 +3485,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentOutOfRangeException(nameof(axis));
 
         var src = this.Contiguous();
-        var newShape = _shape.ToList();
-        newShape.RemoveAt(axis);
-        var result = new Tensor<T>([.. newShape]);
+        var newShape = new int[Rank - 1];
+        for (int d = 0, nd = 0; d < Rank; d++)
+        {
+            if (d != axis) newShape[nd++] = _shape[d];
+        }
+        var result = new Tensor<T>(newShape);
         int axisSize = Shape[axis];
 
         var srcSpan = src._data.AsSpan();
@@ -3516,9 +3521,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentOutOfRangeException(nameof(axis));
 
         var src = this.Contiguous();
-        var newShape = _shape.ToList();
-        newShape.RemoveAt(axis);
-        var result = new Tensor<T>([.. newShape]);
+        var newShape = new int[Rank - 1];
+        for (int d = 0, nd = 0; d < Rank; d++)
+        {
+            if (d != axis) newShape[nd++] = _shape[d];
+        }
+        var result = new Tensor<T>(newShape);
         int axisSize = Shape[axis];
 
         var srcSpan = src._data.AsSpan();
@@ -3549,9 +3557,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentOutOfRangeException(nameof(axis));
 
         var src = this.Contiguous();
-        var newShape = _shape.ToList();
-        newShape.RemoveAt(axis);
-        var result = new Tensor<T>([.. newShape]);
+        var newShape = new int[Rank - 1];
+        for (int d = 0, nd = 0; d < Rank; d++)
+        {
+            if (d != axis) newShape[nd++] = _shape[d];
+        }
+        var result = new Tensor<T>(newShape);
         int axisSize = Shape[axis];
         T divisor = _numOps.FromDouble(axisSize);
 

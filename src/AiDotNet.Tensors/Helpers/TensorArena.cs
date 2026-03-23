@@ -3,33 +3,47 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.Helpers;
 
 /// <summary>
-/// Bump allocator for tensor training loops. Pre-allocates a contiguous byte buffer and
-/// sub-allocates tensors from it via pointer bump — zero GC, zero fragmentation.
+/// Arena-style allocator for tensor training loops. Pre-allocates arrays during the first
+/// iteration, then reuses them for subsequent iterations — zero allocation, zero GC after warmup.
 ///
-/// <para><b>Why this beats PyTorch:</b> PyTorch CPU tensors use malloc/free per tensor.
-/// TensorArena eliminates all allocation overhead during a training iteration.
-/// A single <c>Dispose()</c> at the end of each iteration reclaims everything at once.</para>
+/// <para><b>Why this beats PyTorch:</b> PyTorch CPU tensors use malloc/free per tensor, causing
+/// fragmentation and GC pauses. TensorArena eliminates per-tensor allocation after the first
+/// iteration by reusing the same arrays via a ring buffer of pooled arrays.</para>
 ///
 /// <para><b>Usage:</b></para>
 /// <code>
-/// using var arena = TensorArena.Create(estimatedBytes: 64 * 1024 * 1024); // 64 MB
-/// // All TensorAllocator.Rent calls on this thread now use the arena
-/// var output = model.Forward(input); // zero GC during forward pass
-/// var grads = model.Backward(loss);  // zero GC during backward pass
-/// // arena.Dispose() reclaims everything
+/// using var arena = TensorArena.Create();
+/// for (int epoch = 0; epoch &lt; epochs; epoch++)
+/// {
+///     arena.Reset(); // Reuse arrays from previous iteration
+///     var output = model.Forward(input);  // Allocations come from arena
+///     var grads = model.Backward(loss);   // Zero new GC allocations after warmup
+/// }
 /// </code>
 ///
-/// <para><b>Thread safety:</b> Each thread gets its own arena via thread-local storage.
-/// No locks needed for allocation — bump is thread-local.</para>
+/// <para><b>How it works:</b> On first use (warmup), arrays are allocated normally and tracked.
+/// On Reset(), the cursor rewinds to 0 — subsequent Rent calls return the same arrays.
+/// Arrays are only allocated if the arena doesn't have one of the right size.</para>
+///
+/// <para><b>Thread safety:</b> Each thread gets its own arena via [ThreadStatic]. No locks.</para>
 /// </summary>
 public sealed class TensorArena : IDisposable
 {
     [ThreadStatic]
     private static TensorArena? _current;
 
-    private byte[] _buffer;
-    private int _offset;
-    private readonly int _capacity;
+    /// <summary>
+    /// Pool of arrays allocated during warmup, keyed by element count.
+    /// Each size bucket holds a list of arrays available for reuse.
+    /// </summary>
+    private readonly Dictionary<int, List<Array>> _pool = new();
+
+    /// <summary>
+    /// Tracks the reuse cursor per size bucket — how many arrays of each size
+    /// have been handed out since the last Reset().
+    /// </summary>
+    private readonly Dictionary<int, int> _cursor = new();
+
     private bool _disposed;
 
     /// <summary>
@@ -37,11 +51,8 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     internal static TensorArena? Current => _current;
 
-    private TensorArena(int capacityBytes)
+    private TensorArena()
     {
-        _capacity = capacityBytes;
-        _buffer = new byte[capacityBytes];
-        _offset = 0;
     }
 
     /// <summary>
@@ -49,79 +60,86 @@ public sealed class TensorArena : IDisposable
     /// All <see cref="TensorAllocator.Rent{T}"/> calls on this thread will allocate from the arena
     /// until it is disposed.
     /// </summary>
-    /// <param name="estimatedBytes">Estimated total bytes needed for one training iteration.
-    /// Over-estimate is cheap (unused memory). Under-estimate falls back to normal allocation.</param>
-    /// <returns>An arena that must be disposed to reclaim memory and deactivate.</returns>
-    public static TensorArena Create(int estimatedBytes)
+    /// <returns>An arena that must be disposed to deactivate.</returns>
+    public static TensorArena Create()
     {
-        if (estimatedBytes <= 0)
-            throw new ArgumentOutOfRangeException(nameof(estimatedBytes), "Arena capacity must be positive.");
-
-        var arena = new TensorArena(estimatedBytes);
+        var arena = new TensorArena();
         _current = arena;
         return arena;
     }
 
     /// <summary>
-    /// Tries to allocate <paramref name="elementCount"/> elements of type T from the arena.
-    /// Returns null if the arena doesn't have enough space (caller should fall back to normal allocation).
+    /// Tries to rent an array of the given size from the arena.
+    /// During warmup (first iteration): allocates a new array and tracks it.
+    /// After Reset() (subsequent iterations): returns a previously-allocated array.
+    /// Returns null only if disposed.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal T[]? TryAllocate<T>(int elementCount)
     {
         if (_disposed) return null;
 
-        int byteSize = elementCount * Unsafe.SizeOf<T>();
-        // Align to 64 bytes (cache line) for SIMD operations
-        int aligned = (byteSize + 63) & ~63;
+        if (!_pool.TryGetValue(elementCount, out var bucket))
+        {
+            bucket = new List<Array>(4);
+            _pool[elementCount] = bucket;
+            _cursor[elementCount] = 0;
+        }
 
-        int newOffset = _offset + aligned;
-        if (newOffset > _capacity)
-            return null; // Arena full — caller falls back to normal allocation
+        if (!_cursor.TryGetValue(elementCount, out int cursor))
+            cursor = 0;
 
-        _offset = newOffset;
+        if (cursor < bucket.Count)
+        {
+            // Reuse path: return existing array, advance cursor
+            var existing = (T[])bucket[cursor];
+            _cursor[elementCount] = cursor + 1;
+            // Zero the reused array for correctness
+            Array.Clear(existing, 0, elementCount);
+            return existing;
+        }
 
-        // Create a T[] backed by the arena buffer at the current offset
-        // We allocate a fresh T[] here — the key win is that the arena controls lifetime,
-        // so these arrays are all collected at once when the arena is disposed (gen-0 only).
-        var result = new T[elementCount];
-        return result;
+        // Warmup path: allocate new array and track it
+        var arr = new T[elementCount];
+        bucket.Add(arr);
+        _cursor[elementCount] = cursor + 1;
+        return arr;
     }
 
     /// <summary>
-    /// Resets the arena for the next iteration without deallocating the buffer.
-    /// This allows the same pre-allocated buffer to be reused across training iterations.
+    /// Resets the arena for the next iteration. After this, subsequent Rent calls
+    /// will reuse arrays from the previous iteration — zero allocation.
     /// </summary>
     public void Reset()
     {
-        _offset = 0;
+        // Rewind all cursors to 0 — arrays stay pooled
+        foreach (var key in _cursor.Keys)
+            _cursor[key] = 0;
     }
 
     /// <summary>
-    /// Gets the number of bytes currently allocated from this arena.
+    /// Gets the total number of arrays tracked by this arena.
     /// </summary>
-    public int BytesUsed => _offset;
-
-    /// <summary>
-    /// Gets the total capacity of this arena in bytes.
-    /// </summary>
-    public int Capacity => _capacity;
-
-    /// <summary>
-    /// Gets the remaining capacity in bytes.
-    /// </summary>
-    public int BytesRemaining => _capacity - _offset;
+    public int TrackedArrayCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var bucket in _pool.Values)
+                count += bucket.Count;
+            return count;
+        }
+    }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
-        // Deactivate this arena for the thread
         if (_current == this)
             _current = null;
 
-        // Allow GC to collect the buffer
-        _buffer = Array.Empty<byte>();
+        _pool.Clear();
+        _cursor.Clear();
     }
 }

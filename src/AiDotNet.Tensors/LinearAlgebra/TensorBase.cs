@@ -105,19 +105,17 @@ public abstract class TensorBase<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     protected void EnsureWritable()
     {
-        if (!_cowShared) return; // fast path — no volatile read needed; worst case is one extra check
+        if (!_cowShared) return; // fast path — volatile read ensures latest value, no lock needed
 
         // Slow path: materialize
         lock (CowLock)
         {
             if (!_cowShared) return; // double-check after lock
 
-            if (_storage.RefCount <= 1)
-            {
-                // The other side already materialized — we own storage exclusively now
-                _cowShared = false;
-                return;
-            }
+            // Always materialize if COW-shared, even if RefCount dropped to 1.
+            // The other side may have already materialized (pointing to NEW storage),
+            // but we still point to the ORIGINAL shared storage. We need our own copy
+            // to avoid writing to storage the other side may have views into.
 
             // Materialize private copy
             var newData = new Vector<T>(Length);
