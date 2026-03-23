@@ -444,6 +444,9 @@ public sealed unsafe partial class VulkanBackend
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorAdd);
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorSubtract);

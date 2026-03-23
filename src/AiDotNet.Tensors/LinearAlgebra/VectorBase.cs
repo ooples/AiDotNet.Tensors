@@ -245,6 +245,9 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
+        // Materialize deferred GPU download before exposing CPU data
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory.Span;
     }
 
@@ -262,6 +265,8 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory.Span;
     }
 
@@ -273,12 +278,19 @@ public abstract class VectorBase<T>
     internal T[] GetDataArray()
     {
         if (_cachedArray is not null)
+        {
+            // Materialize deferred GPU download if pending (populates the array on first CPU access)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _cachedArray;
+        }
 
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
             if (segment.Offset == 0)
+            {
+                Helpers.DeferredArrayMaterializer.TryMaterialize(segment.Array);
                 return segment.Array;
+            }
         }
 
         return _memory.ToArray();

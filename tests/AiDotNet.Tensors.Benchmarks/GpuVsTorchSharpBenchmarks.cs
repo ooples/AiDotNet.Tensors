@@ -131,5 +131,6 @@ public class GpuVsTorchSharpBenchmarks
         _torchSoftmax?.Dispose();
         _torchMatA?.Dispose();
         _torchMatB?.Dispose();
+        (_gpu as IDisposable)?.Dispose();
     }
 }

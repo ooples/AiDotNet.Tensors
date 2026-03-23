@@ -146,6 +146,11 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Zero-copy factory from Memory&lt;T&gt;. Preserves array identity for GPU deferred materialization.
+    /// </summary>
+    internal static Vector<T> WrapMemory(Memory<T> memory) => new Vector<T>(memory, false);
+
+    /// <summary>
     /// Initializes a new instance of the Vector class with the specified values.
     /// </summary>
     /// <param name="values">The collection of values to initialize the vector with.</param>

@@ -139,7 +139,8 @@ jobs:
         $nativeProjects = @(
           "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj",
           "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj",
-          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj"
+          "src/AiDotNet.Native.OneDNN/AiDotNet.Native.OneDNN.csproj",
+          "src/AiDotNet.Native.ROCm/AiDotNet.Native.ROCm.csproj"
         )
         foreach ($proj in $nativeProjects) {
           if (Test-Path $proj) {

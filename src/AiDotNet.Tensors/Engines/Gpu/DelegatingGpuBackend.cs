@@ -134,6 +134,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Add(A, B, C, size);
+    public virtual void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddRelu(A, B, C, size);
+    public virtual void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddSigmoid(A, B, C, size);
+    public virtual void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddGelu(A, B, C, size);
 
     /// <inheritdoc/>
     public virtual void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Subtract(A, B, C, size);

@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// Benchmarks for GPU fused kernels vs CPU, measuring throughput and speedup.
 /// Covers reductions, element-wise, activations, gated activations, softmax, and linear algebra.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net10_0)]
+[SimpleJob(RuntimeMoniker.Net90)]
 [MemoryDiagnoser]
 public class GpuFusedKernelBenchmarks
 {
@@ -122,4 +122,10 @@ public class GpuFusedKernelBenchmarks
 
     [Benchmark(Description = "TensorEye 64 (CPU)")] public Tensor<float> Eye_CPU() => _cpu.TensorEye<float>(64);
     [Benchmark(Description = "TensorEye 64 (GPU)")] public Tensor<float>? Eye_GPU() => _gpu?.TensorEye<float>(64);
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        (_gpu as IDisposable)?.Dispose();
+    }
 }

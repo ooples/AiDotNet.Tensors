@@ -219,6 +219,9 @@ public sealed partial class WebGpuBackend
     #region Element-wise Operations
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddAsync(A, B, C, size).GetAwaiter().GetResult();
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => SubAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Multiply(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MulAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Divide(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => DivAsync(A, B, C, size).GetAwaiter().GetResult();
@@ -245,7 +248,7 @@ public sealed partial class WebGpuBackend
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
-        if (aSize <= 0) return;
+        if (aSize <= 0) { Scale(result, result, 0f, Math.Max(1, result.Size)); return; }
         if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
         if (bSize < 0) throw new ArgumentOutOfRangeException(nameof(bSize), "bSize must be non-negative.");
 

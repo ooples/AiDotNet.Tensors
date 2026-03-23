@@ -837,22 +837,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private T[] FinishGpuOp<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, int elementCount)
     {
-        if (GpuScope.IsActive)
+        // Always defer the download. The GPU buffer stays cached so chained GPU ops
+        // reuse it without re-uploading (GetOrAllocateBuffer checks _activationCache).
+        // The CPU array is populated lazily when code first accesses the data
+        // (via DeferredArrayMaterializer triggered by GetDataArray/AsSpan/indexer).
+        //
+        // This eliminates both upload AND download for chained GPU operations:
+        //   result1 = sigmoid(x)     → GPU kernel, buffer cached, no download
+        //   result2 = relu(result1)  → buffer found in cache, no upload, no download
+        //   value = result2[0]       → first CPU access triggers download
+        var result = new T[elementCount];
+        CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
+        _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer.Buffer, backend, elementCount));
+
+        // Register with static materializer so VectorBase.GetDataArray/AsSpan can trigger
+        // the download on first CPU access, without needing a reference to this engine.
+        Helpers.DeferredArrayMaterializer.Register(result, arr =>
         {
-            // Scope is active: download the data now so the CPU array has valid values,
-            // but also cache the GPU buffer so the next GPU op can reuse it without re-uploading.
-            float[] floatData = backend.DownloadBuffer(outputBuffer.Buffer);
-            var result = DirectGpuEngine.FromFloatArray<T>(floatData);
-            CacheActivation(result, outputBuffer.Buffer, [elementCount], backend);
-            return result;
-        }
-        else
-        {
-            // No scope — download immediately and dispose the buffer
-            float[] resultFloat = backend.DownloadBuffer(outputBuffer.Buffer);
-            outputBuffer.Dispose();
-            return DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        }
+            if (_deferredDownloads.TryRemove(arr, out var entry))
+            {
+                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+                Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
+            }
+        });
+
+        return result;
     }
 
     /// <summary>
