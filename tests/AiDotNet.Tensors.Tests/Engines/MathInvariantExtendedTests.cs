@@ -98,7 +98,7 @@ public class MathInvariantExtendedTests
     // TensorCopy / TensorFill (3)
     // ================================================================
     [Fact] public void Copy_ContentEqual() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); AE(dst, src); }
-    [Fact] public void Copy_Independent() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); var sd = src.GetDataArray(); sd[0] += 100f; Assert.NotEqual(100f + dst.GetDataArray()[0], dst.GetDataArray()[0]); }
+    [Fact] public void Copy_ValuesMatch() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); var sd = src.GetDataArray(); var dd = dst.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(sd[i], dd[i], Tol); }
     [Fact] public void Fill_AllSameValue() { var t = new Tensor<float>(new float[64], [64]); E.TensorFill(t, 3.14f); var d = t.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.Equal(3.14f, d[i], Tol); }
 
     // ================================================================

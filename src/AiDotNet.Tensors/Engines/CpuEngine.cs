@@ -16986,6 +16986,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (tensor.Length != mask.Length)
+            throw new ArgumentException($"Tensor length ({tensor.Length}) must match mask length ({mask.Length}).");
 
         var result = tensor.Clone();
         var maskSpan = mask.AsSpan();
@@ -17006,6 +17008,8 @@ public class CpuEngine : ITensorLevelEngine
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
+        if (condition.Length != x.Length || x.Length != y.Length)
+            throw new ArgumentException($"All tensors must have the same length. condition={condition.Length}, x={x.Length}, y={y.Length}.");
 
         var result = TensorAllocator.Rent<T>(x.Shape);
         var condData = condition.GetDataArray();
