@@ -41,7 +41,7 @@ public class TensorWorkspaceTests
         ws.Allocate();
 
         var tensor = ws.Get(slot);
-        Assert.Equal(new[] { 2, 3, 4 }, tensor.Shape);
+        Assert.Equal(new[] { 2, 3, 4 }, tensor.Shape.ToArray());
         Assert.Equal(24, tensor.Length);
     }
 

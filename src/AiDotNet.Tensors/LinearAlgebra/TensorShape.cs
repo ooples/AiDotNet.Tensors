@@ -17,10 +17,13 @@ public readonly struct TensorShape : IEquatable<TensorShape>
     internal readonly int[] _dims;
 
     /// <summary>
-    /// Safe accessor — returns the backing array or empty if this is a default-constructed instance.
-    /// All members use this instead of _dims directly to prevent NullReferenceException on default(TensorShape).
+    /// Safe accessor — returns the backing array or empty for default-constructed instances.
     /// </summary>
-    private int[] Dims => _dims ?? Array.Empty<int>();
+    private int[] Dims
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _dims ?? Array.Empty<int>();
+    }
 
     /// <summary>
     /// Creates a new TensorShape from a dimensions array.

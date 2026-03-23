@@ -203,8 +203,14 @@ public abstract class TensorBase<T> : IDisposable
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
-    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView,
-        TensorStorage<T>? parentStorage = null)
+    protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
+        : this(data, shape, strides, storageOffset, isView, null) { }
+
+    /// <summary>
+    /// View constructor that shares an existing TensorStorage (PyTorch model).
+    /// When parentStorage is provided, it is shared via AddRef instead of creating a new one.
+    /// </summary>
+    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView, TensorStorage<T>? parentStorage)
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         if (strides == null) throw new ArgumentNullException(nameof(strides));
@@ -213,31 +219,24 @@ public abstract class TensorBase<T> : IDisposable
         if (storageOffset < 0)
             throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
 
-        // Defensive copy — prevent caller from mutating our metadata
+        // Defensive copy of metadata
         var shapeCopy = new int[shape.Length];
         var stridesCopy = new int[strides.Length];
         Array.Copy(shape, shapeCopy, shape.Length);
         Array.Copy(strides, stridesCopy, strides.Length);
 
-        // Validate shape dimensions are non-negative (same as non-view constructors)
-        for (int i = 0; i < shapeCopy.Length; i++)
-        {
-            if (shapeCopy[i] < 0)
-                throw new ArgumentException($"Shape dimension {i} must be non-negative, got {shapeCopy[i]}.");
-        }
-
         int totalElements = ComputeProduct(shapeCopy);
 
-        // Validate bounds — use long to prevent overflow for large shapes/strides
+        // Validate bounds with correct negative stride handling
         if (totalElements > 0)
         {
-            long minIndex = storageOffset;
-            long maxIndex = storageOffset;
+            int minIndex = storageOffset;
+            int maxIndex = storageOffset;
             for (int i = 0; i < shapeCopy.Length; i++)
             {
                 if (shapeCopy[i] > 1)
                 {
-                    long extent = (long)(shapeCopy[i] - 1) * stridesCopy[i];
+                    int extent = (shapeCopy[i] - 1) * stridesCopy[i];
                     if (extent >= 0)
                         maxIndex += extent;
                     else
@@ -256,7 +255,7 @@ public abstract class TensorBase<T> : IDisposable
         IsView = isView;
         _data = data;
 
-        // Share parent storage for proper reference counting across views
+        // Share parent's storage if provided, otherwise create new
         if (parentStorage != null)
         {
             _storage = parentStorage;
@@ -264,7 +263,6 @@ public abstract class TensorBase<T> : IDisposable
         }
         else
         {
-            // New storage starts at refCount=1 — no extra AddRef needed
             _storage = new TensorStorage<T>(_data);
         }
 
@@ -451,7 +449,6 @@ public abstract class TensorBase<T> : IDisposable
         var result = CreateInstance<TResult>(_shape);
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
-            // Fast path: direct span access for non-view contiguous tensors
             var src = _data.AsSpan();
             for (int i = 0; i < Length; i++)
                 result._data[i] = func(src[i]);
@@ -576,14 +573,24 @@ public abstract class TensorBase<T> : IDisposable
     private static int ComputeProduct(int[] shape)
     {
         if (shape.Length == 0) return 1; // Scalar
-        long product = 1;
+        int product = 1;
         for (int i = 0; i < shape.Length; i++)
-        {
             product *= shape[i];
-            if (product > int.MaxValue)
-                throw new ArgumentException($"Shape product overflow: shape [{string.Join(", ", shape)}] exceeds int.MaxValue.");
+        return product;
+    }
+
+    /// <summary>
+    /// Compares two shape arrays for equality without LINQ allocation.
+    /// Replaces SequenceEqual which allocates an enumerator per call.
+    /// </summary>
+    internal static bool ShapeEquals(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (a[i] != b[i]) return false;
         }
-        return (int)product;
+        return true;
     }
 
     /// <summary>

@@ -36,8 +36,8 @@ public class FlashAttentionBiasTests
 
         var result = _engine.FlashAttention(query, key, value, null, false, out var stats);
 
-        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, result.Shape);
-        Assert.Equal(new[] { Batch, Heads, SeqQ }, stats.Shape);
+        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, result.Shape.ToArray());
+        Assert.Equal(new[] { Batch, Heads, SeqQ }, stats.Shape.ToArray());
     }
 
     [Fact]
@@ -55,7 +55,7 @@ public class FlashAttentionBiasTests
         var resultWithBias = _engine.FlashAttention(query, key, value, null, false, out _, bias);
 
         // Output should differ when bias is applied
-        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, resultWithBias.Shape);
+        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, resultWithBias.Shape.ToArray());
         bool anyDifferent = false;
         int totalSize = Batch * Heads * SeqQ * HeadDim;
         for (int i = 0; i < totalSize; i++)
@@ -81,8 +81,8 @@ public class FlashAttentionBiasTests
         var bias = CreateRandomTensor([Heads, SeqQ, SeqK], 99);
         var result = _engine.FlashAttention(query, key, value, null, false, out var stats, bias);
 
-        Assert.Equal(new[] { batch, Heads, SeqQ, HeadDim }, result.Shape);
-        Assert.Equal(new[] { batch, Heads, SeqQ }, stats.Shape);
+        Assert.Equal(new[] { batch, Heads, SeqQ, HeadDim }, result.Shape.ToArray());
+        Assert.Equal(new[] { batch, Heads, SeqQ }, stats.Shape.ToArray());
     }
 
     [Fact]
@@ -173,9 +173,9 @@ public class FlashAttentionBiasTests
             scale, false, out var gradQ, out var gradK, out var gradV, bias);
 
         // Gradients should have correct shapes
-        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, gradQ.Shape);
-        Assert.Equal(new[] { Batch, Heads, SeqK, HeadDim }, gradK.Shape);
-        Assert.Equal(new[] { Batch, Heads, SeqK, HeadDim }, gradV.Shape);
+        Assert.Equal(new[] { Batch, Heads, SeqQ, HeadDim }, gradQ.Shape.ToArray());
+        Assert.Equal(new[] { Batch, Heads, SeqK, HeadDim }, gradK.Shape.ToArray());
+        Assert.Equal(new[] { Batch, Heads, SeqK, HeadDim }, gradV.Shape.ToArray());
 
         // Gradients should not be all zeros
         bool gradQNonZero = false;

@@ -15569,7 +15569,7 @@ public class CpuEngine : ITensorLevelEngine
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
 
-        // Compute exp(x - max) — broadcast subtract since maxVals has reduced axis
+        // Compute exp(x - max)
         var shifted = TensorBroadcastSubtract(tensor, maxVals);
         var expShifted = TensorExp(shifted);
 
@@ -16014,7 +16014,7 @@ public class CpuEngine : ITensorLevelEngine
         norm = TensorAdd(norm, epsilon);
 
         // Normalize: v / ||v||
-        var normalized = TensorDivide(tensor, norm);
+        var normalized = TensorBroadcastDivide(tensor, norm);
 
         // Apply scale
         return TensorMultiply(scale, normalized);
@@ -16070,7 +16070,7 @@ public class CpuEngine : ITensorLevelEngine
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
-        // Divide — broadcast since norm has reduced axis
+        // Divide
         return TensorBroadcastDivide(tensor, norm);
     }
 
@@ -16430,6 +16430,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        // Materialize non-contiguous views before BLAS operations
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
 
         // If both tensors are 3D, delegate to BatchMatMul
         if (a.Rank == 3 && b.Rank == 3)
@@ -16917,27 +16921,6 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
-    {
-        if (condition == null) throw new ArgumentNullException(nameof(condition));
-        if (x == null) throw new ArgumentNullException(nameof(x));
-        if (y == null) throw new ArgumentNullException(nameof(y));
-
-        var result = TensorAllocator.Rent<T>(x._shape);
-        var condData = condition.GetDataArray();
-        var xData = x.GetDataArray();
-        var yData = y.GetDataArray();
-        var rData = result.GetDataArray();
-
-        Parallel.For(0, x.Length, i =>
-        {
-            rData[i] = condData[i] ? xData[i] : yData[i];
-        });
-
-        return result;
-    }
-
-    /// <inheritdoc/>
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -16954,6 +16937,27 @@ public class CpuEngine : ITensorLevelEngine
             if ((bool)maskSpan[i])
                 dest[i] = value;
         }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
+    {
+        if (condition == null) throw new ArgumentNullException(nameof(condition));
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+
+        var result = TensorAllocator.Rent<T>(x._shape);
+        var condData = condition.GetDataArray();
+        var xData = x.GetDataArray();
+        var yData = y.GetDataArray();
+        var rData = result.GetDataArray();
+
+        Parallel.For(0, x.Length, i =>
+        {
+            rData[i] = condData[i] ? xData[i] : yData[i];
+        });
 
         return result;
     }

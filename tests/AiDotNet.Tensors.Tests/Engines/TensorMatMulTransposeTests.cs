@@ -24,7 +24,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorTranspose(input);
 
         // Assert
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         Assert.Equal(1f, result[0, 0], FloatTolerance);
         Assert.Equal(3f, result[0, 1], FloatTolerance);
         Assert.Equal(2f, result[1, 0], FloatTolerance);
@@ -44,7 +44,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorTranspose(input);
 
         // Assert
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         Assert.Equal(1.0, result[0, 0], DoubleTolerance);
         Assert.Equal(3.0, result[0, 1], DoubleTolerance);
         Assert.Equal(2.0, result[1, 0], DoubleTolerance);
@@ -64,7 +64,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorTranspose(input);
 
         // Assert
-        Assert.Equal(new[] { 3, 2 }, result.Shape);
+        Assert.Equal(new[] { 3, 2 }, result.Shape.ToArray());
         Assert.Equal(1f, result[0, 0], FloatTolerance);
         Assert.Equal(4f, result[0, 1], FloatTolerance);
         Assert.Equal(2f, result[1, 0], FloatTolerance);
@@ -85,7 +85,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorTranspose(input);
 
         // Assert
-        Assert.Equal(new[] { 1, 1 }, result.Shape);
+        Assert.Equal(new[] { 1, 1 }, result.Shape.ToArray());
         Assert.Equal(42f, result[0, 0], FloatTolerance);
     }
 
@@ -155,7 +155,7 @@ public class TensorMatMulTransposeTests
         // Assert
         // [1,2] * [5,6] = [1*5+2*7, 1*6+2*8] = [19, 22]
         // [3,4]   [7,8]   [3*5+4*7, 3*6+4*8]   [43, 50]
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         Assert.Equal(19f, result[0, 0], FloatTolerance);
         Assert.Equal(22f, result[0, 1], FloatTolerance);
         Assert.Equal(43f, result[1, 0], FloatTolerance);
@@ -179,7 +179,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorMatMul(a, b);
 
         // Assert
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         Assert.Equal(19.0, result[0, 0], DoubleTolerance);
         Assert.Equal(22.0, result[0, 1], DoubleTolerance);
         Assert.Equal(43.0, result[1, 0], DoubleTolerance);
@@ -204,7 +204,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorMatMul(a, b);
 
         // Assert - result should be 2x2
-        Assert.Equal(new[] { 2, 2 }, result.Shape);
+        Assert.Equal(new[] { 2, 2 }, result.Shape.ToArray());
         // [1,2,3] * [7,8]   = [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
         // [4,5,6]   [9,10]    [4*7+5*9+6*11, 4*8+5*10+6*12]   [139, 154]
         //           [11,12]
@@ -229,7 +229,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorMatMul(a, b);
 
         // Assert
-        Assert.Equal(new[] { 1, 1 }, result.Shape);
+        Assert.Equal(new[] { 1, 1 }, result.Shape.ToArray());
         Assert.Equal(12f, result[0, 0], FloatTolerance);
     }
 
@@ -248,7 +248,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorMatMul(a, b);
 
         // Assert - should be 1x1 with dot product
-        Assert.Equal(new[] { 1, 1 }, result.Shape);
+        Assert.Equal(new[] { 1, 1 }, result.Shape.ToArray());
         Assert.Equal(32f, result[0, 0], FloatTolerance); // 1*4 + 2*5 + 3*6 = 32
     }
 
@@ -267,7 +267,7 @@ public class TensorMatMulTransposeTests
         var result = engine.TensorMatMul(a, b);
 
         // Assert - should be 3x2 outer product
-        Assert.Equal(new[] { 3, 2 }, result.Shape);
+        Assert.Equal(new[] { 3, 2 }, result.Shape.ToArray());
         Assert.Equal(4f, result[0, 0], FloatTolerance);  // 1*4
         Assert.Equal(5f, result[0, 1], FloatTolerance);  // 1*5
         Assert.Equal(8f, result[1, 0], FloatTolerance);  // 2*4

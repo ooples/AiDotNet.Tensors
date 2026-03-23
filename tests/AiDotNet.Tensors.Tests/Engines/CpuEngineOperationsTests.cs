@@ -127,7 +127,7 @@ public class CpuEngineOperationsTests
 
         var result = _engine.TensorFloor(tensor);
 
-        Assert.Equal(new[] { 2, 3 }, result.Shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
     }
 
     [Fact]
@@ -287,7 +287,7 @@ public class CpuEngineOperationsTests
 
         var result = _engine.TensorOuter(a, b);
 
-        Assert.Equal(new[] { 2, 3 }, result.Shape);
+        Assert.Equal(new[] { 2, 3 }, result.Shape.ToArray());
         Assert.Equal(10f, result[0, 0], 5);  // 1*10
         Assert.Equal(20f, result[0, 1], 5);  // 1*20
         Assert.Equal(30f, result[0, 2], 5);  // 1*30

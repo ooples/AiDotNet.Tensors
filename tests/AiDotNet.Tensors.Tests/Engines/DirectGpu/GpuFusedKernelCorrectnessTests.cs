@@ -576,7 +576,7 @@ public class GpuFusedKernelCorrectnessTests
     {
         SkipIfNoGpu();
         var result = _gpu!.TensorRandomUniform<float>(new[] { 4, 8 });
-        Assert.Equal(new[] { 4, 8 }, result.Shape);
+        Assert.Equal(new[] { 4, 8 }, result.Shape.ToArray());
         Assert.Equal(32, result.Length);
         // Values should be in [0, 1)
         var data = result.GetDataArray();

@@ -600,7 +600,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrAllocateBiasBuffer<T>(IDirectGpuBackend backend, Tensor<T> attentionBias,
         int batch, int heads, int seqQ, int seqK, out int biasBatchStride)
     {
-        var biasShape = attentionBias._shape;
+        var biasShape = attentionBias.Shape._dims;
 
         if (biasShape.Length == 4)
         {
