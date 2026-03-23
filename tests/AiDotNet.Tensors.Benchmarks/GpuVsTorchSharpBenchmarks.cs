@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// Head-to-head GPU benchmarks: AiDotNet fused GPU kernels vs TorchSharp GPU.
 /// Measures throughput and latency for critical neural network operations.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class GpuVsTorchSharpBenchmarks
 {
@@ -131,5 +131,6 @@ public class GpuVsTorchSharpBenchmarks
         _torchSoftmax?.Dispose();
         _torchMatA?.Dispose();
         _torchMatB?.Dispose();
+        (_gpu as IDisposable)?.Dispose();
     }
 }

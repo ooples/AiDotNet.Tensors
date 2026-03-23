@@ -248,7 +248,7 @@ public sealed partial class WebGpuBackend
     public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
         int aSize, int bSize, int bOffset, int bStride)
     {
-        if (aSize <= 0) return;
+        if (aSize <= 0) { Scale(result, result, 0f, Math.Max(1, result.Size)); return; }
         if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
         if (bSize < 0) throw new ArgumentOutOfRangeException(nameof(bSize), "bSize must be non-negative.");
 

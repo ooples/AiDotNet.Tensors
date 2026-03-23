@@ -122,4 +122,10 @@ public class GpuFusedKernelBenchmarks
 
     [Benchmark(Description = "TensorEye 64 (CPU)")] public Tensor<float> Eye_CPU() => _cpu.TensorEye<float>(64);
     [Benchmark(Description = "TensorEye 64 (GPU)")] public Tensor<float>? Eye_GPU() => _gpu?.TensorEye<float>(64);
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        (_gpu as IDisposable)?.Dispose();
+    }
 }

@@ -266,7 +266,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // CL_BUFFER_CREATE_TYPE_REGION = 0x1220
             var region = new BufferRegion { Origin = (UIntPtr)byteOffset, Size = (UIntPtr)byteSize };
             int err;
-            IntPtr subBuf = clCreateSubBuffer(buffer, 0 /* CL_MEM_READ_WRITE */, 0x1220, ref region, out err);
+            IntPtr subBuf = clCreateSubBuffer(buffer, (uint)CL_MEM_READ_WRITE, 0x1220, ref region, out err);
             return err == 0 ? subBuf : IntPtr.Zero;
         }
 

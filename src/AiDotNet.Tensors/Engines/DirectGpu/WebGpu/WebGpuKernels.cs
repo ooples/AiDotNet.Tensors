@@ -887,6 +887,14 @@ fn equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
+fn not_equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        C[idx] = select(0.0, 1.0, abs(A[idx] - B[idx]) >= 1e-7);
+    }
+}
+
+@compute @workgroup_size(256)
 fn where_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {

@@ -1640,17 +1640,15 @@ void sgemm(
         // Query device max work group size to determine optimal tile size
         ulong maxWorkGroupSize = _context.MaxWorkGroupSize;
 
-        // With WPT=8 register blocking, workgroup = (TS/8)^2 threads
-        // TS=64:  WG = 8x8  = 64 threads (optimal for wave32/RDNA)
-        // TS=128: WG = 16x16 = 256 threads (max occupancy)
-        // TS=32:  WG = 4x4  = 16 threads (fallback)
-        // LDS usage: 2 * TS * (TS+1) * 4 bytes
-        //   TS=64:  ~33KB (fits 64KB LDS)
-        //   TS=128: ~132KB (too large for 64KB LDS)
-        if (maxWorkGroupSize >= 64)
-            _tileSize = 64;  // 8x8 = 64 threads, 33KB LDS — optimal for RDNA1
+        // With WPT=4 register blocking, workgroup = (TS/4)^2 threads
+        // TS=64:  WG = 16x16 = 256 threads (max occupancy, 33KB LDS)
+        // TS=32:  WG = 8x8   = 64 threads (8.4KB LDS, multiple wavefronts)
+        if (maxWorkGroupSize >= 256)
+            _tileSize = 64;  // 16x16 = 256 threads, 33KB LDS
+        else if (maxWorkGroupSize >= 64)
+            _tileSize = 32;  // 8x8 = 64 threads, 8.4KB LDS
         else
-            _tileSize = 32;  // 4x4 = 16 threads (fallback)
+            _tileSize = 16;  // 4x4 = 16 threads (fallback)
 
         // Generate kernel source with appropriate tile size
         string kernelSource = GemmKernelSourceTemplate.Replace("__TILE_SIZE_PLACEHOLDER__", _tileSize.ToString());

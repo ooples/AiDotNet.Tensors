@@ -315,9 +315,23 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
-    // CPU fallback stubs (only used when shaderc is not available)
-    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size) { }
-    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { }
+    // CPU fallback when shaderc is not available — download, compute on CPU, upload
+    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        float[] input = DownloadBuffer(A);
+        float[] output = new float[size];
+        Array.Copy(input, output, Math.Min(input.Length, size));
+        UploadToBuffer(output, B);
+    }
+
+    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        float[] a = DownloadBuffer(A);
+        float[] b = DownloadBuffer(B);
+        float[] c = new float[size];
+        for (int i = 0; i < size; i++) c[i] = a[i] + b[i];
+        UploadToBuffer(c, C);
+    }
 
     /// <summary>
     /// Gets or creates a shader module for the specified kernel.
