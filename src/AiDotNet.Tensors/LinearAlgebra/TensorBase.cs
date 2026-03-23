@@ -362,7 +362,7 @@ public abstract class TensorBase<T>
     /// For contiguous tensors, this equals _strides. For views, these are the OUTPUT strides.
     /// </summary>
     private int[]? _rowMajorStridesCache;
-    private int[] RowMajorStrides => _rowMajorStridesCache ??= ComputeRowMajorStrides(Shape);
+    protected int[] RowMajorStrides => _rowMajorStridesCache ??= ComputeRowMajorStrides(Shape);
 
     /// <summary>
     /// Converts a logical flat index (row-major) to a storage index using strides and offset.
@@ -589,11 +589,11 @@ public abstract class TensorBase<T>
     {
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        if (IsContiguous && _storageOffset == 0)
+        if (IsContiguous)
         {
-            return _data[flatIndex];
+            return _data[flatIndex + _storageOffset];
         }
-        // For views: convert flat index to multi-dim indices, then use strides
+        // For non-contiguous views: convert flat index to multi-dim indices, then use strides
         return _data[FlatIndexToStorageIndex(flatIndex)];
     }
 
@@ -611,9 +611,9 @@ public abstract class TensorBase<T>
     {
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        if (IsContiguous && _storageOffset == 0)
+        if (IsContiguous)
         {
-            _data[flatIndex] = value;
+            _data[flatIndex + _storageOffset] = value;
         }
         else
         {

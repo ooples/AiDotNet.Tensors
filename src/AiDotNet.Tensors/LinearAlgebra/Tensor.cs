@@ -131,9 +131,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else
         {
-            // Non-contiguous — use row-major strides to decompose flat index into multi-dim
-            // Pre-compute row-major strides for the output (avoids inner loop per element)
-            var rowMajorStrides = ComputeRowMajorStrides(Shape);
+            // Non-contiguous — use cached row-major strides to decompose flat index
+            var rowMajorStrides = RowMajorStrides;
 
             for (int i = 0; i < Length; i++)
             {
