@@ -168,6 +168,153 @@ __kernel void argmax_axis(
     }
     output[outerIdx] = maxIdx;
 }
+
+// ============================================================================
+// Extended reductions: mean, variance, std, product, norm, logsumexp, cumsum
+// ============================================================================
+
+__kernel void mean_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    float sum = 0.0f;
+    int base_idx = idx * reduceSize;
+    for (int j = 0; j < reduceSize; j++) sum += input[base_idx + j];
+    output[idx] = sum / (float)reduceSize;
+}
+
+__kernel void variance_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    int base_idx = idx * reduceSize;
+    float sum = 0.0f;
+    for (int j = 0; j < reduceSize; j++) sum += input[base_idx + j];
+    float mean = sum / (float)reduceSize;
+    float var_sum = 0.0f;
+    for (int j = 0; j < reduceSize; j++) { float d = input[base_idx + j] - mean; var_sum += d * d; }
+    output[idx] = var_sum / (float)reduceSize;
+}
+
+__kernel void std_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    int base_idx = idx * reduceSize;
+    float sum = 0.0f;
+    for (int j = 0; j < reduceSize; j++) sum += input[base_idx + j];
+    float mean = sum / (float)reduceSize;
+    float var_sum = 0.0f;
+    for (int j = 0; j < reduceSize; j++) { float d = input[base_idx + j] - mean; var_sum += d * d; }
+    output[idx] = sqrt(var_sum / (float)reduceSize);
+}
+
+__kernel void product_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    float prod = 1.0f;
+    int base_idx = idx * reduceSize;
+    for (int j = 0; j < reduceSize; j++) prod *= input[base_idx + j];
+    output[idx] = prod;
+}
+
+__kernel void norm_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    float sum_sq = 0.0f;
+    int base_idx = idx * reduceSize;
+    for (int j = 0; j < reduceSize; j++) { float v = input[base_idx + j]; sum_sq += v * v; }
+    output[idx] = sqrt(sum_sq);
+}
+
+__kernel void logsumexp_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    int base_idx = idx * reduceSize;
+    float max_val = -INFINITY;
+    for (int j = 0; j < reduceSize; j++) max_val = fmax(max_val, input[base_idx + j]);
+    float sum_exp = 0.0f;
+    for (int j = 0; j < reduceSize; j++) sum_exp += exp(input[base_idx + j] - max_val);
+    output[idx] = max_val + log(sum_exp);
+}
+
+__kernel void cumsum_axis(
+    __global const float* input, __global float* output,
+    int outerSize, int innerSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    int base_idx = idx * innerSize;
+    float running = 0.0f;
+    for (int j = 0; j < innerSize; j++) { running += input[base_idx + j]; output[base_idx + j] = running; }
+}
+
+__kernel void scalar_minus_tensor(
+    __global const float* input, __global float* output,
+    float scalar, int size)
+{
+    int idx = get_global_id(0);
+    if (idx >= size) return;
+    output[idx] = scalar - input[idx];
+}
+
+__kernel void normalize_l2(
+    __global const float* input, __global float* output,
+    int outerSize, int innerSize)
+{
+    int row = get_global_id(0);
+    if (row >= outerSize) return;
+    int base_idx = row * innerSize;
+    float sum_sq = 0.0f;
+    for (int j = 0; j < innerSize; j++) { float v = input[base_idx + j]; sum_sq += v * v; }
+    float inv_norm = 1.0f / (sqrt(sum_sq) + 1e-12f);
+    for (int j = 0; j < innerSize; j++) output[base_idx + j] = input[base_idx + j] * inv_norm;
+}
+
+__kernel void reduce_sum_backward(
+    __global const float* grad_output, __global float* grad_input,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize * reduceSize) return;
+    grad_input[idx] = grad_output[idx / reduceSize];
+}
+
+__kernel void reduce_mean_backward(
+    __global const float* grad_output, __global float* grad_input,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize * reduceSize) return;
+    grad_input[idx] = grad_output[idx / reduceSize] / (float)reduceSize;
+}
+
+__kernel void reduce_sum_of_squares(
+    __global const float* input, __global float* output,
+    int outerSize, int reduceSize)
+{
+    int idx = get_global_id(0);
+    if (idx >= outerSize) return;
+    int base_idx = idx * reduceSize;
+    float sum_sq = 0.0f;
+    for (int j = 0; j < reduceSize; j++) { float v = input[base_idx + j]; sum_sq += v * v; }
+    output[idx] = sum_sq;
+}
 ";
         }
 
@@ -179,7 +326,12 @@ __kernel void argmax_axis(
             return new string[]
             {
                 "reduce_sum", "reduce_max", "reduce_min",
-                "sum_axis", "max_axis", "argmax_axis"
+                "sum_axis", "max_axis", "argmax_axis",
+                "mean_axis", "variance_axis", "std_axis",
+                "product_axis", "norm_axis", "logsumexp_axis",
+                "cumsum_axis", "scalar_minus_tensor", "normalize_l2",
+                "reduce_sum_backward", "reduce_mean_backward",
+                "reduce_sum_of_squares"
             };
         }
     }

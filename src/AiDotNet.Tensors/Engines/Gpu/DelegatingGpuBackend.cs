@@ -134,6 +134,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Add(A, B, C, size);
+    public virtual void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddRelu(A, B, C, size);
+    public virtual void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddSigmoid(A, B, C, size);
+    public virtual void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.AddGelu(A, B, C, size);
 
     /// <inheritdoc/>
     public virtual void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Inner.Subtract(A, B, C, size);
@@ -1581,4 +1584,36 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     }
 
     #endregion
+
+    // Fused kernel delegation
+    public virtual void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => Inner.ReduceMean(i, o, sz);
+    public virtual void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => Inner.ClipKernel(i, o, mn, mx, sz);
+    public virtual void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => Inner.PowScalar(i, o, ex, sz);
+    public virtual void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) => Inner.FracKernel(i, o, sz);
+    public virtual void EyeKernel(IGpuBuffer o, int n) => Inner.EyeKernel(o, n);
+    public virtual void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => Inner.OneHotKernel(idx, o, bs, nc);
+    public virtual void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) => Inner.MaskedFillKernel(i, m, o, fv, sz);
+    public virtual void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.EqualsKernel(a, b, o, sz);
+    public virtual void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.NotEqualsKernel(a, b, o, sz);
+    public virtual void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => Inner.OuterProduct(a, b, o, M, N);
+    public virtual void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => Inner.BatchDotProduct(a, b, o, bs, dim);
+    public virtual void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.GluForward(i, o, os, hd);
+    public virtual void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.GeGluForward(i, o, os, hd);
+    public virtual void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.ReGluForward(i, o, os, hd);
+    public virtual void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => Inner.SwiGluForward(i, o, os, hd);
+    public virtual void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) => Inner.BceLoss(p, t, l, sz);
+
+
+    public virtual void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => Inner.AddScalar(i, o, sc, sz);
+    public virtual void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => Inner.SubScalar(i, o, sc, sz);
+    public virtual void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastAddLast(a, b, o, os, isz);
+    public virtual void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastSubLast(a, b, o, os, isz);
+    public virtual void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastMulLast(a, b, o, os, isz);
+    public virtual void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => Inner.BroadcastDivLast(a, b, o, os, isz);
+
+
+    public virtual void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.DotProduct(a, b, o, sz);
+    public virtual void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int aSize, int bSize, int bOffset, int bStride) => Inner.StridedDotProduct(a, b, result, aSize, bSize, bOffset, bStride);
+
+    public virtual void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => Inner.BatchedDotProduct(a, b, o, bs, dim);
 }

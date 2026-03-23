@@ -50,7 +50,7 @@ public class TorchSharpComparisonBenchmarks
     private DirectGpuTensorEngine? _gpuEngine;
     private IDirectGpuBackend? _gpuBackend;
 
-    private torch.Device _torchDevice = torch.CUDA;
+    private torch.Device _torchDevice = torch.CPU;
     private bool _torchUsesCuda;
     private readonly Consumer _consumer = new();
 
@@ -71,14 +71,24 @@ public class TorchSharpComparisonBenchmarks
         }
 
         torch.set_grad_enabled(false);
-        _torchUsesCuda = torch.cuda.is_available();
-        if (!_torchUsesCuda)
+        try
         {
-            throw new InvalidOperationException("TorchSharp CUDA is not available. Run CPU comparison benchmarks instead.");
+            _torchUsesCuda = torch.cuda.is_available();
         }
-
-        _torchDevice = torch.CUDA;
-        Console.WriteLine("TorchSharp device: CUDA");
+        catch
+        {
+            _torchUsesCuda = false;
+        }
+        if (_torchUsesCuda)
+        {
+            _torchDevice = torch.CUDA;
+            Console.WriteLine("TorchSharp device: CUDA");
+        }
+        else
+        {
+            _torchDevice = torch.CPU;
+            Console.WriteLine("TorchSharp device: CPU (CUDA not available — comparing AiDotNet GPU vs TorchSharp CPU)");
+        }
 
         foreach (var size in MatrixSizes)
         {

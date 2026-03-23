@@ -317,6 +317,26 @@ public interface IEngine
     T DotProduct<T>(Vector<T> a, Vector<T> b);
 
     /// <summary>
+    /// Computes the dot product of vector a with a strided window of vector b.
+    /// </summary>
+    /// <typeparam name="T">The numeric type.</typeparam>
+    /// <param name="a">The first vector (contiguous).</param>
+    /// <param name="b">The source vector to read from with stride.</param>
+    /// <param name="bOffset">Starting index in b.</param>
+    /// <param name="bStride">Step between elements in b (e.g., -1 for reverse).</param>
+    /// <returns>The dot product sum(a[i] * b[bOffset + i * bStride]).</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This is like a normal dot product, but reads elements from b
+    /// at non-contiguous positions. A stride of -1 reads backwards (useful for AR/MA models).
+    /// A stride of 2 reads every other element. The length is determined by a.Length.</para>
+    /// <para><b>Out-of-range semantics:</b> If bOffset + i * bStride falls outside [0, b.Length),
+    /// that element contributes 0 to the sum (boundary clamping). This is intentional for
+    /// time series AR/MA models where the lag window may extend before the start of the series.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown when a or b is null.</exception>
+    T DotProduct<T>(Vector<T> a, Vector<T> b, int bOffset, int bStride);
+
+    /// <summary>
     /// Computes the mean (average) of all elements in the vector.
     /// </summary>
     /// <typeparam name="T">The numeric type of the vector.</typeparam>

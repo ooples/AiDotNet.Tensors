@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- Copy ROCm native libraries to output directory based on runtime -->
+
+  <!-- Windows: rocBLAS + hipBLAS + HIP runtime -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or ('$(RuntimeIdentifier)' == '' And '$(OS)' == 'Windows_NT')">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\rocblas.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\rocblas.dll')">
+      <Link>rocblas.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hipblas.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\hipblas.dll')">
+      <Link>hipblas.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64_6.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\amdhip64_6.dll')">
+      <Link>amdhip64_6.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\MIOpen.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\MIOpen.dll')">
+      <Link>MIOpen.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+</Project>

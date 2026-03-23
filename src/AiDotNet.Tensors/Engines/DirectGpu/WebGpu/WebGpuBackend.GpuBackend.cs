@@ -82,12 +82,10 @@ public sealed partial class WebGpuBackend
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         EnsureInitialized();
-        // WebGPU buffers are always float32-addressed. A true byte-addressed buffer
-        // (e.g. for FP16 / mixed-precision) would require a WebGpuBuffer variant that
-        // tracks bytes and element size, which is not yet implemented.
-        throw new NotSupportedException(
-            "Byte-addressed GPU buffers (e.g., for FP16/mixed-precision) are not supported by the WebGpuBackend. " +
-            "Use float-based buffers or a backend that supports byte-addressed buffers.");
+        // WebGPU buffers are float32-addressed. Allocate enough floats to hold the byte count.
+        // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
+        int floatCount = (size + sizeof(float) - 1) / sizeof(float);
+        return new WebGpuBuffer(floatCount);
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)
@@ -221,12 +219,64 @@ public sealed partial class WebGpuBackend
     #region Element-wise Operations
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => AddAsync(A, B, C, size).GetAwaiter().GetResult();
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => SubAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Multiply(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MulAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Divide(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => DivAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Min(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MinimumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MaximumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => ScaleAsync(A, B, scalar, size).GetAwaiter().GetResult();
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    {
+        if (size <= 0)
+        {
+            Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
+        // Compose: temp = A * B, result = sum(temp)
+        using var temp = AllocateBuffer(size);
+        Multiply(a, b, temp, size);
+        SumAxis(temp, result, 1, size);
+    }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+    {
+        if (aSize <= 0) { Scale(result, result, 0f, Math.Max(1, result.Size)); return; }
+        if (aSize > a.Size) throw new ArgumentOutOfRangeException(nameof(aSize), $"aSize ({aSize}) exceeds buffer A length ({a.Size}).");
+        if (bSize < 0) throw new ArgumentOutOfRangeException(nameof(bSize), "bSize must be non-negative.");
+
+        var bData = DownloadBuffer(b);
+        int bLen = bData.Length;
+        var window = new float[aSize];
+        for (int i = 0; i < aSize; i++)
+        {
+            int bIdx = bOffset + i * bStride;
+            window[i] = (bIdx >= 0 && bIdx < bLen) ? bData[bIdx] : 0f;
+        }
+        using var windowBuf = AllocateBuffer(window);
+        DotProduct(a, windowBuf, result, aSize);
+    }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+    {
+        if (batchSize <= 0 || vecSize <= 0) return;
+        long totalElements = (long)batchSize * vecSize;
+        if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
+        if (totalElements > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer B length ({b.Size}).");
+        if (totalElements > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(batchSize), "batchSize*vecSize exceeds int.MaxValue.");
+
+        using var temp = AllocateBuffer((int)totalElements);
+        Multiply(a, b, temp, (int)totalElements);
+        SumAxis(temp, result, batchSize, vecSize);
+    }
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => PowerAsync(A, B, exponent, size).GetAwaiter().GetResult();
     public void Abs(IGpuBuffer A, IGpuBuffer B, int size) => AbsAsync(A, B, size).GetAwaiter().GetResult();
     public void Exp(IGpuBuffer A, IGpuBuffer B, int size) => ExpAsync(A, B, size).GetAwaiter().GetResult();

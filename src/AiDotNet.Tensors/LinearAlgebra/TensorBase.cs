@@ -130,7 +130,12 @@ public abstract class TensorBase<T>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
         Shape = shape;
-        _data = new Vector<T>(data);
+        // When data is already a T[], use zero-copy Memory<T> path to preserve identity
+        // (critical for GPU deferred materialization — the array reference must match)
+        if (data is T[] array)
+            _data = Vector<T>.WrapMemory(array);
+        else
+            _data = new Vector<T>(data);
         if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
         {
             throw new ArgumentException("The number of values does not match the specified shape.");

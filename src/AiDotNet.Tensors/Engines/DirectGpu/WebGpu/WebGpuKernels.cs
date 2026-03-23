@@ -887,6 +887,14 @@ fn equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
+fn not_equal_to(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        C[idx] = select(0.0, 1.0, abs(A[idx] - B[idx]) >= 1e-7);
+    }
+}
+
+@compute @workgroup_size(256)
 fn where_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
@@ -7554,6 +7562,82 @@ fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+    public const string DotProductSource = @"
+// Dot product with workgroup reduction
+// Computes partial sums per workgroup, then a second dispatch reduces them.
+@group(0) @binding(0) var<storage, read> dp_a: array<f32>;
+@group(0) @binding(1) var<storage, read> dp_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dp_partials: array<f32>;
+
+struct DpParams {
+    size: u32,
+}
+@group(0) @binding(3) var<uniform> dp_params: DpParams;
+
+var<workgroup> dp_shared: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn dot_product(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>,
+               @builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>) {
+    var sum: f32 = 0.0;
+    let grid_size = nwg.x * 256u;
+    var i = gid.x;
+    while (i < dp_params.size) {
+        sum = sum + dp_a[i] * dp_b[i];
+        i = i + grid_size;
+    }
+    dp_shared[lid.x] = sum;
+    workgroupBarrier();
+
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid.x < stride) {
+            dp_shared[lid.x] = dp_shared[lid.x] + dp_shared[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid.x == 0u) {
+        dp_partials[wid.x] = dp_shared[0];
+    }
+}
+
+// Final reduction of partial sums
+@group(0) @binding(0) var<storage, read> rp_partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> rp_result: array<f32>;
+
+struct RpParams {
+    count: u32,
+}
+@group(0) @binding(2) var<uniform> rp_params: RpParams;
+
+var<workgroup> rp_shared: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
+    var sum: f32 = 0.0;
+    var i = lid.x;
+    while (i < rp_params.count) {
+        sum = sum + rp_partials[i];
+        i = i + 256u;
+    }
+    rp_shared[lid.x] = sum;
+    workgroupBarrier();
+
+    for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid.x < stride) {
+            rp_shared[lid.x] = rp_shared[lid.x] + rp_shared[lid.x + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid.x == 0u) {
+        rp_result[0] = rp_shared[0];
+    }
+}
+";
+
     public static string GetCombinedSource()
     {
         return CommonSource + ElementWiseSource + ScalarOpsSource + UnaryMathSource +
@@ -7598,7 +7682,361 @@ fn add_scaled(@builtin(global_invocation_id) gid: vec3<u32>) {
                LayerNormBackwardFullSource + AdaptiveAvgPool2DSource +
                AttentionBackwardSource + GroupedQueryAttentionSource +
                Fp16ConvertSource + LstmCellBackwardSource + GruCellBackwardSource +
-               LerpFusedSource + AddScaledSource;
+               LerpFusedSource + AddScaledSource +
+               GatedActivationSource + SoftmaxVariantsSource +
+               ShapeOpsSource + ReductionExtSource;
     }
+
+    // ============================================================================
+    // Gated Activation Kernels (GLU, GeGLU, ReGLU, SwiGLU)
+    // ============================================================================
+
+    public const string GatedActivationSource = @"
+@group(0) @binding(0) var<storage, read> ga_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ga_output: array<f32>;
+struct GaParams { outer_size: u32, half_dim: u32 }
+@group(0) @binding(2) var<uniform> ga_params: GaParams;
+
+@compute @workgroup_size(256)
+fn glu_forward(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = ga_params.outer_size * ga_params.half_dim;
+    if (idx >= total) { return; }
+    let outer = idx / ga_params.half_dim; let d = idx % ga_params.half_dim;
+    let full_dim = ga_params.half_dim * 2u;
+    let value = ga_input[outer * full_dim + d];
+    let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
+    ga_output[idx] = value * (1.0 / (1.0 + exp(-gate)));
+}
+
+@compute @workgroup_size(256)
+fn geglu_forward(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = ga_params.outer_size * ga_params.half_dim;
+    if (idx >= total) { return; }
+    let outer = idx / ga_params.half_dim; let d = idx % ga_params.half_dim;
+    let full_dim = ga_params.half_dim * 2u;
+    let value = ga_input[outer * full_dim + d];
+    let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
+    let x3 = value * value * value;
+    let gelu = 0.5 * value * (1.0 + tanh(0.7978845608 * (value + 0.044715 * x3)));
+    ga_output[idx] = gelu * gate;
+}
+
+@compute @workgroup_size(256)
+fn reglu_forward(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = ga_params.outer_size * ga_params.half_dim;
+    if (idx >= total) { return; }
+    let outer = idx / ga_params.half_dim; let d = idx % ga_params.half_dim;
+    let full_dim = ga_params.half_dim * 2u;
+    let value = ga_input[outer * full_dim + d];
+    let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
+    ga_output[idx] = max(value, 0.0) * gate;
+}
+
+@compute @workgroup_size(256)
+fn swiglu_forward(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = ga_params.outer_size * ga_params.half_dim;
+    if (idx >= total) { return; }
+    let outer = idx / ga_params.half_dim; let d = idx % ga_params.half_dim;
+    let full_dim = ga_params.half_dim * 2u;
+    let value = ga_input[outer * full_dim + d];
+    let gate = ga_input[outer * full_dim + ga_params.half_dim + d];
+    let sig = 1.0 / (1.0 + exp(-value));
+    ga_output[idx] = value * sig * gate;
+}
+
+@compute @workgroup_size(256)
+fn relu_derivative(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&ga_input)) { return; }
+    ga_output[idx] = select(0.0, 1.0, ga_input[idx] > 0.0);
+}
+
+@compute @workgroup_size(256)
+fn sigmoid_derivative(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&ga_input)) { return; }
+    let s = ga_input[idx];
+    ga_output[idx] = s * (1.0 - s);
+}
+
+@compute @workgroup_size(256)
+fn tanh_derivative(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&ga_input)) { return; }
+    let t = ga_input[idx];
+    ga_output[idx] = 1.0 - t * t;
+}
+";
+
+    // ============================================================================
+    // Softmax Variant Kernels
+    // ============================================================================
+
+    public const string SoftmaxVariantsSource = @"
+@group(0) @binding(0) var<storage, read> sv_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> sv_output: array<f32>;
+struct SvParams { outer_size: u32, inner_size: u32 }
+@group(0) @binding(2) var<uniform> sv_params: SvParams;
+
+@compute @workgroup_size(256)
+fn log_softmax(@builtin(global_invocation_id) gid: vec3u) {
+    let row = gid.x;
+    if (row >= sv_params.outer_size) { return; }
+    let base = row * sv_params.inner_size;
+    var max_val: f32 = -1e38;
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { max_val = max(max_val, sv_input[base + j]); }
+    var sum_exp: f32 = 0.0;
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sum_exp += exp(sv_input[base + j] - max_val); }
+    let log_sum = log(sum_exp);
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] = sv_input[base + j] - max_val - log_sum; }
+}
+
+@compute @workgroup_size(256)
+fn taylor_softmax(@builtin(global_invocation_id) gid: vec3u) {
+    let row = gid.x;
+    if (row >= sv_params.outer_size) { return; }
+    let base = row * sv_params.inner_size;
+    var sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) {
+        let x = sv_input[base + j]; let t = max(1.0 + x + 0.5 * x * x, 1e-10);
+        sv_output[base + j] = t; sum += t;
+    }
+    let inv = 1.0 / sum;
+    for (var j: u32 = 0u; j < sv_params.inner_size; j = j + 1u) { sv_output[base + j] *= inv; }
+}
+";
+
+    // ============================================================================
+    // Shape/Layout Operations
+    // ============================================================================
+
+    public const string ShapeOpsSource = @"
+@group(0) @binding(0) var<storage, read> shape_a: array<f32>;
+@group(0) @binding(1) var<storage, read_write> shape_out: array<f32>;
+struct ShapeParams { outer_size: u32, inner_size_a: u32, inner_size_b: u32, extra: u32 }
+@group(0) @binding(2) var<uniform> shape_params: ShapeParams;
+
+@compute @workgroup_size(256)
+fn eye_kernel(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x; let n = shape_params.outer_size;
+    if (idx >= n * n) { return; }
+    shape_out[idx] = select(0.0, 1.0, (idx / n) == (idx % n));
+}
+
+@compute @workgroup_size(256)
+fn linspace_kernel(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= shape_params.extra) { return; }
+    let start = bitcast<f32>(shape_params.outer_size);
+    let step = bitcast<f32>(shape_params.inner_size_a);
+    shape_out[idx] = start + step * f32(idx);
+}
+
+@compute @workgroup_size(256)
+fn one_hot_kernel(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let batch = shape_params.outer_size; let classes = shape_params.inner_size_a;
+    if (idx >= batch * classes) { return; }
+    let b = idx / classes; let c = idx % classes;
+    shape_out[idx] = select(0.0, 1.0, u32(shape_a[b]) == c);
+}
+
+@compute @workgroup_size(256)
+fn diag_kernel(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x; let n = shape_params.outer_size;
+    if (idx >= n * n) { return; }
+    shape_out[idx] = select(0.0, shape_a[idx / n], (idx / n) == (idx % n));
+}
+";
+
+    // ============================================================================
+    // Extended Reduction Operations
+    // ============================================================================
+
+    public const string ReductionExtSource = @"
+@group(0) @binding(0) var<storage, read> rext_input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> rext_output: array<f32>;
+struct RextParams { outer_size: u32, reduce_size: u32 }
+@group(0) @binding(2) var<uniform> rext_params: RextParams;
+
+@compute @workgroup_size(256)
+fn mean_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
+    rext_output[idx] = sum / f32(rext_params.reduce_size);
+}
+
+@compute @workgroup_size(256)
+fn variance_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
+    let mean = sum / f32(rext_params.reduce_size);
+    var var_sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    rext_output[idx] = var_sum / f32(rext_params.reduce_size);
+}
+
+@compute @workgroup_size(256)
+fn std_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum += rext_input[base + j]; }
+    let mean = sum / f32(rext_params.reduce_size);
+    var var_sum: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let d = rext_input[base + j] - mean; var_sum += d * d; }
+    rext_output[idx] = sqrt(var_sum / f32(rext_params.reduce_size));
+}
+
+@compute @workgroup_size(256)
+fn norm_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var sum_sq: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { let v = rext_input[base + j]; sum_sq += v * v; }
+    rext_output[idx] = sqrt(sum_sq);
+}
+
+@compute @workgroup_size(256)
+fn logsumexp_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var max_val: f32 = -1e38;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { max_val = max(max_val, rext_input[base + j]); }
+    var sum_exp: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { sum_exp += exp(rext_input[base + j] - max_val); }
+    rext_output[idx] = max_val + log(sum_exp);
+}
+
+@compute @workgroup_size(256)
+fn cumsum_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var running: f32 = 0.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { running += rext_input[base + j]; rext_output[base + j] = running; }
+}
+
+@compute @workgroup_size(256)
+fn product_axis(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= rext_params.outer_size) { return; }
+    let base = idx * rext_params.reduce_size;
+    var prod: f32 = 1.0;
+    for (var j: u32 = 0u; j < rext_params.reduce_size; j = j + 1u) { prod *= rext_input[base + j]; }
+    rext_output[idx] = prod;
+}
+";
+    // ============================================================================
+    // Extended Broadcast Operations (3-buffer: A, B -> C)
+    // ============================================================================
+
+    public const string BroadcastExtSource = @"
+@group(0) @binding(0) var<storage, read> bx_a: array<f32>;
+@group(0) @binding(1) var<storage, read> bx_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> bx_c: array<f32>;
+struct BxParams { outer_size: u32, inner_size: u32 }
+@group(0) @binding(3) var<uniform> bx_params: BxParams;
+
+@compute @workgroup_size(256)
+fn broadcast_add_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] + bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_sub_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] - bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_mul_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] * bx_b[idx % bx_params.inner_size];
+}
+
+@compute @workgroup_size(256)
+fn broadcast_div_last(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = bx_params.outer_size * bx_params.inner_size;
+    if (idx >= total) { return; }
+    bx_c[idx] = bx_a[idx] / (bx_b[idx % bx_params.inner_size] + 1e-12);
+}
+";
+
+    // ============================================================================
+    // OuterProduct, BatchDotProduct, MaskedFill (3-buffer ops)
+    // ============================================================================
+
+    public const string OuterProductSource = @"
+@group(0) @binding(0) var<storage, read> op_a: array<f32>;
+@group(0) @binding(1) var<storage, read> op_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> op_c: array<f32>;
+struct OpParams { M: u32, N: u32 }
+@group(0) @binding(3) var<uniform> op_params: OpParams;
+
+@compute @workgroup_size(256)
+fn outer_product(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    let total = op_params.M * op_params.N;
+    if (idx >= total) { return; }
+    op_c[idx] = op_a[idx / op_params.N] * op_b[idx % op_params.N];
+}
+";
+
+    public const string BatchDotProductSource = @"
+@group(0) @binding(0) var<storage, read> bdp_a: array<f32>;
+@group(0) @binding(1) var<storage, read> bdp_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> bdp_c: array<f32>;
+struct BdpParams { batch_size: u32, dim: u32 }
+@group(0) @binding(3) var<uniform> bdp_params: BdpParams;
+
+@compute @workgroup_size(256)
+fn batch_dot_product(@builtin(global_invocation_id) gid: vec3u) {
+    let batch = gid.x;
+    if (batch >= bdp_params.batch_size) { return; }
+    var sum: f32 = 0.0;
+    let base = batch * bdp_params.dim;
+    for (var j: u32 = 0u; j < bdp_params.dim; j = j + 1u) {
+        sum = sum + bdp_a[base + j] * bdp_b[base + j];
+    }
+    bdp_c[batch] = sum;
+}
+";
+
+    public const string MaskedFillSource = @"
+@group(0) @binding(0) var<storage, read> mf_input: array<f32>;
+@group(0) @binding(1) var<storage, read> mf_mask: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mf_output: array<f32>;
+struct MfParams { fill_value: f32, size: u32 }
+@group(0) @binding(3) var<uniform> mf_params: MfParams;
+
+@compute @workgroup_size(256)
+fn masked_fill(@builtin(global_invocation_id) gid: vec3u) {
+    let idx = gid.x;
+    if (idx >= mf_params.size) { return; }
+    mf_output[idx] = select(mf_input[idx], mf_params.fill_value, mf_mask[idx] != 0.0);
+}
+";
 }
 #endif

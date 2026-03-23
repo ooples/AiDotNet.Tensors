@@ -40,4 +40,12 @@
           Condition="Exists('$(NuGetPackageRoot)aidotnet.native.onednn\$(OneDnnPackageVersion)\runtimes\win-x64\native\dnnl.dll')" />
   </Target>
 
+  <!-- Copy CLBlast native DLL for GPU-accelerated BLAS benchmarks -->
+  <Target Name="CopyClBlastToBenchmarkOutput" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\src\AiDotNet.Native.CLBlast\runtimes\win-x64\native\clblast.dll"
+          DestinationFolder="$(OutputPath)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\src\AiDotNet.Native.CLBlast\runtimes\win-x64\native\clblast.dll')" />
+  </Target>
+
 </Project>

@@ -313,6 +313,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+          # Pack ROCm native package (AMD GPU: rocBLAS + hipBLAS)
+          $rocmProj = "src/AiDotNet.Native.ROCm/AiDotNet.Native.ROCm.csproj"
+          if ((Test-Path $rocmProj) -and (Test-Path "src/AiDotNet.Native.ROCm/runtimes/win-x64/native/rocblas.dll")) {
+            Write-Host "Packing AiDotNet.Native.ROCm..."
+            dotnet restore $rocmProj
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            dotnet build $rocmProj -c Release --no-restore
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            dotnet pack $rocmProj -c Release -o out --no-build /p:PackageVersion=$VERSION
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Skipping AiDotNet.Native.ROCm - native binaries not present"
+          }
+
           # Pack MoltenVK native package (Vulkan on macOS via Metal translation)
           # Only pack if all required native binaries are present for both architectures
           # Note: MoltenVK is not in the solution file, so dotnet restore/build above skips it.
@@ -436,6 +450,7 @@ jobs:
 
             ${{ steps.packages.outputs.list }}
             > Note: AiDotNet.Native.CUDA must be built locally due to large binary size (770MB).
+            > Note: AiDotNet.Native.ROCm requires ROCm installed on the target machine for the kernel library (~496MB).
 
             ## Installation
 

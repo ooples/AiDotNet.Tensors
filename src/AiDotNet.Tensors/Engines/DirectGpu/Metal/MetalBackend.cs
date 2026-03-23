@@ -50,6 +50,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _lossLibrary;
     private IntPtr _comparisonLibrary;
     private IntPtr _randomLibrary;
+    private IntPtr _dotProductLibrary;
 
     #region Properties
 
@@ -166,6 +167,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
             // Compile random operations
             _randomLibrary = _shaderLibrary.CompileLibrary("Random", MetalKernels.RandomKernels);
+
+            // Compile dot product operations
+            _dotProductLibrary = _shaderLibrary.CompileLibrary("DotProduct", MetalKernels.DotProductKernels);
         }
         catch (Exception ex)
         {
@@ -667,6 +671,129 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
     #endregion
 
+    #region Dot Product Operations
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    {
+        ThrowIfDisposed();
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        if (size <= 0)
+        {
+            // Zero result for empty input
+            Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
+        uint threadgroupSize = 256;
+        uint numGroups = (uint)Math.Min((size + threadgroupSize - 1) / threadgroupSize, 256);
+
+        // Pass 1: compute partial dot products per threadgroup
+        using var partialBuf = AllocateBuffer((int)numGroups);
+        var partialBuffer = (MetalGpuBuffer)partialBuf;
+
+        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "dot_product");
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(aBuffer, 0);
+            encoder.SetBuffer(bBuffer, 1);
+            encoder.SetBuffer(partialBuffer, 2);
+            encoder.SetBytes((uint)size, 3);
+            encoder.SetThreadgroupMemoryLength(threadgroupSize * sizeof(float), 0);
+            encoder.DispatchThreadgroups(
+                new MTLSize(numGroups, 1, 1),
+                new MTLSize(threadgroupSize, 1, 1));
+        }
+
+        // Pass 2: reduce partial sums to final result
+        var reducePipeline = GetPipeline("DotProduct", _dotProductLibrary, "reduce_partial_sums");
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(reducePipeline.Handle);
+            encoder.SetBuffer(partialBuffer, 0);
+            encoder.SetBuffer(resultBuffer, 1);
+            encoder.SetBytes(numGroups, 2);
+            uint reduceThreads = Math.Min(threadgroupSize, numGroups);
+            encoder.SetThreadgroupMemoryLength(reduceThreads * sizeof(float), 0);
+            encoder.DispatchThreadgroups(
+                new MTLSize(1, 1, 1),
+                new MTLSize(reduceThreads, 1, 1));
+        }
+    }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+    {
+        ThrowIfDisposed();
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        uint threadgroupSize = 256;
+        uint numGroups = (uint)Math.Min((aSize + threadgroupSize - 1) / threadgroupSize, 256);
+
+        using var partialBuf = AllocateBuffer((int)numGroups);
+        var partialBuffer = (MetalGpuBuffer)partialBuf;
+
+        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "strided_dot_product");
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(aBuffer, 0);
+            encoder.SetBuffer(bBuffer, 1);
+            encoder.SetBuffer(partialBuffer, 2);
+            encoder.SetBytes((uint)aSize, 3);
+            encoder.SetBytes((uint)bSize, 4);
+            encoder.SetBytes(bOffset, 5);
+            encoder.SetBytes(bStride, 6);
+            encoder.SetThreadgroupMemoryLength(threadgroupSize * sizeof(float), 0);
+            encoder.DispatchThreadgroups(
+                new MTLSize(numGroups, 1, 1),
+                new MTLSize(threadgroupSize, 1, 1));
+        }
+
+        var reducePipeline = GetPipeline("DotProduct", _dotProductLibrary, "reduce_partial_sums");
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(reducePipeline.Handle);
+            encoder.SetBuffer(partialBuffer, 0);
+            encoder.SetBuffer(resultBuffer, 1);
+            encoder.SetBytes(numGroups, 2);
+            uint reduceThreads = Math.Min(threadgroupSize, numGroups);
+            encoder.SetThreadgroupMemoryLength(reduceThreads * sizeof(float), 0);
+            encoder.DispatchThreadgroups(
+                new MTLSize(1, 1, 1),
+                new MTLSize(reduceThreads, 1, 1));
+        }
+    }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+    {
+        ThrowIfDisposed();
+        if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        uint threadgroupSize = (uint)Math.Min(256, vecSize);
+
+        var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "batched_dot_product");
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(aBuffer, 0);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBuffer(resultBuffer, 2);
+        encoder.SetBytes((uint)batchSize, 3);
+        encoder.SetBytes((uint)vecSize, 4);
+        encoder.SetThreadgroupMemoryLength(threadgroupSize * sizeof(float), 0);
+        encoder.DispatchThreadgroups(
+            new MTLSize(1, (ulong)batchSize, 1),
+            new MTLSize(threadgroupSize, 1, 1));
+    }
+
+    #endregion
+
     #region Element-wise Operations
 
     /// <summary>
@@ -677,6 +804,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         ThrowIfDisposed();
         ExecuteElementWiseOp("add", A, B, C, size);
     }
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
 
     /// <summary>
     /// Element-wise subtraction: C = A - B
@@ -873,7 +1003,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// <summary>
     /// Helper to add a scalar: B = A + scalar
     /// </summary>
-    private void AddScalar(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
+    public void AddScalar(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer)
         {

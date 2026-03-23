@@ -444,6 +444,9 @@ public sealed unsafe partial class VulkanBackend
 
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorAdd);
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => GpuBinaryOp(A, B, C, size, VulkanKernelType.VectorSubtract);
@@ -462,6 +465,74 @@ public sealed unsafe partial class VulkanBackend
 
     public void Tanh(IGpuBuffer A, IGpuBuffer B, int size)
         => GpuUnaryOp(A, B, size, VulkanKernelType.Tanh);
+
+    public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
+    {
+        EnsureInitialized();
+        if (size <= 0)
+        {
+            Scale(result, result, 0f, Math.Max(1, result.Size));
+            return;
+        }
+
+        if (size > a.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer A length ({a.Size}).");
+        if (size > b.Size) throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer B length ({b.Size}).");
+
+        // Zero result first to ensure deterministic output
+        Scale(result, result, 0f, Math.Max(1, result.Size));
+
+        // Direct GPU dispatch using pre-compiled DotProduct SPIR-V kernel
+        var vbA = AsVulkan(a);
+        var vbB = AsVulkan(b);
+        var vbR = AsVulkan(result);
+
+        var pipeline = GetOrCreatePipeline(VulkanKernelType.DotProduct, 3, sizeof(uint));
+        if (pipeline is null)
+            throw new InvalidOperationException("Failed to create DotProduct pipeline.");
+
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbR.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    public void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int aSize, int bSize, int bOffset, int bStride)
+    {
+        EnsureInitialized();
+        if (aSize <= 0) return;
+
+        // Extract strided window into contiguous buffer then standard DotProduct
+        var bFull = DownloadBuffer(b);
+
+        var window = new float[aSize];
+        for (int i = 0; i < aSize; i++)
+        {
+            int bIdx = bOffset + i * bStride;
+            window[i] = (bIdx >= 0 && bIdx < bSize) ? bFull[bIdx] : 0f;
+        }
+
+        using var windowBuf = AllocateBuffer(window);
+        DotProduct(a, windowBuf, result, aSize);
+    }
+
+    public void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result,
+        int batchSize, int vecSize)
+    {
+        EnsureInitialized();
+        if (batchSize <= 0 || vecSize <= 0) return;
+        if ((long)batchSize * vecSize > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer A length ({a.Size}).");
+        if ((long)batchSize * vecSize > b.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({(long)batchSize * vecSize}) exceeds buffer B length ({b.Size}).");
+
+        // Element-wise multiply all batches, then reduce each batch
+        using var temp = AllocateBuffer(batchSize * vecSize);
+        Multiply(a, b, temp, batchSize * vecSize);
+        // Synchronize to ensure Multiply completes before SumAxis reads temp
+        Synchronize();
+        SumAxis(temp, result, batchSize, vecSize);
+    }
 
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {

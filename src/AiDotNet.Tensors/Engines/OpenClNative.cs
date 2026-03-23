@@ -1517,75 +1517,90 @@ public sealed class OpenClMatMul : IDisposable
 
     // Optimized GEMM kernel source template (TILE_SIZE is replaced at runtime)
     private const string GemmKernelSourceTemplate = @"
-// Tiled SGEMM kernel for OpenCL
-// C = alpha * A * B + beta * C
-// A: M x K, B: K x N, C: M x N (row-major)
+// Register-blocked SGEMM: each thread computes WPTxWPT outputs
+// Workgroup: (TS/WPT) x (TS/WPT) threads = RTS^2 threads
+// Each thread accumulates WPT^2 = 64 FMAs per K iteration
 
-#define TILE_SIZE __TILE_SIZE_PLACEHOLDER__
+#define TS __TILE_SIZE_PLACEHOLDER__
+#define WPT 4
+#define RTS (TS / WPT)
 
-__kernel void sgemm(
+__kernel __attribute__((reqd_work_group_size(RTS, RTS, 1)))
+void sgemm(
     const int M, const int N, const int K,
     const float alpha, const float beta,
-    __global const float* A,
-    __global const float* B,
+    __global const float* restrict A,
+    __global const float* restrict B,
     __global float* C)
 {
-    // Block indices
-    const int bx = get_group_id(0);
-    const int by = get_group_id(1);
+    const int tidx = get_local_id(0);
+    const int tidy = get_local_id(1);
+    const int gidx = get_group_id(0);
+    const int gidy = get_group_id(1);
 
-    // Thread indices
-    const int tx = get_local_id(0);
-    const int ty = get_local_id(1);
+    float acc[WPT][WPT];
+    #pragma unroll
+    for (int wi = 0; wi < WPT; wi++)
+        #pragma unroll
+        for (int wj = 0; wj < WPT; wj++)
+            acc[wi][wj] = 0.0f;
 
-    // Global indices
-    const int row = by * TILE_SIZE + ty;
-    const int col = bx * TILE_SIZE + tx;
+    __local float Als[TS][TS + 1];
+    __local float Bls[TS][TS + 1];
 
-    // Shared memory for tiles
-    __local float As[TILE_SIZE][TILE_SIZE];
-    __local float Bs[TILE_SIZE][TILE_SIZE];
+    const int numThreads = RTS * RTS;
+    const int tid = tidy * RTS + tidx;
 
-    float acc = 0.0f;
-
-    // Loop over tiles
-    const int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-
-    for (int t = 0; t < numTiles; t++) {
-        // Load tiles into shared memory
-        const int aCol = t * TILE_SIZE + tx;
-        const int bRow = t * TILE_SIZE + ty;
-
-        if (row < M && aCol < K)
-            As[ty][tx] = A[row * K + aCol];
-        else
-            As[ty][tx] = 0.0f;
-
-        if (bRow < K && col < N)
-            Bs[ty][tx] = B[bRow * N + col];
-        else
-            Bs[ty][tx] = 0.0f;
-
+    for (int kBase = 0; kBase < K; kBase += TS) {
+        #pragma unroll
+        for (int loadIdx = tid; loadIdx < TS * TS; loadIdx += numThreads) {
+            int lr = loadIdx / TS, lc = loadIdx % TS;
+            int gr = gidy * TS + lr, gc = kBase + lc;
+            Als[lr][lc] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        #pragma unroll
+        for (int loadIdx = tid; loadIdx < TS * TS; loadIdx += numThreads) {
+            int lr = loadIdx / TS, lc = loadIdx % TS;
+            int gr = kBase + lr, gc = gidx * TS + lc;
+            Bls[lr][lc] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute partial product
         #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            acc += As[ty][k] * Bs[k][tx];
+        for (int k = 0; k < TS; k++) {
+            float aCache[WPT];
+            #pragma unroll
+            for (int wi = 0; wi < WPT; wi++)
+                aCache[wi] = Als[tidy * WPT + wi][k];
+            float bCache[WPT];
+            #pragma unroll
+            for (int wj = 0; wj < WPT; wj++)
+                bCache[wj] = Bls[k][tidx * WPT + wj];
+            #pragma unroll
+            for (int wi = 0; wi < WPT; wi++)
+                #pragma unroll
+                for (int wj = 0; wj < WPT; wj++)
+                    acc[wi][wj] = fma(aCache[wi], bCache[wj], acc[wi][wj]);
         }
-
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Write result
-    if (row < M && col < N) {
-        if (beta == 0.0f)
-            C[row * N + col] = alpha * acc;
-        else
-            C[row * N + col] = alpha * acc + beta * C[row * N + col];
+    #pragma unroll
+    for (int wi = 0; wi < WPT; wi++) {
+        int globalRow = gidy * TS + tidy * WPT + wi;
+        if (globalRow >= M) continue;
+        #pragma unroll
+        for (int wj = 0; wj < WPT; wj++) {
+            int globalCol = gidx * TS + tidx * WPT + wj;
+            if (globalCol >= N) continue;
+            int idx = globalRow * N + globalCol;
+            C[idx] = (beta == 0.0f) ? alpha * acc[wi][wj]
+                                    : fma(alpha, acc[wi][wj], beta * C[idx]);
+        }
     }
 }
 ";
+
 
     /// <summary>Gets whether OpenCL GEMM is available.</summary>
     public static bool IsAvailable => OpenClContext.IsAvailable;
@@ -1625,14 +1640,15 @@ __kernel void sgemm(
         // Query device max work group size to determine optimal tile size
         ulong maxWorkGroupSize = _context.MaxWorkGroupSize;
 
-        // Calculate tile size: we need tileSize^2 <= maxWorkGroupSize
-        // Use largest power of 2 that satisfies this constraint
-        if (maxWorkGroupSize >= 1024)
-            _tileSize = 32; // 32x32 = 1024 threads
-        else if (maxWorkGroupSize >= 256)
-            _tileSize = 16; // 16x16 = 256 threads
+        // With WPT=4 register blocking, workgroup = (TS/4)^2 threads
+        // TS=64:  WG = 16x16 = 256 threads (max occupancy, 33KB LDS)
+        // TS=32:  WG = 8x8   = 64 threads (8.4KB LDS, multiple wavefronts)
+        if (maxWorkGroupSize >= 256)
+            _tileSize = 64;  // 16x16 = 256 threads, 33KB LDS
+        else if (maxWorkGroupSize >= 64)
+            _tileSize = 32;  // 8x8 = 64 threads, 8.4KB LDS
         else
-            _tileSize = 8;  // 8x8 = 64 threads (fallback)
+            _tileSize = 16;  // 4x4 = 16 threads (fallback)
 
         // Generate kernel source with appropriate tile size
         string kernelSource = GemmKernelSourceTemplate.Replace("__TILE_SIZE_PLACEHOLDER__", _tileSize.ToString());
@@ -1734,13 +1750,16 @@ __kernel void sgemm(
             _gemmKernel.SetArg(6, bufferB.Handle);
             _gemmKernel.SetArg(7, bufferC.Handle);
 
-            // Calculate work sizes using adaptive tile size
-            int tileSize = _tileSize;
-            ulong globalM = (ulong)((M + tileSize - 1) / tileSize * tileSize);
-            ulong globalN = (ulong)((N + tileSize - 1) / tileSize * tileSize);
+            // Register-blocked dispatch: WPT=4, workgroup = (TS/4) x (TS/4) threads
+            // Each workgroup computes TS x TS output elements
+            int ts = _tileSize;
+            int wpt = 4;
+            int rts = ts / wpt;  // reduced tile size = threads per WG dimension
+            int numWgM = (M + ts - 1) / ts;
+            int numWgN = (N + ts - 1) / ts;
 
-            var globalWorkSize = new ulong[] { globalN, globalM };
-            var localWorkSize = new ulong[] { (ulong)tileSize, (ulong)tileSize };
+            var globalWorkSize = new ulong[] { (ulong)(numWgN * rts), (ulong)(numWgM * rts) };
+            var localWorkSize = new ulong[] { (ulong)rts, (ulong)rts };
 
             // Execute kernel
             _gemmKernel.Enqueue(globalWorkSize, localWorkSize);

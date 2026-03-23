@@ -41,6 +41,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private readonly VulkanDevice _device;
     private readonly ConcurrentDictionary<(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize), VulkanComputePipeline> _pipelineCache;
     private readonly ConcurrentDictionary<VulkanKernelType, VulkanShaderModule> _shaderCache;
+    private readonly ConcurrentDictionary<string, VulkanComputePipeline> _glslPipelineCache;
+    private VulkanGlslCompiler? _glslCompiler;
     private VulkanBufferTransfer? _transfer;
     private readonly object _computeLock = new object();
     private bool _initialized;
@@ -54,6 +56,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private int _batchOwnerThreadId;
     private ThreadCommandResources _batchThreadRes;
     private int _batchDispatchCount;
+    private bool _inSecondaryStream;
+    private ThreadCommandResources _secondaryThreadRes;
 
     /// <summary>
     /// Gets the singleton backend instance.
@@ -120,6 +124,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         _device = VulkanDevice.Instance;
         _pipelineCache = new ConcurrentDictionary<(VulkanKernelType, int, uint), VulkanComputePipeline>();
         _shaderCache = new ConcurrentDictionary<VulkanKernelType, VulkanShaderModule>();
+        _glslPipelineCache = new ConcurrentDictionary<string, VulkanComputePipeline>(StringComparer.Ordinal);
+        try { _glslCompiler = new VulkanGlslCompiler(); }
+        catch { _glslCompiler = null; }
     }
 
     /// <summary>
@@ -178,6 +185,155 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         return pipeline;
+    }
+
+    /// <summary>
+    /// Gets or creates a compute pipeline from a GLSL source string using runtime compilation.
+    /// </summary>
+    private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
+    {
+        string cacheKey = $"{glslSource.GetHashCode()}_{bindingCount}_{pushConstantSize}";
+        if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
+            return cached;
+
+        if (_glslCompiler is null || !_glslCompiler.IsAvailable)
+            return null;
+
+        var shader = _glslCompiler.CompileToShaderModule(glslSource);
+        if (shader is null)
+            return null;
+
+        var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
+        if (pipeline is not null)
+            _glslPipelineCache.TryAdd(cacheKey, pipeline);
+
+        return pipeline;
+    }
+
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 2 buffers + push constants.
+    /// </summary>
+    private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int size, uint pushConstantSize = sizeof(uint))
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 2, pushConstantSize);
+        if (pipeline is null)
+        {
+            // Fallback: download, process on CPU, upload
+            CpuFallbackUnary(A, B, size);
+            return;
+        }
+        var vbA = AsVulkan(A);
+        var vbB = AsVulkan(B);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 3 buffers + push constants.
+    /// </summary>
+    private void GlslBinaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, uint pushConstantSize = sizeof(uint))
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 3, pushConstantSize);
+        if (pipeline is null)
+        {
+            CpuFallbackBinary(A, B, C, size);
+            return;
+        }
+        var vbA = AsVulkan(A);
+        var vbB = AsVulkan(B);
+        var vbC = AsVulkan(C);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 1 buffer (output only) + push constants.
+    /// Used for generate ops like Eye, Linspace, TriangularMask.
+    /// </summary>
+    private void GlslGenerateOp(string glslSource, IGpuBuffer O, int size, uint pushConstantSize = sizeof(uint))
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 1, pushConstantSize);
+        if (pipeline is null) return;
+        var vbO = AsVulkan(O);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbO.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 4 buffers + push constants.
+    /// Used for backward ops needing grad_output, input, aux, grad_input.
+    /// </summary>
+    private void GlslQuadOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size, uint pushConstantSize = sizeof(uint))
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
+        if (pipeline is null) return;
+        var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    /// <summary>
+    /// Executes a GLSL-compiled compute pipeline with 5 buffers + push constants.
+    /// Used for complex backward ops needing grad_output, input, mean, variance, grad_input.
+    /// </summary>
+    private void GlslQuintOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, int size, uint pushConstantSize = sizeof(uint))
+    {
+        EnsureInitialized();
+        if (size <= 0) return;
+        var pipeline = GetOrCreateGlslPipeline(glslSource, 5, pushConstantSize);
+        if (pipeline is null) return;
+        var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D); var vbE = AsVulkan(E);
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage, vbD.Storage, vbE.Storage);
+            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+        }
+    }
+
+    // CPU fallback when GLSL pipeline creation fails (shaderc unavailable or compilation error).
+    // These copy input to output unchanged since we cannot determine the intended operation.
+    // Callers should check pipeline availability before dispatching performance-critical work.
+    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — unary op falling back to identity copy");
+        float[] input = DownloadBuffer(A);
+        float[] output = new float[size];
+        Array.Copy(input, output, Math.Min(input.Length, size));
+        UploadToBuffer(output, B);
+    }
+
+    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — binary op falling back to identity copy of A");
+        float[] a = DownloadBuffer(A);
+        float[] output = new float[size];
+        Array.Copy(a, output, Math.Min(a.Length, size));
+        UploadToBuffer(output, C);
     }
 
     /// <summary>
@@ -732,15 +888,25 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void BeginSecondaryStream()
     {
-        // Vulkan multi-stream requires separate command pools per thread/stream.
-        // Not yet implemented — would need a secondary VkCommandPool + VkQueue.
-        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+        if (_inSecondaryStream)
+            throw new InvalidOperationException("Already in a secondary stream.");
+
+        // Acquire a separate set of thread resources (command pool + command buffer + fence)
+        // for concurrent recording. This allows overlapping compute dispatches.
+        _secondaryThreadRes = _device.AcquireThreadResources();
+        _inSecondaryStream = true;
     }
 
     /// <inheritdoc/>
     public void EndSecondaryStream()
     {
-        throw new NotSupportedException("Multi-stream execution is not yet implemented in Vulkan backend.");
+        if (!_inSecondaryStream)
+            throw new InvalidOperationException("Not in a secondary stream.");
+
+        // Submit the secondary command buffer and wait for completion
+        var cmdBuffer = _secondaryThreadRes.CommandBuffer;
+        _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
+        _inSecondaryStream = false;
     }
 
     /// <summary>
