@@ -54,10 +54,10 @@ public static class MeshConvolutionOperations
         Tensor<T> biases)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = vertexFeatures.Shape[0];
-        int inputChannels = vertexFeatures.Shape[1];
-        int spiralLength = spiralIndices.Shape[1];
-        int outputChannels = weights.Shape[0];
+        int numVertices = vertexFeatures._shape[0];
+        int inputChannels = vertexFeatures._shape[1];
+        int spiralLength = spiralIndices._shape[1];
+        int outputChannels = weights._shape[0];
         int gatheredSize = inputChannels * spiralLength;
 
         var output = new T[numVertices * outputChannels];
@@ -169,9 +169,9 @@ public static class MeshConvolutionOperations
         int inputChannels)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = outputGradient.Shape[0];
-        int outputChannels = outputGradient.Shape[1];
-        int spiralLength = spiralIndices.Shape[1];
+        int numVertices = outputGradient._shape[0];
+        int outputChannels = outputGradient._shape[1];
+        int spiralLength = spiralIndices._shape[1];
         int gatheredSize = inputChannels * spiralLength;
 
         var inputGrad = new T[numVertices * inputChannels];
@@ -275,10 +275,10 @@ public static class MeshConvolutionOperations
         Tensor<int> spiralIndices)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = outputGradient.Shape[0];
-        int outputChannels = outputGradient.Shape[1];
-        int inputChannels = vertexFeatures.Shape[1];
-        int spiralLength = spiralIndices.Shape[1];
+        int numVertices = outputGradient._shape[0];
+        int outputChannels = outputGradient._shape[1];
+        int inputChannels = vertexFeatures._shape[1];
+        int spiralLength = spiralIndices._shape[1];
         int gatheredSize = inputChannels * spiralLength;
 
         var weightGrad = new T[outputChannels * gatheredSize];
@@ -375,8 +375,8 @@ public static class MeshConvolutionOperations
     public static Tensor<T> SpiralConvBackwardBias<T>(Tensor<T> outputGradient)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = outputGradient.Shape[0];
-        int outputChannels = outputGradient.Shape[1];
+        int numVertices = outputGradient._shape[0];
+        int outputChannels = outputGradient._shape[1];
 
         var biasGrad = new T[outputChannels];
         var gradData = outputGradient.ToArray();
@@ -456,9 +456,9 @@ public static class MeshConvolutionOperations
         T diffusionTime)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = vertexFeatures.Shape[0];
-        int inputChannels = vertexFeatures.Shape[1];
-        int outputChannels = weights.Shape[0];
+        int numVertices = vertexFeatures._shape[0];
+        int inputChannels = vertexFeatures._shape[1];
+        int outputChannels = weights._shape[0];
 
         double t = numOps.ToDouble(diffusionTime);
         double t2 = t * t / 2.0;
@@ -616,9 +616,9 @@ public static class MeshConvolutionOperations
         T diffusionTime)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = outputGradient.Shape[0];
-        int outputChannels = outputGradient.Shape[1];
-        int inputChannels = vertexFeatures.Shape[1];
+        int numVertices = outputGradient._shape[0];
+        int outputChannels = outputGradient._shape[1];
+        int inputChannels = vertexFeatures._shape[1];
 
         double t = numOps.ToDouble(diffusionTime);
         double t2 = t * t / 2.0;
@@ -746,8 +746,8 @@ public static class MeshConvolutionOperations
         LaplacianType laplacianType = LaplacianType.Cotangent)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = vertices.Shape[0];
-        int numFaces = faces.Shape[0];
+        int numVertices = vertices._shape[0];
+        int numFaces = faces._shape[0];
 
         var vertexData = vertices.GetDataArray();
         var faceData = faces.ToArray();
@@ -906,8 +906,8 @@ public static class MeshConvolutionOperations
         int spiralLength)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = vertices.Shape[0];
-        int numFaces = faces.Shape[0];
+        int numVertices = vertices._shape[0];
+        int numFaces = faces._shape[0];
 
         var vertexData = vertices.GetDataArray();
         var faceData = faces.ToArray();

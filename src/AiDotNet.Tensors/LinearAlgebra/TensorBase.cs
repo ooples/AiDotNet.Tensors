@@ -8,33 +8,70 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-/// <remarks>
-/// <para><b>For Beginners:</b> TensorBase is an abstract class that provides the foundation for working with tensors.
-/// It defines common properties and methods that all tensor implementations should have, regardless of their specific type or dimensionality.
-/// </para>
-/// </remarks>
-public abstract class TensorBase<T>
+public abstract class TensorBase<T> : IDisposable
 {
+    private bool _disposed;
+    // ================================================================
+    // Core storage and metadata
+    // ================================================================
+
     /// <summary>
-    /// The underlying data storage for the tensor elements.
+    /// Shared storage for tensor data. Multiple views can reference the same storage.
     /// </summary>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This field stores all the values in the tensor in a one-dimensional array.
-    /// Even though a tensor can have multiple dimensions, we store its data in a flat structure for efficiency.
-    /// The class provides methods to convert between multi-dimensional indices and this flat storage.</para>
-    /// </remarks>
+    internal readonly TensorStorage<T> _storage;
+
+    /// <summary>
+    /// Direct reference to underlying Vector for backward compatibility with existing engine code.
+    /// All new code should prefer _storage methods.
+    /// </summary>
     protected readonly Vector<T> _data;
 
+    /// <summary>
+    /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
+    /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
+    /// </summary>
+    internal readonly int[] _shape;
 
+    /// <summary>
+    /// Pre-computed strides for each dimension, following PyTorch's stride convention.
+    /// For row-major order: strides[i] = product of shape[i+1..end].
+    /// For transposed views: strides are permuted without copying data.
+    /// </summary>
+    internal readonly int[] _strides;
+
+    /// <summary>
+    /// Offset into the underlying storage where this tensor's data begins.
+    /// Zero for non-view tensors. Non-zero for sliced views.
+    /// </summary>
+    internal readonly int _storageOffset;
+
+    /// <summary>
+    /// Whether this tensor's data is contiguous in memory (row-major with no gaps).
+    /// When true, raw span/array access is safe. When false, Contiguous() must be called
+    /// before passing to BLAS/SIMD operations.
+    /// </summary>
+    public bool IsContiguous { get; }
+
+    /// <summary>
+    /// Whether this tensor is a view into another tensor's storage.
+    /// Views share memory — mutations through one view are visible in others.
+    /// </summary>
+    public bool IsView { get; }
+
+    // ================================================================
+    // Cached derived values
+    // ================================================================
+
+    /// <summary>
+    /// Pre-computed row-major strides for logical flat index decomposition.
+    /// Cached to avoid recomputing in hot paths (FlatIndexToStorageIndex, ToArray, etc.).
+    /// </summary>
+    private int[]? _rowMajorStridesCache;
+    internal int[] RowMajorStrides => _rowMajorStridesCache ??= ComputeRowMajorStrides(_shape);
 
     /// <summary>
     /// Provides numeric operations for the tensor's element type.
     /// </summary>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This field holds a set of mathematical operations (like addition, multiplication, etc.)
-    /// that work with the specific numeric type of this tensor. It allows the tensor to perform calculations
-    /// regardless of whether it contains integers, floating-point numbers, or other numeric types.</para>
-    /// </remarks>
     protected static readonly INumericOperations<T> _numOps = MathHelper.GetNumericOperations<T>();
 
     /// <summary>
@@ -42,136 +79,206 @@ public abstract class TensorBase<T>
     /// </summary>
     protected IEngine Engine => AiDotNetEngine.Current;
 
-    /// <summary>
-    /// Gets the shape (dimensions) of the tensor.
-    /// </summary>
-    public int[] Shape { get; }
+    // ================================================================
+    // Public properties
+    // ================================================================
 
     /// <summary>
-    /// Gets the total number of elements in the tensor.
+    /// Gets the shape (dimensions) of the tensor as an immutable wrapper.
+    /// Use Shape[i] for element access, Shape.Span for zero-copy iteration.
     /// </summary>
-    public int Length => _data.Length;
+    public TensorShape Shape { get; }
+
+    /// <summary>
+    /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
+    /// For views, this is the view's element count, not the underlying storage size.
+    /// </summary>
+    public int Length { get; }
 
     /// <summary>
     /// Gets the rank (number of dimensions) of the tensor.
     /// </summary>
-    public int Rank => Shape.Length;
+    public int Rank => _shape.Length;
 
     /// <summary>
-    /// Gets the underlying data as a Memory&lt;T&gt; for zero-copy access.
-    /// Use .Pin() for unsafe pointer access compatible with both managed and POH-backed tensors.
-    /// Use .Span for indexed access or iteration.
+    /// Gets the pre-computed strides for each dimension as a read-only span.
     /// </summary>
-    /// <remarks>
-    /// <para>Internal to prevent external consumers from directly accessing model weights/tensor data.
-    /// AiDotNet libraries access this via InternalsVisibleTo.</para>
-    /// <para>For large tensors (>256K elements), the memory is POH-pinned, so Pin() is essentially free.</para>
-    /// </remarks>
-    internal Memory<T> Memory => _data.AsWritableMemory();
+    public ReadOnlySpan<int> Strides => _strides;
+
+    // ================================================================
+    // Internal data access (same-assembly only)
+    // ================================================================
 
     /// <summary>
-    /// Shorthand alias for <see cref="Memory"/> — used by engine code.
+    /// Gets the underlying data as a Memory&lt;T&gt; for GPU transfer and pinning.
+    /// Throws for non-contiguous views — call Contiguous() first.
     /// </summary>
-    internal Memory<T> Data => _data.AsWritableMemory();
-
-    /// <summary>
-    /// Creates a new array containing a copy of the tensor's elements in flattened order.
-    /// </summary>
-    /// <returns>A new array containing the tensor's elements.</returns>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This converts the tensor into a regular one-dimensional array.
-    /// The data is returned in flattened (row-major) order. The returned array is a copy, so
-    /// changes to it will not affect the original tensor.</para>
-    /// </remarks>
-    public virtual T[] ToArray()
+    internal Memory<T> Memory
     {
-        return _data.ToArray();
+        get
+        {
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsMemory();
+            return _storage.AsMemory().Slice(_storageOffset, Length);
+        }
     }
 
     /// <summary>
-    /// Copies data from a source array into this tensor's internal storage.
+    /// Shorthand alias for Memory — used by engine code.
     /// </summary>
-    /// <param name="source">The source array to copy from. Must have the same length as the tensor.</param>
-    /// <exception cref="ArgumentException">Thrown when source array length doesn't match tensor length.</exception>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This method copies values from a regular array into the tensor.
-    /// The array must have exactly the same number of elements as the tensor (the product of all dimensions).
-    /// This is useful for deserialization and bulk data loading.</para>
-    /// </remarks>
-    public virtual void CopyFromArray(T[] source)
-    {
-        if (source == null)
-        {
-            throw new ArgumentNullException(nameof(source));
-        }
-        if (source.Length != _data.Length)
-        {
-            throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({_data.Length}).");
-        }
-        source.AsSpan().CopyTo(_data.AsWritableSpan());
-    }
+    internal Memory<T> Data => Memory;
+
+    // ================================================================
+    // Constructors
+    // ================================================================
 
     /// <summary>
-    /// Initializes a new instance of the TensorBase class with the specified shape.
+    /// Initializes a new tensor with the specified shape (all elements zero-initialized).
     /// </summary>
-    /// <param name="shape">The shape of the tensor.</param>
     protected TensorBase(params int[] shape)
     {
-        Shape = shape;
-        int totalSize = 1;
-        for (int i = 0; i < shape.Length; i++) totalSize *= shape[i];
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        ValidateShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
+        int totalSize = ComputeProduct(shape);
+        Length = totalSize;
         _data = new Vector<T>(totalSize);
+        _storage = new TensorStorage<T>(_data);
     }
 
     /// <summary>
-    /// Initializes a new instance of the TensorBase class with the specified data and shape.
+    /// Initializes a new tensor with the specified data and shape.
     /// </summary>
-    /// <param name="data">The data to populate the tensor with.</param>
-    /// <param name="shape">The shape of the tensor.</param>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
-        Shape = shape;
-        // When data is already a T[], use zero-copy Memory<T> path to preserve identity
-        // (critical for GPU deferred materialization — the array reference must match)
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        ValidateShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
         if (data is T[] array)
             _data = Vector<T>.WrapMemory(array);
         else
             _data = new Vector<T>(data);
-        int expectedLen1 = 1;
-        for (int si = 0; si < shape.Length; si++) expectedLen1 *= shape[si];
-        if (_data.Length != expectedLen1)
-        {
+        int expectedSize = ComputeProduct(shape);
+        Length = expectedSize;
+        if (_data.Length != expectedSize)
             throw new ArgumentException("The number of values does not match the specified shape.");
-        }
+        _storage = new TensorStorage<T>(_data);
     }
 
     /// <summary>
-    /// Initializes a new instance of the TensorBase class with an existing Vector (zero-copy).
+    /// Initializes a new tensor with an existing Vector (zero-copy).
     /// </summary>
-    /// <param name="data">The vector to use as backing storage (not copied).</param>
-    /// <param name="shape">The shape of the tensor.</param>
-    /// <remarks>
-    /// <para><b>Performance:</b> This constructor does NOT copy data. The tensor directly uses
-    /// the provided vector's memory. This is useful for high-performance scenarios where
-    /// memory pooling or external memory management is used.</para>
-    /// </remarks>
     protected TensorBase(Vector<T> data, int[] shape)
     {
-        Shape = shape;
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        ValidateShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
         _data = data;
-        int expectedLen2 = 1;
-        for (int si = 0; si < shape.Length; si++) expectedLen2 *= shape[si];
-        if (_data.Length != expectedLen2)
-        {
+        int expectedSize = ComputeProduct(shape);
+        Length = expectedSize;
+        if (_data.Length != expectedSize)
             throw new ArgumentException("The number of values does not match the specified shape.");
-        }
+        _storage = new TensorStorage<T>(_data);
     }
 
     /// <summary>
-    /// Gets or sets the value at the specified indices.
+    /// Internal constructor for creating views with custom strides and offset.
+    /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
-    /// <param name="indices">The indices of the element.</param>
-    /// <returns>The value at the specified indices.</returns>
+    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView,
+        TensorStorage<T>? parentStorage = null)
+    {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        if (strides == null) throw new ArgumentNullException(nameof(strides));
+        if (strides.Length != shape.Length)
+            throw new ArgumentException($"Strides length ({strides.Length}) must match shape length ({shape.Length}).");
+        if (storageOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
+
+        // Defensive copy — prevent caller from mutating our metadata
+        var shapeCopy = new int[shape.Length];
+        var stridesCopy = new int[strides.Length];
+        Array.Copy(shape, shapeCopy, shape.Length);
+        Array.Copy(strides, stridesCopy, strides.Length);
+
+        // Validate shape dimensions are non-negative (same as non-view constructors)
+        for (int i = 0; i < shapeCopy.Length; i++)
+        {
+            if (shapeCopy[i] < 0)
+                throw new ArgumentException($"Shape dimension {i} must be non-negative, got {shapeCopy[i]}.");
+        }
+
+        int totalElements = ComputeProduct(shapeCopy);
+
+        // Validate bounds — use long to prevent overflow for large shapes/strides
+        if (totalElements > 0)
+        {
+            long minIndex = storageOffset;
+            long maxIndex = storageOffset;
+            for (int i = 0; i < shapeCopy.Length; i++)
+            {
+                if (shapeCopy[i] > 1)
+                {
+                    long extent = (long)(shapeCopy[i] - 1) * stridesCopy[i];
+                    if (extent >= 0)
+                        maxIndex += extent;
+                    else
+                        minIndex += extent;
+                }
+            }
+            if (minIndex < 0 || maxIndex >= data.Length)
+                throw new ArgumentException(
+                    $"View exceeds storage bounds: index range [{minIndex}, {maxIndex}] outside storage [0, {data.Length - 1}].");
+        }
+
+        _shape = shapeCopy;
+        Shape = TensorShape.WrapUnsafe(shapeCopy);
+        _strides = stridesCopy;
+        _storageOffset = storageOffset;
+        IsView = isView;
+        _data = data;
+
+        // Share parent storage for proper reference counting across views
+        if (parentStorage != null)
+        {
+            _storage = parentStorage;
+            _storage.AddRef();
+        }
+        else
+        {
+            // New storage starts at refCount=1 — no extra AddRef needed
+            _storage = new TensorStorage<T>(_data);
+        }
+
+        Length = totalElements;
+        IsContiguous = CheckContiguous(shapeCopy, stridesCopy);
+    }
+
+    // ================================================================
+    // Indexers
+    // ================================================================
+
+    /// <summary>
+    /// Gets or sets the value at the specified multi-dimensional indices.
+    /// </summary>
     public virtual T this[params int[] indices]
     {
         get
@@ -187,228 +294,326 @@ public abstract class TensorBase<T>
     }
 
     /// <summary>
-    /// Gets or sets the value at the specified flat index.
+    /// Gets or sets the value at the specified flat (logical) index.
     /// </summary>
-    /// <param name="flatIndex">The flat (linear) index of the element.</param>
-    /// <returns>The value at the specified flat index.</returns>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This indexer allows accessing tensor elements using a single
-    /// index that treats the tensor as a 1D array. The flat index corresponds to
-    /// row-major ordering where the last dimension varies fastest.</para>
-    /// </remarks>
     public virtual T this[int flatIndex]
     {
         get => GetFlat(flatIndex);
         set => SetFlat(flatIndex, value);
     }
 
+    // ================================================================
+    // Data access methods
+    // ================================================================
+
     /// <summary>
-    /// Validates the provided indices against the tensor's shape.
+    /// Creates a new array containing a copy of the tensor's elements in row-major order.
     /// </summary>
-    /// <param name="indices">The indices to validate.</param>
+    public virtual T[] ToArray()
+    {
+        if (Length == 0) return Array.Empty<T>();
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+            return _data.ToArray();
+        var result = new T[Length];
+        if (IsContiguous)
+        {
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(result);
+        }
+        else
+        {
+            var srcData = _data.AsSpan();
+            for (int i = 0; i < Length; i++)
+                result[i] = srcData[FlatIndexToStorageIndex(i)];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Copies data from a source array into this tensor's storage.
+    /// </summary>
+    public virtual void CopyFromArray(T[] source)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (source.Length != Length)
+            throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
+        if (Length == 0) return;
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            source.AsSpan().CopyTo(_data.AsWritableSpan());
+        }
+        else if (IsContiguous)
+        {
+            source.AsSpan().CopyTo(_data.AsWritableSpan().Slice(_storageOffset, Length));
+        }
+        else
+        {
+            var dstData = _data.AsWritableSpan();
+            for (int i = 0; i < Length; i++)
+                dstData[FlatIndexToStorageIndex(i)] = source[i];
+        }
+    }
+
+    /// <summary>
+    /// Gets the value at a flat (logical) index. Handles views correctly.
+    /// </summary>
+    public T GetFlat(int flatIndex)
+    {
+        if (flatIndex < 0 || flatIndex >= Length)
+            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
+        if (IsContiguous)
+            return _data[flatIndex + _storageOffset];
+        return _data[FlatIndexToStorageIndex(flatIndex)];
+    }
+
+    /// <summary>
+    /// Sets the value at a flat (logical) index. Handles views correctly.
+    /// </summary>
+    public void SetFlat(int flatIndex, T value)
+    {
+        if (flatIndex < 0 || flatIndex >= Length)
+            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
+        if (IsContiguous)
+            _data[flatIndex + _storageOffset] = value;
+        else
+            _data[FlatIndexToStorageIndex(flatIndex)] = value;
+    }
+
+    /// <summary>
+    /// Gets a read-only span over the tensor data. Throws for non-contiguous views.
+    /// </summary>
+    public ReadOnlySpan<T> AsSpan()
+    {
+        if (Length == 0) return ReadOnlySpan<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous span from a non-contiguous tensor view. Call Contiguous() first.");
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _data.AsSpan();
+        return _data.AsSpan().Slice(_storageOffset, Length);
+    }
+
+    /// <summary>
+    /// Gets a writable span over the tensor data. Throws for non-contiguous views.
+    /// </summary>
+    internal Span<T> AsWritableSpan()
+    {
+        if (Length == 0) return Span<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _data.AsWritableSpan();
+        return _data.AsWritableSpan().Slice(_storageOffset, Length);
+    }
+
+    /// <summary>
+    /// Gets the underlying array. For views, returns a fresh contiguous copy.
+    /// </summary>
+    internal T[] GetDataArray()
+    {
+        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
+            return ToArray();
+        return _storage.GetDataArray();
+    }
+
+    // ================================================================
+    // Clone and Transform
+    // ================================================================
+
+    /// <summary>
+    /// Creates a deep copy of this tensor (always contiguous, never a view).
+    /// </summary>
+    public virtual TensorBase<T> Clone()
+    {
+        var result = CreateInstance(_shape);
+        if (Length == 0) return result;
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
+        }
+        else
+        {
+            var srcArray = ToArray();
+            srcArray.AsSpan().CopyTo(result._data.AsWritableSpan());
+        }
+        return result;
+    }
+
+    protected abstract TensorBase<T> CreateInstance(int[] shape);
+    protected abstract TensorBase<T> CreateInstance(T[] data, int[] shape);
+    protected abstract TensorBase<TResult> CreateInstance<TResult>(params int[] shape);
+
+    /// <summary>
+    /// Applies a function to each element. View-safe.
+    /// </summary>
+    public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
+    {
+        var result = CreateInstance<TResult>(_shape);
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            // Fast path: direct span access for non-view contiguous tensors
+            var src = _data.AsSpan();
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(src[i]);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(GetFlat(i));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Applies a function to each element with indices. View-safe.
+    /// </summary>
+    public TensorBase<TResult> Transform<TResult>(Func<T, int[], TResult> func)
+    {
+        var result = CreateInstance<TResult>(_shape);
+        var indices = new int[Rank];
+        for (int i = 0; i < Length; i++)
+        {
+            GetIndices(i, indices);
+            result._data[i] = func(GetFlat(i), indices);
+        }
+        return result;
+    }
+
+    // ================================================================
+    // Index computation
+    // ================================================================
+
     protected void ValidateIndices(int[] indices)
     {
-        if (indices.Length != Shape.Length)
+        if (indices.Length != _shape.Length)
             throw new ArgumentException("Number of indices must match the tensor's rank.");
-
         for (int i = 0; i < indices.Length; i++)
         {
-            if (indices[i] < 0 || indices[i] >= Shape[i])
+            if (indices[i] < 0 || indices[i] >= _shape[i])
                 throw new ArgumentOutOfRangeException(nameof(indices), $"Index {i} is out of range.");
         }
     }
 
     /// <summary>
-    /// Converts multi-dimensional indices to a flat index.
+    /// Converts multi-dimensional indices to a storage index using strides and offset.
     /// </summary>
-    /// <param name="indices">The multi-dimensional indices.</param>
-    /// <returns>The corresponding flat index.</returns>
     protected int GetFlatIndex(int[] indices)
     {
-        int flatIndex = 0;
-        int multiplier = 1;
-
-        for (int i = indices.Length - 1; i >= 0; i--)
-        {
-            flatIndex += indices[i] * multiplier;
-            multiplier *= Shape[i];
-        }
-
+        int flatIndex = _storageOffset;
+        for (int i = 0; i < indices.Length; i++)
+            flatIndex += indices[i] * _strides[i];
         return flatIndex;
     }
 
     /// <summary>
-    /// Creates a deep copy of this tensor.
+    /// Converts a logical flat index (row-major) to a storage index for views.
+    /// O(Rank) per call using cached row-major strides.
     /// </summary>
-    /// <returns>A new tensor with the same shape and values as this tensor.</returns>
-    public virtual TensorBase<T> Clone()
+    private int FlatIndexToStorageIndex(int flatIndex)
     {
-        var result = CreateInstance(Shape);
-
-        // Use SIMD Copy for bulk transfer
-        _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
-
-        return result;
-    }
-
-    /// <summary>
-    /// Creates a new instance of the tensor with the specified shape.
-    /// </summary>
-    /// <param name="shape">The shape of the new tensor.</param>
-    /// <returns>A new tensor with the specified shape.</returns>
-    protected abstract TensorBase<T> CreateInstance(int[] shape);
-
-    /// <summary>
-    /// Creates a new instance of the tensor with the specified data and shape.
-    /// </summary>
-    /// <param name="data">The data to populate the new tensor with.</param>
-    /// <param name="shape">The shape of the new tensor.</param>
-    /// <returns>A new tensor with the specified data and shape.</returns>
-    protected abstract TensorBase<T> CreateInstance(T[] data, int[] shape);
-
-    /// <summary>
-    /// Creates a new instance of the tensor with the specified shape and a different element type.
-    /// </summary>
-    /// <typeparam name="TResult">The type of elements in the new tensor.</typeparam>
-    /// <param name="shape">The shape of the new tensor.</param>
-    /// <returns>A new tensor with the specified shape and element type.</returns>
-    protected abstract TensorBase<TResult> CreateInstance<TResult>(params int[] shape);
-
-    /// <summary>
-    /// Applies a function to each element of the tensor.
-    /// </summary>
-    /// <typeparam name="TResult">The type of elements in the resulting tensor.</typeparam>
-    /// <param name="func">The function to apply to each element.</param>
-    /// <returns>A new tensor with the function applied to each element.</returns>
-    public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
-    {
-        var result = CreateInstance<TResult>(Shape);
-        for (int i = 0; i < Length; i++)
+        int storageIndex = _storageOffset;
+        int remaining = flatIndex;
+        var rmStrides = RowMajorStrides;
+        for (int d = 0; d < _shape.Length; d++)
         {
-            result._data[i] = func(_data[i]);
+            int dimIndex = remaining / rmStrides[d];
+            remaining -= dimIndex * rmStrides[d];
+            storageIndex += dimIndex * _strides[d];
         }
-
-        return result;
+        return storageIndex;
     }
 
     /// <summary>
-    /// Applies a function to each element of the tensor, providing the element's indices.
+    /// Converts a flat index to multi-dimensional indices using shape.
     /// </summary>
-    /// <typeparam name="TResult">The type of elements in the resulting tensor.</typeparam>
-    /// <param name="func">The function to apply to each element, which takes the element value and its indices as parameters.</param>
-    /// <returns>A new tensor with the function applied to each element.</returns>
-    public TensorBase<TResult> Transform<TResult>(Func<T, int[], TResult> func)
-    {
-        var result = CreateInstance<TResult>(Shape);
-        var indices = new int[Rank];
-        for (int i = 0; i < Length; i++)
-        {
-            GetIndices(i, indices);
-            result._data[i] = func(_data[i], indices);
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Converts a flat index to multi-dimensional indices.
-    /// </summary>
-    /// <param name="flatIndex">The flat index to convert.</param>
-    /// <param name="indices">An array to store the resulting indices.</param>
     protected void GetIndices(int flatIndex, int[] indices)
     {
         int remainder = flatIndex;
-        for (int i = Rank - 1; i >= 0; i--)
+        for (int i = _shape.Length - 1; i >= 0; i--)
         {
-            indices[i] = remainder % Shape[i];
-            remainder /= Shape[i];
+            indices[i] = remainder % _shape[i];
+            remainder /= _shape[i];
         }
     }
 
+    // ================================================================
+    // Static helpers
+    // ================================================================
+
     /// <summary>
-    /// Gets a read-only span over the internal tensor data.
+    /// Computes row-major strides: strides[i] = product of shape[i+1..end].
+    /// Example: shape [3,4,5] → strides [20, 5, 1].
     /// </summary>
-    /// <returns>A read-only span view of the tensor data (row-major order).</returns>
-    /// <remarks>
-    /// <para><b>Phase B: US-GPU-003 - Zero-Copy Operations</b></para>
-    /// <para>
-    /// This method provides direct access to the underlying storage without copying.
-    /// The tensor is stored in row-major order (last dimension varies fastest).
-    /// </para>
-    /// <para><b>For Beginners:</b> A span is a view over memory that doesn't copy the data.
-    /// This is much faster than copying the entire tensor into a new array, especially for large tensors.
-    /// Use this when you need to pass tensor data to GPU or other operations that can work with spans.</para>
-    /// </remarks>
-    public ReadOnlySpan<T> AsSpan()
+    protected static int[] ComputeRowMajorStrides(int[] shape)
     {
-        return _data.AsSpan();
+        var strides = new int[shape.Length];
+        if (shape.Length == 0) return strides;
+        strides[shape.Length - 1] = 1;
+        for (int i = shape.Length - 2; i >= 0; i--)
+            strides[i] = strides[i + 1] * shape[i + 1];
+        return strides;
     }
 
     /// <summary>
-    /// Gets a writable span over the internal tensor data.
+    /// Checks whether shape+strides represent contiguous row-major layout.
     /// </summary>
-    /// <returns>A writable span view of the tensor data (row-major order).</returns>
-    /// <remarks>
-    /// <para><b>Phase B: US-GPU-003 - Zero-Copy Operations</b></para>
-    /// <para>
-    /// Internal use only. Provides direct write access to underlying storage.
-    /// Used by GpuEngine to write results directly without intermediate copying.
-    /// </para>
-    /// </remarks>
-    internal Span<T> AsWritableSpan()
+    private static bool CheckContiguous(int[] shape, int[] strides)
     {
-        return _data.AsWritableSpan();
+        if (shape.Length == 0) return true;
+        int expected = 1;
+        for (int i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] != 1 && strides[i] != expected)
+                return false;
+            expected *= shape[i];
+        }
+        return true;
     }
 
     /// <summary>
-    /// Gets a reference to the underlying array without copying. This is safe because
-    /// VectorBase always allocates _memory from a T[].
+    /// Computes the product of all dimensions. Returns 0 for zero-size tensors.
     /// </summary>
-    internal T[] GetDataArray()
+    private static int ComputeProduct(int[] shape)
     {
-        return _data.GetDataArray();
+        if (shape.Length == 0) return 1; // Scalar
+        long product = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            product *= shape[i];
+            if (product > int.MaxValue)
+                throw new ArgumentException($"Shape product overflow: shape [{string.Join(", ", shape)}] exceeds int.MaxValue.");
+        }
+        return (int)product;
     }
 
     /// <summary>
-    /// Gets the value at a flat (linear) index in the underlying data.
+    /// Validates that shape dimensions are non-negative.
+    /// Zero-size dimensions are allowed (empty tensors for empty batches, masks, etc.).
+    /// Negative dimensions are rejected.
     /// </summary>
-    /// <param name="flatIndex">The flat index (0 to Length-1).</param>
-    /// <returns>The value at the specified flat index.</returns>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This allows accessing tensor elements using a single
-    /// index that treats the tensor as a 1D array. The flat index corresponds to
-    /// row-major ordering where the last dimension varies fastest.</para>
-    /// </remarks>
-    public T GetFlat(int flatIndex)
+    private static void ValidateShape(int[] shape)
     {
-        if (flatIndex < 0 || flatIndex >= Length)
-            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        return _data[flatIndex];
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new ArgumentException($"Shape dimension {i} must be non-negative, got {shape[i]}.");
+        }
     }
 
-    /// <summary>
-    /// Sets the value at a flat (linear) index in the underlying data.
-    /// </summary>
-    /// <param name="flatIndex">The flat index (0 to Length-1).</param>
-    /// <param name="value">The value to set.</param>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This allows setting tensor elements using a single
-    /// index that treats the tensor as a 1D array. The flat index corresponds to
-    /// row-major ordering where the last dimension varies fastest.</para>
-    /// </remarks>
-    public void SetFlat(int flatIndex, T value)
-    {
-        if (flatIndex < 0 || flatIndex >= Length)
-            throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        _data[flatIndex] = value;
-    }
-
-    /// <summary>
-    /// Returns a string representation of the tensor.
-    /// </summary>
-    /// <returns>A string representation of the tensor.</returns>
     public override string ToString()
     {
-        return $"Tensor<{typeof(T).Name}> with shape [{string.Join(", ", Shape)}]";
+        return $"Tensor<{typeof(T).Name}> with shape {Shape}";
+    }
+
+    /// <summary>
+    /// Releases the tensor's reference to shared storage.
+    /// When the last tensor/view sharing this storage is disposed, the storage can be reclaimed.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _storage.Release();
+        GC.SuppressFinalize(this);
     }
 }

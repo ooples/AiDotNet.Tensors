@@ -173,7 +173,7 @@ public class MultiGpuManager : IDisposable
     {
         var result = new Dictionary<int, Tensor<T>>();
         var data = tensor.AsSpan().ToArray();
-        var batchSize = tensor.Shape[0];
+        var batchSize = tensor._shape[0];
         int chunkSize = batchSize / _devices.Count;
 
         int offset = 0;
@@ -182,7 +182,7 @@ public class MultiGpuManager : IDisposable
         for (int i = 0; i < _devices.Count; i++)
         {
             int samples = chunkSize + (i < batchSize % _devices.Count ? 1 : 0);
-            var newShape = (int[])tensor.Shape.Clone();
+            var newShape = (int[])tensor._shape.Clone();
             newShape[0] = samples;
 
             var chunk = new Tensor<T>(newShape);
@@ -236,7 +236,7 @@ public class MultiGpuManager : IDisposable
         }
 
         var first = gradients.Values.First();
-        var result = new Tensor<T>(first.Shape);
+        var result = new Tensor<T>(first._shape);
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
 
         // Sum all gradients
@@ -276,7 +276,7 @@ public class MultiGpuManager : IDisposable
 
         foreach (var device in _devices)
         {
-            var deviceParams = new Tensor<T>(parameters.Shape);
+            var deviceParams = new Tensor<T>(parameters._shape);
             for (int i = 0; i < data.Length; i++)
             {
                 deviceParams[i] = data[i];

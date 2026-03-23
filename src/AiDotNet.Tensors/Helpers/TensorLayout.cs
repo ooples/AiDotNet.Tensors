@@ -36,10 +36,10 @@ public static class TensorLayout
         if (nchw.Rank != 4)
             throw new ArgumentException($"Expected 4D tensor [N,C,H,W] but got rank {nchw.Rank}.");
 
-        int n = nchw.Shape[0];
-        int c = nchw.Shape[1];
-        int h = nchw.Shape[2];
-        int w = nchw.Shape[3];
+        int n = nchw._shape[0];
+        int c = nchw._shape[1];
+        int h = nchw._shape[2];
+        int w = nchw._shape[3];
 
         var nhwc = new Tensor<T>(new[] { n, h, w, c });
         var src = nchw.AsSpan();
@@ -76,10 +76,10 @@ public static class TensorLayout
         if (nhwc.Rank != 4)
             throw new ArgumentException($"Expected 4D tensor [N,H,W,C] but got rank {nhwc.Rank}.");
 
-        int n = nhwc.Shape[0];
-        int h = nhwc.Shape[1];
-        int w = nhwc.Shape[2];
-        int c = nhwc.Shape[3];
+        int n = nhwc._shape[0];
+        int h = nhwc._shape[1];
+        int w = nhwc._shape[2];
+        int c = nhwc._shape[3];
 
         var nchw = new Tensor<T>(new[] { n, c, h, w });
         var src = nhwc.AsSpan();
@@ -120,9 +120,9 @@ public static class TensorLayout
         if (destination.Length != nchw.Length)
             throw new ArgumentException($"Destination length ({destination.Length}) must match source length ({nchw.Length}).");
         // Validate destination shape matches expected NHWC layout
-        int n = nchw.Shape[0], c = nchw.Shape[1], h = nchw.Shape[2], w = nchw.Shape[3];
-        if (destination.Shape[0] != n || destination.Shape[1] != h || destination.Shape[2] != w || destination.Shape[3] != c)
-            throw new ArgumentException($"Destination shape [{string.Join(",", destination.Shape)}] must be [N={n},H={h},W={w},C={c}].");
+        int n = nchw._shape[0], c = nchw._shape[1], h = nchw._shape[2], w = nchw._shape[3];
+        if (destination._shape[0] != n || destination._shape[1] != h || destination._shape[2] != w || destination._shape[3] != c)
+            throw new ArgumentException($"Destination shape [{string.Join(",", destination._shape)}] must be [N={n},H={h},W={w},C={c}].");
 
         var src = nchw.AsSpan();
         var dst = destination.AsWritableSpan();
@@ -159,10 +159,10 @@ public static class TensorLayout
         if (destination.Length != nhwc.Length)
             throw new ArgumentException($"Destination length ({destination.Length}) must match source length ({nhwc.Length}).");
 
-        int n = nhwc.Shape[0];
-        int h = nhwc.Shape[1];
-        int w = nhwc.Shape[2];
-        int c = nhwc.Shape[3];
+        int n = nhwc._shape[0];
+        int h = nhwc._shape[1];
+        int w = nhwc._shape[2];
+        int c = nhwc._shape[3];
 
         var src = nhwc.AsSpan();
         var dst = destination.AsWritableSpan();

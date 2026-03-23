@@ -286,8 +286,8 @@ public static class CsrGpuTensorFactory
             throw new ArgumentException("Dense tensor must be 2D for CSR conversion", nameof(denseTensor));
 
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
-        int rows = denseTensor.Shape[0];
-        int cols = denseTensor.Shape[1];
+        int rows = denseTensor._shape[0];
+        int cols = denseTensor._shape[1];
 
         // Count non-zeros and build CSR structure
         var values = new System.Collections.Generic.List<float>();

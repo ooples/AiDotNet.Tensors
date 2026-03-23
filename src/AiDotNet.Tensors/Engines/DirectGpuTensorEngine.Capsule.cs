@@ -45,7 +45,7 @@ public partial class DirectGpuTensorEngine
             var outputBuffer = backend.AllocateBuffer(input.ElementCount);
             backend.Squash(input.Buffer, outputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, outputBuffer, input.Shape, GpuTensorRole.Activation, ownsBuffer: true);
+            return new GpuTensor<T>(backend, outputBuffer, input.Shape.ToArray(), GpuTensorRole.Activation, ownsBuffer: true);
         }
 
         // For squash over a non-last axis, we need to permute the tensor
@@ -67,7 +67,7 @@ public partial class DirectGpuTensorEngine
         var permutedOutputBuffer = backend.AllocateBuffer(permutedInput.ElementCount);
         backend.Squash(permutedInput.Buffer, permutedOutputBuffer, permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedOutput = new GpuTensor<T>(backend, permutedOutputBuffer, permutedInput.Shape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        var permutedOutput = new GpuTensor<T>(backend, permutedOutputBuffer, permutedInput.Shape.ToArray(), GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back
         var inversePermutation = new int[rank];
@@ -118,7 +118,7 @@ public partial class DirectGpuTensorEngine
             var gradInputBuffer = backend.AllocateBuffer(input.ElementCount);
             backend.SquashBackward(gradOutput.Buffer, input.Buffer, gradInputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, gradInputBuffer, input.Shape, GpuTensorRole.Gradient, ownsBuffer: true);
+            return new GpuTensor<T>(backend, gradInputBuffer, input.Shape.ToArray(), GpuTensorRole.Gradient, ownsBuffer: true);
         }
 
         // For squash backward over a non-last axis, permute to move axis to end
@@ -140,7 +140,7 @@ public partial class DirectGpuTensorEngine
         backend.SquashBackward(permutedGradOutput.Buffer, permutedInput.Buffer, permutedGradInputBuffer,
             permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedGradInput = new GpuTensor<T>(backend, permutedGradInputBuffer, permutedInput.Shape,
+        var permutedGradInput = new GpuTensor<T>(backend, permutedGradInputBuffer, permutedInput.Shape.ToArray(),
             GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back

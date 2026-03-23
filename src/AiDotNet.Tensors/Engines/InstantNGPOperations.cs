@@ -24,7 +24,7 @@ public static class InstantNGPOperations
         if (positions == null) throw new ArgumentNullException(nameof(positions));
         if (hashTables == null) throw new ArgumentNullException(nameof(hashTables));
         if (resolutions == null) throw new ArgumentNullException(nameof(resolutions));
-        if (positions.Shape.Length != 2 || positions.Shape[1] != 3)
+        if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be [N, 3].", nameof(positions));
         if (hashTables.Length != resolutions.Length)
             throw new ArgumentException("Hash tables and resolutions count mismatch.");
@@ -32,7 +32,7 @@ public static class InstantNGPOperations
             throw new ArgumentOutOfRangeException(nameof(featuresPerLevel));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numPoints = positions.Shape[0];
+        int numPoints = positions._shape[0];
         int numLevels = hashTables.Length;
         int totalFeatures = numLevels * featuresPerLevel;
 
@@ -53,7 +53,7 @@ public static class InstantNGPOperations
             {
                 int resolution = resolutions[level];
                 var table = hashTables[level];
-                int tableSize = table.Shape[0];
+                int tableSize = table._shape[0];
 
                 // Scale position to grid
                 double gx = px * resolution;
@@ -132,7 +132,7 @@ public static class InstantNGPOperations
         if (outputGradient == null) throw new ArgumentNullException(nameof(outputGradient));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numPoints = positions.Shape[0];
+        int numPoints = positions._shape[0];
         int numLevels = hashTables.Length;
         int totalFeatures = numLevels * featuresPerLevel;
 
@@ -142,7 +142,7 @@ public static class InstantNGPOperations
 
         for (int level = 0; level < numLevels; level++)
         {
-            int tableSize = hashTables[level].Shape[0];
+            int tableSize = hashTables[level]._shape[0];
             hashGradients[level] = new Tensor<T>(new T[tableSize * featuresPerLevel], [tableSize, featuresPerLevel]);
             lockObjects[level] = new object[tableSize];
             for (int i = 0; i < tableSize; i++)
@@ -160,7 +160,7 @@ public static class InstantNGPOperations
             for (int level = 0; level < numLevels; level++)
             {
                 int resolution = resolutions[level];
-                int tableSize = hashTables[level].Shape[0];
+                int tableSize = hashTables[level]._shape[0];
                 var gradTable = hashGradients[level];
 
                 double gx = px * resolution;
@@ -257,7 +257,7 @@ public static class InstantNGPOperations
         if (positions == null) throw new ArgumentNullException(nameof(positions));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numSamples = positions.Shape[0];
+        int numSamples = positions._shape[0];
         double thresholdVal = numOps.ToDouble(threshold);
         double decayVal = numOps.ToDouble(decayFactor);
 
@@ -332,7 +332,7 @@ public static class InstantNGPOperations
         if (occupancyBitfield == null) throw new ArgumentNullException(nameof(occupancyBitfield));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int numRays = rayOrigins.Shape[0];
+        int numRays = rayOrigins._shape[0];
 
         double near = numOps.ToDouble(nearBound);
         double far = numOps.ToDouble(farBound);

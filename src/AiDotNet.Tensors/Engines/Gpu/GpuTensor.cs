@@ -34,8 +34,13 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     /// <inheritdoc/>
     public IGpuBuffer Buffer { get; }
 
+    /// <summary>
+    /// Internal shape array for direct access by same-assembly code.
+    /// </summary>
+    internal readonly int[] _shape;
+
     /// <inheritdoc/>
-    public int[] Shape { get; }
+    public TensorShape Shape { get; }
 
     /// <inheritdoc/>
     public int ElementCount { get; }
@@ -64,7 +69,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-        Shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        _shape = (int[])(shape ?? throw new ArgumentNullException(nameof(shape))).Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
         Role = role;
         _ownsBuffer = ownsBuffer;
         _numOps = MathHelper.GetNumericOperations<T>();
@@ -95,7 +101,8 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     public GpuTensor(IDirectGpuBackend backend, T[] data, int[] shape, GpuTensorRole role)
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-        Shape = shape ?? throw new ArgumentNullException(nameof(shape));
+        _shape = (int[])(shape ?? throw new ArgumentNullException(nameof(shape))).Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
         Role = role;
         _ownsBuffer = true;
         _numOps = MathHelper.GetNumericOperations<T>();
@@ -128,7 +135,7 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     /// <param name="tensor">The CPU tensor to upload.</param>
     /// <param name="role">The role of this tensor.</param>
     public GpuTensor(IDirectGpuBackend backend, Tensor<T> tensor, GpuTensorRole role)
-        : this(backend, tensor.ToArray(), tensor.Shape, role)
+        : this(backend, tensor.ToArray(), tensor._shape, role)
     {
     }
 
@@ -155,7 +162,7 @@ public sealed class GpuTensor<T> : IGpuTensor<T>, IGpuTensor
     public Tensor<T> ToTensor()
     {
         var data = GetCpuData();
-        return new Tensor<T>(data, Shape);
+        return new Tensor<T>(data, _shape);
     }
 
     /// <inheritdoc/>
@@ -287,7 +294,8 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
     private bool _disposed;
 
     public IGpuBuffer Buffer => _parent.Buffer;
-    public int[] Shape { get; }
+    internal readonly int[] _shape;
+    public TensorShape Shape { get; }
     public int ElementCount { get; }
     public GpuTensorRole Role => _parent.Role;
     public GpuSyncPoint? LastWriteSync => _parent.LastWriteSync;
@@ -298,7 +306,8 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
     {
         _parent = parent;
         _offset = offset;
-        Shape = shape;
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
 
         ElementCount = 1;
         foreach (var dim in shape)
@@ -320,7 +329,7 @@ internal sealed class GpuTensorView<T> : IGpuTensor<T>
 
     public Tensor<T> ToTensor()
     {
-        return new Tensor<T>(GetCpuData(), Shape);
+        return new Tensor<T>(GetCpuData(), _shape);
     }
 
     public void Synchronize()
