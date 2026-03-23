@@ -472,10 +472,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Create output tensor with same shape
         var resultData = new Vector<TOut>(this.Length);
 
-        // Convert each element
+        // Convert each element (view-safe via GetFlat)
         for (int i = 0; i < this.Length; i++)
         {
-            T sourceValue = _data[i];
+            T sourceValue = GetFlat(i);
 
             // Use the precision conversion methods in INumericOperations
             // Determine the most efficient conversion path
@@ -955,7 +955,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (dimension == subTensor.Rank)
         {
-            this[indices] = subTensor._data[0];
+            this[indices] = subTensor.GetFlat(0);
             return;
         }
 
@@ -1501,33 +1501,31 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (this.Rank != 3 || this._shape[2] != matrix.Rows)
             throw new ArgumentException("Matrix rows must match the last dimension of the tensor.");
 
+        var src = this.Contiguous();
         var result = new Tensor<T>([this._shape[0], this._shape[1], matrix.Columns]);
         int lastDim = this._shape[2];
 
-        // Extract a row vector and matrix column for vectorized dot product
         T[] tensorRow = new T[lastDim];
         T[] matrixCol = new T[lastDim];
+        var srcSpan = src._data.AsSpan();
 
         for (int i = 0; i < this._shape[0]; i++)
         {
             for (int j = 0; j < this._shape[1]; j++)
             {
-                // Extract tensor row [i,j,:] for this position
                 int tensorOffset = (i * this._shape[1] + j) * lastDim;
                 for (int l = 0; l < lastDim; l++)
                 {
-                    tensorRow[l] = _data[tensorOffset + l];
+                    tensorRow[l] = srcSpan[tensorOffset + l];
                 }
 
                 for (int k = 0; k < matrix.Columns; k++)
                 {
-                    // Extract matrix column [:, k]
                     for (int l = 0; l < lastDim; l++)
                     {
                         matrixCol[l] = matrix[l, k];
                     }
 
-                    // Use vectorized Dot product for sum of element-wise products (10-15x faster with AVX2)
                     result[i, j, k] = _numOps.Dot(new ReadOnlySpan<T>(tensorRow), new ReadOnlySpan<T>(matrixCol));
                 }
             }
@@ -1874,8 +1872,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var thisStrides = CalculateBatchStrides(paddedThis);
         var otherStrides = CalculateBatchStrides(paddedOther);
 
-        var thisData = this._data;
-        var otherData = other._data;
+        var thisSrc = this.Contiguous();
+        var otherSrc = other.Contiguous();
+        var thisData = thisSrc._data;
+        var otherData = otherSrc._data;
         var resultData = result._data;
 
         for (int batchIdx = 0; batchIdx < totalBatchSize; batchIdx++)
@@ -2069,31 +2069,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int newCols = endCol - startCol;
         int[] newShape = [newRows, newCols];
 
+        // View-safe: use indexer which respects strides
         Tensor<T> result = new Tensor<T>(newShape);
-
-        // Use vectorized Copy operation per row when slicing full width, otherwise element-by-element
-        int sourceCols = this._shape[1];
-        if (startCol == 0 && endCol == sourceCols)
+        for (int i = 0; i < newRows; i++)
         {
-            // Full width slice - use vectorized Copy per row (5-10x faster)
-            var srcSpan = _data.AsSpan();
-            var destSpan = result._data.AsWritableSpan();
-            for (int i = 0; i < newRows; i++)
+            for (int j = 0; j < newCols; j++)
             {
-                int sourceOffset = (startRow + i) * sourceCols;
-                int destOffset = i * newCols;
-                _numOps.Copy(srcSpan.Slice(sourceOffset, newCols), destSpan.Slice(destOffset, newCols));
-            }
-        }
-        else
-        {
-            // Partial width slice - must copy element by element
-            for (int i = 0; i < newRows; i++)
-            {
-                for (int j = 0; j < newCols; j++)
-                {
-                    result[i, j] = this[startRow + i, startCol + j];
-                }
+                result[i, j] = this[startRow + i, startCol + j];
             }
         }
 
@@ -2285,13 +2267,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int axisSize = Shape[axis];
 
         // Compute strides
-        int[] strides = new int[Rank];
-        strides[Rank - 1] = 1;
-        for (int d = Rank - 2; d >= 0; d--)
-            strides[d] = strides[d + 1] * Shape[d + 1];
-
-        // Compute base flat index from fixed indices
-        int baseIndex = 0;
+        // Use the tensor's actual strides (view-safe), not manually computed row-major strides
+        int baseIndex = _storageOffset;
         int fi = 0;
         for (int d = 0; d < Rank; d++)
         {
@@ -2300,23 +2277,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (idx < 0 || idx >= Shape[d])
                 throw new ArgumentOutOfRangeException(nameof(fixedIndices),
                     $"Index {idx} is out of range for dimension {d} with size {Shape[d]}.");
-            baseIndex += idx * strides[d];
+            baseIndex += idx * _strides[d];
         }
 
-        int axisStride = strides[axis];
+        int axisStride = _strides[axis];
 
-        // Fast path: if axis is the last dimension, data is contiguous
-        if (axis == Rank - 1)
-        {
-            return GetSlice(baseIndex, axisSize);
-        }
-
-        // General path: gather strided elements
+        // Gather strided elements from storage
         var result = new Vector<T>(axisSize);
-        var srcSpan = _data.AsSpan();
         for (int i = 0; i < axisSize; i++)
         {
-            result[i] = srcSpan[baseIndex + i * axisStride];
+            result[i] = _data[baseIndex + i * axisStride];
         }
         return result;
     }
@@ -2348,14 +2318,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 $"Vector length {values.Length} does not match axis size {axisSize}.",
                 nameof(values));
 
-        // Compute strides
-        int[] strides = new int[Rank];
-        strides[Rank - 1] = 1;
-        for (int d = Rank - 2; d >= 0; d--)
-            strides[d] = strides[d + 1] * Shape[d + 1];
-
-        // Compute base flat index from fixed indices (with bounds validation)
-        int baseIndex = 0;
+        // Use the tensor's actual strides (view-safe), not manually computed row-major strides
+        int baseIndex = _storageOffset;
         int fi = 0;
         for (int d = 0; d < Rank; d++)
         {
@@ -2364,24 +2328,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (idx < 0 || idx >= Shape[d])
                 throw new ArgumentOutOfRangeException(nameof(fixedIndices),
                     $"Index {idx} is out of range for dimension {d} with size {Shape[d]}.");
-            baseIndex += idx * strides[d];
+            baseIndex += idx * _strides[d];
         }
 
-        int axisStride = strides[axis];
+        int axisStride = _strides[axis];
 
-        // Fast path: contiguous write for last dimension
-        if (axis == Rank - 1)
-        {
-            SetSlice(baseIndex, values);
-            return;
-        }
-
-        // General path: scatter strided elements
-        var destSpan = _data.AsWritableSpan();
-        var srcSpan = values.AsSpan();
+        // Scatter strided elements into storage
         for (int i = 0; i < axisSize; i++)
         {
-            destSpan[baseIndex + i * axisStride] = srcSpan[i];
+            _data[baseIndex + i * axisStride] = values[i];
         }
     }
 
@@ -2456,8 +2411,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same dimensions for element-wise multiplication.");
 
-        // Use the Vector's ElementwiseMultiply method to perform the operation
-        var resultData = _data.ElementwiseMultiply(other._data);
+        var a = this.Contiguous();
+        var b = other.Contiguous();
+        var resultData = a._data.ElementwiseMultiply(b._data);
         return new Tensor<T>(_shape, resultData);
     }
 
