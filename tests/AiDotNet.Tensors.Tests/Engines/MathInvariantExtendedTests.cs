@@ -67,8 +67,8 @@ public class MathInvariantExtendedTests
     // ================================================================
     // TensorBroadcastAddInPlace (2)
     // ================================================================
-    [Fact] public void BroadcastAddInPlace_MatchesBroadcastAdd() { var a = R([4, 8], 1); var b = R([1, 8], 2); var expected = E.TensorBroadcastAdd(a, b); var aCopy = new Tensor<float>((float[])a.GetDataArray().Clone(), a.Shape); E.TensorBroadcastAddInPlace(aCopy, b); AE(aCopy, expected, 1e-3f); }
-    [Fact] public void BroadcastAddInPlace_AddZero_Unchanged() { var a = R([4, 8], 1); var z = C(0f, [1, 8]); var aCopy = new Tensor<float>((float[])a.GetDataArray().Clone(), a.Shape); E.TensorBroadcastAddInPlace(aCopy, z); AE(aCopy, a); }
+    [Fact] public void BroadcastAddInPlace_MatchesBroadcastAdd() { var a = R([4, 8], 1); var b = R([1, 8], 2); var expected = E.TensorBroadcastAdd(a, b); var aCopy = new Tensor<float>((float[])a.GetDataArray().Clone(), a._shape); E.TensorBroadcastAddInPlace(aCopy, b); AE(aCopy, expected, 1e-3f); }
+    [Fact] public void BroadcastAddInPlace_AddZero_Unchanged() { var a = R([4, 8], 1); var z = C(0f, [1, 8]); var aCopy = new Tensor<float>((float[])a.GetDataArray().Clone(), a._shape); E.TensorBroadcastAddInPlace(aCopy, z); AE(aCopy, a); }
 
     // ================================================================
     // TensorClamp (vs TensorClip) (2)
@@ -356,12 +356,12 @@ public class MathInvariantExtendedTests
     // ================================================================
     // In-place activation ops (SigmoidInPlace, ReLUInPlace, SwishInPlace, GELUInPlace, TanhInPlace, MishInPlace) (6)
     // ================================================================
-    [Fact] public void SigmoidInPlace_MatchesSigmoid() { var x = R([64], 1); var expected = E.TensorSigmoid(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.SigmoidInPlace(copy); AE(copy, expected); }
-    [Fact] public void ReLUInPlace_MatchesReLU() { var x = R([64], 1); var expected = E.TensorReLU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.ReLUInPlace(copy); AE(copy, expected); }
-    [Fact] public void SwishInPlace_MatchesSwish() { var x = R([64], 1); var expected = E.TensorSiLU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.SwishInPlace(copy); AE(copy, expected, 1e-3f); }
-    [Fact] public void GELUInPlace_MatchesGELU() { var x = R([64], 1); var expected = E.TensorGELU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.GELUInPlace(copy); AE(copy, expected, 1e-3f); }
-    [Fact] public void TanhInPlace_MatchesTanh() { var x = R([64], 1); var expected = E.TensorTanh(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.TanhInPlace(copy); AE(copy, expected, 1e-3f); }
-    [Fact] public void MishInPlace_MatchesMish() { var x = R([64], 1); var expected = E.TensorMish(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.MishInPlace(copy); AE(copy, expected, 1e-3f); }
+    [Fact] public void SigmoidInPlace_MatchesSigmoid() { var x = R([64], 1); var expected = E.TensorSigmoid(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.SigmoidInPlace(copy); AE(copy, expected); }
+    [Fact] public void ReLUInPlace_MatchesReLU() { var x = R([64], 1); var expected = E.TensorReLU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.ReLUInPlace(copy); AE(copy, expected); }
+    [Fact] public void SwishInPlace_MatchesSwish() { var x = R([64], 1); var expected = E.TensorSiLU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.SwishInPlace(copy); AE(copy, expected, 1e-3f); }
+    [Fact] public void GELUInPlace_MatchesGELU() { var x = R([64], 1); var expected = E.TensorGELU(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.GELUInPlace(copy); AE(copy, expected, 1e-3f); }
+    [Fact] public void TanhInPlace_MatchesTanh() { var x = R([64], 1); var expected = E.TensorTanh(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.TanhInPlace(copy); AE(copy, expected, 1e-3f); }
+    [Fact] public void MishInPlace_MatchesMish() { var x = R([64], 1); var expected = E.TensorMish(x); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.MishInPlace(copy); AE(copy, expected, 1e-3f); }
 
     // ================================================================
     // Into ops: SigmoidInto, ReLUInto, SwishInto, GELUInto, TanhInto, MishInto (6)
@@ -433,7 +433,7 @@ public class MathInvariantExtendedTests
     // ================================================================
     // LeakyReLUInPlace / LeakyReLUInto (2)
     // ================================================================
-    [Fact] public void LeakyReLUInPlace_MatchesLeakyReLU() { var x = R([64], 1); var expected = E.TensorLeakyReLU(x, 0.01f); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x.Shape); E.LeakyReLUInPlace(copy, 0.01f); AE(copy, expected, 1e-3f); }
+    [Fact] public void LeakyReLUInPlace_MatchesLeakyReLU() { var x = R([64], 1); var expected = E.TensorLeakyReLU(x, 0.01f); var copy = new Tensor<float>((float[])x.GetDataArray().Clone(), x._shape); E.LeakyReLUInPlace(copy, 0.01f); AE(copy, expected, 1e-3f); }
     [Fact] public void LeakyReLUInto_MatchesLeakyReLU() { var x = R([64], 1); var dest = new Tensor<float>(new float[64], [64]); E.LeakyReLUInto(dest, x, 0.01f); AE(dest, E.TensorLeakyReLU(x, 0.01f), 1e-3f); }
 
     // ================================================================
