@@ -582,6 +582,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Get a view into the target location using SubTensor, then copy data through it
         var target = this.SubTensor(indices);
+        if (!ShapeEquals(target._shape, subTensor._shape))
+            throw new ArgumentException($"Sub-tensor shape [{string.Join(", ", subTensor._shape)}] must match target shape [{string.Join(", ", target._shape)}].");
         target.CopyFromArray(subTensor.Contiguous().ToArray());
     }
 
@@ -873,6 +875,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // View-safe: get a view into target location, then copy data through CopyFromArray
         var target = this.Slice(index);
+        if (!ShapeEquals(target._shape, slice._shape))
+            throw new ArgumentException($"Slice shape [{string.Join(", ", slice._shape)}] must match target shape [{string.Join(", ", target._shape)}].");
         target.CopyFromArray(slice.Contiguous().ToArray());
     }
 
@@ -1265,6 +1269,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
+        for (int i = 0; i < newShape.Length; i++)
+        {
+            if (newShape[i] < 0)
+                throw new ArgumentException($"Reshape dimension {i} must be non-negative, got {newShape[i]}.");
+        }
+
         int newTotal = 1;
         for (int i = 0; i < newShape.Length; i++)
             newTotal *= newShape[i];
@@ -2290,10 +2300,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Tensor<T> ElementwiseMultiply(Tensor<T> a, Tensor<T> b)
     {
+        if (!ShapeEquals(a._shape, b._shape))
+            throw new ArgumentException("Tensors must have the same shape for element-wise multiplication.");
         var ac = a.Contiguous();
         var bc = b.Contiguous();
         Tensor<T> result = new Tensor<T>(a._shape);
-        _numOps.Multiply(ac._data.AsSpan(), bc._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Multiply(ac.AsSpan(), bc.AsSpan(), result._data.AsWritableSpan());
 
         return result;
     }
@@ -2682,10 +2694,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
+        if (!ShapeEquals(_shape, other._shape))
+            throw new ArgumentException("Tensors must have the same shape for addition.");
         var a = this.Contiguous();
         var b = other.Contiguous();
         var result = TensorAllocator.Rent<T>(_shape);
-        _numOps.Add(a._data.AsSpan(), b._data.AsSpan(), result._data.AsWritableSpan());
+        _numOps.Add(a.AsSpan(), b.AsSpan(), result._data.AsWritableSpan());
         return result;
     }
 
@@ -3454,6 +3468,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // View-safe: get a view into the target location and copy data through it
         var target = this.GetSliceAlongDimension(index, dimension);
+        if (!ShapeEquals(target._shape, slice._shape))
+            throw new ArgumentException($"Slice shape [{string.Join(", ", slice._shape)}] must match target shape [{string.Join(", ", target._shape)}].");
         target.CopyFromArray(slice.Contiguous().ToArray());
     }
 

@@ -34,7 +34,7 @@ internal sealed class TensorStorage<T>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when size is not positive.</exception>
     internal TensorStorage(int size)
     {
-        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be positive.");
+        if (size < 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be non-negative.");
         _data = new Vector<T>(size);
         _refCount = 1;
     }

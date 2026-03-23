@@ -139,9 +139,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -157,9 +158,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -180,9 +182,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -199,39 +202,71 @@ public abstract class TensorBase<T>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
-    protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
+    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView,
+        TensorStorage<T>? parentStorage = null)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        if (strides == null) throw new ArgumentNullException(nameof(strides));
         if (strides.Length != shape.Length)
             throw new ArgumentException($"Strides length ({strides.Length}) must match shape length ({shape.Length}).");
         if (storageOffset < 0)
             throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
 
-        int totalElements = ComputeProduct(shape);
+        // Defensive copy to prevent external mutation of metadata
+        var shapeCopy = (int[])shape.Clone();
+        var stridesCopy = (int[])strides.Clone();
 
-        // Validate bounds — skip for zero-size tensors (no elements to address)
-        if (totalElements > 0)
+        // Validate shape dimensions are non-negative
+        for (int i = 0; i < shapeCopy.Length; i++)
         {
-            int maxIndex = storageOffset;
-            for (int i = 0; i < shape.Length; i++)
-            {
-                if (shape[i] > 1)
-                    maxIndex += (shape[i] - 1) * Math.Abs(strides[i]);
-            }
-            if (maxIndex >= data.Length)
-                throw new ArgumentException(
-                    $"View exceeds storage bounds: max index {maxIndex} >= storage length {data.Length}.");
+            if (shapeCopy[i] < 0)
+                throw new ArgumentException($"Shape dimension {i} must be non-negative, got {shapeCopy[i]}.");
         }
 
-        _shape = shape;
-        Shape = new TensorShape(shape);
-        _strides = strides;
+        int totalElements = ComputeProduct(shapeCopy);
+
+        // Validate bounds using long to prevent overflow — skip for zero-size tensors
+        if (totalElements > 0)
+        {
+            long minIndex = storageOffset;
+            long maxIndex = storageOffset;
+            for (int i = 0; i < shapeCopy.Length; i++)
+            {
+                if (shapeCopy[i] > 1)
+                {
+                    long extent = (long)(shapeCopy[i] - 1) * stridesCopy[i];
+                    if (extent >= 0)
+                        maxIndex += extent;
+                    else
+                        minIndex += extent;
+                }
+            }
+            if (minIndex < 0 || maxIndex >= data.Length)
+                throw new ArgumentException(
+                    $"View exceeds storage bounds: index range [{minIndex}, {maxIndex}] outside storage [0, {data.Length - 1}].");
+        }
+
+        _shape = shapeCopy;
+        Shape = new TensorShape(shapeCopy);
+        _strides = stridesCopy;
         _storageOffset = storageOffset;
         IsView = isView;
         _data = data;
-        _storage = new TensorStorage<T>(_data);
-        if (isView) _storage.AddRef();
+
+        // Share parent storage for proper reference counting across views
+        if (parentStorage != null)
+        {
+            _storage = parentStorage;
+            _storage.AddRef();
+        }
+        else
+        {
+            _storage = new TensorStorage<T>(_data);
+            if (isView) _storage.AddRef();
+        }
+
         Length = totalElements;
-        IsContiguous = CheckContiguous(shape, strides);
+        IsContiguous = CheckContiguous(shapeCopy, stridesCopy);
     }
 
     // ================================================================

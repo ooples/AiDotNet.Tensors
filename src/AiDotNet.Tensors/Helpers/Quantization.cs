@@ -87,7 +87,8 @@ public static class Quantization
         if (qparams.Scale <= 0)
             throw new ArgumentException("Scale must be positive.", nameof(qparams));
 
-        var src = input.AsSpan();
+        var srcTensor = input.IsContiguous ? input : input.Contiguous();
+        var src = srcTensor.AsSpan();
         var result = new Tensor<sbyte>(input._shape);
         var dst = result.AsWritableSpan();
         float invScale = 1f / qparams.Scale;
@@ -110,7 +111,7 @@ public static class Quantization
     /// </summary>
     public static Tensor<float> DequantizeInt8(Tensor<sbyte> input, QuantizationParams qparams)
     {
-        var src = input.AsSpan();
+        var src = (input.IsContiguous ? input : input.Contiguous()).AsSpan();
         var result = new Tensor<float>(input._shape);
         var dst = result.AsWritableSpan();
         float scale = qparams.Scale;
@@ -129,7 +130,7 @@ public static class Quantization
     /// </summary>
     public static Tensor<Half> QuantizeFP16(Tensor<float> input)
     {
-        var src = input.AsSpan();
+        var src = (input.IsContiguous ? input : input.Contiguous()).AsSpan();
         var result = new Tensor<Half>(input._shape);
         var dst = result.AsWritableSpan();
 
@@ -146,7 +147,7 @@ public static class Quantization
     /// </summary>
     public static Tensor<float> DequantizeFP16(Tensor<Half> input)
     {
-        var src = input.AsSpan();
+        var src = (input.IsContiguous ? input : input.Contiguous()).AsSpan();
         var result = new Tensor<float>(input._shape);
         var dst = result.AsWritableSpan();
 
