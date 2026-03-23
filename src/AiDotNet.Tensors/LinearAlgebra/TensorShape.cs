@@ -3,13 +3,14 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
-/// Immutable, zero-allocation wrapper around tensor dimension metadata.
+/// Immutable wrapper around tensor dimension metadata.
 /// Provides direct indexer access (tensor.Shape[0]) without exposing mutable int[].
 /// </summary>
 /// <remarks>
-/// <para>This is a value type (struct) — no heap allocation, lives on the stack.
-/// Internal array is never exposed to consumers, preventing mutation that could
-/// corrupt stride/contiguity invariants.</para>
+/// <para>This is a value type (struct) — the struct itself lives on the stack.
+/// Internal code uses WrapUnsafe for zero-allocation construction.
+/// The public constructor defensively copies the input array to prevent mutation.</para>
+/// <para>default(TensorShape) is safe — represents a scalar (zero dimensions).</para>
 /// </remarks>
 public readonly struct TensorShape : IEquatable<TensorShape>
 {

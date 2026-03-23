@@ -8,8 +8,9 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T>
+public abstract class TensorBase<T> : IDisposable
 {
+    private bool _disposed;
     // ================================================================
     // Core storage and metadata
     // ================================================================
@@ -139,6 +140,7 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
         Shape = TensorShape.WrapUnsafe(_shape);
@@ -157,6 +159,7 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
         Shape = TensorShape.WrapUnsafe(_shape);
@@ -180,6 +183,7 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
         Shape = TensorShape.WrapUnsafe(_shape);
@@ -260,8 +264,8 @@ public abstract class TensorBase<T>
         }
         else
         {
+            // New storage starts at refCount=1 — no extra AddRef needed
             _storage = new TensorStorage<T>(_data);
-            if (isView) _storage.AddRef();
         }
 
         Length = totalElements;
@@ -445,8 +449,18 @@ public abstract class TensorBase<T>
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
         var result = CreateInstance<TResult>(_shape);
-        for (int i = 0; i < Length; i++)
-            result._data[i] = func(GetFlat(i));
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            // Fast path: direct span access for non-view contiguous tensors
+            var src = _data.AsSpan();
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(src[i]);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(GetFlat(i));
+        }
         return result;
     }
 
@@ -589,5 +603,17 @@ public abstract class TensorBase<T>
     public override string ToString()
     {
         return $"Tensor<{typeof(T).Name}> with shape {Shape}";
+    }
+
+    /// <summary>
+    /// Releases the tensor's reference to shared storage.
+    /// When the last tensor/view sharing this storage is disposed, the storage can be reclaimed.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _storage.Release();
+        GC.SuppressFinalize(this);
     }
 }

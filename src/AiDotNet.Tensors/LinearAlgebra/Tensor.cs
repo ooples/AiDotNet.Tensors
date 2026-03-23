@@ -3329,7 +3329,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else
         {
-            throw new NotSupportedException($"Multiplication is not supported for tensors with shapes {string.Join("x", Shape)} and {string.Join("x", other._shape)}. Supported: 2D×2D, 3D×3D, 3D×2D, 4D×4D, 4D×2D.");
+            throw new NotSupportedException($"Multiplication is not supported for tensors with shapes {string.Join("x", _shape)} and {string.Join("x", other._shape)}. Supported: 2DxD, 3Dx3D, 3Dx2D, 4Dx4D, 4Dx2D.");
         }
     }
 
