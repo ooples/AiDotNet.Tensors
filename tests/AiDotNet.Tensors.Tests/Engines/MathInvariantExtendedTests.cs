@@ -244,7 +244,7 @@ public class MathInvariantExtendedTests
     // SoftmaxBackward (via Softmax method) (2)
     // ================================================================
     [Fact] public void SoftmaxBackward_Consistent() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); Assert.Equal(sm.Shape, E.SoftmaxBackward(grad, sm, -1).Shape); }
-    [Fact] public void SoftmaxBackward_NonZero() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); var back = E.SoftmaxBackward(grad, sm, -1); Assert.True(back.GetDataArray().Any(v => Math.Abs(v) > 1e-7f)); }
+    [Fact] public void SoftmaxBackward_NonZero() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); var back = E.SoftmaxBackward(grad, sm, -1); Assert.Contains(back.GetDataArray(), v => Math.Abs(v) > 1e-7f); }
 
     // ================================================================
     // GroupNorm (3)
@@ -552,7 +552,7 @@ public class MathInvariantExtendedTests
         var dSig = E.SigmoidBackward(grad, sig);
         Assert.Equal(new[] { 64 }, dSig.Shape);
         // Result should be non-zero since grad is non-zero
-        Assert.True(dSig.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "SigmoidBackward all zeros");
+        Assert.Contains(dSig.GetDataArray(), v => Math.Abs(v) > 1e-7f);
     }
 
     [Fact] public void TanhBackward_ShapePreserved()
@@ -562,7 +562,7 @@ public class MathInvariantExtendedTests
         var grad = R([64], 223);
         var dTanh = E.TanhBackward(grad, th);
         Assert.Equal(new[] { 64 }, dTanh.Shape);
-        Assert.True(dTanh.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "TanhBackward all zeros");
+        Assert.Contains(dTanh.GetDataArray(), v => Math.Abs(v) > 1e-7f);
     }
 
     [Fact] public void ReLUDerivative_Correct()
