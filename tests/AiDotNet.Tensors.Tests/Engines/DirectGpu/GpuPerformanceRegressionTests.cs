@@ -62,7 +62,7 @@ public class GpuPerformanceRegressionTests : IDisposable
     }
 
     [SkippableFact]
-    public void TensorAdd_1M_CompletesWithin50ms()
+    public void TensorAdd_1M_CompletesWithin500ms()
     {
         SkipIfNoGpu();
         var a = RandomTensor(new[] { 1000, 1000 }, 1);

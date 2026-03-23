@@ -112,6 +112,8 @@ public static class MathHelper
             return new Int64Operations();
         if (typeof(T) == typeof(ulong))
             return new UInt64Operations();
+        if (typeof(T) == typeof(Bit))
+            return new BitOperations();
 
         throw new NotSupportedException($"Numeric operations for type {typeof(T)} are not supported.");
     }
