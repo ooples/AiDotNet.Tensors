@@ -139,9 +139,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -157,9 +158,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -180,9 +182,10 @@ public abstract class TensorBase<T>
     /// </summary>
     protected TensorBase(Vector<T> data, int[] shape)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
-        _shape = shape;
-        Shape = new TensorShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = new TensorShape(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;

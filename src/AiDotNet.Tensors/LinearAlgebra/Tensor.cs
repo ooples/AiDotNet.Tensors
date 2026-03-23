@@ -194,7 +194,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -227,7 +227,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -259,7 +259,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -1024,8 +1024,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Scale(T factor)
     {
+        var src = IsContiguous ? this : Contiguous();
         var result = TensorAllocator.Rent<T>(this._shape);
-        _numOps.MultiplyScalar(_data.AsSpan(), factor, result._data.AsWritableSpan());
+        _numOps.MultiplyScalar(src.AsSpan(), factor, result._data.AsWritableSpan());
         return result;
     }
 
@@ -1157,15 +1158,29 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (permutation.Length != Rank)
             throw new ArgumentException("Permutation array length must match tensor rank.");
 
-        // Validate permutation is a valid bijection [0..Rank) — O(Rank), zero allocation.
-        // Uses a single int as a bitmask for Rank <= 32 (covers all practical tensor ranks).
-        int seen = 0;
-        for (int i = 0; i < Rank; i++)
+        // Validate permutation is a valid bijection [0..Rank).
+        // Uses bitmask for Rank <= 31, bool[] fallback for higher ranks.
+        if (Rank <= 31)
         {
-            int p = permutation[i];
-            if (p < 0 || p >= Rank || (seen & (1 << p)) != 0)
-                throw new ArgumentException("Invalid permutation array.");
-            seen |= (1 << p);
+            int seen = 0;
+            for (int i = 0; i < Rank; i++)
+            {
+                int p = permutation[i];
+                if (p < 0 || p >= Rank || (seen & (1 << p)) != 0)
+                    throw new ArgumentException("Invalid permutation array.");
+                seen |= (1 << p);
+            }
+        }
+        else
+        {
+            var seen = new bool[Rank];
+            for (int i = 0; i < Rank; i++)
+            {
+                int p = permutation[i];
+                if (p < 0 || p >= Rank || seen[p])
+                    throw new ArgumentException("Invalid permutation array.");
+                seen[p] = true;
+            }
         }
 
         // O(1) view: permute shape and strides, share storage. Zero data movement.
@@ -1177,7 +1192,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newStrides[i] = _strides[permutation[i]];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
     }
 
     /// <summary>
@@ -1200,11 +1215,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
-        var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+        // View-safe: use AsSpan() which handles offset, or materialize non-contiguous views
+        if (IsContiguous && other.IsContiguous)
+        {
+            var result = TensorAllocator.Rent<T>(_shape);
+            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
+            return result;
+        }
 
-        return result;
+        return Contiguous().Subtract(other.Contiguous());
     }
 
     /// <summary>
@@ -1369,7 +1388,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             // O(1) view: same storage, new shape, row-major strides, same offset.
             // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
             var newStrides = ComputeRowMajorStrides(newShape);
-            return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+            return new Tensor<T>(_data, newShape, newStrides, _storageOffset, _storage);
         }
 
         // Non-contiguous view: must materialize first, then reshape the contiguous result
@@ -3420,7 +3439,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.
-            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset);
+            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset, _storage);
         }
         else if (_shape.Length == 2)
         {

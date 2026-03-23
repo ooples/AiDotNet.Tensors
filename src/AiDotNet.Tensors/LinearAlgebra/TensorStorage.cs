@@ -9,8 +9,9 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// <remarks>
 /// <para>This follows the PyTorch Storage model where the actual data lives in a Storage object
 /// and Tensor is a view into that storage with shape/stride metadata.</para>
-/// <para>Thread-safe reference counting ensures storage is kept alive while any view exists
-/// and returned to the pool when the last view is released.</para>
+/// <para>Thread-safe reference counting tracks how many views share this storage.
+/// Currently used for diagnostics and future pool integration. Storage lifetime
+/// is managed by the GC; views increment/decrement the count for bookkeeping.</para>
 /// </remarks>
 /// <typeparam name="T">The numeric type of the stored elements.</typeparam>
 internal sealed class TensorStorage<T>
