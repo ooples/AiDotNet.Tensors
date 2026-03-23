@@ -25,6 +25,37 @@ public abstract class TensorBase<T>
     /// </remarks>
     protected readonly Vector<T> _data;
 
+    /// <summary>
+    /// Pre-computed strides for each dimension, following PyTorch's stride convention.
+    /// For row-major order: strides[i] = product of Shape[i+1..end].
+    /// For transposed views: strides are permuted without copying data.
+    /// </summary>
+    protected readonly int[] _strides;
+
+    /// <summary>
+    /// Offset into the underlying storage where this tensor's data begins.
+    /// Zero for non-view tensors. Non-zero for sliced views.
+    /// </summary>
+    protected readonly int _storageOffset;
+
+    /// <summary>
+    /// Whether this tensor's data is contiguous in memory (row-major with no gaps).
+    /// When true, raw span/array access is safe. When false, Contiguous() must be called
+    /// before passing to BLAS/SIMD operations.
+    /// </summary>
+    public bool IsContiguous { get; }
+
+    /// <summary>
+    /// Whether this tensor is a view into another tensor's storage.
+    /// Views share memory — mutations through one view are visible in others.
+    /// </summary>
+    public bool IsView { get; }
+
+    /// <summary>
+    /// Gets the pre-computed strides for each dimension.
+    /// </summary>
+    public ReadOnlySpan<int> Strides => _strides;
+
 
 
     /// <summary>
@@ -118,6 +149,10 @@ public abstract class TensorBase<T>
     protected TensorBase(params int[] shape)
     {
         Shape = shape;
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
         int totalSize = shape.Aggregate(1, (acc, dim) => acc * dim);
         _data = new Vector<T>(totalSize);
     }
@@ -130,6 +165,10 @@ public abstract class TensorBase<T>
     protected TensorBase(IEnumerable<T> data, params int[] shape)
     {
         Shape = shape;
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
         // When data is already a T[], use zero-copy Memory<T> path to preserve identity
         // (critical for GPU deferred materialization — the array reference must match)
         if (data is T[] array)
@@ -155,11 +194,29 @@ public abstract class TensorBase<T>
     protected TensorBase(Vector<T> data, int[] shape)
     {
         Shape = shape;
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
         _data = data;
         if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
         {
             throw new ArgumentException("The number of values does not match the specified shape.");
         }
+    }
+
+    /// <summary>
+    /// Internal constructor for creating views with custom strides and offset.
+    /// No data is copied — the view shares the same underlying storage.
+    /// </summary>
+    protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
+    {
+        Shape = shape;
+        _strides = strides;
+        _storageOffset = storageOffset;
+        IsView = isView;
+        _data = data;
+        IsContiguous = CheckContiguous(shape, strides);
     }
 
     /// <summary>
@@ -220,16 +277,45 @@ public abstract class TensorBase<T>
     /// <returns>The corresponding flat index.</returns>
     protected int GetFlatIndex(int[] indices)
     {
-        int flatIndex = 0;
-        int multiplier = 1;
-
-        for (int i = indices.Length - 1; i >= 0; i--)
+        int flatIndex = _storageOffset;
+        for (int i = 0; i < indices.Length; i++)
         {
-            flatIndex += indices[i] * multiplier;
-            multiplier *= Shape[i];
+            flatIndex += indices[i] * _strides[i];
         }
-
         return flatIndex;
+    }
+
+    /// <summary>
+    /// Computes row-major strides for the given shape.
+    /// strides[i] = product of shape[i+1..end]
+    /// Example: shape [3,4,5] → strides [20, 5, 1]
+    /// </summary>
+    protected static int[] ComputeRowMajorStrides(int[] shape)
+    {
+        var strides = new int[shape.Length];
+        if (shape.Length == 0) return strides;
+        strides[shape.Length - 1] = 1;
+        for (int i = shape.Length - 2; i >= 0; i--)
+        {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        return strides;
+    }
+
+    /// <summary>
+    /// Checks whether the given shape+strides represent a contiguous row-major layout.
+    /// </summary>
+    private static bool CheckContiguous(int[] shape, int[] strides)
+    {
+        if (shape.Length == 0) return true;
+        int expected = 1;
+        for (int i = shape.Length - 1; i >= 0; i--)
+        {
+            if (shape[i] != 1 && strides[i] != expected)
+                return false;
+            expected *= shape[i];
+        }
+        return true;
     }
 
     /// <summary>
