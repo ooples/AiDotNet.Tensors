@@ -17,29 +17,12 @@ public class MathInvariantTests
     private readonly CpuEngine E = new();
     private const float Tol = 1e-4f;
 
-    /// <summary>Creates a random tensor with values in [-1, 1] using deterministic seed.</summary>
-    private Tensor<float> Rand(int[] shape, int seed) { var r = new Random(seed); var d = new float[shape.Aggregate(1, (a, b) => a * b)]; for (int i = 0; i < d.Length; i++) d[i] = (float)(r.NextDouble() * 2 - 1); return new Tensor<float>(d, shape); }
-    private Tensor<float> R(int[] s, int seed) => Rand(s, seed); // shorthand alias
-
-    /// <summary>Creates a random tensor with strictly positive values in [0.1, 10].</summary>
-    private Tensor<float> RandPositive(int[] shape, int seed) { var r = new Random(seed); var d = new float[shape.Aggregate(1, (a, b) => a * b)]; for (int i = 0; i < d.Length; i++) d[i] = (float)(r.NextDouble() * 9.9 + 0.1); return new Tensor<float>(d, shape); }
-    private Tensor<float> RP(int[] s, int seed) => RandPositive(s, seed); // shorthand alias
-
-    /// <summary>Creates a constant tensor with all elements set to v.</summary>
-    private Tensor<float> Const(float v, int n) => new(Enumerable.Repeat(v, n).ToArray(), new[] { n });
-    private Tensor<float> C(float v, int n) => Const(v, n); // shorthand alias
-
-    /// <summary>Asserts two tensors are element-wise close within tolerance.</summary>
-    private void AssertClose(Tensor<float> a, Tensor<float> b, float tol = 1e-4f, string msg = "") { Assert.Equal(a.Shape, b.Shape); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < tol, $"{msg} [{i}]: {ad[i]} vs {bd[i]}"); }
-    private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") => AssertClose(a, b, t, m); // shorthand alias
-
-    /// <summary>Asserts all elements are near zero.</summary>
-    private void AssertZero(Tensor<float> a, string msg = "") { var d = a.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{msg} [{i}]={d[i]}"); }
-    private void AZ(Tensor<float> a, string m = "") => AssertZero(a, m); // shorthand alias
-
-    /// <summary>Asserts all values are within [lo, hi] range.</summary>
-    private void AssertRange(float[] d, float lo, float hi, string msg) { for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{msg} [{i}]={d[i]}"); }
-    private void AR(float[] d, float lo, float hi, string m) => AssertRange(d, lo, hi, m); // shorthand alias
+    private Tensor<float> R(int[] s, int seed) { var r = new Random(seed); var d = new float[s.Aggregate(1, (a, b) => a * b)]; for (int i = 0; i < d.Length; i++) d[i] = (float)(r.NextDouble() * 2 - 1); return new Tensor<float>(d, s); }
+    private Tensor<float> RP(int[] s, int seed) { var r = new Random(seed); var d = new float[s.Aggregate(1, (a, b) => a * b)]; for (int i = 0; i < d.Length; i++) d[i] = (float)(r.NextDouble() * 9.9 + 0.1); return new Tensor<float>(d, s); }
+    private Tensor<float> C(float v, int n) => new(Enumerable.Repeat(v, n).ToArray(), new[] { n });
+    private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") { Assert.Equal(a.Shape, b.Shape); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < t, $"{m} [{i}]: {ad[i]} vs {bd[i]}"); }
+    private void AZ(Tensor<float> a, string m = "") { var d = a.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{m} [{i}]={d[i]}"); }
+    private void AR(float[] d, float lo, float hi, string m) { for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{m} [{i}]={d[i]}"); }
 
     // ================================================================
     // ADDITION (8)
