@@ -17,21 +17,25 @@ internal sealed class TensorStorage<T>
 {
     private readonly Vector<T> _data;
     private int _refCount;
+    private volatile bool _disposed;
 
     /// <summary>
     /// Creates a new storage wrapping an existing Vector (zero-copy).
     /// </summary>
+    /// <exception cref="ArgumentNullException">Thrown when data is null.</exception>
     internal TensorStorage(Vector<T> data)
     {
-        _data = data;
+        _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
     }
 
     /// <summary>
     /// Creates a new storage with the specified size.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when size is not positive.</exception>
     internal TensorStorage(int size)
     {
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be positive.");
         _data = new Vector<T>(size);
         _refCount = 1;
     }
@@ -49,22 +53,32 @@ internal sealed class TensorStorage<T>
     /// <summary>
     /// Increments the reference count. Called when a new view is created from this storage.
     /// </summary>
+    /// <exception cref="ObjectDisposedException">Thrown when storage has been fully released.</exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void AddRef()
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(TensorStorage<T>));
         Interlocked.Increment(ref _refCount);
     }
 
     /// <summary>
-    /// Decrements the reference count. When it reaches zero, the storage can be reclaimed.
+    /// Decrements the reference count. When it reaches zero, the storage is marked as disposed
+    /// and the pooled array (if any) can be reclaimed by TensorAllocator.
     /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown on double-release (refCount already 0).</exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void Release()
     {
-        if (Interlocked.Decrement(ref _refCount) == 0)
+        int newCount = Interlocked.Decrement(ref _refCount);
+        if (newCount < 0)
         {
-            // Storage is no longer referenced by any tensor view.
-            // Future: return to TensorAllocator pool here.
+            // Restore and throw — this is a bug in the caller.
+            Interlocked.Increment(ref _refCount);
+            throw new InvalidOperationException("TensorStorage released more times than it was acquired.");
+        }
+        if (newCount == 0)
+        {
+            _disposed = true;
         }
     }
 

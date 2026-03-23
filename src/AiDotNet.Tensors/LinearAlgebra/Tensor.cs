@@ -117,30 +117,36 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Contiguous()
     {
-        if (IsContiguous) return this;
+        if (IsContiguous && _storageOffset == 0) return this;
 
         // Materialize: copy data from strided layout to contiguous row-major
         var result = new Tensor<T>(Shape);
         var srcData = _data.GetDataArray();
         var dstData = result._data.AsWritableSpan();
-        var indices = new int[Rank];
 
-        for (int i = 0; i < Length; i++)
+        if (IsContiguous)
         {
-            // Compute strided source index
-            int srcIdx = _storageOffset;
-            int remaining = i;
-            for (int d = 0; d < Rank; d++)
-            {
-                int dimSize = 1;
-                for (int dd = d + 1; dd < Rank; dd++)
-                    dimSize *= Shape[dd];
-                indices[d] = remaining / dimSize;
-                remaining %= dimSize;
-                srcIdx += indices[d] * _strides[d];
-            }
+            // Contiguous with offset — simple bulk copy
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(dstData);
+        }
+        else
+        {
+            // Non-contiguous — use row-major strides to decompose flat index into multi-dim
+            // Pre-compute row-major strides for the output (avoids inner loop per element)
+            var rowMajorStrides = ComputeRowMajorStrides(Shape);
 
-            dstData[i] = srcData[srcIdx];
+            for (int i = 0; i < Length; i++)
+            {
+                int srcIdx = _storageOffset;
+                int remaining = i;
+                for (int d = 0; d < Rank; d++)
+                {
+                    int dimIndex = remaining / rowMajorStrides[d];
+                    remaining -= dimIndex * rowMajorStrides[d];
+                    srcIdx += dimIndex * _strides[d];
+                }
+                dstData[i] = srcData[srcIdx];
+            }
         }
 
         return result;

@@ -79,9 +79,10 @@ public abstract class TensorBase<T>
     public int[] Shape { get; }
 
     /// <summary>
-    /// Gets the total number of elements in the tensor.
+    /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
+    /// For views, this is the view's element count, not the underlying storage size.
     /// </summary>
-    public int Length => _data.Length;
+    public int Length { get; }
 
     /// <summary>
     /// Gets the rank (number of dimensions) of the tensor.
@@ -98,12 +99,14 @@ public abstract class TensorBase<T>
     /// AiDotNet libraries access this via InternalsVisibleTo.</para>
     /// <para>For large tensors (>256K elements), the memory is POH-pinned, so Pin() is essentially free.</para>
     /// </remarks>
-    internal Memory<T> Memory => _data.AsWritableMemory();
+    internal Memory<T> Memory => IsContiguous && _storageOffset == 0
+        ? _data.AsWritableMemory()
+        : _data.AsWritableMemory().Slice(_storageOffset, Length);
 
     /// <summary>
     /// Shorthand alias for <see cref="Memory"/> — used by engine code.
     /// </summary>
-    internal Memory<T> Data => _data.AsWritableMemory();
+    internal Memory<T> Data => Memory;
 
     /// <summary>
     /// Creates a new array containing a copy of the tensor's elements in flattened order.
@@ -116,7 +119,36 @@ public abstract class TensorBase<T>
     /// </remarks>
     public virtual T[] ToArray()
     {
-        return _data.ToArray();
+        if (IsContiguous && _storageOffset == 0 && _data.Length == Length)
+        {
+            return _data.ToArray();
+        }
+        // For views or offset tensors: copy logical elements in row-major order
+        var result = new T[Length];
+        if (IsContiguous)
+        {
+            // Contiguous with offset — bulk copy from offset
+            _data.AsSpan().Slice(_storageOffset, Length).CopyTo(result);
+        }
+        else
+        {
+            // Non-contiguous view — element-by-element using strides
+            var indices = new int[Rank];
+            for (int i = 0; i < Length; i++)
+            {
+                int srcIdx = _storageOffset;
+                int remaining = i;
+                for (int d = 0; d < Rank; d++)
+                {
+                    int dimStride = d < Rank - 1 ? Shape.Skip(d + 1).Aggregate(1, (a, b) => a * b) : 1;
+                    indices[d] = remaining / dimStride;
+                    remaining %= dimStride;
+                    srcIdx += indices[d] * _strides[d];
+                }
+                result[i] = _data[srcIdx];
+            }
+        }
+        return result;
     }
 
     /// <summary>
@@ -135,11 +167,37 @@ public abstract class TensorBase<T>
         {
             throw new ArgumentNullException(nameof(source));
         }
-        if (source.Length != _data.Length)
+        if (source.Length != Length)
         {
-            throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({_data.Length}).");
+            throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
         }
-        source.AsSpan().CopyTo(_data.AsWritableSpan());
+        if (IsContiguous && _storageOffset == 0 && _data.Length == Length)
+        {
+            source.AsSpan().CopyTo(_data.AsWritableSpan());
+        }
+        else if (IsContiguous)
+        {
+            source.AsSpan().CopyTo(_data.AsWritableSpan().Slice(_storageOffset, Length));
+        }
+        else
+        {
+            // Non-contiguous view — element-by-element using strides
+            var dstData = _data.AsWritableSpan();
+            var indices = new int[Rank];
+            for (int i = 0; i < Length; i++)
+            {
+                int dstIdx = _storageOffset;
+                int remaining = i;
+                for (int d = 0; d < Rank; d++)
+                {
+                    int dimStride = d < Rank - 1 ? Shape.Skip(d + 1).Aggregate(1, (a, b) => a * b) : 1;
+                    indices[d] = remaining / dimStride;
+                    remaining %= dimStride;
+                    dstIdx += indices[d] * _strides[d];
+                }
+                dstData[dstIdx] = source[i];
+            }
+        }
     }
 
     /// <summary>
@@ -154,6 +212,7 @@ public abstract class TensorBase<T>
         IsContiguous = true;
         IsView = false;
         int totalSize = shape.Aggregate(1, (acc, dim) => acc * dim);
+        Length = totalSize;
         _data = new Vector<T>(totalSize);
     }
 
@@ -175,7 +234,9 @@ public abstract class TensorBase<T>
             _data = Vector<T>.WrapMemory(array);
         else
             _data = new Vector<T>(data);
-        if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
+        int expectedSize = shape.Aggregate(1, (acc, dim) => acc * dim);
+        Length = expectedSize;
+        if (_data.Length != expectedSize)
         {
             throw new ArgumentException("The number of values does not match the specified shape.");
         }
@@ -199,7 +260,9 @@ public abstract class TensorBase<T>
         IsContiguous = true;
         IsView = false;
         _data = data;
-        if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
+        int expectedSize = shape.Aggregate(1, (acc, dim) => acc * dim);
+        Length = expectedSize;
+        if (_data.Length != expectedSize)
         {
             throw new ArgumentException("The number of values does not match the specified shape.");
         }
@@ -209,13 +272,31 @@ public abstract class TensorBase<T>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage.
     /// </summary>
+    /// <exception cref="ArgumentException">Thrown when strides length doesn't match shape, or when the view exceeds storage bounds.</exception>
     protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
     {
+        if (strides.Length != shape.Length)
+            throw new ArgumentException($"Strides length ({strides.Length}) must match shape length ({shape.Length}).");
+        if (storageOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
+
+        // Validate that the maximum addressable index doesn't exceed storage
+        int maxIndex = storageOffset;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] > 1)
+                maxIndex += (shape[i] - 1) * Math.Abs(strides[i]);
+        }
+        if (maxIndex >= data.Length)
+            throw new ArgumentException(
+                $"View exceeds storage bounds: max index {maxIndex} >= storage length {data.Length}.");
+
         Shape = shape;
         _strides = strides;
         _storageOffset = storageOffset;
         IsView = isView;
         _data = data;
+        Length = shape.Aggregate(1, (acc, dim) => acc * dim);
         IsContiguous = CheckContiguous(shape, strides);
     }
 
@@ -283,6 +364,26 @@ public abstract class TensorBase<T>
             flatIndex += indices[i] * _strides[i];
         }
         return flatIndex;
+    }
+
+    /// <summary>
+    /// Converts a logical flat index (row-major) to a storage index using strides and offset.
+    /// Used by GetFlat/SetFlat for non-contiguous views.
+    /// </summary>
+    private int FlatIndexToStorageIndex(int flatIndex)
+    {
+        int storageIndex = _storageOffset;
+        int remaining = flatIndex;
+        for (int d = 0; d < Rank; d++)
+        {
+            int dimProduct = 1;
+            for (int dd = d + 1; dd < Rank; dd++)
+                dimProduct *= Shape[dd];
+            int dimIndex = remaining / dimProduct;
+            remaining %= dimProduct;
+            storageIndex += dimIndex * _strides[d];
+        }
+        return storageIndex;
     }
 
     /// <summary>
@@ -422,7 +523,13 @@ public abstract class TensorBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
-        return _data.AsSpan();
+        if (IsContiguous && _storageOffset == 0 && _data.Length == Length)
+            return _data.AsSpan();
+        if (IsContiguous)
+            return _data.AsSpan().Slice(_storageOffset, Length);
+        // Non-contiguous: caller must call Contiguous() first
+        throw new InvalidOperationException(
+            "Cannot get a contiguous span from a non-contiguous tensor view. Call Contiguous() first.");
     }
 
     /// <summary>
@@ -438,7 +545,12 @@ public abstract class TensorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
-        return _data.AsWritableSpan();
+        if (IsContiguous && _storageOffset == 0 && _data.Length == Length)
+            return _data.AsWritableSpan();
+        if (IsContiguous)
+            return _data.AsWritableSpan().Slice(_storageOffset, Length);
+        throw new InvalidOperationException(
+            "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
     }
 
     /// <summary>
@@ -447,6 +559,11 @@ public abstract class TensorBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        if (!IsContiguous || _storageOffset != 0 || _data.Length != Length)
+        {
+            // For views: return a fresh contiguous array of just this view's data
+            return ToArray();
+        }
         return _data.GetDataArray();
     }
 
@@ -464,7 +581,12 @@ public abstract class TensorBase<T>
     {
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        return _data[flatIndex];
+        if (IsContiguous && _storageOffset == 0)
+        {
+            return _data[flatIndex];
+        }
+        // For views: convert flat index to multi-dim indices, then use strides
+        return _data[FlatIndexToStorageIndex(flatIndex)];
     }
 
     /// <summary>
@@ -481,7 +603,14 @@ public abstract class TensorBase<T>
     {
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
-        _data[flatIndex] = value;
+        if (IsContiguous && _storageOffset == 0)
+        {
+            _data[flatIndex] = value;
+        }
+        else
+        {
+            _data[FlatIndexToStorageIndex(flatIndex)] = value;
+        }
     }
 
     /// <summary>
