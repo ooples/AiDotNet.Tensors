@@ -203,8 +203,14 @@ public abstract class TensorBase<T> : IDisposable
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
-    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView,
-        TensorStorage<T>? parentStorage = null)
+    protected TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView)
+        : this(data, shape, strides, storageOffset, isView, null) { }
+
+    /// <summary>
+    /// View constructor that shares an existing TensorStorage (PyTorch model).
+    /// When parentStorage is provided, it is shared via AddRef instead of creating a new one.
+    /// </summary>
+    internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView, TensorStorage<T>? parentStorage)
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         if (strides == null) throw new ArgumentNullException(nameof(strides));
@@ -213,29 +219,24 @@ public abstract class TensorBase<T> : IDisposable
         if (storageOffset < 0)
             throw new ArgumentOutOfRangeException(nameof(storageOffset), "Storage offset must be non-negative.");
 
-        // Defensive copy to prevent external mutation of metadata
-        var shapeCopy = (int[])shape.Clone();
-        var stridesCopy = (int[])strides.Clone();
-
-        // Validate shape dimensions are non-negative
-        for (int i = 0; i < shapeCopy.Length; i++)
-        {
-            if (shapeCopy[i] < 0)
-                throw new ArgumentException($"Shape dimension {i} must be non-negative, got {shapeCopy[i]}.");
-        }
+        // Defensive copy of metadata
+        var shapeCopy = new int[shape.Length];
+        var stridesCopy = new int[strides.Length];
+        Array.Copy(shape, shapeCopy, shape.Length);
+        Array.Copy(strides, stridesCopy, strides.Length);
 
         int totalElements = ComputeProduct(shapeCopy);
 
-        // Validate bounds using long to prevent overflow — skip for zero-size tensors
+        // Validate bounds with correct negative stride handling
         if (totalElements > 0)
         {
-            long minIndex = storageOffset;
-            long maxIndex = storageOffset;
+            int minIndex = storageOffset;
+            int maxIndex = storageOffset;
             for (int i = 0; i < shapeCopy.Length; i++)
             {
                 if (shapeCopy[i] > 1)
                 {
-                    long extent = (long)(shapeCopy[i] - 1) * stridesCopy[i];
+                    int extent = (shapeCopy[i] - 1) * stridesCopy[i];
                     if (extent >= 0)
                         maxIndex += extent;
                     else
@@ -254,7 +255,7 @@ public abstract class TensorBase<T> : IDisposable
         IsView = isView;
         _data = data;
 
-        // Share parent storage for proper reference counting across views
+        // Share parent's storage if provided, otherwise create new
         if (parentStorage != null)
         {
             _storage = parentStorage;
@@ -262,7 +263,6 @@ public abstract class TensorBase<T> : IDisposable
         }
         else
         {
-            // New storage starts at refCount=1 — no extra AddRef needed
             _storage = new TensorStorage<T>(_data);
         }
 
@@ -447,8 +447,17 @@ public abstract class TensorBase<T> : IDisposable
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
         var result = CreateInstance<TResult>(_shape);
-        for (int i = 0; i < Length; i++)
-            result._data[i] = func(GetFlat(i));
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+        {
+            var src = _data.AsSpan();
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(src[i]);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+                result._data[i] = func(GetFlat(i));
+        }
         return result;
     }
 
@@ -602,6 +611,11 @@ public abstract class TensorBase<T> : IDisposable
     {
         return $"Tensor<{typeof(T).Name}> with shape {Shape}";
     }
+
+    /// <summary>
+    /// Releases the tensor's reference to shared storage.
+    /// When the last tensor/view sharing this storage is disposed, the storage can be reclaimed.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed) return;

@@ -16431,6 +16431,10 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
+        // Materialize non-contiguous views before BLAS operations
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
         // If both tensors are 3D, delegate to BatchMatMul
         if (a.Rank == 3 && b.Rank == 3)
         {
@@ -16917,27 +16921,6 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
-    {
-        if (condition == null) throw new ArgumentNullException(nameof(condition));
-        if (x == null) throw new ArgumentNullException(nameof(x));
-        if (y == null) throw new ArgumentNullException(nameof(y));
-
-        var result = TensorAllocator.Rent<T>(x._shape);
-        var condData = condition.GetDataArray();
-        var xData = x.GetDataArray();
-        var yData = y.GetDataArray();
-        var rData = result.GetDataArray();
-
-        Parallel.For(0, x.Length, i =>
-        {
-            rData[i] = condData[i] ? xData[i] : yData[i];
-        });
-
-        return result;
-    }
-
-    /// <inheritdoc/>
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -16954,6 +16937,27 @@ public class CpuEngine : ITensorLevelEngine
             if ((bool)maskSpan[i])
                 dest[i] = value;
         }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
+    {
+        if (condition == null) throw new ArgumentNullException(nameof(condition));
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+
+        var result = TensorAllocator.Rent<T>(x._shape);
+        var condData = condition.GetDataArray();
+        var xData = x.GetDataArray();
+        var yData = y.GetDataArray();
+        var rData = result.GetDataArray();
+
+        Parallel.For(0, x.Length, i =>
+        {
+            rData[i] = condData[i] ? xData[i] : yData[i];
+        });
 
         return result;
     }
