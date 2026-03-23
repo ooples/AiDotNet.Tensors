@@ -118,7 +118,8 @@ public abstract class TensorBase<T>
     protected TensorBase(params int[] shape)
     {
         Shape = shape;
-        int totalSize = shape.Aggregate(1, (acc, dim) => acc * dim);
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++) totalSize *= shape[i];
         _data = new Vector<T>(totalSize);
     }
 
@@ -136,7 +137,9 @@ public abstract class TensorBase<T>
             _data = Vector<T>.WrapMemory(array);
         else
             _data = new Vector<T>(data);
-        if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
+        int expectedLen1 = 1;
+        for (int si = 0; si < shape.Length; si++) expectedLen1 *= shape[si];
+        if (_data.Length != expectedLen1)
         {
             throw new ArgumentException("The number of values does not match the specified shape.");
         }
@@ -156,7 +159,9 @@ public abstract class TensorBase<T>
     {
         Shape = shape;
         _data = data;
-        if (_data.Length != shape.Aggregate(1, (acc, dim) => acc * dim))
+        int expectedLen2 = 1;
+        for (int si = 0; si < shape.Length; si++) expectedLen2 *= shape[si];
+        if (_data.Length != expectedLen2)
         {
             throw new ArgumentException("The number of values does not match the specified shape.");
         }
