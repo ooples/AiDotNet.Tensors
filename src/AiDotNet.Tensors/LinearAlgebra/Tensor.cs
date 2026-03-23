@@ -124,6 +124,19 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para><b>Performance:</b> O(1) when already contiguous (just returns this).
     /// O(n) only when the tensor is a non-contiguous view (e.g., from Transpose).</para>
     /// </remarks>
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Creates a zero-allocation, stack-only read-only view of this tensor.
+    /// The view shares the same underlying data — no copy is made.
+    /// </summary>
+    /// <returns>A TensorView that can be used for zero-GC inner-loop iteration.</returns>
+    public TensorView<T> AsView()
+    {
+        return new TensorView<T>(_data.AsSpan(), _shape, _strides, _storageOffset, Length);
+    }
+#endif
+
     public Tensor<T> Contiguous()
     {
         if (IsContiguous && _storageOffset == 0) return this;
@@ -173,6 +186,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ExpandDims(int axis)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (axis < 0 || axis > Rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis must be between 0 and {Rank}.");
 
@@ -212,6 +226,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Squeeze(int axis)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis must be between 0 and {Rank - 1}.");
         if (_shape[axis] != 1)
@@ -239,6 +254,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <returns>A new tensor view with all size-1 dimensions removed.</returns>
     public Tensor<T> Squeeze()
     {
+        EnsureWritable(); // Materialize COW before creating view
         // Count non-one dimensions
         int newRank = 0;
         for (int i = 0; i < Rank; i++)
@@ -550,6 +566,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> SubTensor(params int[] indices)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (indices.Length > Rank)
             throw new ArgumentException("Number of indices exceeds tensor dimensions.");
 
@@ -921,6 +938,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void Fill(T value)
     {
+        EnsureWritable();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
             _numOps.Fill(_data.AsWritableSpan(), value);
@@ -948,6 +966,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int index)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (Rank == 0)
             throw new InvalidOperationException("Cannot slice a scalar (rank-0) tensor.");
         if (index < 0 || index >= _shape[0])
@@ -1070,6 +1089,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transpose(int[] permutation)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (permutation.Length != Rank)
             throw new ArgumentException("Permutation array length must match tensor rank.");
 
@@ -1274,6 +1294,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
+        EnsureWritable(); // Materialize COW before creating view
         int newTotal = 1;
         for (int i = 0; i < newShape.Length; i++)
             newTotal *= newShape[i];
@@ -2533,6 +2554,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> GetSliceAlongDimension(int index, int dimension)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (dimension < 0 || dimension >= Rank)
             throw new ArgumentOutOfRangeException(nameof(dimension), $"Dimension {dimension} is out of range for tensor with {Rank} dimensions.");
         if (index < 0 || index >= _shape[dimension])
@@ -3188,6 +3210,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transpose()
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.
@@ -3418,6 +3441,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int axis, int start, int? end = null)
     {
+        EnsureWritable(); // Materialize COW before creating view
         if (axis < 0 || axis >= Rank)
             throw new ArgumentException($"Invalid axis. Must be between 0 and {Rank - 1}.");
 

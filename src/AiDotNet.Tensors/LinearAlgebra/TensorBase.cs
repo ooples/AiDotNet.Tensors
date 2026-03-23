@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
@@ -12,22 +13,27 @@ public abstract class TensorBase<T>
 {
     // ================================================================
     // Core storage and metadata
+    // Non-readonly to support Copy-on-Write materialization.
+    // Thread-safe: EnsureWritable() uses lock(_cowLock) to prevent
+    // double-materialization. Read paths never modify these fields.
     // ================================================================
 
     /// <summary>
-    /// Shared storage for tensor data. Multiple views can reference the same storage.
+    /// Shared storage for tensor data. Multiple views/clones can reference the same storage.
+    /// Swapped during COW materialization.
     /// </summary>
-    internal readonly TensorStorage<T> _storage;
+    internal TensorStorage<T> _storage;
 
     /// <summary>
     /// Direct reference to underlying Vector for backward compatibility with existing engine code.
-    /// All new code should prefer _storage methods.
+    /// Swapped during COW materialization.
     /// </summary>
-    protected readonly Vector<T> _data;
+    protected Vector<T> _data;
 
     /// <summary>
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
+    /// Never changes — shape is the tensor's identity.
     /// </summary>
     internal readonly int[] _shape;
 
@@ -35,27 +41,138 @@ public abstract class TensorBase<T>
     /// Pre-computed strides for each dimension, following PyTorch's stride convention.
     /// For row-major order: strides[i] = product of shape[i+1..end].
     /// For transposed views: strides are permuted without copying data.
+    /// Reset to row-major during COW materialization.
     /// </summary>
-    internal readonly int[] _strides;
+    internal int[] _strides;
 
     /// <summary>
     /// Offset into the underlying storage where this tensor's data begins.
     /// Zero for non-view tensors. Non-zero for sliced views.
+    /// Reset to 0 during COW materialization.
     /// </summary>
-    internal readonly int _storageOffset;
+    internal int _storageOffset;
 
     /// <summary>
     /// Whether this tensor's data is contiguous in memory (row-major with no gaps).
     /// When true, raw span/array access is safe. When false, Contiguous() must be called
     /// before passing to BLAS/SIMD operations.
+    /// Set to true during COW materialization.
     /// </summary>
-    public bool IsContiguous { get; }
+    public bool IsContiguous { get; private set; }
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.
     /// Views share memory — mutations through one view are visible in others.
+    /// Views do NOT trigger COW on write (shared mutation is intentional for views).
     /// </summary>
     public bool IsView { get; }
+
+    // ================================================================
+    // Copy-on-Write (COW) support
+    // ================================================================
+
+    /// <summary>
+    /// True if this tensor shares storage via Clone() and needs to materialize
+    /// a private copy before the first write. Views (IsView=true) never set this.
+    /// </summary>
+    private volatile bool _cowShared;
+
+    /// <summary>
+    /// Lock object for thread-safe COW materialization.
+    /// Allocated lazily (only when COW is actually used).
+    /// </summary>
+    private object? _cowLock;
+
+    /// <summary>
+    /// Gets the COW lock, creating it on first access via double-check locking.
+    /// </summary>
+    private object CowLock
+    {
+        get
+        {
+            if (_cowLock != null) return _cowLock;
+            Interlocked.CompareExchange(ref _cowLock, new object(), null);
+            return _cowLock;
+        }
+    }
+
+    /// <summary>
+    /// Ensures this tensor owns its storage exclusively before mutation.
+    /// If storage is shared via COW Clone(), materializes a private copy.
+    /// No-op for views (shared mutation is intentional) and non-COW tensors.
+    /// Thread-safe: uses lock to prevent double-materialization.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    protected void EnsureWritable()
+    {
+        if (!_cowShared) return; // fast path — no volatile read needed; worst case is one extra check
+
+        // Slow path: materialize
+        lock (CowLock)
+        {
+            if (!_cowShared) return; // double-check after lock
+
+            if (_storage.RefCount <= 1)
+            {
+                // The other side already materialized — we own storage exclusively now
+                _cowShared = false;
+                return;
+            }
+
+            // Materialize private copy
+            var newData = new Vector<T>(Length);
+            if (Length > 0)
+            {
+                if (IsContiguous)
+                {
+                    _data.AsSpan().Slice(_storageOffset, Length).CopyTo(newData.AsWritableSpan());
+                }
+                else
+                {
+                    var srcData = _data.AsSpan();
+                    var dstData = newData.AsWritableSpan();
+                    var rmStrides = RowMajorStrides;
+                    for (int i = 0; i < Length; i++)
+                    {
+                        int srcIdx = _storageOffset;
+                        int remaining = i;
+                        for (int d = 0; d < _shape.Length; d++)
+                        {
+                            int dimIndex = remaining / rmStrides[d];
+                            remaining -= dimIndex * rmStrides[d];
+                            srcIdx += dimIndex * _strides[d];
+                        }
+                        dstData[i] = srcData[srcIdx];
+                    }
+                }
+            }
+
+            var oldStorage = _storage;
+            _data = newData;
+            _storage = new TensorStorage<T>(newData);
+            _strides = ComputeRowMajorStrides(_shape);
+            _storageOffset = 0;
+            IsContiguous = true;
+            _rowMajorStridesCache = null; // invalidate cache
+            _cowShared = false;
+
+            // Release our reference to the shared storage
+            oldStorage.Release();
+        }
+    }
+
+    /// <summary>
+    /// Marks this tensor as COW-shared. Called by Clone() on both the original and the clone.
+    /// </summary>
+    internal void MarkCowShared()
+    {
+        _cowShared = true;
+    }
+
+    /// <summary>
+    /// Whether this tensor is in a COW-shared state (needs materialization before write).
+    /// </summary>
+    internal bool IsCowShared => _cowShared;
 
     // ================================================================
     // Cached derived values
@@ -111,11 +228,13 @@ public abstract class TensorBase<T>
     /// <summary>
     /// Gets the underlying data as a Memory&lt;T&gt; for GPU transfer and pinning.
     /// Throws for non-contiguous views — call Contiguous() first.
+    /// Triggers COW materialization if needed (write access assumed).
     /// </summary>
     internal Memory<T> Memory
     {
         get
         {
+            EnsureWritable();
             if (!IsContiguous)
                 throw new InvalidOperationException(
                     "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
@@ -272,6 +391,7 @@ public abstract class TensorBase<T>
         }
         set
         {
+            EnsureWritable();
             ValidateIndices(indices);
             _data[GetFlatIndex(indices)] = value;
         }
@@ -298,7 +418,11 @@ public abstract class TensorBase<T>
     public T this[int i0, int i1]
     {
         get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]];
-        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]] = value;
+        set
+        {
+            EnsureWritable();
+            _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1]] = value;
+        }
     }
 
     /// <summary>
@@ -307,7 +431,11 @@ public abstract class TensorBase<T>
     public T this[int i0, int i1, int i2]
     {
         get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]];
-        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]] = value;
+        set
+        {
+            EnsureWritable();
+            _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2]] = value;
+        }
     }
 
     /// <summary>
@@ -316,7 +444,11 @@ public abstract class TensorBase<T>
     public T this[int i0, int i1, int i2, int i3]
     {
         get => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]];
-        set => _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]] = value;
+        set
+        {
+            EnsureWritable();
+            _data[_storageOffset + i0 * _strides[0] + i1 * _strides[1] + i2 * _strides[2] + i3 * _strides[3]] = value;
+        }
     }
 
     // ================================================================
@@ -354,6 +486,7 @@ public abstract class TensorBase<T>
         if (source.Length != Length)
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
         if (Length == 0) return;
+        EnsureWritable();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
             source.AsSpan().CopyTo(_data.AsWritableSpan());
@@ -373,6 +506,7 @@ public abstract class TensorBase<T>
     /// <summary>
     /// Gets the value at a flat (logical) index. Handles views correctly.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T GetFlat(int flatIndex)
     {
         if (flatIndex < 0 || flatIndex >= Length)
@@ -384,11 +518,14 @@ public abstract class TensorBase<T>
 
     /// <summary>
     /// Sets the value at a flat (logical) index. Handles views correctly.
+    /// Triggers COW materialization if storage is shared.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetFlat(int flatIndex, T value)
     {
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
+        EnsureWritable();
         if (IsContiguous)
             _data[flatIndex + _storageOffset] = value;
         else
@@ -397,6 +534,7 @@ public abstract class TensorBase<T>
 
     /// <summary>
     /// Gets a read-only span over the tensor data. Throws for non-contiguous views.
+    /// Does NOT trigger COW (read-only access).
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
@@ -411,10 +549,12 @@ public abstract class TensorBase<T>
 
     /// <summary>
     /// Gets a writable span over the tensor data. Throws for non-contiguous views.
+    /// Triggers COW materialization if storage is shared.
     /// </summary>
     internal Span<T> AsWritableSpan()
     {
         if (Length == 0) return Span<T>.Empty;
+        EnsureWritable();
         if (!IsContiguous)
             throw new InvalidOperationException(
                 "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
@@ -438,22 +578,34 @@ public abstract class TensorBase<T>
     // ================================================================
 
     /// <summary>
-    /// Creates a deep copy of this tensor (always contiguous, never a view).
+    /// Creates a copy of this tensor. Uses Copy-on-Write: no data is copied until
+    /// either the original or the clone is written to. This is O(1) for the common
+    /// case where clones are read-only (gradient checkpointing, model snapshots).
+    /// PyTorch's clone() always copies immediately — COW is strictly better.
     /// </summary>
     public virtual TensorBase<T> Clone()
     {
-        var result = CreateInstance(_shape);
-        if (Length == 0) return result;
-        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
-        {
-            _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
-        }
-        else
-        {
-            var srcArray = ToArray();
-            srcArray.AsSpan().CopyTo(result._data.AsWritableSpan());
-        }
-        return result;
+        if (Length == 0)
+            return CreateInstance(_shape);
+
+        // COW path: share storage, defer copy until first write
+        _storage.AddRef();
+        var clone = CreateInstance(_shape);
+
+        // Point clone at our storage
+        clone._data = _data;
+        clone._storage.Release(); // release the fresh storage CreateInstance made
+        clone._storage = _storage;
+        clone._strides = (int[])_strides.Clone();
+        clone._storageOffset = _storageOffset;
+        clone.IsContiguous = IsContiguous;
+        clone._rowMajorStridesCache = null;
+
+        // Mark both sides as COW — whichever writes first materializes
+        this.MarkCowShared();
+        clone.MarkCowShared();
+
+        return clone;
     }
 
     protected abstract TensorBase<T> CreateInstance(int[] shape);
@@ -504,6 +656,7 @@ public abstract class TensorBase<T>
     /// <summary>
     /// Converts multi-dimensional indices to a storage index using strides and offset.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     protected int GetFlatIndex(int[] indices)
     {
         int flatIndex = _storageOffset;
