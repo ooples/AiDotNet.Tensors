@@ -80,16 +80,34 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void VectorAddUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+#if NET8_0_OR_GREATER
+            if (Avx512F.IsSupported && length >= 64)
             {
-                int simdLength = length & ~31;
-                // 4x unrolled AVX2 with software prefetch for bandwidth-bound large arrays
-                // Prefetch 256 bytes (4 cache lines) ahead to hide memory latency
-                const int prefetchDist = 256 / sizeof(float); // 64 elements ahead
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
+                {
+                    Avx512F.Store(result + i, Avx512F.Add(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                    Avx512F.Store(result + i + 16, Avx512F.Add(Avx512F.LoadVector512(a + i + 16), Avx512F.LoadVector512(b + i + 16)));
+                    Avx512F.Store(result + i + 32, Avx512F.Add(Avx512F.LoadVector512(a + i + 32), Avx512F.LoadVector512(b + i + 32)));
+                    Avx512F.Store(result + i + 48, Avx512F.Add(Avx512F.LoadVector512(a + i + 48), Avx512F.LoadVector512(b + i + 48)));
+                }
+            }
+            if (Avx512F.IsSupported && length - i >= 16)
+            {
+                int simdLength = i + ((length - i) & ~15);
+                for (; i < simdLength; i += 16)
+                {
+                    Avx512F.Store(result + i, Avx512F.Add(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                }
+            }
+#endif
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length - i >= 32)
+            {
+                int simdLength = i + ((length - i) & ~31);
+                const int prefetchDist = 256 / sizeof(float);
                 for (; i < simdLength; i += 32)
                 {
-                    // Software prefetch: bring next chunk into L1 cache while processing current
                     if (Sse.IsSupported && i + prefetchDist < length)
                     {
                         Sse.Prefetch0(a + i + prefetchDist);
@@ -123,11 +141,32 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void VectorMultiplyUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
+#if NET8_0_OR_GREATER
+            if (Avx512F.IsSupported && length >= 64)
+            {
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
+                {
+                    Avx512F.Store(result + i, Avx512F.Multiply(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                    Avx512F.Store(result + i + 16, Avx512F.Multiply(Avx512F.LoadVector512(a + i + 16), Avx512F.LoadVector512(b + i + 16)));
+                    Avx512F.Store(result + i + 32, Avx512F.Multiply(Avx512F.LoadVector512(a + i + 32), Avx512F.LoadVector512(b + i + 32)));
+                    Avx512F.Store(result + i + 48, Avx512F.Multiply(Avx512F.LoadVector512(a + i + 48), Avx512F.LoadVector512(b + i + 48)));
+                }
+            }
+            if (Avx512F.IsSupported && length - i >= 16)
+            {
+                int simdLength = i + ((length - i) & ~15);
+                for (; i < simdLength; i += 16)
+                {
+                    Avx512F.Store(result + i, Avx512F.Multiply(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                }
+            }
+#endif
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+            if (Avx.IsSupported && length - i >= 32)
             {
                 const int prefetchDist = 256 / sizeof(float);
-                int simdLength = length & ~31;
+                int simdLength = i + ((length - i) & ~31);
                 for (; i < simdLength; i += 32)
                 {
                     if (Sse.IsSupported && i + prefetchDist < length)
@@ -163,11 +202,32 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void VectorSubtractUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
+#if NET8_0_OR_GREATER
+            if (Avx512F.IsSupported && length >= 64)
+            {
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
+                {
+                    Avx512F.Store(result + i, Avx512F.Subtract(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                    Avx512F.Store(result + i + 16, Avx512F.Subtract(Avx512F.LoadVector512(a + i + 16), Avx512F.LoadVector512(b + i + 16)));
+                    Avx512F.Store(result + i + 32, Avx512F.Subtract(Avx512F.LoadVector512(a + i + 32), Avx512F.LoadVector512(b + i + 32)));
+                    Avx512F.Store(result + i + 48, Avx512F.Subtract(Avx512F.LoadVector512(a + i + 48), Avx512F.LoadVector512(b + i + 48)));
+                }
+            }
+            if (Avx512F.IsSupported && length - i >= 16)
+            {
+                int simdLength = i + ((length - i) & ~15);
+                for (; i < simdLength; i += 16)
+                {
+                    Avx512F.Store(result + i, Avx512F.Subtract(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                }
+            }
+#endif
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+            if (Avx.IsSupported && length - i >= 32)
             {
                 const int prefetchDist = 256 / sizeof(float);
-                int simdLength = length & ~31;
+                int simdLength = i + ((length - i) & ~31);
                 for (; i < simdLength; i += 32)
                 {
                     if (Sse.IsSupported && i + prefetchDist < length)
@@ -203,11 +263,34 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void ReLUUnsafe(float* input, float* output, int length)
         {
             int i = 0;
+#if NET8_0_OR_GREATER
+            if (Avx512F.IsSupported && length >= 64)
+            {
+                var vzero = Vector512<float>.Zero;
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
+                {
+                    Avx512F.Store(output + i, Avx512F.Max(Avx512F.LoadVector512(input + i), vzero));
+                    Avx512F.Store(output + i + 16, Avx512F.Max(Avx512F.LoadVector512(input + i + 16), vzero));
+                    Avx512F.Store(output + i + 32, Avx512F.Max(Avx512F.LoadVector512(input + i + 32), vzero));
+                    Avx512F.Store(output + i + 48, Avx512F.Max(Avx512F.LoadVector512(input + i + 48), vzero));
+                }
+            }
+            if (Avx512F.IsSupported && length - i >= 16)
+            {
+                var vzero = Vector512<float>.Zero;
+                int simdLength = i + ((length - i) & ~15);
+                for (; i < simdLength; i += 16)
+                {
+                    Avx512F.Store(output + i, Avx512F.Max(Avx512F.LoadVector512(input + i), vzero));
+                }
+            }
+#endif
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+            if (Avx.IsSupported && length - i >= 32)
             {
                 var vzero = Vector256<float>.Zero;
-                int simdLength = length & ~31;
+                int simdLength = i + ((length - i) & ~31);
                 for (; i < simdLength; i += 32)
                 {
                     Avx.Store(output + i, Avx.Max(Avx.LoadVector256(input + i), vzero));
@@ -274,10 +357,31 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void VectorDivideUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+#if NET8_0_OR_GREATER
+            if (Avx512F.IsSupported && length >= 64)
             {
-                int simdLength = length & ~31;
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
+                {
+                    Avx512F.Store(result + i, Avx512F.Divide(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                    Avx512F.Store(result + i + 16, Avx512F.Divide(Avx512F.LoadVector512(a + i + 16), Avx512F.LoadVector512(b + i + 16)));
+                    Avx512F.Store(result + i + 32, Avx512F.Divide(Avx512F.LoadVector512(a + i + 32), Avx512F.LoadVector512(b + i + 32)));
+                    Avx512F.Store(result + i + 48, Avx512F.Divide(Avx512F.LoadVector512(a + i + 48), Avx512F.LoadVector512(b + i + 48)));
+                }
+            }
+            if (Avx512F.IsSupported && length - i >= 16)
+            {
+                int simdLength = i + ((length - i) & ~15);
+                for (; i < simdLength; i += 16)
+                {
+                    Avx512F.Store(result + i, Avx512F.Divide(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
+                }
+            }
+#endif
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length - i >= 32)
+            {
+                int simdLength = i + ((length - i) & ~31);
                 for (; i < simdLength; i += 32)
                 {
                     Avx.Store(result + i, Avx.Divide(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));

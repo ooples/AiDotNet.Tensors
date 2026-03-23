@@ -1867,6 +1867,129 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Binary operation type for stride-aware broadcasting.
+    /// </summary>
+    private enum BroadcastOp { Add, Subtract, Multiply, Divide }
+
+    /// <summary>
+    /// Stride-aware broadcast helper. Identifies contiguous inner dimensions and uses SIMD spans
+    /// instead of per-element indexer access. For [1024,512] + [1,512], this does 1024 SIMD adds
+    /// of length 512 instead of 524K scalar operations.
+    /// </summary>
+    private static Tensor<T> BroadcastBinaryOp(Tensor<T> left, Tensor<T> right, Func<T, T, T> scalarOp,
+        BroadcastOp op)
+    {
+        int[] broadcastShape = GetBroadcastShape(left._shape, right._shape);
+        var result = new Tensor<T>(broadcastShape);
+        int maxRank = broadcastShape.Length;
+
+        // Right-align shapes (prepend 1s for lower-rank tensors)
+        int[] lShape = new int[maxRank];
+        int[] rShape = new int[maxRank];
+        int lOff = maxRank - left.Rank;
+        int rOff = maxRank - right.Rank;
+        for (int i = 0; i < maxRank; i++)
+        {
+            lShape[i] = i < lOff ? 1 : left._shape[i - lOff];
+            rShape[i] = i < rOff ? 1 : right._shape[i - rOff];
+        }
+
+        // Find innermost contiguous SIMD span: both dims equal, neither broadcast from 1
+        int innerLen = 1;
+        int simdDims = 0;
+        for (int d = maxRank - 1; d >= 0; d--)
+        {
+            if (lShape[d] == rShape[d] && lShape[d] > 1)
+            {
+                innerLen *= lShape[d];
+                simdDims++;
+            }
+            else break;
+        }
+
+        // If inner span is large enough, use SIMD fast path
+        if (innerLen >= 4)
+        {
+            var lSrc = left.Contiguous();
+            var rSrc = right.Contiguous();
+            var lData = lSrc._data.AsSpan();
+            var rData = rSrc._data.AsSpan();
+            var dstData = result._data.AsWritableSpan();
+
+            int outerDims = maxRank - simdDims;
+            int[] outerShape = new int[outerDims];
+            int[] lOuterStrides = new int[outerDims];
+            int[] rOuterStrides = new int[outerDims];
+            int[] resultOuterStrides = new int[outerDims];
+
+            // Compute outer strides for iteration
+            int lStride = innerLen, rStride = innerLen, resStride = innerLen;
+            for (int d = outerDims - 1; d >= 0; d--)
+            {
+                outerShape[d] = broadcastShape[d];
+                resultOuterStrides[d] = resStride;
+                lOuterStrides[d] = lShape[d] == 1 ? 0 : lStride;
+                rOuterStrides[d] = rShape[d] == 1 ? 0 : rStride;
+                resStride *= broadcastShape[d];
+                lStride *= lShape[d];
+                rStride *= rShape[d];
+            }
+
+            int outerCount = 1;
+            for (int d = 0; d < outerDims; d++) outerCount *= outerShape[d];
+
+            // Iterate over outer dimensions, SIMD over inner contiguous span
+            for (int outer = 0; outer < outerCount; outer++)
+            {
+                int lIdx = 0, rIdx = 0, resIdx = 0;
+                int remaining = outer;
+                for (int d = outerDims - 1; d >= 0; d--)
+                {
+                    int dimIdx = remaining % outerShape[d];
+                    remaining /= outerShape[d];
+                    lIdx += dimIdx * lOuterStrides[d];
+                    rIdx += dimIdx * rOuterStrides[d];
+                    resIdx += dimIdx * resultOuterStrides[d];
+                }
+
+                var lSlice = lData.Slice(lIdx, innerLen);
+                var rSlice = rData.Slice(rIdx, innerLen);
+                var dSlice = dstData.Slice(resIdx, innerLen);
+                switch (op)
+                {
+                    case BroadcastOp.Add: _numOps.Add(lSlice, rSlice, dSlice); break;
+                    case BroadcastOp.Subtract: _numOps.Subtract(lSlice, rSlice, dSlice); break;
+                    case BroadcastOp.Multiply: _numOps.Multiply(lSlice, rSlice, dSlice); break;
+                    case BroadcastOp.Divide: _numOps.Divide(lSlice, rSlice, dSlice); break;
+                }
+            }
+
+            return result;
+        }
+
+        // Fallback: element-by-element through indexers (handles all cases)
+        int[] lIndices = new int[left.Rank];
+        int[] rIndices = new int[right.Rank];
+
+        foreach (var index in result.GetIndices())
+        {
+            for (int i = 0; i < left.Rank; i++)
+            {
+                int broadcastIdx = i + lOff;
+                lIndices[i] = lShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
+            }
+            for (int i = 0; i < right.Rank; i++)
+            {
+                int broadcastIdx = i + rOff;
+                rIndices[i] = rShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
+            }
+            result[index] = scalarOp(left[lIndices], right[rIndices]);
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Generates all possible index combinations for iterating through a tensor.
     /// </summary>
     /// <returns>An enumerable sequence of index arrays, each representing a position in the tensor.</returns>
@@ -2738,56 +2861,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path
         if (ShapeEquals(_shape, other._shape))
-        {
             return Add(other);
-        }
 
-        // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform addition
-            result[index] = _numOps.Add(this[thisIndices], other[otherIndices]);
-        }
-
-        return result;
+        return BroadcastBinaryOp(this, other,
+            (a, b) => _numOps.Add(a, b), BroadcastOp.Add);
     }
 
     /// <summary>
@@ -2807,56 +2885,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastSubtract(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path
         if (ShapeEquals(_shape, other._shape))
-        {
             return Subtract(other);
-        }
 
-        // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform subtraction
-            result[index] = _numOps.Subtract(this[thisIndices], other[otherIndices]);
-        }
-
-        return result;
+        return BroadcastBinaryOp(this, other,
+            (a, b) => _numOps.Subtract(a, b), BroadcastOp.Subtract);
     }
 
     /// <summary>
@@ -2873,66 +2906,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastMultiply(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path (element-wise multiply)
         if (ShapeEquals(_shape, other._shape))
         {
             var a = this.Contiguous();
             var b = other.Contiguous();
             var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = a._data.AsSpan();
-            var otherSpan = b._data.AsSpan();
-            var destSpan = fastResult._data.AsWritableSpan();
-            for (int i = 0; i < Length; i++)
-            {
-                destSpan[i] = _numOps.Multiply(srcSpan[i], otherSpan[i]);
-            }
+            _numOps.Multiply(a._data.AsSpan(), b._data.AsSpan(), fastResult._data.AsWritableSpan());
             return fastResult;
         }
 
-        // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform multiplication
-            result[index] = _numOps.Multiply(this[thisIndices], other[otherIndices]);
-        }
-
-        return result;
+        return BroadcastBinaryOp(this, other,
+            (a, b) => _numOps.Multiply(a, b), BroadcastOp.Multiply);
     }
 
     /// <summary>
@@ -2952,66 +2936,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastDivide(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path (element-wise divide)
         if (ShapeEquals(_shape, other._shape))
         {
             var a = this.Contiguous();
             var b = other.Contiguous();
             var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = a._data.AsSpan();
-            var otherSpan = b._data.AsSpan();
-            var destSpan = fastResult._data.AsWritableSpan();
-            for (int i = 0; i < Length; i++)
-            {
-                destSpan[i] = _numOps.Divide(srcSpan[i], otherSpan[i]);
-            }
+            _numOps.Divide(a._data.AsSpan(), b._data.AsSpan(), fastResult._data.AsWritableSpan());
             return fastResult;
         }
 
-        // Get broadcast shape
-        int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform division
-            result[index] = _numOps.Divide(this[thisIndices], other[otherIndices]);
-        }
-
-        return result;
+        return BroadcastBinaryOp(this, other,
+            (a, b) => _numOps.Divide(a, b), BroadcastOp.Divide);
     }
 
     /// <summary>
