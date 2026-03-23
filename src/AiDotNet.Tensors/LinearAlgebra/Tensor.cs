@@ -100,8 +100,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// No data is copied — the view shares the same underlying memory.
     /// This enables O(1) Transpose, Reshape, and Slice operations.
     /// </summary>
-    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset)
-        : base(data, shape, strides, storageOffset, isView: true)
+    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset,
+        TensorStorage<T>? parentStorage = null)
+        : base(data, shape, strides, storageOffset, isView: true, parentStorage: parentStorage)
     {
     }
 
@@ -121,7 +122,6 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Materialize: copy data from strided layout to contiguous row-major
         var result = new Tensor<T>(_shape);
-        var srcData = _data.GetDataArray();
         var dstData = result._data.AsWritableSpan();
 
         if (IsContiguous)
@@ -131,7 +131,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else
         {
-            // Non-contiguous — use cached row-major strides to decompose flat index
+            // Non-contiguous — need array for random access by storage index
+            var srcData = _data.GetDataArray();
             var rowMajorStrides = RowMajorStrides;
 
             for (int i = 0; i < Length; i++)
