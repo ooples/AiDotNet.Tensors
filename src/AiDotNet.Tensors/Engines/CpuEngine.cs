@@ -16937,6 +16937,50 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <inheritdoc/>
+    public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor._shape.SequenceEqual(mask._shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
+
+        var result = tensor.Clone();
+        var maskSpan = mask.AsSpan();
+        var dest = result.AsWritableSpan();
+
+        for (int i = 0; i < maskSpan.Length; i++)
+        {
+            if ((bool)maskSpan[i])
+                dest[i] = value;
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
+    {
+        if (condition == null) throw new ArgumentNullException(nameof(condition));
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (x.Length != y.Length || x.Length != condition.Length)
+            throw new ArgumentException("All tensors must have the same length.");
+
+        var result = TensorAllocator.Rent<T>(x._shape);
+        var condData = condition.GetDataArray();
+        var xData = x.GetDataArray();
+        var yData = y.GetDataArray();
+        var rData = result.GetDataArray();
+
+        Parallel.For(0, x.Length, i =>
+        {
+            rData[i] = (bool)condData[i] ? xData[i] : yData[i];
+        });
+
+        return result;
+    }
+
     #endregion
 
     #region Neural Radiance Fields Operations
