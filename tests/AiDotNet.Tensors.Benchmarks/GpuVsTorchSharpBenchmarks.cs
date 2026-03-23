@@ -6,7 +6,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
-/// Head-to-head GPU benchmarks: AiDotNet fused GPU kernels vs TorchSharp GPU.
+/// Head-to-head GPU benchmarks: AiDotNet fused GPU kernels vs TorchSharp.
 /// Measures throughput and latency for critical neural network operations.
 /// </summary>
 [SimpleJob(RuntimeMoniker.Net10_0)]
@@ -76,13 +76,13 @@ public class GpuVsTorchSharpBenchmarks
     [Benchmark(Description = "Add 1M (AiDotNet GPU)")]
     public Tensor<float>? AiDotNet_Add() => _gpu?.TensorAdd(_input1M, _input2_1M);
 
-    [Benchmark(Description = "Add 1M (TorchSharp GPU)")]
+    [Benchmark(Description = "Add 1M (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_Add() => _torchA?.add(_torchB);
 
     [Benchmark(Description = "Multiply 1M (AiDotNet GPU)")]
     public Tensor<float>? AiDotNet_Mul() => _gpu?.TensorMultiply(_input1M, _input2_1M);
 
-    [Benchmark(Description = "Multiply 1M (TorchSharp GPU)")]
+    [Benchmark(Description = "Multiply 1M (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_Mul() => _torchA?.mul(_torchB);
 
     // ==================== Activations ====================
@@ -90,13 +90,13 @@ public class GpuVsTorchSharpBenchmarks
     [Benchmark(Description = "Sigmoid 1M (AiDotNet GPU)")]
     public Tensor<float>? AiDotNet_Sigmoid() => _gpu?.TensorSigmoid(_input1M);
 
-    [Benchmark(Description = "Sigmoid 1M (TorchSharp GPU)")]
+    [Benchmark(Description = "Sigmoid 1M (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_Sigmoid() => _torchA?.sigmoid();
 
     [Benchmark(Description = "ReLU 1M (AiDotNet GPU)")]
     public Tensor<float>? AiDotNet_ReLU() => _gpu?.TensorReLU(_input1M);
 
-    [Benchmark(Description = "ReLU 1M (TorchSharp GPU)")]
+    [Benchmark(Description = "ReLU 1M (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_ReLU() => _torchA?.relu();
 
     // ==================== Softmax ====================
@@ -104,7 +104,7 @@ public class GpuVsTorchSharpBenchmarks
     [Benchmark(Description = "Softmax 1Kx1K (AiDotNet GPU)")]
     public Tensor<float>? AiDotNet_Softmax() => _gpu?.Softmax(_softmaxInput, -1);
 
-    [Benchmark(Description = "Softmax 1Kx1K (TorchSharp GPU)")]
+    [Benchmark(Description = "Softmax 1Kx1K (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_Softmax() => TorchSharp.torch.nn.functional.softmax(_torchSoftmax, -1);
 
     // ==================== MatMul ====================
@@ -112,7 +112,7 @@ public class GpuVsTorchSharpBenchmarks
     [Benchmark(Description = "MatMul 512x512 (AiDotNet GPU)")]
     public Matrix<float>? AiDotNet_MatMul() => _gpu is not null ? ((IEngine)_gpu).MatrixMultiply(_matA, _matB) : null;
 
-    [Benchmark(Description = "MatMul 512x512 (TorchSharp GPU)")]
+    [Benchmark(Description = "MatMul 512x512 (TorchSharp)")]
     public TorchSharp.torch.Tensor? Torch_MatMul() => _torchMatA?.mm(_torchMatB);
 
     // ==================== Reductions ====================
@@ -120,7 +120,7 @@ public class GpuVsTorchSharpBenchmarks
     [Benchmark(Description = "Sum 1M (AiDotNet GPU)")]
     public float AiDotNet_Sum() => _gpu?.TensorSum(_input1M) ?? 0;
 
-    [Benchmark(Description = "Sum 1M (TorchSharp GPU)")]
+    [Benchmark(Description = "Sum 1M (TorchSharp)")]
     public float Torch_Sum() => _torchA?.sum().item<float>() ?? 0;
 
     [GlobalCleanup]

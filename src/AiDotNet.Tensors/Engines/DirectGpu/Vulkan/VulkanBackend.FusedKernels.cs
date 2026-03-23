@@ -13,9 +13,9 @@ public sealed partial class VulkanBackend
     public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, i, o, 1, 2*sizeof(uint));
     public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, 1, 2*sizeof(uint));
     public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.SumOfSquaresAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MaxMagnitudeAxis, i, o, 1, 2*sizeof(uint));
+    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MinMagnitudeAxis, i, o, 1, 2*sizeof(uint));
     public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, 1, 2*sizeof(uint));
     public void VarianceAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, 2 * sizeof(uint));
     public void StdAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.StdAxis, i, o, os, 2 * sizeof(uint));
@@ -32,7 +32,7 @@ public sealed partial class VulkanBackend
 
     public void ReduceVarianceBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer ms, IGpuBuffer gi, int os, int rs) => GlslQuadOp(VulkanGlslKernels.ReduceVarianceBackwardGlsl, go, inp, ms, gi, os * rs, 2 * sizeof(uint));
 
-    public void ReduceLogVariance(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, 2 * sizeof(uint));
+    public void ReduceLogVariance(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogVarianceAxis, i, o, os, 2 * sizeof(uint));
 
     public void ReduceLogVarianceBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer ms, IGpuBuffer vs, IGpuBuffer gi, int os, int rs) => GlslQuintOp(VulkanGlslKernels.ReduceLogVarianceBackwardGlsl, go, inp, ms, vs, gi, os * rs, 2 * sizeof(uint));
 
