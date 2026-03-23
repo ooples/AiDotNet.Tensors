@@ -15570,7 +15570,7 @@ public class CpuEngine : ITensorLevelEngine
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
 
         // Compute exp(x - max)
-        var shifted = TensorSubtract(tensor, maxVals);
+        var shifted = TensorBroadcastSubtract(tensor, maxVals);
         var expShifted = TensorExp(shifted);
 
         // Sum along axis
@@ -16014,7 +16014,7 @@ public class CpuEngine : ITensorLevelEngine
         norm = TensorAdd(norm, epsilon);
 
         // Normalize: v / ||v||
-        var normalized = TensorDivide(tensor, norm);
+        var normalized = TensorBroadcastDivide(tensor, norm);
 
         // Apply scale
         return TensorMultiply(scale, normalized);
@@ -16071,7 +16071,7 @@ public class CpuEngine : ITensorLevelEngine
         norm = TensorAdd(norm, epsArray);
 
         // Divide
-        return TensorDivide(tensor, norm);
+        return TensorBroadcastDivide(tensor, norm);
     }
 
     /// <inheritdoc/>
