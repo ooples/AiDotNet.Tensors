@@ -38,6 +38,37 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public class CpuEngine : ITensorLevelEngine
 {
+    /// <summary>
+    /// Computes the product of all elements in a shape array (total element count).
+    /// Avoids LINQ Aggregate allocation — this is called hundreds of times per forward pass.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static int ShapeProduct(int[] shape)
+    {
+        int product = 1;
+        for (int i = 0; i < shape.Length; i++) product *= shape[i];
+        return product;
+    }
+
+    /// <summary>
+    /// Creates a new shape array with the specified axis removed.
+    /// Avoids LINQ .Where().ToArray() allocation.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static int[] RemoveAxis(int[] shape, int axis)
+    {
+        if (axis < 0 || axis >= shape.Length)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for shape with {shape.Length} dimensions.");
+        if (shape.Length <= 1) return new[] { 1 };
+        var result = new int[shape.Length - 1];
+        int dst = 0;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (i != axis) result[dst++] = shape[i];
+        }
+        return result;
+    }
+
     /// <inheritdoc/>
     public string Name => "CPU Engine";
 
@@ -3585,21 +3616,28 @@ public class CpuEngine : ITensorLevelEngine
                     float* p = (float*)handle.AddrOfPinnedObject();
                     int chunkSize = (length + numChunks - 1) / numChunks;
                     chunkSize = (chunkSize + 31) & ~31; // Align to 32 floats for AVX
-                    float[] partials = new float[numChunks];
-
-                    CpuParallelSettings.LightweightParallel(numChunks, chunk =>
+                    var partials = System.Buffers.ArrayPool<float>.Shared.Rent(numChunks);
+                    try
                     {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
+                        Array.Clear(partials, 0, numChunks);
+                        CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                         {
-                            partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
-                        }
-                    });
+                            int start = chunk * chunkSize;
+                            int count = Math.Min(chunkSize, length - start);
+                            if (count > 0)
+                            {
+                                partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
+                            }
+                        });
 
-                    result = 0f;
-                    for (int c = 0; c < numChunks; c++)
-                        result += partials[c];
+                        result = 0f;
+                        for (int c = 0; c < numChunks; c++)
+                            result += partials[c];
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<float>.Shared.Return(partials);
+                    }
                 }
                 finally
                 {
@@ -3734,24 +3772,31 @@ public class CpuEngine : ITensorLevelEngine
 
         int chunkSize = (length + chunks - 1) / chunks;
         chunkSize = (chunkSize + 31) & ~31; // Align to 32 elements
-        float[] partials = new float[chunks];
-        for (int i = 0; i < chunks; i++) partials[i] = identity;
-
-        IntPtr pData = (IntPtr)data;
-        int totalLength = length;
-
-        Parallel.For(0, chunks, chunk =>
+        var partials = System.Buffers.ArrayPool<float>.Shared.Rent(chunks);
+        try
         {
-            int start = chunk * chunkSize;
-            int count = Math.Min(chunkSize, totalLength - start);
-            if (count > 0)
-                partials[chunk] = kernel((float*)pData + start, count);
-        });
+            for (int i = 0; i < chunks; i++) partials[i] = identity;
 
-        float result = partials[0];
-        for (int i = 1; i < chunks; i++)
-            result = combine(result, partials[i]);
-        return result;
+            IntPtr pData = (IntPtr)data;
+            int totalLength = length;
+
+            Parallel.For(0, chunks, chunk =>
+            {
+                int start = chunk * chunkSize;
+                int count = Math.Min(chunkSize, totalLength - start);
+                if (count > 0)
+                    partials[chunk] = kernel((float*)pData + start, count);
+            });
+
+            float result = partials[0];
+            for (int i = 1; i < chunks; i++)
+                result = combine(result, partials[i]);
+            return result;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(partials);
+        }
     }
 
     /// <inheritdoc/>
@@ -9373,14 +9418,14 @@ public class CpuEngine : ITensorLevelEngine
 
         int strideH = stride[0], strideW = stride[1];
 
-        var gradWeights = new T[weightsShape.Aggregate(1, (acc, val) => acc * val)];
+        var gradWeights = new T[ShapeProduct(weightsShape)];
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
 
         for (int i = 0; i < gradWeights.Length; i++)
             gradWeights[i] = numOps.Zero;
 
-        Parallel.For(0, weightsShape.Aggregate(1, (acc, val) => acc * val), idx => // Iterate over all weight elements
+        Parallel.For(0, ShapeProduct(weightsShape), idx => // Iterate over all weight elements
         {
             // Deconstruct idx to weights indices (oh, ow, oc, ic, kh, kw)
             int flatIdx = idx;
@@ -13021,7 +13066,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = outDimSize;
 
         var sourceData = source.GetDataArray();
-        var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
+        var outputData = new T[ShapeProduct(outputShape)];
 
         // Initialize to zero
         for (int i = 0; i < outputData.Length; i++)
@@ -13074,7 +13119,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var gradOutData = gradOutput.GetDataArray();
         var indicesData = indices.GetDataArray();
-        var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
+        var gradInputData = new T[ShapeProduct(sourceShape)];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < sourceShape.Length; i++)
@@ -13133,7 +13178,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = outDimSize;
 
         var sourceData = source.GetDataArray();
-        var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
+        var outputData = new T[ShapeProduct(outputShape)];
         var countData = new int[outDimSize];
 
         // Initialize
@@ -13209,7 +13254,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutData = gradOutput.GetDataArray();
         var indicesData = indices.GetDataArray();
         var countsData = counts.GetDataArray();
-        var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
+        var gradInputData = new T[ShapeProduct(sourceShape)];
 
         int innerSize = 1;
         for (int i = actualDim + 1; i < sourceShape.Length; i++)
@@ -13270,7 +13315,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[actualDim] = outDimSize;
 
         var sourceData = source.GetDataArray();
-        int outputLength = outputShape.Aggregate(1, (a, b) => a * b);
+        int outputLength = ShapeProduct(outputShape);
         var outputData = new T[outputLength];
         var argmaxData = new int[outputLength];
 
@@ -13334,7 +13379,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var gradOutData = gradOutput.GetDataArray();
         var argmaxData = argmax.GetDataArray();
-        var gradInputData = new T[sourceShape.Aggregate(1, (a, b) => a * b)];
+        var gradInputData = new T[ShapeProduct(sourceShape)];
 
         // Initialize to zero
         for (int i = 0; i < gradInputData.Length; i++)
@@ -13597,7 +13642,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
 
-        int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
+        int outputSize = ShapeProduct(outputShape);
         var outputData = new T[outputSize];
         maxIndices = new int[outputSize];
 
@@ -13646,7 +13691,7 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> ReduceMaxBackward<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int inputSize = inputShape.Aggregate(1, (a, b) => a * b);
+        int inputSize = ShapeProduct(inputShape);
         var gradInputData = new T[inputSize];
 
         for (int i = 0; i < inputSize; i++)
@@ -13689,7 +13734,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
 
-        int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
+        int outputSize = ShapeProduct(outputShape);
         var outputData = new T[outputSize];
         var counts = new int[outputSize];
 
@@ -13743,7 +13788,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(inputShape), "inputShape cannot be null or empty");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int inputSize = inputShape.Aggregate(1, (a, b) => a * b);
+        int inputSize = ShapeProduct(inputShape);
         var gradInputData = new T[inputSize];
 
         // Validate and normalize axes
@@ -13836,7 +13881,7 @@ public class CpuEngine : ITensorLevelEngine
         if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
 
-        int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
+        int outputSize = ShapeProduct(outputShape);
         var outputData = new T[outputSize];
 
         // Compute reduction count (number of elements being reduced)
@@ -14736,7 +14781,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = (int[])firstShape.Clone();
         outputShape[axis] = totalAxisSize;
 
-        int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
+        int outputSize = ShapeProduct(outputShape);
         var outputData = new T[outputSize];
 
         var outputStrides = ComputeStrides(outputShape);
@@ -15144,7 +15189,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>(outputShape);
-        int totalElements = result.Shape.Aggregate(1, (a, b) => a * b);
+        int totalElements = ShapeProduct(result.Shape);
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
 
@@ -15196,7 +15241,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>(length);
-        int totalElements = length.Aggregate(1, (a, b) => a * b);
+        int totalElements = ShapeProduct(length);
         var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
 
@@ -15245,7 +15290,7 @@ public class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
         Array.Copy(destData, resultData, destData.Length);
 
-        int sourceTotal = source.Shape.Aggregate(1, (a, b) => a * b);
+        int sourceTotal = ShapeProduct(source.Shape);
         var sourceData = source.GetDataArray();
 
         // Set the slice values
@@ -15424,7 +15469,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis == -1)
         {
             // Remove all singleton dimensions
-            shape = shape.Where(s => s != 1).ToList();
+            shape = shape.FindAll(s => s != 1);
             if (shape.Count == 0) shape.Add(1); // Keep at least one dimension
         }
         else
@@ -15569,8 +15614,8 @@ public class CpuEngine : ITensorLevelEngine
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
 
-        // Compute exp(x - max)
-        var shifted = TensorSubtract(tensor, maxVals);
+        // Compute exp(x - max) — use broadcast subtract so keepDims max [N,1,...] broadcasts over [N,D,...]
+        var shifted = TensorBroadcastSubtract(tensor, maxVals);
         var expShifted = TensorExp(shifted);
 
         // Sum along axis
@@ -15581,6 +15626,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (keepDims)
         {
+            // logSum and maxVals both have keepDims shape — shapes should match here
             return TensorAdd(logSum, maxVals);
         }
         else
@@ -15605,7 +15651,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = RandomHelper.ThreadSafeRandom;
         var result = TensorAllocator.Rent<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
+        int totalElements = ShapeProduct(shape);
 
         var resultData = result.GetDataArray();
         double meanD = numOps.ToDouble(mean);
@@ -15640,7 +15686,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
         var result = TensorAllocator.Rent<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
+        int totalElements = ShapeProduct(shape);
 
         double minD = numOps.ToDouble(min);
         double maxD = numOps.ToDouble(max);
@@ -15693,7 +15739,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
         var result = TensorAllocator.Rent<T>(shape);
-        int totalElements = shape.Aggregate(1, (a, b) => a * b);
+        int totalElements = ShapeProduct(shape);
 
         double dropoutRateD = numOps.ToDouble(dropoutRate);
         T zero = numOps.Zero;
@@ -16070,8 +16116,8 @@ public class CpuEngine : ITensorLevelEngine
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
-        // Divide
-        return TensorDivide(tensor, norm);
+        // Divide (use broadcast divide so keepDims norm [N,1,...] broadcasts over tensor [N,D,...])
+        return TensorBroadcastDivide(tensor, norm);
     }
 
     /// <inheritdoc/>
@@ -16152,7 +16198,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = tensor.Shape.Length + axis;
 
         // Build output shape (remove axis dimension)
-        var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
+        var outputShape = RemoveAxis(tensor.Shape, axis);
         if (outputShape.Length == 0) outputShape = new[] { 1 };
         var result = new Tensor<int>(outputShape);
 
@@ -16203,7 +16249,7 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = tensor.Shape.Length + axis;
 
         // Build output shape (remove axis dimension)
-        var outputShape = tensor.Shape.Where((_, i) => i != axis).ToArray();
+        var outputShape = RemoveAxis(tensor.Shape, axis);
         if (outputShape.Length == 0) outputShape = new[] { 1 };
         var result = new Tensor<int>(outputShape);
 
@@ -16902,6 +16948,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor.Shape.SequenceEqual(mask.Shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor.Shape)}] must match mask shape [{string.Join(", ", mask.Shape)}].");
 
         var result = tensor.Clone();
         var maskSpan = mask.AsSpan();
@@ -16932,6 +16980,50 @@ public class CpuEngine : ITensorLevelEngine
         Parallel.For(0, x.Length, i =>
         {
             rData[i] = condData[i] ? xData[i] : yData[i];
+        });
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        if (!tensor.Shape.SequenceEqual(mask.Shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor.Shape)}] must match mask shape [{string.Join(", ", mask.Shape)}].");
+
+        var result = tensor.Clone();
+        var maskSpan = mask.AsSpan();
+        var dest = result.AsWritableSpan();
+
+        for (int i = 0; i < maskSpan.Length; i++)
+        {
+            if ((bool)maskSpan[i])
+                dest[i] = value;
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
+    {
+        if (condition == null) throw new ArgumentNullException(nameof(condition));
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (condition.Length != x.Length || x.Length != y.Length)
+            throw new ArgumentException($"All tensors must have the same length. condition={condition.Length}, x={x.Length}, y={y.Length}.");
+
+        var result = TensorAllocator.Rent<T>(x.Shape);
+        var condData = condition.GetDataArray();
+        var xData = x.GetDataArray();
+        var yData = y.GetDataArray();
+        var rData = result.GetDataArray();
+
+        Parallel.For(0, x.Length, i =>
+        {
+            rData[i] = (bool)condData[i] ? xData[i] : yData[i];
         });
 
         return result;
@@ -17636,15 +17728,23 @@ public class CpuEngine : ITensorLevelEngine
                 var inputArray = GetUnderlyingArrayOrCopy<T, float>(input.Data);
                 var weightsArray = GetUnderlyingArrayOrCopy<T, float>(weights.Data);
                 var biasArray = bias != null ? GetUnderlyingArrayOrCopy<T, float>(bias.Data) : null;
-                var outputArray = new float[M * N];
+                var outputArray = System.Buffers.ArrayPool<float>.Shared.Rent(M * N);
+                try
+                {
+                    CpuFusedOperations.FusedGemmBiasActivation(
+                        inputArray, weightsArray, biasArray, outputArray,
+                        M, N, K, activation);
 
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inputArray, weightsArray, biasArray, outputArray,
-                    M, N, K, activation);
-
-                // Reinterpret float[] as T[] using Unsafe.As (safe since T is float)
-                var typedOutput = Unsafe.As<float[], T[]>(ref outputArray);
-                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
+                    // Reinterpret pooled float[] as T[] (safe since T is float in this branch)
+                    var typedOutput = Unsafe.As<float[], T[]>(ref outputArray);
+                    var fused = TensorAllocator.Rent<T>([M, N]);
+                    new ReadOnlySpan<T>(typedOutput, 0, M * N).CopyTo(fused.AsWritableSpan());
+                    return fused;
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(outputArray);
+                }
             }
 
             // Use optimized fused operations for double type
