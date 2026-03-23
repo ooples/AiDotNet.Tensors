@@ -731,41 +731,21 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         if (a is not MetalGpuBuffer aBuffer || b is not MetalGpuBuffer bBuffer || result is not MetalGpuBuffer resultBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
 
-        uint threadgroupSize = 256;
-        uint numGroups = (uint)Math.Min((aSize + threadgroupSize - 1) / threadgroupSize, 256);
-
-        using var partialBuf = AllocateBuffer((int)numGroups);
-        var partialBuffer = (MetalGpuBuffer)partialBuf;
-
+        // Strided dot product uses single-thread kernel (windowed access doesn't parallelize)
         var pipeline = GetPipeline("DotProduct", _dotProductLibrary, "strided_dot_product");
         using (var encoder = _commandQueue.CreateScopedComputeEncoder())
         {
             encoder.SetPipelineState(pipeline.Handle);
             encoder.SetBuffer(aBuffer, 0);
             encoder.SetBuffer(bBuffer, 1);
-            encoder.SetBuffer(partialBuffer, 2);
+            encoder.SetBuffer(resultBuffer, 2);
             encoder.SetBytes((uint)aSize, 3);
             encoder.SetBytes((uint)bSize, 4);
-            encoder.SetBytes(bOffset, 5);
-            encoder.SetBytes(bStride, 6);
-            encoder.SetThreadgroupMemoryLength(threadgroupSize * sizeof(float), 0);
-            encoder.DispatchThreadgroups(
-                new MTLSize(numGroups, 1, 1),
-                new MTLSize(threadgroupSize, 1, 1));
-        }
-
-        var reducePipeline = GetPipeline("DotProduct", _dotProductLibrary, "reduce_partial_sums");
-        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
-        {
-            encoder.SetPipelineState(reducePipeline.Handle);
-            encoder.SetBuffer(partialBuffer, 0);
-            encoder.SetBuffer(resultBuffer, 1);
-            encoder.SetBytes(numGroups, 2);
-            uint reduceThreads = Math.Min(threadgroupSize, numGroups);
-            encoder.SetThreadgroupMemoryLength(reduceThreads * sizeof(float), 0);
+            encoder.SetBytes((uint)bOffset, 5);
+            encoder.SetBytes((uint)bStride, 6);
             encoder.DispatchThreadgroups(
                 new MTLSize(1, 1, 1),
-                new MTLSize(reduceThreads, 1, 1));
+                new MTLSize(1, 1, 1));
         }
     }
 

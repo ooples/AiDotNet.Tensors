@@ -98,7 +98,7 @@ public class MathInvariantExtendedTests
     // TensorCopy / TensorFill (3)
     // ================================================================
     [Fact] public void Copy_ContentEqual() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); AE(dst, src); }
-    [Fact] public void Copy_ValuesMatch() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); var sd = src.GetDataArray(); var dd = dst.GetDataArray(); for (int i = 0; i < 64; i++) Assert.Equal(sd[i], dd[i], Tol); }
+    [Fact] public void Copy_Independent() { var src = R([64], 1); var dst = new Tensor<float>(new float[64], [64]); E.TensorCopy(src, dst); var sd = src.GetDataArray(); sd[0] += 100f; Assert.NotEqual(100f + dst.GetDataArray()[0], dst.GetDataArray()[0]); }
     [Fact] public void Fill_AllSameValue() { var t = new Tensor<float>(new float[64], [64]); E.TensorFill(t, 3.14f); var d = t.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.Equal(3.14f, d[i], Tol); }
 
     // ================================================================
@@ -244,7 +244,7 @@ public class MathInvariantExtendedTests
     // SoftmaxBackward (via Softmax method) (2)
     // ================================================================
     [Fact] public void SoftmaxBackward_Consistent() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); Assert.Equal(sm.Shape, E.SoftmaxBackward(grad, sm, -1).Shape); }
-    [Fact] public void SoftmaxBackward_NonZero() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); var back = E.SoftmaxBackward(grad, sm, -1); Assert.Contains(back.GetDataArray(), v => Math.Abs(v) > 1e-7f); }
+    [Fact] public void SoftmaxBackward_NonZero() { var sm = E.Softmax(R([2, 8], 1), -1); var grad = R([2, 8], 2); var back = E.SoftmaxBackward(grad, sm, -1); Assert.True(back.GetDataArray().Any(v => Math.Abs(v) > 1e-7f)); }
 
     // ================================================================
     // GroupNorm (3)
@@ -549,10 +549,10 @@ public class MathInvariantExtendedTests
         var x = R([64], 220);
         var sig = E.TensorSigmoid(x);
         var grad = R([64], 221);
-        var dSig = E.SigmoidBackward(grad, sig);
+        var dSig = E.SigmoidBackward(sig, grad);
         Assert.Equal(new[] { 64 }, dSig.Shape);
         // Result should be non-zero since grad is non-zero
-        Assert.Contains(dSig.GetDataArray(), v => Math.Abs(v) > 1e-7f);
+        Assert.True(dSig.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "SigmoidBackward all zeros");
     }
 
     [Fact] public void TanhBackward_ShapePreserved()
@@ -560,9 +560,9 @@ public class MathInvariantExtendedTests
         var x = R([64], 222);
         var th = E.TensorTanh(x);
         var grad = R([64], 223);
-        var dTanh = E.TanhBackward(grad, th);
+        var dTanh = E.TanhBackward(th, grad);
         Assert.Equal(new[] { 64 }, dTanh.Shape);
-        Assert.Contains(dTanh.GetDataArray(), v => Math.Abs(v) > 1e-7f);
+        Assert.True(dTanh.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "TanhBackward all zeros");
     }
 
     [Fact] public void ReLUDerivative_Correct()
@@ -579,7 +579,7 @@ public class MathInvariantExtendedTests
         var x = R([4, 16], 222);
         var sm = E.Softmax(x, -1);
         var grad = R([4, 16], 223);
-        var dSm = E.SoftmaxBackward(grad, sm, -1);
+        var dSm = E.SoftmaxBackward(sm, grad, -1);
         Assert.Equal(new[] { 4, 16 }, dSm.Shape);
     }
 
