@@ -31,8 +31,7 @@ public class GpuFusedKernelCorrectnessTests
 
     private void SkipIfNoGpu()
     {
-        if (_gpu is null)
-            throw new SkipException("No GPU backend available");
+        Skip.If(_gpu is null, "No GPU backend available");
     }
 
     private static Tensor<float> RandomTensor(int[] shape, int seed = 42)
@@ -633,9 +632,4 @@ public class GpuFusedKernelCorrectnessTests
 
 /// <summary>
 /// Exception to skip tests when GPU is not available.
-/// xUnit treats this as a skipped test rather than a failure.
-/// </summary>
-public class SkipException : Exception
-{
-    public SkipException(string message) : base(message) { }
-}
+// SkipException removed — using Skip.If from Xunit.SkippableFact instead
