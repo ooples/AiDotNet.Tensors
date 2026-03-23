@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// operations run on the browser's GPU via the WebGPU API.
 /// </para>
 /// </remarks>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class WebGpuBackendBenchmarks
@@ -308,7 +308,7 @@ public class WebGpuBackendBenchmarks
 /// <summary>
 /// Reduction operation benchmarks for WebGPU backend.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class WebGpuReductionBenchmarks
 {

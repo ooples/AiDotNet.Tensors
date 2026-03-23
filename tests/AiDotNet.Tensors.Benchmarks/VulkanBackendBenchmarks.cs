@@ -24,7 +24,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// <item>GPU vs CPU breakeven point</item>
 /// </list>
 /// </remarks>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class VulkanBackendBenchmarks
@@ -238,7 +238,7 @@ public class VulkanBackendBenchmarks
 /// Benchmarks to measure GPU overhead and breakeven points.
 /// Goal: Find the minimum data size where GPU beats CPU.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class GpuBreakevenBenchmarks
 {

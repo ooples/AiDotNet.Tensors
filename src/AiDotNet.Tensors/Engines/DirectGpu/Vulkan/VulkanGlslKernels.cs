@@ -276,6 +276,81 @@ void main() {
     b[idx] = value * sig * gate;
 }";
 
+    // Backward gated activation GLSL kernels.
+    // a[] = gradOutput [outerSize * halfDim]
+    // bdata[] = original input [outerSize * halfDim * 2]  (first half = value, second half = gate)
+    // c[] = gradInput [outerSize * halfDim * 2]  (first half = dValue, second half = dGate)
+    // Each thread computes ONE output pair (dValue[idx], dGate[idx]) from gradOutput[idx] and input.
+
+    public static string GluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float sig = 1.0 / (1.0 + exp(-gate));
+    c[outer * fullDim + d] = grad * sig;
+    c[outer * fullDim + halfDim + d] = grad * value * sig * (1.0 - sig);
+}";
+
+    public static string GeGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float x3 = value * value * value;
+    float z = 0.7978845608 * (value + 0.044715 * x3);
+    float tanh_z = tanh(z);
+    float gelu = 0.5 * value * (1.0 + tanh_z);
+    // GELU derivative: 0.5*(1+tanh(z)) + 0.5*x*sech^2(z)*z'
+    // where z' = 0.7978845608 * (1 + 3*0.044715*x^2)
+    float sech2 = 1.0 - tanh_z * tanh_z;
+    float z_deriv = 0.7978845608 * (1.0 + 3.0 * 0.044715 * value * value);
+    float gelu_deriv = 0.5 * (1.0 + tanh_z) + 0.5 * value * sech2 * z_deriv;
+    c[outer * fullDim + d] = grad * gate * gelu_deriv;
+    c[outer * fullDim + halfDim + d] = grad * gelu;
+}";
+
+    public static string ReGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    c[outer * fullDim + d] = grad * gate * (value > 0.0 ? 1.0 : 0.0);
+    c[outer * fullDim + halfDim + d] = grad * max(value, 0.0);
+}";
+
+    public static string SwiGluBackward => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint halfDim; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * halfDim;
+    if (idx >= total) return;
+    uint outer = idx / halfDim; uint d = idx % halfDim; uint fullDim = halfDim * 2;
+    float grad = a[idx];
+    float value = bdata[outer * fullDim + d];
+    float gate = bdata[outer * fullDim + halfDim + d];
+    float sig = 1.0 / (1.0 + exp(-value));
+    float swish = value * sig;
+    float swish_deriv = sig + value * sig * (1.0 - sig);
+    c[outer * fullDim + d] = grad * gate * swish_deriv;
+    c[outer * fullDim + halfDim + d] = grad * swish;
+}";
+
     public static string ReluDerivative => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {
@@ -817,6 +892,8 @@ void main() {
     for (uint j = 0; j < innerSize; j++) b[base_idx + j] /= sum;
 }";
 
+    // Spherical softmax: normalize by exp-weighted L2 norm (not regular softmax)
+    // output[i] = exp(x[i]) / sqrt(sum(exp(2*x[j])))
     public static string SphericalSoftmaxGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
 void main() {
@@ -825,9 +902,14 @@ void main() {
     uint base_idx = row * innerSize;
     float max_val = a[base_idx];
     for (uint j = 1; j < innerSize; j++) max_val = max(max_val, a[base_idx + j]);
-    float sum_exp = 0.0;
-    for (uint j = 0; j < innerSize; j++) { b[base_idx + j] = exp(a[base_idx + j] - max_val); sum_exp += b[base_idx + j]; }
-    for (uint j = 0; j < innerSize; j++) b[base_idx + j] /= (sum_exp + 1e-10);
+    float sum_sq = 0.0;
+    for (uint j = 0; j < innerSize; j++) {
+        float e = exp(a[base_idx + j] - max_val);
+        b[base_idx + j] = e;
+        sum_sq += e * e;
+    }
+    float inv_norm = 1.0 / (sqrt(sum_sq) + 1e-10);
+    for (uint j = 0; j < innerSize; j++) b[base_idx + j] *= inv_norm;
 }";
 
     // =====================================================================
@@ -949,28 +1031,28 @@ void main() {
 
     public static string SparsemaxGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
-shared float s_sorted[256]; // max innerSize supported in shared memory
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= outerSize) return;
+    if (innerSize > 256) return; // Safety: skip rows with too many classes
     uint base_idx = row * innerSize;
 
-    // Copy to local and sort (bubble sort for small innerSize — GPU-friendly)
-    for (uint j = 0; j < innerSize; j++) s_sorted[j] = a[base_idx + j];
-    // Sort descending
+    // Copy to output and sort in-place (each thread owns its row — no shared memory race)
+    for (uint j = 0; j < innerSize; j++) b[base_idx + j] = a[base_idx + j];
+    // Sort descending (bubble sort — OK for small innerSize typical in sparsemax)
     for (uint i = 0; i < innerSize; i++) {
         for (uint j = i + 1; j < innerSize; j++) {
-            if (s_sorted[j] > s_sorted[i]) { float tmp = s_sorted[i]; s_sorted[i] = s_sorted[j]; s_sorted[j] = tmp; }
+            if (b[base_idx + j] > b[base_idx + i]) { float tmp = b[base_idx + i]; b[base_idx + i] = b[base_idx + j]; b[base_idx + j] = tmp; }
         }
     }
-    // Find tau
+    // Find tau using sorted values (now in b[base_idx..])
     float cs = 0.0, tau = 0.0;
     for (uint k = 0; k < innerSize; k++) {
-        cs += s_sorted[k];
+        cs += b[base_idx + k];
         float cand = (cs - 1.0) / float(k + 1);
-        if (s_sorted[k] > cand) tau = cand;
+        if (b[base_idx + k] > cand) tau = cand;
     }
-    // Apply sparsemax
+    // Apply sparsemax using original unsorted values
     for (uint j = 0; j < innerSize; j++) b[base_idx + j] = max(a[base_idx + j] - tau, 0.0);
 }";
 }
