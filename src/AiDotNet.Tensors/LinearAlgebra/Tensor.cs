@@ -105,6 +105,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
     }
 
+    /// <summary>View constructor that shares the parent tensor's TensorStorage.</summary>
+    internal Tensor(Vector<T> data, int[] shape, int[] strides, int storageOffset, TensorStorage<T> parentStorage)
+        : base(data, shape, strides, storageOffset, isView: true, parentStorage)
+    {
+    }
+
     /// <summary>
     /// Returns a contiguous tensor with the same data. If already contiguous, returns this
     /// (zero-copy). Otherwise, materializes a new tensor with data in row-major order.
@@ -565,7 +571,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             newOffset += indices[i] * _strides[i];
         }
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -790,11 +796,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
 
-        var result = TensorAllocator.Rent<T>(_shape);
-        // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+        // SIMD fast path: both operands contiguous with zero offset
+        if (IsContiguous && _storageOffset == 0 && other.IsContiguous && other._storageOffset == 0)
+        {
+            var result = TensorAllocator.Rent<T>(_shape);
+            _numOps.Subtract(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+            return result;
+        }
 
-        return result;
+        // View-safe path: materialize both operands first
+        return Contiguous().ElementwiseSubtract(other.Contiguous());
     }
 
     /// <summary>
@@ -996,7 +1007,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Array.Copy(_strides, 1, newStrides, 0, newRank);
         int newOffset = _storageOffset + index * _strides[0];
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -1447,7 +1458,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void MultiplyInPlace(T scalar)
     {
-        _numOps.MultiplyScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
+        if (IsContiguous && _storageOffset == 0)
+        {
+            _numOps.MultiplyScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
+        }
+        else
+        {
+            // View-safe: materialize, multiply, copy back
+            var contiguous = Contiguous();
+            _numOps.MultiplyScalar(contiguous._data.AsSpan(), scalar, contiguous._data.AsWritableSpan());
+            // Copy contiguous result back into this view's storage positions
+            var src = contiguous._data.GetDataArray();
+            for (int i = 0; i < Length; i++)
+            {
+                SetFlat(i, src[i]);
+            }
+        }
     }
 
     /// <summary>
@@ -1703,11 +1729,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (ShapeEquals(this._shape, other._shape))
         {
-            // Simple case: tensors have the same shape
-            var result = TensorAllocator.Rent<T>(this._shape);
-            // Use vectorized Multiply operation for SIMD acceleration (5-15x faster with AVX2)
-            _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
-            return result;
+            // SIMD fast path: both contiguous with zero offset
+            if (IsContiguous && _storageOffset == 0 && other.IsContiguous && other._storageOffset == 0)
+            {
+                var result = TensorAllocator.Rent<T>(this._shape);
+                _numOps.Multiply(_data.AsSpan(), other._data.AsSpan(), result._data.AsWritableSpan());
+                return result;
+            }
+            // View-safe: materialize first
+            return Contiguous().PointwiseMultiply(other.Contiguous());
         }
         else
         {
@@ -2567,7 +2597,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         int newOffset = _storageOffset + index * _strides[dimension];
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
@@ -3680,7 +3710,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         newShape[axis] = sliceSize;
         int newOffset = _storageOffset + start * _strides[axis];
 
-        return new Tensor<T>(_data, newShape, newStrides, newOffset);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset, _storage);
     }
 
     /// <summary>
