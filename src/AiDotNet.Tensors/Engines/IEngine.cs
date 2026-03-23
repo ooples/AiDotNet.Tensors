@@ -6043,7 +6043,7 @@ public interface IEngine
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="tensor">The input tensor.</param>
-    /// <param name="mask">Boolean mask tensor (same shape as input or broadcastable).</param>
+    /// <param name="mask">Boolean mask tensor (must have the same shape as input).</param>
     /// <param name="value">The value to fill where mask is true.</param>
     /// <returns>A tensor with masked positions filled.</returns>
     /// <remarks>
