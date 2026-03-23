@@ -900,21 +900,17 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int index)
     {
-        if (index < 0 || index >= Shape[0])
+        if (index < 0 || index >= _shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(index));
         }
 
-        int[] newShape = [.. _shape.Skip(1)];
-        int sliceSize = newShape.Aggregate(1, (a, b) => a * b);
-        int offset = index * sliceSize;
+        // O(1) view: adjust offset by index * stride[0], drop first dimension.
+        var newShape = _shape[1..];
+        var newStrides = _strides[1..];
+        int newOffset = _storageOffset + index * _strides[0];
 
-        var sliceData = new Vector<T>(sliceSize);
-        // Use internal Span methods - do NOT use implicit T[] conversion as it creates copies
-        var sourceSpan = _data.AsSpan().Slice(offset, sliceSize);
-        _numOps.Copy(sourceSpan, sliceData.AsWritableSpan());
-
-        return new Tensor<T>(newShape, sliceData);
+        return new Tensor<T>(_data, newShape, newStrides, newOffset);
     }
 
     /// <summary>
@@ -1067,29 +1063,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (!permutation.OrderBy(x => x).SequenceEqual(Enumerable.Range(0, Rank)))
             throw new ArgumentException("Invalid permutation array.");
 
-        int[] newShape = new int[Rank];
+        // O(1) view: permute shape and strides, share storage. Zero data movement.
+        var newShape = new int[Rank];
+        var newStrides = new int[Rank];
         for (int i = 0; i < Rank; i++)
         {
-            newShape[i] = Shape[permutation[i]];
+            newShape[i] = _shape[permutation[i]];
+            newStrides[i] = _strides[permutation[i]];
         }
 
-        Tensor<T> result = new Tensor<T>(newShape);
-
-        int[] oldIndices = new int[Rank];
-        int[] newIndices = new int[Rank];
-
-        for (int i = 0; i < Length; i++)
-        {
-            GetIndicesFromFlatIndex(i, oldIndices);
-            for (int j = 0; j < Rank; j++)
-            {
-                newIndices[j] = oldIndices[permutation[j]];
-            }
-
-            result[newIndices] = this[oldIndices];
-        }
-
-        return result;
+        return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
     }
 
     /// <summary>
@@ -1273,11 +1256,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentException(
                 $"Cannot reshape tensor with {Length} elements to shape [{string.Join(", ", newShape)}] ({newTotal} elements).");
 
-        var reshaped = new Tensor<T>(newShape);
-        // Use vectorized Copy operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Copy(_data.AsSpan(), reshaped._data.AsWritableSpan());
+        if (IsContiguous)
+        {
+            // O(1) view: same storage, new shape, row-major strides, same offset.
+            // Guaranteed zero-copy for contiguous tensors (PyTorch can't always guarantee this).
+            var newStrides = ComputeRowMajorStrides(newShape);
+            return new Tensor<T>(_data, newShape, newStrides, _storageOffset);
+        }
 
-        return reshaped;
+        // Non-contiguous view: must materialize first, then reshape the contiguous result
+        return Contiguous().Reshape(newShape);
     }
 
     /// <summary>
@@ -3360,30 +3348,19 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transpose()
     {
-        if (_shape.Length == 1)
+        if (_shape.Length <= 1)
         {
-            // 1D tensor: return a copy (transpose has no effect)
-            return Clone();
+            // 0D/1D tensor: transpose is identity. Return view with same data.
+            return new Tensor<T>(_data, (int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset);
         }
         else if (_shape.Length == 2)
         {
-            // 2D tensor: swap rows and columns
-            var result = new Tensor<T>([Shape[1], Shape[0]]);
-
-            for (int i = 0; i < Shape[0]; i++)
-            {
-                for (int j = 0; j < Shape[1]; j++)
-                {
-                    result[j, i] = this[i, j];
-                }
-            }
-
-            return result;
+            // 2D tensor: swap dimensions. O(1) view.
+            return Transpose([1, 0]);
         }
         else
         {
-            // N-dimensional tensor: reverse all dimensions (default behavior)
-            // For example, [2,3,4] becomes [4,3,2]
+            // N-dimensional tensor: reverse all dimensions. O(1) view.
             var permutation = Enumerable.Range(0, Rank).Reverse().ToArray();
             return Transpose(permutation);
         }
@@ -3646,40 +3623,20 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (axis < 0 || axis >= Rank)
             throw new ArgumentException($"Invalid axis. Must be between 0 and {Rank - 1}.");
 
-        int axisSize = Shape[axis];
+        int axisSize = _shape[axis];
         int actualEnd = end ?? axisSize;
         if (start < 0 || start >= axisSize || actualEnd <= start || actualEnd > axisSize)
             throw new ArgumentException("Invalid start or end index for slicing.");
 
         int sliceSize = actualEnd - start;
-        int[] newShape = new int[Rank];
-        Array.Copy(_shape, newShape, Rank);
+
+        // O(1) view: adjust offset by start * stride[axis], narrow shape on axis.
+        var newShape = (int[])_shape.Clone();
         newShape[axis] = sliceSize;
+        var newStrides = (int[])_strides.Clone();
+        int newOffset = _storageOffset + start * _strides[axis];
 
-        Tensor<T> result = new Tensor<T>(newShape);
-
-        int[] sourceIndices = new int[Rank];
-        int[] destIndices = new int[Rank];
-
-        void SliceRecursive(int depth)
-        {
-            if (depth == Rank)
-            {
-                result[destIndices] = this[sourceIndices];
-                return;
-            }
-
-            int limit = depth == axis ? sliceSize : Shape[depth];
-            for (int i = 0; i < limit; i++)
-            {
-                sourceIndices[depth] = depth == axis ? i + start : i;
-                destIndices[depth] = i;
-                SliceRecursive(depth + 1);
-            }
-        }
-
-        SliceRecursive(0);
-        return result;
+        return new Tensor<T>(_data, newShape, newStrides, newOffset);
     }
 
     /// <summary>
