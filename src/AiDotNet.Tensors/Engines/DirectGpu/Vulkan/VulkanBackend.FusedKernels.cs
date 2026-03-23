@@ -8,31 +8,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed partial class VulkanBackend
 {
+    /// <summary>Reinterpret float bits as uint (net471-safe alternative to BitConverter.SingleToUInt32Bits).</summary>
+    private static unsafe uint FloatBits(float value) { return *(uint*)&value; }
+
     #region Fused Reductions
 
-    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.SumOfSquaresAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MaxMagnitudeAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MinMagnitudeAxis, i, o, 1, 2*sizeof(uint));
-    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, 1, 2*sizeof(uint));
-    public void VarianceAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, 2 * sizeof(uint));
-    public void StdAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.StdAxis, i, o, os, 2 * sizeof(uint));
-    public void ProductAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, os, 2 * sizeof(uint));
-    public void NormAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, os, 2 * sizeof(uint));
-    public void LogSumExpAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, os, 2 * sizeof(uint));
-    public void CumSumAxis(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.CumSumAxis, i, o, os, 2 * sizeof(uint));
-    public void ScalarMinusTensor(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.ScalarMinusTensor, i, o, sz, sizeof(float) + sizeof(uint));
-    public void NormalizeL2(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.NormalizeL2, i, o, os, 2 * sizeof(uint));
-    public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceSumBackwardGlsl, go, gi, os * rs, 2 * sizeof(uint));
-    public void ReduceMeanBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceMeanBackwardGlsl, go, gi, os * rs, 2 * sizeof(uint));
+    // Reduce* methods: dispatch 1 workgroup, push {outerSize=1, reduceSize=sz}
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MeanAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceProduct(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceNormL2(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceSumOfSquares(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.SumOfSquaresAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceMaxMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MaxMagnitudeAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceMinMagnitude(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.MinMagnitudeAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    public void ReduceLogSumExp(IGpuBuffer i, IGpuBuffer o, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, 1, new uint[] { 1, (uint)sz }, 2 * sizeof(uint));
+    // Axis methods: dispatch os workgroups, push {outerSize=os, reduceSize=rs}
+    public void VarianceAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.VarianceAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void StdAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.StdAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void ProductAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ProductAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void NormAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.NormAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void LogSumExpAxis(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogSumExpAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void CumSumAxis(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.CumSumAxis, i, o, os, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    // Scalar ops: push {scalar_as_uint_bits, size}
+    public void ScalarMinusTensor(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.ScalarMinusTensor, i, o, sz, new uint[] { FloatBits(sc), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void NormalizeL2(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.NormalizeL2, i, o, os, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    // Backward: dispatch os*rs workgroups, push {outerSize, reduceSize}
+    public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceSumBackwardGlsl, go, gi, os * rs, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+    public void ReduceMeanBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceMeanBackwardGlsl, go, gi, os * rs, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
 
     public void ReduceMaxBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer mx, IGpuBuffer gi, int os, int rs) => GlslQuadOp(VulkanGlslKernels.ReduceMaxBackwardGlsl, go, inp, mx, gi, os * rs, 2 * sizeof(uint));
 
     public void ReduceVarianceBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer ms, IGpuBuffer gi, int os, int rs) => GlslQuadOp(VulkanGlslKernels.ReduceVarianceBackwardGlsl, go, inp, ms, gi, os * rs, 2 * sizeof(uint));
 
-    public void ReduceLogVariance(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogVarianceAxis, i, o, os, 2 * sizeof(uint));
+    public void ReduceLogVariance(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogVarianceAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
 
     public void ReduceLogVarianceBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer ms, IGpuBuffer vs, IGpuBuffer gi, int os, int rs) => GlslQuintOp(VulkanGlslKernels.ReduceLogVarianceBackwardGlsl, go, inp, ms, vs, gi, os * rs, 2 * sizeof(uint));
 
@@ -40,53 +47,53 @@ public sealed partial class VulkanBackend
 
     #region Fused Broadcast / Scalar
 
-    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastSubLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastDivLast, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastAddFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddFirst, a, b, o, os * isz, 2 * sizeof(uint));
-    public void BroadcastMulFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulFirst, a, b, o, os * isz, 2 * sizeof(uint));
-    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.SubScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void DivScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.DivScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => GlslUnaryOp(VulkanGlslKernels.PowScalar, i, o, sz, sizeof(float) + sizeof(uint));
-    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.FracKernel, i, o, sz, sizeof(uint));
-    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.ClipKernel, i, o, sz, 2 * sizeof(float) + sizeof(uint));
-    public void RsqrtKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.RsqrtKernel, i, o, sz);
+    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddLast, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastSubLast, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulLast, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastDivLast, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void BroadcastAddFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastAddFirst, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void BroadcastMulFirst(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => GlslBinaryOp(VulkanGlslKernels.BroadcastMulFirst, a, b, o, os * isz, new uint[] { (uint)os, (uint)isz }, 2 * sizeof(uint));
+    public void AddScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.AddScalar, i, o, sz, new uint[] { FloatBits(sc), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.SubScalar, i, o, sz, new uint[] { FloatBits(sc), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void DivScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => GlslUnaryOp(VulkanGlslKernels.DivScalar, i, o, sz, new uint[] { FloatBits(sc), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => GlslUnaryOp(VulkanGlslKernels.PowScalar, i, o, sz, new uint[] { FloatBits(ex), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.FracKernel, i, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => GlslUnaryOp(VulkanGlslKernels.ClipKernel, i, o, sz, new uint[] { FloatBits(mn), FloatBits(mx), (uint)sz }, 2 * sizeof(float) + sizeof(uint));
+    public void RsqrtKernel(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.RsqrtKernel, i, o, sz, new uint[] { (uint)sz }, sizeof(uint));
 
     public void SinCosKernel(IGpuBuffer i, IGpuBuffer so, IGpuBuffer co, int sz)
     {
         // SinCos requires 1 input → 2 outputs; use GlslUnaryOp for each separately
-        GlslUnaryOp(VulkanGlslKernels.SinKernel, i, so, sz, sizeof(uint));
-        GlslUnaryOp(VulkanGlslKernels.CosKernel, i, co, sz, sizeof(uint));
+        GlslUnaryOp(VulkanGlslKernels.SinKernel, i, so, sz, new uint[] { (uint)sz }, sizeof(uint));
+        GlslUnaryOp(VulkanGlslKernels.CosKernel, i, co, sz, new uint[] { (uint)sz }, sizeof(uint));
     }
 
-    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.EqualsKernel, a, b, o, sz, sizeof(uint));
-    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.NotEqualsKernel, a, b, o, sz, sizeof(uint));
+    public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.EqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.NotEqualsKernel, a, b, o, sz, new uint[] { (uint)sz }, sizeof(uint));
 
     #endregion
 
     #region Fused Gated Activations
 
-    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.GluForward, i, o, os * hd, 2 * sizeof(uint));
-    public void GluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.GluBackward, go, inp, gi, os * hd, 2 * sizeof(uint));
-    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.GeGluForward, i, o, os * hd, 2 * sizeof(uint));
-    public void GeGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.GeGluBackward, go, inp, gi, os * hd, 2 * sizeof(uint));
-    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.ReGluForward, i, o, os * hd, 2 * sizeof(uint));
-    public void ReGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.ReGluBackward, go, inp, gi, os * hd, 2 * sizeof(uint));
-    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.SwiGluForward, i, o, os * hd, 2 * sizeof(uint));
-    public void SwiGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.SwiGluBackward, go, inp, gi, os * hd, 2 * sizeof(uint));
-    public void ReluDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ReluDerivative, i, o, sz);
-    public void SigmoidDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.SigmoidDerivative, i, o, sz);
-    public void TanhDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.TanhDerivative, i, o, sz);
+    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.GluForward, i, o, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void GluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.GluBackward, go, inp, gi, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.GeGluForward, i, o, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void GeGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.GeGluBackward, go, inp, gi, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.ReGluForward, i, o, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void ReGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.ReGluBackward, go, inp, gi, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => GlslUnaryOp(VulkanGlslKernels.SwiGluForward, i, o, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void SwiGluBackward(IGpuBuffer go, IGpuBuffer inp, IGpuBuffer gi, int os, int hd) => GlslBinaryOp(VulkanGlslKernels.SwiGluBackward, go, inp, gi, os * hd, new uint[] { (uint)os, (uint)hd }, 2 * sizeof(uint));
+    public void ReluDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.ReluDerivative, i, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    public void SigmoidDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.SigmoidDerivative, i, o, sz, new uint[] { (uint)sz }, sizeof(uint));
+    public void TanhDerivative(IGpuBuffer i, IGpuBuffer o, int sz) => GlslUnaryOp(VulkanGlslKernels.TanhDerivative, i, o, sz, new uint[] { (uint)sz }, sizeof(uint));
 
     #endregion
 
     #region Fused Shape / Layout
 
-    public void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int ais, int bis) => GlslBinaryOp(VulkanGlslKernels.ConcatAxisGlsl, a, b, o, os * (ais + bis), 3 * sizeof(uint));
-    public void SliceLastAxis(IGpuBuffer i, IGpuBuffer o, int os, int iis, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SliceLastAxisGlsl, i, o, os * ss, 4 * sizeof(uint));
-    public void SetSliceLastAxis(IGpuBuffer o, IGpuBuffer v, int os, int ois, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SetSliceLastAxisGlsl, v, o, os * ss, 4 * sizeof(uint));
+    public void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int ais, int bis) => GlslBinaryOp(VulkanGlslKernels.ConcatAxisGlsl, a, b, o, os * (ais + bis), new uint[] { (uint)os, (uint)ais, (uint)bis }, 3 * sizeof(uint));
+    public void SliceLastAxis(IGpuBuffer i, IGpuBuffer o, int os, int iis, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SliceLastAxisGlsl, i, o, os * ss, new uint[] { (uint)os, (uint)iis, (uint)st, (uint)ss }, 4 * sizeof(uint));
+    public void SetSliceLastAxis(IGpuBuffer o, IGpuBuffer v, int os, int ois, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SetSliceLastAxisGlsl, v, o, os * ss, new uint[] { (uint)os, (uint)ois, (uint)st, (uint)ss }, 4 * sizeof(uint));
     public void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.Stack2Glsl, a, b, o, sz * 2, sizeof(uint));
     public void Pad2D(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl, float pv) => GlslUnaryOp(VulkanGlslKernels.Pad2DGlsl, i, o, ba * ch * oh * ow, 8 * sizeof(uint));
     public void Pad2DBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl) => GlslUnaryOp(VulkanGlslKernels.Pad2DBackwardGlsl, go, gi, ba * ch * ih * iw, 8 * sizeof(uint));

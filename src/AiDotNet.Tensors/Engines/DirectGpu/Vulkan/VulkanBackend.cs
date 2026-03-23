@@ -222,12 +222,21 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int size, uint pushConstantSize = sizeof(uint))
     {
+        // Single-parameter shorthand — pushes {size} as the only push constant
+        GlslUnaryOp(glslSource, A, B, size, new uint[] { (uint)size }, pushConstantSize);
+    }
+
+    /// <summary>
+    /// Executes a GLSL compute pipeline with 2 buffers and explicit push constant values.
+    /// </summary>
+    private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 2, pushConstantSize);
         if (pipeline is null)
         {
-            CpuFallbackUnary(A, B, size);
+            CpuFallbackUnary(A, B, dispatchSize);
             return;
         }
         var vbA = AsVulkan(A);
@@ -236,8 +245,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage);
-            // Push actual constant values based on size — most GLSL kernels expect {outerSize, reduceSize} or just {size}
-            RecordAndExecuteComputeWithPushConstants(pipeline, size, pushConstantSize, threadRes);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
     }
 
@@ -246,12 +254,17 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslBinaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, uint pushConstantSize = sizeof(uint))
     {
+        GlslBinaryOp(glslSource, A, B, C, size, new uint[] { (uint)size }, pushConstantSize);
+    }
+
+    private void GlslBinaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int dispatchSize, uint[] pushConstants, uint pushConstantSize)
+    {
         EnsureInitialized();
-        if (size <= 0) return;
+        if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 3, pushConstantSize);
         if (pipeline is null)
         {
-            CpuFallbackBinary(A, B, C, size);
+            CpuFallbackBinary(A, B, C, dispatchSize);
             return;
         }
         var vbA = AsVulkan(A);
@@ -261,7 +274,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(vbA.Storage, vbB.Storage, vbC.Storage);
-            RecordAndExecuteComputeUnlocked(pipeline, size, threadRes);
+            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
         }
     }
 
@@ -634,12 +647,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <summary>
-    /// Records and executes a compute dispatch with proper push constant values.
-    /// For kernels expecting {outerSize, reduceSize}: size=outerSize, pushConstantSize=8
-    /// For kernels expecting {size}: size=elementCount, pushConstantSize=4
+    /// Records and executes a compute dispatch with explicit push constant values.
+    /// Pushes the exact values needed by the GLSL shader's push_constant block.
     /// Caller MUST hold _computeLock.
     /// </summary>
-    private void RecordAndExecuteComputeWithPushConstants(VulkanComputePipeline pipeline, int elementCount, uint pushConstantSize, ThreadCommandResources threadRes)
+    private void RecordAndExecuteWithPushData(VulkanComputePipeline pipeline, int dispatchSize, uint[] pushConstants, uint pushConstantSize, ThreadCommandResources threadRes)
     {
         var cmdBuffer = threadRes.CommandBuffer;
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
@@ -655,26 +667,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var ds = pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(cmdBuffer, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &ds, 0, null);
 
-        // Push the actual constant data — elementCount is used as the primary parameter.
-        // For 2-uint kernels ({outerSize, reduceSize} or {param, size}), we push both values.
-        if (pushConstantSize <= sizeof(uint))
+        // Push the caller-provided constant values
+        fixed (uint* ptr = pushConstants)
         {
-            uint sz = (uint)elementCount;
-            VulkanNativeBindings.vkCmdPushConstants(cmdBuffer, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint), &sz);
-        }
-        else
-        {
-            // Push elementCount as a uint followed by zeros for remaining parameters.
-            // Individual GlslUnaryOp callers pass 'size' which maps to outerSize or the
-            // primary parameter. The reduceSize/scalar is embedded in the GLSL source.
-            // NOTE: For proper push constant support, callers should provide all values.
-            var constants = stackalloc uint[(int)(pushConstantSize / sizeof(uint))];
-            constants[0] = (uint)elementCount;
-            for (int i = 1; i < (int)(pushConstantSize / sizeof(uint)); i++) constants[i] = 0;
-            VulkanNativeBindings.vkCmdPushConstants(cmdBuffer, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, constants);
+            VulkanNativeBindings.vkCmdPushConstants(cmdBuffer, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
         }
 
-        uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+        uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(dispatchSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
