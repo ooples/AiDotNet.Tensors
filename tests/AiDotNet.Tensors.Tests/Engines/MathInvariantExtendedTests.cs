@@ -441,4 +441,184 @@ public class MathInvariantExtendedTests
     // ================================================================
     [Fact] public void AddScaled_ScaleA() { var a = R([64], 1); var b = C(0f, 64); AE(E.TensorAddScaled(a, b, 3f, 0f), E.TensorMultiplyScalar(a, 3f), 1e-3f); }
     [Fact] public void AddScaled_ScaleB() { var a = C(0f, 64); var b = R([64], 2); AE(E.TensorAddScaled(a, b, 0f, 2f), E.TensorMultiplyScalar(b, 2f), 1e-3f); }
+
+    // ================================================================
+    // ISSUE #48/#49: Transposed tensor operations (6 tests)
+    // Verifies that Transpose() + operation produces correct results
+    // ================================================================
+    [Fact] public void BatchMatMul_WithTransposedInputs()
+    {
+        // A: [2, 3, 4], B: [2, 4, 5] -> C: [2, 3, 5]
+        // Create A as transpose of [2, 4, 3] to test transposed-then-matmul pattern
+        var aOrig = R([2, 4, 3], 200);
+        var aT = aOrig.Transpose(new[] { 0, 2, 1 }); // [2, 3, 4]
+        var b = R([2, 4, 5], 201);
+        var result = E.TensorBatchMatMul(aT, b);
+        Assert.Equal(new[] { 2, 3, 5 }, result.Shape);
+        // Verify against manual computation
+        var ad = aT.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
+        for (int bi = 0; bi < 2; bi++)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 5; j++)
+                {
+                    float expected = 0;
+                    for (int k = 0; k < 4; k++) expected += ad[bi * 12 + i * 4 + k] * bd[bi * 20 + k * 5 + j];
+                    Assert.True(Math.Abs(rd[bi * 15 + i * 5 + j] - expected) < 1e-2f,
+                        $"Mismatch at [{bi},{i},{j}]: got {rd[bi * 15 + i * 5 + j]}, expected {expected}");
+                }
+    }
+
+    [Fact] public void BroadcastMultiply_4D_Values()
+    {
+        // Issue #48 comment: test 4D+ broadcast with VALUE verification, not just shape
+        // a: [2, 3, 4, 5], b: [1, 1, 1, 5] -> broadcast multiply
+        var a = R([2, 3, 4, 5], 202);
+        var b = R([1, 1, 1, 5], 203);
+        var result = E.TensorBroadcastMultiply(a, b);
+        Assert.Equal(new[] { 2, 3, 4, 5 }, result.Shape);
+        // Verify values: each element a[i] should be multiplied by b[i % 5]
+        var ad = a.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
+        for (int i = 0; i < ad.Length; i++)
+            Assert.True(Math.Abs(rd[i] - ad[i] * bd[i % 5]) < 1e-4f,
+                $"4D broadcast mul wrong at [{i}]: {rd[i]} vs {ad[i] * bd[i % 5]}");
+    }
+
+    [Fact] public void BroadcastMultiply_3D_MultiAxis()
+    {
+        // Broadcast across multiple axes simultaneously: [4, 3, 5] * [4, 1, 5]
+        var a = R([4, 3, 5], 204);
+        var b = R([4, 1, 5], 205);
+        var result = E.TensorBroadcastMultiply(a, b);
+        Assert.Equal(new[] { 4, 3, 5 }, result.Shape);
+        var ad = a.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 3; j++)
+                for (int k = 0; k < 5; k++)
+                {
+                    float expected = ad[i * 15 + j * 5 + k] * bd[i * 5 + k]; // b broadcasts over axis 1
+                    Assert.True(Math.Abs(rd[i * 15 + j * 5 + k] - expected) < 1e-4f);
+                }
+    }
+
+    [Fact] public void Transpose_ThenAdd_Correct()
+    {
+        // Transpose both operands, then add — result should match adding originals transposed
+        var a = R([4, 8], 206);
+        var b = R([4, 8], 207);
+        var aT = E.TensorTranspose(a); // [8, 4]
+        var bT = E.TensorTranspose(b); // [8, 4]
+        var sumT = E.TensorAdd(aT, bT); // [8, 4]
+        var sumOrig = E.TensorTranspose(E.TensorAdd(a, b)); // transpose(a+b) should equal aT+bT
+        AE(sumT, sumOrig, 1e-4f, "Transpose+Add mismatch");
+    }
+
+    [Fact] public void Reshape_ThenMatMul_Correct()
+    {
+        // Create a tensor, reshape it, then use in matmul
+        var flat = R([24], 208);
+        var mat = flat.Reshape(4, 6); // [4, 6]
+        var b = R([6, 3], 209);
+        var result = E.TensorMatMul(mat, b);
+        Assert.Equal(new[] { 4, 3 }, result.Shape);
+        // Verify manually
+        var md = mat.GetDataArray(); var bd = b.GetDataArray(); var rd = result.GetDataArray();
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 3; j++)
+            {
+                float expected = 0;
+                for (int k = 0; k < 6; k++) expected += md[i * 6 + k] * bd[k * 3 + j];
+                Assert.True(Math.Abs(rd[i * 3 + j] - expected) < 1e-2f);
+            }
+    }
+
+    [Fact] public void Conv2DBackwardKernel_Shape()
+    {
+        // Conv2DBackwardKernel should produce gradient with same shape as kernel
+        var input = R([1, 3, 8, 8], 210);
+        var gradOutput = R([1, 16, 8, 8], 211);
+        var kernelShape = new[] { 16, 3, 3, 3 };
+        var dW = E.Conv2DBackwardKernel(gradOutput, input, kernelShape, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+        Assert.Equal(kernelShape, dW.Shape);
+    }
+
+    // ================================================================
+    // ADDITIONAL BACKWARD OPS (8 tests)
+    // ================================================================
+    [Fact] public void SigmoidBackward_ShapePreserved()
+    {
+        var x = R([64], 220);
+        var sig = E.TensorSigmoid(x);
+        var grad = R([64], 221);
+        var dSig = E.SigmoidBackward(sig, grad);
+        Assert.Equal(new[] { 64 }, dSig.Shape);
+        // Result should be non-zero since grad is non-zero
+        Assert.True(dSig.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "SigmoidBackward all zeros");
+    }
+
+    [Fact] public void TanhBackward_ShapePreserved()
+    {
+        var x = R([64], 222);
+        var th = E.TensorTanh(x);
+        var grad = R([64], 223);
+        var dTanh = E.TanhBackward(th, grad);
+        Assert.Equal(new[] { 64 }, dTanh.Shape);
+        Assert.True(dTanh.GetDataArray().Any(v => Math.Abs(v) > 1e-7f), "TanhBackward all zeros");
+    }
+
+    [Fact] public void ReLUDerivative_Correct()
+    {
+        // relu'(x) = 1 if x > 0, 0 otherwise
+        var x = new Tensor<float>(new float[] { -2, -1, 0, 1, 2 }, [5]);
+        var d = E.ReLUDerivative(x);
+        var expected = new Tensor<float>(new float[] { 0, 0, 0, 1, 1 }, [5]);
+        AE(d, expected, 1e-4f, "ReLU derivative");
+    }
+
+    [Fact] public void SoftmaxBackward_ShapePreserved()
+    {
+        var x = R([4, 16], 222);
+        var sm = E.Softmax(x, -1);
+        var grad = R([4, 16], 223);
+        var dSm = E.SoftmaxBackward(sm, grad, -1);
+        Assert.Equal(new[] { 4, 16 }, dSm.Shape);
+    }
+
+    [Fact] public void ReduceMax_MatchesTensorMax()
+    {
+        var x = R([4, 8], 224);
+        var rmax = E.ReduceMax(x, new[] { 1 }, false, out _);
+        Assert.Equal(new[] { 4 }, rmax.Shape);
+        var xd = x.GetDataArray(); var rd = rmax.GetDataArray();
+        for (int i = 0; i < 4; i++)
+        {
+            float rowMax = float.MinValue;
+            for (int j = 0; j < 8; j++) rowMax = Math.Max(rowMax, xd[i * 8 + j]);
+            Assert.True(Math.Abs(rd[i] - rowMax) < 1e-4f);
+        }
+    }
+
+    [Fact] public void ReduceVariance_NonNeg()
+    {
+        var x = R([4, 16], 225);
+        var v = E.ReduceVariance(x, new[] { 1 }, false);
+        var vd = v.GetDataArray();
+        for (int i = 0; i < vd.Length; i++)
+            Assert.True(vd[i] >= -1e-6f, $"Variance negative at [{i}]: {vd[i]}");
+    }
+
+    [Fact] public void GroupNorm_ShapePreserved()
+    {
+        var x = R([2, 8, 4, 4], 226);
+        var g = C(1f, 8); var b = C(0f, 8);
+        var r = E.GroupNorm(x, 4, new Tensor<float>(g.GetDataArray(), [8]), new Tensor<float>(b.GetDataArray(), [8]), 1e-5, out _, out _);
+        Assert.Equal(new[] { 2, 8, 4, 4 }, r.Shape);
+    }
+
+    [Fact] public void InstanceNorm_ShapePreserved()
+    {
+        var x = R([2, 4, 8, 8], 227);
+        var g = C(1f, 4); var b = C(0f, 4);
+        var r = E.InstanceNorm(x, new Tensor<float>(g.GetDataArray(), [4]), new Tensor<float>(b.GetDataArray(), [4]), 1e-5, out _, out _);
+        Assert.Equal(new[] { 2, 4, 8, 8 }, r.Shape);
+    }
 }
