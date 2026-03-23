@@ -86,8 +86,7 @@ public sealed class TensorArena : IDisposable
             _cursor[elementCount] = 0;
         }
 
-        if (!_cursor.TryGetValue(elementCount, out int cursor))
-            cursor = 0;
+        int cursor = _cursor[elementCount];
 
         if (cursor < bucket.Count)
         {

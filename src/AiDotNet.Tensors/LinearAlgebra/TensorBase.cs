@@ -180,7 +180,7 @@ public abstract class TensorBase<T>
     /// Pre-computed row-major strides for logical flat index decomposition.
     /// Cached to avoid recomputing in hot paths (FlatIndexToStorageIndex, ToArray, etc.).
     /// </summary>
-    private int[]? _rowMajorStridesCache;
+    private volatile int[]? _rowMajorStridesCache;
     internal int[] RowMajorStrides => _rowMajorStridesCache ??= ComputeRowMajorStrides(_shape);
 
     /// <summary>

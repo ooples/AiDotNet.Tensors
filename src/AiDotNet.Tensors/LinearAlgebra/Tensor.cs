@@ -1186,21 +1186,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return new Tensor<T>([1], new Vector<T>([sum]));
         }
 
-        axes = [.. axes.OrderBy(x => x)];
+        // Build boolean lookup for O(1) axis membership test (replaces LINQ Contains)
+        var isReduceAxis = new bool[Rank];
+        for (int i = 0; i < axes.Length; i++)
+            isReduceAxis[axes[i]] = true;
+
         int[] newShape = new int[Rank - axes.Length];
         int newIndex = 0;
-
         for (int i = 0; i < Rank; i++)
         {
-            if (!axes.Contains(i))
-            {
+            if (!isReduceAxis[i])
                 newShape[newIndex++] = Shape[i];
-            }
         }
 
         var result = new Tensor<T>(newShape);
         int[] indices = new int[Rank];
-        SumRecursive(this, result, axes, indices, 0, _numOps.Zero);
+        SumRecursive(this, result, isReduceAxis, indices, 0, _numOps.Zero);
 
         return result;
     }
@@ -1332,7 +1333,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// specified dimensions. You don't need to call this method directly - it's used internally by 
     /// the Sum method.</para>
     /// </remarks>
-    private void SumRecursive(Tensor<T> input, Tensor<T> result, int[] axes, int[] indices, int depth, T currentSum)
+    private void SumRecursive(Tensor<T> input, Tensor<T> result, bool[] isReduceAxis, int[] indices, int depth, T currentSum)
     {
         if (depth == Rank)
         {
@@ -1340,7 +1341,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             int resultIndex = 0;
             for (int i = 0; i < Rank; i++)
             {
-                if (!axes.Contains(i))
+                if (!isReduceAxis[i])
                 {
                     resultIndices[resultIndex++] = indices[i];
                 }
@@ -1349,12 +1350,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return;
         }
 
-        if (axes.Contains(depth))
+        if (isReduceAxis[depth])
         {
             for (int i = 0; i < Shape[depth]; i++)
             {
                 indices[depth] = i;
-                SumRecursive(input, result, axes, indices, depth + 1, _numOps.Add(currentSum, this[indices]));
+                SumRecursive(input, result, isReduceAxis, indices, depth + 1, _numOps.Add(currentSum, this[indices]));
             }
         }
         else
@@ -1362,7 +1363,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             for (int i = 0; i < Shape[depth]; i++)
             {
                 indices[depth] = i;
-                SumRecursive(input, result, axes, indices, depth + 1, currentSum);
+                SumRecursive(input, result, isReduceAxis, indices, depth + 1, currentSum);
             }
         }
     }
