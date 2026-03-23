@@ -15569,8 +15569,8 @@ public class CpuEngine : ITensorLevelEngine
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
 
-        // Compute exp(x - max)
-        var shifted = TensorSubtract(tensor, maxVals);
+        // Compute exp(x - max) — use broadcast subtract so keepDims max [N,1,...] broadcasts over [N,D,...]
+        var shifted = TensorBroadcastSubtract(tensor, maxVals);
         var expShifted = TensorExp(shifted);
 
         // Sum along axis
@@ -15581,6 +15581,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (keepDims)
         {
+            // logSum and maxVals both have keepDims shape — shapes should match here
             return TensorAdd(logSum, maxVals);
         }
         else
@@ -16070,8 +16071,8 @@ public class CpuEngine : ITensorLevelEngine
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
-        // Divide
-        return TensorDivide(tensor, norm);
+        // Divide (use broadcast divide so keepDims norm [N,1,...] broadcasts over tensor [N,D,...])
+        return TensorBroadcastDivide(tensor, norm);
     }
 
     /// <inheritdoc/>
