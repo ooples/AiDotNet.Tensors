@@ -203,7 +203,7 @@ public class MathInvariantTests
     // LOSS / COMPARISON (4)
     // ================================================================
     [Fact] public void BCE_LowForCorrect() { var loss = E.TensorBinaryCrossEntropy(new Tensor<float>(new float[] { 0.99f, 0.01f }, [2]), new Tensor<float>(new float[] { 1f, 0f }, [2]), 1e-7f); Assert.True(E.TensorMean(loss) < 0.1f); }
-    [Fact] public void BCE_NonNeg() { var d = E.TensorBinaryCrossEntropy(RP([64], 110), new Tensor<float>(Enumerable.Repeat(0.5f, 64).ToArray(), [64]), 1e-7f).GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= -Tol); }
+    [Fact] public void BCE_NonNeg() { var preds = E.TensorSigmoid(R([64], 110)); var d = E.TensorBinaryCrossEntropy(preds, new Tensor<float>(Enumerable.Repeat(0.5f, 64).ToArray(), [64]), 1e-7f).GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= -Tol); }
     [Fact] public void Equals_Reflexive() => AE(E.TensorEquals(R([64], 120), R([64], 120)), C(1, 64));
     [Fact] public void NotEquals_Complement() { var a = R([64], 121); var b = R([64], 122); var eq = E.TensorEquals(a, b).GetDataArray(); var ne = E.TensorNotEquals(a, b).GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(Math.Abs((eq[i] + ne[i]) - 1f) < Tol); }
 }

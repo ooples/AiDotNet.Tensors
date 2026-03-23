@@ -181,7 +181,7 @@ public class BatchMatMulAndAttentionTests
         var V = new Tensor<float>(vData, shape);
         var gradOutput = new Tensor<float>(gradData, shape);
 
-        var output = _engine.ScaledDotProductAttention(Q, K, V, null, scale, out var attnWeights);
+        _engine.ScaledDotProductAttention(Q, K, V, null, scale, out var attnWeights);
 
         _engine.ScaledDotProductAttentionBackward(
             gradOutput, Q, K, V, attnWeights,
@@ -233,7 +233,7 @@ public class BatchMatMulAndAttentionTests
         var gradOutput = new Tensor<float>(
             Enumerable.Repeat(1f, total).ToArray(), shape);
 
-        var output = _engine.ScaledDotProductAttention(Q, K, V, null, scale, out var attnW);
+        _engine.ScaledDotProductAttention(Q, K, V, null, scale, out var attnW);
         _engine.ScaledDotProductAttentionBackward(
             gradOutput, Q, K, V, attnW, scale,
             out _, out _, out var dV);
