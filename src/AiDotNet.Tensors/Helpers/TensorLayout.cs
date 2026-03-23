@@ -42,7 +42,7 @@ public static class TensorLayout
         int w = nchw._shape[3];
 
         var nhwc = new Tensor<T>(new[] { n, h, w, c });
-        var src = nchw.AsSpan();
+        var src = (nchw.IsContiguous ? nchw : nchw.Contiguous()).AsSpan();
         var dst = nhwc.AsWritableSpan();
 
         for (int batch = 0; batch < n; batch++)
@@ -82,7 +82,7 @@ public static class TensorLayout
         int c = nhwc._shape[3];
 
         var nchw = new Tensor<T>(new[] { n, c, h, w });
-        var src = nhwc.AsSpan();
+        var src = (nhwc.IsContiguous ? nhwc : nhwc.Contiguous()).AsSpan();
         var dst = nchw.AsWritableSpan();
 
         for (int batch = 0; batch < n; batch++)
@@ -124,7 +124,7 @@ public static class TensorLayout
         if (destination._shape[0] != n || destination._shape[1] != h || destination._shape[2] != w || destination._shape[3] != c)
             throw new ArgumentException($"Destination shape [{string.Join(",", destination._shape)}] must be [N={n},H={h},W={w},C={c}].");
 
-        var src = nchw.AsSpan();
+        var src = (nchw.IsContiguous ? nchw : nchw.Contiguous()).AsSpan();
         var dst = destination.AsWritableSpan();
 
         for (int batch = 0; batch < n; batch++)
@@ -164,7 +164,7 @@ public static class TensorLayout
         int w = nhwc._shape[2];
         int c = nhwc._shape[3];
 
-        var src = nhwc.AsSpan();
+        var src = (nhwc.IsContiguous ? nhwc : nhwc.Contiguous()).AsSpan();
         var dst = destination.AsWritableSpan();
 
         for (int batch = 0; batch < n; batch++)

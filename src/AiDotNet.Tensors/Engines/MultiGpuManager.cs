@@ -175,7 +175,7 @@ public class MultiGpuManager : IDisposable
             throw new InvalidOperationException("No GPU devices are available for tensor distribution.");
 
         var result = new Dictionary<int, Tensor<T>>();
-        var data = tensor.AsSpan().ToArray();
+        var data = tensor.ToArray();
         var batchSize = tensor._shape[0];
         int chunkSize = batchSize / _devices.Count;
 
