@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>AiDotNet.Native.ROCm</PackageId>
+    <Version>6.3.0</Version>
+    <Authors>AiDotNet Contributors</Authors>
+    <Company>AiDotNet</Company>
+    <Description>Native AMD ROCm binaries (rocBLAS + MIOpen) for GPU-accelerated deep learning on AMD GPUs. Provides assembly-tuned GEMM (rocBLAS) achieving 60-80% peak TFLOPS, and optimized convolution/normalization/pooling/attention primitives (MIOpen). Install this package alongside AiDotNet.Tensors for automatic AMD GPU acceleration via HIP.</Description>
+    <PackageTags>rocm;rocblas;miopen;hip;amd;gpu;blas;deep-learning;native</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ooples/AiDotNet.Tensors</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ooples/AiDotNet.Tensors</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- This is a native-only package, no managed code -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+
+    <!-- Include native libraries in package -->
+    <ContentTargetFolders>content</ContentTargetFolders>
+  </PropertyGroup>
+
+  <!-- Windows x64 native libraries (ROCm for Windows) -->
+  <ItemGroup Condition="Exists('runtimes\win-x64\native\rocblas.dll')">
+    <None Include="runtimes\win-x64\native\rocblas.dll" Pack="true" PackagePath="runtimes\win-x64\native" />
+    <None Include="runtimes\win-x64\native\MIOpen.dll" Pack="true" PackagePath="runtimes\win-x64\native" Condition="Exists('runtimes\win-x64\native\MIOpen.dll')" />
+    <None Include="runtimes\win-x64\native\amdhip64.dll" Pack="true" PackagePath="runtimes\win-x64\native" Condition="Exists('runtimes\win-x64\native\amdhip64.dll')" />
+    <None Include="runtimes\win-x64\native\hiprtc.dll" Pack="true" PackagePath="runtimes\win-x64\native" Condition="Exists('runtimes\win-x64\native\hiprtc.dll')" />
+  </ItemGroup>
+
+  <!-- Linux x64 native libraries (primary ROCm platform) -->
+  <ItemGroup Condition="Exists('runtimes\linux-x64\native\librocblas.so')">
+    <None Include="runtimes\linux-x64\native\librocblas.so" Pack="true" PackagePath="runtimes\linux-x64\native" />
+    <None Include="runtimes\linux-x64\native\libMIOpen.so" Pack="true" PackagePath="runtimes\linux-x64\native" Condition="Exists('runtimes\linux-x64\native\libMIOpen.so')" />
+    <None Include="runtimes\linux-x64\native\libamdhip64.so" Pack="true" PackagePath="runtimes\linux-x64\native" Condition="Exists('runtimes\linux-x64\native\libamdhip64.so')" />
+    <None Include="runtimes\linux-x64\native\libhiprtc.so" Pack="true" PackagePath="runtimes\linux-x64\native" Condition="Exists('runtimes\linux-x64\native\libhiprtc.so')" />
+  </ItemGroup>
+
+  <!-- Ensure the native libraries are copied to output -->
+  <ItemGroup>
+    <None Update="runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- Build targets to copy native libraries -->
+  <ItemGroup>
+    <None Include="build\AiDotNet.Native.ROCm.targets" Pack="true" PackagePath="build" />
+  </ItemGroup>
+
+</Project>
