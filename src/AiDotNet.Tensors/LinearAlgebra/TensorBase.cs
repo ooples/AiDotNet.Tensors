@@ -99,9 +99,18 @@ public abstract class TensorBase<T>
     /// AiDotNet libraries access this via InternalsVisibleTo.</para>
     /// <para>For large tensors (>256K elements), the memory is POH-pinned, so Pin() is essentially free.</para>
     /// </remarks>
-    internal Memory<T> Memory => IsContiguous && _storageOffset == 0
-        ? _data.AsWritableMemory()
-        : _data.AsWritableMemory().Slice(_storageOffset, Length);
+    internal Memory<T> Memory
+    {
+        get
+        {
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            return _storageOffset == 0 && _data.Length == Length
+                ? _data.AsWritableMemory()
+                : _data.AsWritableMemory().Slice(_storageOffset, Length);
+        }
+    }
 
     /// <summary>
     /// Shorthand alias for <see cref="Memory"/> — used by engine code.
@@ -132,20 +141,11 @@ public abstract class TensorBase<T>
         }
         else
         {
-            // Non-contiguous view — element-by-element using strides
-            var indices = new int[Rank];
+            // Non-contiguous view — use FlatIndexToStorageIndex (O(Rank) per element)
+            var srcData = _data.AsSpan();
             for (int i = 0; i < Length; i++)
             {
-                int srcIdx = _storageOffset;
-                int remaining = i;
-                for (int d = 0; d < Rank; d++)
-                {
-                    int dimStride = d < Rank - 1 ? Shape.Skip(d + 1).Aggregate(1, (a, b) => a * b) : 1;
-                    indices[d] = remaining / dimStride;
-                    remaining %= dimStride;
-                    srcIdx += indices[d] * _strides[d];
-                }
-                result[i] = _data[srcIdx];
+                result[i] = srcData[FlatIndexToStorageIndex(i)];
             }
         }
         return result;
@@ -181,21 +181,11 @@ public abstract class TensorBase<T>
         }
         else
         {
-            // Non-contiguous view — element-by-element using strides
+            // Non-contiguous view — use FlatIndexToStorageIndex (O(Rank) per element)
             var dstData = _data.AsWritableSpan();
-            var indices = new int[Rank];
             for (int i = 0; i < Length; i++)
             {
-                int dstIdx = _storageOffset;
-                int remaining = i;
-                for (int d = 0; d < Rank; d++)
-                {
-                    int dimStride = d < Rank - 1 ? Shape.Skip(d + 1).Aggregate(1, (a, b) => a * b) : 1;
-                    indices[d] = remaining / dimStride;
-                    remaining %= dimStride;
-                    dstIdx += indices[d] * _strides[d];
-                }
-                dstData[dstIdx] = source[i];
+                dstData[FlatIndexToStorageIndex(i)] = source[i];
             }
         }
     }
@@ -367,20 +357,27 @@ public abstract class TensorBase<T>
     }
 
     /// <summary>
+    /// Pre-computed row-major strides for logical flat index decomposition.
+    /// Cached to avoid recomputing in hot paths (FlatIndexToStorageIndex, ToArray, etc.).
+    /// For contiguous tensors, this equals _strides. For views, these are the OUTPUT strides.
+    /// </summary>
+    private int[]? _rowMajorStridesCache;
+    private int[] RowMajorStrides => _rowMajorStridesCache ??= ComputeRowMajorStrides(Shape);
+
+    /// <summary>
     /// Converts a logical flat index (row-major) to a storage index using strides and offset.
     /// Used by GetFlat/SetFlat for non-contiguous views.
+    /// O(Rank) per call using pre-computed row-major strides.
     /// </summary>
     private int FlatIndexToStorageIndex(int flatIndex)
     {
         int storageIndex = _storageOffset;
         int remaining = flatIndex;
+        var rmStrides = RowMajorStrides;
         for (int d = 0; d < Rank; d++)
         {
-            int dimProduct = 1;
-            for (int dd = d + 1; dd < Rank; dd++)
-                dimProduct *= Shape[dd];
-            int dimIndex = remaining / dimProduct;
-            remaining %= dimProduct;
+            int dimIndex = remaining / rmStrides[d];
+            remaining -= dimIndex * rmStrides[d];
             storageIndex += dimIndex * _strides[d];
         }
         return storageIndex;
@@ -427,8 +424,17 @@ public abstract class TensorBase<T>
     {
         var result = CreateInstance(Shape);
 
-        // Use SIMD Copy for bulk transfer
-        _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
+        if (IsContiguous && _storageOffset == 0 && _data.Length == Length)
+        {
+            // Fast path: SIMD bulk copy for non-view tensors
+            _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
+        }
+        else
+        {
+            // View-safe: copy logical elements in row-major order
+            var srcArray = ToArray();
+            srcArray.AsSpan().CopyTo(result._data.AsWritableSpan());
+        }
 
         return result;
     }
@@ -467,7 +473,8 @@ public abstract class TensorBase<T>
         var result = CreateInstance<TResult>(Shape);
         for (int i = 0; i < Length; i++)
         {
-            result._data[i] = func(_data[i]);
+            // Use GetFlat which handles views correctly (offset + strides)
+            result._data[i] = func(GetFlat(i));
         }
 
         return result;
@@ -486,7 +493,8 @@ public abstract class TensorBase<T>
         for (int i = 0; i < Length; i++)
         {
             GetIndices(i, indices);
-            result._data[i] = func(_data[i], indices);
+            // Use GetFlat which handles views correctly (offset + strides)
+            result._data[i] = func(GetFlat(i), indices);
         }
 
         return result;
