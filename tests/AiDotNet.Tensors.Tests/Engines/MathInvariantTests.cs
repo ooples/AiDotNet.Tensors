@@ -34,12 +34,12 @@ public class MathInvariantTests
     private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") => AssertClose(a, b, t, m); // shorthand alias
 
     /// <summary>Asserts all elements are near zero.</summary>
-    private void AssertZero(Tensor<float> a, string msg = "") { var d = a.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{msg} [{i}]={d[i]}"); }
+    private void AssertZero(Tensor<float> a, string msg = "") { var d = a.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{msg} [{i}]={d[i]}"); }
     private void AZ(Tensor<float> a, string m = "") => AssertZero(a, m); // shorthand alias
 
-    /// <summary>Asserts all values are within [lo, hi] range.</summary>
-    private void AssertRange(float[] d, float lo, float hi, string msg) { for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{msg} [{i}]={d[i]}"); }
-    private void AR(float[] d, float lo, float hi, string m) => AssertRange(d, lo, hi, m); // shorthand alias
+    /// <summary>Asserts all values are within [lo, hi] range. Uses tensor.Length to avoid pooled array tail.</summary>
+    private void AssertRange(Tensor<float> t, float lo, float hi, string msg) { var d = t.GetDataArray(); for (int i = 0; i < t.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{msg} [{i}]={d[i]}"); }
+    private void AR(Tensor<float> t, float lo, float hi, string m) => AssertRange(t, lo, hi, m); // shorthand alias
 
     // ================================================================
     // ADDITION (8)
@@ -91,8 +91,8 @@ public class MathInvariantTests
     [Fact] public void Pow_Two() { var x = R([64], 1); AE(E.TensorPow(x, 2f), E.TensorMultiply(x, x), 1e-3f); }
     [Fact] public void Floor_LessOrEqual() { var x = R([64], 1); var f = E.TensorFloor(x).GetDataArray(); var xd = x.GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(f[i] <= xd[i] + 1e-6f); }
     [Fact] public void Ceiling_GreaterOrEqual() { var x = R([64], 1); var c = E.TensorCeiling(x).GetDataArray(); var xd = x.GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(c[i] >= xd[i] - 1e-6f); }
-    [Fact] public void Frac_InRange() { AR(E.TensorFrac(R([64], 1)).GetDataArray(), -1f, 1f, "Frac"); }
-    [Fact] public void Clip_InRange() { AR(E.TensorClip(R([256], 1), -0.5f, 0.5f).GetDataArray(), -0.5f, 0.5f, "Clip"); }
+    [Fact] public void Frac_InRange() { AR(E.TensorFrac(R([64], 1)), -1f, 1f, "Frac"); }
+    [Fact] public void Clip_InRange() { AR(E.TensorClip(R([256], 1), -0.5f, 0.5f), -0.5f, 0.5f, "Clip"); }
     [Fact] public void Norm_Positive() { float n = E.TensorNorm(R([64], 2), 0).GetDataArray()[0]; Assert.True(n > 0f); }
 
     // ================================================================
@@ -108,8 +108,8 @@ public class MathInvariantTests
     // ================================================================
     // TRIGONOMETRIC (6)
     // ================================================================
-    [Fact] public void Sin_Range() { AR(E.TensorSin(R([64], 40)).GetDataArray(), -1f, 1f, "Sin"); }
-    [Fact] public void Cos_Range() { AR(E.TensorCos(R([64], 41)).GetDataArray(), -1f, 1f, "Cos"); }
+    [Fact] public void Sin_Range() { AR(E.TensorSin(R([64], 40)), -1f, 1f, "Sin"); }
+    [Fact] public void Cos_Range() { AR(E.TensorCos(R([64], 41)), -1f, 1f, "Cos"); }
     [Fact] public void Sin_Zero() => Assert.True(Math.Abs(E.TensorSin(C(0, 1)).GetDataArray()[0]) < Tol);
     [Fact] public void Cos_Zero() => Assert.Equal(1f, E.TensorCos(C(0, 1)).GetDataArray()[0], Tol);
     [Fact] public void Pythagorean_Identity() { var x = R([64], 42); var s = E.TensorSin(x); var c = E.TensorCos(x); AE(E.TensorAdd(E.TensorMultiply(s, s), E.TensorMultiply(c, c)), C(1, 64), 1e-3f); }
@@ -118,10 +118,10 @@ public class MathInvariantTests
     // ================================================================
     // ACTIVATIONS (18)
     // ================================================================
-    [Fact] public void Sigmoid_Range() { AR(E.TensorSigmoid(R([256], 20)).GetDataArray(), 0f, 1f, "Sigmoid"); }
+    [Fact] public void Sigmoid_Range() { AR(E.TensorSigmoid(R([256], 20)), 0f, 1f, "Sigmoid"); }
     [Fact] public void Sigmoid_Symmetry() { var x = R([64], 21); var s = E.TensorSigmoid(x).GetDataArray(); var sn = E.TensorSigmoid(E.TensorNegate(x)).GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(Math.Abs(sn[i] - (1f - s[i])) < Tol); }
     [Fact] public void Sigmoid_Zero() => Assert.Equal(0.5f, E.TensorSigmoid(C(0, 1)).GetDataArray()[0], Tol);
-    [Fact] public void Tanh_Range() { AR(E.TensorTanh(R([256], 22)).GetDataArray(), -1f, 1f, "Tanh"); }
+    [Fact] public void Tanh_Range() { AR(E.TensorTanh(R([256], 22)), -1f, 1f, "Tanh"); }
     [Fact] public void Tanh_Odd() { var x = R([64], 23); var t = E.TensorTanh(x).GetDataArray(); var tn = E.TensorTanh(E.TensorNegate(x)).GetDataArray(); for (int i = 0; i < 64; i++) Assert.True(Math.Abs(tn[i] + t[i]) < Tol); }
     [Fact] public void Tanh_Zero() => Assert.True(Math.Abs(E.TensorTanh(C(0, 1)).GetDataArray()[0]) < Tol);
     [Fact] public void ReLU_NonNeg() { var d = E.TensorReLU(R([256], 24)).GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= 0f); }

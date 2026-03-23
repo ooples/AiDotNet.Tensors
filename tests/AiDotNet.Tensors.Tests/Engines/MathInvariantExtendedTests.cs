@@ -23,7 +23,7 @@ public class MathInvariantExtendedTests
     private Tensor<float> C(float v, int n) => new(Enumerable.Repeat(v, n).ToArray(), new[] { n });
     private Tensor<float> C(float v, int[] s) => new(Enumerable.Repeat(v, s.Aggregate(1, (a, b) => a * b)).ToArray(), s);
     private void AE(Tensor<float> a, Tensor<float> b, float t = 1e-4f, string m = "") { Assert.Equal(a.Shape, b.Shape); var ad = a.GetDataArray(); var bd = b.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(ad[i] - bd[i]) < t, $"{m} [{i}]: {ad[i]} vs {bd[i]}"); }
-    private void AZ(Tensor<float> a, string m = "") { var d = a.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{m} [{i}]={d[i]}"); }
+    private void AZ(Tensor<float> a, string m = "") { var d = a.GetDataArray(); for (int i = 0; i < a.Length; i++) Assert.True(Math.Abs(d[i]) < Tol, $"{m} [{i}]={d[i]}"); }
     private void AR(float[] d, float lo, float hi, string m) { for (int i = 0; i < d.Length; i++) Assert.True(d[i] >= lo && d[i] <= hi, $"{m} [{i}]={d[i]}"); }
 
     // ================================================================
@@ -111,7 +111,7 @@ public class MathInvariantExtendedTests
     // TensorDropoutMask (2)
     // ================================================================
     [Fact] public void DropoutMask_ShapeCorrect() => Assert.Equal(new[] { 4, 8 }, E.TensorDropoutMask<float>(new[] { 4, 8 }, 0.3f, 1.0f / 0.7f, 42).Shape);
-    [Fact] public void DropoutMask_ValuesInRange() { var m = E.TensorDropoutMask<float>(new[] { 256 }, 0.5f, 2f, 99).GetDataArray(); for (int i = 0; i < m.Length; i++) Assert.True(m[i] == 0f || Math.Abs(m[i] - 2f) < Tol, $"mask[{i}]={m[i]}"); }
+    [Fact] public void DropoutMask_ValuesInRange() { var t = E.TensorDropoutMask<float>(new[] { 256 }, 0.5f, 2f, 99); var m = t.GetDataArray(); for (int i = 0; i < t.Length; i++) Assert.True(m[i] == 0f || Math.Abs(m[i] - 2f) < Tol, $"mask[{i}]={m[i]}"); }
 
     // ================================================================
     // TensorExpandDims / TensorSqueeze (3)
