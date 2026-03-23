@@ -15,7 +15,7 @@ public sealed partial class MetalBackend
     public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { SimpleBinary("ElementWise", _elementWiseLibrary, "equals_kernel", a, b, o, sz); }
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { SimpleBinary("ElementWise", _elementWiseLibrary, "not_equals_kernel", a, b, o, sz); }
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { SimpleBinary("Reduction", _reductionLibrary, "outer_product", a, b, o, M*N); }
-    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { SimpleBinary("Reduction", _reductionLibrary, "cosine_similarity", a, b, o, bs); }
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { SimpleBinary("Reduction", _reductionLibrary, "batch_dot_product", a, b, o, bs); }
     public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "glu_forward", i, o, os*hd); }
     public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "geglu_forward", i, o, os*hd); }
     public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "reglu_forward", i, o, os*hd); }

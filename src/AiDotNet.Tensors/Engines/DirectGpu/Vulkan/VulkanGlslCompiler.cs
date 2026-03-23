@@ -93,9 +93,13 @@ internal sealed class VulkanGlslCompiler : IDisposable
             if (bytesPtr == IntPtr.Zero || (int)byteLength == 0)
                 return null;
 
-            int wordCount = (int)byteLength / sizeof(uint);
+            int byteCount = (int)byteLength;
+            int wordCount = byteCount / sizeof(uint);
             var spirv = new uint[wordCount];
-            Marshal.Copy(bytesPtr, (int[])(object)spirv, 0, wordCount);
+            // Copy as bytes then reinterpret — Marshal.Copy only supports int[]/byte[]
+            var bytes = new byte[byteCount];
+            Marshal.Copy(bytesPtr, bytes, 0, byteCount);
+            Buffer.BlockCopy(bytes, 0, spirv, 0, byteCount);
 
             _cache.TryAdd(glslSource, spirv);
             return spirv;

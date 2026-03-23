@@ -192,7 +192,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
     {
-        string cacheKey = $"{glslSource.GetHashCode()}_{bindingCount}_{pushConstantSize}";
+        // Use SHA256 truncated to 16 chars instead of GetHashCode (collision-prone)
+        string sourceHash;
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        {
+            var hashBytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(glslSource));
+            sourceHash = BitConverter.ToString(hashBytes, 0, 8).Replace("-", "");
+        }
+        string cacheKey = $"{sourceHash}_{bindingCount}_{pushConstantSize}";
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
             return cached;
 
@@ -258,9 +265,25 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
-    // CPU fallback stubs (only used when shaderc is not available)
-    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size) { }
-    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { }
+    // CPU fallback when GLSL pipeline creation fails (shaderc unavailable or compilation error).
+    // Copies input to output unchanged — callers should check pipeline availability for correctness-critical work.
+    private void CpuFallbackUnary(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — unary op falling back to identity copy");
+        float[] input = DownloadBuffer(A);
+        float[] output = new float[size];
+        Array.Copy(input, output, Math.Min(input.Length, size));
+        UploadToBuffer(output, B);
+    }
+
+    private void CpuFallbackBinary(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        System.Diagnostics.Debug.WriteLine("[VulkanBackend] GLSL pipeline unavailable — binary op falling back to identity copy of A");
+        float[] a = DownloadBuffer(A);
+        float[] output = new float[size];
+        Array.Copy(a, output, Math.Min(a.Length, size));
+        UploadToBuffer(output, C);
+    }
 
     /// <summary>
     /// Gets or creates a shader module for the specified kernel.

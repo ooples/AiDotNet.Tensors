@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// Benchmarks for GPU fused kernels vs CPU, measuring throughput and speedup.
 /// Covers reductions, element-wise, activations, gated activations, softmax, and linear algebra.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 public class GpuFusedKernelBenchmarks
 {
