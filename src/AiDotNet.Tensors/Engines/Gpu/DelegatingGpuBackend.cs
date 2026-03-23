@@ -1613,7 +1613,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
 
     public virtual void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => Inner.DotProduct(a, b, o, sz);
-    public virtual void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz, int sA, int sB, int cnt) => Inner.StridedDotProduct(a, b, o, sz, sA, sB, cnt);
+    public virtual void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int aSize, int bSize, int bOffset, int bStride) => Inner.StridedDotProduct(a, b, result, aSize, bSize, bOffset, bStride);
 
     public virtual void BatchedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => Inner.BatchedDotProduct(a, b, o, bs, dim);
 }

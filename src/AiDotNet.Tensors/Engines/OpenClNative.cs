@@ -1750,7 +1750,7 @@ void sgemm(
             _gemmKernel.SetArg(6, bufferB.Handle);
             _gemmKernel.SetArg(7, bufferC.Handle);
 
-            // Register-blocked dispatch: WPT=8, workgroup = (TS/8) x (TS/8) threads
+            // Register-blocked dispatch: WPT=4, workgroup = (TS/4) x (TS/4) threads
             // Each workgroup computes TS x TS output elements
             int ts = _tileSize;
             int wpt = 4;
