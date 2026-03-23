@@ -143,7 +143,7 @@ public abstract class TensorBase<T> : IDisposable
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
-        Shape = new TensorShape(_shape);
+        Shape = TensorShape.WrapUnsafe(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -162,7 +162,7 @@ public abstract class TensorBase<T> : IDisposable
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
-        Shape = new TensorShape(_shape);
+        Shape = TensorShape.WrapUnsafe(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -186,7 +186,7 @@ public abstract class TensorBase<T> : IDisposable
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         ValidateShape(shape);
         _shape = (int[])shape.Clone();
-        Shape = new TensorShape(_shape);
+        Shape = TensorShape.WrapUnsafe(_shape);
         _strides = ComputeRowMajorStrides(shape);
         _storageOffset = 0;
         IsContiguous = true;
@@ -248,7 +248,7 @@ public abstract class TensorBase<T> : IDisposable
         }
 
         _shape = shapeCopy;
-        Shape = new TensorShape(shapeCopy);
+        Shape = TensorShape.WrapUnsafe(shapeCopy);
         _strides = stridesCopy;
         _storageOffset = storageOffset;
         IsView = isView;
