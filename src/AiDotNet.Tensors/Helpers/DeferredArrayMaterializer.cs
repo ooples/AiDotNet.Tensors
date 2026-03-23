@@ -29,7 +29,7 @@ internal static class DeferredArrayMaterializer
     internal static bool TryMaterialize(object array)
     {
         // Fast path: if nothing is pending (common case for CPU-only code), skip the dictionary lookup entirely.
-        // IsEmpty is a volatile read — no lock, no contention.
+        // IsEmpty checks Count == 0 with minimal overhead — avoids full TryRemove lookup.
         if (_pendingMaterializations.IsEmpty)
             return false;
 

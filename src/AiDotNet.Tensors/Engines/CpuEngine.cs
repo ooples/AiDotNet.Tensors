@@ -3617,6 +3617,7 @@ public class CpuEngine : ITensorLevelEngine
                     var partials = System.Buffers.ArrayPool<float>.Shared.Rent(numChunks);
                     try
                     {
+                        Array.Clear(partials, 0, numChunks);
                         CpuParallelSettings.LightweightParallel(numChunks, chunk =>
                         {
                             int start = chunk * chunkSize;

@@ -76,6 +76,53 @@ void main() {
     b[idx] = sqrt(sum_sq);
 }";
 
+    public static string SumOfSquaresAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize) return;
+    uint base_idx = idx * reduceSize;
+    float sum_sq = 0.0;
+    for (uint j = 0; j < reduceSize; j++) { float v = a[base_idx + j]; sum_sq += v * v; }
+    b[idx] = sum_sq;
+}";
+
+    public static string MaxMagnitudeAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize) return;
+    uint base_idx = idx * reduceSize;
+    float mx = 0.0;
+    for (uint j = 0; j < reduceSize; j++) { float v = abs(a[base_idx + j]); mx = max(mx, v); }
+    b[idx] = mx;
+}";
+
+    public static string MinMagnitudeAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize) return;
+    uint base_idx = idx * reduceSize;
+    float mn = abs(a[base_idx]);
+    for (uint j = 1; j < reduceSize; j++) { float v = abs(a[base_idx + j]); mn = min(mn, v); }
+    b[idx] = mn;
+}";
+
+    public static string LogVarianceAxis => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outerSize) return;
+    uint base_idx = idx * reduceSize;
+    float sum = 0.0;
+    for (uint j = 0; j < reduceSize; j++) sum += a[base_idx + j];
+    float mean = sum / float(reduceSize);
+    float var_sum = 0.0;
+    for (uint j = 0; j < reduceSize; j++) { float d = a[base_idx + j] - mean; var_sum += d * d; }
+    b[idx] = log(var_sum / float(reduceSize) + 1e-8);
+}";
+
     public static string LogSumExpAxis => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
 void main() {
