@@ -65,7 +65,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Element-wise ops
 
-    [Fact]
+    [SkippableFact]
     public void TensorAdd_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -76,7 +76,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMultiply_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -87,7 +87,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorSubtract_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -98,7 +98,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorDivide_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -118,7 +118,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Reductions
 
-    [Fact]
+    [SkippableFact]
     public void TensorSum_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -128,7 +128,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertClose(cpuResult, gpuResult, 1e-2f); // Reductions have higher tolerance due to order of operations
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMean_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -142,7 +142,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Activations
 
-    [Fact]
+    [SkippableFact]
     public void TensorExp_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -152,7 +152,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorLog_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -167,7 +167,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorSigmoid_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -177,7 +177,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorTanh_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -187,7 +187,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorReLU_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -197,7 +197,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorGELU_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -211,7 +211,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Fused kernels
 
-    [Fact]
+    [SkippableFact]
     public void TensorClip_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -221,7 +221,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorPow_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -236,7 +236,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorFrac_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -246,7 +246,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorEye_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -255,7 +255,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorEquals_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -266,7 +266,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorOuter_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -277,7 +277,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void DotProduct_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -288,7 +288,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void GLU_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -299,7 +299,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void GeGLU_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -313,7 +313,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Matrix ops
 
-    [Fact]
+    [SkippableFact]
     public void MatrixMultiply_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -333,7 +333,7 @@ public class GpuFusedKernelCorrectnessTests
                 AssertClose(cpuResult[i, j], gpuResult[i, j], 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void MatrixAdd_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -357,7 +357,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Softmax
 
-    [Fact]
+    [SkippableFact]
     public void Softmax_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -371,7 +371,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Normalization
 
-    [Fact]
+    [SkippableFact]
     public void BatchNorm_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -387,7 +387,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Convolution
 
-    [Fact]
+    [SkippableFact]
     public void Conv2D_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -402,7 +402,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Large tensor stress test
 
-    [Fact]
+    [SkippableFact]
     public void TensorAdd_LargeTensor_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -417,7 +417,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Newly wired ops
 
-    [Fact]
+    [SkippableFact]
     public void TensorAddScalar_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -427,7 +427,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorBroadcastMultiply_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -438,7 +438,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorSiLU_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -448,7 +448,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMish_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -458,7 +458,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorDiag_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -468,7 +468,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorLinspace_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -477,7 +477,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReduceSum_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -487,7 +487,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReduceMean_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -497,7 +497,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Pad_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -507,7 +507,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorSumOfSquares_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -517,7 +517,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertClose(cpuResult, gpuResult, 1e-1f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorTriangularMask_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -530,7 +530,7 @@ public class GpuFusedKernelCorrectnessTests
 
     #region Softmax and advanced ops
 
-    [Fact]
+    [SkippableFact]
     public void TensorSoftmax_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -540,7 +540,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorLogSoftmax_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -550,7 +550,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorBroadcastAdd_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -561,7 +561,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorCumSum_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -571,7 +571,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorRandomUniform_HasCorrectShape()
     {
         SkipIfNoGpu();
@@ -586,7 +586,7 @@ public class GpuFusedKernelCorrectnessTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReduceSum_SingleAxis_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -596,7 +596,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Upsample_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -606,7 +606,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void PixelShuffle_GpuMatchesCpu()
     {
         SkipIfNoGpu();
@@ -616,7 +616,7 @@ public class GpuFusedKernelCorrectnessTests
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorBatchMatMul_GpuMatchesCpu()
     {
         SkipIfNoGpu();

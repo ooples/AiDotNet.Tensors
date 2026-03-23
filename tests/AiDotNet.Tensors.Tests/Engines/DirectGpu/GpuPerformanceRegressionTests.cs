@@ -61,7 +61,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         return times[MeasuredRuns / 2]; // Median
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorAdd_1M_CompletesWithin50ms()
     {
         SkipIfNoGpu();
@@ -71,7 +71,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 500, $"TensorAdd 1M took {ms:F1}ms (expected < 500ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMultiply_1M_CompletesWithin50ms()
     {
         SkipIfNoGpu();
@@ -81,7 +81,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 500, $"TensorMultiply 1M took {ms:F1}ms (expected < 500ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Sigmoid_1M_CompletesWithin100ms()
     {
         SkipIfNoGpu();
@@ -90,7 +90,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 1000, $"Sigmoid 1M took {ms:F1}ms (expected < 1000ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void MatMul_256x256_CompletesWithin20ms()
     {
         SkipIfNoGpu();
@@ -104,7 +104,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 500, $"MatMul 256x256 took {ms:F1}ms (expected < 500ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Softmax_1Kx1K_CompletesWithin100ms()
     {
         SkipIfNoGpu();
@@ -113,7 +113,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 1000, $"Softmax 1Kx1K took {ms:F1}ms (expected < 1000ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void Conv2D_SmallBatch_CompletesWithin200ms()
     {
         SkipIfNoGpu();
@@ -123,7 +123,7 @@ public class GpuPerformanceRegressionTests : IDisposable
         Assert.True(ms < 2000, $"Conv2D took {ms:F1}ms (expected < 2000ms)");
     }
 
-    [Fact]
+    [SkippableFact]
     public void BatchNorm_CompletesWithin100ms()
     {
         SkipIfNoGpu();
