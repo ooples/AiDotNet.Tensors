@@ -611,6 +611,123 @@ public abstract class TensorBase<T> : IDisposable
         }
     }
 
+    // ================================================================
+    // Stride-aware helpers for CpuEngine
+    // ================================================================
+
+    /// <summary>
+    /// Whether this tensor is a simple 2D transpose (swap of last two dims) of contiguous storage.
+    /// When true, GEMM can use transA/transB flags instead of materializing.
+    /// </summary>
+    internal bool IsSimpleTranspose
+    {
+        get
+        {
+            if (IsContiguous || _shape.Length < 2) return false;
+            // Check if the strides are a permutation of row-major strides
+            // For a 2D transpose: shape=[M,N], strides=[1, M] instead of [N, 1]
+            // For an ND transpose of last two dims: strides[rank-2] == 1 && strides[rank-1] == shape[rank-2]
+            int rank = _shape.Length;
+            var rmStrides = ComputeRowMajorStrides(_shape);
+
+            // Check if only the last two dimensions are swapped
+            for (int i = 0; i < rank - 2; i++)
+            {
+                if (_strides[i] != rmStrides[i]) return false;
+            }
+            // Last two dims swapped: strides[rank-2] should be 1, strides[rank-1] should be shape[rank-2]
+            return _strides[rank - 1] == _shape[rank - 2] && _strides[rank - 2] == 1;
+        }
+    }
+
+    /// <summary>
+    /// Gets the leading dimension (row stride) for BLAS-style operations.
+    /// For row-major: lda = shape[rank-1] (number of columns).
+    /// For transposed 2D: lda = shape[rank-2] (original number of rows).
+    /// Only valid for contiguous or simple-transposed tensors.
+    /// </summary>
+    internal int LeadingDimension
+    {
+        get
+        {
+            if (_shape.Length < 2) return 1;
+            // Leading dimension = the stride of the second-to-last dimension
+            // For row-major [M,N] with strides [N,1]: ld = N = strides[rank-2] (but that's N, not stride)
+            // Actually for BLAS: lda = the distance between consecutive rows in memory
+            // For row-major: lda = N (columns)
+            // For column-major (transposed): lda = M (rows of original)
+            if (IsContiguous)
+                return _shape[_shape.Length - 1];
+            // For transposed view, the leading dimension is the stride of the row dimension
+            return Math.Max(_strides[_shape.Length - 2], _strides[_shape.Length - 1]);
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the tensor's data can be accessed as a contiguous span
+    /// (contiguous layout, possibly with a storage offset).
+    /// Out parameter provides the span when true.
+    /// </summary>
+    internal bool TryGetContiguousSpan(out ReadOnlySpan<T> span)
+    {
+        if (!IsContiguous)
+        {
+            span = default;
+            return false;
+        }
+        if (_storageOffset == 0 && _storage.Length == Length)
+            span = _data.AsSpan();
+        else
+            span = _data.AsSpan().Slice(_storageOffset, Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Converts a logical flat index (row-major) to a storage index using strides.
+    /// For contiguous tensors, this is offset + flatIndex.
+    /// For strided views, decomposes into multi-dim indices then applies strides.
+    /// </summary>
+    internal int LogicalToStorageIndex(int flatIndex)
+    {
+        if (IsContiguous)
+            return _storageOffset + flatIndex;
+        return FlatIndexToStorageIndex(flatIndex);
+    }
+
+    /// <summary>
+    /// Iterates over all logical elements applying an action with the storage index.
+    /// Provides efficient stride-aware iteration for any view layout.
+    /// For contiguous tensors, the callback receives sequential indices.
+    /// For strided views, indices follow the stride pattern.
+    /// </summary>
+    internal void ForEachStorageIndex(Action<int> action)
+    {
+        if (IsContiguous)
+        {
+            int start = _storageOffset;
+            for (int i = 0; i < Length; i++)
+                action(start + i);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++)
+                action(FlatIndexToStorageIndex(i));
+        }
+    }
+
+    /// <summary>
+    /// Gets the raw underlying data span (full storage, no offset applied).
+    /// Use with LogicalToStorageIndex for stride-aware element access.
+    /// This never throws — returns the full backing storage.
+    /// </summary>
+    internal ReadOnlySpan<T> RawStorageSpan => _data.AsSpan();
+
+    /// <summary>
+    /// Gets the raw underlying writable data span (full storage, no offset applied).
+    /// Use with LogicalToStorageIndex for stride-aware element writes.
+    /// </summary>
+    internal Span<T> RawWritableStorageSpan => _data.AsWritableSpan();
+
     public override string ToString()
     {
         return $"Tensor<{typeof(T).Name}> with shape {Shape}";
