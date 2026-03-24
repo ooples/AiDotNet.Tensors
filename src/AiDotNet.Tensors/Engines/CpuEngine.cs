@@ -1779,6 +1779,11 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
+        // For ND (N>=3) batch matmul, materialize non-contiguous views.
+        // 2D stride-aware GEMM is handled below with transA/transB flags.
+        if (a.Rank >= 3 && !a.IsContiguous) a = a.Contiguous();
+        if (b.Rank >= 3 && !b.IsContiguous) b = b.Contiguous();
+
         // Industry-standard BatchMatMul supports any-rank tensors (2D, 3D, 4D, 5D, ...)
         // For ND tensors where N >= 2:
         // - First N-2 dimensions are batch dimensions (must match)
@@ -1840,19 +1845,46 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(outputShape);
 
-        var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
-        var rData = result.GetDataArray();
-
-        // Handle 2D case (no batch dimensions) - try BLAS first
+        // Handle 2D case (no batch dimensions)
         if (rank == 2)
         {
-            if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
+            // Stride-aware GEMM for float: detect transposed views and pass flags
+            if (typeof(T) == typeof(float))
             {
+                bool transA = a.IsSimpleTranspose;
+                bool transB = b.IsSimpleTranspose;
+                int lda = transA ? a._strides[a.Rank - 1] : (a.IsContiguous ? k : a._strides[a.Rank - 2]);
+                int ldb = transB ? b._strides[b.Rank - 1] : (b.IsContiguous ? n : b._strides[b.Rank - 2]);
+
+                // Get raw float arrays via GetDataArray for GEMM
+                var aArr = a.GetDataArray();
+                var bArr = b.GetDataArray();
+                var rArr = result.GetDataArray();
+                var aFloat = new ReadOnlySpan<float>((float[])(object)aArr).Slice(a._storageOffset);
+                var bFloat = new ReadOnlySpan<float>((float[])(object)bArr).Slice(b._storageOffset);
+                var cFloat = new Span<float>((float[])(object)rArr);
+
+                Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
                 return result;
             }
 
-            // Fallback: direct array access to avoid bounds checking
+            // Try OneDNN/MKL BLAS for contiguous non-transposed
+            if (a.IsContiguous && b.IsContiguous)
+            {
+                if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
+                {
+                    return result;
+                }
+            }
+
+            // Generic fallback: stride-aware scalar matmul
+            var aDataArr = a.GetDataArray();
+            var bDataArr = b.GetDataArray();
+            var rDataArr = result.GetDataArray();
+            int aOff = a._storageOffset, bOff = b._storageOffset;
+            int aStride0 = a._strides[0], aStride1 = a._strides[1];
+            int bStride0 = b._strides[0], bStride1 = b._strides[1];
+
             Parallel.For(0, m, i =>
             {
                 for (int j = 0; j < n; j++)
@@ -1860,13 +1892,19 @@ public class CpuEngine : ITensorLevelEngine
                     T sum = numOps.Zero;
                     for (int p = 0; p < k; p++)
                     {
-                        sum = numOps.Add(sum, numOps.Multiply(aData[i * k + p], bData[p * n + j]));
+                        T aVal = aDataArr[aOff + i * aStride0 + p * aStride1];
+                        T bVal = bDataArr[bOff + p * bStride0 + j * bStride1];
+                        sum = numOps.Add(sum, numOps.Multiply(aVal, bVal));
                     }
-                    rData[i * n + j] = sum;
+                    rDataArr[i * n + j] = sum;
                 }
             });
             return result;
         }
+
+        var aData = a.GetDataArray();
+        var bData = b.GetDataArray();
+        var rData = result.GetDataArray();
 
         // Handle ND case with batch dimensions (N >= 3)
         int matrixSizeA = m * k;
@@ -16431,9 +16469,10 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
-        // Materialize non-contiguous views before BLAS operations
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (!b.IsContiguous) b = b.Contiguous();
+        // Stride-aware: only materialize views that aren't simple transposes
+        // Simple transposes can be handled by GEMM transA/transB flags (zero-copy)
+        if (!a.IsContiguous && !a.IsSimpleTranspose) a = a.Contiguous();
+        if (!b.IsContiguous && !b.IsSimpleTranspose) b = b.Contiguous();
 
         // If both tensors are 3D, delegate to BatchMatMul
         if (a.Rank == 3 && b.Rank == 3)
