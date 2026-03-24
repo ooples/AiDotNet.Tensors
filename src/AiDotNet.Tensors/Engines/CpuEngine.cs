@@ -1952,6 +1952,10 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Stride-aware: materialize non-contiguous views for SIMD path
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
@@ -2057,6 +2061,10 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+
+        // Stride-aware: in-place requires contiguous target; materialize source if needed
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
+        if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
 
@@ -2596,6 +2604,9 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
@@ -2661,6 +2672,10 @@ public class CpuEngine : ITensorLevelEngine
             // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
             return TensorBroadcastMultiply(a, b);
         }
+
+        // Stride-aware: materialize non-contiguous views for SIMD path
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
 
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
@@ -2729,6 +2744,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
+        if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
 
@@ -2843,6 +2861,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
@@ -2860,6 +2880,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
 
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
@@ -15916,6 +15939,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
@@ -15928,6 +15953,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
@@ -15939,6 +15966,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
