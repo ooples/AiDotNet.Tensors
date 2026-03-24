@@ -5470,6 +5470,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) return Mish(tensor.Contiguous());
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
