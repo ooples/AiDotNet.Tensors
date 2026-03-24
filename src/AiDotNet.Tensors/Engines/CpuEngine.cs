@@ -1952,12 +1952,19 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        // Stride-aware: materialize non-contiguous views for SIMD path
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (!b.IsContiguous) b = b.Contiguous();
-
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
+
+        // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
+        if (!a.IsContiguous || !b.IsContiguous)
+        {
+            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
+            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
+            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            return result;
+        }
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
@@ -2604,11 +2611,19 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (!b.IsContiguous) b = b.Contiguous();
-
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
+
+        // Stride-aware: strided iteration for non-contiguous views (zero-copy)
+        if (!a.IsContiguous || !b.IsContiguous)
+        {
+            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
+            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
+            else { for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            return result;
+        }
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
@@ -2673,15 +2688,21 @@ public class CpuEngine : ITensorLevelEngine
             return TensorBroadcastMultiply(a, b);
         }
 
-        // Stride-aware: materialize non-contiguous views for SIMD path
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (!b.IsContiguous) b = b.Contiguous();
-
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
 
-        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
-        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
+        // Stride-aware: strided iteration for non-contiguous views (zero-copy)
+        if (!a.IsContiguous || !b.IsContiguous)
+        {
+            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
+            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
+            else { for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            return result;
+        }
+
+        // SIMD fast path: both contiguous
         if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
@@ -2861,11 +2882,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
-        numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+
+        if (tensor.IsContiguous)
+        {
+            numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+        }
+        else
+        {
+            var src = tensor.GetDataArray();
+            var dst = result.GetDataArray();
+            for (int i = 0; i < tensor.Length; i++)
+                dst[i] = numOps.Multiply(src[tensor.LogicalToStorageIndex(i)], scalar);
+        }
 
         return result;
     }
@@ -2881,11 +2911,19 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        if (!a.IsContiguous) a = a.Contiguous();
-        if (!b.IsContiguous) b = b.Contiguous();
-
         var result = TensorAllocator.Rent<T>(a._shape);
         int length = a.Length;
+
+        // Stride-aware: strided iteration for non-contiguous views (zero-copy)
+        if (!a.IsContiguous || !b.IsContiguous)
+        {
+            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var ops = MathHelper.GetNumericOperations<T>();
+            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
+            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
+            else { for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            return result;
+        }
 
         if (typeof(T) == typeof(float))
         {
