@@ -1856,9 +1856,9 @@ public class CpuEngine : ITensorLevelEngine
                 int lda = transA ? a._strides[a.Rank - 1] : (a.IsContiguous ? k : a._strides[a.Rank - 2]);
                 int ldb = transB ? b._strides[b.Rank - 1] : (b.IsContiguous ? n : b._strides[b.Rank - 2]);
 
-                // Get raw float arrays via GetDataArray for GEMM
-                var aArr = a.GetDataArray();
-                var bArr = b.GetDataArray();
+                // Get raw storage arrays (NOT GetDataArray which copies for views)
+                var aArr = a._storage.GetDataArray();
+                var bArr = b._storage.GetDataArray();
                 var rArr = result.GetDataArray();
                 var aFloat = new ReadOnlySpan<float>((float[])(object)aArr).Slice(a._storageOffset);
                 var bFloat = new ReadOnlySpan<float>((float[])(object)bArr).Slice(b._storageOffset);
@@ -1877,9 +1877,9 @@ public class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            // Generic fallback: stride-aware scalar matmul
-            var aDataArr = a.GetDataArray();
-            var bDataArr = b.GetDataArray();
+            // Generic fallback: stride-aware scalar matmul (raw storage for stride access)
+            var aDataArr = a._storage.GetDataArray();
+            var bDataArr = b._storage.GetDataArray();
             var rDataArr = result.GetDataArray();
             int aOff = a._storageOffset, bOff = b._storageOffset;
             int aStride0 = a._strides[0], aStride1 = a._strides[1];
@@ -1956,13 +1956,14 @@ public class CpuEngine : ITensorLevelEngine
         int length = a.Length;
 
         // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
+        // IMPORTANT: use _storage.GetDataArray() (raw backing array) not tensor.GetDataArray() (which copies for views)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var aRaw = a._storage.GetDataArray(); var bRaw = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
-            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
-            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
-            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
+            if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[aOff + i], bRaw[b.LogicalToStorageIndex(i)]); }
+            else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[bOff + i]); }
+            else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[b.LogicalToStorageIndex(i)]); }
             return result;
         }
 
@@ -2617,7 +2618,7 @@ public class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
@@ -2694,7 +2695,7 @@ public class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
@@ -2891,7 +2892,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var src = tensor.GetDataArray();
+            var src = tensor._storage.GetDataArray();
             var dst = result.GetDataArray();
             for (int i = 0; i < tensor.Length; i++)
                 dst[i] = numOps.Multiply(src[tensor.LogicalToStorageIndex(i)], scalar);
@@ -2917,7 +2918,7 @@ public class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a.GetDataArray(); var bArr = b.GetDataArray(); var rArr = result.GetDataArray();
+            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
             var ops = MathHelper.GetNumericOperations<T>();
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
@@ -2976,6 +2977,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorEquals<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -2992,6 +2994,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorEquals<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3015,6 +3019,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3031,6 +3036,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorNotEquals<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3054,6 +3061,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorGreaterThan<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3077,6 +3086,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3093,6 +3103,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorLessThan<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3116,6 +3128,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorLessThan<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -11750,6 +11763,11 @@ public class CpuEngine : ITensorLevelEngine
         if (value == null)
             throw new ArgumentNullException(nameof(value));
 
+        // Stride-aware: attention QKV often come from reshape+transpose views
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+
         // Expected shapes: [batch, heads, seq, d_k] for Q, K and [batch, heads, seq, d_v] for V
         if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
             throw new ArgumentException("Query, Key, and Value must be 4D tensors [batch, heads, seq, d_k/d_v]");
@@ -11899,6 +11917,12 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(value));
         if (attentionWeights == null)
             throw new ArgumentNullException(nameof(attentionWeights));
+
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!query.IsContiguous) query = query.Contiguous();
+        if (!key.IsContiguous) key = key.Contiguous();
+        if (!value.IsContiguous) value = value.Contiguous();
+        if (!attentionWeights.IsContiguous) attentionWeights = attentionWeights.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -16028,7 +16052,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
-        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
+        else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
@@ -16041,7 +16065,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
-        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
+        else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
@@ -16054,7 +16078,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
-        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
+        else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
