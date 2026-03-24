@@ -17419,17 +17419,16 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMap<T>(Tensor<T> tensor, Func<T, T> func)
     {
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         try
         {
-            var src = tensor.AsSpan();
-            var dest = result.AsWritableSpan();
+            var src = tensor.GetFlattenedData();
+            var dest = result.GetDataArray();
 
-            for (int i = 0; i < src.Length; i++)
+            for (int i = 0; i < tensor.Length; i++)
                 dest[i] = func(src[i]);
 
             return result;
