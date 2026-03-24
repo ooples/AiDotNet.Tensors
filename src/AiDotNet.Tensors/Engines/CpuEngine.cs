@@ -16002,11 +16002,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
-        numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+        if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
@@ -16016,11 +16015,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
-        numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+        if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
@@ -16030,11 +16028,10 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
-        numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+        if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        else { var src = tensor.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         return result;
     }
