@@ -1849,12 +1849,15 @@ public class CpuEngine : ITensorLevelEngine
         if (rank == 2)
         {
             // Stride-aware GEMM for float: detect transposed views and pass flags
-            if (typeof(T) == typeof(float))
+            // SIMD GEMM: only for contiguous or simple-transpose operands
+            if (typeof(T) == typeof(float) &&
+                (a.IsContiguous || a.IsSimpleTranspose) &&
+                (b.IsContiguous || b.IsSimpleTranspose))
             {
                 bool transA = a.IsSimpleTranspose;
                 bool transB = b.IsSimpleTranspose;
-                int lda = transA ? a._strides[a.Rank - 1] : (a.IsContiguous ? k : a._strides[a.Rank - 2]);
-                int ldb = transB ? b._strides[b.Rank - 1] : (b.IsContiguous ? n : b._strides[b.Rank - 2]);
+                int lda = transA ? a._strides[a.Rank - 1] : k;
+                int ldb = transB ? b._strides[b.Rank - 1] : n;
 
                 // Get raw storage arrays (NOT GetDataArray which copies for views)
                 var aArr = a._storage.GetDataArray();
@@ -3849,6 +3852,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var numOps = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? tensor.Rank + axes[0] : axes[0];
+            if (axis < 0 || axis >= tensor.Rank) throw new ArgumentOutOfRangeException(nameof(axes), $"Axis {axes[0]} out of range for rank {tensor.Rank}");
             var (outerSize, axisSize, innerSize) = tensor.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < tensor.Rank; d++)
@@ -14021,6 +14025,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var ops = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            if (axis < 0 || axis >= input.Rank) throw new ArgumentOutOfRangeException(nameof(axes), $"Axis {axes[0]} out of range for rank {input.Rank}");
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
@@ -14135,6 +14140,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var ops = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            if (axis < 0 || axis >= input.Rank) throw new ArgumentOutOfRangeException(nameof(axes), $"Axis {axes[0]} out of range for rank {input.Rank}");
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
@@ -14292,6 +14298,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var ops = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            if (axis < 0 || axis >= input.Rank) throw new ArgumentOutOfRangeException(nameof(axes), $"Axis {axes[0]} out of range for rank {input.Rank}");
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }

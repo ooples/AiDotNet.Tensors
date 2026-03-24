@@ -628,7 +628,7 @@ public abstract class TensorBase<T> : IDisposable
             // For a 2D transpose: shape=[M,N], strides=[1, M] instead of [N, 1]
             // For an ND transpose of last two dims: strides[rank-2] == 1 && strides[rank-1] == shape[rank-2]
             int rank = _shape.Length;
-            var rmStrides = ComputeRowMajorStrides(_shape);
+            var rmStrides = RowMajorStrides; // use cached, avoid allocation
 
             // Check if only the last two dimensions are swapped
             for (int i = 0; i < rank - 2; i++)
@@ -658,7 +658,8 @@ public abstract class TensorBase<T> : IDisposable
             // For column-major (transposed): lda = M (rows of original)
             if (IsContiguous)
                 return _shape[_shape.Length - 1];
-            // For transposed view, the leading dimension is the stride of the row dimension
+            if (!IsSimpleTranspose)
+                throw new InvalidOperationException("LeadingDimension is only valid for contiguous or simple-transposed tensors.");
             return Math.Max(_strides[_shape.Length - 2], _strides[_shape.Length - 1]);
         }
     }
