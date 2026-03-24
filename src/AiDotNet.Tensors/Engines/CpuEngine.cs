@@ -3100,6 +3100,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
@@ -3124,6 +3126,8 @@ public class CpuEngine : ITensorLevelEngine
     public unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
@@ -3150,6 +3154,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
@@ -3174,6 +3180,8 @@ public class CpuEngine : ITensorLevelEngine
     public unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
@@ -3201,6 +3209,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorNegate<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -3282,6 +3292,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         var src = tensor.AsSpan();
@@ -3298,6 +3310,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
@@ -3309,6 +3323,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCos<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -4907,6 +4923,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
@@ -4930,6 +4948,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
@@ -5202,6 +5222,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
@@ -5384,6 +5406,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
@@ -5432,7 +5456,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized Swish (SiLU) - single allocation, zero-copy
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
@@ -16145,6 +16170,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorClip<T>(Tensor<T> tensor, T minValue, T maxValue)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         return TensorClamp(tensor, minValue, maxValue);
     }
 
