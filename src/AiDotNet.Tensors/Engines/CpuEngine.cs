@@ -20733,9 +20733,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        // ReduceVariance is already stride-aware — no Contiguous() needed here
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
