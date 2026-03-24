@@ -3771,8 +3771,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Stride-aware: sum via stride indices for non-contiguous views
+        if (!tensor.IsContiguous)
+        {
+            var ops = MathHelper.GetNumericOperations<T>();
+            var srcArr = tensor._storage.GetDataArray();
+            var idxBuf = new int[tensor.Length];
+            tensor.FillStorageIndices(idxBuf);
+            T sum = ops.Zero;
+            for (int i = 0; i < tensor.Length; i++) sum = ops.Add(sum, srcArr[idxBuf[i]]);
+            return sum;
+        }
 
         // Float fast path: bypass generic dispatch + Span overhead
         if (typeof(T) == typeof(float))
@@ -3831,8 +3842,39 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Stride-aware: for single-axis reduction on non-contiguous views, use direct stride math
+        if (!tensor.IsContiguous && axes != null && axes.Length == 1)
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            int axis = axes[0] < 0 ? tensor.Rank + axes[0] : axes[0];
+            var (outerSize, axisSize, innerSize) = tensor.GetReductionDims(axis);
+            var outShape = new List<int>();
+            for (int d = 0; d < tensor.Rank; d++)
+            {
+                if (d == axis) { if (keepDims) outShape.Add(1); }
+                else outShape.Add(tensor._shape[d]);
+            }
+            var result = TensorAllocator.Rent<T>(outShape.ToArray());
+            var rArr = result.GetDataArray();
+            var srcArr = tensor._storage.GetDataArray();
+
+            for (int o = 0; o < outerSize; o++)
+            {
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    T sum = numOps.Zero;
+                    for (int a = 0; a < axisSize; a++)
+                        sum = numOps.Add(sum, srcArr[tensor.ReductionStorageIndex(o, a, inner, axis)]);
+                    rArr[o * innerSize + inner] = sum;
+                }
+            }
+            return result;
+        }
+
+        // For multi-axis or full reductions, materialize if needed
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         // Full reduction - sum all elements
         if (axes == null || axes.Length == 0)
@@ -14042,6 +14084,27 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
+        // Stride-aware single-axis max
+        if (!input.IsContiguous && axes.Length == 1)
+        {
+            var ops = MathHelper.GetNumericOperations<T>();
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
+            var outShape = new List<int>();
+            for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
+            var result = TensorAllocator.Rent<T>(outShape.ToArray());
+            var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
+            maxIndices = new int[outerSize * innerSize];
+            for (int o = 0; o < outerSize; o++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    T best = srcArr[input.ReductionStorageIndex(o, 0, inner, axis)]; int bestIdx = 0;
+                    for (int a = 1; a < axisSize; a++) { T v = srcArr[input.ReductionStorageIndex(o, a, inner, axis)]; if (ops.GreaterThan(v, best)) { best = v; bestIdx = a; } }
+                    rArr[o * innerSize + inner] = best;
+                    maxIndices[o * innerSize + inner] = bestIdx;
+                }
+            return result;
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
@@ -14137,6 +14200,26 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Stride-aware single-axis mean
+        if (!input.IsContiguous && axes.Length == 1)
+        {
+            var ops = MathHelper.GetNumericOperations<T>();
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
+            var outShape = new List<int>();
+            for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
+            var result = TensorAllocator.Rent<T>(outShape.ToArray());
+            var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
+            T divisor = ops.FromDouble(axisSize);
+            for (int o = 0; o < outerSize; o++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    T sum = ops.Zero;
+                    for (int a = 0; a < axisSize; a++) sum = ops.Add(sum, srcArr[input.ReductionStorageIndex(o, a, inner, axis)]);
+                    rArr[o * innerSize + inner] = ops.Divide(sum, divisor);
+                }
+            return result;
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
@@ -14276,6 +14359,31 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // Stride-aware: compute mean then variance with stride math
+        if (!input.IsContiguous && axes.Length == 1)
+        {
+            var ops = MathHelper.GetNumericOperations<T>();
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
+            var outShape = new List<int>();
+            for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
+            var result = TensorAllocator.Rent<T>(outShape.ToArray());
+            var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
+            T divisor = ops.FromDouble(axisSize);
+            for (int o = 0; o < outerSize; o++)
+                for (int inner = 0; inner < innerSize; inner++)
+                {
+                    // Mean
+                    T sum = ops.Zero;
+                    for (int a = 0; a < axisSize; a++) sum = ops.Add(sum, srcArr[input.ReductionStorageIndex(o, a, inner, axis)]);
+                    T meanVal = ops.Divide(sum, divisor);
+                    // Variance
+                    T varSum = ops.Zero;
+                    for (int a = 0; a < axisSize; a++) { T diff = ops.Subtract(srcArr[input.ReductionStorageIndex(o, a, inner, axis)], meanVal); varSum = ops.Add(varSum, ops.Multiply(diff, diff)); }
+                    rArr[o * innerSize + inner] = ops.Divide(varSum, divisor);
+                }
+            return result;
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
