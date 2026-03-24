@@ -5059,7 +5059,23 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var resultS = TensorAllocator.Rent<T>(tensor._shape);
+                var srcRaw = tensor._storage.GetDataArray();
+                var dstArr = resultS.GetDataArray();
+                var idxBuf = new int[tensor.Length];
+                tensor.FillStorageIndices(idxBuf);
+                for (int i = 0; i < tensor.Length; i++)
+                    { T v = srcRaw[idxBuf[i]]; T e2v = ops.Exp(ops.Multiply(ops.FromDouble(2.0), v)); dstArr[i] = ops.Divide(ops.Subtract(e2v, ops.One), ops.Add(e2v, ops.One)); }
+                return resultS;
+            }
+            tensor = tensor.Contiguous();
+        }
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
@@ -5085,7 +5101,23 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var resultS = TensorAllocator.Rent<T>(tensor._shape);
+                var srcRaw = tensor._storage.GetDataArray();
+                var dstArr = resultS.GetDataArray();
+                var idxBuf = new int[tensor.Length];
+                tensor.FillStorageIndices(idxBuf);
+                for (int i = 0; i < tensor.Length; i++)
+                    { T v = srcRaw[idxBuf[i]]; T negV = ops.Negate(v); dstArr[i] = ops.Divide(ops.One, ops.Add(ops.One, ops.Exp(negV))); }
+                return resultS;
+            }
+            tensor = tensor.Contiguous();
+        }
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
@@ -5360,7 +5392,23 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var resultS = TensorAllocator.Rent<T>(tensor._shape);
+                var srcRaw = tensor._storage.GetDataArray();
+                var dstArr = resultS.GetDataArray();
+                var idxBuf = new int[tensor.Length];
+                tensor.FillStorageIndices(idxBuf);
+                for (int i = 0; i < tensor.Length; i++)
+                    { T v = srcRaw[idxBuf[i]]; dstArr[i] = ops.GreaterThan(v, ops.Zero) ? v : ops.Zero; }
+                return resultS;
+            }
+            tensor = tensor.Contiguous();
+        }
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
@@ -5548,7 +5596,23 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var resultS = TensorAllocator.Rent<T>(tensor._shape);
+                var srcRaw = tensor._storage.GetDataArray();
+                var dstArr = resultS.GetDataArray();
+                var idxBuf = new int[tensor.Length];
+                tensor.FillStorageIndices(idxBuf);
+                for (int i = 0; i < tensor.Length; i++)
+                    { T v = srcRaw[idxBuf[i]]; T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v))))); T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z)); T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One)); T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0)); dstArr[i] = ops.Multiply(v, cdf); }
+                return resultS;
+            }
+            tensor = tensor.Contiguous();
+        }
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
@@ -5574,7 +5638,22 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) return Mish(tensor.Contiguous());
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                var resultS = TensorAllocator.Rent<T>(tensor._shape);
+                var srcRaw = tensor._storage.GetDataArray();
+                var dstArr = resultS.GetDataArray();
+                var idxBuf = new int[tensor.Length];
+                tensor.FillStorageIndices(idxBuf);
+                for (int i = 0; i < tensor.Length; i++)
+                    { T v = srcRaw[idxBuf[i]]; T sp = ops.Log(ops.Add(ops.One, ops.Exp(v))); T e2sp = ops.Exp(ops.Multiply(ops.FromDouble(2.0), sp)); T th = ops.Divide(ops.Subtract(e2sp, ops.One), ops.Add(e2sp, ops.One)); dstArr[i] = ops.Multiply(v, th); }
+                return resultS;
+            }
+            return Mish(tensor.Contiguous());
+        }
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
@@ -5600,7 +5679,19 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops2 = MathHelper.GetNumericOperations<T>();
+                var r = TensorAllocator.Rent<T>(tensor._shape);
+                var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
+                var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
+                for (int i = 0; i < tensor.Length; i++) { T v = src[idx[i]]; T negV = ops2.Negate(v); T sig = ops2.Divide(ops2.One, ops2.Add(ops2.One, ops2.Exp(negV))); dst[i] = ops2.Multiply(v, sig); }
+                return r;
+            }
+            tensor = tensor.Contiguous();
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -5612,7 +5703,24 @@ public class CpuEngine : ITensorLevelEngine
 
     public Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops2 = MathHelper.GetNumericOperations<T>();
+                var r = TensorAllocator.Rent<T>(tensor._shape);
+                var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
+                var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
+                T alphaT = ops2.FromDouble(alpha);
+                for (int i = 0; i < tensor.Length; i++)
+                {
+                    T v = src[idx[i]];
+                    dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alphaT, ops2.Subtract(ops2.Exp(v), ops2.One));
+                }
+                return r;
+            }
+            tensor = tensor.Contiguous();
+        }
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5628,7 +5736,23 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!tensor.IsContiguous)
+        {
+            if (tensor.Length <= 4096)
+            {
+                var ops2 = MathHelper.GetNumericOperations<T>();
+                var r = TensorAllocator.Rent<T>(tensor._shape);
+                var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
+                var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
+                for (int i = 0; i < tensor.Length; i++)
+                {
+                    T v = src[idx[i]];
+                    dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alpha, v);
+                }
+                return r;
+            }
+            tensor = tensor.Contiguous();
+        }
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 

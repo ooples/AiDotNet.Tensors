@@ -728,6 +728,77 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal Span<T> RawWritableStorageSpan => _data.AsWritableSpan();
 
+    /// <summary>
+    /// Fills a pre-allocated array with storage indices for every logical element.
+    /// For sequential iteration this is O(n) total — amortized O(1) per element via
+    /// odometer-style coordinate increment (no division/modulo per element).
+    /// </summary>
+    internal void FillStorageIndices(int[] indices)
+    {
+        int rank = _shape.Length;
+        if (rank == 0) { if (indices.Length > 0) indices[0] = _storageOffset; return; }
+
+        var coords = new int[rank];
+        int storageIdx = _storageOffset;
+
+        for (int i = 0; i < Length; i++)
+        {
+            indices[i] = storageIdx;
+
+            // Odometer increment: advance last dimension, carry into earlier dimensions
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                coords[d]++;
+                storageIdx += _strides[d];
+                if (coords[d] < _shape[d])
+                    break;
+                // Carry: reset this dimension, subtract its full contribution
+                storageIdx -= coords[d] * _strides[d];
+                coords[d] = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Computes the storage index for a reduction along a specific axis.
+    /// Returns (outerSize, axisSize, innerSize) for the reduction loop structure.
+    /// outerSize = product of dims before axis, axisSize = shape[axis], innerSize = product of dims after axis.
+    /// </summary>
+    internal (int outerSize, int axisSize, int innerSize) GetReductionDims(int axis)
+    {
+        int outerSize = 1, innerSize = 1;
+        for (int d = 0; d < axis; d++) outerSize *= _shape[d];
+        for (int d = axis + 1; d < _shape.Length; d++) innerSize *= _shape[d];
+        return (outerSize, _shape[axis], innerSize);
+    }
+
+    /// <summary>
+    /// Computes the storage index for element (outer, axisIdx, inner) in a reduction.
+    /// Uses strides directly — no coordinate decomposition needed.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal int ReductionStorageIndex(int outer, int axisIdx, int inner, int axis)
+    {
+        int idx = _storageOffset + axisIdx * _strides[axis];
+        // Decompose outer into dims before axis
+        int remaining = outer;
+        for (int d = axis - 1; d >= 0; d--)
+        {
+            int dimIdx = remaining % _shape[d];
+            remaining /= _shape[d];
+            idx += dimIdx * _strides[d];
+        }
+        // Decompose inner into dims after axis
+        remaining = inner;
+        for (int d = _shape.Length - 1; d > axis; d--)
+        {
+            int dimIdx = remaining % _shape[d];
+            remaining /= _shape[d];
+            idx += dimIdx * _strides[d];
+        }
+        return idx;
+    }
+
     public override string ToString()
     {
         return $"Tensor<{typeof(T).Name}> with shape {Shape}";
