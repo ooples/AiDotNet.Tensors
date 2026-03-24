@@ -716,6 +716,38 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     /// <summary>
+    /// Returns the tensor's elements as a flat row-major T[] array.
+    /// For contiguous tensors with zero offset: returns the actual backing array (zero-copy).
+    /// For contiguous with offset: returns a slice copy.
+    /// For non-contiguous views: creates a new array via stride iteration.
+    /// This is the stride-aware replacement for GetDataArray() in engine code.
+    /// Unlike Contiguous(), this returns T[] not Tensor&lt;T&gt;, avoiding tensor allocation.
+    /// </summary>
+    internal T[] GetFlattenedData()
+    {
+        if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
+            return _storage.GetDataArray();
+
+        // Must create a flat copy — either offset or non-contiguous
+        var result = new T[Length];
+        if (IsContiguous)
+        {
+            // Contiguous with offset — slice copy
+            Array.Copy(_storage.GetDataArray(), _storageOffset, result, 0, Length);
+        }
+        else
+        {
+            // Non-contiguous — stride iteration
+            var src = _storage.GetDataArray();
+            var indices = new int[Length];
+            FillStorageIndices(indices);
+            for (int i = 0; i < Length; i++)
+                result[i] = src[indices[i]];
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Gets the raw underlying data span (full storage, no offset applied).
     /// Use with LogicalToStorageIndex for stride-aware element access.
     /// This never throws — returns the full backing storage.
