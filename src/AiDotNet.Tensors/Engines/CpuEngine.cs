@@ -4116,6 +4116,7 @@ public class CpuEngine : ITensorLevelEngine
 
     public Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 4)
         {
@@ -4214,6 +4215,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 4)
         {
@@ -4327,6 +4329,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (input.Rank != 4)
@@ -6318,6 +6321,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (input.Rank != 4) throw new ArgumentException($"Conv2D requires 4D input tensor. Got rank {input.Rank}.", nameof(input));
@@ -6684,6 +6688,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -20267,6 +20272,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         return Conv2D(input, kernel, stride, padding, dilation);
     }
 
