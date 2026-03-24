@@ -5638,6 +5638,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -5756,6 +5758,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -5882,6 +5886,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -6000,6 +6006,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -9853,6 +9861,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis = -1)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) output = output.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
 
@@ -19212,6 +19222,8 @@ public class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var result = new T[gradOutput.Length];
         int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
@@ -19236,6 +19248,8 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
         int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) output = output.Contiguous();
 
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
         if (gradData is float[] gF && outData is float[] oF)
@@ -19304,6 +19318,8 @@ public class CpuEngine : ITensorLevelEngine
         var gradData = gradOutput.GetDataArray();
         var outData = output.GetDataArray();
         int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) output = output.Contiguous();
 
         // Float fast path: SIMD grad * (1 - tanh^2)
         if (gradData is float[] gF && outData is float[] oF)
@@ -19373,6 +19389,8 @@ public class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var result = new T[gradOutput.Length];
         int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         const double sqrtTwoPi = 0.7978845608028654;
         const double coeff = 0.044715;
@@ -19416,6 +19434,8 @@ public class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var result = new T[gradOutput.Length];
         int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
 
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
