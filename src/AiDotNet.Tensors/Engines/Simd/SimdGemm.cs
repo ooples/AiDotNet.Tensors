@@ -43,6 +43,22 @@ internal static class SimdGemm
     }
 
     /// <summary>
+    /// Computes C = op(A) * op(B) with optional transpose on either operand.
+    /// op(X) = X when transX=false, op(X) = X^T when transX=true.
+    /// lda/ldb are the leading dimensions (row strides) of the source storage.
+    /// This enables zero-copy matmul on transposed stride-based views.
+    /// </summary>
+    public static void Sgemm(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c,
+        int m, int k, int n)
+    {
+        c.Clear();
+        SgemmAdd(a, lda, transA, b, ldb, transB, c, m, k, n);
+    }
+
+    /// <summary>
     /// Computes C += A * B (accumulates into C without clearing).
     /// </summary>
     public static void SgemmAdd(
@@ -53,38 +69,49 @@ internal static class SimdGemm
         int k,
         int n)
     {
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
-        {
-            SgemmTiled(a, b, c, m, k, n);
-            return;
-        }
-#endif
-        SgemmScalar(a, b, c, m, k, n);
+        SgemmAdd(a, k, false, b, n, false, c, m, k, n);
     }
 
     /// <summary>
-    /// Scalar GEMM fallback for platforms without AVX2/FMA.
+    /// Computes C += op(A) * op(B) with stride and transpose support.
+    /// </summary>
+    public static void SgemmAdd(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c,
+        int m, int k, int n)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n >= Nr)
+        {
+            SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n);
+            return;
+        }
+#endif
+        SgemmScalar(a, lda, transA, b, ldb, transB, c, m, k, n);
+    }
+
+    /// <summary>
+    /// Scalar GEMM fallback with stride/transpose support.
     /// </summary>
     private static void SgemmScalar(
-        ReadOnlySpan<float> a,
-        ReadOnlySpan<float> b,
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> c,
-        int m,
-        int k,
-        int n)
+        int m, int k, int n)
     {
         for (int i = 0; i < m; i++)
         {
-            int aRowBase = i * k;
             int cRowBase = i * n;
             for (int p = 0; p < k; p++)
             {
-                float aip = a[aRowBase + p];
-                int bRowBase = p * n;
+                // op(A)[i,p]: if transA, read A[p,i] = a[p*lda+i]; else A[i,p] = a[i*lda+p]
+                float aip = transA ? a[p * lda + i] : a[i * lda + p];
                 for (int j = 0; j < n; j++)
                 {
-                    c[cRowBase + j] += aip * b[bRowBase + j];
+                    // op(B)[p,j]: if transB, read B[j,p] = b[j*ldb+p]; else B[p,j] = b[p*ldb+j]
+                    float bpj = transB ? b[j * ldb + p] : b[p * ldb + j];
+                    c[cRowBase + j] += aip * bpj;
                 }
             }
         }
@@ -97,12 +124,10 @@ internal static class SimdGemm
     /// Supports parallelism over both M and N dimensions for different matrix shapes.
     /// </summary>
     private static void SgemmTiled(
-        ReadOnlySpan<float> a,
-        ReadOnlySpan<float> b,
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> c,
-        int m,
-        int k,
-        int n)
+        int m, int k, int n)
     {
         // Round up to micro-tile dimensions to avoid buffer overruns in PackA/PackB padding
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
@@ -122,36 +147,16 @@ internal static class SimdGemm
                 {
                     int kc = Math.Min(Kc, k - pc);
 
-                    int numRowBlocks = (m + Mc - 1) / Mc;
-                    int numNrBlocks = (nc + Nr - 1) / Nr;
-                    int maxThreads = Environment.ProcessorCount;
+                    // Sequential path (parallel paths use the same PackA/PackB with stride params)
+                    PackA(a, packedABuf, lda, transA, ic: 0, mc: Math.Min(Mc, m), pc, kc);
+                    PackB(b, packedBBuf, ldb, transB, pc, kc, jc, nc);
 
-                    // N-parallel: preferred when N is wide enough (uses more workers than M-parallel)
-                    bool useParallelN = numNrBlocks >= 4 && maxThreads > 1;
-                    // M-parallel: fallback for very tall, narrow matrices where N-parallel isn't viable
-                    bool useParallelM = !useParallelN && numRowBlocks >= 2 && maxThreads > 1;
-
-                    if (useParallelN)
+                    for (int ic = 0; ic < m; ic += Mc)
                     {
-                        SgemmTiledParallelN(a, b, c, m, k, n, jc, nc, pc, kc,
-                            numNrBlocks, maxThreads, packedABuf);
-                    }
-                    else if (useParallelM)
-                    {
-                        SgemmTiledParallelM(a, b, c, m, k, n, jc, nc, pc, kc,
-                            numRowBlocks, packedBBuf);
-                    }
-                    else
-                    {
-                        // Sequential path
-                        PackB(b, packedBBuf, n, pc, kc, jc, nc);
-
-                        for (int ic = 0; ic < m; ic += Mc)
-                        {
-                            int mc = Math.Min(Mc, m - ic);
-                            PackA(a, packedABuf, k, ic, mc, pc, kc);
-                            MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
-                        }
+                        int mc = Math.Min(Mc, m - ic);
+                        if (ic > 0) // first block already packed above
+                            PackA(a, packedABuf, lda, transA, ic, mc, pc, kc);
+                        MacroKernel(packedABuf, packedBBuf, c, mc, nc, kc, n, ic, jc);
                     }
                 }
             }
@@ -347,11 +352,13 @@ internal static class SimdGemm
     }
 
     /// <summary>
-    /// Pack A[ic:ic+mc, pc:pc+kc] into row-panel format for sequential access in micro-kernel.
+    /// Pack op(A)[ic:ic+mc, pc:pc+kc] into row-panel format for sequential access in micro-kernel.
+    /// When transA=false: reads A[row, col] = a[row*lda + col] (row-major).
+    /// When transA=true:  reads A^T[row, col] = a[col*lda + row] (transposed).
     /// Layout: groups of Mr rows, each stored as Mr x kc contiguous block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, int ic, int mc, int pc, int kc)
+    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
     {
         int pos = 0;
         int i = 0;
@@ -363,7 +370,9 @@ internal static class SimdGemm
             {
                 for (int ii = 0; ii < Mr; ii++)
                 {
-                    packed[pos++] = a[(ic + i + ii) * lda + pc + p];
+                    int row = ic + i + ii;
+                    int col = pc + p;
+                    packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
                 }
             }
         }
@@ -376,9 +385,10 @@ internal static class SimdGemm
             {
                 for (int ii = 0; ii < remaining; ii++)
                 {
-                    packed[pos++] = a[(ic + i + ii) * lda + pc + p];
+                    int row = ic + i + ii;
+                    int col = pc + p;
+                    packed[pos++] = transA ? a[col * lda + row] : a[row * lda + col];
                 }
-                // Pad with zeros
                 for (int ii = remaining; ii < Mr; ii++)
                 {
                     packed[pos++] = 0;
@@ -388,11 +398,20 @@ internal static class SimdGemm
     }
 
     /// <summary>
-    /// Pack B[pc:pc+kc, jc:jc+nc] into column-panel format.
+    /// Backward-compatible PackA without transpose (used by parallel paths).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackA(ReadOnlySpan<float> a, float[] packed, int lda, int ic, int mc, int pc, int kc)
+        => PackA(a, packed, lda, false, ic, mc, pc, kc);
+
+    /// <summary>
+    /// Pack op(B)[pc:pc+kc, jc:jc+nc] into column-panel format.
+    /// When transB=false: reads B[row, col] = b[row*ldb + col] (row-major).
+    /// When transB=true:  reads B^T[row, col] = b[col*ldb + row] (transposed).
     /// Layout: groups of Nr columns, each stored as kc x Nr contiguous block.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, int pc, int kc, int jc, int nc)
+    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, bool transB, int pc, int kc, int jc, int nc)
     {
         int pos = 0;
         int j = 0;
@@ -402,10 +421,11 @@ internal static class SimdGemm
         {
             for (int p = 0; p < kc; p++)
             {
-                int bRow = (pc + p) * ldb + jc + j;
                 for (int jj = 0; jj < Nr; jj++)
                 {
-                    packed[pos++] = b[bRow + jj];
+                    int row = pc + p;
+                    int col = jc + j + jj;
+                    packed[pos++] = transB ? b[col * ldb + row] : b[row * ldb + col];
                 }
             }
         }
@@ -416,10 +436,11 @@ internal static class SimdGemm
         {
             for (int p = 0; p < kc; p++)
             {
-                int bRow = (pc + p) * ldb + jc + j;
                 for (int jj = 0; jj < remaining; jj++)
                 {
-                    packed[pos++] = b[bRow + jj];
+                    int row = pc + p;
+                    int col = jc + j + jj;
+                    packed[pos++] = transB ? b[col * ldb + row] : b[row * ldb + col];
                 }
                 for (int jj = remaining; jj < Nr; jj++)
                 {
@@ -428,6 +449,13 @@ internal static class SimdGemm
             }
         }
     }
+
+    /// <summary>
+    /// Backward-compatible PackB without transpose (used by parallel paths).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, int pc, int kc, int jc, int nc)
+        => PackB(b, packed, ldb, false, pc, kc, jc, nc);
 
     /// <summary>
     /// Macro-kernel: iterate over packed panels with Mr x Nr micro-kernel tiles.
