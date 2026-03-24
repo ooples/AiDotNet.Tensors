@@ -6375,6 +6375,11 @@ public class CpuEngine : ITensorLevelEngine
         if (a.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {a.Rank} for first tensor.");
         if (b.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {b.Rank} for second tensor.");
 
+        // Materialize non-contiguous views so downstream paths can use .Data safely.
+        // BatchMatMul already does this for rank >= 3; TensorMatMul2D did not.
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Standard 2D x 2D case
