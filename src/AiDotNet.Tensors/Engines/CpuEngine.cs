@@ -2136,6 +2136,9 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2161,6 +2164,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -2171,6 +2176,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -2181,6 +2188,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -2191,6 +2200,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -2262,6 +2273,10 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        if (!beta.IsContiguous) beta = beta.Contiguous();
         // GroupNorm writes normalized values into pre-allocated output.
         // The mean/variance stats are small tensors [batch, numGroups] that the callee allocates.
         // The main output tensor avoids allocation since it's pre-allocated by the caller.
@@ -2272,6 +2287,10 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GroupNormSwishInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        if (!beta.IsContiguous) beta = beta.Contiguous();
         // Step 1: GroupNorm into output (single computation)
         GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out _, out _);
 
@@ -2283,6 +2302,11 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void AddGroupNormInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        if (!gamma.IsContiguous) gamma = gamma.Contiguous();
+        if (!beta.IsContiguous) beta = beta.Contiguous();
         // output = GroupNorm(a + b)
         // Step 1: Add a + b directly into output (zero alloc)
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -2294,6 +2318,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void SwishInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
         numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
@@ -2302,6 +2327,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
         numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
@@ -2310,6 +2337,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -2317,6 +2345,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2324,6 +2354,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TanhInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -2331,6 +2362,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2338,6 +2371,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
     }
@@ -2345,6 +2379,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2352,6 +2388,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
     }
@@ -2359,6 +2396,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
     }
@@ -2366,6 +2405,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void MatMulInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2416,6 +2458,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         var result = Concat(tensors, axis);
         result.Data.Span.CopyTo(destination.Data.Span);
     }
@@ -2426,6 +2469,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         if (axes == null || axes.Length == 0 ||
             (input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0))
         {
@@ -2475,6 +2520,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
 
@@ -2512,6 +2559,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var result = TensorLogSoftmax(input, axis);
         try
         {
@@ -2526,6 +2575,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
     public void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
     }
@@ -2533,6 +2585,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Divide into pre-allocated destination. Zero allocation.</summary>
     public void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
     }
@@ -2540,6 +2595,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Exp into pre-allocated destination. Zero allocation.</summary>
     public void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2547,6 +2604,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Log into pre-allocated destination. Zero allocation.</summary>
     public void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Log(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2554,6 +2613,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Sqrt into pre-allocated destination. Zero allocation.</summary>
     public void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2561,6 +2622,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Abs into pre-allocated destination. Zero allocation.</summary>
     public void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2833,6 +2896,9 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3273,6 +3339,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3289,6 +3356,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorPower<T>(Tensor<T> bases, Tensor<T> exponents)
     {
+        if (!bases.IsContiguous) bases = bases.Contiguous();
+        if (!exponents.IsContiguous) exponents = exponents.Contiguous();
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
         if (!bases._shape.SequenceEqual(exponents._shape))
@@ -3309,6 +3378,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorFloor<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3570,6 +3640,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorPow<T>(Tensor<T> tensor, T exponent)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3586,6 +3657,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMax<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3610,6 +3683,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMax<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3629,6 +3703,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -3653,6 +3729,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMin<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3672,6 +3749,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3693,6 +3771,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         // Float fast path: bypass generic dispatch + Span overhead
@@ -3752,6 +3831,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         // Full reduction - sum all elements
@@ -3805,6 +3885,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorMaxValue<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
 
@@ -3826,6 +3907,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorMinValue<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
 
@@ -5139,6 +5221,7 @@ public class CpuEngine : ITensorLevelEngine
 #if !NETFRAMEWORK
     public unsafe void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5163,6 +5246,7 @@ public class CpuEngine : ITensorLevelEngine
 #else
     public void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5337,6 +5421,7 @@ public class CpuEngine : ITensorLevelEngine
 #if !NETFRAMEWORK
     public unsafe void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5360,6 +5445,7 @@ public class CpuEngine : ITensorLevelEngine
 #else
     public void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5412,6 +5498,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public void ReLUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!ShapesMatch(destination._shape, input._shape))
@@ -5524,6 +5612,7 @@ public class CpuEngine : ITensorLevelEngine
 
     public Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5539,6 +5628,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
@@ -5591,6 +5681,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> GLU<T>(Tensor<T> input, int dim = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -5709,6 +5800,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> GeGLU<T>(Tensor<T> input, int dim = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -5839,6 +5931,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> SwiGLU<T>(Tensor<T> input, int dim = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -5960,6 +6053,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ReGLU<T>(Tensor<T> input, int dim = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -6079,6 +6173,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 2)
             throw new ArgumentException($"TensorTranspose requires a 2D tensor. Got rank {tensor.Rank}.");
@@ -6417,6 +6512,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Conv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding, int[] dilation)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, inChannels, height, width]", nameof(inputShape));
@@ -6497,6 +6594,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Conv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding, int[] dilation)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernelShape == null || kernelShape.Length != 4) throw new ArgumentException("kernelShape must be array of 4 elements [outChannels, inChannels, kernelHeight, kernelWidth]", nameof(kernelShape));
@@ -6578,6 +6677,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6653,6 +6753,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6761,6 +6862,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6820,6 +6922,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
@@ -6886,6 +6990,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
@@ -6954,6 +7060,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> DepthwiseConv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -7025,6 +7133,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] outputPadding)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (input.Rank != 4) throw new ArgumentException($"ConvTranspose2D requires 4D input tensor. Got rank {input.Rank}.", nameof(input));
@@ -7141,6 +7251,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -8124,6 +8236,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!grid.IsContiguous) grid = grid.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, height, width, channels].", nameof(inputShape));
@@ -8194,6 +8308,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!grid.IsContiguous) grid = grid.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
@@ -8688,6 +8805,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
@@ -8782,6 +8900,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MaxPool3DBackward<T>(Tensor<T> gradOutput, int[,,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements [batch, channels, depth, height, width].", nameof(inputShape));
@@ -8838,6 +8957,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool3D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (stride == 0) stride = poolSize;
         return AvgPool3D(input, [poolSize, poolSize, poolSize], [stride, stride, stride], [padding, padding, padding]);
     }
@@ -8845,6 +8965,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool3D<T>(Tensor<T> input, int[] poolSize, int[] stride, int[] padding)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 5) throw new ArgumentException($"AvgPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
@@ -8928,6 +9049,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AvgPool3DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements [batch, channels, depth, height, width].", nameof(inputShape));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements.", nameof(poolSize));
@@ -9026,6 +9148,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Upsample3D<T>(Tensor<T> input, int scaleD, int scaleH, int scaleW)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 5) throw new ArgumentException($"Upsample3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0) throw new ArgumentException("Scale factors must be positive.");
@@ -9073,6 +9196,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Upsample3DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int scaleD, int scaleH, int scaleW)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements [batch, channels, depth, height, width].", nameof(inputShape));
         if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0) throw new ArgumentException("Scale factors must be positive.");
@@ -9133,6 +9257,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose3D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] outputPadding)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (input.Rank != 5) throw new ArgumentException($"ConvTranspose3D input requires 5D tensor [batch, in_channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
@@ -9239,6 +9365,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose3DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements.", nameof(inputShape));
@@ -9251,6 +9379,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose3DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernelShape == null || kernelShape.Length != 5) throw new ArgumentException("Kernel shape must be array of 5 elements.", nameof(kernelShape));
@@ -9348,6 +9478,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> LocallyConnectedConv2D<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int[] stride)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!weights.IsContiguous) weights = weights.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
         if (input.Rank != 4) throw new ArgumentException($"LocallyConnectedConv2D input requires a 4D tensor [batch, in_channels, height, width]. Got rank {input.Rank}.");
@@ -9437,6 +9569,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> LocallyConnectedConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> weights, int[] inputShape, int[] stride)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!weights.IsContiguous) weights = weights.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
         if (inputShape == null || inputShape.Length != 4) throw new ArgumentException("inputShape must be array of 4 elements [batch, inChannels, height, width]", nameof(inputShape));
@@ -9502,6 +9636,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> LocallyConnectedConv2DBackwardWeights<T>(Tensor<T> gradOutput, Tensor<T> input, int[] weightsShape, int[] stride)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weightsShape == null || weightsShape.Length != 6) throw new ArgumentException("weightsShape must be array of 6 elements", nameof(weightsShape));
@@ -9572,6 +9708,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> LocallyConnectedConv2DBackwardBias<T>(Tensor<T> gradOutput)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (gradOutput.Rank != 4) throw new ArgumentException($"LocallyConnectedConv2DBackwardBias gradOutput requires 4D tensor. Got rank {gradOutput.Rank}.");
 
@@ -9614,6 +9751,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Softmax<T>(Tensor<T> input, int axis = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         int rank = input.Rank;
@@ -10033,6 +10171,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GumbelSoftmax<T>(Tensor<T> input, double temperature = 1.0, bool hard = false, int axis = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (temperature <= 0)
             throw new ArgumentOutOfRangeException(nameof(temperature), temperature, "Temperature must be positive.");
@@ -10106,6 +10245,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GumbelSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, double temperature, int axis = -1)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (temperature <= 0)
@@ -10128,6 +10269,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TaylorSoftmax<T>(Tensor<T> input, int order = 2, int axis = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
@@ -10209,6 +10351,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TaylorSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int order, int axis = -1)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -10294,6 +10439,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Sparsemax<T>(Tensor<T> input, int axis = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -10361,6 +10507,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SparsemaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis = -1)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
 
@@ -10416,6 +10564,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SphericalSoftmax<T>(Tensor<T> input, int axis = -1)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -10465,6 +10614,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SphericalSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int axis = -1)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -11299,6 +11451,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> LayerNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!gamma.IsContiguous) gamma = gamma.Contiguous();
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -11922,7 +12077,6 @@ public class CpuEngine : ITensorLevelEngine
         if (!query.IsContiguous) query = query.Contiguous();
         if (!key.IsContiguous) key = key.Contiguous();
         if (!value.IsContiguous) value = value.Contiguous();
-        if (!attentionWeights.IsContiguous) attentionWeights = attentionWeights.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -13166,6 +13320,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterAdd<T>(Tensor<T> source, Tensor<int> indices, int dim = 0, int? outputSize = null)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -13234,6 +13390,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterAddBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int[] sourceShape, int dim = 0)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (indices == null)
@@ -13283,6 +13441,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim = 0, int? outputSize = null)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -13366,6 +13526,9 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterMeanBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, Tensor<int> counts, int[] sourceShape, int dim = 0)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
+        if (!counts.IsContiguous) counts = counts.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (indices == null)
@@ -13420,6 +13583,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterMax<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? argmax, int dim = 0, int? outputSize = null)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -13494,6 +13659,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterMaxBackward<T>(Tensor<T> gradOutput, Tensor<int> argmax, int[] sourceShape, int dim = 0)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!argmax.IsContiguous) argmax = argmax.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (argmax == null)
@@ -13548,6 +13715,8 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterSoftmax<T>(Tensor<T> source, Tensor<int> indices, int dim = 0, int? outputSize = null)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -13635,6 +13804,9 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterSoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, Tensor<int> indices, int dim = 0)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (output == null)
@@ -13746,6 +13918,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
         var inputData = input.GetDataArray();
@@ -13816,6 +13989,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMaxBackward<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int inputSize = inputShape.Aggregate(1, (a, b) => a * b);
         var gradInputData = new T[inputSize];
@@ -13839,6 +14013,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
         var inputData = input.GetDataArray();
@@ -13910,6 +14085,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMeanBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (inputShape == null || inputShape.Length == 0)
             throw new ArgumentNullException(nameof(inputShape), "inputShape cannot be null or empty");
 
@@ -13976,6 +14152,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -14072,6 +14249,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVarianceBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
@@ -14122,6 +14301,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceLogVariance<T>(Tensor<T> input, int[] axes, bool keepDims, double epsilon = 1e-8)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -14144,6 +14324,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceLogVarianceBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> variance, int[] axes)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!input.IsContiguous) input = input.Contiguous();
         if (gradOutput == null)
             throw new ArgumentNullException(nameof(gradOutput));
         if (input == null)
@@ -14328,6 +14510,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length < 2)
             throw new ArgumentException("Upsample requires tensor with at least 2 dimensions for height and width.");
@@ -14381,6 +14564,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> UpsampleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int scaleH, int scaleW)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (inputShape.Length < 2)
             throw new ArgumentException("UpsampleBackward requires inputShape with at least 2 dimensions for height and width.");
 
@@ -14435,6 +14619,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
@@ -14483,6 +14668,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PixelShuffleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int upscaleFactor)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         int batch = inputShape[0];
         int channels = inputShape[1];
         int height = inputShape[2];
@@ -14717,6 +14903,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
@@ -14756,6 +14943,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> CropBackward<T>(Tensor<T> gradOutput, int[] inputShape, int top, int left)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = inputShape[0];
@@ -14797,6 +14985,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var shape = input._shape;
         if (shape.Length < 2)
             throw new ArgumentException("Pad expects at least 2D tensor");
@@ -14843,6 +15032,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PadBackward<T>(Tensor<T> gradOutput, int padTop, int padLeft, int[] inputShape)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         int rank = inputShape.Length;
         int height = inputShape[rank - 2];
         int width = inputShape[rank - 1];
@@ -14936,6 +15126,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorSumOfSquares<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
 #if NET5_0_OR_GREATER
@@ -15096,6 +15287,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> RBFKernel<T>(Tensor<T> input, Tensor<T> centers, Tensor<T> epsilons)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!centers.IsContiguous) centers = centers.Contiguous();
+        if (!epsilons.IsContiguous) epsilons = epsilons.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (centers == null) throw new ArgumentNullException(nameof(centers));
         if (epsilons == null) throw new ArgumentNullException(nameof(epsilons));
@@ -15253,6 +15447,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorRepeatElements<T>(Tensor<T> tensor, int repeats, int axis = 0)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be at least 1");
         if (axis < 0 || axis >= tensor._shape.Length)
@@ -15300,6 +15495,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (multiples == null) throw new ArgumentNullException(nameof(multiples));
         if (multiples.Length != tensor._shape.Length)
@@ -15349,6 +15545,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (start == null) throw new ArgumentNullException(nameof(start));
         if (length == null) throw new ArgumentNullException(nameof(length));
@@ -15395,6 +15592,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSetSlice<T>(Tensor<T> destination, Tensor<T> source, int[] start)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!source.IsContiguous) source = source.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (start == null) throw new ArgumentNullException(nameof(start));
@@ -15443,6 +15642,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorWhere<T>(Tensor<T> condition, Tensor<T> x, Tensor<T> y)
     {
+        if (!condition.IsContiguous) condition = condition.Contiguous();
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!y.IsContiguous) y = y.Contiguous();
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -15474,6 +15676,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source.Length != destination.Length)
@@ -15487,6 +15691,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void TensorFill<T>(Tensor<T> tensor, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         tensor.Fill(value);
     }
@@ -15494,6 +15699,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorOuterProduct<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
@@ -15616,6 +15823,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis = 0)
     {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!indices.IsContiguous) indices = indices.Contiguous();
+        if (!updates.IsContiguous) updates = updates.Contiguous();
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
@@ -15656,6 +15866,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis = 0)
     {
+        if (!source.IsContiguous) source = source.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
 
@@ -15691,6 +15903,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15911,6 +16124,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15943,6 +16157,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorDiag<T>(Tensor<T> diagonal)
     {
+        if (!diagonal.IsContiguous) diagonal = diagonal.Contiguous();
         if (diagonal == null) throw new ArgumentNullException(nameof(diagonal));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16086,6 +16301,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TanhDerivative<T>(Tensor<T> tanhOutput)
     {
+        if (!tanhOutput.IsContiguous) tanhOutput = tanhOutput.Contiguous();
         if (tanhOutput == null) throw new ArgumentNullException(nameof(tanhOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16105,6 +16321,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SigmoidDerivative<T>(Tensor<T> sigmoidOutput)
     {
+        if (!sigmoidOutput.IsContiguous) sigmoidOutput = sigmoidOutput.Contiguous();
         if (sigmoidOutput == null) throw new ArgumentNullException(nameof(sigmoidOutput));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16124,6 +16341,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReLUDerivative<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16294,6 +16512,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorOneHot<T>(Tensor<int> indices, int depth)
     {
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (depth <= 0) throw new ArgumentException("Depth must be positive", nameof(depth));
 
@@ -16320,6 +16539,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> TensorArgMax<T>(Tensor<T> tensor, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16371,6 +16591,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> TensorArgMin<T>(Tensor<T> tensor, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -16422,6 +16643,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorBinaryCrossEntropy<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
@@ -16461,6 +16684,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorBinaryCrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets, T epsilon)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
 
@@ -16529,6 +16754,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 3) throw new ArgumentException("TensorSliceAxis currently only supports 3D tensors.");
 
@@ -16724,6 +16950,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // Delegate to Softmax which has the same functionality
         return Softmax(tensor, axis);
     }
@@ -16731,6 +16958,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> outputGradient, int axis)
     {
+        if (!softmaxOutput.IsContiguous) softmaxOutput = softmaxOutput.Contiguous();
+        if (!outputGradient.IsContiguous) outputGradient = outputGradient.Contiguous();
         // Delegate to SoftmaxBackward with reordered parameters (grad first, then output)
         return SoftmaxBackward(outputGradient, softmaxOutput, axis);
     }
@@ -16738,6 +16967,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe Tensor<T> TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         int rank = tensor.Rank;
@@ -16929,6 +17159,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
 
@@ -17057,6 +17289,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMap<T>(Tensor<T> tensor, Func<T, T> func)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
@@ -17081,6 +17314,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
 
@@ -17100,6 +17334,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
         if (!tensor._shape.SequenceEqual(mask._shape))
@@ -17121,6 +17356,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
     {
+        if (!condition.IsContiguous) condition = condition.Contiguous();
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!y.IsContiguous) y = y.Contiguous();
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -17142,6 +17380,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
     {
+        if (!condition.IsContiguous) condition = condition.Contiguous();
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!y.IsContiguous) y = y.Contiguous();
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
@@ -17532,6 +17773,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PairwiseDistance<T>(Tensor<T> x, Tensor<T> y)
     {
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!y.IsContiguous) y = y.Contiguous();
         var distSq = PairwiseDistanceSquared(x, y);
         return TensorSqrt(distSq);
     }
@@ -17604,6 +17847,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -17653,6 +17897,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -17695,6 +17941,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
+        if (!values.IsContiguous) values = values.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -17734,6 +17983,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScatterAdd<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
+        if (!values.IsContiguous) values = values.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -17778,6 +18030,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         var srcData = tensor.GetDataArray();
@@ -17795,6 +18048,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
         var srcData = tensor.GetDataArray();
@@ -17839,6 +18093,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!weights.IsContiguous) weights = weights.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
 
@@ -18211,6 +18467,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void UnregisterPersistentTensor<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // No-op on CPU
     }
 
@@ -18220,6 +18477,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </remarks>
     public void InvalidatePersistentTensor<T>(Tensor<T> tensor)
     {
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         // No-op on CPU
     }
 
@@ -18230,6 +18488,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -18279,6 +18538,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> IRFFT<T>(Tensor<T> input, int outputLength)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null) throw new ArgumentNullException(nameof(input));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -18334,6 +18594,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void FFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
         if (!inputReal._shape.SequenceEqual(inputImag._shape))
@@ -18379,6 +18641,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void IFFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
         if (!inputReal._shape.SequenceEqual(inputImag._shape))
@@ -18426,6 +18690,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void FFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
         if (inputReal._shape.Length < 2)
@@ -18482,6 +18748,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void IFFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
+        if (!inputImag.IsContiguous) inputImag = inputImag.Contiguous();
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
         if (inputReal._shape.Length < 2)
@@ -19194,6 +19462,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Softplus<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetDataArray();
         var result = new T[data.Length];
@@ -19222,6 +19491,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> HardSwish<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetDataArray();
         var result = new T[data.Length];
@@ -19653,6 +19923,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetDataArray();
         var maskData = new T[input.Length];
@@ -19690,6 +19961,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> DropoutBackward<T>(Tensor<T> gradOutput, Tensor<T> mask, double dropoutRate)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var maskData = mask.GetDataArray();
@@ -19704,6 +19976,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
+        if (!indices.IsContiguous) indices = indices.Contiguous();
+        if (!embeddingTable.IsContiguous) embeddingTable = embeddingTable.Contiguous();
         int vocabSize = embeddingTable._shape[0];
         int embeddingDim = embeddingTable._shape[^1];
         int numIndices = indices.Length;
@@ -19738,6 +20012,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> EmbeddingBackward<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         var indicesData = indices.GetDataArray();
@@ -19765,6 +20041,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T CrossEntropyLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = predictions._shape[0];
         int numClasses = predictions._shape[1];
@@ -19840,6 +20118,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = predictions._shape[0];
         int numClasses = predictions._shape[1];
@@ -19909,6 +20189,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T MseLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
@@ -19923,6 +20205,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (!predictions.IsContiguous) predictions = predictions.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // grad = 2 * (pred - target) / N
@@ -19937,6 +20221,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GlobalAvgPool2D<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -19969,6 +20254,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GlobalMaxPool2D<T>(Tensor<T> input)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -20003,6 +20289,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -20214,6 +20501,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (!input.IsContiguous) input = input.Contiguous();
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
@@ -20238,6 +20526,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLerp<T>(Tensor<T> a, Tensor<T> b, T t)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
@@ -20256,6 +20546,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAddScaled<T>(Tensor<T> a, Tensor<T> b, T scaleA, T scaleB)
     {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
