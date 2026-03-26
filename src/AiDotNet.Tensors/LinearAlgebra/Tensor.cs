@@ -1281,7 +1281,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         var result = new Tensor<T>(newShape);
         int[] indices = new int[Rank];
-        SumRecursive(this, result, axes, indices, 0, _numOps.Zero);
+        SumRecursive(result, axes, indices, 0);
 
         return result;
     }
@@ -1412,10 +1412,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// specified dimensions. You don't need to call this method directly - it's used internally by 
     /// the Sum method.</para>
     /// </remarks>
-    private void SumRecursive(Tensor<T> input, Tensor<T> result, int[] axes, int[] indices, int depth, T currentSum)
+    private void SumRecursive(Tensor<T> result, int[] axes, int[] indices, int depth)
     {
         if (depth == Rank)
         {
+            // All indices are now set — read the actual tensor value and accumulate
+            // into the result at the position determined by non-axis indices.
+            // Previously, the value was read at intermediate axis levels where deeper
+            // indices hadn't been set yet, producing wrong results for multi-axis reduction.
+            T value = this[indices];
             int[] resultIndices = new int[result.Rank];
             int resultIndex = 0;
             for (int i = 0; i < Rank; i++)
@@ -1425,25 +1430,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     resultIndices[resultIndex++] = indices[i];
                 }
             }
-            result[resultIndices] = _numOps.Add(result[resultIndices], currentSum);
+            result[resultIndices] = _numOps.Add(result[resultIndices], value);
             return;
         }
 
-        if (axes.Contains(depth))
+        for (int i = 0; i < Shape[depth]; i++)
         {
-            for (int i = 0; i < Shape[depth]; i++)
-            {
-                indices[depth] = i;
-                SumRecursive(input, result, axes, indices, depth + 1, _numOps.Add(currentSum, this[indices]));
-            }
-        }
-        else
-        {
-            for (int i = 0; i < Shape[depth]; i++)
-            {
-                indices[depth] = i;
-                SumRecursive(input, result, axes, indices, depth + 1, currentSum);
-            }
+            indices[depth] = i;
+            SumRecursive(result, axes, indices, depth + 1);
         }
     }
 
