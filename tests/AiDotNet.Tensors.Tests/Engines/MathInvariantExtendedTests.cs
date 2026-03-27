@@ -616,20 +616,26 @@ public class MathInvariantExtendedTests
 
     [Fact] public void GroupNorm_Double_LargeTensor_NoPooledArrayMismatch()
     {
-        // Regression test: GroupNorm with double type and large tensor (>256K elements)
-        // triggers ArrayPool bucketing. Previously, Rent().GetDataArray() returned an
+        // Regression test: GroupNorm with double type and tensor >= ArrayPoolThreshold
+        // to trigger ArrayPool bucketing. Previously, Rent().GetDataArray() returned an
         // oversized array causing "Data length must match shape total" exception.
         var engine = new CpuEngine();
-        int batch = 2, channels = 8, h = 128, w = 128; // 262,144 elements > ArrayPoolThreshold
+        // Derive dimensions from threshold to stay valid if threshold changes
+        int threshold = Helpers.TensorAllocator.ArrayPoolThresholdValue;
+        int channels = 8, numGroups = 4;
+        int spatialPerChannel = (threshold / (2 * channels)) + 1; // ensure total > threshold
+        int h = (int)Math.Ceiling(Math.Sqrt(spatialPerChannel));
+        int w = h;
+        int batch = 2;
         var input = new Tensor<double>(new double[batch * channels * h * w], [batch, channels, h, w]);
         var gamma = new Tensor<double>(Enumerable.Repeat(1.0, channels).ToArray(), [channels]);
         var beta = new Tensor<double>(new double[channels], [channels]);
 
-        // Should not throw "Data length (524288) must match shape total (262144)"
-        var result = engine.GroupNorm(input, 4, gamma, beta, 1e-5, out var mean, out var variance);
+        // Should not throw "Data length must match shape total"
+        var result = engine.GroupNorm(input, numGroups, gamma, beta, 1e-5, out var mean, out var variance);
         Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
-        Assert.Equal(new[] { batch, 4 }, mean.Shape.ToArray());
-        Assert.Equal(new[] { batch, 4 }, variance.Shape.ToArray());
+        Assert.Equal(new[] { batch, numGroups }, mean.Shape.ToArray());
+        Assert.Equal(new[] { batch, numGroups }, variance.Shape.ToArray());
     }
 
     [Fact] public void InstanceNorm_ShapePreserved()

@@ -11738,9 +11738,11 @@ public class CpuEngine : ITensorLevelEngine
         // Mean and variance are computed per batch per group
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
-        // Allocate exact-size array directly — do NOT use Rent().GetDataArray() which
-        // can return an oversized pooled backing array, causing Rent(shape, data) mismatch.
-        var outputData = new T[input.Length];
+        // Allocate output via TensorAllocator to benefit from pooling.
+        // Write directly into the tensor's backing array — avoid the Rent().GetDataArray()
+        // round-trip which can return an oversized pooled array.
+        var output = TensorAllocator.Rent<T>(input._shape);
+        var outputData = output.GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
         Parallel.For(0, batch * numGroups, idx =>
@@ -11792,7 +11794,7 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(meanData));
         variance = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(varData));
-        return TensorAllocator.Rent<T>(input._shape, Vector<T>.WrapMemory(outputData));
+        return output;
     }
 
     /// <inheritdoc/>
