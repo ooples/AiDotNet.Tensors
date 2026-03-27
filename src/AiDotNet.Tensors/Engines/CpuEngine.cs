@@ -4568,6 +4568,11 @@ public class CpuEngine : ITensorLevelEngine
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+
+        // Auto-contiguous: Conv2D accesses .Data which requires contiguous memory
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+
         if (input.Rank != 4)
         {
             throw new ArgumentException($"Conv2D input requires a 4D tensor [batch, in_channels, height, width]. Got rank {input.Rank}.");
