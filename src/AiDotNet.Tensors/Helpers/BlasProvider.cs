@@ -22,9 +22,27 @@ internal static class BlasProvider
     private static CblasDgemm? _dgemm;
     private static BlasSetNumThreads? _setNumThreads;
     private static MklSetDynamic? _setDynamic;
-    private static readonly int? ThreadCountOverride = ReadEnvInt("AIDOTNET_BLAS_THREADS");
+    private static int? ThreadCountOverride = ReadEnvInt("AIDOTNET_BLAS_THREADS");
     private static readonly bool PreferMkl = ReadEnvBool("AIDOTNET_BLAS_PREFER_MKL");
     private static readonly bool TraceEnabled = ReadEnvBool("AIDOTNET_BLAS_TRACE");
+
+    /// <summary>
+    /// Enables deterministic mode by forcing BLAS to single-threaded execution.
+    /// Multi-threaded BLAS (OpenBLAS, MKL) can produce slightly different FP results
+    /// across runs due to parallel reduction ordering. Single-threaded mode guarantees
+    /// bit-identical results for the same input.
+    /// </summary>
+    public static void SetDeterministicMode(bool deterministic)
+    {
+        lock (InitLock)
+        {
+            ThreadCountOverride = deterministic ? 1 : ReadEnvInt("AIDOTNET_BLAS_THREADS");
+            if (_initialized)
+            {
+                ApplyThreadSettings();
+            }
+        }
+    }
 
 #if NETFRAMEWORK
     [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
