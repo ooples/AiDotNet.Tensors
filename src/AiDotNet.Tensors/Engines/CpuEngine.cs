@@ -4572,6 +4572,8 @@ public class CpuEngine : ITensorLevelEngine
         // Auto-contiguous: Conv2D accesses .Data which requires contiguous memory
         if (!input.IsContiguous) input = input.Contiguous();
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
+        if (!output.IsContiguous)
+            throw new InvalidOperationException("Output tensor must be contiguous for Conv2D.");
 
         if (input.Rank != 4)
         {
