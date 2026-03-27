@@ -34,22 +34,12 @@ internal static class BlasProvider
     /// </summary>
     public static void SetDeterministicMode(bool deterministic)
     {
-        if (deterministic)
+        lock (InitLock)
         {
-            ThreadCountOverride = 1;
-            if (_initialized && _setNumThreads != null)
+            ThreadCountOverride = deterministic ? 1 : ReadEnvInt("AIDOTNET_BLAS_THREADS");
+            if (_initialized)
             {
-                _setDynamic?.Invoke(0);
-                _setNumThreads(1);
-            }
-        }
-        else
-        {
-            ThreadCountOverride = ReadEnvInt("AIDOTNET_BLAS_THREADS");
-            if (_initialized && _setNumThreads != null)
-            {
-                int threads = ThreadCountOverride ?? Environment.ProcessorCount;
-                _setNumThreads(threads);
+                ApplyThreadSettings();
             }
         }
     }
