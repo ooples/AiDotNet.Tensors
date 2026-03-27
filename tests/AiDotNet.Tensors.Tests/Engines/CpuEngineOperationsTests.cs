@@ -295,4 +295,32 @@ public class CpuEngineOperationsTests
         Assert.Equal(40f, result[1, 1], 5);  // 2*20
         Assert.Equal(60f, result[1, 2], 5);  // 2*30
     }
+
+    [Fact]
+    public void Conv2DInto_NonContiguousInput_ProducesCorrectResult()
+    {
+        // Create a contiguous input [1,1,4,4], then transpose to make it non-contiguous
+        var contiguousInput = new Tensor<float>(new float[]
+        {
+            1, 2, 3, 4,
+            5, 6, 7, 8,
+            9, 10, 11, 12,
+            13, 14, 15, 16
+        }, new[] { 1, 1, 4, 4 });
+
+        // Transpose last two dims to create a non-contiguous view [1,1,4,4]
+        var nonContiguous = contiguousInput.TransposeLast2D();
+
+        // Simple 1x1 identity kernel [1,1,1,1]
+        var kernel = new Tensor<float>(new float[] { 1f }, new[] { 1, 1, 1, 1 });
+        var output = new Tensor<float>(new[] { 1, 1, 4, 4 });
+
+        // Conv2D with non-contiguous input should auto-contiguous and work
+        _engine.Conv2DInto(output, nonContiguous, kernel);
+
+        // Result should be the transposed values (since input was transposed)
+        Assert.Equal(1f, output[0, 0, 0, 0], 5);
+        Assert.Equal(5f, output[0, 0, 0, 1], 5);  // Was [0,0,1,0] before transpose
+        Assert.Equal(2f, output[0, 0, 1, 0], 5);  // Was [0,0,0,1] before transpose
+    }
 }
