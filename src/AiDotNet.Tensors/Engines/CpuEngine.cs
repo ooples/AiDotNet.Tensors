@@ -11790,9 +11790,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        mean = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(meanData));
-        variance = TensorAllocator.Rent<T>([batch, numGroups], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        mean = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(meanData));
+        variance = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(varData));
+        return TensorAllocator.Rent<T>(input._shape, Vector<T>.WrapMemory(outputData));
     }
 
     /// <inheritdoc/>

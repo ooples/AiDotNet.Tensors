@@ -614,6 +614,24 @@ public class MathInvariantExtendedTests
         Assert.Equal(new[] { 2, 8, 4, 4 }, r.Shape.ToArray());
     }
 
+    [Fact] public void GroupNorm_Double_LargeTensor_NoPooledArrayMismatch()
+    {
+        // Regression test: GroupNorm with double type and large tensor (>256K elements)
+        // triggers ArrayPool bucketing. Previously, Rent().GetDataArray() returned an
+        // oversized array causing "Data length must match shape total" exception.
+        var engine = new CpuEngine();
+        int batch = 2, channels = 8, h = 128, w = 128; // 262,144 elements > ArrayPoolThreshold
+        var input = new Tensor<double>(new double[batch * channels * h * w], [batch, channels, h, w]);
+        var gamma = new Tensor<double>(Enumerable.Repeat(1.0, channels).ToArray(), [channels]);
+        var beta = new Tensor<double>(new double[channels], [channels]);
+
+        // Should not throw "Data length (524288) must match shape total (262144)"
+        var result = engine.GroupNorm(input, 4, gamma, beta, 1e-5, out var mean, out var variance);
+        Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
+        Assert.Equal(new[] { batch, 4 }, mean.Shape.ToArray());
+        Assert.Equal(new[] { batch, 4 }, variance.Shape.ToArray());
+    }
+
     [Fact] public void InstanceNorm_ShapePreserved()
     {
         var x = R([2, 4, 8, 8], 227);
