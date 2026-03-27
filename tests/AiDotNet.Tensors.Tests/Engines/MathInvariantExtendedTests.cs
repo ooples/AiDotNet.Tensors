@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -621,7 +622,7 @@ public class MathInvariantExtendedTests
         // oversized array causing "Data length must match shape total" exception.
         var engine = new CpuEngine();
         // Derive dimensions from threshold to stay valid if threshold changes
-        int threshold = Helpers.TensorAllocator.ArrayPoolThresholdValue;
+        int threshold = TensorAllocator.ArrayPoolThresholdValue;
         int channels = 8, numGroups = 4;
         int spatialPerChannel = (threshold / (2 * channels)) + 1; // ensure total > threshold
         int h = (int)Math.Ceiling(Math.Sqrt(spatialPerChannel));
