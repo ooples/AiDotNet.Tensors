@@ -4569,26 +4569,24 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
-        // Auto-contiguous: Conv2D accesses .Data which requires contiguous memory
-        if (!input.IsContiguous) input = input.Contiguous();
-        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
-        if (!output.IsContiguous)
-            throw new InvalidOperationException("Output tensor must be contiguous for Conv2D.");
-
+        // Cheap validation first — fail fast before any allocation
         if (input.Rank != 4)
-        {
             throw new ArgumentException($"Conv2D input requires a 4D tensor [batch, in_channels, height, width]. Got rank {input.Rank}.");
-        }
         if (kernel.Rank != 4)
-        {
             throw new ArgumentException($"Conv2D kernel requires a 4D tensor [out_channels, in_channels, kernel_height, kernel_width]. Got rank {kernel.Rank}.");
-        }
         if (output.Rank != 4)
-        {
             throw new ArgumentException($"Conv2D output requires a 4D tensor [batch, out_channels, output_height, output_width]. Got rank {output.Rank}.");
-        }
         if (stride <= 0) throw new ArgumentException("Stride must be positive.");
         if (dilation <= 0) throw new ArgumentException("Dilation must be positive.");
+
+        // Auto-contiguous: Conv2D accesses .Data which requires contiguous memory.
+        // Uses Contiguous() unconditionally to also handle offset views (non-zero _storageOffset
+        // with row-major strides passes IsContiguous but still needs materialization for .Data).
+        // Zero-copy when already contiguous with offset 0 (Contiguous() returns this).
+        input = input.Contiguous();
+        kernel = kernel.Contiguous();
+        if (!output.IsContiguous)
+            throw new InvalidOperationException("Output tensor must be contiguous for Conv2D.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
