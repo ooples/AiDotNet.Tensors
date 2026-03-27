@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -612,6 +613,30 @@ public class MathInvariantExtendedTests
         var g = C(1f, 8); var b = C(0f, 8);
         var r = E.GroupNorm(x, 4, new Tensor<float>(g.GetDataArray(), [8]), new Tensor<float>(b.GetDataArray(), [8]), 1e-5, out _, out _);
         Assert.Equal(new[] { 2, 8, 4, 4 }, r.Shape.ToArray());
+    }
+
+    [Fact] public void GroupNorm_Double_LargeTensor_NoPooledArrayMismatch()
+    {
+        // Regression test: GroupNorm with double type and tensor >= ArrayPoolThreshold
+        // to trigger ArrayPool bucketing. Previously, Rent().GetDataArray() returned an
+        // oversized array causing "Data length must match shape total" exception.
+        var engine = new CpuEngine();
+        // Derive dimensions from threshold to stay valid if threshold changes
+        int threshold = TensorAllocator.ArrayPoolThresholdValue;
+        int channels = 8, numGroups = 4;
+        int spatialPerChannel = (threshold / (2 * channels)) + 1; // ensure total > threshold
+        int h = (int)Math.Ceiling(Math.Sqrt(spatialPerChannel));
+        int w = h;
+        int batch = 2;
+        var input = new Tensor<double>(new double[batch * channels * h * w], [batch, channels, h, w]);
+        var gamma = new Tensor<double>(Enumerable.Repeat(1.0, channels).ToArray(), [channels]);
+        var beta = new Tensor<double>(new double[channels], [channels]);
+
+        // Should not throw "Data length must match shape total"
+        var result = engine.GroupNorm(input, numGroups, gamma, beta, 1e-5, out var mean, out var variance);
+        Assert.Equal(new[] { batch, channels, h, w }, result.Shape.ToArray());
+        Assert.Equal(new[] { batch, numGroups }, mean.Shape.ToArray());
+        Assert.Equal(new[] { batch, numGroups }, variance.Shape.ToArray());
     }
 
     [Fact] public void InstanceNorm_ShapePreserved()
