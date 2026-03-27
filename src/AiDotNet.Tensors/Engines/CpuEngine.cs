@@ -1951,8 +1951,8 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
         {
-            throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+            // Fall back to Tensor's BroadcastAdd which handles shape broadcasting
+            return a.BroadcastAdd(b);
         }
 
         var result = TensorAllocator.Rent<T>(a._shape);
@@ -2674,8 +2674,7 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!ShapesMatch(a._shape, b._shape))
         {
-            throw new ArgumentException(
-                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+            return a.BroadcastSubtract(b);
         }
 
         var result = TensorAllocator.Rent<T>(a._shape);
