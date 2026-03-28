@@ -3078,6 +3078,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return max;
         }
 
+        public float Min(IGpuBuffer A, int size)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
+            var kernel = _kernelCache["reduce_min"];
+            int localSize = CalculateOptimalWorkGroupSize1D(size);
+            localSize = ClampLocalSizeForKernel(kernel, localSize, sizeof(float));
+            int groupCount = (size + localSize - 1) / localSize;
+
+            using var partialBuffer = AllocateBuffer(groupCount);
+            var partial = ((DirectOpenClGpuBuffer)partialBuffer).Buffer;
+
+            kernel.SetArg(0, bufferA.Handle);
+            kernel.SetArg(1, partial.Handle);
+            kernel.SetLocalArg(2, localSize * sizeof(float));
+            kernel.SetArg(3, size);
+
+            kernel.Execute1D(size, localSize);
+            _context?.Finish();
+
+            var partials = DownloadBuffer(partialBuffer);
+            float min = float.MaxValue;
+            for (int i = 0; i < partials.Length; i++)
+                if (partials[i] < min) min = partials[i];
+            return min;
+        }
+
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
         {
             if (_context == null)

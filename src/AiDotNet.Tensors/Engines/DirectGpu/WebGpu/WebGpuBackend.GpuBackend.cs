@@ -634,6 +634,7 @@ public sealed partial class WebGpuBackend
 
     public float Sum(IGpuBuffer A, int size) => SumAsync(A, size).GetAwaiter().GetResult();
     public float Max(IGpuBuffer A, int size) => MaxAsync(A, size).GetAwaiter().GetResult();
+    public float Min(IGpuBuffer A, int size) => MinAsync(A, size).GetAwaiter().GetResult();
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {

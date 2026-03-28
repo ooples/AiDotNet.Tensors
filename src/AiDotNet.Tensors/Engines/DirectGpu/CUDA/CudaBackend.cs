@@ -1996,6 +1996,27 @@ public sealed class CudaBackend : IAsyncGpuBackend
         return max;
     }
 
+    public float Min(IGpuBuffer A, int size)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+
+        if (size <= 0)
+            return float.MaxValue;
+
+        using var _ = PushContext();
+        int blockSize = DefaultBlockSize;
+        int gridSize = (size + blockSize - 1) / blockSize;
+
+        using var partialBuffer = AllocateBuffer(gridSize);
+        LaunchReductionKernel("reduce_min", A, partialBuffer, size, blockSize);
+        var partials = DownloadBuffer(partialBuffer);
+        float min = float.MaxValue;
+        for (int i = 0; i < partials.Length; i++)
+            if (partials[i] < min) min = partials[i];
+        return min;
+    }
+
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (!IsAvailable)

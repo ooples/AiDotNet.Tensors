@@ -768,6 +768,11 @@ public interface IDirectGpuBackend : IDisposable
     float Max(IGpuBuffer A, int size);
 
     /// <summary>
+    /// Find minimum element in buffer.
+    /// </summary>
+    float Min(IGpuBuffer A, int size);
+
+    /// <summary>
     /// Sum along axis for batched data.
     /// </summary>
     void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize);
