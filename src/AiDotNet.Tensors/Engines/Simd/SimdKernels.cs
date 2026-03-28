@@ -4120,6 +4120,40 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>Pointer-based MultiplyScalar for float — AVX 8-wide with 4x unroll.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void MultiplyScalarUnsafe(float* a, float scalar, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), vs));
+                    Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), vs));
+                    Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * scalar;
+            }
+        }
+
         /// <summary>Pointer-based MultiplyScalar for double — zero bounds-checking overhead.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void MultiplyScalarUnsafe(double* a, double scalar, double* result, int length)

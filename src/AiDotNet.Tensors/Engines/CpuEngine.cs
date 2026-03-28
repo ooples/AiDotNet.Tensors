@@ -3024,37 +3024,154 @@ public class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
+    /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    public void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
+    public unsafe void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!a.IsContiguous) throw new InvalidOperationException("In-place scalar multiply requires contiguous tensor.");
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var span = a.AsWritableSpan();
-        for (int i = 0; i < span.Length; i++)
+        int length = a.Length;
+
+        // Float fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(float))
         {
-            span[i] = numOps.Multiply(span[i], scalar);
+            float scalarF = (float)(object)scalar!;
+            var aMem = AsFloatMemory(a.Data);
+            using var pinA = aMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarF, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarF, pA, length);
+            }
+            return;
         }
+
+        // Double fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(double))
+        {
+            double scalarD = (double)(object)scalar!;
+            var aMem = AsDoubleMemory(a.Data);
+            using var pinA = aMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarD, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarD, pA, length);
+            }
+            return;
+        }
+
+        // Generic fallback: vectorized numOps
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.MultiplyScalar(a.AsSpan(), scalar, a.AsWritableSpan());
     }
 
     /// <summary>
     /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
+    /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    public void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
+    public unsafe void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!a.IsContiguous) a = a.Contiguous();
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var src = a.AsSpan();
-        var dst = destination.AsWritableSpan();
-        for (int i = 0; i < src.Length; i++)
+        int length = a.Length;
+
+        // Float fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(float))
         {
-            dst[i] = numOps.Multiply(src[i], scalar);
+            float scalarF = (float)(object)scalar!;
+            var aMem = AsFloatMemory(a.Data);
+            var dMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinD = dMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pD = (float*)pinD.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarF, pD + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarF, pD, length);
+            }
+            return;
         }
+
+        // Double fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(double))
+        {
+            double scalarD = (double)(object)scalar!;
+            var aMem = AsDoubleMemory(a.Data);
+            var dMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinD = dMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pD = (double*)pinD.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarD, pD + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarD, pD, length);
+            }
+            return;
+        }
+
+        // Generic fallback: vectorized numOps
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.MultiplyScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
