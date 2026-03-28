@@ -1,4 +1,7 @@
 using AiDotNet.Tensors.Helpers;
+using MA = AiDotNet.Tensors.Helpers.MatrixAllocator;
+using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
+
 namespace AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
@@ -761,7 +764,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetColumnSegment(int columnIndex, int startRow, int length)
     {
-        var result = new Vector<T>(length);
+        var result = VA.RentUninitialized<T>(length);
         var destSpan = result.AsWritableSpan();
         var srcSpan = _memory.Span;
         for (int i = 0; i < length; i++)
@@ -786,7 +789,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetRowSegment(int rowIndex, int startColumn, int length)
     {
-        var result = new Vector<T>(length);
+        var result = VA.RentUninitialized<T>(length);
         var sourceSpan = _memory.Span.Slice(rowIndex * _cols + startColumn, length);
         _numOps.Copy(sourceSpan, result.AsWritableSpan());
         return result;
@@ -808,7 +811,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> GetSubMatrix(int startRow, int startColumn, int rowCount, int columnCount)
     {
-        Matrix<T> subMatrix = new(rowCount, columnCount);
+        Matrix<T> subMatrix = MA.RentUninitialized<T>(rowCount, columnCount);
 
         if (startColumn == 0 && columnCount == Columns)
         {
@@ -889,7 +892,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
             throw new ArgumentException("Tensor dimensions must match matrix dimensions for addition.");
         }
 
-        var result = new Matrix<T>(Rows, Columns);
+        var result = MA.RentUninitialized<T>(Rows, Columns);
         _numOps.Add(_memory.Span, tensor.AsSpan(), result.AsWritableSpan());
         return result;
     }
@@ -1027,7 +1030,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         if (Columns == 0)
             throw new InvalidOperationException("Cannot compute row-wise maximum of a matrix with zero columns");
 
-        Vector<T> result = new(Rows);
+        Vector<T> result = VA.RentUninitialized<T>(Rows);
         for (int i = 0; i < Rows; i++)
         {
             // Use vectorized Max for each row (8-12x speedup with AVX2)
@@ -1049,7 +1052,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Transform(Func<T, int, int, T> transformer)
     {
-        Matrix<T> result = new(Rows, Columns);
+        Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
 
         for (int i = 0; i < Rows; i++)
         {
@@ -1072,7 +1075,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> RowWiseSum()
     {
-        Vector<T> result = new(Rows);
+        Vector<T> result = VA.RentUninitialized<T>(Rows);
 
         for (int i = 0; i < Rows; i++)
         {
@@ -1111,7 +1114,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Divide(T scalar)
     {
-        Matrix<T> result = new(Rows, Columns);
+        Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
         return result;
     }
@@ -1147,7 +1150,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
             throw new ArgumentException("Matrices must have the same dimensions for division.");
         }
 
-        Matrix<T> result = new(Rows, Columns);
+        Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
         // Use vectorized Divide operation for SIMD acceleration (5-15x faster with AVX2)
         _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpan());
 
@@ -1177,7 +1180,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         int rows = a.Length;
         int cols = b.Length;
-        var result = new Matrix<T>(rows, cols);
+        var result = MA.RentUninitialized<T>(rows, cols);
 
         for (int i = 0; i < rows; i++)
         {
@@ -1271,7 +1274,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         if (rowCount < 1 || startRow + rowCount > Rows)
             throw new ArgumentOutOfRangeException(nameof(rowCount));
 
-        Matrix<T> result = new Matrix<T>(rowCount, Columns);
+        Matrix<T> result = MA.RentUninitialized<T>(rowCount, Columns);
         for (int i = 0; i < rowCount; i++)
         {
             _numOps.Copy(GetRowReadOnlySpan(startRow + i), result.GetRowSpan(i));
