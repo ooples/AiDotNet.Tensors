@@ -31,6 +31,9 @@ public static class VectorPool
     /// </summary>
     public static Vector<T> RentNative<T>(int length) where T : unmanaged
     {
+        if (!TensorPool.Enabled)
+            return new Vector<T>(length);
+
         return VectorAllocator.RentNative<T>(length);
     }
 

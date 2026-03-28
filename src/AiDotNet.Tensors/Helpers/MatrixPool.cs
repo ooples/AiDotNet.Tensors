@@ -31,6 +31,9 @@ public static class MatrixPool
     /// </summary>
     public static Matrix<T> RentNative<T>(int rows, int cols) where T : unmanaged
     {
+        if (!TensorPool.Enabled)
+            return new Matrix<T>(rows, cols);
+
         return MatrixAllocator.RentNative<T>(rows, cols);
     }
 

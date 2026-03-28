@@ -150,11 +150,11 @@ public static class VectorAllocator
         int length = data.Length;
 
 #if NET5_0_OR_GREATER
-        // Zero-copy path: wrap the array directly — no allocation, no copy.
+        // Clone to avoid aliasing — caller retains original, vector gets its own copy.
         if (!TensorPool.Enabled || length == 0)
         {
-            var memory = new Memory<T>(data);
-            return Vector<T>.FromMemory(memory);
+            var clone = new Memory<T>((T[])data.Clone());
+            return Vector<T>.FromMemory(clone);
         }
 
         if (length >= ArrayPoolThreshold)
