@@ -26,6 +26,15 @@ public static class MatrixPool
     }
 
     /// <summary>
+    /// Creates a matrix backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for matrices accessed via Span in native interop (oneDNN, VML).
+    /// </summary>
+    public static Matrix<T> RentNative<T>(int rows, int cols) where T : unmanaged
+    {
+        return MatrixAllocator.RentNative<T>(rows, cols);
+    }
+
+    /// <summary>
     /// Creates a matrix for immediate-overwrite scenarios, skipping zero-initialization
     /// where possible. Callers MUST overwrite all elements before reading.
     /// </summary>
@@ -35,6 +44,20 @@ public static class MatrixPool
             return new Matrix<T>(rows, cols);
 
         return MatrixAllocator.RentUninitialized<T>(rows, cols);
+    }
+
+    /// <summary>
+    /// Creates a matrix with data from an existing flat array, using pooled memory for large matrices.
+    /// </summary>
+    public static Matrix<T> Rent<T>(int rows, int cols, T[] data)
+    {
+        if (!TensorPool.Enabled)
+        {
+            var memory = new Memory<T>((T[])data.Clone());
+            return Matrix<T>.FromMemory(memory, rows, cols);
+        }
+
+        return MatrixAllocator.Rent(rows, cols, data);
     }
 
     /// <summary>

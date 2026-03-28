@@ -21,6 +21,11 @@ public static class VectorAllocator
     private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
+    /// Public accessor for the ArrayPool threshold used by workspace and other helpers.
+    /// </summary>
+    public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
+
+    /// <summary>
     /// Creates a zero-initialized vector with the given length.
     /// Large vectors use ArrayPool to reduce GC pressure; small-medium vectors
     /// use standard CLR allocation. All paths return zeroed memory.
@@ -78,6 +83,32 @@ public static class VectorAllocator
     }
 
     /// <summary>
+    /// Creates a vector backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for vectors that will ONLY be accessed via Span — never GetDataArray().
+    /// oneDNN and VML operations should use this for optimal performance.
+    /// </summary>
+    public static Vector<T> RentNative<T>(int length) where T : unmanaged
+    {
+        if (length == 0)
+            return new Vector<T>(length);
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float))
+        {
+            var owner = new NativeMemoryOwner<float>(length, zeroed: true);
+            return (Vector<T>)(object)Vector<float>.FromMemory(owner.Memory);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var owner = new NativeMemoryOwner<double>(length, zeroed: true);
+            return (Vector<T>)(object)Vector<double>.FromMemory(owner.Memory);
+        }
+#endif
+        // Fallback for other unmanaged types
+        return Rent<T>(length);
+    }
+
+    /// <summary>
     /// Creates a vector with the given length WITHOUT zero-initialization.
     /// Use ONLY for vectors that will be immediately and fully overwritten
     /// (e.g., weight initialization with random values, copy targets).
@@ -106,6 +137,42 @@ public static class VectorAllocator
         return Vector<T>.FromMemory(mem);
 #else
         return new Vector<T>(length);
+#endif
+    }
+
+    /// <summary>
+    /// Creates a vector with data from an existing array.
+    /// Zero-copy when the array is exactly the right size.
+    /// Falls back to copy when pooling is needed for large arrays.
+    /// </summary>
+    public static Vector<T> Rent<T>(T[] data)
+    {
+        int length = data.Length;
+
+#if NET5_0_OR_GREATER
+        // Zero-copy path: wrap the array directly — no allocation, no copy.
+        if (!TensorPool.Enabled || length == 0)
+        {
+            var memory = new Memory<T>(data);
+            return Vector<T>.FromMemory(memory);
+        }
+
+        if (length >= ArrayPoolThreshold)
+        {
+            T[] pooled = ArrayPool<T>.Shared.Rent(length);
+            data.AsSpan().CopyTo(pooled.AsSpan(0, length));
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > length)
+                Array.Clear(pooled, length, pooled.Length - length);
+            var memory = new Memory<T>(pooled, 0, length);
+            return Vector<T>.FromPooledMemory(memory, pooled);
+        }
+
+        T[] array = GC.AllocateUninitializedArray<T>(length);
+        data.AsSpan().CopyTo(array);
+        var mem = new Memory<T>(array);
+        return Vector<T>.FromMemory(mem);
+#else
+        return new Vector<T>(data);
 #endif
     }
 

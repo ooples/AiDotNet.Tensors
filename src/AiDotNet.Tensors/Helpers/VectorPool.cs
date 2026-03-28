@@ -26,6 +26,15 @@ public static class VectorPool
     }
 
     /// <summary>
+    /// Creates a vector backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for vectors accessed via Span in native interop (oneDNN, VML).
+    /// </summary>
+    public static Vector<T> RentNative<T>(int length) where T : unmanaged
+    {
+        return VectorAllocator.RentNative<T>(length);
+    }
+
+    /// <summary>
     /// Creates a vector for immediate-overwrite scenarios, skipping zero-initialization
     /// where possible. Callers MUST overwrite all elements before reading.
     /// </summary>
@@ -35,6 +44,17 @@ public static class VectorPool
             return new Vector<T>(length);
 
         return VectorAllocator.RentUninitialized<T>(length);
+    }
+
+    /// <summary>
+    /// Creates a vector with data from an existing array, using pooled memory for large vectors.
+    /// </summary>
+    public static Vector<T> Rent<T>(T[] data)
+    {
+        if (!TensorPool.Enabled)
+            return new Vector<T>(data);
+
+        return VectorAllocator.Rent(data);
     }
 
     /// <summary>

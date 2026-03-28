@@ -21,6 +21,11 @@ public static class MatrixAllocator
     private const int ArrayPoolThreshold = 256 * 1024;
 
     /// <summary>
+    /// Public accessor for the ArrayPool threshold used by workspace and other helpers.
+    /// </summary>
+    public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
+
+    /// <summary>
     /// Creates a zero-initialized matrix with the given dimensions.
     /// Large matrices use ArrayPool to reduce GC pressure; small-medium matrices
     /// use standard CLR allocation. All paths return zeroed memory.
@@ -80,6 +85,34 @@ public static class MatrixAllocator
     }
 
     /// <summary>
+    /// Creates a matrix backed by NativeMemory (64-byte aligned, zero GC overhead).
+    /// Use for matrices that will ONLY be accessed via Span — never GetDataArray().
+    /// oneDNN and VML operations should use this for optimal performance.
+    /// </summary>
+    public static Matrix<T> RentNative<T>(int rows, int cols) where T : unmanaged
+    {
+        int totalSize = checked(rows * cols);
+
+        if (totalSize == 0)
+            return new Matrix<T>(rows, cols);
+
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float))
+        {
+            var owner = new NativeMemoryOwner<float>(totalSize, zeroed: true);
+            return (Matrix<T>)(object)Matrix<float>.FromMemory(owner.Memory, rows, cols);
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var owner = new NativeMemoryOwner<double>(totalSize, zeroed: true);
+            return (Matrix<T>)(object)Matrix<double>.FromMemory(owner.Memory, rows, cols);
+        }
+#endif
+        // Fallback for other unmanaged types
+        return Rent<T>(rows, cols);
+    }
+
+    /// <summary>
     /// Creates a matrix with the given dimensions WITHOUT zero-initialization.
     /// Use ONLY for matrices that will be immediately and fully overwritten
     /// (e.g., matmul results, copy targets).
@@ -110,6 +143,48 @@ public static class MatrixAllocator
         return Matrix<T>.FromMemory(mem, rows, cols);
 #else
         return new Matrix<T>(rows, cols);
+#endif
+    }
+
+    /// <summary>
+    /// Creates a matrix with data from an existing flat array.
+    /// Zero-copy when the array is exactly the right size.
+    /// Falls back to copy when pooling is needed for large arrays.
+    /// </summary>
+    public static Matrix<T> Rent<T>(int rows, int cols, T[] data)
+    {
+        int totalSize = checked(rows * cols);
+
+        if (totalSize != data.Length)
+            throw new ArgumentException(
+                $"Data length ({data.Length}) must equal rows * cols ({totalSize}).",
+                nameof(data));
+
+#if NET5_0_OR_GREATER
+        // Zero-copy path: wrap the array directly.
+        if (!TensorPool.Enabled || totalSize == 0)
+        {
+            var memory = new Memory<T>(data);
+            return Matrix<T>.FromMemory(memory, rows, cols);
+        }
+
+        if (totalSize >= ArrayPoolThreshold)
+        {
+            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
+            data.AsSpan().CopyTo(pooled.AsSpan(0, totalSize));
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > totalSize)
+                Array.Clear(pooled, totalSize, pooled.Length - totalSize);
+            var memory = new Memory<T>(pooled, 0, totalSize);
+            return Matrix<T>.FromPooledMemory(memory, rows, cols, pooled);
+        }
+
+        T[] array = GC.AllocateUninitializedArray<T>(totalSize);
+        data.AsSpan().CopyTo(array);
+        var mem = new Memory<T>(array);
+        return Matrix<T>.FromMemory(mem, rows, cols);
+#else
+        var fallbackMem = new Memory<T>((T[])data.Clone());
+        return Matrix<T>.FromMemory(fallbackMem, rows, cols);
 #endif
     }
 
