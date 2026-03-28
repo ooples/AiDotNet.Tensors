@@ -282,6 +282,48 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
+    /// <summary>
+    /// Strided gather via WGSL compute shader: dst[i] = src[offset + i * stride].
+    /// </summary>
+    public async Task StridedGatherAsync(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        await DispatchStridedOpAsync("strided_gather", src, dst, offset, stride, count);
+    }
+
+    /// <summary>
+    /// Strided scatter via WGSL compute shader: dst[offset + i * stride] = src[i].
+    /// </summary>
+    public async Task StridedScatterAsync(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        await DispatchStridedOpAsync("strided_scatter", src, dst, offset, stride, count);
+    }
+
+    private async Task DispatchStridedOpAsync(string kernelName, IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        ThrowIfNotInitialized();
+
+        var srcBuffer = (WebGpuBuffer)src;
+        var dstBuffer = (WebGpuBuffer)dst;
+
+        var pipelineId = await GetOrCreatePipelineAsync("StridedOps", WebGpuKernels.StridedOpsSource, kernelName);
+
+        // StridedParams: { offset: u32, stride: u32, count: u32, _pad: u32 }
+        var paramsData = new float[]
+        {
+            BitConverter.Int32BitsToSingle(offset),
+            BitConverter.Int32BitsToSingle(stride),
+            BitConverter.Int32BitsToSingle(count),
+            0f // padding to 16-byte alignment
+        };
+        using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+
+        using var bindGroup = new WebGpuBindGroup(pipelineId, srcBuffer, dstBuffer);
+
+        var (workgroups, _) = _device.CalculateWorkgroups1D(count);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+
     #endregion
 
     #region Unary Operations

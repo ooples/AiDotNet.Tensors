@@ -230,23 +230,10 @@ public sealed partial class WebGpuBackend
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => ScaleAsync(A, B, scalar, size).GetAwaiter().GetResult();
 
     public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
-    {
-        // WebGPU: download, gather on CPU, upload (compute shader can be added when WGSL supports indirect indexing well)
-        var srcData = DownloadBuffer(src);
-        var dstData = new float[count];
-        for (int i = 0; i < count; i++)
-            dstData[i] = srcData[offset + i * stride];
-        UploadToBuffer(dstData, dst);
-    }
+        => StridedGatherAsync(src, dst, offset, stride, count).GetAwaiter().GetResult();
 
     public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
-    {
-        var srcData = DownloadBuffer(src);
-        var dstData = DownloadBuffer(dst);
-        for (int i = 0; i < count; i++)
-            dstData[offset + i * stride] = srcData[i];
-        UploadToBuffer(dstData, dst);
-    }
+        => StridedScatterAsync(src, dst, offset, stride, count).GetAwaiter().GetResult();
 
     public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {

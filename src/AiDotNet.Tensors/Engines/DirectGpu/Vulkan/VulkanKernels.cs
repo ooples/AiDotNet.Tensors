@@ -1452,5 +1452,11 @@ public enum VulkanKernelType
     MaxPool2D,
 
     /// <summary>Average pooling 2D</summary>
-    AvgPool2D
+    AvgPool2D,
+
+    /// <summary>Strided gather: dst[i] = src[offset + i * stride]</summary>
+    StridedGather,
+
+    /// <summary>Strided scatter: dst[offset + i * stride] = src[i]</summary>
+    StridedScatter
 }
