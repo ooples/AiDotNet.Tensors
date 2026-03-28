@@ -42,6 +42,18 @@ public static class CpuParallelSettings
     public static int ParallelThreshold { get; set; } = 50000;
 
     /// <summary>
+    /// Gets or sets whether AVX2 hardware gather instructions are used for strided memory access.
+    /// </summary>
+    /// <remarks>
+    /// AVX2 VGATHERDPS/VPGATHERDD can gather 8 floats in a single instruction using an index vector.
+    /// This provides significant speedup for wavelet transforms, FFT butterfly patterns, and
+    /// interleaved channel separation. However, some AMD processors (pre-Zen 3) have slow
+    /// gather implementations that can be slower than scalar loops. Set to false to force
+    /// scalar fallback on such hardware.
+    /// </remarks>
+    public static bool EnableAvx2Gather { get; set; } = true;
+
+    /// <summary>
     /// The minimum chunk size for parallel operations.
     /// </summary>
     /// <remarks>

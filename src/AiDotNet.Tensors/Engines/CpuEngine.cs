@@ -519,7 +519,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1)
+    public unsafe Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1)
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
@@ -538,6 +538,40 @@ public class CpuEngine : ITensorLevelEngine
                 $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
 
         var result = VectorAllocator.Rent<T>(count);
+
+        // Float fast path: AVX2 VGATHERDPS (8 floats per instruction)
+        if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
+        {
+            var srcArr = source._cachedArray;
+            var dstArr = result._cachedArray;
+            if (srcArr is float[] srcF && dstArr is float[] dstF)
+            {
+                fixed (float* pSrc = srcF)
+                fixed (float* pDst = dstF)
+                {
+                    SimdKernels.StridedGatherFloat(pSrc, offset, stride, pDst, count);
+                }
+                return result;
+            }
+        }
+
+        // Double fast path: AVX2 VGATHERQPD (4 doubles per instruction)
+        if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
+        {
+            var srcArr = source._cachedArray;
+            var dstArr = result._cachedArray;
+            if (srcArr is double[] srcD && dstArr is double[] dstD)
+            {
+                fixed (double* pSrc = srcD)
+                fixed (double* pDst = dstD)
+                {
+                    SimdKernels.StridedGatherDouble(pSrc, offset, stride, pDst, count);
+                }
+                return result;
+            }
+        }
+
+        // Generic fallback: scalar loop
         for (int i = 0; i < count; i++)
         {
             result[i] = source[offset + i * stride];
@@ -547,19 +581,53 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
+    public unsafe void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
         if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive.");
 
-        int lastIndex = source.Length > 0 ? offset + (source.Length - 1) * stride : -1;
+        int count = source.Length;
+        int lastIndex = count > 0 ? offset + (count - 1) * stride : -1;
         if (lastIndex >= destination.Length)
             throw new ArgumentOutOfRangeException(nameof(source),
                 $"Strided scatter would access index {lastIndex} but destination length is {destination.Length}.");
 
-        for (int i = 0; i < source.Length; i++)
+        // Float fast path: unrolled scatter (no hardware scatter on x86, AVX-512 only)
+        if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd)
+        {
+            var srcArr = source._cachedArray;
+            var dstArr = destination._cachedArray;
+            if (srcArr is float[] srcF && dstArr is float[] dstF)
+            {
+                fixed (float* pSrc = srcF)
+                fixed (float* pDst = dstF)
+                {
+                    SimdKernels.StridedScatterFloat(pSrc, pDst, offset, stride, count);
+                }
+                return;
+            }
+        }
+
+        // Double fast path: unrolled scatter
+        if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd)
+        {
+            var srcArr = source._cachedArray;
+            var dstArr = destination._cachedArray;
+            if (srcArr is double[] srcD && dstArr is double[] dstD)
+            {
+                fixed (double* pSrc = srcD)
+                fixed (double* pDst = dstD)
+                {
+                    SimdKernels.StridedScatterDouble(pSrc, pDst, offset, stride, count);
+                }
+                return;
+            }
+        }
+
+        // Generic fallback
+        for (int i = 0; i < count; i++)
         {
             destination[offset + i * stride] = source[i];
         }
