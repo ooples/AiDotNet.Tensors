@@ -2556,6 +2556,44 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // No sync - element-wise ops can be chained asynchronously
         }
 
+        public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var bufferSrc = ((DirectOpenClGpuBuffer)src).Buffer;
+            var bufferDst = ((DirectOpenClGpuBuffer)dst).Buffer;
+
+            var kernel = _kernelCache["strided_gather"];
+            kernel.SetArg(0, bufferSrc.Handle);
+            kernel.SetArg(1, bufferDst.Handle);
+            kernel.SetArg(2, offset);
+            kernel.SetArg(3, stride);
+            kernel.SetArg(4, count);
+
+            int localSize = CalculateOptimalWorkGroupSize1D(count);
+            kernel.Execute1D(count, localSize);
+        }
+
+        public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+
+            var bufferSrc = ((DirectOpenClGpuBuffer)src).Buffer;
+            var bufferDst = ((DirectOpenClGpuBuffer)dst).Buffer;
+
+            var kernel = _kernelCache["strided_scatter"];
+            kernel.SetArg(0, bufferSrc.Handle);
+            kernel.SetArg(1, bufferDst.Handle);
+            kernel.SetArg(2, offset);
+            kernel.SetArg(3, stride);
+            kernel.SetArg(4, count);
+
+            int localSize = CalculateOptimalWorkGroupSize1D(count);
+            kernel.Execute1D(count, localSize);
+        }
+
         public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
         {
             if (_context == null)

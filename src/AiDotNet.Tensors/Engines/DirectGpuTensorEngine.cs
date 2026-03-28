@@ -1060,6 +1060,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return result != null ? new Vector<T>(result) : base.Divide(a, b);
     }
 
+    Vector<T> IEngine.StridedGather<T>(Vector<T> source, int offset, int stride, int count)
+    {
+        if (count < 0)
+        {
+            count = offset < source.Length ? (source.Length - offset + stride - 1) / stride : 0;
+        }
+
+        if (count == 0) return new Vector<T>(0);
+
+        if (!TryGetBackend(out var backend))
+            return base.StridedGather(source, offset, stride, count);
+
+        try
+        {
+            var srcData = DirectGpuEngine.ToFloatArray(source.GetDataArray());
+            using var srcBuf = backend.AllocateBuffer(srcData);
+            using var dstBuf = backend.AllocateBuffer(count);
+            backend.StridedGather(srcBuf, dstBuf, offset, stride, count);
+            var resultFloat = backend.DownloadBuffer(dstBuf);
+            return new Vector<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat));
+        }
+        catch
+        {
+            return base.StridedGather(source, offset, stride, count);
+        }
+    }
+
+    void IEngine.StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
+    {
+        if (!TryGetBackend(out var backend))
+        {
+            base.StridedScatter(destination, source, offset, stride);
+            return;
+        }
+
+        try
+        {
+            var srcData = DirectGpuEngine.ToFloatArray(source.GetDataArray());
+            var dstData = DirectGpuEngine.ToFloatArray(destination.GetDataArray());
+            using var srcBuf = backend.AllocateBuffer(srcData);
+            using var dstBuf = backend.AllocateBuffer(dstData);
+            backend.StridedScatter(srcBuf, dstBuf, offset, stride, source.Length);
+            var resultFloat = backend.DownloadBuffer(dstBuf);
+            var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
+            Array.Copy(resultT, destination.GetDataArray(), resultT.Length);
+        }
+        catch
+        {
+            base.StridedScatter(destination, source, offset, stride);
+        }
+    }
+
     Vector<T> IEngine.Divide<T>(Vector<T> vector, T scalar)
     {
         var scalarValue = ToFloatScalar(scalar);

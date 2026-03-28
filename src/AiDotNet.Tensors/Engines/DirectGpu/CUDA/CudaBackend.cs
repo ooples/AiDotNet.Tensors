@@ -1102,6 +1102,48 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchScaleKernel(A, B, scalar, size);
     }
 
+    public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!_kernelCache.TryGetValue("strided_gather", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: strided_gather. Register the kernel or use CPU fallback.");
+
+        using var _ = PushContext();
+        uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr srcPtr = src.Handle;
+        IntPtr dstPtr = dst.Handle;
+        int off = offset;
+        int str = stride;
+        int cnt = count;
+        void** args = stackalloc void*[5];
+        args[0] = &srcPtr;
+        args[1] = &dstPtr;
+        args[2] = &off;
+        args[3] = &str;
+        args[4] = &cnt;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (!_kernelCache.TryGetValue("strided_scatter", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: strided_scatter. Register the kernel or use CPU fallback.");
+
+        using var _ = PushContext();
+        uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr srcPtr = src.Handle;
+        IntPtr dstPtr = dst.Handle;
+        int off = offset;
+        int str = stride;
+        int cnt = count;
+        void** args = stackalloc void*[5];
+        args[0] = &srcPtr;
+        args[1] = &dstPtr;
+        args[2] = &off;
+        args[3] = &str;
+        args[4] = &cnt;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
     {
         LaunchUnaryWithScalarKernel("power_scalar", A, B, exponent, size);

@@ -561,6 +561,26 @@ public sealed unsafe partial class VulkanBackend
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => CpuBinary(A, B, C, size, MathF.Max);
 
+    public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        EnsureInitialized();
+        var srcData = DownloadBuffer(src);
+        var dstData = new float[count];
+        for (int i = 0; i < count; i++)
+            dstData[i] = srcData[offset + i * stride];
+        UploadToBuffer(dstData, dst);
+    }
+
+    public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        EnsureInitialized();
+        var srcData = DownloadBuffer(src);
+        var dstData = DownloadBuffer(dst);
+        for (int i = 0; i < count; i++)
+            dstData[offset + i * stride] = srcData[i];
+        UploadToBuffer(dstData, dst);
+    }
+
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
         => CpuUnary(A, B, size, v => MathF.Pow(v, exponent));
 
