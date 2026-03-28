@@ -1295,6 +1295,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result.Data.Span.CopyTo(dest.Data.Span);
     }
 
+    void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
+            static (backend, bufA, bufB, size) => backend.Subtract(bufA, bufB, bufA, size)))
+            return;
+        base.TensorSubtractInPlace(a, b);
+    }
+
+    void IEngine.TensorSubtractInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
+    {
+        var result = ((IEngine)this).TensorSubtract(a, b);
+        result.Data.Span.CopyTo(dest.Data.Span);
+    }
+
+    void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
+    {
+        var scalarF = ToFloatScalar(scalar);
+        if (TryRunUnaryInPlace(a,
+            (backend, buf, size) => backend.Scale(buf, buf, scalarF, size)))
+            return;
+        base.TensorMultiplyScalarInPlace(a, scalar);
+    }
+
+    void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> dest, Tensor<T> a, T scalar)
+    {
+        var scalarF = ToFloatScalar(scalar);
+        var result = TryRunScalar(a.GetDataArray(), scalar,
+            static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
+        if (result != null)
+        {
+            Array.Copy(result, dest.GetDataArray(), result.Length);
+            return;
+        }
+        base.TensorMultiplyScalarInto(dest, a, scalar);
+    }
+
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         // If shapes match, use GPU element-wise add in-place

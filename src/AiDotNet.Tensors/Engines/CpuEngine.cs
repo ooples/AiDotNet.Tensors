@@ -519,6 +519,53 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive.");
+
+        if (count < 0)
+        {
+            count = offset < source.Length ? (source.Length - offset + stride - 1) / stride : 0;
+        }
+
+        if (count == 0) return new Vector<T>(0);
+
+        int lastIndex = offset + (count - 1) * stride;
+        if (lastIndex >= source.Length)
+            throw new ArgumentOutOfRangeException(nameof(count),
+                $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
+
+        var result = VectorAllocator.Rent<T>(count);
+        for (int i = 0; i < count; i++)
+        {
+            result[i] = source[offset + i * stride];
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive.");
+
+        int lastIndex = source.Length > 0 ? offset + (source.Length - 1) * stride : -1;
+        if (lastIndex >= destination.Length)
+            throw new ArgumentOutOfRangeException(nameof(source),
+                $"Strided scatter would access index {lastIndex} but destination length is {destination.Length}.");
+
+        for (int i = 0; i < source.Length; i++)
+        {
+            destination[offset + i * stride] = source[i];
+        }
+    }
+
+    /// <inheritdoc/>
     public T Product<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
@@ -2912,6 +2959,102 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
+    /// </summary>
+    public unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesMatch(a._shape, b._shape))
+        {
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+        }
+
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        int length = a.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+
+            // No oneDNN subtract primitive — go straight to JIT/SIMD
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
+                return;
+            }
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
+            }
+            return;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
+    /// </summary>
+    public void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place scalar multiply requires contiguous tensor.");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var span = a.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++)
+        {
+            span[i] = numOps.Multiply(span[i], scalar);
+        }
+    }
+
+    /// <summary>
+    /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
+    /// </summary>
+    public void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var src = a.AsSpan();
+        var dst = destination.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++)
+        {
+            dst[i] = numOps.Multiply(src[i], scalar);
+        }
     }
 
     /// <inheritdoc/>

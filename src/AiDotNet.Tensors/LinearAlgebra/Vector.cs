@@ -1572,6 +1572,38 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a vector that wraps an existing array without copying.
+    /// The vector shares the same memory as the array — mutations to either are visible to both.
+    /// </summary>
+    /// <param name="array">The array to wrap. Must not be null.</param>
+    /// <returns>A new Vector{T} backed by the same memory as the input array.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> Unlike <see cref="FromArray"/> which copies the data, Wrap shares
+    /// the same memory. Changes to the array will be reflected in the vector and vice versa.
+    /// Use this for zero-copy integration when you already have data in an array.</para>
+    /// </remarks>
+    public static Vector<T> Wrap(T[] array)
+    {
+        if (array == null)
+            throw new ArgumentNullException(nameof(array));
+        return FromMemory(new Memory<T>(array));
+    }
+
+    /// <summary>
+    /// Creates a vector that wraps a slice of an existing array without copying.
+    /// </summary>
+    /// <param name="array">The array to wrap.</param>
+    /// <param name="offset">The starting index within the array.</param>
+    /// <param name="length">The number of elements to include.</param>
+    /// <returns>A Vector{T} backed by the specified region of the array.</returns>
+    public static Vector<T> Wrap(T[] array, int offset, int length)
+    {
+        if (array == null)
+            throw new ArgumentNullException(nameof(array));
+        return FromMemory(new Memory<T>(array, offset, length));
+    }
+
+    /// <summary>
     /// Creates a new vector from any collection of values.
     /// </summary>
     /// <param name="enumerable">The collection of values to create the vector from.</param>
