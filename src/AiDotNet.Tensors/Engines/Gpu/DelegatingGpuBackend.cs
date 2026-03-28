@@ -370,6 +370,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual float Max(IGpuBuffer A, int size) => Inner.Max(A, size);
 
     /// <inheritdoc/>
+    public virtual float Min(IGpuBuffer A, int size) => Inner.Min(A, size);
+
+    /// <inheritdoc/>
     public virtual void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
         => Inner.SumAxis(A, B, outerSize, reduceSize);
 

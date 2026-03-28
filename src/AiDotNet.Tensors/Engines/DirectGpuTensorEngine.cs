@@ -1924,6 +1924,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return FromFloatScalar<T>(max);
     }
 
+    T IEngine.TensorMinValue<T>(Tensor<T> tensor)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.TensorMinValue(tensor);
+
+        using var bufferA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+        backend.Synchronize();
+        float min = backend.Min(bufferA.Buffer, tensor.Length);
+        return FromFloatScalar<T>(min);
+    }
+
     #region Fused Operations
 
     /// <summary>

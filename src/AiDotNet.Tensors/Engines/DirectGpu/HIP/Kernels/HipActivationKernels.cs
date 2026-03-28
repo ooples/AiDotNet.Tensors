@@ -351,6 +351,30 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* inpu
         output[blockIdx.x] = scratch[0];
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* input, float* output, int size)
+{
+    extern __shared__ float scratch[];
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (idx < (unsigned int)size) ? input[idx] : INFINITY;
+    scratch[tid] = val;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            float other = scratch[tid + s];
+            if (other < scratch[tid])
+                scratch[tid] = other;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        output[blockIdx.x] = scratch[0];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* input, float* output, int outerSize, int reduceSize)
 {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -930,7 +954,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "relu_backward", "sigmoid_backward", "tanh_backward", "gelu_backward",
             "mish_backward", "softplus_backward", "hardswish_backward",
             "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
-            "reduce_sum", "reduce_max", "sum_axis", "bias_add",
+            "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary
             "relu_vec4", "sigmoid_vec4", "tanh_activation_vec4", "gelu_vec4", "swish_vec4",

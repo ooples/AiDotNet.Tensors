@@ -632,8 +632,9 @@ public sealed partial class WebGpuBackend
 
     #region Reduction Operations
 
-    public float Sum(IGpuBuffer A, int size) => SumAsync(A, size).GetAwaiter().GetResult();
-    public float Max(IGpuBuffer A, int size) => MaxAsync(A, size).GetAwaiter().GetResult();
+    public float Sum(IGpuBuffer A, int size) => SumAsync(A, size).ConfigureAwait(false).GetAwaiter().GetResult();
+    public float Max(IGpuBuffer A, int size) => MaxAsync(A, size).ConfigureAwait(false).GetAwaiter().GetResult();
+    public float Min(IGpuBuffer A, int size) => MinAsync(A, size).ConfigureAwait(false).GetAwaiter().GetResult();
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {

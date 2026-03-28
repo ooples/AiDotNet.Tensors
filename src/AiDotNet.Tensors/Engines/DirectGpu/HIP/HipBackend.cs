@@ -2825,6 +2825,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         return ReduceToScalar(krnl, A, size);
     }
 
+    public float Min(IGpuBuffer A, int size)
+    {
+        if (!_kernelCache.TryGetValue("reduce_min", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: reduce_min");
+
+        return ReduceToScalar(krnl, A, size);
+    }
+
     private unsafe float ReduceToScalar(IntPtr kernel, IGpuBuffer input, int size)
     {
         const int blockSize = 256;

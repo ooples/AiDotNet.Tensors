@@ -790,6 +790,7 @@ public sealed unsafe partial class VulkanBackend
     public float Sum(IGpuBuffer A, int size) => CpuReduce(A, size, 0f, (acc, v) => acc + v);
 
     public float Max(IGpuBuffer A, int size) => CpuReduce(A, size, float.MinValue, MathF.Max);
+    public float Min(IGpuBuffer A, int size) => CpuReduce(A, size, float.MaxValue, MathF.Min);
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
