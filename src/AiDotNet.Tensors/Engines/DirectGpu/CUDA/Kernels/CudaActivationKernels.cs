@@ -591,6 +591,47 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     }
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    extern __shared__ float scratch[];
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (idx < (unsigned int)size) ? __ldg(&input[idx]) : INFINITY;
+
+    // Warp-level reduction first (no __syncthreads needed within a warp)
+    unsigned int mask = 0xFFFFFFFF;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        float other = __shfl_down_sync(mask, val, offset);
+        val = fminf(val, other);
+    }
+
+    // Write warp results to shared memory
+    unsigned int lane = tid & 31;
+    unsigned int warpId = tid >> 5;
+    if (lane == 0)
+        scratch[warpId] = val;
+    __syncthreads();
+
+    // Final reduction across warps (only first warp)
+    unsigned int numWarps = (blockDim.x + 31) >> 5;
+    if (tid < numWarps)
+    {
+        val = scratch[tid];
+        unsigned int warp_mask = (numWarps >= 32) ? 0xFFFFFFFF : ((1u << numWarps) - 1);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_down_sync(warp_mask, val, offset);
+            val = fminf(val, other);
+        }
+
+        if (tid == 0)
+            output[blockIdx.x] = val;
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* __restrict__ input, float* __restrict__ output, int outerSize, int reduceSize)
 {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1065,6 +1106,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 // Reductions
                 "reduce_sum",
                 "reduce_max",
+                "reduce_min",
                 "sum_axis",
                 "bias_add",
                 "bias_add_out",
