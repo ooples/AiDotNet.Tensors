@@ -56,6 +56,40 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Internal constructor from Memory backing store.
+    /// </summary>
+    private Matrix(Memory<T> memory, int rows, int cols) : base(memory, rows, cols)
+    {
+    }
+
+    /// <summary>
+    /// Creates a new matrix from an existing Memory&lt;T&gt; backing store.
+    /// </summary>
+    /// <param name="memory">The memory to use as the matrix's backing store.</param>
+    /// <param name="rows">Number of rows in the matrix.</param>
+    /// <param name="cols">Number of columns in the matrix.</param>
+    /// <returns>A new matrix using the provided memory.</returns>
+    public static Matrix<T> FromMemory(Memory<T> memory, int rows, int cols)
+    {
+        return new Matrix<T>(memory, rows, cols);
+    }
+
+    /// <summary>
+    /// Creates a matrix from pooled memory. The pooled array is tracked for return to the pool.
+    /// </summary>
+    /// <param name="memory">The sliced memory (exact size) to use as backing store.</param>
+    /// <param name="rows">Number of rows in the matrix.</param>
+    /// <param name="cols">Number of columns in the matrix.</param>
+    /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
+    /// <returns>A matrix backed by pooled memory.</returns>
+    internal static Matrix<T> FromPooledMemory(Memory<T> memory, int rows, int cols, T[] pooledArray)
+    {
+        var matrix = new Matrix<T>(memory, rows, cols);
+        matrix.SetPooledArray(pooledArray);
+        return matrix;
+    }
+
+    /// <summary>
     /// Creates a new instance of the matrix with the specified dimensions.
     /// </summary>
     /// <param name="rows">The number of rows.</param>
@@ -64,7 +98,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     protected override MatrixBase<T> CreateInstance(int rows, int cols)
     {
         // Skip zero-init since callers always overwrite all elements (Add, Subtract, Multiply, Transpose, etc.)
-        return new Matrix<T>(rows, cols, skipZeroInit: true);
+        return MatrixAllocator.RentUninitialized<T>(rows, cols);
     }
 
     /// <summary>

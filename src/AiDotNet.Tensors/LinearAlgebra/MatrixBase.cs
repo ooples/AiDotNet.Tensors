@@ -7,6 +7,8 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using MA = AiDotNet.Tensors.Helpers.MatrixAllocator;
+using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -30,6 +32,34 @@ public abstract class MatrixBase<T>
     protected readonly Memory<T> _memory;
     internal readonly T[]? _cachedArray;
     private long _version;
+
+    /// <summary>
+    /// If this matrix was created from a pooled array, holds a reference to it for return.
+    /// Null for non-pooled matrices.
+    /// </summary>
+    private T[]? _pooledArray;
+
+    /// <summary>
+    /// Gets the pooled array backing this matrix, or null if not pooled.
+    /// </summary>
+    internal T[]? PooledArray => _pooledArray;
+
+    /// <summary>
+    /// Detaches the pooled array reference so it can be safely returned to the pool.
+    /// After calling this, the matrix still works but the array won't be returned again.
+    /// </summary>
+    internal void DetachPooledArray()
+    {
+        _pooledArray = null;
+    }
+
+    /// <summary>
+    /// Sets the pooled array reference for tracking. Used by allocator factories.
+    /// </summary>
+    internal void SetPooledArray(T[] pooledArray)
+    {
+        _pooledArray = pooledArray;
+    }
 
 
     /// <summary>
@@ -379,7 +409,7 @@ public abstract class MatrixBase<T>
         if (rowCount < 1 || startRow + rowCount > _rows)
             throw new ArgumentOutOfRangeException(nameof(rowCount));
 
-        MatrixBase<T> result = new Matrix<T>(rowCount, _cols);
+        MatrixBase<T> result = MA.RentUninitialized<T>(rowCount, _cols);
 
         // Use vectorized Copy operation to copy entire rows at once
         for (int i = 0; i < rowCount; i++)
@@ -470,7 +500,7 @@ public abstract class MatrixBase<T>
     public virtual Vector<T> GetRow(int row)
     {
         ValidateIndices(row, 0);
-        var result = new Vector<T>(_cols);
+        var result = VA.RentUninitialized<T>(_cols);
         var sourceRow = _memory.Span.Slice(row * _cols, _cols);
         _numOps.Copy(sourceRow, result.AsWritableSpan());
         return result;
@@ -490,7 +520,7 @@ public abstract class MatrixBase<T>
     public virtual Vector<T> GetColumn(int col)
     {
         ValidateIndices(0, col);
-        var result = new Vector<T>(_rows);
+        var result = VA.RentUninitialized<T>(_rows);
         var destSpan = result.AsWritableSpan();
         var srcSpan = _memory.Span;
         for (int i = 0; i < _rows; i++)
@@ -512,7 +542,7 @@ public abstract class MatrixBase<T>
     public virtual Vector<T> Diagonal()
     {
         int minDimension = Math.Min(Rows, Columns);
-        var diagonal = new Vector<T>(minDimension);
+        var diagonal = VA.RentUninitialized<T>(minDimension);
 
         for (int i = 0; i < minDimension; i++)
         {
@@ -544,7 +574,7 @@ public abstract class MatrixBase<T>
             throw new ArgumentException("Invalid submatrix dimensions");
         }
 
-        var subMatrix = new Matrix<T>(numRows, numCols);
+        var subMatrix = MA.RentUninitialized<T>(numRows, numCols);
 
         for (int i = 0; i < numRows; i++)
         {
@@ -590,7 +620,7 @@ public abstract class MatrixBase<T>
         int numRows = endRow - startRow;
         int numCols = columnIndices.Count;
 
-        var subMatrix = new Matrix<T>(numRows, numCols);
+        var subMatrix = MA.RentUninitialized<T>(numRows, numCols);
 
         for (int i = 0; i < numRows; i++)
         {
@@ -882,13 +912,10 @@ public abstract class MatrixBase<T>
             return result;
         }
 
-        // Use cache-oblivious recursive algorithm
+        // Use cache-oblivious recursive algorithm — write directly into result's backing array
         MatrixMultiplyHelper.TraceMatmul("RECURSIVE", M, N, K);
-        var resultData = new T[M * N];
+        var resultData = result.GetDataArray();
         MultiplyRecursive(_memory.ToArray(), other._memory.ToArray(), resultData, 0, 0, 0, 0, 0, 0, M, K, N, K, N, N);
-
-        // Copy result back to the result matrix
-        resultData.AsSpan().CopyTo(result.AsWritableSpan());
 
         return result;
     }
@@ -1025,7 +1052,7 @@ public abstract class MatrixBase<T>
         if (_cols != vector.Length)
             throw new ArgumentException("Number of columns in the matrix must equal the length of the vector.");
 
-        var result = new Vector<T>(_rows);
+        var result = VA.RentUninitialized<T>(_rows);
         var vecSpan = vector.AsSpan();
 
         // Use vectorized dot product for each row (SIMD accelerated)

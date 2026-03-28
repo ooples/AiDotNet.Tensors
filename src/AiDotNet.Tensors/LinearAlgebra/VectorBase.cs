@@ -42,6 +42,34 @@ public abstract class VectorBase<T>
     protected readonly IMemoryOwner<T>? _memoryOwner;
 
     /// <summary>
+    /// If this vector was created from a pooled array, holds a reference to it for return.
+    /// Null for non-pooled vectors.
+    /// </summary>
+    private T[]? _pooledArray;
+
+    /// <summary>
+    /// Gets the pooled array backing this vector, or null if not pooled.
+    /// </summary>
+    internal T[]? PooledArray => _pooledArray;
+
+    /// <summary>
+    /// Detaches the pooled array reference so it can be safely returned to the pool.
+    /// After calling this, the vector still works but the array won't be returned again.
+    /// </summary>
+    internal void DetachPooledArray()
+    {
+        _pooledArray = null;
+    }
+
+    /// <summary>
+    /// Sets the pooled array reference for tracking. Used by allocator factories.
+    /// </summary>
+    internal void SetPooledArray(T[] pooledArray)
+    {
+        _pooledArray = pooledArray;
+    }
+
+    /// <summary>
     /// Provides operations for numeric types (addition, subtraction, etc.).
     /// </summary>
     /// <remarks>

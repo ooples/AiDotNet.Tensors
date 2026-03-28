@@ -7,6 +7,7 @@ using System.Runtime.Intrinsics.X86;
 using System.Runtime.Intrinsics.Arm;
 #endif
 using AiDotNet.Tensors.Helpers;
+using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -189,6 +190,19 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public static Vector<T> FromMemory(Memory<T> memory)
     {
         return new Vector<T>(memory, false);
+    }
+
+    /// <summary>
+    /// Creates a vector from pooled memory. The pooled array is tracked for return to the pool.
+    /// </summary>
+    /// <param name="memory">The sliced memory (exact size) to use as backing store.</param>
+    /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
+    /// <returns>A vector backed by pooled memory.</returns>
+    internal static Vector<T> FromPooledMemory(Memory<T> memory, T[] pooledArray)
+    {
+        var vector = new Vector<T>(memory, false);
+        vector.SetPooledArray(pooledArray);
+        return vector;
     }
 
     #region Sealed SIMD-Inlined Overrides
@@ -427,10 +441,10 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length for element-wise division.", nameof(other));
         }
 
-        var resultArray = new T[this.Length];
-        _numOps.Divide(_memory.Span, other._memory.Span, new Span<T>(resultArray));
+        var result = VA.RentUninitialized<T>(this.Length);
+        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpan());
 
-        return new Vector<T>(resultArray);
+        return result;
     }
 
     /// <summary>
@@ -707,9 +721,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Divide(T scalar)
     {
-        var resultArray = new T[this.Length];
-        _numOps.DivideScalar(_memory.Span, scalar, new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(this.Length);
+        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
@@ -724,7 +738,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     protected override VectorBase<T> CreateInstance(int size)
     {
         // Skip zero-init since callers always overwrite all elements (Add, Subtract, Multiply, etc.)
-        return new Vector<T>(size, skipZeroInit: true);
+        return VA.RentUninitialized<T>(size);
     }
 
     /// <summary>
@@ -807,10 +821,10 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (this.Length != other.Length)
             throw new ArgumentException("Vectors must have the same length for element-wise multiplication.", nameof(other));
 
-        var resultArray = new T[this.Length];
-        _numOps.Multiply(_memory.Span, other._memory.Span, new Span<T>(resultArray));
+        var result = VA.RentUninitialized<T>(this.Length);
+        _numOps.Multiply(_memory.Span, other._memory.Span, result.AsWritableSpan());
 
-        return new Vector<T>(resultArray);
+        return result;
     }
 
     /// <summary>
@@ -1361,9 +1375,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
-        var resultArray = new T[Length];
-        _numOps.Add(_memory.Span, other.AsSpan(), new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(Length);
+        _numOps.Add(_memory.Span, other.AsSpan(), result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
@@ -1381,9 +1395,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
-        var resultArray = new T[Length];
-        _numOps.Subtract(_memory.Span, other.AsSpan(), new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(Length);
+        _numOps.Subtract(_memory.Span, other.AsSpan(), result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
@@ -1398,9 +1412,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Multiply(T scalar)
     {
-        var resultArray = new T[Length];
-        _numOps.MultiplyScalar(_memory.Span, scalar, new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(Length);
+        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
@@ -1436,9 +1450,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (vector == null)
             throw new ArgumentNullException(nameof(vector));
 
-        var resultArray = new T[vector.Length];
-        _numOps.AddScalar(vector._memory.Span, scalar, new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(vector.Length);
+        _numOps.AddScalar(vector._memory.Span, scalar, result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
@@ -1459,9 +1473,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         if (vector == null)
             throw new ArgumentNullException(nameof(vector));
 
-        var resultArray = new T[vector.Length];
-        _numOps.SubtractScalar(vector._memory.Span, scalar, new Span<T>(resultArray));
-        return new Vector<T>(resultArray);
+        var result = VA.RentUninitialized<T>(vector.Length);
+        _numOps.SubtractScalar(vector._memory.Span, scalar, result.AsWritableSpan());
+        return result;
     }
 
     /// <summary>
