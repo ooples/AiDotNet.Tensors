@@ -519,6 +519,127 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public unsafe Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive.");
+
+        if (count < 0)
+        {
+            count = offset < source.Length ? (source.Length - offset + stride - 1) / stride : 0;
+        }
+
+        if (count == 0) return new Vector<T>(0);
+
+        int lastIndex = offset + (count - 1) * stride;
+        if (lastIndex >= source.Length)
+            throw new ArgumentOutOfRangeException(nameof(count),
+                $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
+
+        var result = VectorAllocator.Rent<T>(count);
+
+        // Float fast path: AVX2 VGATHERDPS (8 floats per instruction)
+        // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
+        if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
+        {
+            if (source._cachedArray is float[] srcF && result._cachedArray is float[] dstF)
+            {
+                fixed (float* pSrc = srcF)
+                fixed (float* pDst = dstF)
+                    SimdKernels.StridedGatherFloat(pSrc, offset, stride, pDst, count);
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    result[i] = source[offset + i * stride];
+            }
+            return result;
+        }
+
+        // Double fast path: AVX2 VGATHERQPD (4 doubles per instruction)
+        if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
+        {
+            if (source._cachedArray is double[] srcD && result._cachedArray is double[] dstD)
+            {
+                fixed (double* pSrc = srcD)
+                fixed (double* pDst = dstD)
+                    SimdKernels.StridedGatherDouble(pSrc, offset, stride, pDst, count);
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    result[i] = source[offset + i * stride];
+            }
+            return result;
+        }
+
+        // Generic fallback: scalar loop
+        for (int i = 0; i < count; i++)
+        {
+            result[i] = source[offset + i * stride];
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public unsafe void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative.");
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive.");
+
+        int count = source.Length;
+        int lastIndex = count > 0 ? offset + (count - 1) * stride : -1;
+        if (lastIndex >= destination.Length)
+            throw new ArgumentOutOfRangeException(nameof(source),
+                $"Strided scatter would access index {lastIndex} but destination length is {destination.Length}.");
+
+        // Float fast path: unrolled scatter (no hardware scatter on x86, AVX-512 only)
+        // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
+        if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd)
+        {
+            if (source._cachedArray is float[] srcF && destination._cachedArray is float[] dstF)
+            {
+                fixed (float* pSrc = srcF)
+                fixed (float* pDst = dstF)
+                    SimdKernels.StridedScatterFloat(pSrc, pDst, offset, stride, count);
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    destination[offset + i * stride] = source[i];
+            }
+            return;
+        }
+
+        // Double fast path: unrolled scatter
+        if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd)
+        {
+            if (source._cachedArray is double[] srcD && destination._cachedArray is double[] dstD)
+            {
+                fixed (double* pSrc = srcD)
+                fixed (double* pDst = dstD)
+                    SimdKernels.StridedScatterDouble(pSrc, pDst, offset, stride, count);
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    destination[offset + i * stride] = source[i];
+            }
+            return;
+        }
+
+        // Generic fallback
+        for (int i = 0; i < count; i++)
+        {
+            destination[offset + i * stride] = source[i];
+        }
+    }
+
+    /// <inheritdoc/>
     public T Product<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
@@ -2912,6 +3033,221 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
+    /// </summary>
+    public unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (b == null) throw new ArgumentNullException(nameof(b));
+        if (!ShapesMatch(a._shape, b._shape))
+        {
+            throw new ArgumentException(
+                $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+        }
+
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
+        if (!b.IsContiguous) b = b.Contiguous();
+
+        int length = a.Length;
+
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+
+            // No oneDNN subtract primitive — go straight to JIT/SIMD
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+            {
+                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
+                return;
+            }
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                    {
+                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
+                    }
+                });
+            }
+            else
+            {
+                SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
+            }
+            return;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
+    /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
+    /// </summary>
+    public unsafe void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
+    {
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!a.IsContiguous) throw new InvalidOperationException("In-place scalar multiply requires contiguous tensor.");
+
+        int length = a.Length;
+
+        // Float fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(float))
+        {
+            float scalarF = (float)(object)scalar!;
+            var aMem = AsFloatMemory(a.Data);
+            using var pinA = aMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarF, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarF, pA, length);
+            }
+            return;
+        }
+
+        // Double fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(double))
+        {
+            double scalarD = (double)(object)scalar!;
+            var aMem = AsDoubleMemory(a.Data);
+            using var pinA = aMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarD, pA + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarD, pA, length);
+            }
+            return;
+        }
+
+        // Generic fallback: vectorized numOps
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.MultiplyScalar(a.AsSpan(), scalar, a.AsWritableSpan());
+    }
+
+    /// <summary>
+    /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
+    /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
+    /// </summary>
+    public unsafe void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
+    {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (a == null) throw new ArgumentNullException(nameof(a));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (destination.Length < a.Length)
+            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
+
+        int length = a.Length;
+
+        // Float fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(float))
+        {
+            float scalarF = (float)(object)scalar!;
+            var aMem = AsFloatMemory(a.Data);
+            var dMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinD = dMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pD = (float*)pinD.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarF, pD + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarF, pD, length);
+            }
+            return;
+        }
+
+        // Double fast path: SIMD MultiplyScalar with parallel chunking
+        if (typeof(T) == typeof(double))
+        {
+            double scalarD = (double)(object)scalar!;
+            var aMem = AsDoubleMemory(a.Data);
+            var dMem = AsDoubleMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinD = dMem.Pin();
+            double* pA = (double*)pinA.Pointer;
+            double* pD = (double*)pinD.Pointer;
+
+            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (numChunks >= 2)
+            {
+                int chunkSize = (length + numChunks - 1) / numChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, numChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.MultiplyScalarUnsafe(pA + start, scalarD, pD + start, count);
+                });
+            }
+            else
+            {
+                SimdKernels.MultiplyScalarUnsafe(pA, scalarD, pD, length);
+            }
+            return;
+        }
+
+        // Generic fallback: vectorized numOps
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.MultiplyScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>

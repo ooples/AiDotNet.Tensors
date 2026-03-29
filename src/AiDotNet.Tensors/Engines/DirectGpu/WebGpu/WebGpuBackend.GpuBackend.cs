@@ -229,6 +229,12 @@ public sealed partial class WebGpuBackend
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => MaximumAsync(A, B, C, size).GetAwaiter().GetResult();
     public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => ScaleAsync(A, B, scalar, size).GetAwaiter().GetResult();
 
+    public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+        => StridedGatherAsync(src, dst, offset, stride, count).GetAwaiter().GetResult();
+
+    public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+        => StridedScatterAsync(src, dst, offset, stride, count).GetAwaiter().GetResult();
+
     public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
     {
         if (size <= 0)

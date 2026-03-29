@@ -157,6 +157,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size) => Inner.Scale(A, B, scalar, size);
 
     /// <inheritdoc/>
+    public virtual void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) => Inner.StridedGather(src, dst, offset, stride, count);
+
+    /// <inheritdoc/>
+    public virtual void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count) => Inner.StridedScatter(src, dst, offset, stride, count);
+
+    /// <inheritdoc/>
     public virtual void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size) => Inner.Power(A, B, exponent, size);
 
     /// <inheritdoc/>

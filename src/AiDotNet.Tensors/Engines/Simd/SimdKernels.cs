@@ -4120,6 +4120,165 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>
+        /// AVX2 hardware gather for float: collects elements at stride intervals.
+        /// Uses VGATHERDPS to load 8 floats per instruction with computed index vectors.
+        /// Falls back to scalar for tail elements and non-AVX2 hardware.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void StridedGatherFloat(float* source, int offset, int stride, float* result, int count)
+        {
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && count >= 8)
+            {
+                int i = 0;
+
+                // Build index vector: [0*stride, 1*stride, 2*stride, ..., 7*stride]
+                // Each element is the byte offset from the base pointer
+                var indices = Vector256.Create(
+                    0, stride, stride * 2, stride * 3,
+                    stride * 4, stride * 5, stride * 6, stride * 7);
+
+                int simdCount = count & ~7; // Round down to multiple of 8
+                for (; i < simdCount; i += 8)
+                {
+                    // VGATHERDPS: gather 8 floats from source + offset using index vector
+                    // Scale=4 because indices are element offsets, each float is 4 bytes
+                    var gathered = Avx2.GatherVector256(source + offset + i * stride, indices, 4);
+                    Avx.Store(result + i, gathered);
+                }
+
+                // Scalar tail
+                for (; i < count; i++)
+                {
+                    result[i] = source[offset + i * stride];
+                }
+                return;
+            }
+#endif
+            // Scalar fallback
+            for (int i = 0; i < count; i++)
+            {
+                result[i] = source[offset + i * stride];
+            }
+        }
+
+        /// <summary>
+        /// AVX2 hardware gather for double: collects elements at stride intervals.
+        /// Uses VGATHERQPD to load 4 doubles per instruction.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void StridedGatherDouble(double* source, int offset, int stride, double* result, int count)
+        {
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && count >= 4)
+            {
+                int i = 0;
+
+                // Index vector for 4 doubles: [0, stride, 2*stride, 3*stride]
+                // Scale=8 because each double is 8 bytes
+                var indices = Vector128.Create(0, stride, stride * 2, stride * 3);
+
+                int simdCount = count & ~3;
+                for (; i < simdCount; i += 4)
+                {
+                    var gathered = Avx2.GatherVector256(source + offset + i * stride, indices, 8);
+                    Avx.Store(result + i, gathered);
+                }
+
+                // Scalar tail
+                for (; i < count; i++)
+                {
+                    result[i] = source[offset + i * stride];
+                }
+                return;
+            }
+#endif
+            for (int i = 0; i < count; i++)
+            {
+                result[i] = source[offset + i * stride];
+            }
+        }
+
+        /// <summary>
+        /// Strided scatter for float: writes elements to destination at stride intervals.
+        /// No hardware scatter instruction on x86 (scatter is AVX-512 only), so this uses
+        /// an unrolled scalar loop for best performance.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void StridedScatterFloat(float* source, float* destination, int offset, int stride, int count)
+        {
+            int i = 0;
+            // 4x unrolled for ILP (instruction-level parallelism)
+            int unrolled = count & ~3;
+            for (; i < unrolled; i += 4)
+            {
+                destination[offset + i * stride] = source[i];
+                destination[offset + (i + 1) * stride] = source[i + 1];
+                destination[offset + (i + 2) * stride] = source[i + 2];
+                destination[offset + (i + 3) * stride] = source[i + 3];
+            }
+            for (; i < count; i++)
+            {
+                destination[offset + i * stride] = source[i];
+            }
+        }
+
+        /// <summary>
+        /// Strided scatter for double: writes elements to destination at stride intervals.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void StridedScatterDouble(double* source, double* destination, int offset, int stride, int count)
+        {
+            int i = 0;
+            int unrolled = count & ~3;
+            for (; i < unrolled; i += 4)
+            {
+                destination[offset + i * stride] = source[i];
+                destination[offset + (i + 1) * stride] = source[i + 1];
+                destination[offset + (i + 2) * stride] = source[i + 2];
+                destination[offset + (i + 3) * stride] = source[i + 3];
+            }
+            for (; i < count; i++)
+            {
+                destination[offset + i * stride] = source[i];
+            }
+        }
+
+        /// <summary>Pointer-based MultiplyScalar for float — AVX 8-wide with 4x unroll.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void MultiplyScalarUnsafe(float* a, float scalar, float* result, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                    Avx.Store(result + i + 8, Avx.Multiply(Avx.LoadVector256(a + i + 8), vs));
+                    Avx.Store(result + i + 16, Avx.Multiply(Avx.LoadVector256(a + i + 16), vs));
+                    Avx.Store(result + i + 24, Avx.Multiply(Avx.LoadVector256(a + i + 24), vs));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vs = Vector256.Create(scalar);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    Avx.Store(result + i, Avx.Multiply(Avx.LoadVector256(a + i), vs));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                result[i] = a[i] * scalar;
+            }
+        }
+
         /// <summary>Pointer-based MultiplyScalar for double — zero bounds-checking overhead.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void MultiplyScalarUnsafe(double* a, double scalar, double* result, int length)

@@ -303,6 +303,18 @@ public interface IDirectGpuBackend : IDisposable
     void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size);
 
     /// <summary>
+    /// Strided gather: dst[i] = src[offset + i * stride] for i = 0..count-1.
+    /// Each GPU thread handles one output element.
+    /// </summary>
+    void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count);
+
+    /// <summary>
+    /// Strided scatter: dst[offset + i * stride] = src[i] for i = 0..count-1.
+    /// Each GPU thread handles one source element.
+    /// </summary>
+    void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count);
+
+    /// <summary>
     /// Power with scalar exponent: B = A ^ exponent
     /// </summary>
     void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size);

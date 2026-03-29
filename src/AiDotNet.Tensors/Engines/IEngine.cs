@@ -271,6 +271,27 @@ public interface IEngine
     /// </remarks>
     Vector<T> Negate<T>(Vector<T> vector);
 
+    /// <summary>
+    /// Gathers elements from a vector at regular stride intervals.
+    /// Extracts source[offset], source[offset + stride], source[offset + 2*stride], ...
+    /// </summary>
+    /// <param name="source">The source vector to gather from.</param>
+    /// <param name="offset">The starting index in the source vector.</param>
+    /// <param name="stride">The step between consecutive gathered elements. Must be positive.</param>
+    /// <param name="count">The number of elements to gather. If -1, gathers as many as fit.</param>
+    /// <returns>A new vector containing the gathered elements.</returns>
+    Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1);
+
+    /// <summary>
+    /// Scatters elements from a source vector into a destination vector at regular stride intervals.
+    /// Sets destination[offset + i*stride] = source[i] for i = 0..source.Length-1.
+    /// </summary>
+    /// <param name="destination">The destination vector to scatter into (modified in-place).</param>
+    /// <param name="source">The source vector containing values to scatter.</param>
+    /// <param name="offset">The starting index in the destination vector.</param>
+    /// <param name="stride">The step between consecutive scattered elements. Must be positive.</param>
+    void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride);
+
     #endregion
 
     #region Reduction Operations
@@ -1949,6 +1970,26 @@ public interface IEngine
     /// Multiplies two tensors element-wise into a pre-allocated destination: dest[i] = a[i] * b[i]. Zero allocation.
     /// </summary>
     void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
+    /// </summary>
+    void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Subtracts two tensors into a pre-allocated destination: dest[i] = a[i] - b[i]. Zero allocation.
+    /// </summary>
+    void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
+    /// </summary>
+    void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar);
+
+    /// <summary>
+    /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination: dest[i] = a[i] * scalar. Zero allocation.
+    /// </summary>
+    void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar);
 
     /// <summary>
     /// Adds tensor b to tensor a in-place with broadcasting: a += broadcast(b). Zero allocation.

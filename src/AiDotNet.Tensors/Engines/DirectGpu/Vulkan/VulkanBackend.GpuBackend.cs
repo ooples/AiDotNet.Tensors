@@ -561,6 +561,80 @@ public sealed unsafe partial class VulkanBackend
     public void Max(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         => CpuBinary(A, B, C, size, MathF.Max);
 
+    private const string StridedGatherGlsl = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(push_constant) uniform Params { uint offset; uint stride; uint count; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < count) { dst[idx] = src[offset + idx * stride]; }
+}";
+
+    private const string StridedScatterGlsl = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 1) buffer Dst { float dst[]; };
+layout(push_constant) uniform Params { uint offset; uint stride; uint count; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < count) { dst[offset + idx * stride] = src[idx]; }
+}";
+
+    public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        EnsureInitialized();
+        var pipeline = GetOrCreateGlslPipeline(StridedGatherGlsl, 2, 3 * sizeof(uint));
+        if (pipeline is not null)
+        {
+            var vbSrc = AsVulkan(src);
+            var vbDst = AsVulkan(dst);
+            var threadRes = _device.AcquireThreadResources();
+            lock (_computeLock)
+            {
+                pipeline.UpdateDescriptorSet(vbSrc.Storage, vbDst.Storage);
+                var pushConstants = new uint[] { (uint)offset, (uint)stride, (uint)count };
+                RecordAndExecuteWithPushData(pipeline, count, pushConstants, 3 * sizeof(uint), threadRes);
+            }
+            return;
+        }
+
+        // Fallback: CPU roundtrip if GLSL compiler unavailable
+        var srcData = DownloadBuffer(src);
+        var dstData = new float[count];
+        for (int i = 0; i < count; i++)
+            dstData[i] = srcData[offset + i * stride];
+        UploadToBuffer(dstData, dst);
+    }
+
+    public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        EnsureInitialized();
+        var pipeline = GetOrCreateGlslPipeline(StridedScatterGlsl, 2, 3 * sizeof(uint));
+        if (pipeline is not null)
+        {
+            var vbSrc = AsVulkan(src);
+            var vbDst = AsVulkan(dst);
+            var threadRes = _device.AcquireThreadResources();
+            lock (_computeLock)
+            {
+                pipeline.UpdateDescriptorSet(vbSrc.Storage, vbDst.Storage);
+                var pushConstants = new uint[] { (uint)offset, (uint)stride, (uint)count };
+                RecordAndExecuteWithPushData(pipeline, count, pushConstants, 3 * sizeof(uint), threadRes);
+            }
+            return;
+        }
+
+        // Fallback: CPU roundtrip if GLSL compiler unavailable
+        var srcData = DownloadBuffer(src);
+        var dstData = DownloadBuffer(dst);
+        for (int i = 0; i < count; i++)
+            dstData[offset + i * stride] = srcData[i];
+        UploadToBuffer(dstData, dst);
+    }
+
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
         => CpuUnary(A, B, size, v => MathF.Pow(v, exponent));
 

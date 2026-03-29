@@ -857,6 +857,54 @@ public sealed partial class MetalBackend : IDirectGpuBackend
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
+    public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        ThrowIfDisposed();
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= src.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
+        if (src is not MetalGpuBuffer srcBuffer || dst is not MetalGpuBuffer dstBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "strided_gather");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(srcBuffer, 0);
+        encoder.SetBuffer(dstBuffer, 1);
+        encoder.SetBytes((uint)offset, 2);
+        encoder.SetBytes((uint)stride, 3);
+        encoder.SetBytes((uint)count, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        ThrowIfDisposed();
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
+        if (src is not MetalGpuBuffer srcBuffer || dst is not MetalGpuBuffer dstBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "strided_scatter");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(srcBuffer, 0);
+        encoder.SetBuffer(dstBuffer, 1);
+        encoder.SetBytes((uint)offset, 2);
+        encoder.SetBytes((uint)stride, 3);
+        encoder.SetBytes((uint)count, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     /// <summary>
     /// Power with scalar exponent: B = A ^ exponent
     /// </summary>

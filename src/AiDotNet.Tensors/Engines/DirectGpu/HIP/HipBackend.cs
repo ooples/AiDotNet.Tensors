@@ -1423,6 +1423,48 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             }
     }
 
+    public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= src.Size) throw new ArgumentOutOfRangeException(nameof(count));
+        if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
+        if (!_kernelCache.TryGetValue("strided_gather", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: strided_gather");
+
+        IntPtr srcPtr = src.Handle;
+        IntPtr dstPtr = dst.Handle;
+        int off = offset, str = stride, cnt = count;
+        void** args = stackalloc void*[5];
+        args[0] = &srcPtr; args[1] = &dstPtr; args[2] = &off; args[3] = &str; args[4] = &cnt;
+        uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
+    }
+
+    public unsafe void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
+    {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
+        if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
+        if (!_kernelCache.TryGetValue("strided_scatter", out var krnl))
+            throw new InvalidOperationException("HIP kernel not found: strided_scatter");
+
+        IntPtr srcPtr = src.Handle;
+        IntPtr dstPtr = dst.Handle;
+        int off = offset, str = stride, cnt = count;
+        void** args = stackalloc void*[5];
+        args[0] = &srcPtr; args[1] = &dstPtr; args[2] = &off; args[3] = &str; args[4] = &cnt;
+        uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args);
+        Synchronize();
+    }
+
     public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
     {
         // Power uses same pattern as Scale

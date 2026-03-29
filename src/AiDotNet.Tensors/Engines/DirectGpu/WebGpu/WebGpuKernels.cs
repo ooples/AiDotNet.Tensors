@@ -173,6 +173,44 @@ fn clamp_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Strided memory access operations for wavelet transforms and interleaved data.
+    /// </summary>
+    public const string StridedOpsSource = @"
+@group(0) @binding(0) var<storage, read> SrcBuf: array<f32>;
+@group(0) @binding(1) var<storage, read_write> DstBuf: array<f32>;
+
+struct StridedParams {
+    offset: u32,
+    stride: u32,
+    count: u32,
+    _pad: u32,
+}
+@group(0) @binding(2) var<uniform> sparams: StridedParams;
+
+@compute @workgroup_size(256)
+fn strided_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < sparams.count) {
+        let src_idx = sparams.offset + idx * sparams.stride;
+        if (src_idx < arrayLength(&SrcBuf)) {
+            DstBuf[idx] = SrcBuf[src_idx];
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn strided_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < sparams.count) {
+        let dst_idx = sparams.offset + idx * sparams.stride;
+        if (dst_idx < arrayLength(&DstBuf)) {
+            DstBuf[dst_idx] = SrcBuf[idx];
+        }
+    }
+}
+";
+
+    /// <summary>
     /// Unary math operations.
     /// </summary>
     public const string UnaryMathSource = @"
@@ -7684,7 +7722,8 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                Fp16ConvertSource + LstmCellBackwardSource + GruCellBackwardSource +
                LerpFusedSource + AddScaledSource +
                GatedActivationSource + SoftmaxVariantsSource +
-               ShapeOpsSource + ReductionExtSource;
+               ShapeOpsSource + ReductionExtSource +
+               StridedOpsSource;
     }
 
     // ============================================================================
