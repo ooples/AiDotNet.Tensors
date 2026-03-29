@@ -2066,6 +2066,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -2184,6 +2187,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
     /// Uses parallel SIMD for large float tensors.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -2258,6 +2264,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Adds tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -2697,6 +2706,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -2789,6 +2801,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -2866,6 +2881,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -2944,6 +2962,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -3018,6 +3039,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -3038,6 +3062,9 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -3100,6 +3127,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -3172,6 +3202,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -3307,6 +3340,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -4108,6 +4144,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -6709,6 +6748,9 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -6749,6 +6791,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     private Tensor<T> TensorMatMul2D<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
         int m = a._shape[0];
@@ -6791,6 +6836,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Batched matmul: [..., M, N] @ [N, P] = [..., M, P]
     /// Weights (b) are broadcasted over all batch dimensions of a.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     private Tensor<T> TensorMatMulBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
         int aRank = a.Rank;
@@ -6860,6 +6908,9 @@ public class CpuEngine : ITensorLevelEngine
     /// Full batched matmul: [..., M, N] @ [..., N, P] = [..., M, P]
     /// Batch dimensions must match.
     /// </summary>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     private Tensor<T> TensorMatMulFullBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
         int rank = a.Rank;
@@ -18569,6 +18620,9 @@ public class CpuEngine : ITensorLevelEngine
     #region Fused Operations
 
     /// <inheritdoc/>
+    #if !NETFRAMEWORK
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
     public Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
