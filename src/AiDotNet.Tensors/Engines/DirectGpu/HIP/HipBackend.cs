@@ -1425,6 +1425,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= src.Size) throw new ArgumentOutOfRangeException(nameof(count));
+        if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
         if (!_kernelCache.TryGetValue("strided_gather", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: strided_gather");
 
@@ -1440,6 +1446,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
     public unsafe void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
+        if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count));
+
         if (!_kernelCache.TryGetValue("strided_scatter", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: strided_scatter");
 

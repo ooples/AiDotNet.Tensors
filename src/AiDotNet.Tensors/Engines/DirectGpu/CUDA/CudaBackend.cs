@@ -1104,6 +1104,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        int lastIdx = offset + (count - 1) * stride;
+        if (lastIdx >= src.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Strided gather would access index {lastIdx} but source size is {src.Size}.");
+        if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds destination size ({dst.Size}).");
+
         if (!_kernelCache.TryGetValue("strided_gather", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: strided_gather. Register the kernel or use CPU fallback.");
 
@@ -1125,6 +1132,13 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        int lastIdx = offset + (count - 1) * stride;
+        if (lastIdx >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Strided scatter would access index {lastIdx} but destination size is {dst.Size}.");
+        if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds source size ({src.Size}).");
+
         if (!_kernelCache.TryGetValue("strided_scatter", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: strided_scatter. Register the kernel or use CPU fallback.");
 

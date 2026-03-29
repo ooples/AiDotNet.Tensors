@@ -540,35 +540,38 @@ public class CpuEngine : ITensorLevelEngine
         var result = VectorAllocator.Rent<T>(count);
 
         // Float fast path: AVX2 VGATHERDPS (8 floats per instruction)
+        // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
         if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
         {
-            var srcArr = source._cachedArray;
-            var dstArr = result._cachedArray;
-            if (srcArr is float[] srcF && dstArr is float[] dstF)
+            if (source._cachedArray is float[] srcF && result._cachedArray is float[] dstF)
             {
                 fixed (float* pSrc = srcF)
                 fixed (float* pDst = dstF)
-                {
                     SimdKernels.StridedGatherFloat(pSrc, offset, stride, pDst, count);
-                }
-                return result;
             }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    result[i] = source[offset + i * stride];
+            }
+            return result;
         }
 
         // Double fast path: AVX2 VGATHERQPD (4 doubles per instruction)
         if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
         {
-            var srcArr = source._cachedArray;
-            var dstArr = result._cachedArray;
-            if (srcArr is double[] srcD && dstArr is double[] dstD)
+            if (source._cachedArray is double[] srcD && result._cachedArray is double[] dstD)
             {
                 fixed (double* pSrc = srcD)
                 fixed (double* pDst = dstD)
-                {
                     SimdKernels.StridedGatherDouble(pSrc, offset, stride, pDst, count);
-                }
-                return result;
             }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    result[i] = source[offset + i * stride];
+            }
+            return result;
         }
 
         // Generic fallback: scalar loop
@@ -595,35 +598,38 @@ public class CpuEngine : ITensorLevelEngine
                 $"Strided scatter would access index {lastIndex} but destination length is {destination.Length}.");
 
         // Float fast path: unrolled scatter (no hardware scatter on x86, AVX-512 only)
+        // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
         if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd)
         {
-            var srcArr = source._cachedArray;
-            var dstArr = destination._cachedArray;
-            if (srcArr is float[] srcF && dstArr is float[] dstF)
+            if (source._cachedArray is float[] srcF && destination._cachedArray is float[] dstF)
             {
                 fixed (float* pSrc = srcF)
                 fixed (float* pDst = dstF)
-                {
                     SimdKernels.StridedScatterFloat(pSrc, pDst, offset, stride, count);
-                }
-                return;
             }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    destination[offset + i * stride] = source[i];
+            }
+            return;
         }
 
         // Double fast path: unrolled scatter
         if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd)
         {
-            var srcArr = source._cachedArray;
-            var dstArr = destination._cachedArray;
-            if (srcArr is double[] srcD && dstArr is double[] dstD)
+            if (source._cachedArray is double[] srcD && destination._cachedArray is double[] dstD)
             {
                 fixed (double* pSrc = srcD)
                 fixed (double* pDst = dstD)
-                {
                     SimdKernels.StridedScatterDouble(pSrc, pDst, offset, stride, count);
-                }
-                return;
             }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    destination[offset + i * stride] = source[i];
+            }
+            return;
         }
 
         // Generic fallback
@@ -3172,6 +3178,8 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!a.IsContiguous) a = a.Contiguous();
+        if (destination.Length < a.Length)
+            throw new ArgumentException($"Destination length ({destination.Length}) must be >= source length ({a.Length}).");
 
         int length = a.Length;
 

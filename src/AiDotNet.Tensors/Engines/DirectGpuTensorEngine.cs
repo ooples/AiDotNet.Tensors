@@ -1062,12 +1062,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Vector<T> IEngine.StridedGather<T>(Vector<T> source, int offset, int stride, int count)
     {
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+
         if (count < 0)
         {
             count = offset < source.Length ? (source.Length - offset + stride - 1) / stride : 0;
         }
 
         if (count == 0) return new Vector<T>(0);
+
+        int lastIndex = offset + (count - 1) * stride;
+        if (lastIndex >= source.Length)
+            throw new ArgumentOutOfRangeException(nameof(count),
+                $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
 
         if (!TryGetBackend(out var backend))
             return base.StridedGather(source, offset, stride, count);
@@ -1349,6 +1357,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!a.IsContiguous) { base.TensorSubtractInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Subtract(bufA, bufB, bufA, size)))
             return;
@@ -1357,12 +1366,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInto<T>(Tensor<T> dest, Tensor<T> a, Tensor<T> b)
     {
+        if (!dest.IsContiguous) { base.TensorSubtractInto(dest, a, b); return; }
+        // Compute on GPU then copy directly into dest's backing storage
         var result = ((IEngine)this).TensorSubtract(a, b);
         result.Data.Span.CopyTo(dest.Data.Span);
     }
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
+        if (!a.IsContiguous) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         var scalarF = ToFloatScalar(scalar);
         if (TryRunUnaryInPlace(a,
             (backend, buf, size) => backend.Scale(buf, buf, scalarF, size)))
@@ -1372,12 +1384,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> dest, Tensor<T> a, T scalar)
     {
+        if (!dest.IsContiguous) { base.TensorMultiplyScalarInto(dest, a, scalar); return; }
+        // Compute on GPU, copy result directly into dest's contiguous span
         var scalarF = ToFloatScalar(scalar);
         var result = TryRunScalar(a.GetDataArray(), scalar,
             static (backend, input, output, value, size) => backend.Scale(input, output, value, size));
         if (result != null)
         {
-            Array.Copy(result, dest.GetDataArray(), result.Length);
+            result.AsSpan(0, Math.Min(result.Length, dest.Length)).CopyTo(dest.Data.Span);
             return;
         }
         base.TensorMultiplyScalarInto(dest, a, scalar);

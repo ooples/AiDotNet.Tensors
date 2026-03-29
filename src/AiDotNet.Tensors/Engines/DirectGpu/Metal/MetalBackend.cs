@@ -860,6 +860,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         ThrowIfDisposed();
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= src.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
         if (src is not MetalGpuBuffer srcBuffer || dst is not MetalGpuBuffer dstBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
@@ -880,6 +884,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         ThrowIfDisposed();
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+        if (offset + (count - 1) * stride >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
         if (src is not MetalGpuBuffer srcBuffer || dst is not MetalGpuBuffer dstBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");

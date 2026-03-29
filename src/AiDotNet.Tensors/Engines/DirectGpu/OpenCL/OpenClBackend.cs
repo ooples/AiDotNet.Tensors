@@ -2560,6 +2560,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            if (count <= 0) return;
+            if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+            if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+            if (offset + (count - 1) * stride >= src.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
             var bufferSrc = ((DirectOpenClGpuBuffer)src).Buffer;
             var bufferDst = ((DirectOpenClGpuBuffer)dst).Buffer;
@@ -2579,6 +2583,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            if (count <= 0) return;
+            if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+            if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+            if (offset + (count - 1) * stride >= dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
             var bufferSrc = ((DirectOpenClGpuBuffer)src).Buffer;
             var bufferDst = ((DirectOpenClGpuBuffer)dst).Buffer;
