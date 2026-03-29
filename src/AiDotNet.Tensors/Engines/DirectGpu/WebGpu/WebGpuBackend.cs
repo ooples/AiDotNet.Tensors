@@ -301,6 +301,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     private async Task DispatchStridedOpAsync(string kernelName, IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
     {
         ThrowIfNotInitialized();
+        if (count <= 0) return;
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset), "Offset must be non-negative for u32 shader encoding.");
+        if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride), "Stride must be positive for u32 shader encoding.");
 
         var srcBuffer = (WebGpuBuffer)src;
         var dstBuffer = (WebGpuBuffer)dst;

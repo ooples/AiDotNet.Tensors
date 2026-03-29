@@ -191,7 +191,10 @@ struct StridedParams {
 fn strided_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < sparams.count) {
-        DstBuf[idx] = SrcBuf[sparams.offset + idx * sparams.stride];
+        let src_idx = sparams.offset + idx * sparams.stride;
+        if (src_idx < arrayLength(&SrcBuf)) {
+            DstBuf[idx] = SrcBuf[src_idx];
+        }
     }
 }
 
@@ -199,7 +202,10 @@ fn strided_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn strided_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < sparams.count) {
-        DstBuf[sparams.offset + idx * sparams.stride] = SrcBuf[idx];
+        let dst_idx = sparams.offset + idx * sparams.stride;
+        if (dst_idx < arrayLength(&DstBuf)) {
+            DstBuf[dst_idx] = SrcBuf[idx];
+        }
     }
 }
 ";
