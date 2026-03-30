@@ -207,11 +207,17 @@ public class GradientTapeExtendedTests
         var z = _engine.TensorBroadcastAdd(a, b);
         var grads = tape.ComputeGradients(z, new[] { a, b });
 
-        // dz/da = ones (same shape as a)
+        // dz/da = ones (same shape as a: [2, 3])
         Assert.Equal(new[] { 2, 3 }, grads[a].Shape.ToArray());
+        for (int i = 0; i < grads[a].Length; i++)
+            Assert.Equal(1f, grads[a].GetFlat(i), 4);
 
         // dz/db = sum over broadcast dim 0 -> [1, 3] with values [2, 2, 2]
         Assert.True(grads.ContainsKey(b));
+        Assert.Equal(new[] { 1, 3 }, grads[b].Shape.ToArray());
+        Assert.Equal(2f, grads[b][0, 0], 4);
+        Assert.Equal(2f, grads[b][0, 1], 4);
+        Assert.Equal(2f, grads[b][0, 2], 4);
     }
 
     // ──────────────────────────────────────────────────────────────

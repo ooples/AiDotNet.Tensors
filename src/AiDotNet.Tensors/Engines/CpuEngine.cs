@@ -20213,6 +20213,11 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gradOutput.Length != input.Length)
+            throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
@@ -20391,6 +20396,11 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gradOutput.Length != input.Length)
+            throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
+
         var numOps = MathHelper.GetNumericOperations<T>();
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();

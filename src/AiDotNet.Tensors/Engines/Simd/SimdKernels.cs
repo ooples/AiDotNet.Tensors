@@ -5662,7 +5662,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             const float coeff = 0.044715f;
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && Fma.IsSupported)
+            if (Avx2.IsSupported && Fma.IsSupported)
             {
                 var vSqrtTwoPi = Vector256.Create(sqrtTwoPi);
                 var vCoeff = Vector256.Create(coeff);
@@ -5670,7 +5670,6 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vHalf = Vector256.Create(0.5f);
                 var vOne = Vector256.Create(1f);
                 var vTwo = Vector256.Create(2f);
-                var vNegTwo = Vector256.Create(-2f);
                 int simdLength = length & ~7;
                 for (; i < simdLength; i += 8)
                 {
