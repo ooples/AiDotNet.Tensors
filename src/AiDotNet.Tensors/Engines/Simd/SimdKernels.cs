@@ -5709,6 +5709,157 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD-accelerated Sigmoid backward: result[i] = grad[i] * sigmoid_out[i] * (1 - sigmoid_out[i])
+        /// Uses the output of sigmoid forward (savedState), NOT the input, avoiding recomputation.
+        /// </summary>
+        public static unsafe void SigmoidBackwardUnsafe(float* grad, float* sigmoidOutput, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var s = Avx.LoadVector256(sigmoidOutput + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    // grad * s * (1 - s)
+                    var oneMinusS = Avx.Subtract(vOne, s);
+                    Avx.Store(output + i, Avx.Multiply(g, Avx.Multiply(s, oneMinusS)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float s = sigmoidOutput[i];
+                output[i] = grad[i] * s * (1f - s);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Tanh backward: result[i] = grad[i] * (1 - tanh_out[i]^2)
+        /// Uses the output of tanh forward.
+        /// </summary>
+        public static unsafe void TanhBackwardUnsafe(float* grad, float* tanhOutput, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var t = Avx.LoadVector256(tanhOutput + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    // grad * (1 - t^2)
+                    var t2 = Avx.Multiply(t, t);
+                    Avx.Store(output + i, Avx.Multiply(g, Avx.Subtract(vOne, t2)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float t = tanhOutput[i];
+                output[i] = grad[i] * (1f - t * t);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Swish/SiLU backward: result[i] = grad[i] * (s + x * s * (1 - s))
+        /// where s = sigmoid(x). Uses input x to compute sigmoid.
+        /// </summary>
+        public static unsafe void SwishBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1f);
+                var vNegOne = Vector256.Create(-1f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    // sigmoid(x) = 1 / (1 + exp(-x))
+                    var negX = Avx.Multiply(x, vNegOne);
+                    var expNegX = ExpApprox256(negX);
+                    var s = Avx.Divide(vOne, Avx.Add(vOne, expNegX));
+                    // derivative = s * (1 + x * (1 - s))
+                    var oneMinusS = Avx.Subtract(vOne, s);
+                    var xOneMinusS = Avx.Multiply(x, oneMinusS);
+                    var deriv = Avx.Multiply(s, Avx.Add(vOne, xOneMinusS));
+                    Avx.Store(output + i, Avx.Multiply(g, deriv));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float s = 1f / (1f + MathF.Exp(-x));
+                float deriv = s * (1f + x * (1f - s));
+                output[i] = grad[i] * deriv;
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated LeakyReLU backward: result[i] = input[i] >= 0 ? grad[i] : alpha * grad[i]
+        /// </summary>
+        public static unsafe void LeakyReluBackwardUnsafe(float* grad, float* input, float* output, int length, float alpha)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                var vAlpha = Vector256.Create(alpha);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var mask = Avx.Compare(x, vzero, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    // result = mask ? grad : alpha * grad
+                    var alphaGrad = Avx.Multiply(g, vAlpha);
+                    Avx.Store(output + i, Avx.BlendVariable(alphaGrad, g, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] >= 0 ? grad[i] : alpha * grad[i];
+        }
+
+        /// <summary>
+        /// SIMD-accelerated ELU backward: result[i] = input[i] >= 0 ? grad[i] : grad[i] * (output[i] + alpha)
+        /// </summary>
+        public static unsafe void EluBackwardUnsafe(float* grad, float* input, float* eluOutput, float* output, int length, float alpha)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                var vAlpha = Vector256.Create(alpha);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var e = Avx.LoadVector256(eluOutput + i);
+                    var mask = Avx.Compare(x, vzero, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    // negative branch: grad * (elu_output + alpha)
+                    var negDeriv = Avx.Multiply(g, Avx.Add(e, vAlpha));
+                    Avx.Store(output + i, Avx.BlendVariable(negDeriv, g, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] >= 0 ? grad[i] : grad[i] * (eluOutput[i] + alpha);
+        }
+
+        /// <summary>
         /// Fast 8-wide exp approximation for AVX2: ~1e-4 relative error.
         /// Uses polynomial approximation with 2^n scaling via integer bit manipulation.
         /// </summary>
