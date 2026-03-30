@@ -2990,6 +2990,11 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        Tensor<T>? savedA = null;
+        var mulTape = GradientTape<T>.Current;
+        if (mulTape is not null && mulTape.Options.RecordInPlace)
+            savedA = a.Clone();
+
         if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -3049,6 +3054,8 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        if (savedA is not null)
+            DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
     }
 
     /// <summary>
@@ -3089,6 +3096,11 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
+
+        Tensor<T>? savedASub = null;
+        var subTape = GradientTape<T>.Current;
+        if (subTape is not null && subTape.Options.RecordInPlace)
+            savedASub = a.Clone();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
@@ -3136,6 +3148,8 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        if (savedASub is not null)
+            DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
     }
 
     /// <summary>
@@ -16551,6 +16565,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new NotImplementedException("Scatter-add only implemented for axis=0 with 2D destination");
         }
 
+        DifferentiableOps.RecordIfActive("TensorScatterAdd", result, new[] { destination, updates },
+            BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, axis });
         return result;
     }
 
