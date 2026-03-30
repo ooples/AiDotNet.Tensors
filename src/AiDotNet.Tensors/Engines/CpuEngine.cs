@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
@@ -2091,13 +2092,11 @@ public class CpuEngine : ITensorLevelEngine
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[aOff + i], bRaw[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[bOff + i]); }
             else { for (int i = 0; i < length; i++) rArr[i] = ops.Add(aRaw[a.LogicalToStorageIndex(i)], bRaw[b.LogicalToStorageIndex(i)]); }
-            return result;
         }
-
-        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
-        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
-        if (typeof(T) == typeof(float))
+        else if (typeof(T) == typeof(float))
         {
+            // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
+            // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
             var rMem = AsFloatMemory(result.Data);
@@ -2112,38 +2111,37 @@ public class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
-                return result;
-            }
-
-            // Fallback: SimdKernels with parallel chunking for large arrays
-            // Use PersistentParallelExecutor for near-zero dispatch overhead
-            // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
-            int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-            if (addChunks >= 2)
-            {
-                int chunkSize = (length + addChunks - 1) / addChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-                var pACap = pA; var pBCap = pB; var pRCap = pR;
-                int lenCap = length;
-
-                PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, lenCap - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorAddUnsafe(pACap + start, pBCap + start, pRCap + start, count);
-                    }
-                });
             }
             else
             {
-                SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
-            }
-            return result;
-        }
+                // Fallback: SimdKernels with parallel chunking for large arrays
+                // Use PersistentParallelExecutor for near-zero dispatch overhead
+                // (pre-spawned threads, no ThreadPool queuing, no closure allocation)
+                int addChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                if (addChunks >= 2)
+                {
+                    int chunkSize = (length + addChunks - 1) / addChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+                    var pACap = pA; var pBCap = pB; var pRCap = pR;
+                    int lenCap = length;
 
-        if (typeof(T) == typeof(double))
+                    PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, lenCap - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.VectorAddUnsafe(pACap + start, pBCap + start, pRCap + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+                }
+            }
+        }
+        else if (typeof(T) == typeof(double))
         {
             var aMem = AsDoubleMemory(a.Data);
             var bMem = AsDoubleMemory(b.Data);
@@ -2174,12 +2172,14 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
-
+        DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
         return result;
     }
 
@@ -2291,7 +2291,9 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
 
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
-        return a.BroadcastAdd(b);
+        var result = a.BroadcastAdd(b);
+        DifferentiableOps.RecordBinary("TensorBroadcastAdd", result, a, b, BackwardFunctions<T>.BroadcastAddBackward);
+        return result;
     }
 
     /// <inheritdoc/>
@@ -2302,8 +2304,9 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        // Use optimized Tensor.BroadcastSubtract which handles broadcasting logic
-        return a.BroadcastSubtract(b);
+        var result = a.BroadcastSubtract(b);
+        DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, a, b, BackwardFunctions<T>.BroadcastSubtractBackward);
+        return result;
     }
 
     /// <inheritdoc/>
@@ -2314,8 +2317,9 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        // Use optimized Tensor.BroadcastDivide which handles broadcasting logic
-        return a.BroadcastDivide(b);
+        var result = a.BroadcastDivide(b);
+        DifferentiableOps.RecordBinary("TensorBroadcastDivide", result, a, b, BackwardFunctions<T>.BroadcastDivideBackward);
+        return result;
     }
 
     /// <inheritdoc/>
@@ -2326,8 +2330,9 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
-        // Use optimized Tensor.BroadcastMultiply which handles broadcasting logic
-        return a.BroadcastMultiply(b);
+        var result = a.BroadcastMultiply(b);
+        DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+        return result;
     }
 
     /// <inheritdoc/>
@@ -2825,13 +2830,10 @@ public class CpuEngine : ITensorLevelEngine
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
             else { for (int i = 0; i < length; i++) rArr[i] = ops.Subtract(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
-            return result;
         }
-
-        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
-        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
-        if (typeof(T) == typeof(float))
+        else if (typeof(T) == typeof(float))
         {
+            // Fast path for float tensors
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
             var rMem = AsFloatMemory(result.Data);
@@ -2842,41 +2844,41 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
-                return result;
-            }
-
-            // Fallback: SimdKernels with parallel chunking for large arrays
-            // 500K threshold matches libtorch's at::parallel_for grain size for bandwidth-bound ops
-            int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-            if (subChunks >= 2)
-            {
-                int chunkSize = (length + subChunks - 1) / subChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, subChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pR + start, count);
-                    }
-                });
             }
             else
             {
-                SimdKernels.VectorSubtractUnsafe(pA, pB, pR, length);
+                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                if (subChunks >= 2)
+                {
+                    int chunkSize = (length + subChunks - 1) / subChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, subChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pR + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    SimdKernels.VectorSubtractUnsafe(pA, pB, pR, length);
+                }
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
-
+        DifferentiableOps.RecordBinary("TensorSubtract", result, a, b, BackwardFunctions<T>.SubtractBackward);
         return result;
     }
 
@@ -2905,11 +2907,8 @@ public class CpuEngine : ITensorLevelEngine
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
             else { for (int i = 0; i < length; i++) rArr[i] = ops.Multiply(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
-            return result;
         }
-
-        // SIMD fast path: both contiguous
-        if (typeof(T) == typeof(float))
+        else if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
@@ -2921,41 +2920,41 @@ public class CpuEngine : ITensorLevelEngine
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
 
-            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
-                return result;
-            }
-
-            // Fallback: SimdKernels with parallel chunking for large arrays
-            // Use 500K threshold for bandwidth-bound ops (12MB data = 3× inputs + output)
-            int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-            if (mulChunks >= 2)
-            {
-                int chunkSize = (length + mulChunks - 1) / mulChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, mulChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorMultiplyUnsafe(pA + start, pB + start, pR + start, count);
-                    }
-                });
             }
             else
             {
-                SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, length);
+                int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                if (mulChunks >= 2)
+                {
+                    int chunkSize = (length + mulChunks - 1) / mulChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, mulChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.VectorMultiplyUnsafe(pA + start, pB + start, pR + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, length);
+                }
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
-
+        DifferentiableOps.RecordBinary("TensorMultiply", result, a, b, BackwardFunctions<T>.MultiplyBackward);
         return result;
     }
 
@@ -3336,6 +3335,8 @@ public class CpuEngine : ITensorLevelEngine
                 dst[i] = numOps.Multiply(src[tensor.LogicalToStorageIndex(i)], scalar);
         }
 
+        if (scalar is not null)
+            DifferentiableOps.RecordUnary("TensorMultiplyScalar", result, tensor, BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
         return result;
     }
 
@@ -3364,10 +3365,8 @@ public class CpuEngine : ITensorLevelEngine
             if (a.IsContiguous) { int aOff = a._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[aOff + i], bArr[b.LogicalToStorageIndex(i)]); }
             else if (b.IsContiguous) { int bOff = b._storageOffset; for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[bOff + i]); }
             else { for (int i = 0; i < length; i++) rArr[i] = ops.Divide(aArr[a.LogicalToStorageIndex(i)], bArr[b.LogicalToStorageIndex(i)]); }
-            return result;
         }
-
-        if (typeof(T) == typeof(float))
+        else if (typeof(T) == typeof(float))
         {
             var aMem = AsFloatMemory(a.Data);
             var bMem = AsFloatMemory(b.Data);
@@ -3385,7 +3384,6 @@ public class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Parallel chunking for large arrays when JIT not available
                 int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
                 if (subChunks >= 2)
                 {
@@ -3404,12 +3402,14 @@ public class CpuEngine : ITensorLevelEngine
                     SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
                 }
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
-
+        DifferentiableOps.RecordBinary("TensorDivide", result, a, b, BackwardFunctions<T>.DivideBackward);
         return result;
     }
 
@@ -3606,11 +3606,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.LogUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("TensorLog", result, tensor, BackwardFunctions<T>.LogBackward);
         return result;
     }
 
@@ -3633,11 +3636,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.ExpUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("TensorExp", result, tensor, BackwardFunctions<T>.ExpBackward);
         return result;
     }
 
@@ -3660,11 +3666,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
             ParallelComputeBound(pI, pR, length, SimdKernels.SqrtUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("TensorSqrt", result, tensor, BackwardFunctions<T>.SqrtBackward);
         return result;
     }
 
@@ -3686,14 +3695,15 @@ public class CpuEngine : ITensorLevelEngine
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
             float* pR = (float*)pinR.Pointer;
-            // Abs is bandwidth-bound (just AND mask), use same compute-bound threshold
-            // since the overhead is minimal and parallelism helps at 1M+
             ParallelComputeBound(pI, pR, length, SimdKernels.AbsUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("TensorAbs", result, tensor, BackwardFunctions<T>.AbsBackward);
         return result;
     }
 
@@ -3708,6 +3718,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("TensorNegate", result, tensor, BackwardFunctions<T>.NegateBackward);
         return result;
     }
 
@@ -3725,6 +3736,8 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Power(src[i], exponent);
 
+        if (exponent is not null)
+            DifferentiableOps.RecordUnary("TensorPower", result, tensor, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
         return result;
     }
 
@@ -5830,6 +5843,7 @@ public class CpuEngine : ITensorLevelEngine
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; dstArr[i] = ops.GreaterThan(v, ops.Zero) ? v : ops.Zero; }
+                DifferentiableOps.RecordUnary("ReLU", resultS, tensor, BackwardFunctions<T>.ReLUBackward);
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -5838,8 +5852,6 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>(tensor._shape);
         int length = tensor.Length;
 
-        // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
-        // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy when segment != full array
         if (typeof(T) == typeof(float))
         {
             var srcMem = AsFloatMemory(tensor.Data);
@@ -5849,41 +5861,41 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
 
-            // JIT-compiled kernels: size-specialized, 4x unrolled
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitUnaryDispatch(pSrc, pDst, length);
-                return result;
-            }
-
-            // Fallback: SimdKernels with parallel chunking for large arrays
-            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
-            if (reluChunks >= 2)
-            {
-                int chunkSize = (length + reluChunks - 1) / reluChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                Parallel.For(0, reluChunks, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
-                    }
-                });
             }
             else
             {
-                SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+                if (reluChunks >= 2)
+                {
+                    int chunkSize = (length + reluChunks - 1) / reluChunks;
+                    chunkSize = (chunkSize + 31) & ~31;
+
+                    Parallel.For(0, reluChunks, chunk =>
+                    {
+                        int start = chunk * chunkSize;
+                        int count = Math.Min(chunkSize, length - start);
+                        if (count > 0)
+                        {
+                            SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
+                        }
+                    });
+                }
+                else
+                {
+                    SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                }
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        // Generic fallback
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
-
+        DifferentiableOps.RecordUnary("ReLU", result, tensor, BackwardFunctions<T>.ReLUBackward);
         return result;
     }
 
@@ -6034,6 +6046,7 @@ public class CpuEngine : ITensorLevelEngine
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v))))); T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z)); T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One)); T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0)); dstArr[i] = ops.Multiply(v, cdf); }
+                DifferentiableOps.RecordUnary("GELU", resultS, tensor, BackwardFunctions<T>.GELUBackward);
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -6050,11 +6063,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.GELUUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("GELU", result, tensor, BackwardFunctions<T>.GELUBackward);
         return result;
     }
 
@@ -6113,6 +6129,7 @@ public class CpuEngine : ITensorLevelEngine
                 var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
                 var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
                 for (int i = 0; i < tensor.Length; i++) { T v = src[idx[i]]; T negV = ops2.Negate(v); T sig = ops2.Divide(ops2.One, ops2.Add(ops2.One, ops2.Exp(negV))); dst[i] = ops2.Multiply(v, sig); }
+                DifferentiableOps.RecordUnary("Swish", r, tensor, BackwardFunctions<T>.SwishBackward);
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -6123,6 +6140,7 @@ public class CpuEngine : ITensorLevelEngine
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("Swish", result, tensor, BackwardFunctions<T>.SwishBackward);
         return result;
     }
 
@@ -6142,6 +6160,7 @@ public class CpuEngine : ITensorLevelEngine
                     T v = src[idx[i]];
                     dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alphaT, ops2.Subtract(ops2.Exp(v), ops2.One));
                 }
+                DifferentiableOps.RecordUnary("ELU", r, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -6149,12 +6168,12 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        // Use SIMD-optimized ELU - single allocation, zero-copy
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("ELU", result, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
         return result;
     }
 
@@ -6174,6 +6193,7 @@ public class CpuEngine : ITensorLevelEngine
                     T v = src[idx[i]];
                     dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alpha, v);
                 }
+                DifferentiableOps.RecordUnary("LeakyReLU", r, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { MathHelper.GetNumericOperations<T>().ToDouble(alpha) });
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -6182,6 +6202,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
 
         var result = TensorAllocator.Rent<T>(tensor._shape);
+        var negSlope = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
 
         if (typeof(T) == typeof(float))
         {
@@ -6193,7 +6214,6 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             int len = tensor.Length;
-            // Parallel for compute-bound LeakyReLU at 256K+ elements
             const int parallelThreshold = 256 * 1024;
             int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
             int chunks = Math.Min(maxThreads, Math.Max(1, len / parallelThreshold));
@@ -6215,11 +6235,14 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.LeakyReLUUnsafe(pSrc, pDst, len, alphaF);
             }
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("LeakyReLU", result, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { negSlope });
         return result;
     }
 
@@ -6744,6 +6767,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         return result;
     }
 
@@ -6765,26 +6789,31 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        Tensor<T> result;
+
         // Standard 2D x 2D case
         if (a.Rank == 2 && b.Rank == 2)
         {
-            return TensorMatMul2D(a, b, numOps);
+            result = TensorMatMul2D(a, b, numOps);
         }
-
         // ND x 2D case: broadcast 2D weights over batch dimensions
         // This is the common transformer pattern: [batch, seq, features] @ [features, output]
-        if (b.Rank == 2)
+        else if (b.Rank == 2)
         {
-            return TensorMatMulBatched(a, b, numOps);
+            result = TensorMatMulBatched(a, b, numOps);
         }
-
         // 3D x 3D or ND x ND: full batched matmul (batch dimensions must match)
-        if (a.Rank == b.Rank)
+        else if (a.Rank == b.Rank)
         {
-            return TensorMatMulFullBatched(a, b, numOps);
+            result = TensorMatMulFullBatched(a, b, numOps);
+        }
+        else
+        {
+            throw new ArgumentException($"Unsupported TensorMatMul combination: ranks {a.Rank} and {b.Rank}. Supported: 2Dx2D, NDx2D, NDxND (same rank).");
         }
 
-        throw new ArgumentException($"Unsupported TensorMatMul combination: ranks {a.Rank} and {b.Rank}. Supported: 2Dx2D, NDx2D, NDxND (same rank).");
+        DifferentiableOps.RecordBinary("TensorMatMul", result, a, b, BackwardFunctions<T>.MatMulBackward);
+        return result;
     }
 
     /// <summary>
@@ -10310,6 +10339,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
+            DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
             return result;
         }
 
@@ -10324,7 +10354,6 @@ public class CpuEngine : ITensorLevelEngine
             int outer = idx / innerSize;
             int inner = idx % innerSize;
 
-            // Find max for numerical stability
             T maxVal = numOps.MinValue;
             for (int i = 0; i < axisSize; i++)
             {
@@ -10333,7 +10362,6 @@ public class CpuEngine : ITensorLevelEngine
                     maxVal = inputData[flatIdx];
             }
 
-            // Compute exp and sum
             T sumExp = numOps.Zero;
             var expVals = new T[axisSize];
             for (int i = 0; i < axisSize; i++)
@@ -10343,7 +10371,6 @@ public class CpuEngine : ITensorLevelEngine
                 sumExp = numOps.Add(sumExp, expVals[i]);
             }
 
-            // Normalize
             for (int i = 0; i < axisSize; i++)
             {
                 int flatIdx = (outer * axisSize + i) * innerSize + inner;
@@ -10351,6 +10378,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("Softmax", result2, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
         return result2;
     }
 
