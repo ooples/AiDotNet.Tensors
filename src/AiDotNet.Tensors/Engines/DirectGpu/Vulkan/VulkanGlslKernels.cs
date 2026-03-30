@@ -1078,6 +1078,52 @@ void main() {
     c[idx] = (x > 0.0 && x < 6.0) ? a[idx] : 0.0;
 }";
 
+    public static string PRelu => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; uint alphaSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx];
+    float alpha = bdata[idx % alphaSize];
+    c[idx] = x >= 0.0 ? x : alpha * x;
+}";
+
+    public static string PReluBackwardInput => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut[]; };
+layout(set = 0, binding = 1) readonly buffer INP { float inp[]; };
+layout(set = 0, binding = 2) readonly buffer ALPHA { float alpha[]; };
+layout(set = 0, binding = 3) writeonly buffer GI { float gradIn[]; };
+layout(push_constant) uniform Params { uint size; uint alphaSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = inp[idx];
+    float a = alpha[idx % alphaSize];
+    gradIn[idx] = x >= 0.0 ? gradOut[idx] : a * gradOut[idx];
+}";
+
+    public static string RRelu => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx];
+    c[idx] = x >= 0.0 ? x : bdata[idx] * x;
+}";
+
+    public static string RReluBackward => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut[]; };
+layout(set = 0, binding = 1) readonly buffer INP { float inp[]; };
+layout(set = 0, binding = 2) readonly buffer NOISE { float noise[]; };
+layout(set = 0, binding = 3) writeonly buffer GI { float gradIn[]; };
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = inp[idx];
+    gradIn[idx] = gradOut[idx] * (x >= 0.0 ? 1.0 : noise[idx]);
+}";
+
     public static string Threshold => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint size; float thresh; float val; };
 void main() {
@@ -1142,6 +1188,63 @@ void main() {
     float x = a[idx]; float t = bdata[idx];
     float ax = abs(x);
     c[idx] = max(x, 0.0) - x * t + log(1.0 + exp(-ax));
+}";
+
+    public static string L1LossBatch => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numFeatures; };
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= batchSize) return;
+    float sum_abs = 0.0;
+    for (uint f = 0; f < numFeatures; f++) sum_abs += abs(a[b * numFeatures + f] - bdata[b * numFeatures + f]);
+    c[b] = sum_abs / float(numFeatures);
+}";
+
+    public static string HuberLossBatch => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numFeatures; float delta; };
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= batchSize) return;
+    float sum = 0.0;
+    for (uint f = 0; f < numFeatures; f++) {
+        float d = a[b * numFeatures + f] - bdata[b * numFeatures + f];
+        float ad = abs(d);
+        sum += (ad <= delta) ? (0.5 * d * d) : (delta * (ad - 0.5 * delta));
+    }
+    c[b] = sum / float(numFeatures);
+}";
+
+    public static string NllLossBatch => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint numClasses; };
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= batchSize) return;
+    int tc = int(bdata[b]);
+    c[b] = (tc >= 0 && tc < int(numClasses)) ? -a[b * numClasses + uint(tc)] : 0.0;
+}";
+
+    public static string KlDivElementwise => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float t = bdata[idx];
+    c[idx] = (t > 0.0) ? t * (log(t) - a[idx]) : 0.0;
+}";
+
+    public static string HuberLossBackward => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut[]; };
+layout(set = 0, binding = 1) readonly buffer P { float pred[]; };
+layout(set = 0, binding = 2) readonly buffer T { float tgt[]; };
+layout(set = 0, binding = 3) writeonly buffer GI { float gradIn[]; };
+layout(push_constant) uniform Params { uint size; float invN; float delta; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float d = pred[idx] - tgt[idx];
+    float ad = abs(d);
+    float grad = (ad <= delta) ? d : (delta * ((d > 0.0) ? 1.0 : -1.0));
+    gradIn[idx] = gradOut[0] * grad * invN;
 }";
 
     public static string MseLossBackward => Header + @"

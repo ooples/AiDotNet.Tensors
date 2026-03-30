@@ -356,28 +356,14 @@ public sealed unsafe partial class VulkanBackend
 
     public void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
     {
-        // PReLU requires 3 buffers with alphaSize param — use CpuBinary with index-aware alpha
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var alp = DownloadBuffer(alpha);
-        var res = new float[size];
-        for (int i = 0; i < size; i++)
-        {
-            float x = inp[i]; float a = alp[i % alphaSize];
-            res[i] = x >= 0 ? x : a * x;
-        }
-        UploadToBuffer(res, output);
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslBinaryOp(VulkanGlslKernels.PRelu, input, alpha, output, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var alp = DownloadBuffer(alpha);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; float a = alp[i % alphaSize]; gi[i] = x >= 0 ? go[i] : a * go[i]; }
-        UploadToBuffer(gi, gradInput);
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslQuadOp(VulkanGlslKernels.PReluBackwardInput, gradOutput, input, alpha, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
@@ -391,25 +377,10 @@ public sealed unsafe partial class VulkanBackend
     }
 
     public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
-    {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var n = DownloadBuffer(noise);
-        var res = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; res[i] = x >= 0 ? x : n[i] * x; }
-        UploadToBuffer(res, output);
-    }
+        => GlslBinaryOp(VulkanGlslKernels.RRelu, input, noise, output, size);
 
     public void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
-    {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var n = DownloadBuffer(noise);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; gi[i] = go[i] * (x >= 0 ? 1f : n[i]); }
-        UploadToBuffer(gi, gradInput);
-    }
+        => GlslQuadOp(VulkanGlslKernels.RReluBackward, gradOutput, input, noise, gradInput, size);
 
     public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
@@ -428,118 +399,50 @@ public sealed unsafe partial class VulkanBackend
 
     public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(predictions);
-        var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0; for (int f = 0; f < numFeatures; f++) sum += MathF.Abs(p[b * numFeatures + f] - t[b * numFeatures + f]);
-            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
-        }
-        UploadToBuffer(l, loss);
+        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures };
+        GlslBinaryOp(VulkanGlslKernels.L1LossBatch, predictions, targets, loss, batchSize, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
-        EnsureInitialized();
-        var p = DownloadBuffer(predictions);
-        var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0;
-            for (int f = 0; f < numFeatures; f++)
-            {
-                float d = p[b * numFeatures + f] - t[b * numFeatures + f];
-                float ad = MathF.Abs(d);
-                sum += ad <= delta ? 0.5f * d * d : delta * (ad - 0.5f * delta);
-            }
-            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
-        }
-        UploadToBuffer(l, loss);
+        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures, BitConverter.SingleToUInt32Bits(delta) };
+        GlslBinaryOp(VulkanGlslKernels.HuberLossBatch, predictions, targets, loss, batchSize, pushData, (uint)(3 * sizeof(uint)));
     }
 
     public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
-    {
-        EnsureInitialized();
-        var x = DownloadBuffer(logits);
-        var t = DownloadBuffer(targets);
-        var l = new float[size];
-        for (int i = 0; i < size; i++)
-        {
-            float ax = MathF.Abs(x[i]);
-            l[i] = MathF.Max(x[i], 0f) - x[i] * t[i] + MathF.Log(1f + MathF.Exp(-ax));
-        }
-        UploadToBuffer(l, loss);
-    }
+        => GlslBinaryOp(VulkanGlslKernels.BceWithLogitsElementwise, logits, targets, loss, size);
 
     public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
     {
-        EnsureInitialized();
-        var lp = DownloadBuffer(logProbs);
-        var tgt = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int tc = (int)tgt[b];
-            l[b] = (tc >= 0 && tc < numClasses) ? -lp[b * numClasses + tc] : 0f;
-        }
-        UploadToBuffer(l, loss);
+        var pushData = new uint[] { (uint)batchSize, (uint)numClasses };
+        GlslBinaryOp(VulkanGlslKernels.NllLossBatch, logProbs, targets, loss, batchSize, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
-    {
-        EnsureInitialized();
-        var inp = DownloadBuffer(input);
-        var tgt = DownloadBuffer(target);
-        var l = new float[size];
-        for (int i = 0; i < size; i++) l[i] = tgt[i] > 0 ? tgt[i] * (MathF.Log(tgt[i]) - inp[i]) : 0f;
-        UploadToBuffer(l, loss);
-    }
+        => GlslBinaryOp(VulkanGlslKernels.KlDivElementwise, input, target, loss, size);
 
     public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var p = DownloadBuffer(predictions);
-        var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) gi[i] = go[0] * 2f * (p[i] - t[i]) * invN;
-        UploadToBuffer(gi, gradInput);
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.MseLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var p = DownloadBuffer(predictions);
-        var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float d = p[i] - t[i]; gi[i] = go[0] * (d > 0 ? 1f : d < 0 ? -1f : 0f) * invN; }
-        UploadToBuffer(gi, gradInput);
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.L1LossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var p = DownloadBuffer(predictions);
-        var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float d = p[i] - t[i]; float ad = MathF.Abs(d); gi[i] = go[0] * (ad <= delta ? d : delta * (d > 0 ? 1f : -1f)) * invN; }
-        UploadToBuffer(gi, gradInput);
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN), BitConverter.SingleToUInt32Bits(delta) };
+        GlslQuadOp(VulkanGlslKernels.HuberLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(3 * sizeof(uint)));
     }
 
     public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var x = DownloadBuffer(logits);
-        var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float sig = 1f / (1f + MathF.Exp(-x[i])); gi[i] = go[0] * (sig - t[i]) * invN; }
-        UploadToBuffer(gi, gradInput);
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.BceWithLogitsBackward, gradOutput, logits, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     #endregion
