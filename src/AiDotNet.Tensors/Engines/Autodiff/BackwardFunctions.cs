@@ -503,6 +503,46 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
+    /// <summary>GridSample backward: uses engine.GridSampleBackwardInput and GridSampleBackwardGrid</summary>
+    internal static void GridSampleBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // inputs[0] = input, inputs[1] = grid
+        var gradInput = engine.GridSampleBackwardInput(gradOutput, inputs[1], inputs[0].Shape.ToArray());
+        var gradGrid = engine.GridSampleBackwardGrid(gradOutput, inputs[0], inputs[1]);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGrid, engine);
+    }
+
+    /// <summary>Unfold backward: fold the gradient back to input shape</summary>
+    internal static void UnfoldBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var kernelSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        var padding = (int[])savedState[2];
+        var outputSize = new[] { inputs[0].Shape.ToArray()[2], inputs[0].Shape.ToArray()[3] };
+
+        var grad = engine.Fold(gradOutput, outputSize, kernelSize, stride, padding);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>Fold backward: unfold the gradient back to column shape</summary>
+    internal static void FoldBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var kernelSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        var padding = (int[])savedState[2];
+
+        var grad = engine.Unfold(gradOutput, kernelSize, stride, padding);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>MaxPool2D backward: uses engine.MaxPool2DBackward with saved max indices</summary>
     internal static void MaxPool2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

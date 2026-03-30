@@ -5556,6 +5556,78 @@ KERNEL VARIANTS (A/B testing):
             k.Execute3D(kernelW, kernelH, outChannels * inChannels, localX, localY, localZ);
         }
 
+        public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+            int batch, int inChannels, int inLength,
+            int outChannels, int outLength, int kernelLength,
+            int stride, int padding, int dilation)
+        {
+            Conv2D(input, kernel, output, batch, inChannels, 1, inLength,
+                outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+        }
+
+        public void Conv1DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+            int batch, int inChannels, int inLength,
+            int outChannels, int outLength, int kernelLength,
+            int stride, int padding, int dilation)
+        {
+            Conv2DBackwardInput(gradOutput, kernel, gradInput, batch, inChannels, 1, inLength,
+                outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+        }
+
+        public void Conv1DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+            int batch, int inChannels, int inLength,
+            int outChannels, int outLength, int kernelLength,
+            int stride, int padding, int dilation)
+        {
+            Conv2DBackwardKernel(input, gradOutput, gradKernel, batch, inChannels, 1, inLength,
+                outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+        }
+
+        public void Unfold(IGpuBuffer input, IGpuBuffer output,
+            int batch, int channels, int height, int width,
+            int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        {
+            var k = _kernelCache["im2col"];
+            int outH = (height + 2 * padH - kernelH) / strideH + 1;
+            int outW = (width + 2 * padW - kernelW) / strideW + 1;
+            int totalPatches = batch * outH * outW;
+            int dilationH = 1, dilationW = 1;
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch); k.SetArg(arg++, channels);
+            k.SetArg(arg++, height); k.SetArg(arg++, width);
+            k.SetArg(arg++, kernelH); k.SetArg(arg++, kernelW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            k.SetArg(arg++, dilationH); k.SetArg(arg++, dilationW);
+            k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.Execute1D(totalPatches, 256);
+        }
+
+        public void Fold(IGpuBuffer input, IGpuBuffer output,
+            int batch, int channels, int outputH, int outputW,
+            int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        {
+            int totalSize = batch * channels * outputH * outputW;
+            ZeroBuffer(output, totalSize);
+            var k = _kernelCache["col2im"];
+            int outH = (outputH + 2 * padH - kernelH) / strideH + 1;
+            int outW = (outputW + 2 * padW - kernelW) / strideW + 1;
+            int dilationH = 1, dilationW = 1;
+            uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch); k.SetArg(arg++, channels);
+            k.SetArg(arg++, outputH); k.SetArg(arg++, outputW);
+            k.SetArg(arg++, kernelH); k.SetArg(arg++, kernelW);
+            k.SetArg(arg++, strideH); k.SetArg(arg++, strideW);
+            k.SetArg(arg++, padH); k.SetArg(arg++, padW);
+            k.SetArg(arg++, dilationH); k.SetArg(arg++, dilationW);
+            k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.Execute1D(totalSize, 256);
+        }
+
         public void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
             int batch, int inChannels, int inDepth, int inHeight, int inWidth,
             int outChannels, int outDepth, int outHeight, int outWidth,

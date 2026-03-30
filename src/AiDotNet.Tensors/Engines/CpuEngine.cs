@@ -15604,7 +15604,138 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordBinary("GridSample", output, input, grid, BackwardFunctions<T>.GridSampleBackward);
         return output;
+    }
+
+    /// <summary>
+    /// Extracts sliding local blocks (im2col) from a batched input tensor.
+    /// Input: [batch, channels, height, width] -> Output: [batch, channels * kH * kW, L]
+    /// </summary>
+    public Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException($"Unfold requires 4D input [batch, channels, height, width]. Got rank {input.Rank}.");
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0];
+        int channels = input._shape[1];
+        int height = input._shape[2];
+        int width = input._shape[3];
+        int kH = kernelSize[0], kW = kernelSize[1];
+        int sH = stride[0], sW = stride[1];
+        int pH = padding[0], pW = padding[1];
+
+        int outH = (height + 2 * pH - kH) / sH + 1;
+        int outW = (width + 2 * pW - kW) / sW + 1;
+        int colLength = outH * outW;
+        int colChannels = channels * kH * kW;
+
+        var result = TensorAllocator.Rent<T>(new[] { batch, colChannels, colLength });
+        var inputData = input.GetDataArray();
+        var resultData = result.GetDataArray();
+
+        for (int b = 0; b < batch; b++)
+        {
+            int batchInputOffset = b * channels * height * width;
+            int batchOutputOffset = b * colChannels * colLength;
+
+            for (int c = 0; c < channels; c++)
+            {
+                for (int ki = 0; ki < kH; ki++)
+                {
+                    for (int kj = 0; kj < kW; kj++)
+                    {
+                        int colRow = (c * kH + ki) * kW + kj;
+                        for (int oh = 0; oh < outH; oh++)
+                        {
+                            int ih = oh * sH + ki - pH;
+                            for (int ow = 0; ow < outW; ow++)
+                            {
+                                int iw = ow * sW + kj - pW;
+                                int colIdx = batchOutputOffset + colRow * colLength + oh * outW + ow;
+                                if (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    resultData[colIdx] = inputData[batchInputOffset + c * height * width + ih * width + iw];
+                                else
+                                    resultData[colIdx] = numOps.Zero;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.RecordUnary("Unfold", result, input, BackwardFunctions<T>.UnfoldBackward,
+            new object[] { kernelSize, stride, padding });
+        return result;
+    }
+
+    /// <summary>
+    /// Combines sliding local blocks back into a full tensor (col2im).
+    /// Input: [batch, channels * kH * kW, L] -> Output: [batch, channels, outputH, outputW]
+    /// </summary>
+    public Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 3) throw new ArgumentException($"Fold requires 3D input [batch, C*kH*kW, L]. Got rank {input.Rank}.");
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int batch = input._shape[0];
+        int kH = kernelSize[0], kW = kernelSize[1];
+        int sH = stride[0], sW = stride[1];
+        int pH = padding[0], pW = padding[1];
+        int outH = outputSize[0], outW = outputSize[1];
+        int colChannels = input._shape[1];
+        int channels = colChannels / (kH * kW);
+        int colLength = input._shape[2];
+
+        int unfoldH = (outH + 2 * pH - kH) / sH + 1;
+        int unfoldW = (outW + 2 * pW - kW) / sW + 1;
+
+        var result = TensorAllocator.Rent<T>(new[] { batch, channels, outH, outW });
+        var inputData = input.GetDataArray();
+        var resultData = result.GetDataArray();
+
+        // Initialize to zero
+        for (int i = 0; i < resultData.Length; i++)
+            resultData[i] = numOps.Zero;
+
+        for (int b = 0; b < batch; b++)
+        {
+            int batchInputOffset = b * colChannels * colLength;
+            int batchOutputOffset = b * channels * outH * outW;
+
+            for (int c = 0; c < channels; c++)
+            {
+                for (int ki = 0; ki < kH; ki++)
+                {
+                    for (int kj = 0; kj < kW; kj++)
+                    {
+                        int colRow = (c * kH + ki) * kW + kj;
+                        for (int oh = 0; oh < unfoldH; oh++)
+                        {
+                            int ih = oh * sH + ki - pH;
+                            for (int ow = 0; ow < unfoldW; ow++)
+                            {
+                                int iw = ow * sW + kj - pW;
+                                if (ih >= 0 && ih < outH && iw >= 0 && iw < outW)
+                                {
+                                    int colIdx = batchInputOffset + colRow * colLength + oh * unfoldW + ow;
+                                    int outIdx = batchOutputOffset + c * outH * outW + ih * outW + iw;
+                                    resultData[outIdx] = numOps.Add(resultData[outIdx], inputData[colIdx]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.RecordUnary("Fold", result, input, BackwardFunctions<T>.FoldBackward,
+            new object[] { kernelSize, stride, padding });
+        return result;
     }
 
     public (Tensor<T> real, Tensor<T> imag) ComplexMatMul<T>(Tensor<T> aReal, Tensor<T> aImag, Tensor<T> bReal, Tensor<T> bImag)

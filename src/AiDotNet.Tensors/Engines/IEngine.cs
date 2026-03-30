@@ -5070,6 +5070,22 @@ public interface IEngine
     Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid);
 
     /// <summary>
+    /// Extracts sliding local blocks (patches) from a batched input tensor.
+    /// Similar to PyTorch's torch.nn.functional.unfold (im2col).
+    /// Input shape: [batch, channels, height, width]
+    /// Output shape: [batch, channels * kernelH * kernelW, L] where L = number of patches.
+    /// </summary>
+    Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding);
+
+    /// <summary>
+    /// Combines an array of sliding local blocks back into a full tensor.
+    /// Inverse of <see cref="Unfold{T}"/>. Similar to PyTorch's torch.nn.functional.fold (col2im).
+    /// Input shape: [batch, channels * kernelH * kernelW, L]
+    /// Output shape: [batch, channels, outputH, outputW]
+    /// </summary>
+    Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding);
+
+    /// <summary>
     /// Performs complex-valued matrix multiplication using split real/imaginary tensors.
     /// </summary>
     /// <typeparam name="T">Numeric type.</typeparam>

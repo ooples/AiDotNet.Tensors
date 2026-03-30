@@ -186,6 +186,81 @@ public sealed partial class MetalBackend
         }
     }
 
+    public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Conv2D(input, kernel, output, batch, inChannels, 1, inLength,
+            outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+
+    public void Conv1DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Conv2DBackwardInput(gradOutput, kernel, gradInput, batch, inChannels, 1, inLength,
+            outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+
+    public void Conv1DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Conv2DBackwardKernel(input, gradOutput, gradKernel, batch, inChannels, 1, inLength,
+            outChannels, 1, outLength, 1, kernelLength, 1, stride, 0, padding, 1, dilation);
+
+    public void Unfold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        var inp = DownloadBuffer(input);
+        int outH = (height + 2 * padH - kernelH) / strideH + 1;
+        int outW = (width + 2 * padW - kernelW) / strideW + 1;
+        int colLen = outH * outW;
+        int colCh = channels * kernelH * kernelW;
+        var outp = new float[batch * colCh * colLen];
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int ki = 0; ki < kernelH; ki++)
+                    for (int kj = 0; kj < kernelW; kj++)
+                        for (int oh = 0; oh < outH; oh++)
+                            for (int ow = 0; ow < outW; ow++)
+                            {
+                                int ih = oh * strideH + ki - padH, iw = ow * strideW + kj - padW;
+                                int colRow = (c * kernelH + ki) * kernelW + kj;
+                                outp[b * colCh * colLen + colRow * colLen + oh * outW + ow] =
+                                    (ih >= 0 && ih < height && iw >= 0 && iw < width)
+                                    ? inp[(b * channels + c) * height * width + ih * width + iw] : 0f;
+                            }
+        UploadToBuffer(output, outp);
+    }
+
+    public void Fold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int outputH, int outputW,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        var inp = DownloadBuffer(input);
+        int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
+        int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;
+        int colLen = unfoldH * unfoldW;
+        int colCh = channels * kernelH * kernelW;
+        var outp = new float[batch * channels * outputH * outputW];
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+                for (int ki = 0; ki < kernelH; ki++)
+                    for (int kj = 0; kj < kernelW; kj++)
+                        for (int oh = 0; oh < unfoldH; oh++)
+                            for (int ow = 0; ow < unfoldW; ow++)
+                            {
+                                int ih = oh * strideH + ki - padH, iw = ow * strideW + kj - padW;
+                                if (ih >= 0 && ih < outputH && iw >= 0 && iw < outputW)
+                                {
+                                    int colRow = (c * kernelH + ki) * kernelW + kj;
+                                    outp[b * channels * outputH * outputW + c * outputH * outputW + ih * outputW + iw]
+                                        += inp[b * colCh * colLen + colRow * colLen + oh * unfoldW + ow];
+                                }
+                            }
+        UploadToBuffer(output, outp);
+    }
+
     /// <summary>
     /// 3D Convolution forward pass.
     /// </summary>

@@ -436,6 +436,44 @@ public class DelegatingGpuBackend : IDirectGpuBackend
             strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW);
 
     /// <inheritdoc/>
+    public virtual void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Inner.Conv1D(input, kernel, output, batch, inChannels, inLength,
+            outChannels, outLength, kernelLength, stride, padding, dilation);
+
+    /// <inheritdoc/>
+    public virtual void Conv1DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Inner.Conv1DBackwardInput(gradOutput, kernel, gradInput, batch, inChannels, inLength,
+            outChannels, outLength, kernelLength, stride, padding, dilation);
+
+    /// <inheritdoc/>
+    public virtual void Conv1DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+        => Inner.Conv1DBackwardKernel(input, gradOutput, gradKernel, batch, inChannels, inLength,
+            outChannels, outLength, kernelLength, stride, padding, dilation);
+
+    /// <inheritdoc/>
+    public virtual void Unfold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        => Inner.Unfold(input, output, batch, channels, height, width,
+            kernelH, kernelW, strideH, strideW, padH, padW);
+
+    /// <inheritdoc/>
+    public virtual void Fold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int outputH, int outputW,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        => Inner.Fold(input, output, batch, channels, outputH, outputW,
+            kernelH, kernelW, strideH, strideW, padH, padW);
+
+    /// <inheritdoc/>
     public virtual void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth,
         int outHeight, int outWidth,

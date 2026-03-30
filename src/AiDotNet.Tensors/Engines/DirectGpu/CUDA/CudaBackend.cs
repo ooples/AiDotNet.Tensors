@@ -3130,6 +3130,96 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
     }
 
+    public unsafe void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+    {
+        // Conv1D via Conv2D with height=1: [B,C,L] -> [B,C,1,L]
+        Conv2D(input, kernel, output,
+            batch, inChannels, 1, inLength,
+            outChannels, 1, outLength,
+            1, kernelLength,
+            1, stride, 0, padding, 1, dilation);
+    }
+
+    public unsafe void Conv1DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+    {
+        Conv2DBackwardInput(gradOutput, kernel, gradInput,
+            batch, inChannels, 1, inLength,
+            outChannels, 1, outLength,
+            1, kernelLength, 1, stride, 0, padding, 1, dilation);
+    }
+
+    public unsafe void Conv1DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inLength,
+        int outChannels, int outLength, int kernelLength,
+        int stride, int padding, int dilation)
+    {
+        Conv2DBackwardKernel(input, gradOutput, gradKernel,
+            batch, inChannels, 1, inLength,
+            outChannels, 1, outLength,
+            1, kernelLength, 1, stride, 0, padding, 1, dilation);
+    }
+
+    public unsafe void Unfold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("im2col", out var im2colKernel))
+            throw new InvalidOperationException("CUDA kernel not found: im2col");
+
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        int outH = (height + 2 * padH - kernelH) / strideH + 1;
+        int outW = (width + 2 * padW - kernelW) / strideW + 1;
+        int totalPatches = batch * outH * outW;
+        int dilationH = 1, dilationW = 1;
+
+        void** args = stackalloc void*[15];
+        args[0] = &inputPtr; args[1] = &outputPtr;
+        args[2] = &batch; args[3] = &channels; args[4] = &height; args[5] = &width;
+        args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
+        args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
+        args[14] = &outH;
+
+        uint gridX = (uint)((totalPatches + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(im2colKernel, gridX, DefaultBlockSize, args);
+    }
+
+    public unsafe void Fold(IGpuBuffer input, IGpuBuffer output,
+        int batch, int channels, int outputH, int outputW,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        using var _ = PushContext();
+        if (!_kernelCache.TryGetValue("col2im", out var col2imKernel))
+            throw new InvalidOperationException("CUDA kernel not found: col2im");
+
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        int outH = (outputH + 2 * padH - kernelH) / strideH + 1;
+        int outW = (outputW + 2 * padW - kernelW) / strideW + 1;
+        int totalSize = batch * channels * outputH * outputW;
+        int dilationH = 1, dilationW = 1;
+
+        // Zero output first
+        ZeroBuffer(output, totalSize);
+
+        void** args = stackalloc void*[15];
+        args[0] = &inputPtr; args[1] = &outputPtr;
+        args[2] = &batch; args[3] = &channels; args[4] = &outputH; args[5] = &outputW;
+        args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
+        args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
+        args[14] = &outH;
+
+        uint gridX = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(col2imKernel, gridX, DefaultBlockSize, args);
+    }
+
     public unsafe void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inDepth, int inHeight, int inWidth,
         int outChannels, int outDepth, int outHeight, int outWidth,
