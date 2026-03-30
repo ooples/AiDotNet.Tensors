@@ -120,6 +120,7 @@ public sealed class GradientTape<T> : IDisposable
     /// by walking the tape in reverse order (reverse-mode automatic differentiation).
     /// </summary>
     /// <param name="loss">The scalar loss tensor to differentiate. Should have a single element.</param>
+    /// <remarks>Hot path — uses AggressiveOptimization to skip tiered JIT compilation.</remarks>
     /// <param name="sources">Optional set of tensors to compute gradients for.
     /// If null, computes gradients for all input tensors on the tape.</param>
     /// <param name="createGraph">If true, keeps the tape recording during backward so gradient
@@ -128,6 +129,9 @@ public sealed class GradientTape<T> : IDisposable
     /// <returns>A dictionary mapping each source tensor to its gradient tensor.</returns>
     /// <exception cref="ObjectDisposedException">Thrown if the tape has been disposed.</exception>
     /// <exception cref="InvalidOperationException">Thrown if the tape has no entries.</exception>
+#if !NETFRAMEWORK
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+#endif
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
         Tensor<T>[]? sources = null,

@@ -76,7 +76,11 @@ internal static class DifferentiableOps
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining
+#if !NETFRAMEWORK
+        | MethodImplOptions.AggressiveOptimization
+#endif
+    )]
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
