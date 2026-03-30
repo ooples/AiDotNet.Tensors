@@ -3873,6 +3873,8 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("Sin", result, tensor,
+            BackwardFunctions<T>.SinBackward);
         return result;
     }
 
@@ -3887,6 +3889,8 @@ public class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>(tensor._shape);
         numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("Cos", result, tensor,
+            BackwardFunctions<T>.CosBackward);
         return result;
     }
 
@@ -4201,6 +4205,9 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = val;
         }
 
+        DifferentiableOps.RecordUnary("Clamp", result, tensor,
+            BackwardFunctions<T>.ClampBackward,
+            savedState: new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
         return result;
     }
 
