@@ -327,4 +327,119 @@ public class GradientCorrectnessTests
         Assert.True(finalLoss < initialLoss * 0.5f,
             $"MLP training should reduce loss. Initial: {initialLoss:G4}, Final: {finalLoss:G4}");
     }
+
+    // ─── Integration tests for advanced features ────────────────
+
+    [Fact]
+    public void Integration_GradientAccumulator_TrainsWithMiniBatches()
+    {
+        var w = new Tensor<float>(new float[] { 0f, 0f }, [2]);
+        var accumulator = new GradientAccumulator<float>();
+        accumulator.Register(w);
+
+        // 4 mini-batches, accumulate then step
+        for (int batch = 0; batch < 4; batch++)
+        {
+            using var tape = new GradientTape<float>();
+            var x = new Tensor<float>(new float[] { (batch + 1) * 1f, (batch + 1) * 2f }, [2]);
+            var target = new Tensor<float>(new float[] { 3f, 6f }, [2]);
+            var diff = _engine.TensorSubtract(_engine.TensorMultiply(w, x), target);
+            var loss = _engine.TensorMultiply(diff, diff);
+            var grads = tape.ComputeGradients(loss, sources: new[] { w });
+            accumulator.Accumulate(grads);
+        }
+
+        Assert.Equal(4, accumulator.AccumulationCount);
+        var grad = accumulator.GetGrad(w);
+        Assert.NotNull(grad);
+        Assert.True(grad!.Length == 2);
+
+        accumulator.Step(0.001f);
+        accumulator.ZeroGrad();
+        Assert.Equal(0, accumulator.AccumulationCount);
+    }
+
+    [Fact]
+    public void Integration_FusedLinear_ProducesCorrectGradients()
+    {
+        using var tape = new GradientTape<float>();
+
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        var w = new Tensor<float>(new float[] { 0.5f, 0.3f, 0.2f, 0.4f }, [2, 2]);
+        var b = new Tensor<float>(new float[] { 0.1f, 0.2f }, [2]);
+
+        var output = FusedOperations<float>.Linear(x, w, b);
+
+        var grads = tape.ComputeGradients(output, sources: new[] { x, w, b });
+
+        Assert.True(grads.ContainsKey(x), "Should have gradient for input");
+        Assert.True(grads.ContainsKey(w), "Should have gradient for weight");
+        Assert.True(grads.ContainsKey(b), "Should have gradient for bias");
+
+        // Verify gradients are finite
+        foreach (var g in new[] { grads[x], grads[w], grads[b] })
+            for (int i = 0; i < g.Length; i++)
+                Assert.False(float.IsNaN(g[i]) || float.IsInfinity(g[i]));
+    }
+
+    [Fact]
+    public void Integration_GradientCheckpointing_ProducesGradients()
+    {
+        using var tape = new GradientTape<float>();
+
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f }, [3]);
+
+        // Chain of operations with checkpointing
+        var functions = new List<Func<Tensor<float>, Tensor<float>>>
+        {
+            inp => _engine.TensorMultiplyScalar(inp, 2f),
+            inp => _engine.ReLU(inp),
+            inp => _engine.TensorMultiplyScalar(inp, 0.5f),
+        };
+
+        var output = GradientCheckpointing<float>.Checkpoint(functions, x, segmentSize: 2);
+
+        var grads = tape.ComputeGradients(output, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x), "Checkpointed forward should produce gradients");
+
+        // Verify gradient is finite and non-zero
+        for (int i = 0; i < grads[x].Length; i++)
+        {
+            Assert.False(float.IsNaN(grads[x][i]) || float.IsInfinity(grads[x][i]));
+        }
+    }
+
+    [Fact]
+    public void Integration_CompiledBackward_MatchesUncompiled()
+    {
+        // Compare compiled vs uncompiled backward
+        var x = new Tensor<float>(new float[] { 2f, 3f }, [2]);
+        var w = new Tensor<float>(new float[] { 0.5f, 1.5f }, [2]);
+
+        // Uncompiled
+        Dictionary<Tensor<float>, Tensor<float>> uncompiledGrads;
+        using (var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
+        {
+            var y = _engine.TensorMultiply(x, w);
+            uncompiledGrads = tape.ComputeGradients(y, sources: new[] { x, w });
+        }
+
+        // Compiled
+        Dictionary<Tensor<float>, Tensor<float>> compiledGrads;
+        using (var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
+        {
+            var y = _engine.TensorMultiply(x, w);
+            var compiled = tape.CompileBackward(y, sources: new[] { x, w });
+            compiledGrads = compiled.Execute();
+        }
+
+        // Should produce identical gradients
+        Assert.True(compiledGrads.ContainsKey(x));
+        Assert.True(compiledGrads.ContainsKey(w));
+        for (int i = 0; i < x.Length; i++)
+        {
+            Assert.Equal(uncompiledGrads[x][i], compiledGrads[x][i], 1e-6f);
+            Assert.Equal(uncompiledGrads[w][i], compiledGrads[w][i], 1e-6f);
+        }
+    }
 }
