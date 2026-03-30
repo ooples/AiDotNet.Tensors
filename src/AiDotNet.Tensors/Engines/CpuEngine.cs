@@ -20502,6 +20502,22 @@ public class CpuEngine : ITensorLevelEngine
             float* pR = (float*)pinR.Pointer;
             SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
+        else if (typeof(T) == typeof(double))
+        {
+            // Double SIMD backward (AVX2: 4 doubles per vector)
+            var gMem = AsDoubleMemory(gradOutput.Data);
+            var iMem = AsDoubleMemory(input.Data);
+            var rMem = AsDoubleMemory(resultTensor.Data);
+            using var pinG = gMem.Pin();
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            unsafe
+            {
+                SimdKernels.ReluBackwardDouble(
+                    (double*)pinG.Pointer, (double*)pinI.Pointer,
+                    (double*)pinR.Pointer, length);
+            }
+        }
         else
         {
             var gradData = gradOutput.GetDataArray();
@@ -20539,6 +20555,26 @@ public class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
+        // Double SIMD path
+        if (typeof(T) == typeof(double))
+        {
+            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
+            var gMem = AsDoubleMemory(gradOutput.Data);
+            var oMem = AsDoubleMemory(output.Data);
+            var rMem = AsDoubleMemory(resultTensor.Data);
+            using var pinG = gMem.Pin();
+            using var pinO = oMem.Pin();
+            using var pinR = rMem.Pin();
+            unsafe
+            {
+                SimdKernels.SigmoidBackwardDouble(
+                    (double*)pinG.Pointer, (double*)pinO.Pointer,
+                    (double*)pinR.Pointer, length);
+            }
+            return resultTensor;
+        }
+
+        // Generic scalar fallback
         var result = new T[length];
 
         for (int i = 0; i < length; i++)
@@ -20609,6 +20645,26 @@ public class CpuEngine : ITensorLevelEngine
             return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
         }
 
+        // Double SIMD path
+        if (typeof(T) == typeof(double))
+        {
+            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
+            var gMem = AsDoubleMemory(gradOutput.Data);
+            var oMem = AsDoubleMemory(output.Data);
+            var rMem = AsDoubleMemory(resultTensor.Data);
+            using var pinG = gMem.Pin();
+            using var pinO = oMem.Pin();
+            using var pinR = rMem.Pin();
+            unsafe
+            {
+                SimdKernels.TanhBackwardDouble(
+                    (double*)pinG.Pointer, (double*)pinO.Pointer,
+                    (double*)pinR.Pointer, length);
+            }
+            return resultTensor;
+        }
+
+        // Generic scalar fallback
         var result = new T[length];
 
         for (int i = 0; i < length; i++)
