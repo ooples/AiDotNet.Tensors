@@ -286,6 +286,47 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Compiles the backward graph for repeated execution on persistent tapes.
+    /// Dead node elimination removes entries not reachable from the loss tensor.
+    /// </summary>
+    /// <param name="loss">The loss tensor to differentiate.</param>
+    /// <param name="sources">Optional tensors to compute gradients for.</param>
+    /// <returns>A compiled backward graph that can be executed multiple times efficiently.</returns>
+    public CompiledBackwardGraph<T> CompileBackward(Tensor<T> loss, Tensor<T>[]? sources = null)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (!_options.Persistent)
+            throw new InvalidOperationException("CompileBackward requires a persistent tape.");
+        if (_entries.Count == 0)
+            throw new InvalidOperationException("Cannot compile: the tape has no recorded operations.");
+
+        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine);
+    }
+
+    /// <summary>
+    /// Computes gradients and applies them in a single pass.
+    /// Avoids the overhead of building a gradient dictionary then iterating it.
+    /// </summary>
+    /// <param name="loss">The loss tensor.</param>
+    /// <param name="parameters">Parameter tensors to update.</param>
+    /// <param name="learningRate">SGD learning rate.</param>
+    public void GradientAndUpdate(Tensor<T> loss, Tensor<T>[] parameters, T learningRate)
+    {
+        var grads = ComputeGradients(loss, sources: parameters);
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+
+        foreach (var param in parameters)
+        {
+            if (grads.TryGetValue(param, out var grad))
+            {
+                // In-place SGD: param -= lr * grad
+                for (int i = 0; i < param.Length && i < grad.Length; i++)
+                    param[i] = numOps.Subtract(param[i], numOps.Multiply(learningRate, grad[i]));
+            }
+        }
+    }
+
+    /// <summary>
     /// Disposes the tape and restores the parent tape (if any) as the current tape.
     /// </summary>
     public void Dispose()
