@@ -3017,18 +3017,20 @@ public class CpuEngine : ITensorLevelEngine
             if (OneDnnProvider.IsAvailable)
             {
                 if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
+                {
+                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
                     return;
+                }
             }
 #endif
 
-            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
+                if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
                 return;
             }
 
-            // Fallback: SimdKernels with parallel chunking for large arrays
             int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
             if (numChunks >= 2)
             {
@@ -3049,6 +3051,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
             }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, b, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
@@ -3120,6 +3123,7 @@ public class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
+                if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
                 return;
             }
 
@@ -3143,6 +3147,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
             }
+            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, b, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
@@ -4714,6 +4719,16 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
         var result = TensorAllocator.Rent<T>(outputShape);
 
+        // When tape is active, use WithIndices variant so backward can access max indices
+        var tape = GradientTape<T>.Current;
+        if (tape is not null)
+        {
+            var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
+            DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, input, BackwardFunctions<T>.MaxPool2DBackward,
+                new object[] { maxIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
+            return resultWithIdx;
+        }
+
         // Float fast path: direct array access with specialized inner loops
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
         {
@@ -4853,6 +4868,8 @@ public class CpuEngine : ITensorLevelEngine
                     }
                 }
             });
+            DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
+                new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             return result;
         }
 
@@ -4892,6 +4909,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
+            new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
         return result;
     }
 
@@ -5794,6 +5813,11 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
+        Tensor<T>? savedInput = null;
+        var sigTape = GradientTape<T>.Current;
+        if (sigTape is not null && sigTape.Options.RecordInPlace)
+            savedInput = tensor.Clone();
+
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
@@ -5804,13 +5828,16 @@ public class CpuEngine : ITensorLevelEngine
                 fixed (float* ptr = segment.Array)
                 {
                     if (OneDnnProvider.TrySigmoid(ptr, tensor.Length))
+                    {
+                        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
                         return;
+                    }
                 }
             }
         }
 
-        // Fallback: Sigmoid is compute-bound, so parallel chunking helps for large arrays
         SigmoidParallel(tensor);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
     public void SigmoidInPlace<T>(Tensor<T> tensor)
@@ -5819,7 +5846,13 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
+        Tensor<T>? savedInput = null;
+        var sigTape = GradientTape<T>.Current;
+        if (sigTape is not null && sigTape.Options.RecordInPlace)
+            savedInput = tensor.Clone();
+
         SigmoidParallel(tensor);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #endif
 
@@ -6009,6 +6042,11 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
+        Tensor<T>? savedInput = null;
+        var reluTape = GradientTape<T>.Current;
+        if (reluTape is not null && reluTape.Options.RecordInPlace)
+            savedInput = tensor.Clone();
+
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
@@ -6019,12 +6057,16 @@ public class CpuEngine : ITensorLevelEngine
                 fixed (float* ptr = segment.Array)
                 {
                     if (OneDnnProvider.TryReLU(ptr, tensor.Length))
+                    {
+                        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
                         return;
+                    }
                 }
             }
         }
 
         ReLUParallel(tensor);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
     public void ReLUInPlace<T>(Tensor<T> tensor)
@@ -6033,7 +6075,13 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
+        Tensor<T>? savedInput = null;
+        var reluTape = GradientTape<T>.Current;
+        if (reluTape is not null && reluTape.Options.RecordInPlace)
+            savedInput = tensor.Clone();
+
         ReLUParallel(tensor);
+        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #endif
 
