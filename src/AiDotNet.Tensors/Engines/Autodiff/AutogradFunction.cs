@@ -50,9 +50,17 @@ public abstract class AutogradFunction<T>
     public Tensor<T> Apply(params Tensor<T>[] inputs)
     {
         var ctx = new AutogradContext();
-        var output = Forward(ctx, inputs);
 
-        // Record on active tape using the Backward method as the backward function
+        // Suppress tape recording during Forward to prevent double-recording:
+        // The custom function's forward ops would otherwise record to the tape,
+        // AND we record the custom function itself — resulting in double gradients.
+        Tensor<T> output;
+        using (GradientTape<T>.NoGrad())
+        {
+            output = Forward(ctx, inputs);
+        }
+
+        // Record the custom function as a single opaque op on the tape
         DifferentiableOps.RecordIfActive(GetType().Name, output, inputs,
             (gradOutput, inp, outp, savedState, engine, grads) =>
             {

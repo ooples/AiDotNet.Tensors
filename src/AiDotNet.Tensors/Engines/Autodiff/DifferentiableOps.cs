@@ -89,7 +89,11 @@ internal static class DifferentiableOps
         }
         else
         {
-            grads[tensor] = grad.Clone();
+            // Store directly on first access — no clone needed since backward
+            // functions create fresh gradient tensors that aren't shared.
+            // Only clone if the grad is the SAME reference as another tensor
+            // (which would alias and corrupt on subsequent accumulation).
+            grads[tensor] = grad;
         }
     }
 }

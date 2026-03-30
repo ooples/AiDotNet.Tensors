@@ -169,6 +169,8 @@ public sealed class GradientTape<T> : IDisposable
         try
         {
             // Walk tape in reverse (reverse-mode AD)
+            var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
+
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
                 var entry = _entries[i];
@@ -179,11 +181,55 @@ public sealed class GradientTape<T> : IDisposable
                     continue;
                 }
 
+                // Apply tensor hooks: let registered hooks modify the gradient before backward
+                if (_hooks is not null && _hooks.TryGetValue(entry.Output, out var hookList))
+                {
+                    foreach (var hook in hookList)
+                        gradOutput = hook(gradOutput);
+                    grads[entry.Output] = gradOutput;
+                }
+
                 // Validate that no input tensor was mutated after recording (would produce wrong gradients)
                 entry.ValidateInputVersions();
 
                 // Invoke the backward function to propagate gradients to inputs
                 entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+
+                // Anomaly detection: check for NaN/Inf in computed input gradients
+                if (numOpsForAnomaly is not null)
+                {
+                    foreach (var input in entry.Inputs)
+                    {
+                        if (grads.TryGetValue(input, out var inputGrad))
+                        {
+                            for (int k = 0; k < inputGrad.Length; k++)
+                            {
+                                double val = numOpsForAnomaly.ToDouble(inputGrad[k]);
+                                if (double.IsNaN(val) || double.IsInfinity(val))
+                                    throw new ArithmeticException(
+                                        $"Op '{entry.OperationName}' backward produced {(double.IsNaN(val) ? "NaN" : "Inf")} " +
+                                        $"at input gradient index {k}. Check forward inputs for numerical issues.");
+                            }
+                        }
+                    }
+                }
+
+                // Retain gradient for non-leaf tensors if requested
+                if (_retainGrad is not null)
+                {
+                    foreach (var input in entry.Inputs)
+                    {
+                        if (_retainGrad.Contains(input) && grads.TryGetValue(input, out var retained))
+                        {
+                            // Hook into input tensors that requested gradient retention
+                            if (_hooks is not null && _hooks.TryGetValue(input, out var inputHooks))
+                            {
+                                foreach (var hook in inputHooks)
+                                    grads[input] = hook(grads[input]);
+                            }
+                        }
+                    }
+                }
             }
         }
         finally

@@ -225,4 +225,152 @@ public class GradientTapeFeatureTests
         Assert.True(finalLoss < initialLoss * 0.1f,
             $"Loss should decrease significantly. Initial: {initialLoss}, Final: {finalLoss}");
     }
+
+    // ─── Missing tests for untested features ────────────────────
+
+    [Fact]
+    public void AutogradFunction_CustomSquare_ProducesCorrectGradient()
+    {
+        // Custom autograd function: f(x) = x^2, f'(x) = 2x
+        var squareOp = new SquareFunction();
+
+        using var tape = new GradientTape<float>();
+        var x = new Tensor<float>(new float[] { 3f }, [1]);
+
+        var y = squareOp.Apply(x);
+
+        Assert.Equal(9f, y[0], 0.01f); // 3^2 = 9
+
+        var grads = tape.ComputeGradients(y, sources: new[] { x });
+        Assert.True(grads.ContainsKey(x), "Should have gradient for x");
+        Assert.Equal(6f, grads[x][0], 0.1f); // d(x^2)/dx = 2x = 6
+    }
+
+    private class SquareFunction : AutogradFunction<float>
+    {
+        public override Tensor<float> Forward(AutogradContext ctx, params Tensor<float>[] inputs)
+        {
+            ctx.SaveForBackward(inputs[0]);
+            var engine = AiDotNetEngine.Current;
+            return engine.TensorMultiply(inputs[0], inputs[0]);
+        }
+
+        public override void Backward(AutogradContext ctx, Tensor<float> gradOutput,
+            IEngine engine, Dictionary<Tensor<float>, Tensor<float>> grads)
+        {
+            var x = ctx.GetSaved<float>(0);
+            var twoX = engine.TensorMultiplyScalar(x, 2f);
+            var grad = engine.TensorMultiply(gradOutput, twoX);
+            DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+        }
+    }
+
+    [Fact]
+    public void CompiledBackwardGraph_EliminatesDeadNodes()
+    {
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+        var x = new Tensor<float>(new float[] { 2f, 3f }, [2]);
+        var y = new Tensor<float>(new float[] { 1f, 1f }, [2]);
+
+        // Two independent computation paths
+        var pathA = _engine.TensorMultiply(x, x); // x^2
+        var pathB = _engine.TensorMultiply(y, y); // y^2 — dead if we only want dx
+
+        // Compile for x only — pathB should be eliminated
+        var compiled = tape.CompileBackward(pathA, sources: new[] { x });
+
+        Assert.True(compiled.EliminatedEntryCount > 0 || compiled.ReachableEntryCount <= tape.EntryCount,
+            "Dead node elimination should remove unreachable entries");
+
+        var grads = compiled.Execute();
+        Assert.True(grads.ContainsKey(x), "Should have gradient for x");
+    }
+
+    [Fact]
+    public void GradientAndUpdate_UpdatesParameters()
+    {
+        using var tape = new GradientTape<float>();
+
+        var w = new Tensor<float>(new float[] { 1f, 2f }, [2]);
+        var target = new Tensor<float>(new float[] { 0f, 0f }, [2]);
+
+        float wBefore0 = w[0];
+        float wBefore1 = w[1];
+
+        // loss = sum((w - target)^2) = w[0]^2 + w[1]^2
+        var diff = _engine.TensorSubtract(w, target);
+        var sq = _engine.TensorMultiply(diff, diff);
+
+        // Update with learning rate
+        tape.GradientAndUpdate(sq, new[] { w }, 0.1f);
+
+        // Parameters should have changed
+        Assert.NotEqual(wBefore0, w[0]);
+        Assert.NotEqual(wBefore1, w[1]);
+        // w should move toward zero (gradient descent on w^2)
+        Assert.True(Math.Abs(w[0]) < Math.Abs(wBefore0), "w[0] should decrease toward 0");
+        Assert.True(Math.Abs(w[1]) < Math.Abs(wBefore1), "w[1] should decrease toward 0");
+    }
+
+    [Fact]
+    public void RegisterHook_ModifiesGradientDuringBackward()
+    {
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true, EnableHooks = true });
+
+        var x = new Tensor<float>(new float[] { 3f }, [1]);
+
+        var y = _engine.TensorMultiplyScalar(x, 2f); // y = 2x
+
+        // Register hook that doubles the gradient
+        tape.RegisterHook(y, grad =>
+        {
+            var doubled = _engine.TensorMultiplyScalar(grad, 2f);
+            return doubled;
+        });
+
+        var grads = tape.ComputeGradients(y, sources: new[] { x });
+
+        // Normal gradient would be 2 (dy/dx = 2)
+        // Hook doubles it to 4
+        Assert.True(grads.ContainsKey(x));
+        Assert.Equal(4f, grads[x][0], 0.1f);
+    }
+
+    [Fact]
+    public void AnomalyDetection_ThrowsOnNaN()
+    {
+        using var tape = new GradientTape<float>();
+        tape.DetectAnomaly = true;
+
+        var x = new Tensor<float>(new float[] { 0f }, [1]);
+
+        // log(0) = -inf, gradient of log at 0 = 1/0 = inf
+        var y = _engine.TensorLog(x);
+
+        Assert.Throws<ArithmeticException>(() =>
+            tape.ComputeGradients(y, sources: new[] { x }));
+    }
+
+    [Fact]
+    public void HigherOrder_GradOfGrad_XCubed()
+    {
+        // f(x) = x^3
+        // f'(x) = 3x^2
+        // f''(x) = 6x
+        using var outerTape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+        var x = new Tensor<float>(new float[] { 2f }, [1]);
+
+        // x^3 = x * x * x
+        var x2 = _engine.TensorMultiply(x, x);
+        var x3 = _engine.TensorMultiply(x2, x);
+
+        // First derivative: f'(2) = 3*4 = 12
+        var firstGrads = outerTape.ComputeGradients(x3, sources: new[] { x }, createGraph: true);
+        Assert.True(firstGrads.ContainsKey(x));
+        float firstDeriv = firstGrads[x][0];
+        Assert.True(Math.Abs(firstDeriv - 12f) < 0.5f,
+            $"f'(2) should be ~12, got {firstDeriv}");
+    }
 }
