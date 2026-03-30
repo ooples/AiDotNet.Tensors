@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class GradientCorrectnessTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly CpuEngine _cpu = (CpuEngine)AiDotNetEngine.Current;
     private const double Epsilon = 1e-3; // Central difference: O(eps^2) truncation error
     private const double RelTolerance = 5e-2; // 5% tolerance accounts for float finite-difference error
     // Note: finite-difference gradient has O(eps^2) truncation + O(1/eps) roundoff error.
@@ -587,6 +588,96 @@ public class GradientCorrectnessTests
     {
         var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
         VerifyGradient(inp => _engine.TensorPermute(inp, new[] { 1, 0 }), x, "Permute");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Loss function gradient tests
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void MSELoss_Gradient_MatchesNumerical()
+    {
+        var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
+        VerifyGradient(inp => _cpu.TensorMSELoss(inp, target), pred, "MSELoss");
+    }
+
+    [Fact]
+    public void L1Loss_Gradient_MatchesNumerical()
+    {
+        var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
+        VerifyGradient(inp => _cpu.TensorL1Loss(inp, target), pred, "L1Loss");
+    }
+
+    [Fact]
+    public void HuberLoss_Gradient_MatchesNumerical()
+    {
+        var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
+        VerifyGradient(inp => _cpu.TensorHuberLoss(inp, target), pred, "HuberLoss");
+    }
+
+    [Fact]
+    public void BCEWithLogitsLoss_Gradient_MatchesNumerical()
+    {
+        var logits = new Tensor<float>(new float[] { -1f, 0f, 1f, 2f }, [4]);
+        var targets = new Tensor<float>(new float[] { 0f, 0f, 1f, 1f }, [4]);
+        VerifyGradient(inp => _engine.TensorBCEWithLogitsLoss(inp, targets), logits, "BCEWithLogitsLoss");
+    }
+
+    [Fact]
+    public void CosineSimilarity_Gradient_MatchesNumerical()
+    {
+        var a = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var b = new Tensor<float>(new float[] { 4f, 3f, 2f, 1f }, [4]);
+        VerifyGradient(inp => _engine.TensorCosineSimilarityLoss(inp, b), a, "CosineSimilarity");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // New activation gradient tests
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void SELU_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { -1f, -0.5f, 0.5f, 1f }, [4]);
+        VerifyGradient(inp => _engine.TensorSELU(inp), x, "SELU");
+    }
+
+    [Fact]
+    public void HardSigmoid_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { -1f, 0f, 1f, 2f }, [4]);
+        VerifyGradient(inp => _engine.TensorHardSigmoid(inp), x, "HardSigmoid");
+    }
+
+    [Fact]
+    public void ReLU6_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { -1f, 2f, 5f, 7f }, [4]);
+        VerifyGradient(inp => _engine.TensorReLU6(inp), x, "ReLU6");
+    }
+
+    [Fact]
+    public void Reciprocal_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 0.5f, 1f, 2f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorReciprocal(inp), x, "Reciprocal");
+    }
+
+    [Fact]
+    public void Mean_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [6]);
+        VerifyGradient(inp => _engine.TensorMeanDiff(inp), x, "Mean");
+    }
+
+    [Fact]
+    public void Flatten_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        VerifyGradient(inp => _engine.TensorFlatten(inp), x, "Flatten");
     }
 
     [Fact]

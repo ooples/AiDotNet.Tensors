@@ -1965,6 +1965,177 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             }
     }
 
+    public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (!_kernelCache.TryGetValue("relu6", out var krnl)) throw new InvalidOperationException("HIP kernel not found: relu6");
+        IntPtr _p0 = A.Handle; IntPtr _p1 = B.Handle;
+        void** args = stackalloc void*[3]; args[0] = &_p0; args[1] = &_p1; args[2] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("relu6_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: relu6_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu");
+        IntPtr _p0 = input.Handle; IntPtr _p1 = alpha.Handle; IntPtr _p2 = output.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size; args[4] = &alphaSize;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu_backward_input", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_input");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = alpha.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &alphaSize;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradAlpha.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size; args[4] = &alphaSize;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue("rrelu", out var krnl)) throw new InvalidOperationException("HIP kernel not found: rrelu");
+        IntPtr _p0 = input.Handle; IntPtr _p1 = noise.Handle; IntPtr _p2 = output.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("rrelu_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: rrelu_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = noise.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
+    {
+        if (!_kernelCache.TryGetValue("threshold_forward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: threshold_forward");
+        IntPtr _p0 = input.Handle; IntPtr _p1 = output.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &threshold; args[3] = &value; args[4] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
+    {
+        if (!_kernelCache.TryGetValue("threshold_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: threshold_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &threshold; args[4] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("reciprocal_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: reciprocal_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+        if (!_kernelCache.TryGetValue("l1_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: l1_loss");
+        IntPtr _p0 = predictions.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numFeatures;
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
+    {
+        if (!_kernelCache.TryGetValue("huber_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: huber_loss");
+        IntPtr _p0 = predictions.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
+        void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numFeatures; args[5] = &delta;
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
+    {
+        if (!_kernelCache.TryGetValue("bce_with_logits_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bce_with_logits_loss");
+        IntPtr _p0 = logits.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+    {
+        if (!_kernelCache.TryGetValue("nll_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: nll_loss");
+        IntPtr _p0 = logProbs.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
+        void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numClasses;
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
+    {
+        if (!_kernelCache.TryGetValue("kl_div_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: kl_div_loss");
+        IntPtr _p0 = input.Handle; IntPtr _p1 = target.Handle; IntPtr _p2 = loss.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("mse_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: mse_loss_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("l1_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: l1_loss_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
+    {
+        if (!_kernelCache.TryGetValue("huber_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: huber_loss_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[7]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN; args[6] = &delta;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
+    public unsafe void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("bce_with_logits_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bce_with_logits_backward");
+        IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = logits.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
+        void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
     #region Trigonometric Operations
 
     public void Sin(IGpuBuffer A, IGpuBuffer B, int size)

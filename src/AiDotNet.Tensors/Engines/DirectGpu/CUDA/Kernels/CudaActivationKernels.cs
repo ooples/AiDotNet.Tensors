@@ -313,6 +313,110 @@ extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const floa
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
+// ===========================================================================
+// ReLU6 forward: min(max(0, x), 6)
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void relu6(const float* __restrict__ input, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    output[idx] = fminf(fmaxf(x, 0.0f), 6.0f);
+}
+
+// ReLU6 backward: grad * (0 < x < 6 ? 1 : 0)
+extern ""C"" __global__ __launch_bounds__(256) void relu6_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = (x > 0.0f && x < 6.0f) ? gradOutput[idx] : 0.0f;
+}
+
+// ===========================================================================
+// PReLU forward: max(0,x) + alpha * min(0,x) where alpha is per-channel
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void prelu(const float* __restrict__ input, const float* __restrict__ alpha, float* __restrict__ output, int size, int alphaSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float a = alpha[idx % alphaSize];
+    output[idx] = x >= 0.0f ? x : a * x;
+}
+
+// PReLU backward: d/dx = (x >= 0) ? grad : alpha * grad; d/dalpha = (x < 0) ? x * grad : 0
+extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_input(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ alpha, float* __restrict__ gradInput, int size, int alphaSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float a = alpha[idx % alphaSize];
+    gradInput[idx] = x >= 0.0f ? gradOutput[idx] : a * gradOutput[idx];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_alpha(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradAlpha, int size, int alphaSize)
+{
+    // Atomic add for per-channel alpha gradient accumulation
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    if (x < 0.0f) {
+        int alphaIdx = idx % alphaSize;
+        atomicAdd(&gradAlpha[alphaIdx], x * gradOutput[idx]);
+    }
+}
+
+// ===========================================================================
+// RReLU forward: x >= 0 ? x : noise[i] * x
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void rrelu(const float* __restrict__ input, const float* __restrict__ noise, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    output[idx] = x >= 0.0f ? x : noise[idx] * x;
+}
+
+// RReLU backward: grad * (x >= 0 ? 1 : noise[i])
+extern ""C"" __global__ __launch_bounds__(256) void rrelu_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ noise, float* __restrict__ gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = gradOutput[idx] * (x >= 0.0f ? 1.0f : noise[idx]);
+}
+
+// ===========================================================================
+// Threshold: x > threshold ? x : value
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void threshold_forward(const float* __restrict__ input, float* __restrict__ output, float thresh, float val, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    output[idx] = x > thresh ? x : val;
+}
+
+// Threshold backward: grad * (x > threshold ? 1 : 0)
+extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, float thresh, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
+}
+
+// ===========================================================================
+// Reciprocal backward: d(1/x)/dx = -1/x^2
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = -gradOutput[idx] / (x * x);
+}
+
 // Warp-level reduction helpers for maximum performance
 __device__ __forceinline__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -1060,6 +1164,17 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "selu_backward",
                 "hardsigmoid_backward",
                 "hardtanh_backward",
+                // New activation forward + backward
+                "relu6",
+                "relu6_backward",
+                "prelu",
+                "prelu_backward_input",
+                "prelu_backward_alpha",
+                "rrelu",
+                "rrelu_backward",
+                "threshold_forward",
+                "threshold_backward",
+                "reciprocal_backward",
                 // Element-wise binary
                 "add_vectors",
                 "subtract_vectors",

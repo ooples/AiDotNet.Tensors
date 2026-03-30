@@ -52,11 +52,65 @@ __kernel void gaussian_noise(__global float* output, int size, float mean, float
     float u2 = (float)(c2 >> 8) * (1.0f / 16777216.0f);
     output[idx] = mean + stdDev * sqrt(-2.0f * log(u1)) * cos(2.0f * 3.14159265358979323846f * u2);
 }
+__kernel void l1_loss(__global const float* predictions, __global const float* targets, __global float* loss, int batchSize, int numFeatures) {
+    int b = get_global_id(0); if (b >= batchSize) return;
+    float sum_abs = 0.0f;
+    for (int f = 0; f < numFeatures; f++) sum_abs += fabs(predictions[b * numFeatures + f] - targets[b * numFeatures + f]);
+    loss[b] = sum_abs / (float)numFeatures;
+}
+__kernel void huber_loss(__global const float* predictions, __global const float* targets, __global float* loss, int batchSize, int numFeatures, float delta) {
+    int b = get_global_id(0); if (b >= batchSize) return;
+    float sum = 0.0f;
+    for (int f = 0; f < numFeatures; f++) {
+        float diff = predictions[b * numFeatures + f] - targets[b * numFeatures + f];
+        float ad = fabs(diff);
+        sum += (ad <= delta) ? (0.5f * diff * diff) : (delta * (ad - 0.5f * delta));
+    }
+    loss[b] = sum / (float)numFeatures;
+}
+__kernel void bce_with_logits_loss(__global const float* logits, __global const float* targets, __global float* loss, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float x = logits[idx]; float t = targets[idx]; float ax = fabs(x);
+    loss[idx] = fmax(x, 0.0f) - x * t + log1p(exp(-ax));
+}
+__kernel void nll_loss(__global const float* logProbs, __global const int* targets, __global float* loss, int batchSize, int numClasses) {
+    int b = get_global_id(0); if (b >= batchSize) return;
+    int tc = targets[b];
+    loss[b] = (tc >= 0 && tc < numClasses) ? -logProbs[b * numClasses + tc] : 0.0f;
+}
+__kernel void kl_div_loss(__global const float* input, __global const float* target, __global float* loss, int size) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float t = target[idx];
+    loss[idx] = (t > 0.0f) ? t * (log(t) - input[idx]) : 0.0f;
+}
+__kernel void mse_loss_backward(__global const float* gradOutput, __global const float* predictions, __global const float* targets, __global float* gradInput, int size, float inv_n) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    gradInput[idx] = gradOutput[0] * 2.0f * (predictions[idx] - targets[idx]) * inv_n;
+}
+__kernel void l1_loss_backward(__global const float* gradOutput, __global const float* predictions, __global const float* targets, __global float* gradInput, int size, float inv_n) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float diff = predictions[idx] - targets[idx];
+    float s = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+    gradInput[idx] = gradOutput[0] * s * inv_n;
+}
+__kernel void huber_loss_backward(__global const float* gradOutput, __global const float* predictions, __global const float* targets, __global float* gradInput, int size, float inv_n, float delta) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float diff = predictions[idx] - targets[idx]; float ad = fabs(diff);
+    float grad = (ad <= delta) ? diff : (delta * ((diff > 0.0f) ? 1.0f : -1.0f));
+    gradInput[idx] = gradOutput[0] * grad * inv_n;
+}
+__kernel void bce_with_logits_backward(__global const float* gradOutput, __global const float* logits, __global const float* targets, __global float* gradInput, int size, float inv_n) {
+    int idx = get_global_id(0); if (idx >= size) return;
+    float sig = 1.0f / (1.0f + exp(-logits[idx]));
+    gradInput[idx] = gradOutput[0] * (sig - targets[idx]) * inv_n;
+}
 ";
     }
 
     public static string[] GetKernelNames()
     {
-        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "gaussian_noise" };
+        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "gaussian_noise",
+            "l1_loss", "huber_loss", "bce_with_logits_loss", "nll_loss", "kl_div_loss",
+            "mse_loss_backward", "l1_loss_backward", "huber_loss_backward", "bce_with_logits_backward" };
     }
 }

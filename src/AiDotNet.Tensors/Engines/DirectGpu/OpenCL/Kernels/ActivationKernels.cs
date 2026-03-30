@@ -1035,6 +1035,59 @@ __kernel void hardtanh_backward(
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
+// ReLU6: min(max(0, x), 6)
+__kernel void relu6(__global const float* input, __global float* output, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; output[idx] = fmin(fmax(x, 0.0f), 6.0f);
+}
+__kernel void relu6_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; gradInput[idx] = (x > 0.0f && x < 6.0f) ? gradOutput[idx] : 0.0f;
+}
+// PReLU
+__kernel void prelu(__global const float* input, __global const float* alpha, __global float* output, const int size, const int alphaSize)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; float a = alpha[idx % alphaSize];
+    output[idx] = x >= 0.0f ? x : a * x;
+}
+__kernel void prelu_backward_input(__global const float* gradOutput, __global const float* input, __global const float* alpha, __global float* gradInput, const int size, const int alphaSize)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; float a = alpha[idx % alphaSize];
+    gradInput[idx] = x >= 0.0f ? gradOutput[idx] : a * gradOutput[idx];
+}
+// RReLU
+__kernel void rrelu(__global const float* input, __global const float* noise, __global float* output, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; output[idx] = x >= 0.0f ? x : noise[idx] * x;
+}
+__kernel void rrelu_backward(__global const float* gradOutput, __global const float* input, __global const float* noise, __global float* gradInput, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; gradInput[idx] = gradOutput[idx] * (x >= 0.0f ? 1.0f : noise[idx]);
+}
+// Threshold
+__kernel void threshold_forward(__global const float* input, __global float* output, const float thresh, const float val, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    output[idx] = input[idx] > thresh ? input[idx] : val;
+}
+__kernel void threshold_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const float thresh, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
+}
+// Reciprocal backward: -1/x^2
+__kernel void reciprocal_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; gradInput[idx] = -gradOutput[idx] / (x * x);
+}
+
 // ============================================================================
 // Single-kernel fused softmax for large rows.
 // All workgroups cooperate within ONE kernel launch:
@@ -1258,6 +1311,11 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "relu_backward", "leaky_relu_backward", "sigmoid_backward", "tanh_backward",
                 "gelu_backward", "swish_backward", "mish_backward", "softplus_backward",
                 "hardswish_backward", "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
+                "relu6", "relu6_backward",
+                "prelu", "prelu_backward_input",
+                "rrelu", "rrelu_backward",
+                "threshold_forward", "threshold_backward",
+                "reciprocal_backward",
                 // Element-wise binary
                 "add_vectors", "subtract_vectors", "multiply_vectors",
                 "divide_vectors", "min_vectors", "max_vectors",
