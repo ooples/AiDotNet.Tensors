@@ -7977,7 +7977,11 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, input, kernel,
+            BackwardFunctions<T>.ConvTranspose2DBackward,
+            savedState: new object[] { stride, padding });
+        return convTransResult;
     }
 
     /// <inheritdoc/>
@@ -17418,7 +17422,11 @@ public class CpuEngine : ITensorLevelEngine
         if (tensors == null || tensors.Length == 0)
             throw new ArgumentNullException(nameof(tensors));
 
-        return Tensor<T>.Concatenate(tensors, axis);
+        var result = Tensor<T>.Concatenate(tensors, axis);
+        DifferentiableOps.RecordIfActive("Concatenate", result, tensors,
+            BackwardFunctions<T>.ConcatenateBackward,
+            savedState: new object[] { axis });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -20404,7 +20412,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
+        var softplusResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
+        DifferentiableOps.RecordUnary("Softplus", softplusResult, input,
+            BackwardFunctions<T>.SoftplusBackward);
+        return softplusResult;
     }
 
     /// <inheritdoc/>
@@ -20435,7 +20446,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
+        var hardSwishResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
+        DifferentiableOps.RecordUnary("HardSwish", hardSwishResult, input,
+            BackwardFunctions<T>.HardSwishBackward);
+        return hardSwishResult;
     }
 
     /// <inheritdoc/>
