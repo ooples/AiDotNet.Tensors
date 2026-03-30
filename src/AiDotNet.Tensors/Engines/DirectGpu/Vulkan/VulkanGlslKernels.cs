@@ -1102,6 +1102,21 @@ void main() {
     gradIn[idx] = x >= 0.0 ? gradOut[idx] : a * gradOut[idx];
 }";
 
+    public static string PReluBackwardAlpha => Header + @"
+layout(set = 0, binding = 0) readonly buffer GO { float gradOut[]; };
+layout(set = 0, binding = 1) readonly buffer INP { float inp[]; };
+layout(set = 0, binding = 2) writeonly buffer GA { float gradAlpha[]; };
+layout(push_constant) uniform Params { uint size; uint alphaSize; };
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= alphaSize) return;
+    float sum = 0.0;
+    for (uint i = c; i < size; i += alphaSize) {
+        if (inp[i] < 0.0) sum += inp[i] * gradOut[i];
+    }
+    gradAlpha[c] = sum;
+}";
+
     public static string RRelu => Header + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {

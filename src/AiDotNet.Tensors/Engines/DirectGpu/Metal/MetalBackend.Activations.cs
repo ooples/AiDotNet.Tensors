@@ -573,14 +573,19 @@ public sealed partial class MetalBackend
 
     public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        // Atomic reduction across elements — not easily parallelizable per-element on Metal.
-        // Use CPU path for alpha gradient accumulation (small buffer).
         ThrowIfDisposed();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var ga = new float[alphaSize];
-        for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
-        UploadToBuffer(gradAlpha, ga);
+        if (gradOutput is not MetalGpuBuffer goBuffer || input is not MetalGpuBuffer iBuffer || gradAlpha is not MetalGpuBuffer gaBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "prelu_backward_alpha");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(alphaSize);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(iBuffer, 1);
+        encoder.SetBuffer(gaBuffer, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.SetBytes((uint)alphaSize, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)

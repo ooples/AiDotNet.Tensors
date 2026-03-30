@@ -1789,6 +1789,40 @@ fn rrelu_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// PReLU alpha backward: segmented reduction (3 buffers: gradOut, input, gradAlpha).
+    /// One thread per alpha channel, loops over its segment.
+    /// </summary>
+    public const string PReluAlphaBackwardSource = @"
+@group(0) @binding(0) var<storage, read> pab_grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> pab_input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pab_grad_alpha: array<f32>;
+
+struct PABParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: u32,
+    pad2: u32,
+}
+@group(0) @binding(3) var<uniform> pab_params: PABParams;
+
+@compute @workgroup_size(256)
+fn prelu_backward_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= pab_params.alpha_size) { return; }
+    var sum: f32 = 0.0;
+    var i: u32 = c;
+    loop {
+        if (i >= pab_params.size) { break; }
+        if (pab_input[i] < 0.0) {
+            sum += pab_input[i] * pab_grad_out[i];
+        }
+        i += pab_params.alpha_size;
+    }
+    pab_grad_alpha[c] = sum;
+}
+";
+
+    /// <summary>
     /// Loss function backward pass kernels.
     /// </summary>
     public const string LossBackwardSource = @"

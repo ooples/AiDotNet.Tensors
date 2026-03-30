@@ -7759,11 +7759,13 @@ KERNEL VARIANTS (A/B testing):
 
         public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
         {
-            // Atomic reduction not available in all OpenCL - use CPU path
-            var go = DownloadBuffer(gradOutput); var inp = DownloadBuffer(input);
-            var ga = new float[alphaSize];
-            for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
-            ((DirectOpenClGpuBuffer)gradAlpha).Buffer.CopyFromHost(ga);
+            var k = _kernelCache["prelu_backward_alpha"]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradAlpha).Buffer.Handle);
+            k.SetArg(arg++, size);
+            k.SetArg(arg++, alphaSize);
+            k.Execute1D(alphaSize, Math.Min(256, alphaSize));
         }
 
         public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)

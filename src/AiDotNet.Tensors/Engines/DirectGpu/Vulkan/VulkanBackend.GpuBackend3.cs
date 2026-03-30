@@ -368,12 +368,9 @@ public sealed unsafe partial class VulkanBackend
 
     public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var inp = DownloadBuffer(input);
-        var ga = new float[alphaSize];
-        for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
-        UploadToBuffer(ga, gradAlpha);
+        // Segmented reduction: one thread per alpha channel, loops over its segment
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslBinaryOp(VulkanGlslKernels.PReluBackwardAlpha, gradOutput, input, gradAlpha, alphaSize, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)

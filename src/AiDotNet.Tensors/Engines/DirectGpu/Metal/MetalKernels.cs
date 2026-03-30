@@ -880,6 +880,26 @@ kernel void prelu_backward_input(
     }
 }
 
+// PReLU backward for alpha: segmented reduction, one thread per alpha channel
+kernel void prelu_backward_alpha(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradAlpha [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    constant uint& alphaSize [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < alphaSize) {
+        float sum = 0.0f;
+        for (uint i = gid; i < size; i += alphaSize) {
+            if (input[i] < 0.0f) {
+                sum += input[i] * gradOutput[i];
+            }
+        }
+        gradAlpha[gid] = sum;
+    }
+}
+
 // L1 Loss element-wise
 kernel void l1_loss_elementwise(
     device const float* predictions [[buffer(0)]],

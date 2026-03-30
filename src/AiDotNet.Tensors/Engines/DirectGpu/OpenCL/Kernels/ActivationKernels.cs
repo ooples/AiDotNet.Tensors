@@ -1059,6 +1059,16 @@ __kernel void prelu_backward_input(__global const float* gradOutput, __global co
     float x = input[idx]; float a = alpha[idx % alphaSize];
     gradInput[idx] = x >= 0.0f ? gradOutput[idx] : a * gradOutput[idx];
 }
+// PReLU backward alpha: segmented reduction, one workitem per alpha channel
+__kernel void prelu_backward_alpha(__global const float* gradOutput, __global const float* input, __global float* gradAlpha, const int size, const int alphaSize)
+{
+    const int c = get_global_id(0); if (c >= alphaSize) return;
+    float sum = 0.0f;
+    for (int i = c; i < size; i += alphaSize) {
+        if (input[i] < 0.0f) sum += input[i] * gradOutput[i];
+    }
+    gradAlpha[c] = sum;
+}
 // RReLU
 __kernel void rrelu(__global const float* input, __global const float* noise, __global float* output, const int size)
 {
@@ -1312,7 +1322,7 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "gelu_backward", "swish_backward", "mish_backward", "softplus_backward",
                 "hardswish_backward", "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
                 "relu6", "relu6_backward",
-                "prelu", "prelu_backward_input",
+                "prelu", "prelu_backward_input", "prelu_backward_alpha",
                 "rrelu", "rrelu_backward",
                 "threshold_forward", "threshold_backward",
                 "reciprocal_backward",

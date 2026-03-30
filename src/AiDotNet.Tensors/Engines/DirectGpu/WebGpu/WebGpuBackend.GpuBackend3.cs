@@ -377,12 +377,9 @@ public sealed partial class WebGpuBackend
 
     public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
-        // Atomic reduction across elements — not parallelizable per-element on WebGPU
-        // This accumulates x*grad into alpha gradient bins which requires atomic add
-        var go = DownloadBuffer(gradOutput); var inp = DownloadBuffer(input);
-        var ga = new float[alphaSize];
-        for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
-        UploadToBuffer(ga, gradAlpha);
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch3BufferAsync("PReluAlphaBackward", WebGpuKernels.PReluAlphaBackwardSource, "prelu_backward_alpha",
+            gradOutput, input, gradAlpha, uniformParams, alphaSize).GetAwaiter().GetResult();
     }
 
     public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
