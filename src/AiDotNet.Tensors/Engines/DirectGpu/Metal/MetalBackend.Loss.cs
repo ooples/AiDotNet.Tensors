@@ -837,28 +837,36 @@ public sealed partial class MetalBackend
     public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
         ThrowIfDisposed();
-        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0; for (int f = 0; f < numFeatures; f++) sum += MathF.Abs(p[b * numFeatures + f] - t[b * numFeatures + f]);
-            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
-        }
-        UploadToBuffer(loss, l);
+        if (predictions is not MetalGpuBuffer pBuffer || targets is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer lBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "l1_loss_batch");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(pBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(lBuffer, 2);
+        encoder.SetBytes((uint)batchSize, 3);
+        encoder.SetBytes((uint)numFeatures, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
         ThrowIfDisposed();
-        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            float sum = 0;
-            for (int f = 0; f < numFeatures; f++) { float d = p[b * numFeatures + f] - t[b * numFeatures + f]; float ad = MathF.Abs(d); sum += ad <= delta ? 0.5f * d * d : delta * (ad - 0.5f * delta); }
-            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
-        }
-        UploadToBuffer(loss, l);
+        if (predictions is not MetalGpuBuffer pBuffer || targets is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer lBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "huber_loss_batch");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(pBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(lBuffer, 2);
+        encoder.SetBytes(delta, 3);
+        encoder.SetBytes((uint)batchSize, 4);
+        encoder.SetBytes((uint)numFeatures, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
@@ -880,10 +888,18 @@ public sealed partial class MetalBackend
     public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
     {
         ThrowIfDisposed();
-        var lp = DownloadBuffer(logProbs); var tgt = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++) { int tc = (int)tgt[b]; l[b] = (tc >= 0 && tc < numClasses) ? -lp[b * numClasses + tc] : 0f; }
-        UploadToBuffer(loss, l);
+        if (logProbs is not MetalGpuBuffer lpBuffer || targets is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer lBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "nll_loss_batch");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(lpBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(lBuffer, 2);
+        encoder.SetBytes((uint)batchSize, 3);
+        encoder.SetBytes((uint)numClasses, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)

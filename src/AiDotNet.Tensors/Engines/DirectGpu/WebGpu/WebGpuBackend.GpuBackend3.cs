@@ -423,18 +423,14 @@ public sealed partial class WebGpuBackend
 
     public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
-        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++) { float s = 0; for (int f = 0; f < numFeatures; f++) s += MathF.Abs(p[b * numFeatures + f] - t[b * numFeatures + f]); l[b] = numFeatures > 0 ? s / numFeatures : 0f; }
-        UploadToBuffer(l, loss);
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "l1_loss_batch",
+            predictions, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numFeatures), 0f, 0f), batchSize).GetAwaiter().GetResult();
     }
 
     public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
-        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++) { float s = 0; for (int f = 0; f < numFeatures; f++) { float d = p[b * numFeatures + f] - t[b * numFeatures + f]; float ad = MathF.Abs(d); s += ad <= delta ? 0.5f * d * d : delta * (ad - 0.5f * delta); } l[b] = numFeatures > 0 ? s / numFeatures : 0f; }
-        UploadToBuffer(l, loss);
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "huber_loss_batch",
+            predictions, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numFeatures), delta, 0f), batchSize).GetAwaiter().GetResult();
     }
 
     public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
@@ -445,10 +441,8 @@ public sealed partial class WebGpuBackend
 
     public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
     {
-        var lp = DownloadBuffer(logProbs); var tgt = DownloadBuffer(targets);
-        var l = new float[batchSize];
-        for (int b = 0; b < batchSize; b++) { int tc = (int)tgt[b]; l[b] = (tc >= 0 && tc < numClasses) ? -lp[b * numClasses + tc] : 0f; }
-        UploadToBuffer(l, loss);
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "nll_loss_batch",
+            logProbs, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numClasses), 0f, 0f), batchSize).GetAwaiter().GetResult();
     }
 
     public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)

@@ -2643,6 +2643,62 @@ kernel void huber_backward(
         }
     }
 }
+
+// L1 Loss forward: mean(|pred - target|) per batch sample
+kernel void l1_loss_batch(
+    device const float* predictions [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& numFeatures [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < batchSize) {
+        float sum_abs = 0.0f;
+        uint base_idx = gid * numFeatures;
+        for (uint f = 0; f < numFeatures; f++) {
+            sum_abs += abs(predictions[base_idx + f] - targets[base_idx + f]);
+        }
+        loss[gid] = sum_abs / float(numFeatures);
+    }
+}
+
+// Huber Loss forward: smooth L1 per batch sample
+kernel void huber_loss_batch(
+    device const float* predictions [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant float& delta [[buffer(3)]],
+    constant uint& batchSize [[buffer(4)]],
+    constant uint& numFeatures [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < batchSize) {
+        float sum = 0.0f;
+        uint base_idx = gid * numFeatures;
+        for (uint f = 0; f < numFeatures; f++) {
+            float d = predictions[base_idx + f] - targets[base_idx + f];
+            float ad = abs(d);
+            sum += (ad <= delta) ? (0.5f * d * d) : (delta * (ad - 0.5f * delta));
+        }
+        loss[gid] = sum / float(numFeatures);
+    }
+}
+
+// NLL Loss forward: -log_probs[target_class] per batch sample (sparse targets as float)
+kernel void nll_loss_batch(
+    device const float* logProbs [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& numClasses [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < batchSize) {
+        int tc = int(targets[gid]);
+        loss[gid] = (tc >= 0 && tc < int(numClasses)) ? -logProbs[gid * numClasses + uint(tc)] : 0.0f;
+    }
+}
 ";
 
     #endregion

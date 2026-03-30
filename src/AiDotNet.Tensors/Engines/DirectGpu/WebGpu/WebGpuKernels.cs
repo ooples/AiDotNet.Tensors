@@ -8210,6 +8210,47 @@ fn l1_loss_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
         lf_loss[idx] = abs(lf_pred[idx] - lf_target[idx]);
     }
 }
+
+@compute @workgroup_size(256)
+fn l1_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numFeatures = bitcast<u32>(lf_params.param1);
+    if (b >= batchSize) { return; }
+    var sum_abs: f32 = 0.0;
+    let base_idx = b * numFeatures;
+    for (var f: u32 = 0u; f < numFeatures; f = f + 1u) {
+        sum_abs += abs(lf_pred[base_idx + f] - lf_target[base_idx + f]);
+    }
+    lf_loss[b] = sum_abs / f32(numFeatures);
+}
+
+@compute @workgroup_size(256)
+fn huber_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numFeatures = bitcast<u32>(lf_params.param1);
+    let delta = lf_params.param2;
+    if (b >= batchSize) { return; }
+    var sum: f32 = 0.0;
+    let base_idx = b * numFeatures;
+    for (var f: u32 = 0u; f < numFeatures; f = f + 1u) {
+        let d = lf_pred[base_idx + f] - lf_target[base_idx + f];
+        let ad = abs(d);
+        sum += select(delta * (ad - 0.5 * delta), 0.5 * d * d, ad <= delta);
+    }
+    lf_loss[b] = sum / f32(numFeatures);
+}
+
+@compute @workgroup_size(256)
+fn nll_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numClasses = bitcast<u32>(lf_params.param1);
+    if (b >= batchSize) { return; }
+    let tc = i32(lf_target[b]);
+    lf_loss[b] = select(0.0, -lf_pred[b * numClasses + u32(tc)], tc >= 0 && tc < i32(numClasses));
+}
 ";
 }
 #endif

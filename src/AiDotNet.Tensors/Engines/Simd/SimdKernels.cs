@@ -6332,6 +6332,184 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        // ──────────────────────────────────────────────────────────────
+        // Complex SIMD backward kernels (reduction-based)
+        // ──────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Softmax backward for float: grad_input[i] = softmax[i] * (grad[i] - dot(grad, softmax))
+        /// Per-row operation where each row is processed independently.
+        /// </summary>
+        public static unsafe void SoftmaxBackwardUnsafe(float* grad, float* softmaxOutput, float* output, int batchSize, int features)
+        {
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * features;
+                // Compute dot(grad, softmax) for this row
+                float dot = 0;
+                int j = 0;
+#if NET5_0_OR_GREATER
+                if (Avx.IsSupported)
+                {
+                    var vDot = Vector256<float>.Zero;
+                    int simdLen = features & ~7;
+                    for (; j < simdLen; j += 8)
+                    {
+                        var g = Avx.LoadVector256(grad + offset + j);
+                        var s = Avx.LoadVector256(softmaxOutput + offset + j);
+                        vDot = Avx.Add(vDot, Avx.Multiply(g, s));
+                    }
+                    // Horizontal sum of vDot
+                    var hi = Avx.ExtractVector128(vDot, 1);
+                    var lo = vDot.GetLower();
+                    var sum4 = Sse.Add(lo, hi);
+                    sum4 = Sse.Add(sum4, Sse.MoveHighToLow(sum4, sum4));
+                    sum4 = Sse.AddScalar(sum4, Sse.Shuffle(sum4, sum4, 0x01));
+                    dot = sum4.ToScalar();
+                }
+#endif
+                for (; j < features; j++)
+                    dot += grad[offset + j] * softmaxOutput[offset + j];
+
+                // grad_input[i] = softmax[i] * (grad[i] - dot)
+                j = 0;
+#if NET5_0_OR_GREATER
+                if (Avx.IsSupported)
+                {
+                    var vDotBroadcast = Vector256.Create(dot);
+                    int simdLen = features & ~7;
+                    for (; j < simdLen; j += 8)
+                    {
+                        var s = Avx.LoadVector256(softmaxOutput + offset + j);
+                        var g = Avx.LoadVector256(grad + offset + j);
+                        var diff = Avx.Subtract(g, vDotBroadcast);
+                        Avx.Store(output + offset + j, Avx.Multiply(s, diff));
+                    }
+                }
+#endif
+                for (; j < features; j++)
+                    output[offset + j] = softmaxOutput[offset + j] * (grad[offset + j] - dot);
+            }
+        }
+
+        /// <summary>
+        /// BatchNorm backward for float.
+        /// Computes gradients for input, gamma (scale), and beta (shift).
+        /// </summary>
+        public static unsafe void BatchNormBackwardUnsafe(
+            float* gradOutput, float* input, float* gamma,
+            float* mean, float* variance, float epsilon,
+            float* gradInput, float* gradGamma, float* gradBeta,
+            int batchSize, int channels, int spatialSize)
+        {
+            int totalPerChannel = batchSize * spatialSize;
+            float invN = 1.0f / totalPerChannel;
+
+            for (int c = 0; c < channels; c++)
+            {
+                float m = mean[c];
+                float invStd = 1.0f / MathF.Sqrt(variance[c] + epsilon);
+                float gGamma = 0, gBeta = 0;
+                float sumGradXhat = 0, sumGrad = 0;
+
+                // Pass 1: accumulate gradGamma, gradBeta, and intermediate sums
+                for (int b = 0; b < batchSize; b++)
+                {
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        float go = gradOutput[idx];
+                        float xhat = (input[idx] - m) * invStd;
+                        gGamma += go * xhat;
+                        gBeta += go;
+                        sumGradXhat += go * xhat;
+                        sumGrad += go;
+                    }
+                }
+                gradGamma[c] = gGamma;
+                gradBeta[c] = gBeta;
+
+                // Pass 2: compute gradInput
+                float g = gamma[c];
+                for (int b = 0; b < batchSize; b++)
+                {
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        float xhat = (input[idx] - m) * invStd;
+                        gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// LayerNorm backward for float.
+        /// Computes gradient for input given gradOutput, normalized input, gamma.
+        /// </summary>
+        public static unsafe void LayerNormBackwardUnsafe(
+            float* gradOutput, float* input, float* gamma,
+            float* mean, float* variance, float epsilon,
+            float* gradInput, float* gradGamma, float* gradBeta,
+            int batchSize, int normSize)
+        {
+            // Accumulate gradGamma and gradBeta across batch
+            for (int i = 0; i < normSize; i++)
+            {
+                gradGamma[i] = 0;
+                gradBeta[i] = 0;
+            }
+
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * normSize;
+                float m = mean[b];
+                float invStd = 1.0f / MathF.Sqrt(variance[b] + epsilon);
+
+                // Accumulate gradGamma and gradBeta
+                for (int i = 0; i < normSize; i++)
+                {
+                    float xhat = (input[offset + i] - m) * invStd;
+                    gradGamma[i] += gradOutput[offset + i] * xhat;
+                    gradBeta[i] += gradOutput[offset + i];
+                }
+
+                // Compute intermediate sums for gradInput
+                float ds = 0, db = 0;
+                for (int i = 0; i < normSize; i++)
+                {
+                    float go = gradOutput[offset + i] * gamma[i];
+                    float xhat = (input[offset + i] - m) * invStd;
+                    ds += go * xhat;
+                    db += go;
+                }
+
+                // gradInput
+                float invN = 1.0f / normSize;
+                for (int i = 0; i < normSize; i++)
+                {
+                    float xhat = (input[offset + i] - m) * invStd;
+                    gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Softmax backward for double.
+        /// </summary>
+        public static unsafe void SoftmaxBackwardDouble(double* grad, double* softmaxOutput, double* output, int batchSize, int features)
+        {
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * features;
+                double dot = 0;
+                for (int j = 0; j < features; j++)
+                    dot += grad[offset + j] * softmaxOutput[offset + j];
+                for (int j = 0; j < features; j++)
+                    output[offset + j] = softmaxOutput[offset + j] * (grad[offset + j] - dot);
+            }
+        }
+
     #endregion
     }
 }
