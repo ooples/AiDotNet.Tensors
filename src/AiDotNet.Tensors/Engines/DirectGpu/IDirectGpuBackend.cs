@@ -849,12 +849,24 @@ public interface IDirectGpuBackend : IDisposable
         int outChannels, int outLength, int kernelLength,
         int stride, int padding, int dilation);
 
-    /// <summary>Im2col: extract sliding patches from 4D input into column matrix</summary>
+    /// <summary>
+    /// Im2col: extract sliding patches from 4D input into column matrix.
+    /// Input layout: [batch, channels, height, width] (NCHW, row-major contiguous).
+    /// Output layout: [batch, channels * kernelH * kernelW, outH * outW] where
+    /// outH = (height + 2*padH - kernelH) / strideH + 1, outW = (width + 2*padW - kernelW) / strideW + 1.
+    /// Dilation is fixed at 1. Padded positions are filled with zero.
+    /// </summary>
     void Unfold(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW);
 
-    /// <summary>Col2im: fold column matrix back into 4D spatial tensor (accumulates overlapping regions)</summary>
+    /// <summary>
+    /// Col2im: fold column matrix back into 4D spatial tensor.
+    /// Inverse of <see cref="Unfold"/>. Overlapping regions are summed (accumulated).
+    /// Implementations MUST zero the output buffer before accumulation.
+    /// Input layout: [batch, channels * kernelH * kernelW, L].
+    /// Output layout: [batch, channels, outputH, outputW] (NCHW, row-major contiguous).
+    /// </summary>
     void Fold(IGpuBuffer input, IGpuBuffer output,
         int batch, int channels, int outputH, int outputW,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW);

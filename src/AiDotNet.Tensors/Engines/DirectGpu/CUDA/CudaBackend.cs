@@ -3169,6 +3169,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("im2col", out var im2colKernel))
             throw new InvalidOperationException("CUDA kernel not found: im2col");
@@ -3177,6 +3178,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         IntPtr outputPtr = output.Handle;
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
+        if (outH <= 0 || outW <= 0) throw new ArgumentException($"Invalid Unfold output dimensions {outH}x{outW}.");
         int totalPatches = batch * outH * outW;
         int dilationH = 1, dilationW = 1;
 
@@ -3195,6 +3197,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         int batch, int channels, int outputH, int outputW,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("col2im", out var col2imKernel))
             throw new InvalidOperationException("CUDA kernel not found: col2im");

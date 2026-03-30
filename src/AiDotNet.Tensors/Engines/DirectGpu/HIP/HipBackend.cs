@@ -3173,6 +3173,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+        int unfoldOutH = (height + 2 * padH - kernelH) / strideH + 1;
+        int unfoldOutW = (width + 2 * padW - kernelW) / strideW + 1;
+        if (unfoldOutH <= 0 || unfoldOutW <= 0) throw new ArgumentException($"Invalid Unfold output dimensions {unfoldOutH}x{unfoldOutW}.");
+
         if (!_kernelCache.TryGetValue("im2col", out var im2colKernel))
             throw new InvalidOperationException("HIP kernel not found: im2col");
 
@@ -3199,6 +3204,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         int batch, int channels, int outputH, int outputW,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
+
         if (!_kernelCache.TryGetValue("col2im", out var col2imKernel))
             throw new InvalidOperationException("HIP kernel not found: col2im");
 

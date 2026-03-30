@@ -211,6 +211,8 @@ public sealed partial class MetalBackend
         int batch, int channels, int height, int width,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        ThrowIfDisposed();
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         var inp = DownloadBuffer(input);
         int outH = (height + 2 * padH - kernelH) / strideH + 1;
         int outW = (width + 2 * padW - kernelW) / strideW + 1;
@@ -237,6 +239,8 @@ public sealed partial class MetalBackend
         int batch, int channels, int outputH, int outputW,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
     {
+        ThrowIfDisposed();
+        if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         var inp = DownloadBuffer(input);
         int unfoldH = (outputH + 2 * padH - kernelH) / strideH + 1;
         int unfoldW = (outputW + 2 * padW - kernelW) / strideW + 1;

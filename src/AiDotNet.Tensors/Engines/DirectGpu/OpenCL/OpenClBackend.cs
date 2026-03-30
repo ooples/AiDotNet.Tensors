@@ -5528,7 +5528,7 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
-            var k = _kernelCache["conv2d_backward_kernel"];
+            var k = _kernelCache["conv2d_backward_weights"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
@@ -5602,7 +5602,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padH); k.SetArg(arg++, padW);
             k.SetArg(arg++, dilationH); k.SetArg(arg++, dilationW);
             k.SetArg(arg++, outH); k.SetArg(arg++, outW);
-            k.Execute1D(totalPatches, 256);
+            k.Execute1D(totalPatches, Math.Min(256, (int)_maxWorkGroupSize));
         }
 
         public void Fold(IGpuBuffer input, IGpuBuffer output,
@@ -5625,7 +5625,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, padH); k.SetArg(arg++, padW);
             k.SetArg(arg++, dilationH); k.SetArg(arg++, dilationW);
             k.SetArg(arg++, outH); k.SetArg(arg++, outW);
-            k.Execute1D(totalSize, 256);
+            k.Execute1D(totalSize, Math.Min(256, (int)_maxWorkGroupSize));
         }
 
         public void Conv3D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,

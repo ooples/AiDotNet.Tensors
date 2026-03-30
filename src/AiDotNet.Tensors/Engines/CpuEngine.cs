@@ -15615,7 +15615,11 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
+        if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
+        if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
         if (input.Rank != 4) throw new ArgumentException($"Unfold requires 4D input [batch, channels, height, width]. Got rank {input.Rank}.");
+        if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15629,6 +15633,8 @@ public class CpuEngine : ITensorLevelEngine
 
         int outH = (height + 2 * pH - kH) / sH + 1;
         int outW = (width + 2 * pW - kW) / sW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new ArgumentException($"Invalid Unfold dimensions: output would be {outH}x{outW}. Check kernel, stride, and padding.");
         int colLength = outH * outW;
         int colChannels = channels * kH * kW;
 
@@ -15678,7 +15684,12 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (outputSize == null || outputSize.Length < 2) throw new ArgumentException("outputSize must have at least 2 elements.", nameof(outputSize));
+        if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
+        if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
+        if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
         if (input.Rank != 3) throw new ArgumentException($"Fold requires 3D input [batch, C*kH*kW, L]. Got rank {input.Rank}.");
+        if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15688,8 +15699,14 @@ public class CpuEngine : ITensorLevelEngine
         int pH = padding[0], pW = padding[1];
         int outH = outputSize[0], outW = outputSize[1];
         int colChannels = input._shape[1];
-        int channels = colChannels / (kH * kW);
+        int kernelElements = kH * kW;
+        if (kernelElements == 0 || colChannels % kernelElements != 0)
+            throw new ArgumentException($"Input channels ({colChannels}) must be divisible by kernel elements ({kernelElements}).");
+        int channels = colChannels / kernelElements;
         int colLength = input._shape[2];
+        int expectedColLength = ((outH + 2 * pH - kH) / sH + 1) * ((outW + 2 * pW - kW) / sW + 1);
+        if (colLength != expectedColLength)
+            throw new ArgumentException($"Column length {colLength} doesn't match expected {expectedColLength} for output {outH}x{outW} with kernel {kH}x{kW}, stride {sH}x{sW}, pad {pH}x{pW}.");
 
         int unfoldH = (outH + 2 * pH - kH) / sH + 1;
         int unfoldW = (outW + 2 * pW - kW) / sW + 1;
