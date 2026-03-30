@@ -905,10 +905,20 @@ public sealed partial class MetalBackend
     public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
         ThrowIfDisposed();
-        var go = DownloadBuffer(gradOutput); var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) gi[i] = go[0] * 2f * (p[i] - t[i]) * invN;
-        UploadToBuffer(gradInput, gi);
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scale = goScalar * invN;
+        if (predictions is not MetalGpuBuffer pBuffer || targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "mse_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(pBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(giBuffer, 2);
+        encoder.SetBytes(scale, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
@@ -933,10 +943,21 @@ public sealed partial class MetalBackend
     public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
         ThrowIfDisposed();
-        var go = DownloadBuffer(gradOutput); var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float d = p[i] - t[i]; float ad = MathF.Abs(d); gi[i] = go[0] * (ad <= delta ? d : delta * (d > 0 ? 1f : -1f)) * invN; }
-        UploadToBuffer(gradInput, gi);
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scale = goScalar * invN;
+        if (predictions is not MetalGpuBuffer pBuffer || targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "huber_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(pBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(giBuffer, 2);
+        encoder.SetBytes(delta, 3);
+        encoder.SetBytes(scale, 4);
+        encoder.SetBytes((uint)size, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
