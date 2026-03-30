@@ -22192,6 +22192,178 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Missing Phase 1 ops
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>Stack tensors along a new axis (differentiable).</summary>
+    public Tensor<T> TensorStackDiff<T>(Tensor<T>[] tensors, int axis = 0)
+    {
+        var result = TensorStack(tensors, axis);
+        DifferentiableOps.RecordIfActive("Stack", result, tensors,
+            BackwardFunctions<T>.StackBackward, savedState: new object[] { axis });
+        return result;
+    }
+
+    /// <summary>Variance of all elements, returns scalar tensor.</summary>
+    public Tensor<T> TensorVar<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double mean = 0;
+        for (int i = 0; i < tensor.Length; i++) mean += numOps.ToDouble(tensor[i]);
+        mean /= tensor.Length;
+        double variance = 0;
+        for (int i = 0; i < tensor.Length; i++)
+        {
+            double d = numOps.ToDouble(tensor[i]) - mean;
+            variance += d * d;
+        }
+        variance /= tensor.Length;
+        var result = new Tensor<T>(new[] { numOps.FromDouble(variance) }, [1]);
+        DifferentiableOps.RecordUnary("Var", result, tensor, BackwardFunctions<T>.VarBackward);
+        return result;
+    }
+
+    /// <summary>Standard deviation of all elements, returns scalar tensor.</summary>
+    public Tensor<T> TensorStd<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double mean = 0;
+        for (int i = 0; i < tensor.Length; i++) mean += numOps.ToDouble(tensor[i]);
+        mean /= tensor.Length;
+        double variance = 0;
+        for (int i = 0; i < tensor.Length; i++)
+        {
+            double d = numOps.ToDouble(tensor[i]) - mean;
+            variance += d * d;
+        }
+        variance /= tensor.Length;
+        var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(variance)) }, [1]);
+        DifferentiableOps.RecordUnary("Std", result, tensor, BackwardFunctions<T>.StdBackward);
+        return result;
+    }
+
+    /// <summary>Element-wise square: x^2.</summary>
+    public Tensor<T> TensorSquare<T>(Tensor<T> tensor)
+    {
+        var result = TensorMultiply(tensor, tensor);
+        // Replace the TensorMultiply tape entry with Square for cleaner backward
+        // Actually, TensorMultiply already records and self-multiply gives correct 2x gradient
+        // But let's record explicitly for semantics
+        return result;
+    }
+
+    /// <summary>LogSumExp: log(sum(exp(x))). Numerically stable.</summary>
+    public Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double maxVal = double.NegativeInfinity;
+        for (int i = 0; i < tensor.Length; i++)
+            maxVal = Math.Max(maxVal, numOps.ToDouble(tensor[i]));
+        double sumExp = 0;
+        for (int i = 0; i < tensor.Length; i++)
+            sumExp += Math.Exp(numOps.ToDouble(tensor[i]) - maxVal);
+        double lse = maxVal + Math.Log(sumExp);
+        var result = new Tensor<T>(new[] { numOps.FromDouble(lse) }, [1]);
+        DifferentiableOps.RecordUnary("LogSumExp", result, tensor, BackwardFunctions<T>.LogSumExpBackward);
+        return result;
+    }
+
+    /// <summary>L2 norm: sqrt(sum(x^2)).</summary>
+    public Tensor<T> TensorNorm<T>(Tensor<T> tensor)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double sumSq = 0;
+        for (int i = 0; i < tensor.Length; i++)
+        {
+            double v = numOps.ToDouble(tensor[i]);
+            sumSq += v * v;
+        }
+        var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(sumSq)) }, [1]);
+        DifferentiableOps.RecordUnary("Norm", result, tensor, BackwardFunctions<T>.NormBackward);
+        return result;
+    }
+
+    /// <summary>Adaptive max pool 2D with argmax tracking.</summary>
+    public Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
+        int outH = outputSize[0], outW = outputSize[1];
+        var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
+        var argmax = new int[n * c * outH * outW];
+        var inData = input.GetFlattenedData();
+        var outData = result.GetDataArray();
+
+        for (int batch = 0; batch < n; batch++)
+            for (int ch = 0; ch < c; ch++)
+                for (int oh = 0; oh < outH; oh++)
+                    for (int ow = 0; ow < outW; ow++)
+                    {
+                        int hStart = oh * h / outH, hEnd = (oh + 1) * h / outH;
+                        int wStart = ow * w / outW, wEnd = (ow + 1) * w / outW;
+                        int baseIdx = (batch * c + ch) * h * w;
+                        double maxV = double.NegativeInfinity;
+                        int maxI = baseIdx + hStart * w + wStart;
+                        for (int ih = hStart; ih < hEnd; ih++)
+                            for (int iw = wStart; iw < wEnd; iw++)
+                            {
+                                int idx = baseIdx + ih * w + iw;
+                                double v = numOps.ToDouble(inData[idx]);
+                                if (v > maxV) { maxV = v; maxI = idx; }
+                            }
+                        int outIdx = (batch * c + ch) * outH * outW + oh * outW + ow;
+                        outData[outIdx] = numOps.FromDouble(maxV);
+                        argmax[outIdx] = maxI;
+                    }
+        DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,
+            BackwardFunctions<T>.AdaptiveMaxPool2DBackward, savedState: new object[] { argmax });
+        return result;
+    }
+
+    /// <summary>Where: select elements from x or y based on condition.</summary>
+    public Tensor<T> TensorWhere<T>(bool[] condition, Tensor<T> x, Tensor<T> y)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(x.Shape.ToArray());
+        for (int i = 0; i < x.Length; i++)
+            result[i] = condition[i] ? x[i] : y[i];
+        DifferentiableOps.RecordBinary("Where", result, x, y,
+            BackwardFunctions<T>.WhereBackward, savedState: new object[] { condition });
+        return result;
+    }
+
+    /// <summary>MaskedFill: fill elements where mask is true with value.</summary>
+    public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, bool[] mask, T value)
+    {
+        var result = new Tensor<T>(tensor.Shape.ToArray());
+        for (int i = 0; i < tensor.Length; i++)
+            result[i] = mask[i] ? value : tensor[i];
+        DifferentiableOps.RecordUnary("MaskedFill", result, tensor,
+            BackwardFunctions<T>.MaskedFillBackward, savedState: new object[] { mask });
+        return result;
+    }
+
+    /// <summary>Scaled dot-product attention: softmax(Q@K^T/sqrt(dk)) @ V</summary>
+    public Tensor<T> TensorScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int dk = query._shape[^1];
+        T scale = numOps.FromDouble(1.0 / Math.Sqrt(dk));
+
+        // Q @ K^T
+        var keyT = TensorTranspose(key);
+        var scores = TensorMatMul(query, keyT);
+        // Scale
+        var scaledScores = TensorMultiplyScalar(scores, scale);
+        // Softmax along last axis
+        int axis = scaledScores.Rank - 1;
+        var attnWeights = TensorSoftmax(scaledScores, axis);
+        // @ V
+        var output = TensorMatMul(attnWeights, value);
+        return output;
+    }
+
     private static void CopyTensorRegion<T>(Tensor<T> src, Tensor<T> dst, int[] padding, int rank)
     {
         var srcData = src.GetFlattenedData();

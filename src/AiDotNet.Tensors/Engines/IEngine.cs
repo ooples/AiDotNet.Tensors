@@ -7065,6 +7065,40 @@ public interface IEngine
 
     /// <summary>Full mean reduction returning scalar tensor for tape.</summary>
     Tensor<T> TensorMeanDiff<T>(Tensor<T> tensor);
+
+    // ──────────────────────────────────────────────────────────────
+    // Missing Phase 1 ops
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>Stack tensors along a new axis.</summary>
+    Tensor<T> TensorStackDiff<T>(Tensor<T>[] tensors, int axis = 0);
+
+    /// <summary>Variance of all elements, returns scalar tensor.</summary>
+    Tensor<T> TensorVar<T>(Tensor<T> tensor);
+
+    /// <summary>Standard deviation of all elements, returns scalar tensor.</summary>
+    Tensor<T> TensorStd<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise square: x^2.</summary>
+    Tensor<T> TensorSquare<T>(Tensor<T> tensor);
+
+    /// <summary>LogSumExp: log(sum(exp(x))). Numerically stable.</summary>
+    Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor);
+
+    /// <summary>L2 norm: sqrt(sum(x^2)).</summary>
+    Tensor<T> TensorNorm<T>(Tensor<T> tensor);
+
+    /// <summary>Adaptive max pool 2D.</summary>
+    Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize);
+
+    /// <summary>Where: select from x or y based on condition.</summary>
+    Tensor<T> TensorWhere<T>(bool[] condition, Tensor<T> x, Tensor<T> y);
+
+    /// <summary>MaskedFill: fill where mask is true.</summary>
+    Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, bool[] mask, T value);
+
+    /// <summary>Scaled dot-product attention: softmax(Q@K^T/sqrt(dk)) @ V.</summary>
+    Tensor<T> TensorScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value);
 }
 
 /// <summary>

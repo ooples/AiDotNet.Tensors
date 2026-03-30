@@ -679,6 +679,66 @@ public class GradientCorrectnessTests
         VerifyGradient(inp => _engine.TensorFlatten(inp), x, "Flatten");
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Missing Phase 1 ops gradient tests
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Var_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [6]);
+        VerifyGradient(inp => _engine.TensorVar(inp), x, "Var");
+    }
+
+    [Fact]
+    public void Std_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [6]);
+        VerifyGradient(inp => _engine.TensorStd(inp), x, "Std");
+    }
+
+    [Fact]
+    public void LogSumExp_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 0.5f }, [4]);
+        VerifyGradient(inp => _engine.TensorLogSumExp(inp), x, "LogSumExp");
+    }
+
+    [Fact]
+    public void Norm_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 3f, 4f, 5f, 6f }, [4]);
+        VerifyGradient(inp => _engine.TensorNorm(inp), x, "Norm");
+    }
+
+    [Fact]
+    public void Where_Gradient_MatchesNumerical()
+    {
+        // Test gradient through the true branch
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var y = new Tensor<float>(new float[] { 10f, 20f, 30f, 40f }, [4]);
+        var condition = new bool[] { true, false, true, false };
+        VerifyGradient(inp => _engine.TensorWhere(condition, inp, y), x, "Where_TrueBranch");
+    }
+
+    [Fact]
+    public void MaskedFill_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        var mask = new bool[] { false, true, false, true };
+        VerifyGradient(inp => _engine.TensorMaskedFill(inp, mask, 0f), x, "MaskedFill");
+    }
+
+    [Fact]
+    public void ScaledDotProductAttention_Gradient_MatchesNumerical()
+    {
+        // Simple 2x2 attention
+        var q = new Tensor<float>(new float[] { 0.1f, 0.2f, 0.3f, 0.4f }, [2, 2]);
+        var k = new Tensor<float>(new float[] { 0.5f, 0.6f, 0.7f, 0.8f }, [2, 2]);
+        var v = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        VerifyGradient(inp => _engine.TensorScaledDotProductAttention(inp, k, v), q, "ScaledDotProductAttention");
+    }
+
     [Fact]
     public void Integration_CompiledBackward_MatchesUncompiled()
     {

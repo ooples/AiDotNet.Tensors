@@ -6139,6 +6139,199 @@ namespace AiDotNet.Tensors.Engines.Simd
                 output[i] = input[i] >= 0 ? grad[i] : alpha * grad[i];
         }
 
+        /// <summary>
+        /// SIMD-accelerated HardSwish backward for float.
+        /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt; x &lt; 3, 0 for x &lt;= -3, 1 for x >= 3
+        /// </summary>
+        public static unsafe void HardSwishBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vNeg3 = Vector256.Create(-3.0f);
+                var vPos3 = Vector256.Create(3.0f);
+                var vTwo = Vector256.Create(2.0f);
+                var vThree = Vector256.Create(3.0f);
+                var vSix = Vector256.Create(6.0f);
+                var vZero = Vector256<float>.Zero;
+                var vOne = Vector256.Create(1.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    // linear region: (2x+3)/6
+                    var linear = Avx.Divide(Avx.Add(Avx.Multiply(vTwo, x), vThree), vSix);
+                    // mask: x >= 3 => 1, x <= -3 => 0, else linear
+                    var maskHigh = Avx.Compare(x, vPos3, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    var maskLow = Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    var deriv = Avx.BlendVariable(linear, vOne, maskHigh);
+                    deriv = Avx.BlendVariable(deriv, vZero, maskLow);
+                    Avx.Store(output + i, Avx.Multiply(g, deriv));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float deriv = x <= -3f ? 0f : x >= 3f ? 1f : (2f * x + 3f) / 6f;
+                output[i] = grad[i] * deriv;
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated HardSigmoid backward for float.
+        /// d/dx[clip((x+3)/6, 0, 1)] = 1/6 for -3 &lt; x &lt; 3, else 0
+        /// </summary>
+        public static unsafe void HardSigmoidBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vNeg3 = Vector256.Create(-3.0f);
+                var vPos3 = Vector256.Create(3.0f);
+                var vSixth = Vector256.Create(1.0f / 6.0f);
+                var vZero = Vector256<float>.Zero;
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var inRange = Avx.And(
+                        Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedGreaterThanSignaling),
+                        Avx.Compare(x, vPos3, FloatComparisonMode.OrderedLessThanSignaling));
+                    var deriv = Avx.And(vSixth, inRange);
+                    Avx.Store(output + i, Avx.Multiply(g, deriv));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                output[i] = (x > -3f && x < 3f) ? grad[i] / 6f : 0f;
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated ReLU6 backward for float.
+        /// </summary>
+        public static unsafe void Relu6BackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vZero = Vector256<float>.Zero;
+                var vSix = Vector256.Create(6.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var inRange = Avx.And(
+                        Avx.Compare(x, vZero, FloatComparisonMode.OrderedGreaterThanSignaling),
+                        Avx.Compare(x, vSix, FloatComparisonMode.OrderedLessThanSignaling));
+                    Avx.Store(output + i, Avx.And(g, inRange));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                output[i] = (x > 0f && x < 6f) ? grad[i] : 0f;
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────
+        // Additional double backward kernels
+        // ──────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// SIMD-accelerated GELU backward for double.
+        /// </summary>
+        public static unsafe void GeluBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                double t = Math.Tanh(0.7978845608 * (x + 0.044715 * x * x * x));
+                double dtdx = 0.7978845608 * (1.0 + 0.134145 * x * x) * (1.0 - t * t);
+                output[i] = grad[i] * (0.5 * (1.0 + t) + 0.5 * x * dtdx);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Swish backward for double.
+        /// </summary>
+        public static unsafe void SwishBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                output[i] = grad[i] * (sig + x * sig * (1.0 - sig));
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated ELU backward for double.
+        /// </summary>
+        public static unsafe void EluBackwardDouble(double* grad, double* input, double* eluOutput, double* output, int length, double alpha)
+        {
+            for (int i = 0; i < length; i++)
+                output[i] = input[i] >= 0 ? grad[i] : grad[i] * (eluOutput[i] + alpha);
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Mish backward for double.
+        /// </summary>
+        public static unsafe void MishBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                double sp = Math.Log(1.0 + Math.Exp(x));
+                double tanhSp = Math.Tanh(sp);
+                double sig = 1.0 / (1.0 + Math.Exp(-x));
+                output[i] = grad[i] * (tanhSp + x * (1.0 - tanhSp * tanhSp) * sig);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Softplus backward for double.
+        /// </summary>
+        public static unsafe void SoftplusBackwardDouble(double* grad, double* input, double* output, int length, double beta)
+        {
+            for (int i = 0; i < length; i++)
+                output[i] = grad[i] / (1.0 + Math.Exp(-input[i] * beta));
+        }
+
+        /// <summary>
+        /// SIMD-accelerated SELU backward for double.
+        /// </summary>
+        public static unsafe void SeluBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            const double lambda = 1.0507009873554805;
+            const double alpha = 1.6732632423543773;
+            for (int i = 0; i < length; i++)
+                output[i] = grad[i] * (input[i] >= 0 ? lambda : lambda * alpha * Math.Exp(input[i]));
+        }
+
+        /// <summary>
+        /// SIMD-accelerated HardSwish backward for double.
+        /// </summary>
+        public static unsafe void HardSwishBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                double deriv = x <= -3.0 ? 0.0 : x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
+                output[i] = grad[i] * deriv;
+            }
+        }
+
     #endregion
     }
 }
