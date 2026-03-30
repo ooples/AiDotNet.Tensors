@@ -5889,6 +5889,150 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 #endif
 
+        /// <summary>
+        /// SIMD-accelerated Mish backward: d/dx[x*tanh(softplus(x))]
+        /// derivative = tanh(sp) + x * sech^2(sp) * sigmoid(x)
+        /// </summary>
+        public static unsafe void MishBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1f);
+                var vNegOne = Vector256.Create(-1f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    // softplus(x) = log(1 + exp(x))
+                    var expX = ExpApprox256(x);
+                    var sp = SimdLog256(Avx.Add(vOne, expX));
+                    // tanh(sp) via exp: (exp(2sp)-1)/(exp(2sp)+1)
+                    var exp2sp = ExpApprox256(Avx.Multiply(Vector256.Create(2f), sp));
+                    var tanhSp = Avx.Divide(Avx.Subtract(exp2sp, vOne), Avx.Add(exp2sp, vOne));
+                    // sech^2(sp) = 1 - tanh^2(sp)
+                    var sech2 = Avx.Subtract(vOne, Avx.Multiply(tanhSp, tanhSp));
+                    // sigmoid(x) = 1 / (1 + exp(-x))
+                    var negX = Avx.Multiply(x, vNegOne);
+                    var sig = Avx.Divide(vOne, Avx.Add(vOne, ExpApprox256(negX)));
+                    // deriv = tanh(sp) + x * sech^2(sp) * sigmoid(x)
+                    var deriv = Avx.Add(tanhSp, Avx.Multiply(Avx.Multiply(x, sech2), sig));
+                    Avx.Store(output + i, Avx.Multiply(g, deriv));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float sp = MathF.Log(1f + MathF.Exp(x));
+                float tanhSp = MathF.Tanh(sp);
+                float sech2 = 1f - tanhSp * tanhSp;
+                float sig = 1f / (1f + MathF.Exp(-x));
+                output[i] = grad[i] * (tanhSp + x * sech2 * sig);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Softplus backward: result[i] = grad[i] * sigmoid(beta * input[i])
+        /// </summary>
+        public static unsafe void SoftplusBackwardUnsafe(float* grad, float* input, float* output, int length, float beta)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vBeta = Vector256.Create(beta);
+                var vOne = Vector256.Create(1f);
+                var vNegOne = Vector256.Create(-1f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var bx = Avx.Multiply(x, vBeta);
+                    var negBx = Avx.Multiply(bx, vNegOne);
+                    var sig = Avx.Divide(vOne, Avx.Add(vOne, ExpApprox256(negBx)));
+                    Avx.Store(output + i, Avx.Multiply(g, sig));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float bx = input[i] * beta;
+                float sig = bx > 20f ? 1f : 1f / (1f + MathF.Exp(-bx));
+                output[i] = grad[i] * sig;
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated SELU backward.
+        /// </summary>
+        public static unsafe void SeluBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            const float lambda = 1.0507009873554805f;
+            const float alpha = 1.6732632423543773f;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                var vLambda = Vector256.Create(lambda);
+                var vLambdaAlpha = Vector256.Create(lambda * alpha);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var mask = Avx.Compare(x, vzero, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    // positive: lambda, negative: lambda * alpha * exp(x)
+                    var expX = ExpApprox256(x);
+                    var negDeriv = Avx.Multiply(vLambdaAlpha, expX);
+                    var deriv = Avx.BlendVariable(negDeriv, vLambda, mask);
+                    Avx.Store(output + i, Avx.Multiply(g, deriv));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float deriv = x >= 0 ? lambda : lambda * alpha * MathF.Exp(x);
+                output[i] = grad[i] * deriv;
+            }
+        }
+
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// Fast 8-wide log approximation for AVX2.
+        /// Uses polynomial approximation via integer bit manipulation.
+        /// </summary>
+        private static Vector256<float> SimdLog256(Vector256<float> x)
+        {
+            if (!Avx2.IsSupported) return Vector256<float>.Zero;
+            // log(x) = log(2) * (exponent + log2(mantissa))
+            // Extract exponent: (bits >> 23) - 127
+            var bits = x.AsInt32();
+            var exponent = Avx2.Subtract(Avx2.ShiftRightLogical(bits, 23), Vector256.Create(127));
+            var exponentF = Avx.ConvertToVector256Single(exponent);
+
+            // Extract mantissa: set exponent to 0 (127 bias)
+            var mantissaBits = Avx2.Or(Avx2.And(bits, Vector256.Create(0x007FFFFF)), Vector256.Create(0x3F800000));
+            var m = mantissaBits.AsSingle();
+
+            // Polynomial approximation of log2(m) for m in [1,2)
+            // log2(m) ≈ -1.7417939 + m * (2.8212026 + m * (-1.4699568 + m * 0.44717955))
+            var p = Vector256.Create(0.44717955f);
+            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(-1.4699568f));
+            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(2.8212026f));
+            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(-1.7417939f));
+
+            // log(x) = log(2) * (exponent + log2(mantissa))
+            var ln2 = Vector256.Create(0.6931471805599453f);
+            return Avx.Multiply(ln2, Avx.Add(exponentF, p));
+        }
+#endif
+
     #endregion
     }
 }

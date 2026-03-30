@@ -3819,6 +3819,8 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Floor(src[i]);
 
+        DifferentiableOps.RecordUnary("Floor", result, tensor,
+            BackwardFunctions<T>.StraightThroughBackward);
         return result;
     }
 
@@ -3835,6 +3837,8 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Ceiling(src[i]);
 
+        DifferentiableOps.RecordUnary("Ceiling", result, tensor,
+            BackwardFunctions<T>.StraightThroughBackward);
         return result;
     }
 
@@ -17940,6 +17944,8 @@ public class CpuEngine : ITensorLevelEngine
             {
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
+            DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
+                BackwardFunctions<T>.LogSoftmaxBackward);
             return result;
         }
 
@@ -17981,7 +17987,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(tensor._shape, new Vector<T>(outputData));
+        var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
+            BackwardFunctions<T>.LogSoftmaxBackward);
+        return logSoftmaxResult;
     }
 
     /// <summary>
