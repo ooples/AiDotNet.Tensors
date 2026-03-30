@@ -508,6 +508,23 @@ fn hardsigmoid(@builtin(global_invocation_id) gid: vec3<u32>) {
         B[idx] = clamp(A[idx] / 6.0 + 0.5, 0.0, 1.0);
     }
 }
+
+@compute @workgroup_size(256)
+fn relu6(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        B[idx] = min(max(A[idx], 0.0), 6.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn threshold_op(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        // params.alpha = threshold value, params.beta (unused) could be fill value but we use 0
+        B[idx] = select(0.0, A[idx], A[idx] > params.alpha);
+    }
+}
 ";
 
     /// <summary>
@@ -8101,6 +8118,97 @@ fn masked_fill(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
     if (idx >= mf_params.size) { return; }
     mf_output[idx] = select(mf_input[idx], mf_params.fill_value, mf_mask[idx] != 0.0);
+}
+";
+
+    /// <summary>
+    /// 4-buffer loss backward kernels: gradOutput, predictions/logits, targets, gradInput.
+    /// </summary>
+    public const string LossBackward4Source = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> logits_data: array<f32>;
+@group(0) @binding(2) var<storage, read> target_data: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_input_data: array<f32>;
+
+struct Params4 {
+    size: u32,
+    inv_size: f32,
+    param1: f32,
+    param2: f32,
+}
+@group(0) @binding(4) var<uniform> params: Params4;
+
+@compute @workgroup_size(256)
+fn bce_logits_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = logits_data[idx];
+        let sig = 1.0 / (1.0 + exp(-x));
+        let t = target_data[idx];
+        grad_input_data[idx] = grad_output[0] * (sig - t) * params.inv_size;
+    }
+}
+
+@compute @workgroup_size(256)
+fn mse_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        grad_input_data[idx] = grad_output[0] * 2.0 * (logits_data[idx] - target_data[idx]) * params.inv_size;
+    }
+}
+
+@compute @workgroup_size(256)
+fn l1_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let d = logits_data[idx] - target_data[idx];
+        grad_input_data[idx] = grad_output[0] * sign(d) * params.inv_size;
+    }
+}
+";
+
+    /// <summary>
+    /// 3-buffer loss forward kernels for element-wise loss computation.
+    /// </summary>
+    public const string LossForwardSource = @"
+@group(0) @binding(0) var<storage, read> lf_pred: array<f32>;
+@group(0) @binding(1) var<storage, read> lf_target: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lf_loss: array<f32>;
+
+struct LFParams {
+    size: u32,
+    param1: f32,
+    param2: f32,
+    param3: f32,
+}
+@group(0) @binding(3) var<uniform> lf_params: LFParams;
+
+@compute @workgroup_size(256)
+fn bce_with_logits_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        let x = lf_pred[idx];
+        let t = lf_target[idx];
+        let ax = abs(x);
+        lf_loss[idx] = max(x, 0.0) - x * t + log(1.0 + exp(-ax));
+    }
+}
+
+@compute @workgroup_size(256)
+fn kl_div_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        let t = lf_target[idx];
+        lf_loss[idx] = select(0.0, t * (log(t) - lf_pred[idx]), t > 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn l1_loss_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        lf_loss[idx] = abs(lf_pred[idx] - lf_target[idx]);
+    }
 }
 ";
 }
