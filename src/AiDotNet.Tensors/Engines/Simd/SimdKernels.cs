@@ -6510,6 +6510,161 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        // ──────────────────────────────────────────────────────────────
+        // Half precision backward kernels (compute in FP32, store in FP16)
+        // Uses convert-compute-convert pattern: Half→float, run float SIMD, float→Half
+        // ──────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Half precision ReLU backward via FP32 conversion.
+        /// </summary>
+        public static void ReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) ReluBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision Sigmoid backward via FP32 conversion.
+        /// </summary>
+        public static void SigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> sigmoidOutput, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var sf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(sigmoidOutput, sf);
+            unsafe { fixed (float* gp = gf, sp = sf, op = outf) SigmoidBackwardUnsafe(gp, sp, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision Tanh backward via FP32 conversion.
+        /// </summary>
+        public static void TanhBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> tanhOutput, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var tf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(tanhOutput, tf);
+            unsafe { fixed (float* gp = gf, tp = tf, op = outf) TanhBackwardUnsafe(gp, tp, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision GELU backward via FP32 conversion.
+        /// </summary>
+        public static void GeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) GeluBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision Swish backward via FP32 conversion.
+        /// </summary>
+        public static void SwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) SwishBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision LeakyReLU backward via FP32 conversion.
+        /// </summary>
+        public static void LeakyReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float alpha)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) LeakyReluBackwardUnsafe(gp, ip, op, len, alpha); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision Mish backward via FP32 conversion.
+        /// </summary>
+        public static void MishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) MishBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision SELU backward via FP32 conversion.
+        /// </summary>
+        public static void SeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) SeluBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision HardSwish backward via FP32 conversion.
+        /// </summary>
+        public static void HardSwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) HardSwishBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>
+        /// Half precision Softplus backward via FP32 conversion.
+        /// </summary>
+        public static void SoftplusBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float beta)
+        {
+            int len = grad.Length;
+            var gf = new float[len];
+            var inf = new float[len];
+            var outf = new float[len];
+            ConvertToSingle(grad, gf);
+            ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) SoftplusBackwardUnsafe(gp, ip, op, len, beta); }
+            ConvertToHalf(outf, output);
+        }
+
     #endregion
     }
 }
