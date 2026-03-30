@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// <param name="gradOutput">The gradient flowing back from the output of this operation.</param>
 /// <param name="inputs">The input tensors that were passed to the forward operation.</param>
 /// <param name="output">The output tensor produced by the forward operation.</param>
-/// <param name="savedState">Optional extra state saved during the forward pass (e.g., masks, indices).</param>
+/// <param name="savedState">Extra state saved during the forward pass (e.g., masks, indices). Never null at invocation time.</param>
 /// <param name="engine">The engine to use for gradient computation.</param>
 /// <param name="gradAccumulator">Dictionary mapping each tensor to its accumulated gradient.
 /// Backward functions should add their computed input gradients into this accumulator.</param>
@@ -17,7 +17,7 @@ public delegate void BackwardFunction<T>(
     Tensor<T> gradOutput,
     Tensor<T>[] inputs,
     Tensor<T> output,
-    object[]? savedState,
+    object[] savedState,
     IEngine engine,
     Dictionary<Tensor<T>, Tensor<T>> gradAccumulator);
 

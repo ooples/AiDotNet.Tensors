@@ -1892,7 +1892,10 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (newShape == null) throw new ArgumentNullException(nameof(newShape));
 
-        return tensor.Reshape(newShape);
+        var originalShape = tensor.Shape.ToArray();
+        var result = tensor.Reshape(newShape);
+        DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -4899,8 +4902,8 @@ public class CpuEngine : ITensorLevelEngine
         // Squeeze height dimension: [B, Cout, 1, outL] -> [B, Cout, outL]
         var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
 
-        DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
-            new object[] { new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation } });
+        DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv1DBackward,
+            new object[] { stride, padding, dilation });
         return result;
     }
 
@@ -9161,6 +9164,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("Conv3D", result, input, kernel, BackwardFunctions<T>.Conv3DBackward,
+            new object[] { stride, padding, dilation });
         return result;
     }
 
@@ -12093,7 +12098,10 @@ public class CpuEngine : ITensorLevelEngine
         // Create mean and variance tensors with batch shape
         mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>(batchShape, new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        var lnResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
+            BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+        return lnResult;
     }
 
     /// <inheritdoc/>
@@ -12237,6 +12245,8 @@ public class CpuEngine : ITensorLevelEngine
                 variance = TensorAllocator.Rent<T>(new[] { batch, numGroups },
                     new Vector<T>((T[])(object)varArr));
             }
+            DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { input, gamma, beta },
+                BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
             return result;
         }
 
@@ -12303,6 +12313,8 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(meanData));
         variance = TensorAllocator.Rent<T>([batch, numGroups], Vector<T>.WrapMemory(varData));
+        DifferentiableOps.RecordIfActive("GroupNorm", output, new[] { input, gamma, beta },
+            BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
         return output;
     }
 
@@ -16567,6 +16579,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
+            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
             return result;
         }
         else
@@ -16942,6 +16955,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
+        DifferentiableOps.RecordUnary("TensorAddScalar", result, tensor, BackwardFunctions<T>.AddScalarBackward);
         return result;
     }
 
@@ -16955,6 +16969,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
+        DifferentiableOps.RecordUnary("TensorSubtractScalar", result, tensor, BackwardFunctions<T>.SubtractScalarBackward);
         return result;
     }
 
@@ -16968,6 +16983,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
+        if (scalar is not null)
+            DifferentiableOps.RecordUnary("TensorDivideScalar", result, tensor, BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar });
         return result;
     }
 

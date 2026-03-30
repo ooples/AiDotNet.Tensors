@@ -2,6 +2,7 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
 /// Configuration options for <see cref="GradientTape{T}"/>.
+/// Properties use init-only setters to prevent mutation of the shared <see cref="Default"/> instance.
 /// </summary>
 public sealed class GradientTapeOptions
 {
@@ -14,17 +15,17 @@ public sealed class GradientTapeOptions
     /// Whether the tape is persistent (can compute gradients multiple times).
     /// When false, <see cref="GradientTape{T}.ComputeGradients"/> clears the tape after use.
     /// </summary>
-    public bool Persistent { get; set; }
+    public bool Persistent { get; init; }
 
     /// <summary>
     /// Maximum number of tape entries. 0 means unlimited.
     /// When the limit is reached, the oldest entries are discarded.
     /// </summary>
-    public int MaxEntries { get; set; }
+    public int MaxEntries { get; init; }
 
     /// <summary>
     /// Whether to record in-place operations by saving a copy of the input before mutation.
     /// When false, in-place operations are not recorded (gradients will not flow through them).
     /// </summary>
-    public bool RecordInPlace { get; set; } = true;
+    public bool RecordInPlace { get; init; } = true;
 }

@@ -48,6 +48,7 @@ public sealed class GradientTape<T> : IDisposable
     private readonly GradientTape<T>? _parent;
     private readonly List<TapeEntry<T>> _entries;
     private readonly GradientTapeOptions _options;
+    private readonly IEngine _engine;
     private bool _disposed;
 
     /// <summary>
@@ -59,6 +60,12 @@ public sealed class GradientTape<T> : IDisposable
     /// Gets the options for this tape.
     /// </summary>
     public GradientTapeOptions Options => _options;
+
+    /// <summary>
+    /// Gets the engine captured at tape construction time.
+    /// This ensures backward passes use the same engine as the forward pass.
+    /// </summary>
+    public IEngine Engine => _engine;
 
     /// <summary>
     /// Gets whether this tape has been disposed.
@@ -74,6 +81,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         _options = options ?? GradientTapeOptions.Default;
         _entries = new List<TapeEntry<T>>();
+        _engine = AiDotNetEngine.Current;
         _parent = _current;
         SetCurrentTape(this);
     }
@@ -123,7 +131,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
 
-        var engine = AiDotNetEngine.Current;
+        var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Gradient accumulator: maps each tensor (by reference identity) to its accumulated gradient
@@ -148,13 +156,14 @@ public sealed class GradientTape<T> : IDisposable
             }
 
             // Invoke the backward function to propagate gradients to inputs
-            entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState, engine, grads);
+            // Pass empty array instead of null to avoid null-forgiving operators in backward functions
+            entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
         }
 
         // If sources specified, filter to only those
         if (sources is not null)
         {
-            var filtered = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer.Instance);
+            var filtered = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
             foreach (var source in sources)
             {
                 if (grads.TryGetValue(source, out var grad))
@@ -204,22 +213,8 @@ public sealed class GradientTape<T> : IDisposable
 }
 
 /// <summary>
-/// Reference equality comparer for use with gradient dictionaries.
-/// Ensures tensor identity (not value equality) is used for gradient mapping.
-/// </summary>
-internal sealed class ReferenceEqualityComparer : IEqualityComparer<object>
-{
-    public static readonly ReferenceEqualityComparer Instance = new();
-
-    private ReferenceEqualityComparer() { }
-
-    public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
-
-    public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
-}
-
-/// <summary>
 /// Typed reference equality comparer for gradient dictionaries.
+/// Ensures tensor identity (not value equality) is used for gradient mapping.
 /// </summary>
 internal sealed class ReferenceEqualityComparer<TItem> : IEqualityComparer<TItem> where TItem : class
 {
