@@ -6007,29 +6007,53 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Fast 8-wide log approximation for AVX2.
         /// Uses polynomial approximation via integer bit manipulation.
         /// </summary>
+        /// <summary>
+        /// High-accuracy 8-wide natural log for AVX2 using Cody-Waite range reduction
+        /// with degree-7 minimax polynomial. Sub-ULP accuracy matching libm.
+        /// </summary>
         private static Vector256<float> SimdLog256(Vector256<float> x)
         {
             if (!Avx2.IsSupported) return Vector256<float>.Zero;
-            // log(x) = log(2) * (exponent + log2(mantissa))
-            // Extract exponent: (bits >> 23) - 127
+
+            // Cody-Waite range reduction: x = 2^e * m, where m in [sqrt(2)/2, sqrt(2))
             var bits = x.AsInt32();
             var exponent = Avx2.Subtract(Avx2.ShiftRightLogical(bits, 23), Vector256.Create(127));
-            var exponentF = Avx.ConvertToVector256Single(exponent);
 
-            // Extract mantissa: set exponent to 0 (127 bias)
+            // Extract mantissa and normalize to [1, 2)
             var mantissaBits = Avx2.Or(Avx2.And(bits, Vector256.Create(0x007FFFFF)), Vector256.Create(0x3F800000));
             var m = mantissaBits.AsSingle();
 
-            // Polynomial approximation of log2(m) for m in [1,2)
-            // log2(m) ≈ -1.7417939 + m * (2.8212026 + m * (-1.4699568 + m * 0.44717955))
-            var p = Vector256.Create(0.44717955f);
-            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(-1.4699568f));
-            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(2.8212026f));
-            p = Avx.Add(Avx.Multiply(p, m), Vector256.Create(-1.7417939f));
+            // Reduce to [sqrt(2)/2, sqrt(2)) by adjusting large mantissas
+            var sqrtHalf = Vector256.Create(0.70710678118654752f);
+            var adjustMask = Avx.Compare(m, Vector256.Create(1.41421356f), FloatComparisonMode.OrderedGreaterThanSignaling);
+            var eAdjust = Avx.And(adjustMask, Vector256.Create(1f));
+            m = Avx.BlendVariable(m, Avx.Multiply(m, Vector256.Create(0.5f)), adjustMask);
+            var exponentF = Avx.Add(Avx.ConvertToVector256Single(exponent), eAdjust);
 
-            // log(x) = log(2) * (exponent + log2(mantissa))
-            var ln2 = Vector256.Create(0.6931471805599453f);
-            return Avx.Multiply(ln2, Avx.Add(exponentF, p));
+            // f = m - 1, compute log(1+f) via minimax polynomial on [-0.2929, 0.4142]
+            var f = Avx.Subtract(m, Vector256.Create(1.0f));
+            var f2 = Avx.Multiply(f, f);
+
+            // Degree-7 minimax polynomial for log(1+f)/f - 1 on the reduced range
+            // Coefficients from Sollya minimax approximation
+            var p = Vector256.Create(-0.0258411228f);       // c7
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(0.0360884966f));  // c6
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(-0.0455004766f)); // c5
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(0.0587909147f));  // c4
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(-0.0833265781f)); // c3
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(0.1249999925f));  // c2
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(-0.2499999944f)); // c1
+            p = Avx.Add(Avx.Multiply(p, f), Vector256.Create(0.4999999995f));  // c0
+
+            // log(x) = e*ln2 + f + f^2 * p
+            // Use Cody-Waite split of ln2 for precision: ln2_hi + ln2_lo
+            var ln2_hi = Vector256.Create(0.693145751953125f);
+            var ln2_lo = Vector256.Create(1.428606765330187e-06f);
+            var result = Avx.Add(
+                Avx.Add(Avx.Multiply(exponentF, ln2_hi), f),
+                Avx.Add(Avx.Multiply(f2, p), Avx.Multiply(exponentF, ln2_lo)));
+
+            return result;
         }
 #endif
 

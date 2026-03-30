@@ -21958,14 +21958,20 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
+        // Compute channel-aware alpha indexing for NCHW tensors
+        int channels = alpha.Length;
+        int spatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
         var result = TensorAllocator.Rent<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
         {
             double x = numOps.ToDouble(tensor[i]);
-            double a = numOps.ToDouble(alpha[i % alpha.Length]);
+            int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
+            double a = numOps.ToDouble(alpha[channelIdx]);
             result[i] = numOps.FromDouble(x >= 0 ? x : a * x);
         }
-        DifferentiableOps.RecordBinary("PReLU", result, tensor, alpha, BackwardFunctions<T>.PReLUBackward);
+        DifferentiableOps.RecordBinary("PReLU", result, tensor, alpha,
+            BackwardFunctions<T>.PReLUBackward,
+            savedState: new object[] { channels, spatialSize });
         return result;
     }
 
