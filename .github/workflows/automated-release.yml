@@ -240,13 +240,9 @@ jobs:
             echo EOF
           } >> $GITHUB_OUTPUT
 
-      - name: Restore dependencies
-        if: steps.version.outputs.should_release == 'true'
-        run: dotnet restore
-
-      - name: Build
-        if: steps.version.outputs.should_release == 'true'
-        run: dotnet build -c Release --no-restore -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+      # Build validation is handled by the Build and Test workflow (build.yml)
+      # which builds both net10.0 and net471 targets on every push and PR.
+      # No need to rebuild here — the pack job does its own build for packaging.
 
   pack:
     name: Pack NuGet
