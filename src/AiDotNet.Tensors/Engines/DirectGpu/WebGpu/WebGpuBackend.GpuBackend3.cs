@@ -363,27 +363,22 @@ public sealed partial class WebGpuBackend
 
     public void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
     {
-        // PReLU needs 3 buffers with modular alpha indexing — use 3-buffer dispatch
-        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "leaky_relu_backward",
-            input, alpha, output, MakeUniform2(size, 0f), size).GetAwaiter().GetResult();
-        // Note: using leaky_relu_backward as proxy is incorrect; PReLU needs per-element alpha.
-        // Until a dedicated PReLU WGSL shader is added, fall back to CPU for correctness
-        var inp = DownloadBuffer(input); var alp = DownloadBuffer(alpha);
-        var res = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; res[i] = x >= 0 ? x : alp[i % alphaSize] * x; }
-        UploadToBuffer(res, output);
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch3BufferAsync("PReluForward", WebGpuKernels.PReluForwardSource, "prelu_forward",
+            input, alpha, output, uniformParams, size).GetAwaiter().GetResult();
     }
 
     public void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
     {
-        var go = DownloadBuffer(gradOutput); var inp = DownloadBuffer(input); var alp = DownloadBuffer(alpha);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; gi[i] = x >= 0 ? go[i] : alp[i % alphaSize] * go[i]; }
-        UploadToBuffer(gi, gradInput);
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch4BufferAsync("PReluBackward", WebGpuKernels.PReluBackwardSource, "prelu_backward_input",
+            gradOutput, input, alpha, gradInput, uniformParams, size).GetAwaiter().GetResult();
     }
 
     public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
     {
+        // Atomic reduction across elements — not parallelizable per-element on WebGPU
+        // This accumulates x*grad into alpha gradient bins which requires atomic add
         var go = DownloadBuffer(gradOutput); var inp = DownloadBuffer(input);
         var ga = new float[alphaSize];
         for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
@@ -392,18 +387,16 @@ public sealed partial class WebGpuBackend
 
     public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
     {
-        var inp = DownloadBuffer(input); var n = DownloadBuffer(noise);
-        var res = new float[size];
-        for (int i = 0; i < size; i++) { float x = inp[i]; res[i] = x >= 0 ? x : n[i] * x; }
-        UploadToBuffer(res, output);
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(size), 0f, 0f };
+        Dispatch3BufferAsync("PReluForward", WebGpuKernels.PReluForwardSource, "rrelu_forward",
+            input, noise, output, uniformParams, size).GetAwaiter().GetResult();
     }
 
     public void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
     {
-        var go = DownloadBuffer(gradOutput); var inp = DownloadBuffer(input); var n = DownloadBuffer(noise);
-        var gi = new float[size];
-        for (int i = 0; i < size; i++) { gi[i] = go[i] * (inp[i] >= 0 ? 1f : n[i]); }
-        UploadToBuffer(gi, gradInput);
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(size), 0f, 0f };
+        Dispatch4BufferAsync("PReluBackward", WebGpuKernels.PReluBackwardSource, "rrelu_backward",
+            gradOutput, input, noise, gradInput, uniformParams, size).GetAwaiter().GetResult();
     }
 
     public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)

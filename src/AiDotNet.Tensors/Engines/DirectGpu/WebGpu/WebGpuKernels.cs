@@ -1716,6 +1716,79 @@ fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// PReLU/RReLU forward kernels (3 buffers: input, alpha/noise, output).
+    /// </summary>
+    public const string PReluForwardSource = @"
+@group(0) @binding(0) var<storage, read> pr_input: array<f32>;
+@group(0) @binding(1) var<storage, read> pr_alpha: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pr_output: array<f32>;
+
+struct PRParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: u32,
+    pad2: u32,
+}
+@group(0) @binding(3) var<uniform> pr_params: PRParams;
+
+@compute @workgroup_size(256)
+fn prelu_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < pr_params.size) {
+        let x = pr_input[idx];
+        let a = pr_alpha[idx % pr_params.alpha_size];
+        pr_output[idx] = select(a * x, x, x >= 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn rrelu_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < pr_params.size) {
+        let x = pr_input[idx];
+        pr_output[idx] = select(pr_alpha[idx] * x, x, x >= 0.0);
+    }
+}
+";
+
+    /// <summary>
+    /// PReLU/RReLU backward kernels (4 buffers: gradOutput, input, alpha/noise, gradInput).
+    /// </summary>
+    public const string PReluBackwardSource = @"
+@group(0) @binding(0) var<storage, read> prb_grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> prb_input: array<f32>;
+@group(0) @binding(2) var<storage, read> prb_alpha: array<f32>;
+@group(0) @binding(3) var<storage, read_write> prb_grad_in: array<f32>;
+
+struct PRBParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: f32,
+    pad2: f32,
+}
+@group(0) @binding(4) var<uniform> prb_params: PRBParams;
+
+@compute @workgroup_size(256)
+fn prelu_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < prb_params.size) {
+        let x = prb_input[idx];
+        let a = prb_alpha[idx % prb_params.alpha_size];
+        prb_grad_in[idx] = select(a * prb_grad_out[idx], prb_grad_out[idx], x >= 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn rrelu_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < prb_params.size) {
+        let x = prb_input[idx];
+        prb_grad_in[idx] = prb_grad_out[idx] * select(prb_alpha[idx], 1.0, x >= 0.0);
+    }
+}
+";
+
+    /// <summary>
     /// Loss function backward pass kernels.
     /// </summary>
     public const string LossBackwardSource = @"
