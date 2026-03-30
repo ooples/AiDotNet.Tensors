@@ -15633,8 +15633,8 @@ public class CpuEngine : ITensorLevelEngine
         int sH = stride[0], sW = stride[1];
         int pH = padding[0], pW = padding[1];
 
-        int outH = (height + 2 * pH - kH) / sH + 1;
-        int outW = (width + 2 * pW - kW) / sW + 1;
+        int outH = (int)Math.Floor((height + 2.0 * pH - kH) / sH) + 1;
+        int outW = (int)Math.Floor((width + 2.0 * pW - kW) / sW) + 1;
         if (outH <= 0 || outW <= 0)
             throw new ArgumentException($"Invalid Unfold dimensions: output would be {outH}x{outW}. Check kernel, stride, and padding.");
         int colLength = outH * outW;
@@ -15674,8 +15674,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Unfold", result, input, BackwardFunctions<T>.UnfoldBackward,
-            new object[] { kernelSize, stride, padding });
+        DifferentiableOps.RecordUnaryLazy("Unfold", result, input, BackwardFunctions<T>.UnfoldBackward,
+            () => new object[] { kernelSize, stride, padding });
         return result;
     }
 
@@ -15708,12 +15708,11 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Input channels ({colChannels}) must be divisible by kernel elements ({kernelElements}).");
         int channels = colChannels / kernelElements;
         int colLength = input._shape[2];
-        int expectedColLength = ((outH + 2 * pH - kH) / sH + 1) * ((outW + 2 * pW - kW) / sW + 1);
+        int unfoldH = (int)Math.Floor((outH + 2.0 * pH - kH) / sH) + 1;
+        int unfoldW = (int)Math.Floor((outW + 2.0 * pW - kW) / sW) + 1;
+        int expectedColLength = unfoldH * unfoldW;
         if (colLength != expectedColLength)
             throw new ArgumentException($"Column length {colLength} doesn't match expected {expectedColLength} for output {outH}x{outW} with kernel {kH}x{kW}, stride {sH}x{sW}, pad {pH}x{pW}.");
-
-        int unfoldH = (outH + 2 * pH - kH) / sH + 1;
-        int unfoldW = (outW + 2 * pW - kW) / sW + 1;
 
         var result = TensorAllocator.Rent<T>(new[] { batch, channels, outH, outW });
         var inputData = input.GetDataArray();
@@ -15754,8 +15753,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Fold", result, input, BackwardFunctions<T>.FoldBackward,
-            new object[] { kernelSize, stride, padding });
+        DifferentiableOps.RecordUnaryLazy("Fold", result, input, BackwardFunctions<T>.FoldBackward,
+            () => new object[] { kernelSize, stride, padding });
         return result;
     }
 
