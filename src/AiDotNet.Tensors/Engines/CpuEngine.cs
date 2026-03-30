@@ -2066,6 +2066,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+            BackwardFunctions<T>.BatchMatMulBackward);
         return result;
     }
 
@@ -17793,7 +17795,10 @@ public class CpuEngine : ITensorLevelEngine
         // If both tensors are 3D, delegate to BatchMatMul
         if (a.Rank == 3 && b.Rank == 3)
         {
-            return BatchMatMul(a, b);
+            var bmmResult = BatchMatMul(a, b);
+            DifferentiableOps.RecordBinary("BatchMatMul", bmmResult, a, b,
+                BackwardFunctions<T>.BatchMatMulBackward);
+            return bmmResult;
         }
 
         // Handle broadcasting case where b is 2D [K, N]

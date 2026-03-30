@@ -1038,12 +1038,33 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var bT = engine.TensorTranspose(inputs[1]);
-        var gradA = engine.TensorBatchMatMul(gradOutput, bT);
-        var aT = engine.TensorTranspose(inputs[0]);
-        var gradB = engine.TensorBatchMatMul(aT, gradOutput);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        // For ND tensors, transpose the last 2 dimensions using TensorPermute
+        int rank = inputs[1].Rank;
+        if (rank >= 3)
+        {
+            // Build permutation that swaps last two dims
+            var perm = new int[rank];
+            for (int i = 0; i < rank - 2; i++) perm[i] = i;
+            perm[rank - 2] = rank - 1;
+            perm[rank - 1] = rank - 2;
+
+            var bT = engine.TensorPermute(inputs[1], perm);
+            var gradA = engine.BatchMatMul(gradOutput, bT);
+            var aT = engine.TensorPermute(inputs[0], perm);
+            var gradB = engine.BatchMatMul(aT, gradOutput);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        }
+        else
+        {
+            // 2D case
+            var bT = engine.TensorTranspose(inputs[1]);
+            var gradA = engine.TensorMatMul(gradOutput, bT);
+            var aT = engine.TensorTranspose(inputs[0]);
+            var gradB = engine.TensorMatMul(aT, gradOutput);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        }
     }
 
     /// <summary>Upsample (nearest) backward: sum gradients from upsampled positions</summary>

@@ -147,7 +147,7 @@ public class GradientTapeFeatureTests
         Assert.True(tape.DetectAnomaly);
     }
 
-    [Fact(Skip = "BatchMatMul has multiple return paths — hook needs to be added to BatchMatMul at line 1902")]
+    [Fact]
     public void BatchMatMul_Backward_ProducesGradients()
     {
         using var tape = new GradientTape<float>();
