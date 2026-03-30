@@ -15619,7 +15619,9 @@ public class CpuEngine : ITensorLevelEngine
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
         if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
         if (input.Rank != 4) throw new ArgumentException($"Unfold requires 4D input [batch, channels, height, width]. Got rank {input.Rank}.");
+        if (kernelSize[0] <= 0 || kernelSize[1] <= 0) throw new ArgumentException("Kernel size elements must be positive.", nameof(kernelSize));
         if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
+        if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative.", nameof(padding));
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15689,7 +15691,9 @@ public class CpuEngine : ITensorLevelEngine
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
         if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
         if (input.Rank != 3) throw new ArgumentException($"Fold requires 3D input [batch, C*kH*kW, L]. Got rank {input.Rank}.");
+        if (kernelSize[0] <= 0 || kernelSize[1] <= 0) throw new ArgumentException("Kernel size elements must be positive.", nameof(kernelSize));
         if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
+        if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative.", nameof(padding));
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
