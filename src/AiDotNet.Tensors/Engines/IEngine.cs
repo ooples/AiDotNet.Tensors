@@ -2835,6 +2835,29 @@ public interface IEngine
     Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
 
     /// <summary>
+    /// Performs 1D convolution on a 3D tensor (batch, channels, length).
+    /// Implemented by reshaping to Conv2D with height=1.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="input">The input tensor [batch, in_channels, length].</param>
+    /// <param name="kernel">The convolution kernel [out_channels, in_channels, kernel_length].</param>
+    /// <param name="stride">The stride of the convolution.</param>
+    /// <param name="padding">The amount of zero-padding to add.</param>
+    /// <param name="dilation">The dilation spacing between kernel elements.</param>
+    /// <returns>The convolved tensor [batch, out_channels, output_length].</returns>
+    Tensor<T> Conv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
+
+    /// <summary>
+    /// Computes gradient w.r.t. input for 1D convolution backward pass.
+    /// </summary>
+    Tensor<T> Conv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding, int dilation);
+
+    /// <summary>
+    /// Computes gradient w.r.t. kernel for 1D convolution backward pass.
+    /// </summary>
+    Tensor<T> Conv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding, int dilation);
+
+    /// <summary>
     /// Performs 2D convolution with asymmetric stride, padding, and dilation.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

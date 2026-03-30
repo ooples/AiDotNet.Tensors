@@ -46,6 +46,23 @@ public abstract class TensorBase<T> : IDisposable
     internal readonly int _storageOffset;
 
     /// <summary>
+    /// Monotonically increasing version counter. Incremented by in-place mutation operations.
+    /// Used by GradientTape to detect when a recorded tensor has been mutated after recording,
+    /// which would produce incorrect gradients during the backward pass.
+    /// </summary>
+    internal int _version;
+
+    /// <summary>
+    /// Gets the current mutation version of this tensor.
+    /// </summary>
+    public int Version => _version;
+
+    /// <summary>
+    /// Increments the version counter. Called by in-place operations to signal mutation.
+    /// </summary>
+    internal void IncrementVersion() => System.Threading.Interlocked.Increment(ref _version);
+
+    /// <summary>
     /// Whether this tensor's data is contiguous in memory (row-major with no gaps).
     /// When true, raw span/array access is safe. When false, Contiguous() must be called
     /// before passing to BLAS/SIMD operations.
