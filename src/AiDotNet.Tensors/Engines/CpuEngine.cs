@@ -15347,7 +15347,11 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[heightIdx] = newHeight;
         outputShape[widthIdx] = newWidth;
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var upsampleResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Upsample", upsampleResult, input,
+            BackwardFunctions<T>.UpsampleBackward,
+            savedState: new object[] { scaleH, scaleW });
+        return upsampleResult;
     }
 
     /// <inheritdoc/>
@@ -16475,6 +16479,8 @@ public class CpuEngine : ITensorLevelEngine
             resultData[flatIdx] = tensorData[inputFlat];
         });
 
+        DifferentiableOps.RecordUnary("Tile", result, tensor,
+            BackwardFunctions<T>.TileBackward);
         return result;
     }
 
@@ -17830,6 +17836,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+            BackwardFunctions<T>.BatchMatMulBackward);
         return result;
     }
 
@@ -21286,6 +21294,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, input,
+            BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
+            savedState: new object[] { outputHeight, outputWidth });
         return result;
     }
 
