@@ -508,6 +508,23 @@ fn hardsigmoid(@builtin(global_invocation_id) gid: vec3<u32>) {
         B[idx] = clamp(A[idx] / 6.0 + 0.5, 0.0, 1.0);
     }
 }
+
+@compute @workgroup_size(256)
+fn relu6(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        B[idx] = min(max(A[idx], 0.0), 6.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn threshold_op(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        // params.alpha = threshold value, params.beta (unused) could be fill value but we use 0
+        B[idx] = select(0.0, A[idx], A[idx] > params.alpha);
+    }
+}
 ";
 
     /// <summary>
@@ -1669,6 +1686,139 @@ fn hardtanh_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         // params.alpha = minVal, params.beta = maxVal
         grad_input[idx] = grad_output[idx] * select(0.0, 1.0, x >= params.alpha && x <= params.beta);
     }
+}
+
+@compute @workgroup_size(256)
+fn relu6_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = forward_data[idx];
+        grad_input[idx] = select(0.0, grad_output[idx], x > 0.0 && x < 6.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn threshold_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        grad_input[idx] = select(0.0, grad_output[idx], forward_data[idx] > params.alpha);
+    }
+}
+
+@compute @workgroup_size(256)
+fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = forward_data[idx];
+        grad_input[idx] = -grad_output[idx] / (x * x);
+    }
+}
+";
+
+    /// <summary>
+    /// PReLU/RReLU forward kernels (3 buffers: input, alpha/noise, output).
+    /// </summary>
+    public const string PReluForwardSource = @"
+@group(0) @binding(0) var<storage, read> pr_input: array<f32>;
+@group(0) @binding(1) var<storage, read> pr_alpha: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pr_output: array<f32>;
+
+struct PRParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: u32,
+    pad2: u32,
+}
+@group(0) @binding(3) var<uniform> pr_params: PRParams;
+
+@compute @workgroup_size(256)
+fn prelu_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < pr_params.size) {
+        let x = pr_input[idx];
+        let a = pr_alpha[idx % pr_params.alpha_size];
+        pr_output[idx] = select(a * x, x, x >= 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn rrelu_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < pr_params.size) {
+        let x = pr_input[idx];
+        pr_output[idx] = select(pr_alpha[idx] * x, x, x >= 0.0);
+    }
+}
+";
+
+    /// <summary>
+    /// PReLU/RReLU backward kernels (4 buffers: gradOutput, input, alpha/noise, gradInput).
+    /// </summary>
+    public const string PReluBackwardSource = @"
+@group(0) @binding(0) var<storage, read> prb_grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> prb_input: array<f32>;
+@group(0) @binding(2) var<storage, read> prb_alpha: array<f32>;
+@group(0) @binding(3) var<storage, read_write> prb_grad_in: array<f32>;
+
+struct PRBParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: f32,
+    pad2: f32,
+}
+@group(0) @binding(4) var<uniform> prb_params: PRBParams;
+
+@compute @workgroup_size(256)
+fn prelu_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < prb_params.size) {
+        let x = prb_input[idx];
+        let a = prb_alpha[idx % prb_params.alpha_size];
+        prb_grad_in[idx] = select(a * prb_grad_out[idx], prb_grad_out[idx], x >= 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn rrelu_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < prb_params.size) {
+        let x = prb_input[idx];
+        prb_grad_in[idx] = prb_grad_out[idx] * select(prb_alpha[idx], 1.0, x >= 0.0);
+    }
+}
+";
+
+    /// <summary>
+    /// PReLU alpha backward: segmented reduction (3 buffers: gradOut, input, gradAlpha).
+    /// One thread per alpha channel, loops over its segment.
+    /// </summary>
+    public const string PReluAlphaBackwardSource = @"
+@group(0) @binding(0) var<storage, read> pab_grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> pab_input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pab_grad_alpha: array<f32>;
+
+struct PABParams {
+    size: u32,
+    alpha_size: u32,
+    pad1: u32,
+    pad2: u32,
+}
+@group(0) @binding(3) var<uniform> pab_params: PABParams;
+
+@compute @workgroup_size(256)
+fn prelu_backward_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= pab_params.alpha_size) { return; }
+    var sum: f32 = 0.0;
+    var i: u32 = c;
+    loop {
+        if (i >= pab_params.size) { break; }
+        if (pab_input[i] < 0.0) {
+            sum += pab_input[i] * pab_grad_out[i];
+        }
+        i += pab_params.alpha_size;
+    }
+    pab_grad_alpha[c] = sum;
 }
 ";
 
@@ -8075,6 +8225,138 @@ fn masked_fill(@builtin(global_invocation_id) gid: vec3u) {
     let idx = gid.x;
     if (idx >= mf_params.size) { return; }
     mf_output[idx] = select(mf_input[idx], mf_params.fill_value, mf_mask[idx] != 0.0);
+}
+";
+
+    /// <summary>
+    /// 4-buffer loss backward kernels: gradOutput, predictions/logits, targets, gradInput.
+    /// </summary>
+    public const string LossBackward4Source = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> logits_data: array<f32>;
+@group(0) @binding(2) var<storage, read> target_data: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_input_data: array<f32>;
+
+struct Params4 {
+    size: u32,
+    inv_size: f32,
+    param1: f32,
+    param2: f32,
+}
+@group(0) @binding(4) var<uniform> params: Params4;
+
+@compute @workgroup_size(256)
+fn bce_logits_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = logits_data[idx];
+        let sig = 1.0 / (1.0 + exp(-x));
+        let t = target_data[idx];
+        grad_input_data[idx] = grad_output[0] * (sig - t) * params.inv_size;
+    }
+}
+
+@compute @workgroup_size(256)
+fn mse_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        grad_input_data[idx] = grad_output[0] * 2.0 * (logits_data[idx] - target_data[idx]) * params.inv_size;
+    }
+}
+
+@compute @workgroup_size(256)
+fn l1_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let d = logits_data[idx] - target_data[idx];
+        grad_input_data[idx] = grad_output[0] * sign(d) * params.inv_size;
+    }
+}
+";
+
+    /// <summary>
+    /// 3-buffer loss forward kernels for element-wise loss computation.
+    /// </summary>
+    public const string LossForwardSource = @"
+@group(0) @binding(0) var<storage, read> lf_pred: array<f32>;
+@group(0) @binding(1) var<storage, read> lf_target: array<f32>;
+@group(0) @binding(2) var<storage, read_write> lf_loss: array<f32>;
+
+struct LFParams {
+    size: u32,
+    param1: f32,
+    param2: f32,
+    param3: f32,
+}
+@group(0) @binding(3) var<uniform> lf_params: LFParams;
+
+@compute @workgroup_size(256)
+fn bce_with_logits_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        let x = lf_pred[idx];
+        let t = lf_target[idx];
+        let ax = abs(x);
+        lf_loss[idx] = max(x, 0.0) - x * t + log(1.0 + exp(-ax));
+    }
+}
+
+@compute @workgroup_size(256)
+fn kl_div_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        let t = lf_target[idx];
+        lf_loss[idx] = select(0.0, t * (log(t) - lf_pred[idx]), t > 0.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn l1_loss_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < lf_params.size) {
+        lf_loss[idx] = abs(lf_pred[idx] - lf_target[idx]);
+    }
+}
+
+@compute @workgroup_size(256)
+fn l1_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numFeatures = bitcast<u32>(lf_params.param1);
+    if (b >= batchSize) { return; }
+    var sum_abs: f32 = 0.0;
+    let base_idx = b * numFeatures;
+    for (var f: u32 = 0u; f < numFeatures; f = f + 1u) {
+        sum_abs += abs(lf_pred[base_idx + f] - lf_target[base_idx + f]);
+    }
+    lf_loss[b] = sum_abs / f32(numFeatures);
+}
+
+@compute @workgroup_size(256)
+fn huber_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numFeatures = bitcast<u32>(lf_params.param1);
+    let delta = lf_params.param2;
+    if (b >= batchSize) { return; }
+    var sum: f32 = 0.0;
+    let base_idx = b * numFeatures;
+    for (var f: u32 = 0u; f < numFeatures; f = f + 1u) {
+        let d = lf_pred[base_idx + f] - lf_target[base_idx + f];
+        let ad = abs(d);
+        sum += select(delta * (ad - 0.5 * delta), 0.5 * d * d, ad <= delta);
+    }
+    lf_loss[b] = sum / f32(numFeatures);
+}
+
+@compute @workgroup_size(256)
+fn nll_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    let batchSize = lf_params.size;
+    let numClasses = bitcast<u32>(lf_params.param1);
+    if (b >= batchSize) { return; }
+    let tc = i32(lf_target[b]);
+    lf_loss[b] = select(0.0, -lf_pred[b * numClasses + u32(tc)], tc >= 0 && tc < i32(numClasses));
 }
 ";
 }

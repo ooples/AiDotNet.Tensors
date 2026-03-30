@@ -6051,8 +6051,220 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (!_kernelCache.TryGetValue("relu6", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: relu6");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr aPtr = A.Handle; IntPtr bPtr = B.Handle; int n = size;
+        void** args = stackalloc void*[3]; args[0] = &aPtr; args[1] = &bPtr; args[2] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("relu6_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: relu6_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &giPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: prelu");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr aPtr = alpha.Handle; IntPtr oPtr = output.Handle; int n = size; int aSize = alphaSize;
+        void** args = stackalloc void*[5]; args[0] = &iPtr; args[1] = &aPtr; args[2] = &oPtr; args[3] = &n; args[4] = &aSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu_backward_input", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_input");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr aPtr = alpha.Handle; IntPtr giPtr = gradInput.Handle; int n = size; int aSize = alphaSize;
+        void** args = stackalloc void*[6]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &aPtr; args[3] = &giPtr; args[4] = &n; args[5] = &aSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
+    {
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr gaPtr = gradAlpha.Handle; int n = size; int aSize = alphaSize;
+        void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &gaPtr; args[3] = &n; args[4] = &aSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
+    {
+        if (!_kernelCache.TryGetValue("rrelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rrelu");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr nPtr = noise.Handle; IntPtr oPtr = output.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &iPtr; args[1] = &nPtr; args[2] = &oPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("rrelu_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: rrelu_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr nPtr = noise.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &nPtr; args[3] = &giPtr; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
+    {
+        if (!_kernelCache.TryGetValue("threshold_forward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: threshold_forward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr oPtr = output.Handle; int n = size;
+        void** args = stackalloc void*[5]; args[0] = &iPtr; args[1] = &oPtr; args[2] = &threshold; args[3] = &value; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
+    {
+        if (!_kernelCache.TryGetValue("threshold_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: threshold_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &giPtr; args[3] = &threshold; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("reciprocal_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: reciprocal_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &goPtr; args[1] = &iPtr; args[2] = &giPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     #endregion
 
+    #region Loss Function GPU Kernel Operations
+
+    public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+        if (!_kernelCache.TryGetValue("l1_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: l1_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nf = numFeatures;
+        void** args = stackalloc void*[5]; args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &bs; args[4] = &nf;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
+    {
+        if (!_kernelCache.TryGetValue("huber_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: huber_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nf = numFeatures;
+        void** args = stackalloc void*[6]; args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &bs; args[4] = &nf; args[5] = &delta;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
+    {
+        if (!_kernelCache.TryGetValue("bce_with_logits_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: bce_with_logits_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr lPtr = logits.Handle; IntPtr tPtr = targets.Handle; IntPtr oPtr = loss.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &lPtr; args[1] = &tPtr; args[2] = &oPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+    {
+        if (!_kernelCache.TryGetValue("nll_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: nll_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr lpPtr = logProbs.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nc = numClasses;
+        void** args = stackalloc void*[5]; args[0] = &lpPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &bs; args[4] = &nc;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
+    {
+        if (!_kernelCache.TryGetValue("kl_div_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: kl_div_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr tPtr = target.Handle; IntPtr lPtr = loss.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &iPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("mse_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: mse_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[6]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &giPtr; args[4] = &n; args[5] = &invN;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("l1_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: l1_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[6]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &giPtr; args[4] = &n; args[5] = &invN;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
+    {
+        if (!_kernelCache.TryGetValue("huber_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: huber_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[7]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &giPtr; args[4] = &n; args[5] = &invN; args[6] = &delta;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        if (!_kernelCache.TryGetValue("bce_with_logits_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: bce_with_logits_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle; IntPtr lPtr = logits.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
+        void** args = stackalloc void*[6]; args[0] = &goPtr; args[1] = &lPtr; args[2] = &tPtr; args[3] = &giPtr; args[4] = &n; args[5] = &invN;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    #endregion
 
 
     #region Loss Function Operations

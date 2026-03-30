@@ -28,6 +28,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
@@ -45,6 +46,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
@@ -63,6 +65,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
@@ -73,7 +76,11 @@ internal static class DifferentiableOps
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining
+#if !NETFRAMEWORK
+        | MethodImplOptions.AggressiveOptimization
+#endif
+    )]
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
@@ -86,7 +93,11 @@ internal static class DifferentiableOps
         }
         else
         {
-            grads[tensor] = grad.Clone();
+            // Store directly on first access — no clone needed since backward
+            // functions create fresh gradient tensors that aren't shared.
+            // Only clone if the grad is the SAME reference as another tensor
+            // (which would alias and corrupt on subsequent accumulation).
+            grads[tensor] = grad;
         }
     }
 }

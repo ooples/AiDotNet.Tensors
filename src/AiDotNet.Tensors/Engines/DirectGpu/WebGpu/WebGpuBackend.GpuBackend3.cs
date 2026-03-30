@@ -352,6 +352,133 @@ public sealed partial class WebGpuBackend
             gradOutput, input, gradInput, MakeUniform3(size, minVal, maxVal), size).GetAwaiter().GetResult();
     }
 
+    public void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
+        => DispatchActivationAsync("relu6", A, B, size, 0).GetAwaiter().GetResult();
+
+    public void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "relu6_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
+    {
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch3BufferAsync("PReluForward", WebGpuKernels.PReluForwardSource, "prelu_forward",
+            input, alpha, output, uniformParams, size).GetAwaiter().GetResult();
+    }
+
+    public void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
+    {
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch4BufferAsync("PReluBackward", WebGpuKernels.PReluBackwardSource, "prelu_backward_input",
+            gradOutput, input, alpha, gradInput, uniformParams, size).GetAwaiter().GetResult();
+    }
+
+    public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
+    {
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(alphaSize), 0f, 0f };
+        Dispatch3BufferAsync("PReluAlphaBackward", WebGpuKernels.PReluAlphaBackwardSource, "prelu_backward_alpha",
+            gradOutput, input, gradAlpha, uniformParams, alphaSize).GetAwaiter().GetResult();
+    }
+
+    public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
+    {
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(size), 0f, 0f };
+        Dispatch3BufferAsync("PReluForward", WebGpuKernels.PReluForwardSource, "rrelu_forward",
+            input, noise, output, uniformParams, size).GetAwaiter().GetResult();
+    }
+
+    public void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
+    {
+        var uniformParams = new float[] { BitConverter.Int32BitsToSingle(size), BitConverter.Int32BitsToSingle(size), 0f, 0f };
+        Dispatch4BufferAsync("PReluBackward", WebGpuKernels.PReluBackwardSource, "rrelu_backward",
+            gradOutput, input, noise, gradInput, uniformParams, size).GetAwaiter().GetResult();
+    }
+
+    public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
+        => DispatchActivationAsync("threshold_op", input, output, size, threshold).GetAwaiter().GetResult();
+
+    public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
+    {
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "threshold_backward",
+            gradOutput, input, gradInput, MakeUniform2(size, threshold), size).GetAwaiter().GetResult();
+    }
+
+    public void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "reciprocal_backward",
+            gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "l1_loss_batch",
+            predictions, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numFeatures), 0f, 0f), batchSize).GetAwaiter().GetResult();
+    }
+
+    public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
+    {
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "huber_loss_batch",
+            predictions, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numFeatures), delta, 0f), batchSize).GetAwaiter().GetResult();
+    }
+
+    public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
+    {
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "bce_with_logits_forward",
+            logits, targets, loss, MakeUniform4(size, 0f, 0f, 0f), size).GetAwaiter().GetResult();
+    }
+
+    public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+    {
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "nll_loss_batch",
+            logProbs, targets, loss, MakeUniform4(batchSize, BitConverter.Int32BitsToSingle(numClasses), 0f, 0f), batchSize).GetAwaiter().GetResult();
+    }
+
+    public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
+    {
+        Dispatch3BufferAsync("LossForward", WebGpuKernels.LossForwardSource, "kl_div_forward",
+            input, target, loss, MakeUniform4(size, 0f, 0f, 0f), size).GetAwaiter().GetResult();
+    }
+
+    public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        // Use existing 3-buffer WGSL loss backward (predictions, targets, grad_input)
+        // The gradOutput scalar is folded into inv_size uniform
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scaledInvN = goScalar * invN;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mse_backward",
+            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, 0f, 0f), size).GetAwaiter().GetResult();
+    }
+
+    public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scaledInvN = goScalar * invN;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "mae_backward",
+            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, 0f, 0f), size).GetAwaiter().GetResult();
+    }
+
+    public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
+    {
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scaledInvN = goScalar * invN;
+        Dispatch3BufferAsync("LossBackward", WebGpuKernels.LossBackwardSource, "huber_backward",
+            predictions, targets, gradInput, MakeUniform4(size, scaledInvN, delta, 0f), size).GetAwaiter().GetResult();
+    }
+
+    public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        // BCE with logits backward: sigmoid(x) - t, scaled by gradOutput and invN
+        // The existing bce_backward kernel uses predictions (sigmoid output), not logits
+        // Need to compute sigmoid first or use a dedicated kernel
+        float goScalar = DownloadBuffer(gradOutput)[0];
+        float scaledInvN = goScalar * invN;
+        // Use the 4-buffer dispatch with a dedicated WGSL shader
+        Dispatch4BufferAsync("LossBackward4", WebGpuKernels.LossBackward4Source, "bce_logits_backward",
+            gradOutput, logits, targets, gradInput, MakeUniform4(size, invN, 0f, 0f), size).GetAwaiter().GetResult();
+    }
+
     public void ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "relu_backward",

@@ -728,6 +728,94 @@ extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const floa
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
+// ReLU6: min(max(0, x), 6)
+extern ""C"" __global__ __launch_bounds__(256) void relu6(const float* input, float* output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    output[idx] = fminf(fmaxf(x, 0.0f), 6.0f);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void relu6_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = (x > 0.0f && x < 6.0f) ? gradOutput[idx] : 0.0f;
+}
+
+// PReLU: max(0,x) + alpha * min(0,x)
+extern ""C"" __global__ __launch_bounds__(256) void prelu(const float* input, const float* alpha, float* output, int size, int alphaSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float a = alpha[idx % alphaSize];
+    output[idx] = x >= 0.0f ? x : a * x;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_input(const float* gradOutput, const float* input, const float* alpha, float* gradInput, int size, int alphaSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float a = alpha[idx % alphaSize];
+    gradInput[idx] = x >= 0.0f ? gradOutput[idx] : a * gradOutput[idx];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void prelu_backward_alpha(const float* gradOutput, const float* input, float* gradAlpha, int size, int alphaSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    if (x < 0.0f) {
+        int alphaIdx = idx % alphaSize;
+        atomicAdd(&gradAlpha[alphaIdx], x * gradOutput[idx]);
+    }
+}
+
+// RReLU
+extern ""C"" __global__ __launch_bounds__(256) void rrelu(const float* input, const float* noise, float* output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    output[idx] = x >= 0.0f ? x : noise[idx] * x;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void rrelu_backward(const float* gradOutput, const float* input, const float* noise, float* gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = gradOutput[idx] * (x >= 0.0f ? 1.0f : noise[idx]);
+}
+
+// Threshold
+extern ""C"" __global__ __launch_bounds__(256) void threshold_forward(const float* input, float* output, float thresh, float val, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    output[idx] = input[idx] > thresh ? input[idx] : val;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const float* gradOutput, const float* input, float* gradInput, float thresh, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
+}
+
+// Reciprocal backward: -1/x^2
+extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* gradOutput, const float* input, float* gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    gradInput[idx] = -gradOutput[idx] / (x * x);
+}
+
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
@@ -954,6 +1042,11 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "relu_backward", "sigmoid_backward", "tanh_backward", "gelu_backward",
             "mish_backward", "softplus_backward", "hardswish_backward",
             "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
+            "relu6", "relu6_backward",
+            "prelu", "prelu_backward_input", "prelu_backward_alpha",
+            "rrelu", "rrelu_backward",
+            "threshold_forward", "threshold_backward",
+            "reciprocal_backward",
             "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary

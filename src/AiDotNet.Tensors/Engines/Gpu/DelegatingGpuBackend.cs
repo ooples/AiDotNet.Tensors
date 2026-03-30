@@ -1135,6 +1135,25 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     /// <inheritdoc/>
     public virtual void HardtanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float minVal, float maxVal, int size)
         => Inner.HardtanhBackward(gradOutput, input, gradInput, minVal, maxVal, size);
+    public virtual void Relu6(IGpuBuffer A, IGpuBuffer B, int size) => Inner.Relu6(A, B, size);
+    public virtual void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size) => Inner.Relu6Backward(gradOutput, input, gradInput, size);
+    public virtual void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize) => Inner.PRelu(input, alpha, output, size, alphaSize);
+    public virtual void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize) => Inner.PReluBackwardInput(gradOutput, input, alpha, gradInput, size, alphaSize);
+    public virtual void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize) => Inner.PReluBackwardAlpha(gradOutput, input, gradAlpha, size, alphaSize);
+    public virtual void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size) => Inner.RRelu(input, noise, output, size);
+    public virtual void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size) => Inner.RReluBackward(gradOutput, input, noise, gradInput, size);
+    public virtual void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size) => Inner.Threshold(input, output, threshold, value, size);
+    public virtual void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size) => Inner.ThresholdBackward(gradOutput, input, gradInput, threshold, size);
+    public virtual void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size) => Inner.ReciprocalBackward(gradOutput, input, gradInput, size);
+    public virtual void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures) => Inner.L1Loss(predictions, targets, loss, batchSize, numFeatures);
+    public virtual void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta) => Inner.HuberLoss(predictions, targets, loss, batchSize, numFeatures, delta);
+    public virtual void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size) => Inner.BceWithLogitsLoss(logits, targets, loss, size);
+    public virtual void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses) => Inner.NllLoss(logProbs, targets, loss, batchSize, numClasses);
+    public virtual void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size) => Inner.KlDivLoss(input, target, loss, size);
+    public virtual void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN) => Inner.MseLossBackward(gradOutput, predictions, targets, gradInput, size, invN);
+    public virtual void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN) => Inner.L1LossBackward(gradOutput, predictions, targets, gradInput, size, invN);
+    public virtual void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta) => Inner.HuberLossBackward(gradOutput, predictions, targets, gradInput, size, invN, delta);
+    public virtual void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN) => Inner.BceWithLogitsBackward(gradOutput, logits, targets, gradInput, size, invN);
 
     #endregion
 

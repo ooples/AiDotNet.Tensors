@@ -348,6 +348,100 @@ public sealed unsafe partial class VulkanBackend
     public void HardtanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float minVal, float maxVal, int size)
         => CpuBinary(gradOutput, input, gradInput, size, (g, x) => x > minVal && x < maxVal ? g : 0f);
 
+    public void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
+        => GlslUnaryOp(VulkanGlslKernels.Relu6, A, B, size);
+
+    public void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+        => GlslBinaryOp(VulkanGlslKernels.Relu6Backward, gradOutput, input, gradInput, size);
+
+    public void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
+    {
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslBinaryOp(VulkanGlslKernels.PRelu, input, alpha, output, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
+    {
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslQuadOp(VulkanGlslKernels.PReluBackwardInput, gradOutput, input, alpha, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
+    {
+        // Segmented reduction: one thread per alpha channel, loops over its segment
+        var pushData = new uint[] { (uint)size, (uint)alphaSize };
+        GlslBinaryOp(VulkanGlslKernels.PReluBackwardAlpha, gradOutput, input, gradAlpha, alphaSize, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
+        => GlslBinaryOp(VulkanGlslKernels.RRelu, input, noise, output, size);
+
+    public void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
+        => GlslQuadOp(VulkanGlslKernels.RReluBackward, gradOutput, input, noise, gradInput, size);
+
+    public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(threshold), BitConverter.SingleToUInt32Bits(value) };
+        GlslUnaryOp(VulkanGlslKernels.Threshold, input, output, size, pushData, (uint)(3 * sizeof(uint)));
+    }
+
+    public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(threshold) };
+        GlslBinaryOp(VulkanGlslKernels.ThresholdBackward, gradOutput, input, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+        => GlslBinaryOp(VulkanGlslKernels.ReciprocalBackward, gradOutput, input, gradInput, size);
+
+    public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures };
+        GlslBinaryOp(VulkanGlslKernels.L1LossBatch, predictions, targets, loss, batchSize, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
+    {
+        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures, BitConverter.SingleToUInt32Bits(delta) };
+        GlslBinaryOp(VulkanGlslKernels.HuberLossBatch, predictions, targets, loss, batchSize, pushData, (uint)(3 * sizeof(uint)));
+    }
+
+    public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
+        => GlslBinaryOp(VulkanGlslKernels.BceWithLogitsElementwise, logits, targets, loss, size);
+
+    public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+    {
+        var pushData = new uint[] { (uint)batchSize, (uint)numClasses };
+        GlslBinaryOp(VulkanGlslKernels.NllLossBatch, logProbs, targets, loss, batchSize, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
+        => GlslBinaryOp(VulkanGlslKernels.KlDivElementwise, input, target, loss, size);
+
+    public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.MseLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.L1LossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
+    public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN), BitConverter.SingleToUInt32Bits(delta) };
+        GlslQuadOp(VulkanGlslKernels.HuberLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(3 * sizeof(uint)));
+    }
+
+    public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        GlslQuadOp(VulkanGlslKernels.BceWithLogitsBackward, gradOutput, logits, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
     #endregion
 
     #region Loss Functions
