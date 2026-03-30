@@ -14,7 +14,6 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public class GradientCorrectnessTests
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
-    private readonly CpuEngine _cpu = (CpuEngine)AiDotNetEngine.Current;
     private const double Epsilon = 1e-3; // Central difference: O(eps^2) truncation error
     private const double RelTolerance = 5e-2; // 5% tolerance accounts for float finite-difference error
     // Note: finite-difference gradient has O(eps^2) truncation + O(1/eps) roundoff error.
@@ -599,7 +598,7 @@ public class GradientCorrectnessTests
     {
         var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
         var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
-        VerifyGradient(inp => _cpu.TensorMSELoss(inp, target), pred, "MSELoss");
+        VerifyGradient(inp => _engine.TensorMSELoss(inp, target), pred, "MSELoss");
     }
 
     [Fact]
@@ -607,7 +606,7 @@ public class GradientCorrectnessTests
     {
         var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
         var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
-        VerifyGradient(inp => _cpu.TensorL1Loss(inp, target), pred, "L1Loss");
+        VerifyGradient(inp => _engine.TensorL1Loss(inp, target), pred, "L1Loss");
     }
 
     [Fact]
@@ -615,7 +614,7 @@ public class GradientCorrectnessTests
     {
         var pred = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
         var target = new Tensor<float>(new float[] { 1.5f, 2.5f, 2.5f, 3.5f }, [4]);
-        VerifyGradient(inp => _cpu.TensorHuberLoss(inp, target), pred, "HuberLoss");
+        VerifyGradient(inp => _engine.TensorHuberLoss(inp, target), pred, "HuberLoss");
     }
 
     [Fact]

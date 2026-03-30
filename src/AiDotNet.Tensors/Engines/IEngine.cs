@@ -6984,6 +6984,87 @@ public interface IEngine
     Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1);
 
     #endregion
+
+    // ──────────────────────────────────────────────────────────────
+    // Differentiable loss functions (return scalar Tensor<T> for tape)
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>MSE loss: mean((pred - target)^2). Returns scalar tensor.</summary>
+    Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets);
+
+    /// <summary>L1 loss: mean(|pred - target|). Returns scalar tensor.</summary>
+    Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets);
+
+    /// <summary>Huber loss: smooth L1. Returns scalar tensor.</summary>
+    Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0);
+
+    /// <summary>BCE with logits: sigmoid cross-entropy. Returns scalar tensor.</summary>
+    Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets);
+
+    /// <summary>Cross-entropy with softmax. Returns scalar tensor.</summary>
+    Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets);
+
+    /// <summary>NLL loss on log-probabilities. Returns scalar tensor.</summary>
+    Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets);
+
+    /// <summary>KL divergence loss. Returns scalar tensor.</summary>
+    Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target);
+
+    /// <summary>Cosine similarity. Returns scalar tensor.</summary>
+    Tensor<T> TensorCosineSimilarityLoss<T>(Tensor<T> a, Tensor<T> b);
+
+    // ──────────────────────────────────────────────────────────────
+    // Differentiable activations
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>SELU activation.</summary>
+    Tensor<T> TensorSELU<T>(Tensor<T> tensor);
+
+    /// <summary>HardSigmoid: clamp(x/6 + 0.5, 0, 1).</summary>
+    Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor);
+
+    /// <summary>ReLU6: min(max(0, x), 6).</summary>
+    Tensor<T> TensorReLU6<T>(Tensor<T> tensor);
+
+    /// <summary>PReLU with learnable alpha.</summary>
+    Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha);
+
+    /// <summary>RReLU with random leaky slope.</summary>
+    Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true);
+
+    /// <summary>Threshold: x > threshold ? x : value.</summary>
+    Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value);
+
+    /// <summary>Element-wise reciprocal: 1/x.</summary>
+    Tensor<T> TensorReciprocal<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise sign: -1, 0, or 1.</summary>
+    Tensor<T> TensorSign<T>(Tensor<T> tensor);
+
+    // ──────────────────────────────────────────────────────────────
+    // Differentiable shape/indexing/pooling ops
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>Flatten tensor to 1D.</summary>
+    Tensor<T> TensorFlatten<T>(Tensor<T> tensor);
+
+    /// <summary>Narrow (slice along one axis).</summary>
+    Tensor<T> TensorNarrow<T>(Tensor<T> tensor, int dim, int start, int length);
+
+    /// <summary>Constant padding for N-dimensional tensors.</summary>
+    Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value);
+
+    /// <summary>Upsample bilinear (4D NCHW).</summary>
+    Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize);
+
+    /// <summary>1D average pooling.</summary>
+    Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride);
+
+    /// <summary>1D max pooling.</summary>
+    Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride);
+
+    /// <summary>Full mean reduction returning scalar tensor for tape.</summary>
+    Tensor<T> TensorMeanDiff<T>(Tensor<T> tensor);
 }
 
 /// <summary>

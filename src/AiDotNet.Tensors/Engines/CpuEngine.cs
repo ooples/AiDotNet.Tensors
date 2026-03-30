@@ -21750,10 +21750,14 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var diff = TensorSubtract(predictions, targets);
-        var sq = TensorMultiply(diff, diff);
-        T sum = TensorSum(sq);
-        T mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        T mean;
+        using (new NoGradScope<T>())
+        {
+            var diff = TensorSubtract(predictions, targets);
+            var sq = TensorMultiply(diff, diff);
+            T sum = TensorSum(sq);
+            mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("MSELoss", result, predictions, targets, BackwardFunctions<T>.MSELossBackward);
         return result;
@@ -21763,10 +21767,14 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var diff = TensorSubtract(predictions, targets);
-        var absDiff = TensorAbs(diff);
-        T sum = TensorSum(absDiff);
-        T mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        T mean;
+        using (new NoGradScope<T>())
+        {
+            var diff = TensorSubtract(predictions, targets);
+            var absDiff = TensorAbs(diff);
+            T sum = TensorSum(absDiff);
+            mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+        }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("L1Loss", result, predictions, targets, BackwardFunctions<T>.L1LossBackward);
         return result;
@@ -21776,7 +21784,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var diff = TensorSubtract(predictions, targets);
+        Tensor<T> diff;
+        using (new NoGradScope<T>()) { diff = TensorSubtract(predictions, targets); }
         T sum = numOps.Zero;
         for (int i = 0; i < diff.Length; i++)
         {

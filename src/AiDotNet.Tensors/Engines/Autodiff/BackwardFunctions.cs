@@ -1251,11 +1251,12 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var target = (Tensor<T>)savedState[0];
-        T scale = numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
-        var diff = engine.TensorSubtract(inputs[0], target);
+        var predictions = inputs[0];
+        var targets = inputs[1];
+        T scale = numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length);
+        var diff = engine.TensorSubtract(predictions, targets);
         var grad = engine.TensorMultiplyScalar(diff, scale);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        DifferentiableOps.AccumulateGrad(grads, predictions, grad, engine);
     }
 
     /// <summary>BCE with logits loss backward</summary>
@@ -1264,7 +1265,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var targets = (Tensor<T>)savedState[0];
+        var targets = inputs[1];
         int n = inputs[0].Length;
         double gScale = numOps.ToDouble(gradOutput[0]) / n;
         var dx = new Tensor<T>(new T[n], inputs[0].Shape.ToArray());
@@ -1284,7 +1285,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var targets = (Tensor<T>)savedState[0];
+        var targets = inputs[1];
         int n = inputs[0].Shape[0]; // batch
         int c = inputs[0].Length / n; // classes
         double scale = numOps.ToDouble(gradOutput[0]) / n;
@@ -1349,7 +1350,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var target = (Tensor<T>)savedState[0];
+        var target = inputs[1];
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
         var diff = engine.TensorSubtract(inputs[0], target);
         var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
@@ -1364,8 +1365,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var target = (Tensor<T>)savedState[0];
-        double delta = (double)savedState[1];
+        var target = inputs[1];
+        double delta = (double)savedState[0];
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
         var diff = engine.TensorSubtract(inputs[0], target);
         var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
@@ -1384,7 +1385,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var target = (Tensor<T>)savedState[0];
+        var target = inputs[1];
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
         var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
         for (int i = 0; i < inputs[0].Length; i++)
@@ -1398,14 +1399,14 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int[] targets = (int[])savedState[0];
+        var targetTensor = inputs[1];
         int n = inputs[0].Shape[0];
         int c = inputs[0].Length / n;
         double scale = numOps.ToDouble(gradOutput[0]) / n;
         var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
         for (int b = 0; b < n; b++)
         {
-            int target = targets[b];
+            int target = (int)numOps.ToDouble(targetTensor[b]);
             if (target >= 0 && target < c)
                 dx[b * c + target] = numOps.FromDouble(-scale);
         }
