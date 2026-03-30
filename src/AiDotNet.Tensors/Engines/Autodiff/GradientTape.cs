@@ -83,6 +83,14 @@ public sealed class GradientTape<T> : IDisposable
         _entries = new List<TapeEntry<T>>();
         _engine = AiDotNetEngine.Current;
         _parent = _current;
+
+        if (_options.EnableHooks)
+        {
+            _hooks = new Dictionary<Tensor<T>, List<Func<Tensor<T>, Tensor<T>>>>(
+                ReferenceEqualityComparer<Tensor<T>>.Instance);
+            _retainGrad = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        }
+
         SetCurrentTape(this);
     }
 
@@ -232,6 +240,50 @@ public sealed class GradientTape<T> : IDisposable
     /// When true, each backward function's output is checked for NaN/Inf.
     /// </summary>
     public bool DetectAnomaly { get; set; }
+
+    /// <summary>
+    /// Tensor-specific backward hooks. When a tensor's gradient is computed during backward,
+    /// all registered hooks for that tensor are called with the gradient.
+    /// Like PyTorch's tensor.register_hook().
+    /// </summary>
+    private readonly Dictionary<Tensor<T>, List<Func<Tensor<T>, Tensor<T>>>>? _hooks;
+
+    /// <summary>
+    /// Set of tensors that should retain their gradients even if they are non-leaf tensors.
+    /// Like PyTorch's tensor.retain_grad().
+    /// </summary>
+    private readonly HashSet<Tensor<T>>? _retainGrad;
+
+    /// <summary>
+    /// Registers a hook on a tensor that will be called with its gradient during backward.
+    /// The hook can modify the gradient by returning a new tensor.
+    /// </summary>
+    /// <param name="tensor">The tensor to hook.</param>
+    /// <param name="hook">Function receiving gradient, returning (possibly modified) gradient.</param>
+    public void RegisterHook(Tensor<T> tensor, Func<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        var hooks = _hooks ?? throw new InvalidOperationException(
+            "Hooks require GradientTapeOptions with EnableHooks=true");
+        if (!hooks.TryGetValue(tensor, out var list))
+        {
+            list = new List<Func<Tensor<T>, Tensor<T>>>();
+            hooks[tensor] = list;
+        }
+        list.Add(hook);
+    }
+
+    /// <summary>
+    /// Marks a tensor to retain its gradient after backward, even if it's a non-leaf tensor.
+    /// Like PyTorch's tensor.retain_grad().
+    /// </summary>
+    public void RetainGrad(Tensor<T> tensor)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        var retain = _retainGrad ?? throw new InvalidOperationException(
+            "RetainGrad requires GradientTapeOptions with EnableHooks=true");
+        retain.Add(tensor);
+    }
 
     /// <summary>
     /// Disposes the tape and restores the parent tape (if any) as the current tape.

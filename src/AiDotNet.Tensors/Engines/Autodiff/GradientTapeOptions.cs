@@ -28,4 +28,10 @@ public sealed class GradientTapeOptions
     /// When false, in-place operations are not recorded (gradients will not flow through them).
     /// </summary>
     public bool RecordInPlace { get; init; } = true;
+
+    /// <summary>
+    /// Whether to enable tensor hooks (RegisterHook, RetainGrad).
+    /// Disabled by default to avoid dictionary allocation overhead.
+    /// </summary>
+    public bool EnableHooks { get; init; }
 }

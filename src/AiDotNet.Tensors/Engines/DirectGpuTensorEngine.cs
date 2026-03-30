@@ -10765,7 +10765,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSigmoid(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Sigmoid", output, tensor,
+                    Autodiff.BackwardFunctions<T>.SigmoidBackward);
+                return output;
+            }
+            return base.TensorSigmoid(tensor);
         }
         catch (Exception)
         {
@@ -10778,7 +10785,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorReLU(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("ReLU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.ReLUBackward);
+                return output;
+            }
+            return base.TensorReLU(tensor);
         }
         catch (Exception)
         {
@@ -10791,7 +10805,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorGELU(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("GELU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.GELUBackward);
+                return output;
+            }
+            return base.TensorGELU(tensor);
         }
         catch (Exception)
         {
@@ -10804,7 +10825,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSiLU(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Swish", output, tensor,
+                    Autodiff.BackwardFunctions<T>.SwishBackward);
+                return output;
+            }
+            return base.TensorSiLU(tensor);
         }
         catch (Exception)
         {
@@ -10817,7 +10845,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorTanh(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Tanh", output, tensor,
+                    Autodiff.BackwardFunctions<T>.TanhBackward);
+                return output;
+            }
+            return base.TensorTanh(tensor);
         }
         catch (Exception)
         {
@@ -10838,7 +10873,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
             float[] resultFloat = backend.DownloadBuffer(bufferB.Buffer);
             var result = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            return new Tensor<T>(result, tensor.Shape._dims);
+            var gpuOutput = new Tensor<T>(result, tensor.Shape._dims);
+            Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
+                Autodiff.BackwardFunctions<T>.LeakyReLUBackward,
+                savedState: new object[] { alphaFloat });
+            return gpuOutput;
         }
         catch (Exception)
         {
@@ -10851,7 +10890,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorMish(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Mish", output, tensor,
+                    Autodiff.BackwardFunctions<T>.MishBackward);
+                return output;
+            }
+            return base.TensorMish(tensor);
         }
         catch (Exception)
         {
@@ -10864,7 +10910,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
-            return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorHardSwish(tensor);
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("HardSwish", output, tensor,
+                    Autodiff.BackwardFunctions<T>.HardSwishBackward);
+                return output;
+            }
+            return base.TensorHardSwish(tensor);
         }
         catch (Exception)
         {
