@@ -114,12 +114,16 @@ public sealed class GradientTape<T> : IDisposable
     /// <param name="loss">The scalar loss tensor to differentiate. Should have a single element.</param>
     /// <param name="sources">Optional set of tensors to compute gradients for.
     /// If null, computes gradients for all input tensors on the tape.</param>
+    /// <param name="createGraph">If true, keeps the tape recording during backward so gradient
+    /// ops are recorded for higher-order differentiation (gradient of gradient).
+    /// Required for WGAN-GP gradient penalty, MAML, Hessian computation.</param>
     /// <returns>A dictionary mapping each source tensor to its gradient tensor.</returns>
     /// <exception cref="ObjectDisposedException">Thrown if the tape has been disposed.</exception>
     /// <exception cref="InvalidOperationException">Thrown if the tape has no entries.</exception>
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
-        Tensor<T>[]? sources = null)
+        Tensor<T>[]? sources = null,
+        bool createGraph = false)
     {
         if (_disposed)
         {
@@ -144,11 +148,16 @@ public sealed class GradientTape<T> : IDisposable
         var seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
         grads[loss] = seedGrad;
 
-        // Suspend ambient recording so backward engine calls don't append to this tape.
-        // Without this, operations inside BackwardFunctions (TensorMultiply, TensorAdd, etc.)
-        // would record themselves, corrupting persistent tapes and shifting bounded tapes mid-iteration.
+        // When createGraph=false (default): suspend recording so backward engine calls
+        // don't append to this tape — they'd corrupt persistent tapes and shift bounded tapes.
+        // When createGraph=true: KEEP recording so backward ops are on the tape for
+        // higher-order differentiation (gradient of gradient).
         var savedCurrent = _current;
-        SetCurrentTape(null);
+        if (!createGraph)
+        {
+            SetCurrentTape(null);
+        }
+
         try
         {
             // Walk tape in reverse (reverse-mode AD)
@@ -171,8 +180,10 @@ public sealed class GradientTape<T> : IDisposable
         }
         finally
         {
-            // Restore the tape (or parent if this tape was disposed during backward)
-            SetCurrentTape(savedCurrent);
+            if (!createGraph)
+            {
+                SetCurrentTape(savedCurrent);
+            }
         }
 
         // If sources specified, filter to only those
@@ -217,6 +228,12 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Gets or sets whether anomaly detection is enabled.
+    /// When true, each backward function's output is checked for NaN/Inf.
+    /// </summary>
+    public bool DetectAnomaly { get; set; }
+
+    /// <summary>
     /// Disposes the tape and restores the parent tape (if any) as the current tape.
     /// </summary>
     public void Dispose()
@@ -224,6 +241,58 @@ public sealed class GradientTape<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
         SetCurrentTape(_parent);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // NoGradScope: suppress tape recording during inference
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Suppresses gradient tape recording within its scope.
+    /// Like PyTorch's torch.no_grad() — zero overhead for inference.
+    /// </summary>
+    /// <example>
+    /// using (GradientTape&lt;float&gt;.NoGrad())
+    /// {
+    ///     var output = engine.TensorMatMul(x, w); // NOT recorded
+    /// }
+    /// </example>
+    public static NoGradScope<T> NoGrad() => new();
+}
+
+/// <summary>
+/// Suppresses gradient tape recording. Operations performed while this scope
+/// is active will not be recorded to any GradientTape, enabling zero-overhead inference.
+/// </summary>
+/// <typeparam name="T">The numeric type.</typeparam>
+public sealed class NoGradScope<T> : IDisposable
+{
+    [ThreadStatic]
+    private static int _suppressionCount;
+
+    private bool _disposed;
+
+    /// <summary>
+    /// Gets whether tape recording is currently suppressed on this thread.
+    /// Checked by DifferentiableOps.RecordIfActive.
+    /// </summary>
+    public static bool IsSuppressed => _suppressionCount > 0;
+
+    /// <summary>
+    /// Creates a new NoGradScope, incrementing the suppression counter.
+    /// Supports nesting: multiple scopes can be active simultaneously.
+    /// </summary>
+    public NoGradScope()
+    {
+        _suppressionCount++;
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _suppressionCount--;
     }
 }
 

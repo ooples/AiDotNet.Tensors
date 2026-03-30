@@ -28,6 +28,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
@@ -45,6 +46,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
@@ -63,6 +65,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
