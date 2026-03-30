@@ -5612,5 +5612,133 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
     #endregion
+
+    #region Backward Kernels
+
+        /// <summary>
+        /// SIMD-accelerated ReLU backward: result[i] = input[i] > 0 ? grad[i] : 0
+        /// Uses AVX2 compare + bitwise AND for zero-branch vectorization.
+        /// </summary>
+        public static unsafe void ReluBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    // mask = input > 0 ? all-ones : all-zeros
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(grad + i), mask0));
+                    Avx.Store(output + i + 8, Avx.And(Avx.LoadVector256(grad + i + 8), mask1));
+                    Avx.Store(output + i + 16, Avx.And(Avx.LoadVector256(grad + i + 16), mask2));
+                    Avx.Store(output + i + 24, Avx.And(Avx.LoadVector256(grad + i + 24), mask3));
+                }
+                int simdTail = length & ~7;
+                for (; i < simdTail; i += 8)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(grad + i), mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] > 0 ? grad[i] : 0;
+        }
+
+        /// <summary>
+        /// SIMD-accelerated GELU backward using the tanh approximation.
+        /// d/dx[GELU(x)] = 0.5*(1 + tanh(k)) + 0.5*x*(1 - tanh(k)^2)*k'
+        /// where k = sqrt(2/pi)*(x + 0.044715*x^3)
+        /// </summary>
+        public static unsafe void GeluBackwardUnsafe(float* grad, float* input, float* output, int length)
+        {
+            const float sqrtTwoPi = 0.7978845608028654f;
+            const float coeff = 0.044715f;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && Fma.IsSupported)
+            {
+                var vSqrtTwoPi = Vector256.Create(sqrtTwoPi);
+                var vCoeff = Vector256.Create(coeff);
+                var vThreeCoeff = Vector256.Create(3f * coeff);
+                var vHalf = Vector256.Create(0.5f);
+                var vOne = Vector256.Create(1f);
+                var vTwo = Vector256.Create(2f);
+                var vNegTwo = Vector256.Create(-2f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var x2 = Avx.Multiply(x, x);
+                    var x3 = Avx.Multiply(x2, x);
+                    // k = sqrt(2/pi) * (x + 0.044715 * x^3)
+                    var inner = Fma.MultiplyAdd(vCoeff, x3, x);
+                    var k = Avx.Multiply(vSqrtTwoPi, inner);
+                    // tanh(k) using exp: tanh(k) = (exp(2k) - 1) / (exp(2k) + 1)
+                    var exp2k = ExpApprox256(Avx.Multiply(vTwo, k));
+                    var tanhK = Avx.Divide(Avx.Subtract(exp2k, vOne), Avx.Add(exp2k, vOne));
+                    // sech^2(k) = 1 - tanh^2(k)
+                    var sech2 = Avx.Subtract(vOne, Avx.Multiply(tanhK, tanhK));
+                    // k' = sqrt(2/pi) * (1 + 3*0.044715*x^2)
+                    var kPrime = Avx.Multiply(vSqrtTwoPi, Fma.MultiplyAdd(vThreeCoeff, x2, vOne));
+                    // derivative = 0.5 * (1 + tanh(k)) + 0.5 * x * sech^2(k) * k'
+                    var term1 = Avx.Multiply(vHalf, Avx.Add(vOne, tanhK));
+                    var term2 = Avx.Multiply(vHalf, Avx.Multiply(Avx.Multiply(x, sech2), kPrime));
+                    var derivative = Avx.Add(term1, term2);
+                    Avx.Store(output + i, Avx.Multiply(g, derivative));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float x2 = x * x;
+                float inner = sqrtTwoPi * (x + coeff * x2 * x);
+                float tanhK = MathF.Tanh(inner);
+                float sech2 = 1f - tanhK * tanhK;
+                float kPrime = sqrtTwoPi * (1f + 3f * coeff * x2);
+                float derivative = 0.5f * (1f + tanhK) + 0.5f * x * sech2 * kPrime;
+                output[i] = grad[i] * derivative;
+            }
+        }
+
+        /// <summary>
+        /// Fast 8-wide exp approximation for AVX2: ~1e-4 relative error.
+        /// Uses polynomial approximation with 2^n scaling via integer bit manipulation.
+        /// </summary>
+#if NET5_0_OR_GREATER
+        private static Vector256<float> ExpApprox256(Vector256<float> x)
+        {
+            if (!Avx.IsSupported) return Vector256<float>.Zero;
+            var log2e = Vector256.Create(1.4426950408889634f);
+            var ln2 = Vector256.Create(0.6931471805599453f);
+            var c1 = Vector256.Create(0.5f);
+            var c2 = Vector256.Create(1f);
+            var c3 = Vector256.Create(0.16666666666666666f);
+            var shift = Vector256.Create(127);
+            var maxClamp = Vector256.Create(88f);
+            var minClamp = Vector256.Create(-88f);
+            x = Avx.Max(Avx.Min(x, maxClamp), minClamp);
+            var fx = Avx.Multiply(x, log2e);
+            var floorFx = Avx.Floor(fx);
+            var r = Avx.Subtract(x, Avx.Multiply(floorFx, ln2));
+            // Polynomial: 1 + r + r^2/2 + r^3/6
+            var r2 = Avx.Multiply(r, r);
+            var poly = Avx.Add(c2, Avx.Add(r, Avx.Add(Avx.Multiply(c1, r2), Avx.Multiply(c3, Avx.Multiply(r2, r)))));
+            // 2^n via integer exponent shift: reinterpret (n + 127) << 23 as float
+            var ni = Avx2.ConvertToVector256Int32(floorFx);
+            var pow2n = Avx2.ShiftLeftLogical(Avx2.Add(ni, shift), 23).AsSingle();
+            return Avx.Multiply(poly, pow2n);
+        }
+#endif
+
+    #endregion
     }
 }

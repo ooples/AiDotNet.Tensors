@@ -4262,6 +4262,7 @@ public class CpuEngine : ITensorLevelEngine
                     rArr[o * innerSize + inner] = sum;
                 }
             }
+            DifferentiableOps.RecordUnary("ReduceSum", result, tensor, BackwardFunctions<T>.ReduceSumBackward);
             return result;
         }
 
@@ -4272,15 +4273,20 @@ public class CpuEngine : ITensorLevelEngine
         if (axes == null || axes.Length == 0)
         {
             T sum = TensorSum(tensor);
+            Tensor<T> fullResult;
             if (keepDims)
             {
                 var shape = new int[tensor.Rank];
                 for (int i = 0; i < tensor.Rank; i++) shape[i] = 1;
-                var result = TensorAllocator.Rent<T>(shape);
-                result.GetDataArray()[0] = sum;
-                return result;
+                fullResult = TensorAllocator.Rent<T>(shape);
+                fullResult.GetDataArray()[0] = sum;
             }
-            return TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
+            else
+            {
+                fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
+            }
+            DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensor, BackwardFunctions<T>.ReduceSumBackward);
+            return fullResult;
         }
 
         // Validate and normalize axes consistently with other reducers
@@ -4305,15 +4311,20 @@ public class CpuEngine : ITensorLevelEngine
         // Use tensor's built-in Sum which is already optimized
         var summed = tensor.Sum(normalizedAxes);
 
+        Tensor<T> reduceSumResult;
         // Copy to result with correct shape
         if (keepDims && summed.Rank != result2.Rank)
         {
-            // Need to reshape
             Array.Copy(summed.GetDataArray(), result2.GetDataArray(), summed.Length);
-            return result2;
+            reduceSumResult = result2;
+        }
+        else
+        {
+            reduceSumResult = summed;
         }
 
-        return summed;
+        DifferentiableOps.RecordUnary("ReduceSum", reduceSumResult, tensor, BackwardFunctions<T>.ReduceSumBackward);
+        return reduceSumResult;
     }
 
     /// <inheritdoc/>
@@ -4855,6 +4866,55 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <summary>
+    /// 1D convolution via reshape to Conv2D with height=1.
+    /// Input: [batch, in_channels, length], Kernel: [out_channels, in_channels, kernel_length]
+    /// </summary>
+    public Tensor<T> Conv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (input.Rank != 3) throw new ArgumentException($"Conv1D requires 3D input [batch, channels, length]. Got rank {input.Rank}.", nameof(input));
+        if (kernel.Rank != 3) throw new ArgumentException($"Conv1D requires 3D kernel [out_ch, in_ch, kernel_len]. Got rank {kernel.Rank}.", nameof(kernel));
+
+        // Reshape to 4D: [B, C, 1, L] and [Cout, Cin, 1, K]
+        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+
+        var result4D = Conv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+
+        // Squeeze height dimension: [B, Cout, 1, outL] -> [B, Cout, outL]
+        var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+
+        DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+            new object[] { new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation } });
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> Conv1DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int stride, int padding, int dilation)
+    {
+        // Reshape to 4D and use Conv2DBackwardInput
+        var grad4D = Reshape(gradOutput, new[] { gradOutput._shape[0], gradOutput._shape[1], 1, gradOutput._shape[2] });
+        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+        var inputShape4D = new[] { inputShape[0], inputShape[1], 1, inputShape[2] };
+
+        var result4D = Conv2DBackwardInput(grad4D, kernel4D, inputShape4D, new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+        return Reshape(result4D, inputShape);
+    }
+
+    /// <inheritdoc/>
+    public Tensor<T> Conv1DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int stride, int padding, int dilation)
+    {
+        // Reshape to 4D and use Conv2DBackwardKernel
+        var grad4D = Reshape(gradOutput, new[] { gradOutput._shape[0], gradOutput._shape[1], 1, gradOutput._shape[2] });
+        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+        var kernelShape4D = new[] { kernelShape[0], kernelShape[1], 1, kernelShape[2] };
+
+        var result4D = Conv2DBackwardKernel(grad4D, input4D, kernelShape4D, new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+        return Reshape(result4D, kernelShape);
+    }
+
     public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -5510,6 +5570,7 @@ public class CpuEngine : ITensorLevelEngine
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T e2v = ops.Exp(ops.Multiply(ops.FromDouble(2.0), v)); dstArr[i] = ops.Divide(ops.Subtract(e2v, ops.One), ops.Add(e2v, ops.One)); }
+                DifferentiableOps.RecordUnary("Tanh", resultS, tensor, BackwardFunctions<T>.TanhBackward);
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -5526,11 +5587,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.TanhUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("Tanh", result, tensor, BackwardFunctions<T>.TanhBackward);
         return result;
     }
 
@@ -5552,6 +5616,7 @@ public class CpuEngine : ITensorLevelEngine
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T negV = ops.Negate(v); dstArr[i] = ops.Divide(ops.One, ops.Add(ops.One, ops.Exp(negV))); }
+                DifferentiableOps.RecordUnary("Sigmoid", resultS, tensor, BackwardFunctions<T>.SigmoidBackward);
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -5613,6 +5678,7 @@ public class CpuEngine : ITensorLevelEngine
                         pDst[i] = 1.0f / (1.0f + MathF.Exp(-pSrc[i]));
                     }
                 }
+                DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
                 return result;
             }
 
@@ -5637,6 +5703,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
+            DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             return result;
         }
 
@@ -5674,6 +5741,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
+            DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             return result;
         }
 
@@ -5681,6 +5749,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
 
+        DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
         return result;
     }
 
@@ -6091,6 +6160,7 @@ public class CpuEngine : ITensorLevelEngine
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T sp = ops.Log(ops.Add(ops.One, ops.Exp(v))); T e2sp = ops.Exp(ops.Multiply(ops.FromDouble(2.0), sp)); T th = ops.Divide(ops.Subtract(e2sp, ops.One), ops.Add(e2sp, ops.One)); dstArr[i] = ops.Multiply(v, th); }
+                DifferentiableOps.RecordUnary("Mish", resultS, tensor, BackwardFunctions<T>.MishBackward);
                 return resultS;
             }
             return Mish(tensor.Contiguous());
@@ -6107,11 +6177,14 @@ public class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             ParallelComputeBound(pSrc, pDst, tensor.Length, SimdKernels.MishUnsafe);
-            return result;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
+        DifferentiableOps.RecordUnary("Mish", result, tensor, BackwardFunctions<T>.MishBackward);
         return result;
     }
 
@@ -7092,6 +7165,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
+            new object[] { stride, padding, dilation });
         return result;
     }
 
@@ -11271,13 +11346,17 @@ public class CpuEngine : ITensorLevelEngine
         if (workingInput._shape.Length == 4)
         {
             var result4D = BatchNorm4D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
-            return was1D ? result4D.Reshape([result4D._shape[1]]) : result4D;
+            var r4 = was1D ? result4D.Reshape([result4D._shape[1]]) : result4D;
+            DifferentiableOps.RecordIfActive("BatchNorm", r4, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            return r4;
         }
 
         if (workingInput._shape.Length == 3)
         {
             var result3D = BatchNorm3D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
-            return was1D ? result3D.Reshape([result3D.Length]) : result3D;
+            var r3 = was1D ? result3D.Reshape([result3D.Length]) : result3D;
+            DifferentiableOps.RecordIfActive("BatchNorm", r3, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            return r3;
         }
 
         // 2D case: [batch, features]
@@ -11332,7 +11411,9 @@ public class CpuEngine : ITensorLevelEngine
 
         // Return with original shape (restore 1D if input was 1D)
         var result = TensorAllocator.Rent<T>(workingInput._shape, new Vector<T>(outputData));
-        return was1D ? result.Reshape([features]) : result;
+        var bnResult = was1D ? result.Reshape([features]) : result;
+        DifferentiableOps.RecordIfActive("BatchNorm", bnResult, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+        return bnResult;
     }
 
     /// <summary>
@@ -16166,6 +16247,7 @@ public class CpuEngine : ITensorLevelEngine
             resultData[flatIdx] = tensorData[inputFlat];
         });
 
+        DifferentiableOps.RecordUnary("TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward, new object[] { start });
         return result;
     }
 
@@ -16344,7 +16426,9 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Axes length must match tensor rank");
 
         // Use tensor's built-in Transpose method
-        return tensor.Transpose(axes);
+        var result = tensor.Transpose(axes);
+        DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -16366,7 +16450,9 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = axis; i < rank; i++)
             newShape[i + 1] = tensor._shape[i];
 
-        return tensor.Reshape(newShape);
+        var result = tensor.Reshape(newShape);
+        DifferentiableOps.RecordUnary("TensorExpandDims", result, tensor, BackwardFunctions<T>.ExpandDimsBackward, new object[] { axis });
+        return result;
     }
 
     /// <inheritdoc/>
@@ -16394,7 +16480,9 @@ public class CpuEngine : ITensorLevelEngine
             if (shape.Count == 0) shape.Add(1);
         }
 
-        return tensor.Reshape(shape.ToArray());
+        var squeezeResult = tensor.Reshape(shape.ToArray());
+        DifferentiableOps.RecordUnary("TensorSqueeze", squeezeResult, tensor, BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
+        return squeezeResult;
     }
 
     /// <inheritdoc/>
@@ -20074,29 +20162,41 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    public unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.GetDataArray();
-        var inputData = input.GetFlattenedData();
-        var result = new T[gradOutput.Length];
-        int length = gradOutput.Length;
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
+        int length = gradOutput.Length;
 
-        if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
+        var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
+
+        if (typeof(T) == typeof(float))
         {
-            Parallel.For(0, length, i => { rF[i] = iF[i] > 0f ? gF[i] : 0f; });
+            var gMem = AsFloatMemory(gradOutput.Data);
+            var iMem = AsFloatMemory(input.Data);
+            var rMem = AsFloatMemory(resultTensor.Data);
+            using var pinG = gMem.Pin();
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pG = (float*)pinG.Pointer;
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
         else
         {
+            var gradData = gradOutput.GetDataArray();
+            var inputData = input.GetFlattenedData();
+            var resultData = resultTensor.GetDataArray();
             for (int i = 0; i < length; i++)
             {
                 double inputVal = numOps.ToDouble(inputData[i]);
-                result[i] = inputVal > 0 ? gradData[i] : numOps.Zero;
+                resultData[i] = inputVal > 0 ? gradData[i] : numOps.Zero;
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+        return resultTensor;
     }
 
     /// <inheritdoc/>
@@ -20240,35 +20340,35 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    public unsafe Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var result = new T[gradOutput.Length];
-        int length = gradOutput.Length;
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
+        int length = gradOutput.Length;
 
-        const double sqrtTwoPi = 0.7978845608028654;
-        const double coeff = 0.044715;
+        var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
 
-        if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
+        if (typeof(T) == typeof(float))
         {
-            const float sqrtTwoPiF = 0.7978845608028654f;
-            const float coeffF = 0.044715f;
-            Parallel.For(0, length, i =>
-            {
-                float x = iF[i];
-                float tanhArg = sqrtTwoPiF * (x + coeffF * x * x * x);
-                float tanhVal = MathF.Tanh(tanhArg);
-                float sechSq = 1f - tanhVal * tanhVal;
-                float derivative = 0.5f * (1f + tanhVal) + 0.5f * x * sechSq * sqrtTwoPiF * (1f + 3f * coeffF * x * x);
-                rF[i] = gF[i] * derivative;
-            });
+            var gMem = AsFloatMemory(gradOutput.Data);
+            var iMem = AsFloatMemory(input.Data);
+            var rMem = AsFloatMemory(resultTensor.Data);
+            using var pinG = gMem.Pin();
+            using var pinI = iMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pG = (float*)pinG.Pointer;
+            float* pI = (float*)pinI.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            SimdKernels.GeluBackwardUnsafe(pG, pI, pR, length);
         }
         else
         {
+            const double sqrtTwoPi = 0.7978845608028654;
+            const double coeff = 0.044715;
+            var gradData = gradOutput.GetDataArray();
+            var inputData = input.GetDataArray();
+            var resultData = resultTensor.GetDataArray();
             for (int i = 0; i < length; i++)
             {
                 double x = numOps.ToDouble(inputData[i]);
@@ -20277,11 +20377,11 @@ public class CpuEngine : ITensorLevelEngine
                 double tanhVal = Math.Tanh(tanhArg);
                 double sechSq = 1.0 - tanhVal * tanhVal;
                 double derivative = 0.5 * (1.0 + tanhVal) + 0.5 * x * sechSq * sqrtTwoPi * (1.0 + 3.0 * coeff * x * x);
-                result[i] = numOps.FromDouble(grad * derivative);
+                resultData[i] = numOps.FromDouble(grad * derivative);
             }
         }
 
-        return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+        return resultTensor;
     }
 
     /// <inheritdoc/>
@@ -20506,7 +20606,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         mask = TensorAllocator.Rent<T>(input._shape, new Vector<T>(maskData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        var dropResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        DifferentiableOps.RecordUnary("Dropout", dropResult, input, BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
+        return dropResult;
     }
 
     /// <inheritdoc/>
@@ -20554,7 +20656,10 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = indices._shape[i];
         outputShape[^1] = embeddingDim;
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(resultData));
+        var embResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(resultData));
+        DifferentiableOps.RecordUnary("Embedding", embResult, embeddingTable, BackwardFunctions<T>.EmbeddingBackward,
+            new object[] { indices, vocabSize, embeddingDim });
+        return embResult;
     }
 
     /// <inheritdoc/>
