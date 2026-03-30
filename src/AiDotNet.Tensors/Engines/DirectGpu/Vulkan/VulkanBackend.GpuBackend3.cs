@@ -7,6 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
+    /// <summary>Reinterpret float bits as uint32, compatible with net471 (no BitConverter.SingleToUInt32Bits).</summary>
+    private static uint FloatToUInt32(float value) => *(uint*)&value;
+
     #region Attention Operations
 
     public void ScaledDotProductAttention(IGpuBuffer query, IGpuBuffer key, IGpuBuffer value,
@@ -381,13 +384,13 @@ public sealed unsafe partial class VulkanBackend
 
     public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(threshold), BitConverter.SingleToUInt32Bits(value) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(threshold), FloatToUInt32(value) };
         GlslUnaryOp(VulkanGlslKernels.Threshold, input, output, size, pushData, (uint)(3 * sizeof(uint)));
     }
 
     public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(threshold) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(threshold) };
         GlslBinaryOp(VulkanGlslKernels.ThresholdBackward, gradOutput, input, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
@@ -402,7 +405,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
-        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures, BitConverter.SingleToUInt32Bits(delta) };
+        var pushData = new uint[] { (uint)batchSize, (uint)numFeatures, FloatToUInt32(delta) };
         GlslBinaryOp(VulkanGlslKernels.HuberLossBatch, predictions, targets, loss, batchSize, pushData, (uint)(3 * sizeof(uint)));
     }
 
@@ -420,25 +423,25 @@ public sealed unsafe partial class VulkanBackend
 
     public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(invN) };
         GlslQuadOp(VulkanGlslKernels.MseLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(invN) };
         GlslQuadOp(VulkanGlslKernels.L1LossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
     public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN), BitConverter.SingleToUInt32Bits(delta) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(invN), FloatToUInt32(delta) };
         GlslQuadOp(VulkanGlslKernels.HuberLossBackward, gradOutput, predictions, targets, gradInput, size, pushData, (uint)(3 * sizeof(uint)));
     }
 
     public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        var pushData = new uint[] { (uint)size, BitConverter.SingleToUInt32Bits(invN) };
+        var pushData = new uint[] { (uint)size, FloatToUInt32(invN) };
         GlslQuadOp(VulkanGlslKernels.BceWithLogitsBackward, gradOutput, logits, targets, gradInput, size, pushData, (uint)(2 * sizeof(uint)));
     }
 
