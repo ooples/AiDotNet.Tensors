@@ -349,6 +349,8 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException("CompileBackward requires a persistent tape.");
         if (_entries.Count == 0)
             throw new InvalidOperationException("Cannot compile: the tape has no recorded operations.");
+        if (loss.Length != 1)
+            throw new ArgumentException($"CompileBackward requires a scalar loss tensor (length 1), got length {loss.Length}.", nameof(loss));
 
         return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine);
     }
@@ -369,8 +371,12 @@ public sealed class GradientTape<T> : IDisposable
         {
             if (grads.TryGetValue(param, out var grad))
             {
+                if (param.Length != grad.Length)
+                    throw new InvalidOperationException(
+                        $"Gradient length ({grad.Length}) does not match parameter length ({param.Length}). " +
+                        "This indicates a shape mismatch in the backward pass.");
                 // In-place SGD: param -= lr * grad
-                for (int i = 0; i < param.Length && i < grad.Length; i++)
+                for (int i = 0; i < param.Length; i++)
                     param[i] = numOps.Subtract(param[i], numOps.Multiply(learningRate, grad[i]));
             }
         }

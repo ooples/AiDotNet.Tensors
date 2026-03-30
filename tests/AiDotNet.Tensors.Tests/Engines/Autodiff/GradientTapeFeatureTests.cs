@@ -275,10 +275,12 @@ public class GradientTapeFeatureTests
 
         // Two independent computation paths
         var pathA = _engine.TensorMultiply(x, x); // x^2
+        var lossA = _engine.TensorMeanDiff(pathA); // reduce to scalar
         var pathB = _engine.TensorMultiply(y, y); // y^2 — dead if we only want dx
+        var lossB = _engine.TensorMeanDiff(pathB); // dead path
 
         // Compile for x only — pathB should be eliminated
-        var compiled = tape.CompileBackward(pathA, sources: new[] { x });
+        var compiled = tape.CompileBackward(lossA, sources: new[] { x });
 
         Assert.True(compiled.EliminatedEntryCount > 0 || compiled.ReachableEntryCount <= tape.EntryCount,
             "Dead node elimination should remove unreachable entries");

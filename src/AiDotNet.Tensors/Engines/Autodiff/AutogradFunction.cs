@@ -61,7 +61,7 @@ public abstract class AutogradFunction<T>
         }
 
         // Record the custom function as a single opaque op on the tape
-        DifferentiableOps.RecordIfActive(GetType().Name, output, inputs,
+        DifferentiableOps.RecordIfActive(GetType().Name, output, (Tensor<T>[])inputs.Clone(),
             (gradOutput, inp, outp, savedState, engine, grads) =>
             {
                 var savedCtx = (AutogradContext)savedState[0];

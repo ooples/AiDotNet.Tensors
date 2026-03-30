@@ -1521,15 +1521,23 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }
 
-    /// <summary>Split backward: concatenate gradients back together</summary>
+    /// <summary>Split backward: scatter chunk gradient back to correct position in input gradient</summary>
     internal static void SplitBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Split backward is handled differently — each split output has its own gradient
-        // The input gradient is the concatenation of all output gradients
-        // This is called once per split output, so we just accumulate
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+        int axis = (int)savedState[0];
+        int start = (int)savedState[1];
+        int[] originalShape = (int[])savedState[2];
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // Create a zero gradient with original input shape, then copy chunk into correct position
+        var grad = new Tensor<T>(originalShape);
+        engine.TensorFill(grad, numOps.Zero);
+        var startArr = new int[originalShape.Length];
+        startArr[axis] = start;
+        engine.TensorSetSlice(grad, gradOutput, startArr);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>AvgPool1D backward</summary>

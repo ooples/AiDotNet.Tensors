@@ -3824,7 +3824,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.Floor(src[i]);
 
         DifferentiableOps.RecordUnary("Floor", result, tensor,
-            BackwardFunctions<T>.StraightThroughBackward);
+            BackwardFunctions<T>.SignBackward); // zero gradient: floor is piecewise constant
         return result;
     }
 
@@ -3842,7 +3842,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.Ceiling(src[i]);
 
         DifferentiableOps.RecordUnary("Ceiling", result, tensor,
-            BackwardFunctions<T>.StraightThroughBackward);
+            BackwardFunctions<T>.SignBackward); // zero gradient: ceil is piecewise constant
         return result;
     }
 
@@ -7995,7 +7995,7 @@ public class CpuEngine : ITensorLevelEngine
         var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
         DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, input, kernel,
             BackwardFunctions<T>.ConvTranspose2DBackward,
-            savedState: new object[] { stride, padding });
+            savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
         return convTransResult;
     }
 
@@ -17506,7 +17506,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensors));
 
         var result = Tensor<T>.Concatenate(tensors, axis);
-        DifferentiableOps.RecordIfActive("Concatenate", result, tensors,
+        DifferentiableOps.RecordIfActive("Concatenate", result, (Tensor<T>[])tensors.Clone(),
             BackwardFunctions<T>.ConcatenateBackward,
             savedState: new object[] { axis });
         return result;
@@ -17869,10 +17869,8 @@ public class CpuEngine : ITensorLevelEngine
         // If both tensors are 3D, delegate to BatchMatMul
         if (a.Rank == 3 && b.Rank == 3)
         {
-            var bmmResult = BatchMatMul(a, b);
-            DifferentiableOps.RecordBinary("BatchMatMul", bmmResult, a, b,
-                BackwardFunctions<T>.BatchMatMulBackward);
-            return bmmResult;
+            // Delegate to BatchMatMul which already records to the tape — do NOT record again
+            return BatchMatMul(a, b);
         }
 
         // Handle broadcasting case where b is 2D [K, N]

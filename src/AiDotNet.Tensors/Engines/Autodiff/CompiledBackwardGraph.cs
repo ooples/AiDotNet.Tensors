@@ -44,7 +44,7 @@ public sealed class CompiledBackwardGraph<T>
         Tensor<T>[]? sources,
         IEngine engine)
     {
-        _entries = entries;
+        _entries = new List<TapeEntry<T>>(entries); // snapshot to prevent mutation
         _loss = loss;
         _sources = sources;
         _engine = engine;
@@ -89,6 +89,7 @@ public sealed class CompiledBackwardGraph<T>
             if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 continue;
 
+            entry.ValidateInputVersions(); // same mutation safety check as uncompiled path
             entry.Backward(gradOutput, entry.Inputs, entry.Output,
                 entry.SavedState ?? Array.Empty<object>(), _engine, grads);
         }

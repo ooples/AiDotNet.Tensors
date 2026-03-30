@@ -22,7 +22,7 @@ public class GradientTapeBenchmarks
         _output = output;
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_TapeOverhead_PerOp()
     {
         // Measure cost of tape recording per operation
@@ -60,7 +60,7 @@ public class GradientTapeBenchmarks
         Assert.True(overheadPerOp < 50, $"Tape overhead {overheadPerOp:F2}us per op exceeds 50us target");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_ReLUBackward_1M_Elements()
     {
         int size = 1_000_000;
@@ -82,7 +82,7 @@ public class GradientTapeBenchmarks
         Assert.True(msPerCall < 2.0, $"ReLU backward {msPerCall:F3}ms exceeds 2ms target");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_SigmoidBackward_1M_Elements()
     {
         int size = 1_000_000;
@@ -104,7 +104,7 @@ public class GradientTapeBenchmarks
         Assert.True(msPerCall < 5.0, $"Sigmoid backward {msPerCall:F3}ms exceeds 5ms target");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_MatMul_Backward_256x256()
     {
         var a = Tensor<float>.CreateRandom([256, 256]);
@@ -127,7 +127,7 @@ public class GradientTapeBenchmarks
         Assert.True(msPerStep < 50, $"MatMul forward+backward {msPerStep:F3}ms exceeds 50ms target");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_NoGradScope_Overhead()
     {
         var a = Tensor<float>.CreateRandom([1000]);
@@ -150,7 +150,7 @@ public class GradientTapeBenchmarks
         Assert.True(usPerOp < 50, $"NoGradScope overhead {usPerOp:F2}us exceeds 50us");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_FullTrainingStep_MLP()
     {
         // Simulate a single MLP training step: Linear(256) -> ReLU -> Linear(10)

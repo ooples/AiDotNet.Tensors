@@ -5774,7 +5774,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            if (Avx2.IsSupported)
             {
                 var vOne = Vector256.Create(1f);
                 var vNegOne = Vector256.Create(-1f);
@@ -5866,7 +5866,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 #if NET5_0_OR_GREATER
         private static Vector256<float> ExpApprox256(Vector256<float> x)
         {
-            if (!Avx.IsSupported) return Vector256<float>.Zero;
+            if (!Avx2.IsSupported) return Vector256<float>.Zero;
             var log2e = Vector256.Create(1.4426950408889634f);
             var ln2 = Vector256.Create(0.6931471805599453f);
             var c1 = Vector256.Create(0.5f);
@@ -5897,7 +5897,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            if (Avx2.IsSupported)
             {
                 var vOne = Vector256.Create(1f);
                 var vNegOne = Vector256.Create(-1f);
@@ -5941,7 +5941,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            if (Avx2.IsSupported)
             {
                 var vBeta = Vector256.Create(beta);
                 var vOne = Vector256.Create(1f);
@@ -5975,7 +5975,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             const float alpha = 1.6732632423543773f;
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            if (Avx2.IsSupported)
             {
                 var vzero = Vector256<float>.Zero;
                 var vLambda = Vector256.Create(lambda);

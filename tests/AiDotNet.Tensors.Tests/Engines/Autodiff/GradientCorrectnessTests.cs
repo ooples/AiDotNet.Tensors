@@ -751,7 +751,8 @@ public class GradientCorrectnessTests
         using (var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
         {
             var y = _engine.TensorMultiply(x, w);
-            uncompiledGrads = tape.ComputeGradients(y, sources: new[] { x, w });
+            var loss = _engine.TensorMeanDiff(y); // reduce to scalar for CompileBackward
+            uncompiledGrads = tape.ComputeGradients(loss, sources: new[] { x, w });
         }
 
         // Compiled
@@ -759,7 +760,8 @@ public class GradientCorrectnessTests
         using (var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true }))
         {
             var y = _engine.TensorMultiply(x, w);
-            var compiled = tape.CompileBackward(y, sources: new[] { x, w });
+            var loss = _engine.TensorMeanDiff(y); // reduce to scalar
+            var compiled = tape.CompileBackward(loss, sources: new[] { x, w });
             compiledGrads = compiled.Execute();
         }
 

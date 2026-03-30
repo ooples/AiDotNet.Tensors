@@ -10876,7 +10876,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var gpuOutput = new Tensor<T>(result, tensor.Shape._dims);
             Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
                 Autodiff.BackwardFunctions<T>.LeakyReLUBackward,
-                savedState: new object[] { alphaFloat });
+                savedState: new object[] { (double)alphaFloat });
             return gpuOutput;
         }
         catch (Exception)

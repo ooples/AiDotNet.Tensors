@@ -101,6 +101,11 @@ public static class TensorPool<T>
     /// <summary>
     /// Clears all pooled tensors. Call at the end of training or when switching models.
     /// </summary>
+    /// <summary>
+    /// Clears the pool for the calling thread. Each thread has its own pool
+    /// (ThreadStatic), so this only affects the current thread's cache.
+    /// Call from each worker thread to clear all caches.
+    /// </summary>
     public static void Clear()
     {
         _pools?.Clear();
