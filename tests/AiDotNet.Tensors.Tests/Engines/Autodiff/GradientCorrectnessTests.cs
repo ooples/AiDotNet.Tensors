@@ -409,6 +409,186 @@ public class GradientCorrectnessTests
         }
     }
 
+    // ─── Additional arithmetic gradient checks ───────────────────
+
+    [Fact]
+    public void Negate_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, -2f, 3f }, [3]);
+        VerifyGradient(inp => _engine.TensorNegate(inp), x, "Negate");
+    }
+
+    [Fact]
+    public void MultiplyScalar_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f }, [3]);
+        VerifyGradient(inp => _engine.TensorMultiplyScalar(inp, 2.5f), x, "MulScalar");
+    }
+
+    [Fact]
+    public void BroadcastAdd_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        var bias = new Tensor<float>(new float[] { 0.5f, 1.5f }, [2]);
+        VerifyGradient(inp => _engine.TensorBroadcastAdd(inp, bias), x, "BroadcastAdd");
+    }
+
+    [Fact]
+    public void Clamp_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { -2f, 0.5f, 1.5f, 3f }, [4]);
+        VerifyGradient(inp => _engine.TensorClamp(inp, 0f, 2f), x, "Clamp");
+    }
+
+    [Fact]
+    public void Sin_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 0f, 0.5f, 1f, 2f }, [4]);
+        VerifyGradient(inp => _engine.TensorSin(inp), x, "Sin");
+    }
+
+    [Fact]
+    public void Cos_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 0f, 0.5f, 1f, 2f }, [4]);
+        VerifyGradient(inp => _engine.TensorCos(inp), x, "Cos");
+    }
+
+    [Fact]
+    public void Transpose_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        VerifyGradient(inp => _engine.TensorTranspose(inp), x, "Transpose");
+    }
+
+    [Fact]
+    public void Reshape_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        VerifyGradient(inp => _engine.Reshape(inp, new[] { 3, 2 }), x, "Reshape");
+    }
+
+    [Fact]
+    public void ReduceSum_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        VerifyGradient(inp => _engine.ReduceSum(inp, new[] { 0 }, keepDims: true), x, "ReduceSum");
+    }
+
+    [Fact]
+    public void Conv2D_Gradient_MatchesNumerical()
+    {
+        // Simple 1-channel 3x3 input with 1x1 kernel
+        var x = new Tensor<float>(new float[]
+        {
+            1f, 2f, 3f,
+            4f, 5f, 6f,
+            7f, 8f, 9f
+        }, [1, 1, 3, 3]);
+        var kernel = new Tensor<float>(new float[] { 0.5f }, [1, 1, 1, 1]);
+
+        VerifyGradient(inp =>
+        {
+            return _engine.Conv2D(inp, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+        }, x, "Conv2D");
+    }
+
+    [Fact]
+    public void AddScalar_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorAddScalar(inp, 2.5f), x, "AddScalar");
+    }
+
+    [Fact]
+    public void SubtractScalar_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorSubtractScalar(inp, 1.5f), x, "SubtractScalar");
+    }
+
+    [Fact]
+    public void DivideScalar_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorDivideScalar(inp, 2.0f), x, "DivideScalar");
+    }
+
+    [Fact]
+    public void BroadcastMultiply_Gradient_MatchesNumerical()
+    {
+        // 2x3 tensor broadcast multiplied by 1x3 scale
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        var scale = new Tensor<float>(new float[] { 0.5f, 1.0f, 2.0f }, [1, 3]);
+        VerifyGradient(inp => _engine.TensorBroadcastMultiply(inp, scale), x, "BroadcastMultiply");
+    }
+
+    [Fact]
+    public void ReduceMean_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        VerifyGradient(inp => _engine.ReduceMean(inp, new[] { 0 }, keepDims: true), x, "ReduceMean");
+    }
+
+    [Fact]
+    public void ExpandDims_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorExpandDims(inp, 0), x, "ExpandDims");
+    }
+
+    [Fact]
+    public void Squeeze_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [1, 4]);
+        VerifyGradient(inp => _engine.TensorSqueeze(inp, 0), x, "Squeeze");
+    }
+
+    [Fact]
+    public void BroadcastSubtract_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        var bias = new Tensor<float>(new float[] { 0.1f, 0.2f, 0.3f }, [1, 3]);
+        VerifyGradient(inp => _engine.TensorBroadcastSubtract(inp, bias), x, "BroadcastSubtract");
+    }
+
+    [Fact]
+    public void Power_2D_Gradient_MatchesNumerical()
+    {
+        // Test power with 2D input
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        var exp = new Tensor<float>(new float[] { 2f, 2f, 2f, 2f }, [2, 2]);
+        VerifyGradient(inp => _engine.TensorPower(inp, exp), x, "Power2D");
+    }
+
+    [Fact]
+    public void ChainedOps_Gradient_MatchesNumerical()
+    {
+        // Test gradient through a chain: sigmoid(x * 2 + 1)
+        var x = new Tensor<float>(new float[] { 0.1f, 0.5f, -0.3f, 0.8f }, [4]);
+        VerifyGradient(inp =>
+        {
+            var scaled = _engine.TensorMultiplyScalar(inp, 2.0f);
+            var shifted = _engine.TensorAddScalar(scaled, 1.0f);
+            return _engine.TensorSigmoid(shifted);
+        }, x, "ChainedOps");
+    }
+
+    [Fact]
+    public void MultipleInputPaths_Gradient_MatchesNumerical()
+    {
+        // Test when same input is used multiple times: x * x (should give 2x gradient)
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [4]);
+        VerifyGradient(inp => _engine.TensorMultiply(inp, inp), x, "SelfMultiply");
+    }
+
+    [Fact]
+    public void Permute_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        VerifyGradient(inp => _engine.TensorPermute(inp, new[] { 1, 0 }), x, "Permute");
+    }
+
     [Fact]
     public void Integration_CompiledBackward_MatchesUncompiled()
     {

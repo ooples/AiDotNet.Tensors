@@ -174,6 +174,29 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>d(base^exp)/d(base) = grad * exp * base^(exp-1), for element-wise tensor power</summary>
+    internal static void PowerTensorBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var bases = inputs[0];
+        var exponents = inputs[1];
+
+        // d/d(base) = grad * exp * base^(exp - 1)
+        var expMinus1 = engine.TensorAddScalar(exponents, numOps.FromDouble(-1.0));
+        var basePow = engine.TensorPower(bases, expMinus1);
+        var scaled = engine.TensorMultiply(exponents, basePow);
+        var gradBase = engine.TensorMultiply(gradOutput, scaled);
+        DifferentiableOps.AccumulateGrad(grads, bases, gradBase, engine);
+
+        // d/d(exp) = grad * base^exp * ln(base)
+        var logBase = engine.TensorLog(bases);
+        var dExp = engine.TensorMultiply(output, logBase);
+        var gradExp = engine.TensorMultiply(gradOutput, dExp);
+        DifferentiableOps.AccumulateGrad(grads, exponents, gradExp, engine);
+    }
+
     /// <summary>d(sin(x))/dx = grad * cos(x)</summary>
     internal static void SinBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -201,8 +224,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var min = (T)savedState[0];
-        var max = (T)savedState[1];
+        var min = numOps.FromDouble((double)savedState[0]);
+        var max = numOps.FromDouble((double)savedState[1]);
         var mask = new Tensor<T>(inputs[0].Shape.ToArray());
         for (int i = 0; i < inputs[0].Length; i++)
         {

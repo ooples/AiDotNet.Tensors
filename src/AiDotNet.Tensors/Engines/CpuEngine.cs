@@ -3804,6 +3804,8 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < srcB.Length; i++)
             dest[i] = numOps.Power(srcB[i], srcE[i]);
 
+        DifferentiableOps.RecordBinary("TensorPowerTensor", result, bases, exponents,
+            BackwardFunctions<T>.PowerTensorBackward);
         return result;
     }
 
@@ -14838,8 +14840,8 @@ public class CpuEngine : ITensorLevelEngine
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
-            var result = TensorAllocator.Rent<T>(outShape.ToArray());
-            var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
+            var earlyResult = TensorAllocator.Rent<T>(outShape.ToArray());
+            var rArr = earlyResult.GetDataArray(); var srcArr = input._storage.GetDataArray();
             T divisor = ops.FromDouble(axisSize);
             for (int o = 0; o < outerSize; o++)
                 for (int inner = 0; inner < innerSize; inner++)
@@ -14848,7 +14850,10 @@ public class CpuEngine : ITensorLevelEngine
                     for (int a = 0; a < axisSize; a++) sum = ops.Add(sum, srcArr[input.ReductionStorageIndex(o, a, inner, axis)]);
                     rArr[o * innerSize + inner] = ops.Divide(sum, divisor);
                 }
-            return result;
+            DifferentiableOps.RecordUnary("ReduceMean", earlyResult, input,
+                BackwardFunctions<T>.ReduceMeanBackward,
+                savedState: new object[] { new[] { axis } });
+            return earlyResult;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
@@ -14915,7 +14920,11 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ReduceMean", result, input,
+            BackwardFunctions<T>.ReduceMeanBackward,
+            savedState: new object[] { normalizedAxes.ToArray() });
+        return result;
     }
 
     /// <inheritdoc/>
