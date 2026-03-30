@@ -144,20 +144,35 @@ public sealed class GradientTape<T> : IDisposable
         var seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
         grads[loss] = seedGrad;
 
-        // Walk tape in reverse (reverse-mode AD)
-        for (int i = _entries.Count - 1; i >= 0; i--)
+        // Suspend ambient recording so backward engine calls don't append to this tape.
+        // Without this, operations inside BackwardFunctions (TensorMultiply, TensorAdd, etc.)
+        // would record themselves, corrupting persistent tapes and shifting bounded tapes mid-iteration.
+        var savedCurrent = _current;
+        SetCurrentTape(null);
+        try
         {
-            var entry = _entries[i];
-
-            // Skip if we don't have a gradient for this entry's output
-            if (!grads.TryGetValue(entry.Output, out var gradOutput))
+            // Walk tape in reverse (reverse-mode AD)
+            for (int i = _entries.Count - 1; i >= 0; i--)
             {
-                continue;
-            }
+                var entry = _entries[i];
 
-            // Invoke the backward function to propagate gradients to inputs
-            // Pass empty array instead of null to avoid null-forgiving operators in backward functions
-            entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                // Skip if we don't have a gradient for this entry's output
+                if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    continue;
+                }
+
+                // Validate that no input tensor was mutated after recording (would produce wrong gradients)
+                entry.ValidateInputVersions();
+
+                // Invoke the backward function to propagate gradients to inputs
+                entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+            }
+        }
+        finally
+        {
+            // Restore the tape (or parent if this tape was disposed during backward)
+            SetCurrentTape(savedCurrent);
         }
 
         // If sources specified, filter to only those

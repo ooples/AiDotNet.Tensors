@@ -647,14 +647,30 @@ internal static class BackwardFunctions<T>
     // Reduction operations
     // ──────────────────────────────────────────────────────────────
 
-    /// <summary>d(sum(x))/dx = ones_like(x) * grad (broadcast scalar grad to input shape)</summary>
+    /// <summary>d(sum(x, axes))/dx = broadcast grad back to input shape along reduced axes</summary>
     internal static void ReduceSumBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // gradOutput may be reduced — broadcast it back to input shape
+        var axes = (int[])savedState[0];
+        var keepDims = (bool)savedState[1];
         var inputShape = inputs[0].Shape.ToArray();
-        var grad = BroadcastGradToShape(gradOutput, inputShape, engine);
+
+        // If keepDims was false, we need to reinsert singleton dimensions at the reduced axes
+        // so we can broadcast back to the original shape
+        var expandedGrad = gradOutput;
+        if (!keepDims)
+        {
+            // Sort axes so we insert in order
+            var sortedAxes = axes.OrderBy(a => a).ToArray();
+            foreach (var axis in sortedAxes)
+            {
+                expandedGrad = engine.TensorExpandDims(expandedGrad, axis);
+            }
+        }
+
+        // Now expandedGrad has the same rank as input with size-1 at reduced dims — tile to match
+        var grad = BroadcastGradToShape(expandedGrad, inputShape, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

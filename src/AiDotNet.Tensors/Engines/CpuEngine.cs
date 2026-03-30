@@ -2209,6 +2209,9 @@ public class CpuEngine : ITensorLevelEngine
         if (tape is not null && tape.Options.RecordInPlace)
             savedA = a.Clone();
 
+        // Increment version BEFORE mutation so prior tape entries detect the change
+        a.IncrementVersion();
+
         // Stride-aware: in-place requires contiguous target; materialize source if needed
         if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
@@ -2995,6 +2998,8 @@ public class CpuEngine : ITensorLevelEngine
         if (mulTape is not null && mulTape.Options.RecordInPlace)
             savedA = a.Clone();
 
+        a.IncrementVersion();
+
         if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -3104,6 +3109,8 @@ public class CpuEngine : ITensorLevelEngine
         var subTape = GradientTape<T>.Current;
         if (subTape is not null && subTape.Options.RecordInPlace)
             savedASub = a.Clone();
+
+        a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
@@ -4297,7 +4304,8 @@ public class CpuEngine : ITensorLevelEngine
                     rArr[o * innerSize + inner] = sum;
                 }
             }
-            DifferentiableOps.RecordUnary("ReduceSum", result, tensor, BackwardFunctions<T>.ReduceSumBackward);
+            DifferentiableOps.RecordUnary("ReduceSum", result, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { new[] { axis }, keepDims });
             return result;
         }
 
@@ -4307,6 +4315,10 @@ public class CpuEngine : ITensorLevelEngine
         // Full reduction - sum all elements
         if (axes == null || axes.Length == 0)
         {
+            // Full reduction: all axes
+            var allAxes = new int[tensor.Rank];
+            for (int ax = 0; ax < tensor.Rank; ax++) allAxes[ax] = ax;
+
             T sum = TensorSum(tensor);
             Tensor<T> fullResult;
             if (keepDims)
@@ -4320,7 +4332,8 @@ public class CpuEngine : ITensorLevelEngine
             {
                 fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
             }
-            DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensor, BackwardFunctions<T>.ReduceSumBackward);
+            DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { allAxes, keepDims });
             return fullResult;
         }
 
@@ -4358,7 +4371,8 @@ public class CpuEngine : ITensorLevelEngine
             reduceSumResult = summed;
         }
 
-        DifferentiableOps.RecordUnary("ReduceSum", reduceSumResult, tensor, BackwardFunctions<T>.ReduceSumBackward);
+        DifferentiableOps.RecordUnary("ReduceSum", reduceSumResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+            new object[] { normalizedAxes.ToArray(), keepDims });
         return reduceSumResult;
     }
 
@@ -5818,6 +5832,8 @@ public class CpuEngine : ITensorLevelEngine
         if (sigTape is not null && sigTape.Options.RecordInPlace)
             savedInput = tensor.Clone();
 
+        tensor.IncrementVersion();
+
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
@@ -5850,6 +5866,8 @@ public class CpuEngine : ITensorLevelEngine
         var sigTape = GradientTape<T>.Current;
         if (sigTape is not null && sigTape.Options.RecordInPlace)
             savedInput = tensor.Clone();
+
+        tensor.IncrementVersion();
 
         SigmoidParallel(tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
@@ -6047,6 +6065,8 @@ public class CpuEngine : ITensorLevelEngine
         if (reluTape is not null && reluTape.Options.RecordInPlace)
             savedInput = tensor.Clone();
 
+        tensor.IncrementVersion();
+
         // Try oneDNN for float tensors
         if (typeof(T) == typeof(float) && OneDnnProvider.IsAvailable)
         {
@@ -6079,6 +6099,8 @@ public class CpuEngine : ITensorLevelEngine
         var reluTape = GradientTape<T>.Current;
         if (reluTape is not null && reluTape.Options.RecordInPlace)
             savedInput = tensor.Clone();
+
+        tensor.IncrementVersion();
 
         ReLUParallel(tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);

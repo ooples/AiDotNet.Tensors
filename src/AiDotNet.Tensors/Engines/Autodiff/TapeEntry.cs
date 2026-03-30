@@ -55,7 +55,13 @@ public sealed class TapeEntry<T>
     public object[]? SavedState { get; }
 
     /// <summary>
-    /// Creates a new tape entry.
+    /// Version counters of each input tensor at recording time.
+    /// Used to detect in-place mutation after recording (which corrupts gradients).
+    /// </summary>
+    public int[] InputVersions { get; }
+
+    /// <summary>
+    /// Creates a new tape entry. Captures input tensor version counters for mutation detection.
     /// </summary>
     public TapeEntry(
         string operationName,
@@ -69,5 +75,27 @@ public sealed class TapeEntry<T>
         Output = output;
         Backward = backward;
         SavedState = savedState;
+
+        // Snapshot version counters so backward can detect post-record mutations
+        InputVersions = new int[inputs.Length];
+        for (int i = 0; i < inputs.Length; i++)
+            InputVersions[i] = inputs[i].Version;
+    }
+
+    /// <summary>
+    /// Validates that no input tensor has been mutated since this entry was recorded.
+    /// Throws if any input's version counter has changed.
+    /// </summary>
+    public void ValidateInputVersions()
+    {
+        for (int i = 0; i < Inputs.Length; i++)
+        {
+            if (Inputs[i].Version != InputVersions[i])
+            {
+                throw new InvalidOperationException(
+                    $"Tensor input {i} of operation '{OperationName}' was mutated in-place after being recorded on the gradient tape. " +
+                    $"This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
+            }
+        }
     }
 }
