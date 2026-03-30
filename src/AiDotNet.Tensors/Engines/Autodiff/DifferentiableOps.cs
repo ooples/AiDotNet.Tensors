@@ -52,42 +52,6 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
-    /// Lazy overload: defers savedState allocation until tape is confirmed active.
-    /// Use this when savedState requires a new array allocation to avoid heap allocation on the no-grad path.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void RecordUnaryLazy<T>(
-        string opName,
-        Tensor<T> output,
-        Tensor<T> input,
-        BackwardFunction<T> backward,
-        Func<object[]> savedStateFactory)
-    {
-        var tape = GradientTape<T>.Current;
-        if (tape is null) return;
-
-        tape.Record(new TapeEntry<T>(opName, new[] { input }, output, backward, savedStateFactory()));
-    }
-
-    /// <summary>
-    /// Lazy overload for binary operations: defers savedState allocation until tape is confirmed active.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void RecordBinaryLazy<T>(
-        string opName,
-        Tensor<T> output,
-        Tensor<T> a,
-        Tensor<T> b,
-        BackwardFunction<T> backward,
-        Func<object[]> savedStateFactory)
-    {
-        var tape = GradientTape<T>.Current;
-        if (tape is null) return;
-
-        tape.Record(new TapeEntry<T>(opName, new[] { a, b }, output, backward, savedStateFactory()));
-    }
-
-    /// <summary>
     /// Convenience overload for binary operations (two inputs).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -15622,6 +15622,9 @@ public class CpuEngine : ITensorLevelEngine
         if (kernelSize[0] <= 0 || kernelSize[1] <= 0) throw new ArgumentException("Kernel size elements must be positive.", nameof(kernelSize));
         if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
         if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative.", nameof(padding));
+
+        // Save original input for tape before potential Contiguous() replacement
+        var originalUnfoldInput = input;
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15674,8 +15677,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnaryLazy("Unfold", result, input, BackwardFunctions<T>.UnfoldBackward,
-            () => new object[] { kernelSize, stride, padding });
+        if (GradientTape<T>.Current is not null)
+            DifferentiableOps.RecordUnary("Unfold", result, originalUnfoldInput, BackwardFunctions<T>.UnfoldBackward,
+                new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
         return result;
     }
 
@@ -15694,6 +15698,8 @@ public class CpuEngine : ITensorLevelEngine
         if (kernelSize[0] <= 0 || kernelSize[1] <= 0) throw new ArgumentException("Kernel size elements must be positive.", nameof(kernelSize));
         if (stride[0] <= 0 || stride[1] <= 0) throw new ArgumentException("Stride elements must be positive.", nameof(stride));
         if (padding[0] < 0 || padding[1] < 0) throw new ArgumentException("Padding elements must be non-negative.", nameof(padding));
+
+        var originalFoldInput = input;
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15753,8 +15759,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnaryLazy("Fold", result, input, BackwardFunctions<T>.FoldBackward,
-            () => new object[] { kernelSize, stride, padding });
+        if (GradientTape<T>.Current is not null)
+            DifferentiableOps.RecordUnary("Fold", result, originalFoldInput, BackwardFunctions<T>.FoldBackward,
+                new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
         return result;
     }
 
