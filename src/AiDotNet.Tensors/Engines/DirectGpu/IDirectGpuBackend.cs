@@ -2649,6 +2649,19 @@ public interface IDirectGpuBackend : IDisposable
     void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize);
     void AddScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void SubScalar(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
+
+    // =====================================================================
+    // Differentiable Loss Functions (forward + backward)
+    // =====================================================================
+    void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures);
+    void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta);
+    void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size);
+    void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses);
+    void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size);
+    void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
+    void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
+    void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta);
+    void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
 }
 
 /// <summary>
@@ -2747,15 +2760,6 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     // =====================================================================
     void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses);
     void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures);
-    void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures);
-    void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta);
-    void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size);
-    void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses);
-    void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size);
-    void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
-    void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
-    void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta);
-    void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
     void DropoutMask(IGpuBuffer mask, int size, float keepProb, ulong seed);
     void GaussianNoise(IGpuBuffer output, int size, float mean, float stdDev, ulong seed);
 

@@ -719,6 +719,242 @@ kernel void prelu(
         output[gid] = x > 0.0f ? x : w * x;
     }
 }
+
+// ReLU6: min(max(0, x), 6)
+kernel void relu6(
+    device const float* A [[buffer(0)]],
+    device float* B [[buffer(1)]],
+    constant uint& size [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = A[gid];
+        B[gid] = min(max(x, 0.0f), 6.0f);
+    }
+}
+
+kernel void relu6_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        gradInput[gid] = (x > 0.0f && x < 6.0f) ? gradOutput[gid] : 0.0f;
+    }
+}
+
+// RReLU: x >= 0 ? x : noise * x
+kernel void rrelu(
+    device const float* input [[buffer(0)]],
+    device const float* noise [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        output[gid] = x >= 0.0f ? x : noise[gid] * x;
+    }
+}
+
+kernel void rrelu_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* noise [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        gradInput[gid] = gradOutput[gid] * (x >= 0.0f ? 1.0f : noise[gid]);
+    }
+}
+
+// Threshold: x > threshold ? x : value
+kernel void threshold_forward(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant float& thresh [[buffer(2)]],
+    constant float& val [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        output[gid] = input[gid] > thresh ? input[gid] : val;
+    }
+}
+
+kernel void threshold_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant float& thresh [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        gradInput[gid] = input[gid] > thresh ? gradOutput[gid] : 0.0f;
+    }
+}
+
+// Reciprocal backward: -grad / (x * x)
+kernel void reciprocal_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        gradInput[gid] = -gradOutput[gid] / (x * x);
+    }
+}
+
+// SELU backward
+kernel void selu_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        const float alpha = 1.6732632423543772f;
+        const float scale = 1.0507009873554805f;
+        float x = input[gid];
+        float grad = x > 0.0f ? scale : scale * alpha * exp(x);
+        gradInput[gid] = gradOutput[gid] * grad;
+    }
+}
+
+// Hardsigmoid backward
+kernel void hardsigmoid_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        float grad = (x > -3.0f && x < 3.0f) ? (1.0f / 6.0f) : 0.0f;
+        gradInput[gid] = gradOutput[gid] * grad;
+    }
+}
+
+// Hardtanh backward
+kernel void hardtanh_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    constant float& minVal [[buffer(2)]],
+    constant float& maxVal [[buffer(3)]],
+    device float* gradInput [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        gradInput[gid] = (x > minVal && x < maxVal) ? gradOutput[gid] : 0.0f;
+    }
+}
+
+// PReLU backward for input gradients
+kernel void prelu_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* alpha [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    constant uint& alphaSize [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid];
+        float a = alpha[gid % alphaSize];
+        gradInput[gid] = x >= 0.0f ? gradOutput[gid] : a * gradOutput[gid];
+    }
+}
+
+// L1 Loss element-wise
+kernel void l1_loss_elementwise(
+    device const float* predictions [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        loss[gid] = abs(predictions[gid] - targets[gid]);
+    }
+}
+
+// BCE with logits element-wise
+kernel void bce_with_logits_elementwise(
+    device const float* logits [[buffer(0)]],
+    device const float* targets [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = logits[gid];
+        float t = targets[gid];
+        float ax = abs(x);
+        loss[gid] = max(x, 0.0f) - x * t + log(1.0f + exp(-ax));
+    }
+}
+
+// KL divergence element-wise
+kernel void kl_div_elementwise(
+    device const float* input [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device float* loss [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float t = target[gid];
+        loss[gid] = (t > 0.0f) ? t * (log(t) - input[gid]) : 0.0f;
+    }
+}
+
+// L1 loss backward
+kernel void l1_loss_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* predictions [[buffer(1)]],
+    device const float* targets [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant float& invN [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float d = predictions[gid] - targets[gid];
+        float s = (d > 0.0f) ? 1.0f : ((d < 0.0f) ? -1.0f : 0.0f);
+        gradInput[gid] = gradOutput[0] * s * invN;
+    }
+}
+
+// BCE with logits backward
+kernel void bce_with_logits_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* logits [[buffer(1)]],
+    device const float* targets [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant float& invN [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float sig = 1.0f / (1.0f + exp(-logits[gid]));
+        gradInput[gid] = gradOutput[0] * (sig - targets[gid]) * invN;
+    }
+}
 ";
 
     #endregion

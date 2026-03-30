@@ -1670,6 +1670,32 @@ fn hardtanh_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
         grad_input[idx] = grad_output[idx] * select(0.0, 1.0, x >= params.alpha && x <= params.beta);
     }
 }
+
+@compute @workgroup_size(256)
+fn relu6_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = forward_data[idx];
+        grad_input[idx] = select(0.0, grad_output[idx], x > 0.0 && x < 6.0);
+    }
+}
+
+@compute @workgroup_size(256)
+fn threshold_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        grad_input[idx] = select(0.0, grad_output[idx], forward_data[idx] > params.alpha);
+    }
+}
+
+@compute @workgroup_size(256)
+fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        let x = forward_data[idx];
+        grad_input[idx] = -grad_output[idx] / (x * x);
+    }
+}
 ";
 
     /// <summary>

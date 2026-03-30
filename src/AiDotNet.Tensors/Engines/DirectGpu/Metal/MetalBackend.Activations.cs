@@ -514,6 +514,157 @@ public sealed partial class MetalBackend
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
+    public void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        ThrowIfDisposed();
+        ExecuteUnaryOp("relu6", A, B, size, _activationLibrary);
+    }
+
+    public void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer2 || input is not MetalGpuBuffer iBuffer2 || gradInput is not MetalGpuBuffer giBuffer2)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline2 = GetPipeline("Activation", _activationLibrary, "relu6_backward");
+        var (tg2, tpg2) = pipeline2.Calculate1DDispatch(size);
+        using var enc2 = _commandQueue.CreateScopedComputeEncoder();
+        enc2.SetPipelineState(pipeline2.Handle);
+        enc2.SetBuffer(goBuffer2, 0); enc2.SetBuffer(iBuffer2, 1); enc2.SetBuffer(giBuffer2, 2);
+        enc2.SetBytes((uint)size, 3);
+        enc2.DispatchThreadgroups(tg2, tpg2);
+    }
+
+    public void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer iBuffer || alpha is not MetalGpuBuffer aBuffer || output is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "prelu");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(iBuffer, 0);
+        encoder.SetBuffer(aBuffer, 1);
+        encoder.SetBuffer(oBuffer, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.SetBytes((uint)alphaSize, 4);
+        encoder.SetBytes((uint)1, 5); // spatial_size = 1 for flat alpha
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer || input is not MetalGpuBuffer iBuffer ||
+            alpha is not MetalGpuBuffer aBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "prelu_backward_input");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(iBuffer, 1);
+        encoder.SetBuffer(aBuffer, 2);
+        encoder.SetBuffer(giBuffer, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.SetBytes((uint)alphaSize, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void PReluBackwardAlpha(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradAlpha, int size, int alphaSize)
+    {
+        // Atomic reduction across elements — not easily parallelizable per-element on Metal.
+        // Use CPU path for alpha gradient accumulation (small buffer).
+        ThrowIfDisposed();
+        var go = DownloadBuffer(gradOutput);
+        var inp = DownloadBuffer(input);
+        var ga = new float[alphaSize];
+        for (int i = 0; i < size; i++) { if (inp[i] < 0) ga[i % alphaSize] += inp[i] * go[i]; }
+        UploadToBuffer(gradAlpha, ga);
+    }
+
+    public void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer iBuffer || noise is not MetalGpuBuffer nBuffer || output is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "rrelu");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(iBuffer, 0);
+        encoder.SetBuffer(nBuffer, 1);
+        encoder.SetBuffer(oBuffer, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer || input is not MetalGpuBuffer iBuffer ||
+            noise is not MetalGpuBuffer nBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "rrelu_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(iBuffer, 1);
+        encoder.SetBuffer(nBuffer, 2);
+        encoder.SetBuffer(giBuffer, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer iBuffer || output is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "threshold_forward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(iBuffer, 0);
+        encoder.SetBuffer(oBuffer, 1);
+        encoder.SetBytes(threshold, 2);
+        encoder.SetBytes(value, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer || input is not MetalGpuBuffer iBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "threshold_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(iBuffer, 1);
+        encoder.SetBuffer(giBuffer, 2);
+        encoder.SetBytes(threshold, 3);
+        encoder.SetBytes((uint)size, 4);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer3 || input is not MetalGpuBuffer iBuffer3 || gradInput is not MetalGpuBuffer giBuffer3)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline3 = GetPipeline("Activation", _activationLibrary, "reciprocal_backward");
+        var (tg3, tpg3) = pipeline3.Calculate1DDispatch(size);
+        using var enc3 = _commandQueue.CreateScopedComputeEncoder();
+        enc3.SetPipelineState(pipeline3.Handle);
+        enc3.SetBuffer(goBuffer3, 0); enc3.SetBuffer(iBuffer3, 1); enc3.SetBuffer(giBuffer3, 2);
+        enc3.SetBytes((uint)size, 3);
+        enc3.DispatchThreadgroups(tg3, tpg3);
+    }
+
     #endregion
 
     #region Capsule Network Operations

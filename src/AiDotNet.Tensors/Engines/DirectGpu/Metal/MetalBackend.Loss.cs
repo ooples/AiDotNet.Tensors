@@ -834,5 +834,129 @@ public sealed partial class MetalBackend
         }
     }
 
+    public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
+    {
+        ThrowIfDisposed();
+        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
+        var l = new float[batchSize];
+        for (int b = 0; b < batchSize; b++)
+        {
+            float sum = 0; for (int f = 0; f < numFeatures; f++) sum += MathF.Abs(p[b * numFeatures + f] - t[b * numFeatures + f]);
+            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
+        }
+        UploadToBuffer(loss, l);
+    }
+
+    public void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
+    {
+        ThrowIfDisposed();
+        var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
+        var l = new float[batchSize];
+        for (int b = 0; b < batchSize; b++)
+        {
+            float sum = 0;
+            for (int f = 0; f < numFeatures; f++) { float d = p[b * numFeatures + f] - t[b * numFeatures + f]; float ad = MathF.Abs(d); sum += ad <= delta ? 0.5f * d * d : delta * (ad - 0.5f * delta); }
+            l[b] = numFeatures > 0 ? sum / numFeatures : 0f;
+        }
+        UploadToBuffer(loss, l);
+    }
+
+    public void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
+    {
+        ThrowIfDisposed();
+        if (logits is not MetalGpuBuffer lBuffer || targets is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "bce_with_logits_elementwise");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(lBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(oBuffer, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+    {
+        ThrowIfDisposed();
+        var lp = DownloadBuffer(logProbs); var tgt = DownloadBuffer(targets);
+        var l = new float[batchSize];
+        for (int b = 0; b < batchSize; b++) { int tc = (int)tgt[b]; l[b] = (tc >= 0 && tc < numClasses) ? -lp[b * numClasses + tc] : 0f; }
+        UploadToBuffer(loss, l);
+    }
+
+    public void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer iBuffer || target is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "kl_div_elementwise");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(iBuffer, 0);
+        encoder.SetBuffer(tBuffer, 1);
+        encoder.SetBuffer(oBuffer, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        ThrowIfDisposed();
+        var go = DownloadBuffer(gradOutput); var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
+        var gi = new float[size];
+        for (int i = 0; i < size; i++) gi[i] = go[0] * 2f * (p[i] - t[i]) * invN;
+        UploadToBuffer(gradInput, gi);
+    }
+
+    public void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer || predictions is not MetalGpuBuffer pBuffer ||
+            targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "l1_loss_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(pBuffer, 1);
+        encoder.SetBuffer(tBuffer, 2);
+        encoder.SetBuffer(giBuffer, 3);
+        encoder.SetBytes(invN, 4);
+        encoder.SetBytes((uint)size, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
+    {
+        ThrowIfDisposed();
+        var go = DownloadBuffer(gradOutput); var p = DownloadBuffer(predictions); var t = DownloadBuffer(targets);
+        var gi = new float[size];
+        for (int i = 0; i < size; i++) { float d = p[i] - t[i]; float ad = MathF.Abs(d); gi[i] = go[0] * (ad <= delta ? d : delta * (d > 0 ? 1f : -1f)) * invN; }
+        UploadToBuffer(gradInput, gi);
+    }
+
+    public void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer goBuffer || logits is not MetalGpuBuffer lBuffer ||
+            targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Loss", _lossLibrary, "bce_with_logits_backward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(goBuffer, 0);
+        encoder.SetBuffer(lBuffer, 1);
+        encoder.SetBuffer(tBuffer, 2);
+        encoder.SetBuffer(giBuffer, 3);
+        encoder.SetBytes(invN, 4);
+        encoder.SetBytes((uint)size, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     #endregion
 }
