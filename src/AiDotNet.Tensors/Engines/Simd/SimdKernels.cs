@@ -6033,6 +6033,112 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 #endif
 
+        // ──────────────────────────────────────────────────────────
+        // Double precision backward kernels (AVX2: 4 doubles at a time)
+        // ──────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// SIMD-accelerated ReLU backward for double: result[i] = input[i] > 0 ? grad[i] : 0
+        /// </summary>
+        public static unsafe void ReluBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<double>.Zero;
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(grad + i), mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] > 0 ? grad[i] : 0;
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Sigmoid backward for double: result[i] = grad[i] * s[i] * (1 - s[i])
+        /// </summary>
+        public static unsafe void SigmoidBackwardDouble(double* grad, double* sigmoidOutput, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1.0);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    var s = Avx.LoadVector256(sigmoidOutput + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var oneMinusS = Avx.Subtract(vOne, s);
+                    Avx.Store(output + i, Avx.Multiply(g, Avx.Multiply(s, oneMinusS)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                double s = sigmoidOutput[i];
+                output[i] = grad[i] * s * (1.0 - s);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated Tanh backward for double: result[i] = grad[i] * (1 - t[i]^2)
+        /// </summary>
+        public static unsafe void TanhBackwardDouble(double* grad, double* tanhOutput, double* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vOne = Vector256.Create(1.0);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    var t = Avx.LoadVector256(tanhOutput + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var t2 = Avx.Multiply(t, t);
+                    Avx.Store(output + i, Avx.Multiply(g, Avx.Subtract(vOne, t2)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                double t = tanhOutput[i];
+                output[i] = grad[i] * (1.0 - t * t);
+            }
+        }
+
+        /// <summary>
+        /// SIMD-accelerated LeakyReLU backward for double.
+        /// </summary>
+        public static unsafe void LeakyReluBackwardDouble(double* grad, double* input, double* output, int length, double alpha)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                var vzero = Vector256<double>.Zero;
+                var vAlpha = Vector256.Create(alpha);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var g = Avx.LoadVector256(grad + i);
+                    var mask = Avx.Compare(x, vzero, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    var alphaGrad = Avx.Multiply(g, vAlpha);
+                    Avx.Store(output + i, Avx.BlendVariable(alphaGrad, g, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] >= 0 ? grad[i] : alpha * grad[i];
+        }
+
     #endregion
     }
 }
