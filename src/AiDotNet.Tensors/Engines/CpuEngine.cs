@@ -2200,6 +2200,12 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Save input before mutation when tape is active (for backward pass)
+        Tensor<T>? savedA = null;
+        var tape = GradientTape<T>.Current;
+        if (tape is not null && tape.Options.RecordInPlace)
+            savedA = a.Clone();
+
         // Stride-aware: in-place requires contiguous target; materialize source if needed
         if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
         if (!b.IsContiguous) b = b.Contiguous();
@@ -2222,7 +2228,10 @@ public class CpuEngine : ITensorLevelEngine
             if (OneDnnProvider.IsAvailable)
             {
                 if (OneDnnProvider.TryAdd(pB, pA, pA, length))
+                {
+                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
                     return;
+                }
             }
 #endif
 
@@ -2230,6 +2239,7 @@ public class CpuEngine : ITensorLevelEngine
             if (CpuJitSelfTest.IsVerified && length >= 64)
             {
                 JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
+                if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
                 return;
             }
 
@@ -2254,11 +2264,14 @@ public class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
             }
+            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        if (savedA is not null)
+            DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, b, BackwardFunctions<T>.AddBackward);
     }
 
     /// <summary>
