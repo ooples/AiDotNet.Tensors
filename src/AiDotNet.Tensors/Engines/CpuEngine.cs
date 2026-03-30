@@ -12492,7 +12492,10 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         rms = TensorAllocator.Rent<T>(batchShape, new Vector<T>(rmsData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        var rmsResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("RMSNorm", rmsResult, new[] { input, gamma },
+            BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
+        return rmsResult;
     }
 
     /// <inheritdoc/>
@@ -20527,7 +20530,10 @@ public class CpuEngine : ITensorLevelEngine
 
         mean = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(meanData));
         variance = TensorAllocator.Rent<T>([batch, channels], new Vector<T>(varData));
-        return TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        var inResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        DifferentiableOps.RecordIfActive("InstanceNorm", inResult, new[] { input, gamma, beta },
+            BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
+        return inResult;
     }
 
     /// <inheritdoc/>
