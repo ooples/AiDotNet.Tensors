@@ -299,6 +299,28 @@ public abstract class VectorBase<T>
     }
 
     /// <summary>
+    /// <summary>
+    /// Gets the backing array reference WITHOUT triggering deferred GPU materialization.
+    /// Used by DirectGpuTensorEngine to check activation cache before deciding whether
+    /// to download — avoids wasteful GPU-to-CPU transfers for chained GPU operations.
+    /// WARNING: The returned array may contain stale/empty data if a deferred download is pending.
+    /// Only use this for cache key lookups, never for reading actual data.
+    /// </summary>
+    internal T[]? GetBackingArrayUnsafe()
+    {
+        if (_cachedArray is not null)
+            return _cachedArray;
+
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null && segment.Offset == 0)
+        {
+            return segment.Array;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Gets a reference to the underlying array without copying.
     /// The returned array may be larger than <see cref="Length"/> when backed by ArrayPool.
     /// Callers MUST index by Length, not array.Length.

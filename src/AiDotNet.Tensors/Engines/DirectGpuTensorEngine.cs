@@ -541,6 +541,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Checks both persistent tensor cache (weights/biases) and activation cache (layer outputs).
     /// Thread-safe: uses lock to prevent use-after-dispose during cache eviction.
     /// </summary>
+    /// <summary>
+    /// Gets a GPU buffer for tensor data. Checks activation cache and persistent cache
+    /// BEFORE triggering any CPU materialization, avoiding wasteful GPU-to-CPU downloads
+    /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
+    /// </summary>
+    private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
+    {
+        // Get the backing array reference WITHOUT triggering materialization.
+        // This is critical: GetDataArray() would download from GPU, which is wasteful
+        // when we're about to find the GPU buffer in the activation cache.
+        var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
+        if (backingArray is not null)
+        {
+            // Check caches using the raw array reference (no download triggered)
+            var cached = TryGetCachedBuffer(backingArray);
+            if (cached != null)
+                return new OwnedBuffer(cached, ownsBuffer: false);
+
+            lock (_activationCacheLock)
+            {
+                if (_activationCache.TryGetValue(backingArray, out var activationEntry) &&
+                    ReferenceEquals(activationEntry.Backend, backend))
+                {
+                    return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                }
+            }
+
+            // Not in any cache — we need actual CPU data to upload.
+            // Now it's safe to trigger materialization since we know a transfer is needed.
+            if (_deferredDownloads.ContainsKey(backingArray))
+            {
+                MaterializeIfDeferred(backingArray);
+            }
+
+            float[] floatData = DirectGpuEngine.ToFloatArray(backingArray);
+            return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
+        }
+
+        // Fallback: no cached array reference, use GetDataArray() which may materialize
+        return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+    }
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, T[] data)
     {
         // First check persistent tensor cache (for weights/biases)
@@ -549,22 +591,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return new OwnedBuffer(cached, ownsBuffer: false);
 
         // Check activation cache (for intermediate layer outputs)
-        // Only reuse if the cached buffer was created by the same backend to avoid cross-backend issues
-        // Use lock to prevent eviction/clear while we're using the cached buffer
         lock (_activationCacheLock)
         {
             if (_activationCache.TryGetValue(data, out var activationEntry) &&
                 ReferenceEquals(activationEntry.Backend, backend))
             {
-                // Found in activation cache with matching backend - reuse buffer without re-uploading
-                // Return with ownsBuffer=false so we don't dispose the cached buffer
                 return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
             }
         }
 
         // Not cached - need to upload.
-        // If this array has a deferred download pending, materialize it first
-        // so we upload actual data instead of an empty array.
         if (_deferredDownloads.ContainsKey(data))
         {
             MaterializeIfDeferred(data);
@@ -955,6 +991,55 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// Tensor-aware TryRunUnary: checks GPU activation cache BEFORE triggering CPU materialization.
+    /// This is the preferred path for chained GPU operations — avoids wasteful downloads.
+    /// </summary>
+    private T[]? TryRunUnary<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
+    {
+        if (!TryGetBackend(out var backend))
+            return null;
+
+        using var bufferA = GetOrAllocateBuffer(backend, input);
+        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+            return FinishGpuOp<T>(backend, bufferB, input.Length);
+        }
+        catch
+        {
+            bufferB.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Tensor-aware TryRunBinary: checks GPU activation cache BEFORE triggering CPU materialization.
+    /// </summary>
+    private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op)
+    {
+        if (!TryGetBackend(out var backend))
+            return null;
+        if (left.Length != right.Length)
+            return null;
+
+        using var bufferA = GetOrAllocateBuffer(backend, left);
+        using var bufferB = GetOrAllocateBuffer(backend, right);
+        var bufferC = AllocateOutputBuffer(backend, left.Length);
+        try
+        {
+            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            return FinishGpuOp<T>(backend, bufferC, left.Length);
+        }
+        catch
+        {
+            bufferC.Dispose();
+            throw;
+        }
+    }
+
+    // Legacy T[] overloads kept for backward compatibility with IEngine explicit implementations
     private T[]? TryRunUnary<T>(T[] input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
         if (!TryGetBackend(out var backend))
@@ -1322,7 +1407,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorAdd(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Add(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Add(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorAdd(a, b);
     }
 
@@ -1331,7 +1416,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorSubtract(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Subtract(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Subtract(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorSubtract(a, b);
     }
 
@@ -1340,7 +1425,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMultiply(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Multiply(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Multiply(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMultiply(a, b);
     }
 
@@ -1349,7 +1434,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorDivide(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Divide(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Divide(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorDivide(a, b);
     }
 
@@ -1965,25 +2050,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorAbs<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Abs(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Abs(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorAbs(tensor);
     }
 
     Tensor<T> IEngine.TensorExp<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Exp(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Exp(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorExp(tensor);
     }
 
     Tensor<T> IEngine.TensorLog<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Log(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Log(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorLog(tensor);
     }
 
     Tensor<T> IEngine.TensorSqrt<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sqrt(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sqrt(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.TensorSqrt(tensor);
     }
 
@@ -2004,7 +2089,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMax(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Max(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Max(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMax(a, b);
     }
 
@@ -2013,31 +2098,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
             return base.TensorMin(a, b);
 
-        var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, left, right, output, size) => backend.Min(left, right, output, size));
+        var result = TryRunBinary(a, b, static (backend, left, right, output, size) => backend.Min(left, right, output, size));
         return result != null ? new Tensor<T>(result, a.Shape._dims) : base.TensorMin(a, b);
     }
 
     Tensor<T> IEngine.Tanh<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Tanh(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Tanh(tensor);
     }
 
     Tensor<T> IEngine.Sigmoid<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.Sigmoid(tensor);
     }
 
     Tensor<T> IEngine.ReLU<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.ReLU(tensor);
     }
 
     Tensor<T> IEngine.GELU<T>(Tensor<T> tensor)
     {
-        var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+        var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
         return result != null ? new Tensor<T>(result, tensor.Shape._dims) : base.GELU(tensor);
     }
 
@@ -10801,7 +10886,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10821,7 +10906,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10841,7 +10926,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10861,7 +10946,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Silu(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Silu(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10881,7 +10966,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Tanh(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Tanh(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10926,7 +11011,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -10946,7 +11031,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Hardswish(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Hardswish(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11045,7 +11130,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Add(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Add(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -11061,7 +11146,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Subtract(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Subtract(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -11077,7 +11162,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Multiply(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Multiply(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -11093,7 +11178,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Divide(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Divide(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -11113,7 +11198,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Exp(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Exp(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11129,7 +11214,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Log(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Log(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11145,7 +11230,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sqrt(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sqrt(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11161,7 +11246,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Abs(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Abs(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11177,7 +11262,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Negate(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Negate(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11197,7 +11282,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Swish(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Swish(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11213,7 +11298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), (backend, input, output, size) => backend.Elu(input, output, (float)alpha, size));
+            var result = TryRunUnary(tensor, (backend, input, output, size) => backend.Elu(input, output, (float)alpha, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11230,7 +11315,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(input.GetDataArray(), static (backend, inp, output, size) => backend.Softplus(inp, output, size));
+            var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Softplus(inp, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, input.Shape._dims);
@@ -11249,7 +11334,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             const float alpha = 1.6732632423543772f;
             const float scale = 1.0507009873554805f;
-            var result = TryRunUnary(tensor.GetDataArray(), (backend, input, output, size) => backend.Selu(input, output, alpha, scale, size));
+            var result = TryRunUnary(tensor, (backend, input, output, size) => backend.Selu(input, output, alpha, scale, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11266,7 +11351,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Hardsigmoid(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Hardsigmoid(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11283,7 +11368,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu6(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu6(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11384,7 +11469,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sin(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sin(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11400,7 +11485,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Cos(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Cos(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11423,7 +11508,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
             {
                 float scalarF = scalar is float f ? f : Convert.ToSingle(scalar);
-                var result = TryRunUnary(tensor.GetDataArray(), (b, input, output, size) => b.Scale(input, output, scalarF, size));
+                var result = TryRunUnary(tensor, (b, input, output, size) => b.Scale(input, output, scalarF, size));
                 if (result != null)
                 {
                     var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11445,7 +11530,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Floor(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Floor(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11461,7 +11546,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Ceiling(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Ceiling(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11480,7 +11565,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
             {
                 float expF = exponent is float ef ? ef : Convert.ToSingle(exponent);
-                var result = TryRunUnary(tensor.GetDataArray(), (b, input, output, size) => b.Power(input, output, expF, size));
+                var result = TryRunUnary(tensor, (b, input, output, size) => b.Power(input, output, expF, size));
                 if (result != null)
                 {
                     var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11502,7 +11587,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Round(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Round(input, output, size));
             if (result != null)
                 return new Tensor<T>(result, tensor.Shape._dims);
         }
@@ -11514,7 +11599,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sign(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sign(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -11534,7 +11619,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Max(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Max(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -11550,7 +11635,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Min(ia, ib, o, size));
+            var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Min(ia, ib, o, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
@@ -12506,7 +12591,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -12523,7 +12608,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -12540,7 +12625,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -12557,7 +12642,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, tensor.Shape._dims);
@@ -12598,7 +12683,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(input.GetDataArray(), static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
+            var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
             if (result != null)
             {
                 var output = new Tensor<T>(result, input.Shape._dims);

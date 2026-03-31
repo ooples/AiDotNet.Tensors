@@ -27,6 +27,12 @@ public abstract class TensorBase<T> : IDisposable
     protected readonly Vector<T> _data;
 
     /// <summary>
+    /// Internal accessor for the backing vector. Used by DirectGpuTensorEngine to check
+    /// activation cache without triggering CPU materialization.
+    /// </summary>
+    internal Vector<T> DataVector => _data;
+
+    /// <summary>
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
     /// </summary>
