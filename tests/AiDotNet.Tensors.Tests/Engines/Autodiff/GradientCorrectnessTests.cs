@@ -739,6 +739,75 @@ public class GradientCorrectnessTests
         VerifyGradient(inp => _engine.TensorScaledDotProductAttention(inp, k, v), q, "ScaledDotProductAttention");
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Previously untested ops
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void RReLU_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { -1f, -0.5f, 0.5f, 1f }, [4]);
+        // RReLU in non-training mode uses fixed slope (lower+upper)/2
+        VerifyGradient(inp => _engine.TensorRReLU(inp, 0.125, 0.333, training: false), x, "RReLU");
+    }
+
+    [Fact]
+    public void AvgPool1D_Gradient_MatchesNumerical()
+    {
+        // [batch=1, channels=1, width=6], kernel=2, stride=2
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [1, 1, 6]);
+        VerifyGradient(inp => _engine.TensorAvgPool1D(inp, 2, 2), x, "AvgPool1D");
+    }
+
+    [Fact]
+    public void MaxPool1D_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 3f, 2f, 5f, 4f, 6f }, [1, 1, 6]);
+        VerifyGradient(inp => _engine.TensorMaxPool1D(inp, 2, 2), x, "MaxPool1D");
+    }
+
+    [Fact]
+    public void Narrow_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        VerifyGradient(inp => _engine.TensorNarrow(inp, 1, 0, 2), x, "Narrow");
+    }
+
+    [Fact]
+    public void CrossEntropyLoss_Gradient_MatchesNumerical()
+    {
+        // [batch=2, classes=3] — use values that produce distinct softmax probs
+        var logits = new Tensor<float>(new float[] { 1f, 2f, 0.5f, 0.1f, 0.9f, 2f }, [2, 3]);
+        var targets = new Tensor<float>(new float[] { 0f, 1f, 0f, 0f, 0f, 1f }, [2, 3]);
+        VerifyGradient(inp => _engine.TensorCrossEntropyLoss(inp, targets), logits, "CrossEntropyLoss");
+    }
+
+    [Fact]
+    public void NLLLoss_Gradient_MatchesNumerical()
+    {
+        // Log probabilities [batch=2, classes=3], targets as class indices
+        var logProbs = new Tensor<float>(new float[] { -2.3f, -0.1f, -3.0f, -0.5f, -1.5f, -0.2f }, [2, 3]);
+        var targets = new Tensor<float>(new float[] { 1f, 2f }, [2]);
+        VerifyGradient(inp => _engine.TensorNLLLoss(inp, targets), logProbs, "NLLLoss");
+    }
+
+    [Fact]
+    public void KLDivLoss_Gradient_MatchesNumerical()
+    {
+        var input = new Tensor<float>(new float[] { -1f, -0.5f, -2f, -0.3f }, [4]);
+        var target = new Tensor<float>(new float[] { 0.25f, 0.25f, 0.25f, 0.25f }, [4]);
+        VerifyGradient(inp => _engine.TensorKLDivLoss(inp, target), input, "KLDivLoss");
+    }
+
+    [Fact]
+    public void PReLU_4D_NCHW_Gradient_MatchesNumerical()
+    {
+        // 4D tensor [N=1, C=2, H=2, W=2] with per-channel alpha [2]
+        var x = new Tensor<float>(new float[] { -1f, 2f, -3f, 4f, -5f, 6f, -7f, 8f }, [1, 2, 2, 2]);
+        var alpha = new Tensor<float>(new float[] { 0.1f, 0.2f }, [2]);
+        VerifyGradient(inp => _engine.TensorPReLU(inp, alpha), x, "PReLU_4D");
+    }
+
     [Fact]
     public void Integration_CompiledBackward_MatchesUncompiled()
     {

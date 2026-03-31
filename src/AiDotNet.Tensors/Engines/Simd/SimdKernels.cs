@@ -6356,6 +6356,53 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        // Missing double backward kernels
+        public static unsafe void HardSigmoidBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                output[i] = (x > -3.0 && x < 3.0) ? grad[i] / 6.0 : 0.0;
+            }
+        }
+
+        public static unsafe void Relu6BackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                output[i] = (x > 0.0 && x < 6.0) ? grad[i] : 0.0;
+            }
+        }
+
+        // Missing Half backward kernels
+        public static void EluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, ReadOnlySpan<Half> eluOutput, Span<Half> output, float alpha)
+        {
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var ef = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf); ConvertToSingle(eluOutput, ef);
+            unsafe { fixed (float* gp = gf, ip = inf, ep = ef, op = outf) EluBackwardUnsafe(gp, ip, ep, op, len, alpha); }
+            ConvertToHalf(outf, output);
+        }
+
+        public static void HardSigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) HardSigmoidBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        public static void Relu6BackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        {
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) Relu6BackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
         // ──────────────────────────────────────────────────────────────
         // Complex SIMD backward kernels (reduction-based)
         // ──────────────────────────────────────────────────────────────

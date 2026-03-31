@@ -22051,7 +22051,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
-            savedState: new object[] { dim, start });
+            savedState: new object[] { dim, start, length });
         return result;
     }
 
