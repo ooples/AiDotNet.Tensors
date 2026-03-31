@@ -866,6 +866,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Creates a deferred Tensor from a raw GPU buffer. The buffer stays GPU-resident;
+    /// the CPU array is only populated when code accesses the tensor data.
+    /// Use this instead of bb.DownloadBuffer() in IEngine implementations to keep
+    /// intermediate results GPU-resident for chained operations.
+    /// </summary>
+    private Tensor<T> DeferTensorResult<T>(IDirectGpuBackend backend, IGpuBuffer outputBuffer, int elementCount, int[] shape)
+    {
+        var result = new T[elementCount];
+        CacheActivation(result, outputBuffer, shape, backend);
+        _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer, backend, elementCount));
+
+        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        {
+            if (_deferredDownloads.TryRemove(arr, out var entry))
+            {
+                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+                Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
+            }
+        });
+
+        return new Tensor<T>(result, shape);
+    }
+
+    /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
     /// within a GpuScope without downloading. This is called automatically when CPU
     /// code needs the actual data (e.g., reductions, CPU fallback operations, scope exit).
@@ -12755,9 +12780,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
-                using var bufOut = bb.AllocateBuffer(tensor.Length);
+                var bufOut = bb.AllocateBuffer(tensor.Length);
                 bb.DivScalar(bufIn, bufOut, Convert.ToSingle(scalar), tensor.Length);
-                return new Tensor<T>((T[])(object)bb.DownloadBuffer(bufOut), tensor.Shape.ToArray());
+                return DeferTensorResult<T>(bb, bufOut, tensor.Length, tensor.Shape.ToArray());
             }
             catch { }
         }
@@ -13015,85 +13040,85 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorAddScalar<T>(Tensor<T> input, T scalar)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=b.AllocateBuffer(input.Length); b.AddScalar(gi,go,Convert.ToSingle(scalar),input.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),input.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=b.AllocateBuffer(input.Length); b.AddScalar(gi,go,Convert.ToSingle(scalar),input.Length); return DeferTensorResult<T>(b,go,input.Length,input.Shape.ToArray()); } catch{} }
         return base.TensorAddScalar(input,scalar);
     }
 
     Tensor<T> IEngine.TensorSubtractScalar<T>(Tensor<T> input, T scalar)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=b.AllocateBuffer(input.Length); b.SubScalar(gi,go,Convert.ToSingle(scalar),input.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),input.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=b.AllocateBuffer(input.Length); b.SubScalar(gi,go,Convert.ToSingle(scalar),input.Length); return DeferTensorResult<T>(b,go,input.Length,input.Shape.ToArray()); } catch{} }
         return base.TensorSubtractScalar(input,scalar);
     }
 
     Tensor<T> IEngine.TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(a.Length); b.BroadcastAddLast(ga,gb,go,os,b2.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),a.Shape.ToArray()); } catch{} }
+        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=b.AllocateBuffer(a.Length); b.BroadcastAddLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
         return base.TensorBroadcastAdd(a,b2);
     }
 
     Tensor<T> IEngine.TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(a.Length); b.BroadcastSubLast(ga,gb,go,os,b2.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),a.Shape.ToArray()); } catch{} }
+        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=b.AllocateBuffer(a.Length); b.BroadcastSubLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
         return base.TensorBroadcastSubtract(a,b2);
     }
 
     Tensor<T> IEngine.TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(a.Length); b.BroadcastMulLast(ga,gb,go,os,b2.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),a.Shape.ToArray()); } catch{} }
+        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=b.AllocateBuffer(a.Length); b.BroadcastMulLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
         return base.TensorBroadcastMultiply(a,b2);
     }
 
     Tensor<T> IEngine.TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Length>b2.Length && a.Length%b2.Length==0)
-        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(a.Length); b.BroadcastDivLast(ga,gb,go,os,b2.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),a.Shape.ToArray()); } catch{} }
+        { try { int os=a.Length/b2.Length; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=b.AllocateBuffer(a.Length); b.BroadcastDivLast(ga,gb,go,os,b2.Length); return DeferTensorResult<T>(b,go,a.Length,a.Shape.ToArray()); } catch{} }
         return base.TensorBroadcastDivide(a,b2);
     }
 
     Tensor<T> IEngine.TensorSiLU<T>(Tensor<T> tensor)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Silu(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=b.AllocateBuffer(tensor.Length); b.Silu(gi,go,tensor.Length); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorSiLU(tensor);
     }
 
     Tensor<T> IEngine.TensorMish<T>(Tensor<T> tensor)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Mish(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=b.AllocateBuffer(tensor.Length); b.Mish(gi,go,tensor.Length); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorMish(tensor);
     }
 
     Tensor<T> IEngine.TensorHardSwish<T>(Tensor<T> tensor)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Hardswish(gi,go,tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=b.AllocateBuffer(tensor.Length); b.Hardswish(gi,go,tensor.Length); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorHardSwish(tensor);
     }
 
     Tensor<T> IEngine.TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.LeakyRelu(gi,go,Convert.ToSingle(alpha),tensor.Length); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=b.AllocateBuffer(tensor.Length); b.LeakyRelu(gi,go,Convert.ToSingle(alpha),tensor.Length); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorLeakyReLU(tensor, alpha);
     }
 
 
     Tensor<T> IEngine.TensorRandomUniform<T>(int[] shape)
     {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
         {
             try
             {
                 int total = 1;
                 foreach (var d in shape) total *= d;
-                using var go = b.AllocateBuffer(total);
-                b.GenerateRandomUniform(go, total, 0f, 1f, (ulong)(ulong)Environment.TickCount);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), shape);
+                var go = b.AllocateBuffer(total);
+                b.GenerateRandomUniform(go, total, 0f, 1f, (ulong)Environment.TickCount);
+                return DeferTensorResult<T>(b, go, total, shape);
             }
             catch { }
         }
@@ -13102,15 +13127,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorRandomNormal<T>(int[] shape, T mean, T stddev)
     {
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b))
+        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
         {
             try
             {
                 int total = 1;
                 foreach (var d in shape) total *= d;
-                using var go = b.AllocateBuffer(total);
-                b.GenerateRandomNormal(go, total, Convert.ToSingle(mean), Convert.ToSingle(stddev), (ulong)(ulong)Environment.TickCount);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), shape);
+                var go = b.AllocateBuffer(total);
+                b.GenerateRandomNormal(go, total, Convert.ToSingle(mean), Convert.ToSingle(stddev), (ulong)Environment.TickCount);
+                return DeferTensorResult<T>(b, go, total, shape);
             }
             catch { }
         }
@@ -13134,9 +13159,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = axis + 1; i < rank; i++) innerSize *= tensor.Shape._dims[i];
                     int totalOuter = outerSize * innerSize;
                     using var gi = b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
-                    using var go = b.AllocateBuffer(totalOuter);
+                    var go = b.AllocateBuffer(totalOuter);
                     b.SumAxis(gi, go, totalOuter, reduceSize);
-                    float[] result = b.DownloadBuffer(go);
                     int[] outShape;
                     if (keepDims)
                     {
@@ -13149,7 +13173,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = tensor.Shape._dims[i];
                     }
-                    return new Tensor<T>((T[])(object)result, outShape);
+                    return DeferTensorResult<T>(b, go, totalOuter, outShape);
                 }
             }
             catch { }
@@ -13174,9 +13198,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape._dims[i];
                     int totalOuter = outerSize * innerSize;
                     using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                    using var go = b.AllocateBuffer(totalOuter);
+                    var go = b.AllocateBuffer(totalOuter);
                     b.MeanAxis(gi, go, totalOuter, reduceSize);
-                    float[] result = b.DownloadBuffer(go);
                     int[] outShape;
                     if (keepDims)
                     {
@@ -13189,7 +13212,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = input.Shape._dims[i];
                     }
-                    return new Tensor<T>((T[])(object)result, outShape);
+                    return DeferTensorResult<T>(b, go, totalOuter, outShape);
                 }
             }
             catch { }
@@ -13209,11 +13232,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int N = b2.Shape._dims[b2.Rank - 1];
                 using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
                 using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
-                using var go = b.AllocateBuffer(batchSize * M * N);
+                var go = b.AllocateBuffer(batchSize * M * N);
                 b.BatchedGemm(ga, gb, go, M, N, K, batchSize);
                 int[] outShape = (int[])a.Shape._dims.Clone();
                 outShape[a.Rank - 1] = N;
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+                return DeferTensorResult<T>(b, go, batchSize * M * N, outShape);
             }
             catch { }
         }
@@ -13232,115 +13255,117 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorDiag<T>(Tensor<T> diagonal)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int n=diagonal.Length; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)diagonal).GetDataArray()); using var go=bb.AllocateBuffer(n*n); bb.DiagKernel(gi,go,n); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n,n}); } catch{} }
+        { try { int n=diagonal.Length; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)diagonal).GetDataArray()); var go=bb.AllocateBuffer(n*n); bb.DiagKernel(gi,go,n); return DeferTensorResult<T>(bb,go,n*n,new[]{n,n}); } catch{} }
         return base.TensorDiag(diagonal);
     }
 
     Tensor<T> IEngine.TensorDiagonal<T>(Tensor<T> tensor)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2)
-        { try { int n=Math.Min(tensor.Shape._dims[0],tensor.Shape._dims[1]); using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(n); bb.ExtractDiagKernel(gi,go,n,tensor.Shape._dims[1]); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{n}); } catch{} }
+        { try { int n=Math.Min(tensor.Shape._dims[0],tensor.Shape._dims[1]); using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(n); bb.ExtractDiagKernel(gi,go,n,tensor.Shape._dims[1]); return DeferTensorResult<T>(bb,go,n,new[]{n}); } catch{} }
         return base.TensorDiagonal(tensor);
     }
 
     Tensor<T> IEngine.TensorLinspace<T>(T start, T end, int count)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && count>1)
-        { try { float s=Convert.ToSingle(start),e=Convert.ToSingle(end); float step=(e-s)/(count-1); using var go=bb.AllocateBuffer(count); bb.LinspaceKernel(go,s,step,count); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{count}); } catch{} }
+        { try { float s=Convert.ToSingle(start),e=Convert.ToSingle(end); float step=(e-s)/(count-1); var go=bb.AllocateBuffer(count); bb.LinspaceKernel(go,s,step,count); return DeferTensorResult<T>(bb,go,count,new[]{count}); } catch{} }
         return base.TensorLinspace(start,end,count);
     }
 
     Tensor<T> IEngine.PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
-        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1]/(upscaleFactor*upscaleFactor),ih=input.Shape._dims[2],iw=input.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*upscaleFactor*iw*upscaleFactor); bb.PixelShuffle(gi,go,ba,ch,ih,iw,upscaleFactor); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,ih*upscaleFactor,iw*upscaleFactor}); } catch{} }
+        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1]/(upscaleFactor*upscaleFactor),ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int total=ba*ch*ih*upscaleFactor*iw*upscaleFactor; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=bb.AllocateBuffer(total); bb.PixelShuffle(gi,go,ba,ch,ih,iw,upscaleFactor); return DeferTensorResult<T>(bb,go,total,new[]{ba,ch,ih*upscaleFactor,iw*upscaleFactor}); } catch{} }
         return base.PixelShuffle(input,upscaleFactor);
     }
 
     Tensor<T> IEngine.PixelShuffleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int upscaleFactor)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
-        { try { int ba=inputShape[0],ch=inputShape[1]/(upscaleFactor*upscaleFactor),ih=inputShape[2],iw=inputShape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(inputShape[0]*inputShape[1]*inputShape[2]*inputShape[3]); bb.PixelShuffleBackward(gi,go,ba,ch,ih,iw,upscaleFactor); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        { try { int ba=inputShape[0],ch=inputShape[1]/(upscaleFactor*upscaleFactor),ih=inputShape[2],iw=inputShape[3]; int total=inputShape[0]*inputShape[1]*inputShape[2]*inputShape[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); var go=bb.AllocateBuffer(total); bb.PixelShuffleBackward(gi,go,ba,ch,ih,iw,upscaleFactor); return DeferTensorResult<T>(bb,go,total,inputShape); } catch{} }
         return base.PixelShuffleBackward(gradOutput,inputShape,upscaleFactor);
     }
 
     Tensor<T> IEngine.Pad<T>(Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
-        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int oh=ih+padTop+padBottom,ow=iw+padLeft+padRight; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*oh*ow); bb.Pad2D(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft,Convert.ToSingle(padValue)); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,oh,ow}); } catch{} }
+        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int oh=ih+padTop+padBottom,ow=iw+padLeft+padRight; int total=ba*ch*oh*ow; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=bb.AllocateBuffer(total); bb.Pad2D(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft,Convert.ToSingle(padValue)); return DeferTensorResult<T>(bb,go,total,new[]{ba,ch,oh,ow}); } catch{} }
         return base.Pad(input,padTop,padBottom,padLeft,padRight,padValue);
     }
 
     Tensor<T> IEngine.PadBackward<T>(Tensor<T> gradOutput, int padTop, int padLeft, int[] inputShape)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
-        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int oh=gradOutput.Shape._dims[2],ow=gradOutput.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*iw); bb.Pad2DBackward(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int total=ba*ch*ih*iw; int oh=gradOutput.Shape._dims[2],ow=gradOutput.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); var go=bb.AllocateBuffer(total); bb.Pad2DBackward(gi,go,ba,ch,ih,iw,oh,ow,padTop,padLeft); return DeferTensorResult<T>(bb,go,total,inputShape); } catch{} }
         return base.PadBackward(gradOutput,padTop,padLeft,inputShape);
     }
 
     Tensor<T> IEngine.Crop<T>(Tensor<T> input, int top, int left, int height, int width)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && input.Rank==4)
-        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*height*width); bb.Crop2D(gi,go,ba,ch,ih,iw,height,width,top,left); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{ba,ch,height,width}); } catch{} }
+        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int total=ba*ch*height*width; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=bb.AllocateBuffer(total); bb.Crop2D(gi,go,ba,ch,ih,iw,height,width,top,left); return DeferTensorResult<T>(bb,go,total,new[]{ba,ch,height,width}); } catch{} }
         return base.Crop(input,top,left,height,width);
     }
 
     Tensor<T> IEngine.CropBackward<T>(Tensor<T> gradOutput, int[] inputShape, int top, int left)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && inputShape.Length==4)
-        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int oh=gradOutput.Shape._dims[2],ow=gradOutput.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=bb.AllocateBuffer(ba*ch*ih*iw); bb.Fill(go,0f,ba*ch*ih*iw); bb.Crop2DBackward(gi,go,ba,ch,ih,iw,oh,ow,top,left); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),inputShape); } catch{} }
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int total=ba*ch*ih*iw; int oh=gradOutput.Shape._dims[2],ow=gradOutput.Shape._dims[3]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); var go=bb.AllocateBuffer(total); bb.Fill(go,0f,total); bb.Crop2DBackward(gi,go,ba,ch,ih,iw,oh,ow,top,left); return DeferTensorResult<T>(bb,go,total,inputShape); } catch{} }
         return base.CropBackward(gradOutput,inputShape,top,left);
     }
 
     Tensor<T> IEngine.TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.CumSumAxis(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(tensor.Length); bb.CumSumAxis(gi,go,outerSize,innerSize); return DeferTensorResult<T>(bb,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorCumSum(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(outerSize); bb.LogSumExpAxis(gi,go,outerSize,reduceSize); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return DeferTensorResult<T>(bb,go,outerSize,outShape); } catch{} }
         return base.TensorLogSumExp(tensor,axis,keepDims);
     }
 
     Tensor<T> IEngine.TensorNorm<T>(Tensor<T> tensor, int axis, bool keepDims)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.NormAxis(gi,go,outerSize,reduceSize); float[] result=bb.DownloadBuffer(go); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return new Tensor<T>((T[])(object)result,outShape); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int reduceSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(outerSize); bb.NormAxis(gi,go,outerSize,reduceSize); int[] outShape; if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];} return DeferTensorResult<T>(bb,go,outerSize,outShape); } catch{} }
         return base.TensorNorm(tensor,axis,keepDims);
     }
 
     Tensor<T> IEngine.TensorNormalize<T>(Tensor<T> tensor, int axis, T epsilon)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.NormalizeL2(gi,go,outerSize,innerSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[ea]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(tensor.Length); bb.NormalizeL2(gi,go,outerSize,innerSize); return DeferTensorResult<T>(bb,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorNormalize(tensor,axis,epsilon);
     }
 
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; int total=outerSize*(aInner+bInner); using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=bb.AllocateBuffer(total); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return DeferTensorResult<T>(bb,go,total,outShape); } catch{} }
         return base.TensorConcatenate(tensors,axis);
     }
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensor.Rank==2 && start.Length==2 && length.Length==2 && start[0]==0 && length[0]==tensor.Shape._dims[0])
-        { try { int outerSize=tensor.Shape._dims[0]; int inputInner=tensor.Shape._dims[1]; int sliceStart=start[1]; int sliceSize=length[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*sliceSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{outerSize,sliceSize}); } catch{} }
+        { try { int outerSize=tensor.Shape._dims[0]; int inputInner=tensor.Shape._dims[1]; int sliceStart=start[1]; int sliceSize=length[1]; int total=outerSize*sliceSize; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(total); bb.SliceLastAxis(gi,go,outerSize,inputInner,sliceStart,sliceSize); return DeferTensorResult<T>(bb,go,total,new[]{outerSize,sliceSize}); } catch{} }
         return base.TensorSlice(tensor,start,length);
     }
 
     Tensor<T> IEngine.TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && multiples.Length==tensor.Rank && multiples[multiples.Length-1]>1)
-        { try { int lastAxis=tensor.Rank-1; bool onlyLastTiled=true; for(int i=0;i<lastAxis;i++) if(multiples[i]!=1) onlyLastTiled=false; if(onlyLastTiled){ int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[lastAxis]; int repeats=multiples[lastAxis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*innerSize*repeats); bb.TileLastAxis(gi,go,outerSize,innerSize,repeats); int[] outShape=(int[])tensor.Shape._dims.Clone(); outShape[lastAxis]*=repeats; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } } catch{} }
+        { try { int lastAxis=tensor.Rank-1; bool onlyLastTiled=true; for(int i=0;i<lastAxis;i++) if(multiples[i]!=1) onlyLastTiled=false; if(onlyLastTiled){ int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=tensor.Shape._dims[i]; int innerSize=tensor.Shape._dims[lastAxis]; int repeats=multiples[lastAxis]; int total=outerSize*innerSize*repeats; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(total); bb.TileLastAxis(gi,go,outerSize,innerSize,repeats); int[] outShape=(int[])tensor.Shape._dims.Clone(); outShape[lastAxis]*=repeats; return DeferTensorResult<T>(bb,go,total,outShape); } } catch{} }
         return base.TensorTile(tensor,multiples);
     }
 
+    // GenerateDropoutMask and GenerateGaussianNoise return Vector<T> and need CPU-side
+    // post-processing (scale multiplication), so they must download immediately.
     Vector<T> IEngine.GenerateDropoutMask<T>(int length, T dropoutRate, T scale, int? seed)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
@@ -13358,14 +13383,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis==tensor.Rank-1)
-        { try { int outerSize=1; for(int i=0;i<axis;i++)outerSize*=tensor.Shape._dims[i]; int inputInner=tensor.Shape._dims[axis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(outerSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,index,1); int[] outShape=new int[tensor.Rank-1]; for(int i=0,j=0;i<tensor.Rank;i++) if(i!=axis) outShape[j++]=tensor.Shape._dims[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { int outerSize=1; for(int i=0;i<axis;i++)outerSize*=tensor.Shape._dims[i]; int inputInner=tensor.Shape._dims[axis]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(outerSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,index,1); int[] outShape=new int[tensor.Rank-1]; for(int i=0,j=0;i<tensor.Rank;i++) if(i!=axis) outShape[j++]=tensor.Shape._dims[i]; return DeferTensorResult<T>(bb,go,outerSize,outShape); } catch{} }
         return base.TensorSliceAxis(tensor,axis,index);
     }
 
     Tensor<T> IEngine.TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Length==2 && axis==0)
-        { try { var a=tensors[0]; var b2=tensors[1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(a.Length*2); bb.Stack2(ga,gb,go,a.Length); int[] outShape=new int[a.Rank+1]; outShape[0]=2; for(int i=0;i<a.Rank;i++) outShape[i+1]=a.Shape._dims[i]; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; int total=a.Length*2; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=bb.AllocateBuffer(total); bb.Stack2(ga,gb,go,a.Length); int[] outShape=new int[a.Rank+1]; outShape[0]=2; for(int i=0;i<a.Rank;i++) outShape[i+1]=a.Shape._dims[i]; return DeferTensorResult<T>(bb,go,total,outShape); } catch{} }
         return base.TensorStack(tensors,axis);
     }
 
@@ -13373,14 +13398,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorSetSlice<T>(Tensor<T> destination, Tensor<T> source, int[] start)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && destination.Rank==2 && start.Length==2 && start[0]==0)
-        { try { int outerSize=destination.Shape._dims[0]; int outputInner=destination.Shape._dims[1]; int sliceStart=start[1]; int sliceSize=source.Shape._dims[1]; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)destination).GetDataArray()); using var gv=bb.AllocateBuffer(((Tensor<float>)(object)source).GetDataArray()); bb.SetSliceLastAxis(gi,gv,outerSize,outputInner,sliceStart,sliceSize); return new Tensor<T>((T[])(object)bb.DownloadBuffer(gi),destination.Shape.ToArray()); } catch{} }
-        return base.TensorSetSlice(destination,source,start);
+        {
+            try
+            {
+                int outerSize = destination.Shape._dims[0];
+                int outputInner = destination.Shape._dims[1];
+                int sliceStart = start[1];
+                int sliceSize = source.Shape._dims[1];
+                // SetSlice modifies the destination buffer in-place, so we can't defer — the input IS the output
+                using var gi = bb.AllocateBuffer(((Tensor<float>)(object)destination).GetDataArray());
+                using var gv = bb.AllocateBuffer(((Tensor<float>)(object)source).GetDataArray());
+                bb.SetSliceLastAxis(gi, gv, outerSize, outputInner, sliceStart, sliceSize);
+                return new Tensor<T>((T[])(object)bb.DownloadBuffer(gi), destination.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorSetSlice(destination, source, start);
     }
 
     Tensor<T> IEngine.Concat<T>(IReadOnlyList<Tensor<T>> tensors, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && tensors.Count==2 && (axis==-1||axis==tensors[0].Rank-1))
-        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(outerSize*(aInner+bInner)); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),outShape); } catch{} }
+        { try { var a=tensors[0]; var b2=tensors[1]; int lastAxis=a.Rank-1; int outerSize=1; for(int i=0;i<lastAxis;i++)outerSize*=a.Shape._dims[i]; int aInner=a.Shape._dims[lastAxis],bInner=b2.Shape._dims[lastAxis]; int total=outerSize*(aInner+bInner); using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=bb.AllocateBuffer(total); bb.ConcatAxis(ga,gb,go,outerSize,aInner,bInner); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[lastAxis]=aInner+bInner; return DeferTensorResult<T>(bb,go,total,outShape); } catch{} }
         return base.Concat(tensors,axis);
     }
 
@@ -13431,9 +13470,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(input.Length);
+                var go = b.AllocateBuffer(input.Length);
                 b.ClipKernel(gi, go, Convert.ToSingle(min), Convert.ToSingle(max), input.Length);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
             }
             catch { }
         }
@@ -13447,9 +13486,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(input.Length);
+                var go = b.AllocateBuffer(input.Length);
                 b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
             }
             catch { }
         }
@@ -13463,9 +13502,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(input.Length);
+                var go = b.AllocateBuffer(input.Length);
                 b.FracKernel(gi, go, input.Length);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), input.Shape.ToArray());
+                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
             }
             catch { }
         }
@@ -13478,9 +13517,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                using var go = b.AllocateBuffer(n * n);
+                var go = b.AllocateBuffer(n * n);
                 b.EyeKernel(go, n);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), new[] { n, n });
+                return DeferTensorResult<T>(b, go, n * n, new[] { n, n });
             }
             catch { }
         }
@@ -13498,9 +13537,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
                 using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
-                using var go = b.AllocateBuffer(a.Length);
+                var go = b.AllocateBuffer(a.Length);
                 b.EqualsKernel(ga, gb, go, a.Length);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), a.Shape.ToArray());
+                return DeferTensorResult<T>(b, go, a.Length, a.Shape.ToArray());
             }
             catch { }
         }
@@ -13515,9 +13554,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
                 using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
-                using var go = b.AllocateBuffer(a.Length);
+                var go = b.AllocateBuffer(a.Length);
                 b.NotEqualsKernel(ga, gb, go, a.Length);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), a.Shape.ToArray());
+                return DeferTensorResult<T>(b, go, a.Length, a.Shape.ToArray());
             }
             catch { }
         }
@@ -13533,9 +13572,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int M = a.Length, N = b2.Length;
                 using var ga = b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray());
                 using var gb = b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray());
-                using var go = b.AllocateBuffer(M * N);
+                var go = b.AllocateBuffer(M * N);
                 b.OuterProduct(ga, gb, go, M, N);
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), new[] { M, N });
+                return DeferTensorResult<T>(b, go, M * N, new[] { M, N });
             }
             catch { }
         }
@@ -13578,7 +13617,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.GluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+                return DeferTensorResult<T>(b, go, outputLen, outShape);
             }
             catch { }
         }
@@ -13598,11 +13637,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
                 int outputLen = outerSize * halfDim;
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(outputLen);
+                var go = b.AllocateBuffer(outputLen);
                 b.GeGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+                return DeferTensorResult<T>(b, go, outputLen, outShape);
             }
             catch { }
         }
@@ -13619,12 +13658,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
+                int outputLen = outerSize * halfDim;
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(outerSize * halfDim);
+                var go = b.AllocateBuffer(outputLen);
                 b.ReGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+                return DeferTensorResult<T>(b, go, outputLen, outShape);
             }
             catch { }
         }
@@ -13641,12 +13681,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
+                int outputLen = outerSize * halfDim;
                 using var gi = b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-                using var go = b.AllocateBuffer(outerSize * halfDim);
+                var go = b.AllocateBuffer(outputLen);
                 b.SwiGluForward(gi, go, outerSize, halfDim);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return new Tensor<T>((T[])(object)b.DownloadBuffer(go), outShape);
+                return DeferTensorResult<T>(b, go, outputLen, outShape);
             }
             catch { }
         }
@@ -13658,14 +13699,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.BatchMatMul<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && a.Rank>=2 && b2.Rank>=2)
-        { try { int M=a.Shape._dims[a.Rank-2],K=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; int batchSize=a.Length/(M*K); using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=b.AllocateBuffer(batchSize*M*N); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[a.Rank-1]=N; return new Tensor<T>((T[])(object)b.DownloadBuffer(go),outShape); } catch{} }
+        { try { int M=a.Shape._dims[a.Rank-2],K=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; int batchSize=a.Length/(M*K); int total=batchSize*M*N; using var ga=b.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=b.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=b.AllocateBuffer(total); b.BatchedGemm(ga,gb,go,M,N,K,batchSize); int[] outShape=(int[])a.Shape._dims.Clone(); outShape[a.Rank-1]=N; return DeferTensorResult<T>(b,go,total,outShape); } catch{} }
         return base.BatchMatMul(a,b2);
     }
 
     Tensor<T> IEngine.TensorTriangularMask<T>(int size, bool upper, int diagonal)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { using var go=bb.AllocateBuffer(size*size); bb.TriangularMask(go,size,size,diagonal,upper?-1e9f:0f); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{size,size}); } catch{} }
+        { try { var go=bb.AllocateBuffer(size*size); bb.TriangularMask(go,size,size,diagonal,upper?-1e9f:0f); return DeferTensorResult<T>(bb,go,size*size,new[]{size,size}); } catch{} }
         return base.TensorTriangularMask<T>(size,upper,diagonal);
     }
 
@@ -13716,35 +13757,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && input.Rank==4 && scaleH==scaleW)
-        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int oh=ih*scaleH,ow=iw*scaleW; using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); using var go=b.AllocateBuffer(ba*ch*oh*ow); b.NearestNeighborUpsample(gi,go,ba*ch,ih,iw,scaleH); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),new[]{ba,ch,oh,ow}); } catch{} }
+        { try { int ba=input.Shape._dims[0],ch=input.Shape._dims[1],ih=input.Shape._dims[2],iw=input.Shape._dims[3]; int oh=ih*scaleH,ow=iw*scaleW; int total=ba*ch*oh*ow; using var gi=b.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray()); var go=b.AllocateBuffer(total); b.NearestNeighborUpsample(gi,go,ba*ch,ih,iw,scaleH); return DeferTensorResult<T>(b,go,total,new[]{ba,ch,oh,ow}); } catch{} }
         return base.Upsample(input,scaleH,scaleW);
     }
 
     Tensor<T> IEngine.UpsampleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int scaleH, int scaleW)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && inputShape.Length==4 && scaleH==scaleW)
-        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; using var gi=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(ba*ch*ih*iw); b.NearestNeighborUpsampleBackward(gi,go,ba*ch,ih,iw,scaleH); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),inputShape); } catch{} }
+        { try { int ba=inputShape[0],ch=inputShape[1],ih=inputShape[2],iw=inputShape[3]; int total=ba*ch*ih*iw; using var gi=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); var go=b.AllocateBuffer(total); b.NearestNeighborUpsampleBackward(gi,go,ba*ch,ih,iw,scaleH); return DeferTensorResult<T>(b,go,total,inputShape); } catch{} }
         return base.UpsampleBackward(gradOutput,inputShape,scaleH,scaleW);
     }
 
     Tensor<T> IEngine.TensorSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=b.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=b.AllocateBuffer(tensor.Length); b.Softmax(gi,go,outerSize,features); return DeferTensorResult<T>(b,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorSoftmax(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); using var go=bb.AllocateBuffer(tensor.Length); bb.LogSoftmax(gi,go,outerSize,features); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),tensor.Shape.ToArray()); } catch{} }
+        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis; int features=tensor.Shape._dims[ea]; int outerSize=tensor.Length/features; using var gi=bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray()); var go=bb.AllocateBuffer(tensor.Length); bb.LogSoftmax(gi,go,outerSize,features); return DeferTensorResult<T>(bb,go,tensor.Length,tensor.Shape.ToArray()); } catch{} }
         return base.TensorLogSoftmax(tensor,axis);
     }
 
     Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
-        { try { using var gso=b.AllocateBuffer(((Tensor<float>)(object)softmaxOutput).GetDataArray()); using var ggo=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); using var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput.Shape._dims[ea]; int outerSize=softmaxOutput.Length/features; b.SoftmaxBackward(gso,ggo,go,outerSize,features); return new Tensor<T>((T[])(object)b.DownloadBuffer(go),softmaxOutput.Shape.ToArray()); } catch{} }
+        { try { using var gso=b.AllocateBuffer(((Tensor<float>)(object)softmaxOutput).GetDataArray()); using var ggo=b.AllocateBuffer(((Tensor<float>)(object)gradOutput).GetDataArray()); var go=b.AllocateBuffer(softmaxOutput.Length); int rank=softmaxOutput.Rank; int ea=axis<0?rank+axis:axis; int features=softmaxOutput.Shape._dims[ea]; int outerSize=softmaxOutput.Length/features; b.SoftmaxBackward(gso,ggo,go,outerSize,features); return DeferTensorResult<T>(b,go,softmaxOutput.Length,softmaxOutput.Shape.ToArray()); } catch{} }
         return base.TensorSoftmaxBackward(softmaxOutput,gradOutput,axis);
     }
 
@@ -13779,14 +13820,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.PairwiseDistance<T>(Tensor<T> x, Tensor<T> y)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && x.Rank==2 && y.Rank==2 && x.Shape._dims[1]==y.Shape._dims[1])
-        { try { int M=x.Shape._dims[0],N=y.Shape._dims[0],dim=x.Shape._dims[1]; using var gx=bb.AllocateBuffer(((Tensor<float>)(object)x).GetDataArray()); using var gy=bb.AllocateBuffer(((Tensor<float>)(object)y).GetDataArray()); using var go=bb.AllocateBuffer(M*N); bb.PairwiseDistance(gx,gy,go,M,N,dim); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{M,N}); } catch{} }
+        { try { int M=x.Shape._dims[0],N=y.Shape._dims[0],dim=x.Shape._dims[1]; using var gx=bb.AllocateBuffer(((Tensor<float>)(object)x).GetDataArray()); using var gy=bb.AllocateBuffer(((Tensor<float>)(object)y).GetDataArray()); var go=bb.AllocateBuffer(M*N); bb.PairwiseDistance(gx,gy,go,M,N,dim); return DeferTensorResult<T>(bb,go,M*N,new[]{M,N}); } catch{} }
         return base.PairwiseDistance(x,y);
     }
 
     Tensor<T> IEngine.TensorBatchOuterProduct<T>(Tensor<T> a, Tensor<T> b2)
     {
         if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && a.Rank>=2 && b2.Rank>=2)
-        { try { int batchSize=a.Shape._dims[0],M=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); using var go=bb.AllocateBuffer(batchSize*M*N); bb.BatchOuterProduct(ga,gb,go,batchSize,M,N); return new Tensor<T>((T[])(object)bb.DownloadBuffer(go),new[]{batchSize,M,N}); } catch{} }
+        { try { int batchSize=a.Shape._dims[0],M=a.Shape._dims[a.Rank-1],N=b2.Shape._dims[b2.Rank-1]; int total=batchSize*M*N; using var ga=bb.AllocateBuffer(((Tensor<float>)(object)a).GetDataArray()); using var gb=bb.AllocateBuffer(((Tensor<float>)(object)b2).GetDataArray()); var go=bb.AllocateBuffer(total); bb.BatchOuterProduct(ga,gb,go,batchSize,M,N); return DeferTensorResult<T>(bb,go,total,new[]{batchSize,M,N}); } catch{} }
         return base.TensorBatchOuterProduct(a,b2);
     }
 
