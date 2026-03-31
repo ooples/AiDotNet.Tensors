@@ -6408,6 +6408,8 @@ namespace AiDotNet.Tensors.Engines.Simd
         // Missing Half backward kernels
         public static void EluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, ReadOnlySpan<Half> eluOutput, Span<Half> output, float alpha)
         {
+            if (grad.Length != input.Length || grad.Length != eluOutput.Length || grad.Length != output.Length)
+                throw new ArgumentException($"ELU Half backward span length mismatch: grad={grad.Length}, input={input.Length}, eluOutput={eluOutput.Length}, output={output.Length}");
             int len = grad.Length;
             var gf = new float[len]; var inf = new float[len]; var ef = new float[len]; var outf = new float[len];
             ConvertToSingle(grad, gf); ConvertToSingle(input, inf); ConvertToSingle(eluOutput, ef);
@@ -6416,7 +6418,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         public static void HardSigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
             ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
@@ -6425,7 +6427,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         public static void Relu6BackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
             ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
@@ -6689,8 +6691,15 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Half precision ReLU backward via FP32 conversion.
         /// </summary>
+        private static void ValidateHalfSpanLengths(ReadOnlySpan<Half> a, ReadOnlySpan<Half> b, Span<Half> output)
+        {
+            if (a.Length != b.Length || a.Length != output.Length)
+                throw new ArgumentException($"Half backward span length mismatch: grad={a.Length}, input={b.Length}, output={output.Length}");
+        }
+
         public static void ReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
         {
+            ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6705,7 +6714,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Sigmoid backward via FP32 conversion.
         /// </summary>
         public static void SigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> sigmoidOutput, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, sigmoidOutput, output);
             int len = grad.Length;
             var gf = new float[len];
             var sf = new float[len];
@@ -6720,7 +6729,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Tanh backward via FP32 conversion.
         /// </summary>
         public static void TanhBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> tanhOutput, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, tanhOutput, output);
             int len = grad.Length;
             var gf = new float[len];
             var tf = new float[len];
@@ -6735,7 +6744,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision GELU backward via FP32 conversion.
         /// </summary>
         public static void GeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6750,7 +6759,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Swish backward via FP32 conversion.
         /// </summary>
         public static void SwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6765,7 +6774,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision LeakyReLU backward via FP32 conversion.
         /// </summary>
         public static void LeakyReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float alpha)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6780,7 +6789,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Mish backward via FP32 conversion.
         /// </summary>
         public static void MishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6795,7 +6804,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision SELU backward via FP32 conversion.
         /// </summary>
         public static void SeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6810,7 +6819,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision HardSwish backward via FP32 conversion.
         /// </summary>
         public static void HardSwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6825,7 +6834,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Softplus backward via FP32 conversion.
         /// </summary>
         public static void SoftplusBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float beta)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];

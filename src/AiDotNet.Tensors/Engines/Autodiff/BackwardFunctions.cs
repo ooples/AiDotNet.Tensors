@@ -1489,12 +1489,11 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var noise = (Tensor<T>)savedState[0];
         // RReLU backward: grad * (x >= 0 ? 1 : noise[i])
+        // Use engine ops for tape recording when createGraph=true
+        var noiseGrad = engine.TensorMultiply(gradOutput, noise);
         var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
         for (int i = 0; i < inputs[0].Length; i++)
-        {
-            bool positive = numOps.ToDouble(inputs[0][i]) >= 0;
-            dx[i] = positive ? gradOutput[i] : numOps.Multiply(gradOutput[i], noise[i]);
-        }
+            dx[i] = numOps.ToDouble(inputs[0][i]) >= 0 ? gradOutput[i] : noiseGrad[i];
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }
 
