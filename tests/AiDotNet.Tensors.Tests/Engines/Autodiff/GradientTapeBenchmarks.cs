@@ -373,9 +373,37 @@ public class GradientTapeBenchmarks
         for (int i = 0; i < iterations; i++)
             _engine.TensorMatMul(x, w);
         sw.Stop();
-        _output.WriteLine($"  MatMul forward 32x256 @ 256x128: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+        _output.WriteLine($"  1. MatMul forward 32x256 @ 256x128: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
 
-        // 2. Full forward+backward with scalar loss
+        // 2. BroadcastAdd only
+        var tempH = _engine.TensorMatMul(x, w);
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+            _engine.TensorBroadcastAdd(tempH, bias);
+        sw.Stop();
+        _output.WriteLine($"  2. BroadcastAdd [32,128]+[1,128]: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 3. MSELoss only
+        var tempOutput = _engine.TensorBroadcastAdd(tempH, bias);
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+            _engine.TensorMSELoss(tempOutput, target);
+        sw.Stop();
+        _output.WriteLine($"  3. MSELoss [32,128]: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 4. Forward only (no backward)
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+        {
+            using var tape = new GradientTape<float>();
+            var fh = _engine.TensorMatMul(x, w);
+            var fo = _engine.TensorBroadcastAdd(fh, bias);
+            var fl = _engine.TensorMSELoss(fo, target);
+        }
+        sw.Stop();
+        _output.WriteLine($"  4. Forward only (with tape): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 5. Full forward+backward with scalar loss
         sw.Restart();
         for (int i = 0; i < iterations; i++)
         {
