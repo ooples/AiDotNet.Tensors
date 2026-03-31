@@ -6931,7 +6931,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int rows = tensor._shape[0];
         int cols = tensor._shape[1];
-        var result = TensorAllocator.Rent<T>(new[] { cols, rows });
+        var result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
 
         var srcData = tensor.GetFlattenedData();
         var dstData = result.GetDataArray();
