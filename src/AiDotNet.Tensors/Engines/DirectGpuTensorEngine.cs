@@ -172,8 +172,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // CAUTION: ClearActivationCache should not be called during active GPU operations.
     private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
     private readonly object _activationCacheLock = new();
-    private const int DefaultActivationCacheSize = 256;
+    private const int DefaultActivationCacheSize = 4096;
     private int _maxActivationCacheSize = DefaultActivationCacheSize;
+
+    /// <summary>
+    /// Maximum GPU memory (bytes) the activation cache is allowed to use.
+    /// Default is 75% of total GPU memory. When this limit is approached,
+    /// the oldest entries are evicted regardless of entry count.
+    /// Set to 0 to disable memory-based eviction (count-based only).
+    /// </summary>
+    private long _maxActivationCacheBytes;
+    private long _currentActivationCacheBytes;
     private long _activationCacheTimestamp = 0;
 
     // Deferred download tracking for GPU-resident execution
@@ -187,12 +196,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
+        _maxActivationCacheBytes = _directGpu.GlobalMemoryBytes * 3 / 4; // 75% of GPU memory
     }
 
     public DirectGpuTensorEngine(DirectGpuEngine directGpu)
     {
         _directGpu = directGpu;
         _ownsDirectGpu = false;
+        _maxActivationCacheBytes = directGpu?.GlobalMemoryBytes * 3 / 4 ?? 0;
     }
 
     public bool IsGpuAvailable => _directGpu?.IsAvailable == true;
@@ -689,8 +700,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
         lock (_activationCacheLock)
         {
-            // Evict old entries if cache is full (removal under lock, disposal deferred)
-            if (_activationCache.Count >= _maxActivationCacheSize)
+            // Evict old entries if cache is full by count or GPU memory budget
+            bool overCount = _activationCache.Count >= _maxActivationCacheSize;
+            bool overMemory = _maxActivationCacheBytes > 0
+                && _currentActivationCacheBytes + (buffer.Size * sizeof(float)) > _maxActivationCacheBytes;
+            if (overCount || overMemory)
             {
                 evicted = EvictOldestActivationsUnsafe();
             }
@@ -706,8 +720,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (!added)
                 {
-                    // Entry was not added (key already exists or exception occurred); dispose to avoid leaking the buffer.
                     entry.Dispose();
+                }
+                else
+                {
+                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, buffer.Size * sizeof(float));
                 }
             }
         }
@@ -754,6 +771,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
+                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
+                        -(entry.Buffer.Size * sizeof(float)));
                     toDispose.Add(entry);
                     removed++;
                 }
