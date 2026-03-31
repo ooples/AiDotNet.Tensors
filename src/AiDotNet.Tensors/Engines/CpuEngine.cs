@@ -20627,18 +20627,14 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var oMem = AsDoubleMemory(output.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinO = oMem.Pin();
-            using var pinR = rMem.Pin();
+            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var gArr = (double[])(object)gradOutput.GetFlattenedData();
+            var oArr = (double[])(object)output.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
             unsafe
             {
-                SimdKernels.SigmoidBackwardDouble(
-                    (double*)pinG.Pointer, (double*)pinO.Pointer,
-                    (double*)pinR.Pointer, length);
+                fixed (double* pG = gArr, pO = oArr, pR = rArr)
+                    SimdKernels.SigmoidBackwardDouble(pG, pO, pR, length);
             }
             return resultTensor;
         }
@@ -20717,18 +20713,14 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var oMem = AsDoubleMemory(output.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinO = oMem.Pin();
-            using var pinR = rMem.Pin();
+            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var gArr = (double[])(object)gradOutput.GetFlattenedData();
+            var oArr = (double[])(object)output.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
             unsafe
             {
-                SimdKernels.TanhBackwardDouble(
-                    (double*)pinG.Pointer, (double*)pinO.Pointer,
-                    (double*)pinR.Pointer, length);
+                fixed (double* pG = gArr, pO = oArr, pR = rArr)
+                    SimdKernels.TanhBackwardDouble(pG, pO, pR, length);
             }
             return resultTensor;
         }

@@ -5626,10 +5626,40 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported)
             {
                 var vzero = Vector256<float>.Zero;
+                // Process 64 floats (2 cache lines) per iteration with prefetch
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    // Prefetch next 2 cache lines (256 bytes ahead = 64 floats)
+                    if (i + 128 < length)
+                    {
+                        Sse.Prefetch1(input + i + 64);
+                        Sse.Prefetch1(input + i + 80);
+                        Sse.Prefetch1(grad + i + 64);
+                        Sse.Prefetch1(grad + i + 80);
+                    }
+                    // Block 0: 32 floats
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(grad + i), mask0));
+                    Avx.Store(output + i + 8, Avx.And(Avx.LoadVector256(grad + i + 8), mask1));
+                    Avx.Store(output + i + 16, Avx.And(Avx.LoadVector256(grad + i + 16), mask2));
+                    Avx.Store(output + i + 24, Avx.And(Avx.LoadVector256(grad + i + 24), mask3));
+                    // Block 1: next 32 floats
+                    var mask4 = Avx.Compare(Avx.LoadVector256(input + i + 32), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask5 = Avx.Compare(Avx.LoadVector256(input + i + 40), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask6 = Avx.Compare(Avx.LoadVector256(input + i + 48), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask7 = Avx.Compare(Avx.LoadVector256(input + i + 56), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i + 32, Avx.And(Avx.LoadVector256(grad + i + 32), mask4));
+                    Avx.Store(output + i + 40, Avx.And(Avx.LoadVector256(grad + i + 40), mask5));
+                    Avx.Store(output + i + 48, Avx.And(Avx.LoadVector256(grad + i + 48), mask6));
+                    Avx.Store(output + i + 56, Avx.And(Avx.LoadVector256(grad + i + 56), mask7));
+                }
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    // mask = input > 0 ? all-ones : all-zeros
                     var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
                     var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
                     var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
