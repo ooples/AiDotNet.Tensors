@@ -12579,8 +12579,136 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     // MaxPool2D and AvgPool2D use `public override` earlier in this file.
-    // TensorBroadcastAdd/Sub/Div already have GPU dispatch via IEngine explicit implementations.
     // TensorBroadcastMultiply uses `public override` earlier in this file.
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated broadcast ops (override virtual methods)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        {
+            try
+            {
+                int outerSize = a.Length / b.Length;
+                using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
+                using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, a.Length);
+                backend.BroadcastAddLast(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, b.Length);
+                var result = FinishGpuOp<T>(backend, bufOut, a.Length);
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("BroadcastAdd", output, a, b,
+                    Autodiff.BackwardFunctions<T>.BroadcastAddBackward);
+                return output;
+            }
+            catch { }
+        }
+        return base.TensorBroadcastAdd(a, b);
+    }
+
+    public override Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        {
+            try
+            {
+                int outerSize = a.Length / b.Length;
+                using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
+                using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, a.Length);
+                backend.BroadcastSubLast(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, b.Length);
+                var result = FinishGpuOp<T>(backend, bufOut, a.Length);
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("BroadcastSubtract", output, a, b,
+                    Autodiff.BackwardFunctions<T>.BroadcastSubtractBackward);
+                return output;
+            }
+            catch { }
+        }
+        return base.TensorBroadcastSubtract(a, b);
+    }
+
+    public override Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && a.Length > b.Length && a.Length % b.Length == 0)
+        {
+            try
+            {
+                int outerSize = a.Length / b.Length;
+                using var bufA = GetOrAllocateBuffer(backend, a.GetDataArray());
+                using var bufB = GetOrAllocateBuffer(backend, b.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, a.Length);
+                backend.BroadcastDivLast(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, b.Length);
+                var result = FinishGpuOp<T>(backend, bufOut, a.Length);
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("BroadcastDivide", output, a, b,
+                    Autodiff.BackwardFunctions<T>.BroadcastDivideBackward);
+                return output;
+            }
+            catch { }
+        }
+        return base.TensorBroadcastDivide(a, b);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated Conv2D (non-Tensor-prefix)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
+    {
+        return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated Var/Std reductions
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorVar<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
+            return base.TensorVar(tensor);
+
+        try
+        {
+            // Compute variance as a single scalar: var = mean((x - mean(x))^2)
+            // Use MeanAxis then VarAxis
+            int size = tensor.Length;
+            using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
+            using var bufMean = bb.AllocateBuffer(1);
+            using var bufVar = bb.AllocateBuffer(1);
+            bb.MeanAxis(bufIn, bufMean, 1, size);
+            bb.VarAxis(bufIn, bufMean, bufVar, 1, size);
+            float[] result = bb.DownloadBuffer(bufVar);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            return new Tensor<T>(new[] { numOps.FromDouble(result[0]) }, new[] { 1 });
+        }
+        catch (Exception)
+        {
+            return base.TensorVar(tensor);
+        }
+    }
+
+    public override Tensor<T> TensorStd<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
+            return base.TensorStd(tensor);
+
+        try
+        {
+            int size = tensor.Length;
+            using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
+            using var bufOut = bb.AllocateBuffer(1);
+            bb.StdAxis(bufIn, bufOut, 1, size);
+            float[] result = bb.DownloadBuffer(bufOut);
+            var numOps = MathHelper.GetNumericOperations<T>();
+            return new Tensor<T>(new[] { numOps.FromDouble(result[0]) }, new[] { 1 });
+        }
+        catch (Exception)
+        {
+            return base.TensorStd(tensor);
+        }
+    }
 
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated scalar ops and reductions
