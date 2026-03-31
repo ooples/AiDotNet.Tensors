@@ -908,11 +908,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         //   result1 = sigmoid(x)     → GPU kernel, buffer cached, no download
         //   result2 = relu(result1)  → buffer found in cache, no upload, no download
         //   value = result2[0]       → first CPU access triggers download
-        // TODO: When GpuTensor<T> integration is complete (Task #15), this allocation
-        // goes away entirely — GpuTensor has no CPU array until explicitly requested.
-        // For now, the cache-first GetOrAllocateBuffer(Tensor<T>) ensures this array
-        // is never read during chained GPU operations.
+        // Allocate uninitialized array — skips zeroing since the data will either:
+        // (a) be populated lazily from GPU on first CPU access, or
+        // (b) never be read at all (chained GPU ops use the cached GPU buffer directly).
+        // GC.AllocateUninitializedArray avoids the O(n) zero-fill of new T[n].
+#if !NETFRAMEWORK
+        var result = GC.AllocateUninitializedArray<T>(elementCount);
+#else
         var result = new T[elementCount];
+#endif
         CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
         _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer.Buffer, backend, elementCount));
 
@@ -939,7 +943,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private Tensor<T> DeferTensorResult<T>(IDirectGpuBackend backend, IGpuBuffer outputBuffer, int elementCount, int[] shape)
     {
+#if !NETFRAMEWORK
+        var result = GC.AllocateUninitializedArray<T>(elementCount);
+#else
         var result = new T[elementCount];
+#endif
         CacheActivation(result, outputBuffer, shape, backend);
         _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer, backend, elementCount));
 
