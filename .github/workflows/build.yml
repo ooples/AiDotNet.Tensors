@@ -40,6 +40,7 @@ jobs:
     - name: Build (net471)
       run: |
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net471 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
+        dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net471
 
     - name: Test with Coverage
       run: |
