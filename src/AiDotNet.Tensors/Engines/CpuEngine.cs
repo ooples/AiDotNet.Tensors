@@ -20837,7 +20837,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    public virtual unsafe Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -20887,7 +20887,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
+    public virtual Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
@@ -20913,6 +20913,175 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         return TensorAllocator.Rent<T>(gradOutput._shape, new Vector<T>(result));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Activation backward methods — virtual for GPU override dispatch
+    // ──────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double sig = 1.0 / (1.0 + Math.Exp(-x));
+            double deriv = sig + x * sig * (1.0 - sig);
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double sp = Math.Log(1.0 + Math.Exp(x));
+            double tsp = Math.Tanh(sp);
+            double sig = 1.0 / (1.0 + Math.Exp(-x));
+            double deriv = tsp + x * sig * (1.0 - tsp * tsp);
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double sig = 1.0 / (1.0 + Math.Exp(-x));
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * sig);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double deriv = x <= -3.0 ? 0.0 : x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        const double alpha = 1.6732632423543772;
+        const double scale = 1.0507009873554805;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double deriv = x >= 0 ? scale : scale * alpha * Math.Exp(x);
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double deriv = (x > -3.0 && x < 3.0) ? 1.0 / 6.0 : 0.0;
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            result[i] = (x > 0 && x < 6) ? gData[i] : numOps.Zero;
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        var oData = output.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            double deriv = x >= 0 ? 1.0 : numOps.ToDouble(oData[i]) + alpha;
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ThresholdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double threshold)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            result[i] = x > threshold ? gData[i] : numOps.Zero;
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    {
+        // d/dx(1/x) = -1/x^2 = -(1/x)^2 = -output^2
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new T[gradOutput.Length];
+        var gData = gradOutput.GetDataArray();
+        var oData = output.GetDataArray();
+        for (int i = 0; i < result.Length; i++)
+        {
+            double o = numOps.ToDouble(oData[i]);
+            result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * (-o * o));
+        }
+        return new Tensor<T>(result, gradOutput.Shape.ToArray());
     }
 
     /// <inheritdoc/>

@@ -11556,6 +11556,254 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated activation backward methods
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.GeluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.GeluBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.LeakyReluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, (float)negativeSlope, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.LeakyReluBackward(gradOutput, input, negativeSlope);
+    }
+
+    public override Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.SwishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.SwishBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.MishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.MishBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.SoftplusBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.SoftplusBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.HardswishBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.HardswishBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                const float alpha = 1.6732632423543772f;
+                const float scale = 1.0507009873554805f;
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.SeluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, alpha, scale, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.SeluBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.HardsigmoidBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.HardsigmoidBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.Relu6Backward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.Relu6Backward(gradOutput, input);
+    }
+
+    public override Tensor<T> ThresholdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double threshold)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                var oBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.ThresholdBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, (float)threshold, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, oBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.ThresholdBackward(gradOutput, input, threshold);
+    }
+
+    public override Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var oBuf2 = GetOrAllocateBuffer(backend, output);
+                var rBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.ReciprocalBackward(gBuf.Buffer, oBuf2.Buffer, rBuf.Buffer, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, rBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { rBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.ReciprocalBackward(gradOutput, output);
+    }
+
+    // ──────────────────────────────────────────────────────────────
     // GPU-accelerated trigonometric
     // ──────────────────────────────────────────────────────────────
 

@@ -1677,6 +1677,36 @@ public interface IEngine
     /// <returns>The gradient with respect to the input.</returns>
     Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope);
 
+    /// <summary>Backward pass for Swish/SiLU activation.</summary>
+    Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for Mish activation.</summary>
+    Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for Softplus activation.</summary>
+    Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for HardSwish activation.</summary>
+    Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for SELU activation.</summary>
+    Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for HardSigmoid activation.</summary>
+    Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for ReLU6 activation.</summary>
+    Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for ELU activation.</summary>
+    Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha);
+
+    /// <summary>Backward pass for Threshold activation.</summary>
+    Tensor<T> ThresholdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double threshold);
+
+    /// <summary>Backward pass for Reciprocal.</summary>
+    Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output);
+
     #endregion
 
     #region Matrix Operations (Phase B: Epic 2)
