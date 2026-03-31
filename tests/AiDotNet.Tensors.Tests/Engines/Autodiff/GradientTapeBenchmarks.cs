@@ -211,7 +211,7 @@ public class GradientTapeBenchmarks
             warmTape.ComputeGradients(warmLoss, sources: new[] { input });
         }
 
-        // Measure full tape forward + backward with scalar loss
+        // Measure full tape forward + backward with scalar loss (no arena)
         var sw = Stopwatch.StartNew();
         int iterations = 100;
         for (int i = 0; i < iterations; i++)
@@ -223,8 +223,34 @@ public class GradientTapeBenchmarks
         }
         sw.Stop();
         double msPerOp = sw.Elapsed.TotalMilliseconds / iterations;
-        _output.WriteLine($"ReLU backward 1M (tape + scalar loss): {msPerOp:F3}ms (PyTorch baseline: ~0.30ms, target: <0.20ms)");
-        _output.WriteLine($"  Speedup vs PyTorch: {0.30 / msPerOp:F2}x");
+        _output.WriteLine($"ReLU backward 1M (no arena): {msPerOp:F3}ms");
+
+        // With TensorArena (realistic training loop)
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            // Warmup
+            {
+                using var warmTape = new GradientTape<float>();
+                var wo = _engine.ReLU(input);
+                var wl = _engine.TensorMeanDiff(wo);
+                warmTape.ComputeGradients(wl, sources: new[] { input });
+            }
+            arena.Reset();
+
+            sw.Restart();
+            for (int i = 0; i < iterations; i++)
+            {
+                arena.Reset();
+                using var tape = new GradientTape<float>();
+                var output = _engine.ReLU(input);
+                var loss = _engine.TensorMeanDiff(output);
+                tape.ComputeGradients(loss, sources: new[] { input });
+            }
+            sw.Stop();
+            double msArena = sw.Elapsed.TotalMilliseconds / iterations;
+            _output.WriteLine($"ReLU backward 1M (with arena): {msArena:F3}ms (PyTorch baseline: ~0.30ms, target: <0.20ms)");
+            _output.WriteLine($"  Speedup vs PyTorch: {0.30 / msArena:F2}x");
+        }
 
         // Also measure the raw SIMD kernel only (no tape overhead)
         var gradOutput = Tensor<float>.CreateRandom([1000000]);
