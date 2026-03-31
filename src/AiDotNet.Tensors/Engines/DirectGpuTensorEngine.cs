@@ -11259,6 +11259,204 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorReLU6(tensor);
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated backward functions
+    // These dispatch activation backward to GPU kernels
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                var gArr = (float[])(object)gradOutput.GetFlattenedData();
+                var iArr = (float[])(object)input.GetFlattenedData();
+                int size = gArr.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gArr);
+                using var iBuf = GetOrAllocateBuffer(backend, iArr);
+                var oBuf = AllocateOutputBuffer(backend, size);
+                try
+                {
+                    backend.ReluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, size);
+                    var result = FinishGpuOp<T>(backend, oBuf, size);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.ReluBackward(gradOutput, input);
+    }
+
+    public override Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                var gArr = (float[])(object)gradOutput.GetFlattenedData();
+                var oArr = (float[])(object)output.GetDataArray();
+                int size = gArr.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gArr);
+                using var oBuf = GetOrAllocateBuffer(backend, oArr);
+                var rBuf = AllocateOutputBuffer(backend, size);
+                try
+                {
+                    backend.SigmoidBackward(gBuf.Buffer, oBuf.Buffer, rBuf.Buffer, size);
+                    var result = FinishGpuOp<T>(backend, rBuf, size);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { rBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.SigmoidBackward(gradOutput, output);
+    }
+
+    public override Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                var gArr = (float[])(object)gradOutput.GetFlattenedData();
+                var oArr = (float[])(object)output.GetDataArray();
+                int size = gArr.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gArr);
+                using var oBuf = GetOrAllocateBuffer(backend, oArr);
+                var rBuf = AllocateOutputBuffer(backend, size);
+                try
+                {
+                    backend.TanhBackward(gBuf.Buffer, oBuf.Buffer, rBuf.Buffer, size);
+                    var result = FinishGpuOp<T>(backend, rBuf, size);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { rBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.TanhBackward(gradOutput, output);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated trigonometric
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorSin<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sin(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Sin", output, tensor, Autodiff.BackwardFunctions<T>.SinBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorSin(tensor);
+    }
+
+    public override Tensor<T> TensorCos<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Cos(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Cos", output, tensor, Autodiff.BackwardFunctions<T>.CosBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorCos(tensor);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated scalar operations
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                float scalarF = scalar is float f ? f : Convert.ToSingle(scalar);
+                var result = TryRunUnary(tensor.GetDataArray(), (b, input, output, size) => b.Scale(input, output, scalarF, size));
+                if (result != null)
+                {
+                    var output = new Tensor<T>(result, tensor.Shape._dims);
+                    Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", output, tensor,
+                        Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar as object ?? new object() });
+                    return output;
+                }
+            }
+        }
+        catch { }
+        return base.TensorMultiplyScalar(tensor, scalar);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated floor/ceiling
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorFloor<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Floor(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Floor", output, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorFloor(tensor);
+    }
+
+    public override Tensor<T> TensorCeiling<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Ceiling(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Ceiling", output, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorCeiling(tensor);
+    }
+
+    public override Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                float expF = exponent is float ef ? ef : Convert.ToSingle(exponent);
+                var result = TryRunUnary(tensor.GetDataArray(), (b, input, output, size) => b.Power(input, output, expF, size));
+                if (result != null)
+                {
+                    var output = new Tensor<T>(result, tensor.Shape._dims);
+                    Autodiff.DifferentiableOps.RecordUnary("TensorPower", output, tensor,
+                        Autodiff.BackwardFunctions<T>.PowerBackward, new object[] { exponent as object ?? new object() });
+                    return output;
+                }
+            }
+        }
+        catch { }
+        return base.TensorPower(tensor, exponent);
+    }
+
     // --- Scalar reductions ---
     T IEngine.Sum<T>(Vector<T> v)
     {

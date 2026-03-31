@@ -3786,7 +3786,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorPower<T>(Tensor<T> bases, Tensor<T> exponents)
+    public virtual Tensor<T> TensorPower<T>(Tensor<T> bases, Tensor<T> exponents)
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
@@ -3881,7 +3881,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSin<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorSin<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3897,7 +3897,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorCos<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorCos<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -20609,7 +20609,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    public virtual unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -20665,7 +20665,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    public virtual Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
@@ -20751,7 +20751,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    public virtual Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
