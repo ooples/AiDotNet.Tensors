@@ -343,8 +343,12 @@ public class GradientTapeBenchmarks
         }
 
         // 7. Check AVX2 support
+#if NET5_0_OR_GREATER
         _output.WriteLine($"7. System.Runtime.Intrinsics.X86.Avx2.IsSupported: {System.Runtime.Intrinsics.X86.Avx2.IsSupported}");
         _output.WriteLine($"   System.Runtime.Intrinsics.X86.Avx.IsSupported: {System.Runtime.Intrinsics.X86.Avx.IsSupported}");
+#else
+        _output.WriteLine("7. AVX2/AVX: not available on net471");
+#endif
     }
 
     [Fact(Skip = "Benchmark — run manually, not in CI")]
