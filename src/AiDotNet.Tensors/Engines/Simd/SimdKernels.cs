@@ -5626,10 +5626,40 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (Avx.IsSupported)
             {
                 var vzero = Vector256<float>.Zero;
+                // Process 64 floats (2 cache lines) per iteration with prefetch
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    // Prefetch next 2 cache lines (256 bytes ahead = 64 floats)
+                    if (i + 128 < length)
+                    {
+                        Sse.Prefetch1(input + i + 64);
+                        Sse.Prefetch1(input + i + 80);
+                        Sse.Prefetch1(grad + i + 64);
+                        Sse.Prefetch1(grad + i + 80);
+                    }
+                    // Block 0: 32 floats
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(Avx.LoadVector256(grad + i), mask0));
+                    Avx.Store(output + i + 8, Avx.And(Avx.LoadVector256(grad + i + 8), mask1));
+                    Avx.Store(output + i + 16, Avx.And(Avx.LoadVector256(grad + i + 16), mask2));
+                    Avx.Store(output + i + 24, Avx.And(Avx.LoadVector256(grad + i + 24), mask3));
+                    // Block 1: next 32 floats
+                    var mask4 = Avx.Compare(Avx.LoadVector256(input + i + 32), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask5 = Avx.Compare(Avx.LoadVector256(input + i + 40), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask6 = Avx.Compare(Avx.LoadVector256(input + i + 48), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask7 = Avx.Compare(Avx.LoadVector256(input + i + 56), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i + 32, Avx.And(Avx.LoadVector256(grad + i + 32), mask4));
+                    Avx.Store(output + i + 40, Avx.And(Avx.LoadVector256(grad + i + 40), mask5));
+                    Avx.Store(output + i + 48, Avx.And(Avx.LoadVector256(grad + i + 48), mask6));
+                    Avx.Store(output + i + 56, Avx.And(Avx.LoadVector256(grad + i + 56), mask7));
+                }
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    // mask = input > 0 ? all-ones : all-zeros
                     var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
                     var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
                     var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
@@ -6356,6 +6386,55 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        // Missing double backward kernels
+        public static unsafe void HardSigmoidBackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                output[i] = (x > -3.0 && x < 3.0) ? grad[i] / 6.0 : 0.0;
+            }
+        }
+
+        public static unsafe void Relu6BackwardDouble(double* grad, double* input, double* output, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                double x = input[i];
+                output[i] = (x > 0.0 && x < 6.0) ? grad[i] : 0.0;
+            }
+        }
+
+        // Missing Half backward kernels
+        public static void EluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, ReadOnlySpan<Half> eluOutput, Span<Half> output, float alpha)
+        {
+            if (grad.Length != input.Length || grad.Length != eluOutput.Length || grad.Length != output.Length)
+                throw new ArgumentException($"ELU Half backward span length mismatch: grad={grad.Length}, input={input.Length}, eluOutput={eluOutput.Length}, output={output.Length}");
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var ef = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf); ConvertToSingle(eluOutput, ef);
+            unsafe { fixed (float* gp = gf, ip = inf, ep = ef, op = outf) EluBackwardUnsafe(gp, ip, ep, op, len, alpha); }
+            ConvertToHalf(outf, output);
+        }
+
+        public static void HardSigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        { ValidateHalfSpanLengths(grad, input, output);
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) HardSigmoidBackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
+        public static void Relu6BackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
+        { ValidateHalfSpanLengths(grad, input, output);
+            int len = grad.Length;
+            var gf = new float[len]; var inf = new float[len]; var outf = new float[len];
+            ConvertToSingle(grad, gf); ConvertToSingle(input, inf);
+            unsafe { fixed (float* gp = gf, ip = inf, op = outf) Relu6BackwardUnsafe(gp, ip, op, len); }
+            ConvertToHalf(outf, output);
+        }
+
         // ──────────────────────────────────────────────────────────────
         // Complex SIMD backward kernels (reduction-based)
         // ──────────────────────────────────────────────────────────────
@@ -6534,6 +6613,76 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>BatchNorm backward for double.</summary>
+        public static unsafe void BatchNormBackwardDouble(
+            double* gradOutput, double* input, double* gamma,
+            double* mean, double* variance, double epsilon,
+            double* gradInput, double* gradGamma, double* gradBeta,
+            int batchSize, int channels, int spatialSize)
+        {
+            int totalPerChannel = batchSize * spatialSize;
+            double invN = 1.0 / totalPerChannel;
+            for (int c = 0; c < channels; c++)
+            {
+                double m = mean[c];
+                double invStd = 1.0 / Math.Sqrt(variance[c] + epsilon);
+                double gGamma = 0, gBeta = 0, sumGradXhat = 0, sumGrad = 0;
+                for (int b = 0; b < batchSize; b++)
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        double go = gradOutput[idx];
+                        double xhat = (input[idx] - m) * invStd;
+                        gGamma += go * xhat; gBeta += go;
+                        sumGradXhat += go * xhat; sumGrad += go;
+                    }
+                gradGamma[c] = gGamma; gradBeta[c] = gBeta;
+                double g = gamma[c];
+                for (int b = 0; b < batchSize; b++)
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        double xhat = (input[idx] - m) * invStd;
+                        gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
+                    }
+            }
+        }
+
+        /// <summary>LayerNorm backward for double.</summary>
+        public static unsafe void LayerNormBackwardDouble(
+            double* gradOutput, double* input, double* gamma,
+            double* mean, double* variance, double epsilon,
+            double* gradInput, double* gradGamma, double* gradBeta,
+            int batchSize, int normSize)
+        {
+            for (int i = 0; i < normSize; i++) { gradGamma[i] = 0; gradBeta[i] = 0; }
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * normSize;
+                double m = mean[b];
+                double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+                for (int i = 0; i < normSize; i++)
+                {
+                    double xhat = (input[offset + i] - m) * invStd;
+                    gradGamma[i] += gradOutput[offset + i] * xhat;
+                    gradBeta[i] += gradOutput[offset + i];
+                }
+                double ds = 0, db = 0;
+                for (int i = 0; i < normSize; i++)
+                {
+                    double go = gradOutput[offset + i] * gamma[i];
+                    double xhat = (input[offset + i] - m) * invStd;
+                    ds += go * xhat; db += go;
+                }
+                double invN = 1.0 / normSize;
+                for (int i = 0; i < normSize; i++)
+                {
+                    double xhat = (input[offset + i] - m) * invStd;
+                    gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));
+                }
+            }
+        }
+
         // ──────────────────────────────────────────────────────────────
         // Half precision backward kernels (compute in FP32, store in FP16)
         // Uses convert-compute-convert pattern: Half→float, run float SIMD, float→Half
@@ -6542,8 +6691,15 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Half precision ReLU backward via FP32 conversion.
         /// </summary>
+        private static void ValidateHalfSpanLengths(ReadOnlySpan<Half> a, ReadOnlySpan<Half> b, Span<Half> output)
+        {
+            if (a.Length != b.Length || a.Length != output.Length)
+                throw new ArgumentException($"Half backward span length mismatch: grad={a.Length}, input={b.Length}, output={output.Length}");
+        }
+
         public static void ReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
         {
+            ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6558,7 +6714,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Sigmoid backward via FP32 conversion.
         /// </summary>
         public static void SigmoidBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> sigmoidOutput, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, sigmoidOutput, output);
             int len = grad.Length;
             var gf = new float[len];
             var sf = new float[len];
@@ -6573,7 +6729,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Tanh backward via FP32 conversion.
         /// </summary>
         public static void TanhBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> tanhOutput, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, tanhOutput, output);
             int len = grad.Length;
             var gf = new float[len];
             var tf = new float[len];
@@ -6588,7 +6744,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision GELU backward via FP32 conversion.
         /// </summary>
         public static void GeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6603,7 +6759,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Swish backward via FP32 conversion.
         /// </summary>
         public static void SwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6618,7 +6774,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision LeakyReLU backward via FP32 conversion.
         /// </summary>
         public static void LeakyReluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float alpha)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6633,7 +6789,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Mish backward via FP32 conversion.
         /// </summary>
         public static void MishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6648,7 +6804,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision SELU backward via FP32 conversion.
         /// </summary>
         public static void SeluBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6663,7 +6819,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision HardSwish backward via FP32 conversion.
         /// </summary>
         public static void HardSwishBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6678,7 +6834,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Half precision Softplus backward via FP32 conversion.
         /// </summary>
         public static void SoftplusBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> input, Span<Half> output, float beta)
-        {
+        { ValidateHalfSpanLengths(grad, input, output);
             int len = grad.Length;
             var gf = new float[len];
             var inf = new float[len];
@@ -6687,6 +6843,57 @@ namespace AiDotNet.Tensors.Engines.Simd
             ConvertToSingle(input, inf);
             unsafe { fixed (float* gp = gf, ip = inf, op = outf) SoftplusBackwardUnsafe(gp, ip, op, len, beta); }
             ConvertToHalf(outf, output);
+        }
+
+        /// <summary>Softmax backward for Half via FP32 conversion.</summary>
+        public static void SoftmaxBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> softmaxOutput, Span<Half> output, int batchSize, int features)
+        {
+            var gf = new float[grad.Length]; var sf = new float[softmaxOutput.Length]; var outf = new float[output.Length];
+            ConvertToSingle(grad, gf); ConvertToSingle(softmaxOutput, sf);
+            unsafe { fixed (float* gp = gf, sp = sf, op = outf) SoftmaxBackwardUnsafe(gp, sp, op, batchSize, features); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>BatchNorm backward for Half via FP32 conversion.</summary>
+        public static void BatchNormBackwardHalf(
+            ReadOnlySpan<Half> gradOutput, ReadOnlySpan<Half> input, ReadOnlySpan<Half> gamma,
+            ReadOnlySpan<Half> mean, ReadOnlySpan<Half> variance, float epsilon,
+            Span<Half> gradInput, Span<Half> gradGamma, Span<Half> gradBeta,
+            int batchSize, int channels, int spatialSize)
+        {
+            int totalLen = gradOutput.Length;
+            var gof = new float[totalLen]; var inf = new float[totalLen]; var gaf = new float[channels];
+            var mf = new float[channels]; var vf = new float[channels]; var gif = new float[totalLen];
+            var ggf = new float[channels]; var gbf = new float[channels];
+            ConvertToSingle(gradOutput, gof); ConvertToSingle(input, inf); ConvertToSingle(gamma, gaf);
+            ConvertToSingle(mean, mf); ConvertToSingle(variance, vf);
+            unsafe
+            {
+                fixed (float* gop = gof, ip = inf, gap = gaf, mp = mf, vp = vf, gip = gif, ggp = ggf, gbp = gbf)
+                    BatchNormBackwardUnsafe(gop, ip, gap, mp, vp, epsilon, gip, ggp, gbp, batchSize, channels, spatialSize);
+            }
+            ConvertToHalf(gif, gradInput); ConvertToHalf(ggf, gradGamma); ConvertToHalf(gbf, gradBeta);
+        }
+
+        /// <summary>LayerNorm backward for Half via FP32 conversion.</summary>
+        public static void LayerNormBackwardHalf(
+            ReadOnlySpan<Half> gradOutput, ReadOnlySpan<Half> input, ReadOnlySpan<Half> gamma,
+            ReadOnlySpan<Half> mean, ReadOnlySpan<Half> variance, float epsilon,
+            Span<Half> gradInput, Span<Half> gradGamma, Span<Half> gradBeta,
+            int batchSize, int normSize)
+        {
+            int totalLen = gradOutput.Length;
+            var gof = new float[totalLen]; var inf = new float[totalLen]; var gaf = new float[normSize];
+            var mf = new float[batchSize]; var vf = new float[batchSize]; var gif = new float[totalLen];
+            var ggf = new float[normSize]; var gbf = new float[normSize];
+            ConvertToSingle(gradOutput, gof); ConvertToSingle(input, inf); ConvertToSingle(gamma, gaf);
+            ConvertToSingle(mean, mf); ConvertToSingle(variance, vf);
+            unsafe
+            {
+                fixed (float* gop = gof, ip = inf, gap = gaf, mp = mf, vp = vf, gip = gif, ggp = ggf, gbp = gbf)
+                    LayerNormBackwardUnsafe(gop, ip, gap, mp, vp, epsilon, gip, ggp, gbp, batchSize, normSize);
+            }
+            ConvertToHalf(gif, gradInput); ConvertToHalf(ggf, gradGamma); ConvertToHalf(gbf, gradBeta);
         }
 
     #endregion

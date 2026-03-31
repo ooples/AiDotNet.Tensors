@@ -7099,6 +7099,9 @@ public interface IEngine
 
     /// <summary>Scaled dot-product attention: softmax(Q@K^T/sqrt(dk)) @ V.</summary>
     Tensor<T> TensorScaledDotProductAttention<T>(Tensor<T> query, Tensor<T> key, Tensor<T> value);
+
+    /// <summary>IndexSelect with differentiable backward.</summary>
+    Tensor<T> TensorIndexSelectDiff<T>(Tensor<T> source, Tensor<int> indices, int axis);
 }
 
 /// <summary>

@@ -2840,7 +2840,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a._shape);
+        var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -2917,7 +2917,7 @@ public class CpuEngine : ITensorLevelEngine
             return TensorBroadcastMultiply(a, b);
         }
 
-        var result = TensorAllocator.Rent<T>(a._shape);
+        var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -3365,7 +3365,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor._shape);
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
 
         if (tensor.IsContiguous)
         {
@@ -4354,6 +4354,50 @@ public class CpuEngine : ITensorLevelEngine
 
         // Validate and normalize axes consistently with other reducers
         var normalizedAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+
+        // Fast path: single-axis sum on 2D contiguous float tensor
+        if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(float))
+        {
+            int axis = normalizedAxes[0];
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var srcArr = (float[])(object)tensor.GetDataArray();
+
+            if (axis == 0)
+            {
+                // Sum along rows → output [1, cols] or [cols]
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var rArr = (float[])(object)fastResult.GetDataArray();
+                Array.Clear(rArr, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rArr[c] += srcArr[offset + c];
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+            else if (axis == 1)
+            {
+                // Sum along cols → output [rows, 1] or [rows]
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var rArr = (float[])(object)fastResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    float sum = 0;
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sum += srcArr[offset + c];
+                    rArr[r] = sum;
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+        }
 
         // Calculate output shape
         var outputShape = new List<int>();
@@ -6931,7 +6975,7 @@ public class CpuEngine : ITensorLevelEngine
 
         int rows = tensor._shape[0];
         int cols = tensor._shape[1];
-        var result = TensorAllocator.Rent<T>(new[] { cols, rows });
+        var result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
 
         var srcData = tensor.GetFlattenedData();
         var dstData = result.GetDataArray();
@@ -20559,20 +20603,17 @@ public class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         int length = gradOutput.Length;
 
-        var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
+        // Use RentUninitialized — backward kernel writes every element
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
 
         if (typeof(T) == typeof(float))
         {
-            var gMem = AsFloatMemory(gradOutput.Data);
-            var iMem = AsFloatMemory(input.Data);
-            var rMem = AsFloatMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinI = iMem.Pin();
-            using var pinR = rMem.Pin();
-            float* pG = (float*)pinG.Pointer;
-            float* pI = (float*)pinI.Pointer;
-            float* pR = (float*)pinR.Pointer;
-            SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
+            // Use fixed instead of Memory.Pin() — avoids GCHandle allocation overhead
+            var gArr = (float[])(object)gradOutput.GetFlattenedData();
+            var iArr = (float[])(object)input.GetFlattenedData();
+            var rArr = (float[])(object)resultTensor.GetDataArray();
+            fixed (float* pG = gArr, pI = iArr, pR = rArr)
+                SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -20630,18 +20671,14 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var oMem = AsDoubleMemory(output.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinO = oMem.Pin();
-            using var pinR = rMem.Pin();
+            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var gArr = (double[])(object)gradOutput.GetFlattenedData();
+            var oArr = (double[])(object)output.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
             unsafe
             {
-                SimdKernels.SigmoidBackwardDouble(
-                    (double*)pinG.Pointer, (double*)pinO.Pointer,
-                    (double*)pinR.Pointer, length);
+                fixed (double* pG = gArr, pO = oArr, pR = rArr)
+                    SimdKernels.SigmoidBackwardDouble(pG, pO, pR, length);
             }
             return resultTensor;
         }
@@ -20720,18 +20757,14 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var oMem = AsDoubleMemory(output.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinO = oMem.Pin();
-            using var pinR = rMem.Pin();
+            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var gArr = (double[])(object)gradOutput.GetFlattenedData();
+            var oArr = (double[])(object)output.GetDataArray();
+            var rArr = (double[])(object)resultTensor.GetDataArray();
             unsafe
             {
-                SimdKernels.TanhBackwardDouble(
-                    (double*)pinG.Pointer, (double*)pinO.Pointer,
-                    (double*)pinR.Pointer, length);
+                fixed (double* pG = gArr, pO = oArr, pR = rArr)
+                    SimdKernels.TanhBackwardDouble(pG, pO, pR, length);
             }
             return resultTensor;
         }
@@ -22051,7 +22084,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
-            savedState: new object[] { dim, start });
+            savedState: new object[] { dim, start, length });
         return result;
     }
 
