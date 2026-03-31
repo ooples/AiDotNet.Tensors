@@ -2485,6 +2485,9 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorCeiling<T>(Tensor<T> tensor);
 
+    /// <summary>Element-wise round to nearest integer.</summary>
+    Tensor<T> TensorRound<T>(Tensor<T> tensor);
+
     /// <summary>
     /// Computes the element-wise fractional part of a tensor (x - floor(x)).
     /// </summary>

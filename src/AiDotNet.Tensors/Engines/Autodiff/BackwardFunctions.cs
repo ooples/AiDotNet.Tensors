@@ -1829,4 +1829,40 @@ internal static class BackwardFunctions<T>
             dx[i] = mask[i] ? numOps.Zero : gradOutput[i];
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }
+
+    /// <summary>Element-wise max backward: gradient flows to whichever input was larger</summary>
+    internal static void MaxBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradA = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradB = TensorPool<T>.RentZeroed(inputs[1].Shape.ToArray());
+        for (int i = 0; i < inputs[0].Length; i++)
+        {
+            bool aGreater = numOps.GreaterThan(inputs[0][i], inputs[1][i]);
+            if (aGreater) gradA[i] = gradOutput[i];
+            else gradB[i] = gradOutput[i];
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+    }
+
+    /// <summary>Element-wise min backward: gradient flows to whichever input was smaller</summary>
+    internal static void MinBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var gradA = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradB = TensorPool<T>.RentZeroed(inputs[1].Shape.ToArray());
+        for (int i = 0; i < inputs[0].Length; i++)
+        {
+            bool aSmaller = numOps.LessThan(inputs[0][i], inputs[1][i]);
+            if (aSmaller) gradA[i] = gradOutput[i];
+            else gradB[i] = gradOutput[i];
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+    }
 }
