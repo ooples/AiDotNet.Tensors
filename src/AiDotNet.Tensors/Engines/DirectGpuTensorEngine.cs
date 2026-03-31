@@ -10994,12 +10994,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufferA = GetOrAllocateBuffer(backend, a.GetDataArray());
             using var bufferB = GetOrAllocateBuffer(backend, b.GetDataArray());
-            using var bufferResult = AllocateOutputBuffer(backend, size);
+            var bufferResult = AllocateOutputBuffer(backend, size);
 
             backend.AddScaled(bufferA.Buffer, bufferB.Buffer, bufferResult.Buffer, scaleAFloat, scaleBFloat, size);
 
-            float[] resultFloat = backend.DownloadBuffer(bufferResult.Buffer);
-            return new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(resultFloat), a.Shape._dims);
+            var result = FinishGpuOp<T>(backend, bufferResult, size);
+            return new Tensor<T>(result, a.Shape._dims);
         }
         catch (Exception)
         {
@@ -12080,22 +12080,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
-        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb))
             return base.TensorMSELoss(predictions, targets);
 
         try
         {
-            int batchSize = predictions.Shape._dims[0];
+            int batchSize = predictions.Rank >= 2 ? predictions.Shape._dims[0] : 1;
             int numFeatures = predictions.Length / batchSize;
-            using var bufP = GetOrAllocateBuffer(backend, predictions.GetDataArray());
-            using var bufT = GetOrAllocateBuffer(backend, targets.GetDataArray());
-            using var bufOut = AllocateOutputBuffer(backend, 1);
-            backend.MseLoss(bufP.Buffer, bufT.Buffer, predictions.Length);
-            // MseLoss returns scalar, compute via SumAxis
-            float[] pData = backend.DownloadBuffer(bufP.Buffer);
-            float[] tData = backend.DownloadBuffer(bufT.Buffer);
-            // Fallback to compute the full loss tensor through CPU since the backend returns scalar
-            return base.TensorMSELoss(predictions, targets);
+            using var bufP = bb.AllocateBuffer(((Tensor<float>)(object)predictions).GetDataArray());
+            using var bufT = bb.AllocateBuffer(((Tensor<float>)(object)targets).GetDataArray());
+            var bufOut = bb.AllocateBuffer(batchSize);
+            bb.MseLoss(bufP, bufT, bufOut, batchSize, numFeatures);
+            return DeferTensorResult<T>(bb, bufOut, batchSize, new[] { batchSize });
         }
         catch (Exception)
         {
@@ -12701,12 +12697,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int size = tensor.Length;
             using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
             using var bufMean = bb.AllocateBuffer(1);
-            using var bufVar = bb.AllocateBuffer(1);
+            var bufVar = bb.AllocateBuffer(1);
             bb.MeanAxis(bufIn, bufMean, 1, size);
             bb.VarAxis(bufIn, bufMean, bufVar, 1, size);
-            float[] result = bb.DownloadBuffer(bufVar);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            return new Tensor<T>(new[] { numOps.FromDouble(result[0]) }, new[] { 1 });
+            return DeferTensorResult<T>(bb, bufVar, 1, new[] { 1 });
         }
         catch (Exception)
         {
@@ -12723,11 +12717,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int size = tensor.Length;
             using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
-            using var bufOut = bb.AllocateBuffer(1);
+            var bufOut = bb.AllocateBuffer(1);
             bb.StdAxis(bufIn, bufOut, 1, size);
-            float[] result = bb.DownloadBuffer(bufOut);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            return new Tensor<T>(new[] { numOps.FromDouble(result[0]) }, new[] { 1 });
+            return DeferTensorResult<T>(bb, bufOut, 1, new[] { 1 });
         }
         catch (Exception)
         {
@@ -12808,9 +12800,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape._dims[i];
             int totalOuter = outerSize * innerSize;
             using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
-            using var bufOut = bb.AllocateBuffer(totalOuter);
+            var bufOut = bb.AllocateBuffer(totalOuter);
             bb.StdAxis(bufIn, bufOut, totalOuter, reduceSize);
-            float[] result = bb.DownloadBuffer(bufOut);
             int[] outShape;
             if (keepDims)
             {
@@ -12823,7 +12814,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 for (int i = 0, j = 0; i < rank; i++)
                     if (i != axis) outShape[j++] = input.Shape._dims[i];
             }
-            return new Tensor<T>((T[])(object)result, outShape);
+            return DeferTensorResult<T>(bb, bufOut, totalOuter, outShape);
         }
         catch (Exception)
         {
@@ -12881,13 +12872,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int innerSize = tensor.Rank >= 2 ? tensor.Length / tensor.Shape._dims[0] : 1;
             using var bufSrc = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
             using var bufIdx = bb.AllocateIntBuffer(indices.GetDataArray());
-            using var bufOut = bb.AllocateBuffer(numIndices * innerSize);
+            int total = numIndices * innerSize;
+            var bufOut = bb.AllocateBuffer(total);
             bb.IndexSelect(bufSrc, bufIdx, bufOut, numIndices, innerSize);
-            float[] resultFloat = bb.DownloadBuffer(bufOut);
             int[] outShape = tensor.Rank >= 2
                 ? new[] { numIndices }.Concat(tensor.Shape._dims.Skip(1)).ToArray()
                 : new[] { numIndices };
-            var output = new Tensor<T>((T[])(object)resultFloat, outShape);
+            var output = DeferTensorResult<T>(bb, bufOut, total, outShape);
             Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
                 Autodiff.BackwardFunctions<T>.IndexSelectBackward,
                 new object[] { indices, axis, tensor.Shape._dims });
