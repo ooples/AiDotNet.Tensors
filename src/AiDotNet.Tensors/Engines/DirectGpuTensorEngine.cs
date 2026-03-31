@@ -887,7 +887,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         });
 
-        return new Tensor<T>(result, shape);
+        var tensor = new Tensor<T>(result, shape);
+        tensor._device = backend.BackendName?.ToUpperInvariant() switch
+        {
+            "CUDA" or "NVIDIA" => TensorDevice.CUDA,
+            "OPENCL" => TensorDevice.OpenCL,
+            "HIP" or "ROCM" => TensorDevice.HIP,
+            "VULKAN" => TensorDevice.Vulkan,
+            "METAL" or "MPS" => TensorDevice.Metal,
+            "WEBGPU" => TensorDevice.WebGPU,
+            "DIRECTML" or "DML" => TensorDevice.DirectML,
+            _ => TensorDevice.CUDA
+        };
+        return tensor;
     }
 
     /// <summary>

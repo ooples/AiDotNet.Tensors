@@ -46,6 +46,42 @@ public abstract class TensorBase<T> : IDisposable
     internal readonly int _storageOffset;
 
     /// <summary>
+    /// Tracks the device where this tensor's data currently resides.
+    /// Set to GPU by DirectGpuTensorEngine when a GPU op defers its download.
+    /// Reset to CPU when the data is materialized to the CPU-side array.
+    /// </summary>
+    internal TensorDevice _device = TensorDevice.CPU;
+
+    /// <summary>
+    /// Gets or sets the device where this tensor's data resides.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This tells you whether the tensor's data is on the CPU
+    /// (regular computer memory) or on the GPU (graphics card memory). When a GPU operation
+    /// produces a result, the tensor is marked as GPU-resident. Reading the data from CPU
+    /// code triggers a lazy download, and the device changes back to CPU.</para>
+    /// </remarks>
+    public TensorDevice Device
+    {
+        get
+        {
+            // If data was deferred and has since been materialized, update device to CPU
+            if (_device != TensorDevice.CPU && _data._cachedArray is not null
+                && !Helpers.DeferredArrayMaterializer.IsPending(_data._cachedArray))
+            {
+                _device = TensorDevice.CPU;
+            }
+            return _device;
+        }
+        internal set => _device = value;
+    }
+
+    /// <summary>
+    /// Returns true if this tensor's data currently resides on a GPU device.
+    /// </summary>
+    public bool IsGpuResident => _device != TensorDevice.CPU;
+
+    /// <summary>
     /// Monotonically increasing version counter. Incremented by in-place mutation operations.
     /// Used by GradientTape to detect when a recorded tensor has been mutated after recording,
     /// which would produce incorrect gradients during the backward pass.
