@@ -1050,10 +1050,8 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T scale = numOps.Divide(gradOutput[0], numOps.FromDouble(inputs[0].Length));
-        var data = new T[inputs[0].Length];
-        for (int i = 0; i < data.Length; i++)
-            data[i] = scale;
-        var grad = new Tensor<T>(data, inputs[0].Shape.ToArray());
+        var grad = TensorPool<T>.Rent(inputs[0].Shape.ToArray());
+        engine.TensorFill(grad, scale);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

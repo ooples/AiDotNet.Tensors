@@ -20563,16 +20563,12 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var gMem = AsFloatMemory(gradOutput.Data);
-            var iMem = AsFloatMemory(input.Data);
-            var rMem = AsFloatMemory(resultTensor.Data);
-            using var pinG = gMem.Pin();
-            using var pinI = iMem.Pin();
-            using var pinR = rMem.Pin();
-            float* pG = (float*)pinG.Pointer;
-            float* pI = (float*)pinI.Pointer;
-            float* pR = (float*)pinR.Pointer;
-            SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
+            // Use fixed instead of Memory.Pin() — avoids GCHandle allocation overhead
+            var gArr = (float[])(object)gradOutput.GetFlattenedData();
+            var iArr = (float[])(object)input.GetFlattenedData();
+            var rArr = (float[])(object)resultTensor.GetDataArray();
+            fixed (float* pG = gArr, pI = iArr, pR = rArr)
+                SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
         else if (typeof(T) == typeof(double))
         {
