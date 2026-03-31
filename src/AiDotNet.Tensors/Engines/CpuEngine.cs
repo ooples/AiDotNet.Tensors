@@ -2075,7 +2075,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2830,7 +2830,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2907,7 +2907,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3388,7 +3388,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3632,7 +3632,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Tensor Element-wise Math Operations
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorLog<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorLog<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3662,7 +3662,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3692,7 +3692,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3722,7 +3722,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3752,7 +3752,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorNegate<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorNegate<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -6365,7 +6365,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> Swish<T>(Tensor<T> tensor)
+    public virtual Tensor<T> Swish<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6394,7 +6394,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
+    public virtual Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
         if (!tensor.IsContiguous)
         {
@@ -20544,7 +20544,7 @@ public class CpuEngine : ITensorLevelEngine
     #region GPU-Accelerated Operations (CPU Fallback Implementations)
 
     /// <inheritdoc/>
-    public Tensor<T> Softplus<T>(Tensor<T> input)
+    public virtual Tensor<T> Softplus<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetFlattenedData();
@@ -21960,7 +21960,7 @@ public class CpuEngine : ITensorLevelEngine
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>SELU activation: scale * (max(0,x) + min(0, alpha*(exp(x)-1)))</summary>
-    public Tensor<T> TensorSELU<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorSELU<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         const double alpha = 1.6732632423543772;
@@ -21977,7 +21977,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>HardSigmoid: clamp(x/6 + 0.5, 0, 1)</summary>
-    public Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -21992,7 +21992,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>ReLU6: min(max(0, x), 6)</summary>
-    public Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);

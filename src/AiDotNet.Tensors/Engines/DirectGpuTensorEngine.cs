@@ -11000,6 +11000,265 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated element-wise arithmetic
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+    {
+        try
+        {
+            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Add(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorAdd", output, a, b, Autodiff.BackwardFunctions<T>.AddBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAdd(a, b);
+    }
+
+    public override Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+    {
+        try
+        {
+            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Subtract(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorSubtract", output, a, b, Autodiff.BackwardFunctions<T>.SubtractBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorSubtract(a, b);
+    }
+
+    public override Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
+    {
+        try
+        {
+            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Multiply(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorMultiply", output, a, b, Autodiff.BackwardFunctions<T>.MultiplyBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorMultiply(a, b);
+    }
+
+    public override Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
+    {
+        try
+        {
+            var result = TryRunBinary(a.GetDataArray(), b.GetDataArray(), static (backend, ia, ib, o, size) => backend.Divide(ia, ib, o, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, a.Shape._dims);
+                Autodiff.DifferentiableOps.RecordBinary("TensorDivide", output, a, b, Autodiff.BackwardFunctions<T>.DivideBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorDivide(a, b);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated unary math
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorExp<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Exp(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorExp", output, tensor, Autodiff.BackwardFunctions<T>.ExpBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorExp(tensor);
+    }
+
+    public override Tensor<T> TensorLog<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Log(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorLog", output, tensor, Autodiff.BackwardFunctions<T>.LogBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorLog(tensor);
+    }
+
+    public override Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sqrt(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorSqrt", output, tensor, Autodiff.BackwardFunctions<T>.SqrtBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorSqrt(tensor);
+    }
+
+    public override Tensor<T> TensorAbs<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Abs(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorAbs", output, tensor, Autodiff.BackwardFunctions<T>.AbsBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAbs(tensor);
+    }
+
+    public override Tensor<T> TensorNegate<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Negate(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorNegate", output, tensor, Autodiff.BackwardFunctions<T>.NegateBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorNegate(tensor);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated activations (missing from original 13)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> Swish<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Swish(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Swish", output, tensor, Autodiff.BackwardFunctions<T>.SwishBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.Swish(tensor);
+    }
+
+    public override Tensor<T> ELU<T>(Tensor<T> tensor, double alpha)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), (backend, input, output, size) => backend.Elu(input, output, (float)alpha, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("ELU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.ELUBackward, new object[] { alpha });
+                return output;
+            }
+        }
+        catch { }
+        return base.ELU(tensor, alpha);
+    }
+
+    public override Tensor<T> Softplus<T>(Tensor<T> input)
+    {
+        try
+        {
+            var result = TryRunUnary(input.GetDataArray(), static (backend, inp, output, size) => backend.Softplus(inp, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, input.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Softplus", output, input,
+                    Autodiff.BackwardFunctions<T>.SoftplusBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.Softplus(input);
+    }
+
+    public override Tensor<T> TensorSELU<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            const float alpha = 1.6732632423543772f;
+            const float scale = 1.0507009873554805f;
+            var result = TryRunUnary(tensor.GetDataArray(), (backend, input, output, size) => backend.Selu(input, output, alpha, scale, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("SELU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.SELUBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorSELU(tensor);
+    }
+
+    public override Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Hardsigmoid(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("HardSigmoid", output, tensor,
+                    Autodiff.BackwardFunctions<T>.HardSigmoidBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorHardSigmoid(tensor);
+    }
+
+    public override Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu6(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("ReLU6", output, tensor,
+                    Autodiff.BackwardFunctions<T>.ReLU6Backward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorReLU6(tensor);
+    }
+
     // --- Scalar reductions ---
     T IEngine.Sum<T>(Vector<T> v)
     {
