@@ -403,20 +403,21 @@ public class GradientTapeBenchmarks
         sw.Stop();
         _output.WriteLine($"  4. Forward only (with tape): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
 
-        // 5. Backward-only timing
+        // 5. Backward-only timing with per-op profiling
         {
             using var tape = new GradientTape<float>();
             var h5 = _engine.TensorMatMul(x, w);
             var o5 = _engine.TensorBroadcastAdd(h5, bias);
             var l5 = _engine.TensorMSELoss(o5, target);
             _output.WriteLine($"  5. Tape entries: {tape.EntryCount}");
+            // tape.ProfileBackward = true; // uncomment for per-op timing
             sw.Restart();
             tape.ComputeGradients(l5, sources: new[] { w, bias });
             sw.Stop();
-            _output.WriteLine($"  5b. ComputeGradients only: {sw.Elapsed.TotalMilliseconds:F3}ms");
+            _output.WriteLine($"  5b. ComputeGradients total: {sw.Elapsed.TotalMilliseconds:F3}ms");
         }
 
-        // 6. Full forward+backward with scalar loss
+        // 6. Full forward+backward WITHOUT arena
         sw.Restart();
         for (int i = 0; i < iterations; i++)
         {
@@ -427,6 +428,35 @@ public class GradientTapeBenchmarks
             tape.ComputeGradients(loss, sources: new[] { w, bias });
         }
         sw.Stop();
+        _output.WriteLine($"  6. Without arena: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 7. Full forward+backward WITH TensorArena (zero-GC after warmup)
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            // Warmup iteration to populate arena
+            {
+                using var warmTape = new GradientTape<float>();
+                var wh = _engine.TensorMatMul(x, w);
+                var wo = _engine.TensorBroadcastAdd(wh, bias);
+                var wl = _engine.TensorMSELoss(wo, target);
+                warmTape.ComputeGradients(wl, sources: new[] { w, bias });
+            }
+            arena.Reset();
+
+            sw.Restart();
+            for (int i = 0; i < iterations; i++)
+            {
+                arena.Reset();
+                using var tape = new GradientTape<float>();
+                var h = _engine.TensorMatMul(x, w);
+                var output = _engine.TensorBroadcastAdd(h, bias);
+                var loss = _engine.TensorMSELoss(output, target);
+                tape.ComputeGradients(loss, sources: new[] { w, bias });
+            }
+            sw.Stop();
+            _output.WriteLine($"  7. With TensorArena: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+        }
+
         double msPerOp = sw.Elapsed.TotalMilliseconds / iterations;
         _output.WriteLine($"Linear forward+backward 32x256->128: {msPerOp:F3}ms (PyTorch baseline: ~4.50ms, target: <3.00ms)");
         _output.WriteLine($"  Speedup vs PyTorch: {4.50 / msPerOp:F2}x");

@@ -123,6 +123,65 @@ internal static class SimdGemm
     /// Follows BLIS architecture: loop order is jc -> pc -> ic -> jr -> ir.
     /// Supports parallelism over both M and N dimensions for different matrix shapes.
     /// </summary>
+    /// <summary>
+    /// Small-M GEMM: for M &lt;= 64, skip packing and compute directly.
+    /// Each row of C is computed as a dot product of a row of A with columns of B,
+    /// using SIMD to process 8 columns of B at a time.
+    /// </summary>
+    private static unsafe void SgemmSmallM(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c,
+        int m, int k, int n)
+    {
+        fixed (float* pA = a, pB = b, pC = c)
+        {
+            for (int i = 0; i < m; i++)
+            {
+                int cRow = i * n;
+                // Process N in chunks of 8 (AVX2 width)
+                int j = 0;
+                for (; j + 8 <= n; j += 8)
+                {
+                    var acc = Vector256<float>.Zero;
+                    for (int p = 0; p < k; p++)
+                    {
+                        float aVal = transA ? pA[p * lda + i] : pA[i * lda + p];
+                        var aVec = Vector256.Create(aVal);
+                        int bIdx = transB ? (j * ldb + p) : (p * ldb + j);
+                        // For transB, elements are strided — need gather or scalar
+                        if (!transB)
+                        {
+                            var bVec = Avx.LoadVector256(pB + bIdx);
+                            acc = Fma.MultiplyAdd(aVec, bVec, acc);
+                        }
+                        else
+                        {
+                            // Gather from transposed B — each element at stride ldb
+                            var bVec = Vector256.Create(
+                                pB[j * ldb + p], pB[(j + 1) * ldb + p], pB[(j + 2) * ldb + p], pB[(j + 3) * ldb + p],
+                                pB[(j + 4) * ldb + p], pB[(j + 5) * ldb + p], pB[(j + 6) * ldb + p], pB[(j + 7) * ldb + p]);
+                            acc = Fma.MultiplyAdd(aVec, bVec, acc);
+                        }
+                    }
+                    Avx.Store(pC + cRow + j, acc);
+                }
+                // Scalar tail
+                for (; j < n; j++)
+                {
+                    float sum = 0;
+                    for (int p = 0; p < k; p++)
+                    {
+                        float aVal = transA ? pA[p * lda + i] : pA[i * lda + p];
+                        float bVal = transB ? pB[j * ldb + p] : pB[p * ldb + j];
+                        sum += aVal * bVal;
+                    }
+                    pC[cRow + j] = sum;
+                }
+            }
+        }
+    }
+
     private static void SgemmTiled(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,

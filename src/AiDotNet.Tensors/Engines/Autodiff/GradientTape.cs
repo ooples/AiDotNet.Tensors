@@ -196,8 +196,21 @@ public sealed class GradientTape<T> : IDisposable
                 // Validate that no input tensor was mutated after recording (would produce wrong gradients)
                 entry.ValidateInputVersions();
 
+                // Performance profiling: log per-op backward time when enabled
+                System.Diagnostics.Stopwatch? opSw = null;
+                if (ProfileBackward)
+                {
+                    opSw = System.Diagnostics.Stopwatch.StartNew();
+                }
+
                 // Invoke the backward function to propagate gradients to inputs
                 entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+
+                if (opSw is not null)
+                {
+                    opSw.Stop();
+                    System.Console.WriteLine($"  backward[{entry.OperationName}]: {opSw.Elapsed.TotalMilliseconds:F3}ms");
+                }
 
                 // Anomaly detection: check for NaN/Inf in computed input gradients
                 if (numOpsForAnomaly is not null)
@@ -290,6 +303,11 @@ public sealed class GradientTape<T> : IDisposable
     /// When true, each backward function's output is checked for NaN/Inf.
     /// </summary>
     public bool DetectAnomaly { get; set; }
+
+    /// <summary>
+    /// When true, logs per-backward-function timing to Console for performance profiling.
+    /// </summary>
+    public bool ProfileBackward { get; set; }
 
     /// <summary>
     /// Tensor-specific backward hooks. When a tensor's gradient is computed during backward,

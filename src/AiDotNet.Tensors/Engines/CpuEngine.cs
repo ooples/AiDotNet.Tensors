@@ -4355,6 +4355,50 @@ public class CpuEngine : ITensorLevelEngine
         // Validate and normalize axes consistently with other reducers
         var normalizedAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
 
+        // Fast path: single-axis sum on 2D contiguous float tensor
+        if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(float))
+        {
+            int axis = normalizedAxes[0];
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var srcArr = (float[])(object)tensor.GetDataArray();
+
+            if (axis == 0)
+            {
+                // Sum along rows → output [1, cols] or [cols]
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var rArr = (float[])(object)fastResult.GetDataArray();
+                Array.Clear(rArr, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rArr[c] += srcArr[offset + c];
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+            else if (axis == 1)
+            {
+                // Sum along cols → output [rows, 1] or [rows]
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var rArr = (float[])(object)fastResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    float sum = 0;
+                    int offset = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sum += srcArr[offset + c];
+                    rArr[r] = sum;
+                }
+                DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { normalizedAxes.ToArray(), keepDims });
+                return fastResult;
+            }
+        }
+
         // Calculate output shape
         var outputShape = new List<int>();
         for (int i = 0; i < tensor.Rank; i++)
