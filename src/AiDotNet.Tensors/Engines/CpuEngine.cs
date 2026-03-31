@@ -2840,7 +2840,7 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a._shape);
+        var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -2917,7 +2917,7 @@ public class CpuEngine : ITensorLevelEngine
             return TensorBroadcastMultiply(a, b);
         }
 
-        var result = TensorAllocator.Rent<T>(a._shape);
+        var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -3365,7 +3365,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>(tensor._shape);
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
 
         if (tensor.IsContiguous)
         {

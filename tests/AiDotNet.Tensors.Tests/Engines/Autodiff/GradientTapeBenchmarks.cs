@@ -403,7 +403,20 @@ public class GradientTapeBenchmarks
         sw.Stop();
         _output.WriteLine($"  4. Forward only (with tape): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
 
-        // 5. Full forward+backward with scalar loss
+        // 5. Backward-only timing
+        {
+            using var tape = new GradientTape<float>();
+            var h5 = _engine.TensorMatMul(x, w);
+            var o5 = _engine.TensorBroadcastAdd(h5, bias);
+            var l5 = _engine.TensorMSELoss(o5, target);
+            _output.WriteLine($"  5. Tape entries: {tape.EntryCount}");
+            sw.Restart();
+            tape.ComputeGradients(l5, sources: new[] { w, bias });
+            sw.Stop();
+            _output.WriteLine($"  5b. ComputeGradients only: {sw.Elapsed.TotalMilliseconds:F3}ms");
+        }
+
+        // 6. Full forward+backward with scalar loss
         sw.Restart();
         for (int i = 0; i < iterations; i++)
         {
