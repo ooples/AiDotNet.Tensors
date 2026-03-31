@@ -101,6 +101,17 @@ public abstract class TensorBase<T> : IDisposable
     public bool IsGpuResident => _device != TensorDevice.CPU;
 
     /// <summary>
+    /// Gets the full device info including device index for multi-GPU scenarios.
+    /// Equivalent to PyTorch's <c>tensor.device</c> which returns e.g. <c>device(type='cuda', index=0)</c>.
+    /// </summary>
+    public DeviceInfo DeviceInfo => new DeviceInfo(Device, _gpuDeviceIndex);
+
+    /// <summary>
+    /// The device index for multi-GPU scenarios (0 = first GPU, 1 = second, etc.).
+    /// </summary>
+    internal int _gpuDeviceIndex;
+
+    /// <summary>
     /// Monotonically increasing version counter. Incremented by in-place mutation operations.
     /// Used by GradientTape to detect when a recorded tensor has been mutated after recording,
     /// which would produce incorrect gradients during the backward pass.

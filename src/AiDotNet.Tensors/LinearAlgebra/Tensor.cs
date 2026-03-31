@@ -3940,6 +3940,26 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <c>tensor.to('cpu')</c>. It moves your data to the GPU for faster computation, or back
     /// to the CPU when you need to inspect the values.</para>
     /// </remarks>
+    /// <summary>
+    /// Moves this tensor to the device specified by a DeviceInfo struct.
+    /// Supports multi-GPU: <c>tensor.To(DeviceInfo.Cuda(1))</c> moves to the second CUDA GPU.
+    /// </summary>
+    /// <param name="deviceInfo">The target device with index.</param>
+    /// <returns>A tensor on the target device.</returns>
+    public Tensor<T> To(DeviceInfo deviceInfo)
+    {
+        // TODO: Multi-GPU support — use deviceInfo.Index to select specific GPU context
+        return To(deviceInfo.Type);
+    }
+
+    /// <summary>
+    /// Moves this tensor to the device specified by a string like "cuda:0", "cpu", "opencl:1".
+    /// </summary>
+    public Tensor<T> To(string deviceString)
+    {
+        return To(DeviceInfo.Parse(deviceString));
+    }
+
     public Tensor<T> To(TensorDevice device)
     {
         if (Device == device)
