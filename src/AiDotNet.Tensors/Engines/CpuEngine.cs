@@ -6131,7 +6131,7 @@ public class CpuEngine : ITensorLevelEngine
     /// Uses parallel SIMD for large float tensors, oneDNN when available.
     /// </summary>
 #if !NETFRAMEWORK
-    public unsafe void ReLUInPlace<T>(Tensor<T> tensor)
+    public virtual unsafe void ReLUInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6166,7 +6166,7 @@ public class CpuEngine : ITensorLevelEngine
         if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensor, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
-    public void ReLUInPlace<T>(Tensor<T> tensor)
+    public virtual void ReLUInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
