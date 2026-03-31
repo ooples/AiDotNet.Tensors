@@ -1098,7 +1098,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferB = AllocateOutputBuffer(backend, input.Length);
         try
         {
-            op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+            // AutocastScope: convert to fp16 for compute, back to fp32 for output
+            var fp16Input = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, input.Length);
+            if (fp16Input is not null)
+            {
+                using var fp16Output = AllocateOutputBuffer(backend, input.Length);
+                op(backend, fp16Input, fp16Output.Buffer, input.Length);
+                // Convert output back to fp32
+                backend.ConvertToFp32(fp16Output.Buffer, bufferB.Buffer, input.Length);
+                fp16Input.Dispose();
+            }
+            else
+            {
+                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+            }
             return FinishGpuOp<T>(backend, bufferB, input.Length);
         }
         catch
@@ -1123,7 +1136,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufferC = AllocateOutputBuffer(backend, left.Length);
         try
         {
-            op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            var fp16A = Gpu.AutocastScope.MaybeConvertInput(backend, bufferA.Buffer, left.Length);
+            var fp16B = Gpu.AutocastScope.MaybeConvertInput(backend, bufferB.Buffer, left.Length);
+            if (fp16A is not null && fp16B is not null)
+            {
+                using var fp16Out = AllocateOutputBuffer(backend, left.Length);
+                op(backend, fp16A, fp16B, fp16Out.Buffer, left.Length);
+                backend.ConvertToFp32(fp16Out.Buffer, bufferC.Buffer, left.Length);
+                fp16A.Dispose();
+                fp16B.Dispose();
+            }
+            else
+            {
+                fp16A?.Dispose();
+                fp16B?.Dispose();
+                op(backend, bufferA.Buffer, bufferB.Buffer, bufferC.Buffer, left.Length);
+            }
             return FinishGpuOp<T>(backend, bufferC, left.Length);
         }
         catch
