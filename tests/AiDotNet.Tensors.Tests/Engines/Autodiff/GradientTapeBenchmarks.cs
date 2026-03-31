@@ -239,6 +239,89 @@ public class GradientTapeBenchmarks
     }
 
     [Fact(Skip = "Benchmark — run manually, not in CI")]
+    public void Profile_ReLUBackward_Breakdown()
+    {
+        // Profile each component of ReLU backward to find the bottleneck
+        int size = 1_000_000;
+        var input = Tensor<float>.CreateRandom([size]);
+        var gradOutput = Tensor<float>.CreateRandom([size]);
+        int iterations = 50;
+
+        // Warmup
+        for (int w = 0; w < 5; w++) _engine.ReluBackward(gradOutput, input);
+
+        // 1. Measure raw SIMD kernel via engine
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iterations; i++)
+            _engine.ReluBackward(gradOutput, input);
+        sw.Stop();
+        _output.WriteLine($"1. engine.ReluBackward (SIMD+alloc): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 2. Measure Tensor creation (new Tensor<float> with shape)
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+        {
+            var t = new Tensor<float>(new float[size], [size]);
+        }
+        sw.Stop();
+        _output.WriteLine($"2. new Tensor<float>(float[1M]): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 3. Measure raw array allocation
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+        {
+            var arr = new float[size];
+        }
+        sw.Stop();
+        _output.WriteLine($"3. new float[1M] allocation: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 4. Measure raw SIMD kernel only (pointer-based, no Tensor overhead)
+        unsafe
+        {
+            var gArr = gradOutput.GetFlattenedData();
+            var iArr = input.GetFlattenedData();
+            var oArr = new float[size];
+            // Warmup
+            fixed (float* gp = gArr, ip = iArr, op = oArr)
+                AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardUnsafe(gp, ip, op, size);
+
+            sw.Restart();
+            for (int i = 0; i < iterations; i++)
+            {
+                fixed (float* gp = gArr, ip = iArr, op = oArr)
+                    AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardUnsafe(gp, ip, op, size);
+            }
+            sw.Stop();
+            _output.WriteLine($"4. SimdKernels.ReluBackwardUnsafe (raw SIMD): {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+        }
+
+        // 5. Measure tape creation + ReLU forward recording
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+        {
+            using var tape = new GradientTape<float>();
+            var output = _engine.ReLU(input);
+        }
+        sw.Stop();
+        _output.WriteLine($"5. Tape + ReLU forward 1M: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 6. Measure ComputeGradients overhead (seed creation + dict lookup)
+        using (var tape = new GradientTape<float>())
+        {
+            var output = _engine.ReLU(input);
+            var loss = _engine.TensorMeanDiff(output);
+            sw.Restart();
+            tape.ComputeGradients(loss, sources: new[] { input });
+            sw.Stop();
+            _output.WriteLine($"6. ComputeGradients (1 op): {sw.Elapsed.TotalMilliseconds:F3}ms");
+        }
+
+        // 7. Check AVX2 support
+        _output.WriteLine($"7. System.Runtime.Intrinsics.X86.Avx2.IsSupported: {System.Runtime.Intrinsics.X86.Avx2.IsSupported}");
+        _output.WriteLine($"   System.Runtime.Intrinsics.X86.Avx.IsSupported: {System.Runtime.Intrinsics.X86.Avx.IsSupported}");
+    }
+
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_MatMulBackward_VsPyTorch()
     {
         // Target: < 1.80ms (1.17x faster than PyTorch's ~2.10ms)
