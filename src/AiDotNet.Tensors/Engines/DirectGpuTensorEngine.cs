@@ -3583,7 +3583,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated 2D max pooling operation.
     /// Uses GPU kernels for efficient parallel computation of maximum values within pooling windows.
     /// </summary>
-    public new Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public override Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (stride == 0) stride = poolSize;
 
@@ -3771,7 +3771,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated 2D average pooling operation.
     /// Uses GPU kernels for efficient parallel computation of average values within pooling windows.
     /// </summary>
-    public new Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (stride == 0) stride = poolSize;
 
@@ -9105,7 +9105,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated ReduceMean operation.
     /// </summary>
-    public new Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
+    public override Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         var safeAxes = axes ?? Array.Empty<int>();
         if (!TryGetBackend(out var backend))
@@ -9173,7 +9173,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated ReduceSum operation.
     /// </summary>
-    public new Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
+    public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         if (!TryGetBackend(out var backend))
             return base.ReduceSum(tensor, axes, keepDims);
@@ -9355,7 +9355,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated TensorBroadcastMultiply operation.
     /// Performs element-wise multiplication with NumPy-style broadcasting.
     /// </summary>
-    public new Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
+    public override Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             return base.TensorBroadcastMultiply(a, b);
@@ -12462,6 +12462,391 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return base.Fold(input, outputSize, kernelSize, stride, padding);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated non-Tensor-prefix activations
+    // (ensures GPU dispatch when callers use engine.Sigmoid() directly)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> Sigmoid<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Sigmoid", output, tensor,
+                    Autodiff.BackwardFunctions<T>.SigmoidBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.Sigmoid(tensor);
+    }
+
+    public override Tensor<T> ReLU<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Relu(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("ReLU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.ReLUBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.ReLU(tensor);
+    }
+
+    public override Tensor<T> GELU<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Gelu(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("GELU", output, tensor,
+                    Autodiff.BackwardFunctions<T>.GELUBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.GELU(tensor);
+    }
+
+    public override Tensor<T> Mish<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor.GetDataArray(), static (backend, input, output, size) => backend.Mish(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("Mish", output, tensor,
+                    Autodiff.BackwardFunctions<T>.MishBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.Mish(tensor);
+    }
+
+    public override Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
+    {
+        if (!TryGetBackend(out var backend))
+            return base.LeakyReLU(tensor, alpha);
+
+        try
+        {
+            float alphaFloat = ToFloatScalar(alpha);
+            using var bufferA = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            using var bufferB = AllocateOutputBuffer(backend, tensor.Length);
+            backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
+            var result = FinishGpuOp<T>(backend, bufferB, tensor.Length);
+            var gpuOutput = new Tensor<T>(result, tensor.Shape._dims);
+            Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
+                Autodiff.BackwardFunctions<T>.LeakyReLUBackward,
+                savedState: new object[] { (double)alphaFloat });
+            return gpuOutput;
+        }
+        catch (Exception)
+        {
+            return base.LeakyReLU(tensor, alpha);
+        }
+    }
+
+    public override Tensor<T> HardSwish<T>(Tensor<T> input)
+    {
+        try
+        {
+            var result = TryRunUnary(input.GetDataArray(), static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, input.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("HardSwish", output, input,
+                    Autodiff.BackwardFunctions<T>.HardSwishBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.HardSwish(input);
+    }
+
+    // MaxPool2D and AvgPool2D use `public override` earlier in this file.
+    // TensorBroadcastAdd/Sub/Div already have GPU dispatch via IEngine explicit implementations.
+    // TensorBroadcastMultiply uses `public override` earlier in this file.
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated scalar ops and reductions
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        {
+            try
+            {
+                using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+                backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+                return new Tensor<T>(result, tensor.Shape._dims);
+            }
+            catch { }
+        }
+        return base.TensorAddScalar(tensor, scalar);
+    }
+
+    public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
+    {
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+        {
+            try
+            {
+                using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+                backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+                return new Tensor<T>(result, tensor.Shape._dims);
+            }
+            catch { }
+        }
+        return base.TensorSubtractScalar(tensor, scalar);
+    }
+
+    public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
+    {
+        if (typeof(T) == typeof(float) && TryGetBatchBackend(out var bb))
+        {
+            try
+            {
+                using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
+                using var bufOut = bb.AllocateBuffer(tensor.Length);
+                bb.DivScalar(bufIn, bufOut, Convert.ToSingle(scalar), tensor.Length);
+                return new Tensor<T>((T[])(object)bb.DownloadBuffer(bufOut), tensor.Shape.ToArray());
+            }
+            catch { }
+        }
+        return base.TensorDivideScalar(tensor, scalar);
+    }
+
+    public override Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb) || axes.Length != 1)
+            return base.ReduceStd(input, axes, keepDims);
+
+        try
+        {
+            int rank = input.Rank;
+            int axis = axes[0] < 0 ? rank + axes[0] : axes[0];
+            if (axis < 0 || axis >= rank)
+                return base.ReduceStd(input, axes, keepDims);
+
+            int outerSize = 1;
+            for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
+            int reduceSize = input.Shape._dims[axis];
+            int innerSize = 1;
+            for (int i = axis + 1; i < rank; i++) innerSize *= input.Shape._dims[i];
+            int totalOuter = outerSize * innerSize;
+            using var bufIn = bb.AllocateBuffer(((Tensor<float>)(object)input).GetDataArray());
+            using var bufOut = bb.AllocateBuffer(totalOuter);
+            bb.StdAxis(bufIn, bufOut, totalOuter, reduceSize);
+            float[] result = bb.DownloadBuffer(bufOut);
+            int[] outShape;
+            if (keepDims)
+            {
+                outShape = (int[])input.Shape._dims.Clone();
+                outShape[axis] = 1;
+            }
+            else
+            {
+                outShape = new int[rank - 1];
+                for (int i = 0, j = 0; i < rank; i++)
+                    if (i != axis) outShape[j++] = input.Shape._dims[i];
+            }
+            return new Tensor<T>((T[])(object)result, outShape);
+        }
+        catch (Exception)
+        {
+            return base.ReduceStd(input, axes, keepDims);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated remaining activations (RReLU) and indexing (IndexSelect, MaskedFill)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower, double upper, bool training)
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+            return base.TensorRReLU(tensor, lower, upper, training);
+
+        try
+        {
+            // Generate noise buffer for RReLU
+            float lowerF = (float)lower, upperF = (float)upper;
+            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            using var bufNoise = AllocateOutputBuffer(backend, tensor.Length);
+            using var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            if (training)
+            {
+                backend.GenerateRandomUniform(bufNoise.Buffer, tensor.Length, lowerF, upperF, (ulong)Environment.TickCount);
+            }
+            else
+            {
+                float mid = (lowerF + upperF) / 2f;
+                backend.Fill(bufNoise.Buffer, mid, tensor.Length);
+            }
+            backend.RRelu(bufIn.Buffer, bufNoise.Buffer, bufOut.Buffer, tensor.Length);
+            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            var output = new Tensor<T>(result, tensor.Shape._dims);
+            Autodiff.DifferentiableOps.RecordUnary("RReLU", output, tensor,
+                Autodiff.BackwardFunctions<T>.RReLUBackward,
+                new object[] { lower, upper, training, new Tensor<T>(FinishGpuOp<T>(backend, bufNoise, tensor.Length), tensor.Shape._dims) });
+            return output;
+        }
+        catch (Exception)
+        {
+            return base.TensorRReLU(tensor, lower, upper, training);
+        }
+    }
+
+    public override Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBatchBackend(out var bb) || axis != 0)
+            return base.TensorIndexSelect(tensor, indices, axis);
+
+        try
+        {
+            int numIndices = indices.Length;
+            int innerSize = tensor.Rank >= 2 ? tensor.Length / tensor.Shape._dims[0] : 1;
+            using var bufSrc = bb.AllocateBuffer(((Tensor<float>)(object)tensor).GetDataArray());
+            using var bufIdx = bb.AllocateIntBuffer(indices.GetDataArray());
+            using var bufOut = bb.AllocateBuffer(numIndices * innerSize);
+            bb.IndexSelect(bufSrc, bufIdx, bufOut, numIndices, innerSize);
+            float[] resultFloat = bb.DownloadBuffer(bufOut);
+            int[] outShape = tensor.Rank >= 2
+                ? new[] { numIndices }.Concat(tensor.Shape._dims.Skip(1)).ToArray()
+                : new[] { numIndices };
+            var output = new Tensor<T>((T[])(object)resultFloat, outShape);
+            Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
+                Autodiff.BackwardFunctions<T>.IndexSelectBackward,
+                new object[] { indices, axis, tensor.Shape._dims });
+            return output;
+        }
+        catch (Exception)
+        {
+            return base.TensorIndexSelect(tensor, indices, axis);
+        }
+    }
+
+    public override Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float))
+            return base.TensorMaskedFill(tensor, mask, value);
+
+        try
+        {
+            // Convert bool mask to float (1.0 = true, 0.0 = false) for GPU
+            float[] maskFloat = new float[mask.Length];
+            var maskData = mask.GetDataArray();
+            for (int i = 0; i < mask.Length; i++)
+                maskFloat[i] = maskData[i] ? 1f : 0f;
+
+            using var bufIn = GetOrAllocateBuffer(backend, tensor.GetDataArray());
+            using var bufMask = backend.AllocateBuffer(maskFloat);
+            using var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            backend.MaskedFillKernel(bufIn.Buffer, bufMask, bufOut.Buffer, Convert.ToSingle(value), tensor.Length);
+            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
+            var output = new Tensor<T>(result, tensor.Shape._dims);
+            Autodiff.DifferentiableOps.RecordUnary("MaskedFill", output, tensor,
+                Autodiff.BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
+            return output;
+        }
+        catch (Exception)
+        {
+            return base.TensorMaskedFill(tensor, mask, value);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated shape ops with data movement (Concatenate, Split, Stack, Tile, Slice, LogSumExp)
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
+    {
+        // Delegate to IEngine explicit implementation which already has GPU dispatch
+        return ((IEngine)this).TensorConcatenate(tensors, axis);
+    }
+
+    public override Tensor<T> TensorStack<T>(Tensor<T>[] tensors, int axis)
+    {
+        return ((IEngine)this).TensorStack(tensors, axis);
+    }
+
+    public override Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
+    {
+        return ((IEngine)this).TensorTile(tensor, multiples);
+    }
+
+    public override Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
+    {
+        return ((IEngine)this).TensorSlice(tensor, start, length);
+    }
+
+    public override Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims)
+    {
+        return ((IEngine)this).TensorLogSumExp(tensor, axis, keepDims);
+    }
+
+    // ReduceSum and ReduceMean already have GPU dispatch via IEngine explicit implementations.
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated AdaptiveMaxPool2D
+    // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4)
+            return base.TensorAdaptiveMaxPool2D(input, outputSize);
+
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int inH = input.Shape._dims[2], inW = input.Shape._dims[3];
+            int outH = outputSize[0], outW = outputSize[1];
+            // For 1x1 output, use GlobalMaxPool2D
+            if (outH == 1 && outW == 1)
+            {
+                using var bufIn = GetOrAllocateBuffer(backend, input.GetDataArray());
+                using var bufOut = AllocateOutputBuffer(backend, batch * channels);
+                backend.GlobalMaxPool2D(bufIn.Buffer, bufOut.Buffer, batch, channels, inH, inW);
+                var result = FinishGpuOp<T>(backend, bufOut, batch * channels);
+                return new Tensor<T>(result, new[] { batch, channels, 1, 1 });
+            }
+            return base.TensorAdaptiveMaxPool2D(input, outputSize);
+        }
+        catch (Exception)
+        {
+            return base.TensorAdaptiveMaxPool2D(input, outputSize);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GPU-accelerated ReLUInPlace
+    // ──────────────────────────────────────────────────────────────
+
+    public override void ReLUInPlace<T>(Tensor<T> tensor)
+    {
+        if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
+            return;
+        base.ReLUInPlace(tensor);
     }
 
     // --- Scalar reductions ---
