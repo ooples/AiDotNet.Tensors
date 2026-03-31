@@ -354,21 +354,36 @@ public class GradientTapeBenchmarks
         var x = Tensor<float>.CreateRandom([32, 256]);
         var w = Tensor<float>.CreateRandom([256, 128]);
         var bias = Tensor<float>.CreateRandom([1, 128]);
-        for (int warm = 0; warm < 3; warm++)
+        var target = Tensor<float>.CreateRandom([32, 128]);
+        for (int warm = 0; warm < 5; warm++)
         {
             using var warmTape = new GradientTape<float>();
             var h = _engine.TensorMatMul(x, w);
             var output = _engine.TensorBroadcastAdd(h, bias);
-            warmTape.ComputeGradients(output, sources: new[] { w, bias });
+            var loss = _engine.TensorMSELoss(output, target);
+            warmTape.ComputeGradients(loss, sources: new[] { w, bias });
         }
+
+        // Profile each component
         var sw = Stopwatch.StartNew();
         int iterations = 50;
+
+        // 1. MatMul forward only
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+            _engine.TensorMatMul(x, w);
+        sw.Stop();
+        _output.WriteLine($"  MatMul forward 32x256 @ 256x128: {sw.Elapsed.TotalMilliseconds / iterations:F3}ms");
+
+        // 2. Full forward+backward with scalar loss
+        sw.Restart();
         for (int i = 0; i < iterations; i++)
         {
             using var tape = new GradientTape<float>();
             var h = _engine.TensorMatMul(x, w);
             var output = _engine.TensorBroadcastAdd(h, bias);
-            tape.ComputeGradients(output, sources: new[] { w, bias });
+            var loss = _engine.TensorMSELoss(output, target);
+            tape.ComputeGradients(loss, sources: new[] { w, bias });
         }
         sw.Stop();
         double msPerOp = sw.Elapsed.TotalMilliseconds / iterations;

@@ -20559,7 +20559,8 @@ public class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         int length = gradOutput.Length;
 
-        var resultTensor = TensorAllocator.Rent<T>(gradOutput._shape);
+        // Use RentUninitialized — backward kernel writes every element
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
 
         if (typeof(T) == typeof(float))
         {
