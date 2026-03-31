@@ -1314,8 +1314,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int dim = (int)savedState[0];
-        int[] indices = (int[])savedState[1];
+        int[] indices = (int[])savedState[0];
+        int dim = (int)savedState[1];
         var inShape = inputs[0].Shape.ToArray();
         var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
 
@@ -1418,7 +1418,8 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var inShape = inputs[0].Shape.ToArray();
         int h = inShape[^2], w = inShape[^1];
-        int outH = (int)savedState[0], outW = (int)savedState[1];
+        var goShape = gradOutput.Shape.ToArray();
+        int outH = goShape[^2], outW = goShape[^1];
         int batchChannels = 1;
         for (int i = 0; i < inShape.Length - 2; i++) batchChannels *= inShape[i];
 
@@ -1426,13 +1427,16 @@ internal static class BackwardFunctions<T>
         for (int bc = 0; bc < batchChannels; bc++)
         for (int oy = 0; oy < outH; oy++)
         {
-            double srcY = (double)oy * (h - 1) / Math.Max(outH - 1, 1);
-            int y0 = (int)Math.Floor(srcY), y1 = Math.Min(y0 + 1, h - 1);
+            // Match forward's coordinate mapping: (oy + 0.5) * h / outH - 0.5
+            double srcY = (oy + 0.5) * h / outH - 0.5;
+            int y0 = Math.Max(0, (int)Math.Floor(srcY));
+            int y1 = Math.Min(y0 + 1, h - 1);
             double fy = srcY - y0;
             for (int ox = 0; ox < outW; ox++)
             {
-                double srcX = (double)ox * (w - 1) / Math.Max(outW - 1, 1);
-                int x0 = (int)Math.Floor(srcX), x1 = Math.Min(x0 + 1, w - 1);
+                double srcX = (ox + 0.5) * w / outW - 0.5;
+                int x0 = Math.Max(0, (int)Math.Floor(srcX));
+                int x1 = Math.Min(x0 + 1, w - 1);
                 double fx = srcX - x0;
                 double g = numOps.ToDouble(gradOutput[bc * outH * outW + oy * outW + ox]);
                 int baseIdx = bc * h * w;

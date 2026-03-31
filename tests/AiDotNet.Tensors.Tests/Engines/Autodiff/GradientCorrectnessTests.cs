@@ -809,6 +809,58 @@ public class GradientCorrectnessTests
     }
 
     [Fact]
+    public void Stack_Gradient_MatchesNumerical()
+    {
+        var a = new Tensor<float>(new float[] { 1f, 2f, 3f }, [3]);
+        var b = new Tensor<float>(new float[] { 4f, 5f, 6f }, [3]);
+        // Test gradient w.r.t. first tensor in stack
+        VerifyGradient(inp =>
+        {
+            var stacked = _engine.TensorStackDiff(new[] { inp, b }, axis: 0);
+            // Reduce to scalar for gradient
+            return _engine.TensorMeanDiff(stacked);
+        }, a, "Stack");
+    }
+
+    [Fact]
+    public void ConstantPad_Gradient_MatchesNumerical()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [2, 2]);
+        VerifyGradient(inp => _engine.TensorConstantPad(inp, new[] { 1, 1, 1, 1 }, 0f), x, "ConstantPad");
+    }
+
+    [Fact]
+    public void IndexSelect_Gradient_MatchesNumerical()
+    {
+        // 2D tensor, select rows 0 and 2 along axis 0
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [3, 2]);
+        var indices = new Tensor<int>(new int[] { 0, 2 }, [2]);
+        VerifyGradient(inp => _engine.TensorIndexSelectDiff(inp, indices, 0), x, "IndexSelect");
+    }
+
+    [Fact]
+    public void AdaptiveMaxPool2D_Gradient_MatchesNumerical()
+    {
+        // [N=1, C=1, H=4, W=4] -> [1, 1, 2, 2]
+        var x = new Tensor<float>(new float[]
+        {
+            1f, 3f, 2f, 4f,
+            5f, 7f, 6f, 8f,
+            9f, 11f, 10f, 12f,
+            13f, 15f, 14f, 16f
+        }, [1, 1, 4, 4]);
+        VerifyGradient(inp => _engine.TensorAdaptiveMaxPool2D(inp, new[] { 2, 2 }), x, "AdaptiveMaxPool2D");
+    }
+
+    [Fact]
+    public void UpsampleBilinear_Gradient_MatchesNumerical()
+    {
+        // [N=1, C=1, H=2, W=2] -> [1, 1, 4, 4]
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, [1, 1, 2, 2]);
+        VerifyGradient(inp => _engine.TensorUpsampleBilinear(inp, new[] { 4, 4 }), x, "UpsampleBilinear");
+    }
+
+    [Fact]
     public void Integration_CompiledBackward_MatchesUncompiled()
     {
         // Compare compiled vs uncompiled backward
