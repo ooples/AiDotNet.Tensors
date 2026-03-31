@@ -32,11 +32,22 @@ internal static class BlasProvider
     /// across runs due to parallel reduction ordering. Single-threaded mode guarantees
     /// bit-identical results for the same input.
     /// </summary>
+    private static bool _deterministicMode;
+
     public static void SetDeterministicMode(bool deterministic)
     {
         lock (InitLock)
         {
+            _deterministicMode = deterministic;
             ThreadCountOverride = deterministic ? 1 : ReadEnvInt("AIDOTNET_BLAS_THREADS");
+            if (deterministic)
+            {
+                // Disable MKL.NET managed bindings: MKL's multi-threaded GEMM produces
+                // non-deterministic results from parallel reduction ordering, and we cannot
+                // reliably set MKL's internal thread count via the managed API.
+                // Falls back to deterministic sequential MultiplyMatrixBlocked.
+                _useMklNet = false;
+            }
             if (_initialized)
             {
                 ApplyThreadSettings();
@@ -316,6 +327,10 @@ internal static class BlasProvider
         return true;
     }
 
+    /// <summary>
+    /// Sets MKL.NET thread count for deterministic GEMM.
+    /// Separated to prevent JIT from loading MKL.NET types when not available.
+    /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
         if (!EnsureInitialized())
@@ -427,6 +442,10 @@ internal static class BlasProvider
         }
 
         // Try MKL.NET first (preferred for best performance)
+        // Skip MKL.NET in deterministic mode: MKL's multi-threaded GEMM produces
+        // non-deterministic results from parallel reduction ordering.
+        if (!_deterministicMode)
+        {
         // Wrapped in try-catch because on net471, the JIT may throw FileNotFoundException
         // when trying to resolve the MKL.NET assembly before entering TryInitializeMklNet's own try-catch
         try
@@ -442,6 +461,7 @@ internal static class BlasProvider
         {
             Trace($"[BLAS] MKL.NET JIT load failed: {ex.GetType().Name}: {ex.Message}");
         }
+        } // end if (!_deterministicMode)
         Trace("[BLAS] MKL.NET not available, trying native libraries...");
 
         string? explicitPath = Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PATH");
