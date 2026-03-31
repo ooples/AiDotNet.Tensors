@@ -548,6 +548,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // Fast path: tensor already has a GPU buffer from a previous GPU operation.
+        // This is the PyTorch-like path — no cache lookup, no CPU materialization.
+        if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
+        {
+            return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+        }
+
         // Get the backing array reference WITHOUT triggering materialization.
         // This is critical: GetDataArray() would download from GPU, which is wasteful
         // when we're about to find the GPU buffer in the activation cache.
@@ -882,6 +889,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         //   result1 = sigmoid(x)     → GPU kernel, buffer cached, no download
         //   result2 = relu(result1)  → buffer found in cache, no upload, no download
         //   value = result2[0]       → first CPU access triggers download
+        // TODO: When GpuTensor<T> integration is complete (Task #15), this allocation
+        // goes away entirely — GpuTensor has no CPU array until explicitly requested.
+        // For now, the cache-first GetOrAllocateBuffer(Tensor<T>) ensures this array
+        // is never read during chained GPU operations.
         var result = new T[elementCount];
         CacheActivation(result, outputBuffer.Buffer, new[] { elementCount }, backend);
         _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer.Buffer, backend, elementCount));
@@ -924,6 +935,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
 
         var tensor = new Tensor<T>(result, shape);
+        tensor._gpuBuffer = outputBuffer;
+        tensor._gpuBackend = backend;
         tensor._device = backend.BackendName?.ToUpperInvariant() switch
         {
             "CUDA" or "NVIDIA" => TensorDevice.CUDA,

@@ -59,6 +59,19 @@ public abstract class TensorBase<T> : IDisposable
     internal TensorDevice _device = TensorDevice.CPU;
 
     /// <summary>
+    /// Optional GPU buffer reference for GPU-resident tensors.
+    /// When non-null, this tensor's authoritative data is on the GPU — the CPU-side
+    /// _data array may be empty/stale until explicitly synchronized.
+    /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
+    /// </summary>
+    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
+
+    /// <summary>
+    /// Backend that owns the GPU buffer. Required for downloading data to CPU.
+    /// </summary>
+    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
+
+    /// <summary>
     /// Gets or sets the device where this tensor's data resides.
     /// </summary>
     /// <remarks>
