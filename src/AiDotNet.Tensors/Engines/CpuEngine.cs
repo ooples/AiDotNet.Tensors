@@ -3847,6 +3847,22 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public Tensor<T> TensorRound<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
+        // Round uses straight-through estimator (same as PyTorch) for gradient
+        DifferentiableOps.RecordUnary("Round", result, tensor,
+            BackwardFunctions<T>.StraightThroughBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorFrac<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -4119,6 +4135,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.GreaterThan(aVal, bVal) ? aVal : bVal;
         }
 
+        DifferentiableOps.RecordBinary("TensorMax", result, a, b, BackwardFunctions<T>.MaxBackward);
         return result;
     }
 
@@ -4165,6 +4182,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.LessThan(aVal, bVal) ? aVal : bVal;
         }
 
+        DifferentiableOps.RecordBinary("TensorMin", result, a, b, BackwardFunctions<T>.MinBackward);
         return result;
     }
 
