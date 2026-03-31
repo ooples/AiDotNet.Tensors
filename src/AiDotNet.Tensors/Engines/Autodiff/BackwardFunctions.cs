@@ -1116,7 +1116,7 @@ internal static class BackwardFunctions<T>
         int batch = inShape[0], channels = inShape[1], inH = inShape[2], inW = inShape[3];
         int outH = (int)savedState[0], outW = (int)savedState[1];
 
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
         for (int c = 0; c < channels; c++)
         for (int oh = 0; oh < outH; oh++)
@@ -1151,7 +1151,7 @@ internal static class BackwardFunctions<T>
         var outShape = gradOutput.Shape.ToArray();
         int totalOut = gradOutput.Length;
 
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int flat = 0; flat < totalOut; flat++)
         {
             int remaining = flat;
@@ -1234,7 +1234,7 @@ internal static class BackwardFunctions<T>
         int start = (int)savedState[1];
         int length = (int)savedState[2];
         var inShape = inputs[0].Shape.ToArray();
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
 
         int outerSize = 1, innerSize = 1;
         int dimSize = inShape[dim];
@@ -1317,7 +1317,7 @@ internal static class BackwardFunctions<T>
         int[] indices = (int[])savedState[0];
         int dim = (int)savedState[1];
         var inShape = inputs[0].Shape.ToArray();
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
 
         int outerSize = 1, innerSize = 1;
         int dimSize = inShape[dim];
@@ -1423,7 +1423,7 @@ internal static class BackwardFunctions<T>
         int batchChannels = 1;
         for (int i = 0; i < inShape.Length - 2; i++) batchChannels *= inShape[i];
 
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int bc = 0; bc < batchChannels; bc++)
         for (int oy = 0; oy < outH; oy++)
         {
@@ -1456,7 +1456,7 @@ internal static class BackwardFunctions<T>
     {
         int[] padding = (int[])savedState[0];
         var inShape = inputs[0].Shape.ToArray();
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
         var outShape = gradOutput.Shape.ToArray();
 
         int totalSrc = inputs[0].Length;
@@ -1560,7 +1560,7 @@ internal static class BackwardFunctions<T>
         int outLength = (length - kernelSize) / stride + 1;
         T scale = numOps.FromDouble(1.0 / kernelSize);
 
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
         for (int c = 0; c < channels; c++)
         for (int o = 0; o < outLength; o++)
@@ -1582,7 +1582,7 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
         var inShape = inputs[0].Shape.ToArray();
-        var inputGrad = new Tensor<T>(new T[inputs[0].Length], inShape);
+        var inputGrad = TensorPool<T>.RentZeroed(inShape);
 
         for (int i = 0; i < gradOutput.Length; i++)
         {

@@ -6581,6 +6581,76 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        /// <summary>BatchNorm backward for double.</summary>
+        public static unsafe void BatchNormBackwardDouble(
+            double* gradOutput, double* input, double* gamma,
+            double* mean, double* variance, double epsilon,
+            double* gradInput, double* gradGamma, double* gradBeta,
+            int batchSize, int channels, int spatialSize)
+        {
+            int totalPerChannel = batchSize * spatialSize;
+            double invN = 1.0 / totalPerChannel;
+            for (int c = 0; c < channels; c++)
+            {
+                double m = mean[c];
+                double invStd = 1.0 / Math.Sqrt(variance[c] + epsilon);
+                double gGamma = 0, gBeta = 0, sumGradXhat = 0, sumGrad = 0;
+                for (int b = 0; b < batchSize; b++)
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        double go = gradOutput[idx];
+                        double xhat = (input[idx] - m) * invStd;
+                        gGamma += go * xhat; gBeta += go;
+                        sumGradXhat += go * xhat; sumGrad += go;
+                    }
+                gradGamma[c] = gGamma; gradBeta[c] = gBeta;
+                double g = gamma[c];
+                for (int b = 0; b < batchSize; b++)
+                    for (int s = 0; s < spatialSize; s++)
+                    {
+                        int idx = (b * channels + c) * spatialSize + s;
+                        double xhat = (input[idx] - m) * invStd;
+                        gradInput[idx] = g * invStd * (gradOutput[idx] - invN * (sumGrad + xhat * sumGradXhat));
+                    }
+            }
+        }
+
+        /// <summary>LayerNorm backward for double.</summary>
+        public static unsafe void LayerNormBackwardDouble(
+            double* gradOutput, double* input, double* gamma,
+            double* mean, double* variance, double epsilon,
+            double* gradInput, double* gradGamma, double* gradBeta,
+            int batchSize, int normSize)
+        {
+            for (int i = 0; i < normSize; i++) { gradGamma[i] = 0; gradBeta[i] = 0; }
+            for (int b = 0; b < batchSize; b++)
+            {
+                int offset = b * normSize;
+                double m = mean[b];
+                double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
+                for (int i = 0; i < normSize; i++)
+                {
+                    double xhat = (input[offset + i] - m) * invStd;
+                    gradGamma[i] += gradOutput[offset + i] * xhat;
+                    gradBeta[i] += gradOutput[offset + i];
+                }
+                double ds = 0, db = 0;
+                for (int i = 0; i < normSize; i++)
+                {
+                    double go = gradOutput[offset + i] * gamma[i];
+                    double xhat = (input[offset + i] - m) * invStd;
+                    ds += go * xhat; db += go;
+                }
+                double invN = 1.0 / normSize;
+                for (int i = 0; i < normSize; i++)
+                {
+                    double xhat = (input[offset + i] - m) * invStd;
+                    gradInput[offset + i] = invStd * (gradOutput[offset + i] * gamma[i] - invN * (db + xhat * ds));
+                }
+            }
+        }
+
         // ──────────────────────────────────────────────────────────────
         // Half precision backward kernels (compute in FP32, store in FP16)
         // Uses convert-compute-convert pattern: Half→float, run float SIMD, float→Half
@@ -6734,6 +6804,57 @@ namespace AiDotNet.Tensors.Engines.Simd
             ConvertToSingle(input, inf);
             unsafe { fixed (float* gp = gf, ip = inf, op = outf) SoftplusBackwardUnsafe(gp, ip, op, len, beta); }
             ConvertToHalf(outf, output);
+        }
+
+        /// <summary>Softmax backward for Half via FP32 conversion.</summary>
+        public static void SoftmaxBackwardHalf(ReadOnlySpan<Half> grad, ReadOnlySpan<Half> softmaxOutput, Span<Half> output, int batchSize, int features)
+        {
+            var gf = new float[grad.Length]; var sf = new float[softmaxOutput.Length]; var outf = new float[output.Length];
+            ConvertToSingle(grad, gf); ConvertToSingle(softmaxOutput, sf);
+            unsafe { fixed (float* gp = gf, sp = sf, op = outf) SoftmaxBackwardUnsafe(gp, sp, op, batchSize, features); }
+            ConvertToHalf(outf, output);
+        }
+
+        /// <summary>BatchNorm backward for Half via FP32 conversion.</summary>
+        public static void BatchNormBackwardHalf(
+            ReadOnlySpan<Half> gradOutput, ReadOnlySpan<Half> input, ReadOnlySpan<Half> gamma,
+            ReadOnlySpan<Half> mean, ReadOnlySpan<Half> variance, float epsilon,
+            Span<Half> gradInput, Span<Half> gradGamma, Span<Half> gradBeta,
+            int batchSize, int channels, int spatialSize)
+        {
+            int totalLen = gradOutput.Length;
+            var gof = new float[totalLen]; var inf = new float[totalLen]; var gaf = new float[channels];
+            var mf = new float[channels]; var vf = new float[channels]; var gif = new float[totalLen];
+            var ggf = new float[channels]; var gbf = new float[channels];
+            ConvertToSingle(gradOutput, gof); ConvertToSingle(input, inf); ConvertToSingle(gamma, gaf);
+            ConvertToSingle(mean, mf); ConvertToSingle(variance, vf);
+            unsafe
+            {
+                fixed (float* gop = gof, ip = inf, gap = gaf, mp = mf, vp = vf, gip = gif, ggp = ggf, gbp = gbf)
+                    BatchNormBackwardUnsafe(gop, ip, gap, mp, vp, epsilon, gip, ggp, gbp, batchSize, channels, spatialSize);
+            }
+            ConvertToHalf(gif, gradInput); ConvertToHalf(ggf, gradGamma); ConvertToHalf(gbf, gradBeta);
+        }
+
+        /// <summary>LayerNorm backward for Half via FP32 conversion.</summary>
+        public static void LayerNormBackwardHalf(
+            ReadOnlySpan<Half> gradOutput, ReadOnlySpan<Half> input, ReadOnlySpan<Half> gamma,
+            ReadOnlySpan<Half> mean, ReadOnlySpan<Half> variance, float epsilon,
+            Span<Half> gradInput, Span<Half> gradGamma, Span<Half> gradBeta,
+            int batchSize, int normSize)
+        {
+            int totalLen = gradOutput.Length;
+            var gof = new float[totalLen]; var inf = new float[totalLen]; var gaf = new float[normSize];
+            var mf = new float[batchSize]; var vf = new float[batchSize]; var gif = new float[totalLen];
+            var ggf = new float[normSize]; var gbf = new float[normSize];
+            ConvertToSingle(gradOutput, gof); ConvertToSingle(input, inf); ConvertToSingle(gamma, gaf);
+            ConvertToSingle(mean, mf); ConvertToSingle(variance, vf);
+            unsafe
+            {
+                fixed (float* gop = gof, ip = inf, gap = gaf, mp = mf, vp = vf, gip = gif, ggp = ggf, gbp = gbf)
+                    LayerNormBackwardUnsafe(gop, ip, gap, mp, vp, epsilon, gip, ggp, gbp, batchSize, normSize);
+            }
+            ConvertToHalf(gif, gradInput); ConvertToHalf(ggf, gradGamma); ConvertToHalf(gbf, gradBeta);
         }
 
     #endregion
