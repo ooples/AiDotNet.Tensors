@@ -199,26 +199,43 @@ public class GradientTapeBenchmarks
     public void Benchmark_ReLUBackward_1M_VsPyTorch()
     {
         // Target: < 0.20ms (1.5x faster than PyTorch's ~0.30ms)
+        // Note: uses scalar loss reduction (TensorMeanDiff) like real training,
+        // not the raw 1M-element tensor as loss (which would allocate a 4MB seed gradient)
         var input = Tensor<float>.CreateRandom([1000000]);
         // Warmup
-        for (int w = 0; w < 3; w++)
+        for (int w = 0; w < 5; w++)
         {
             using var warmTape = new GradientTape<float>();
             var warmOut = _engine.ReLU(input);
-            warmTape.ComputeGradients(warmOut, sources: new[] { input });
+            var warmLoss = _engine.TensorMeanDiff(warmOut);
+            warmTape.ComputeGradients(warmLoss, sources: new[] { input });
         }
+
+        // Measure full tape forward + backward with scalar loss
         var sw = Stopwatch.StartNew();
         int iterations = 100;
         for (int i = 0; i < iterations; i++)
         {
             using var tape = new GradientTape<float>();
             var output = _engine.ReLU(input);
-            tape.ComputeGradients(output, sources: new[] { input });
+            var loss = _engine.TensorMeanDiff(output);
+            tape.ComputeGradients(loss, sources: new[] { input });
         }
         sw.Stop();
         double msPerOp = sw.Elapsed.TotalMilliseconds / iterations;
-        _output.WriteLine($"ReLU backward 1M elements: {msPerOp:F3}ms (PyTorch baseline: ~0.30ms, target: <0.20ms)");
+        _output.WriteLine($"ReLU backward 1M (tape + scalar loss): {msPerOp:F3}ms (PyTorch baseline: ~0.30ms, target: <0.20ms)");
         _output.WriteLine($"  Speedup vs PyTorch: {0.30 / msPerOp:F2}x");
+
+        // Also measure the raw SIMD kernel only (no tape overhead)
+        var gradOutput = Tensor<float>.CreateRandom([1000000]);
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+        {
+            _engine.ReluBackward(gradOutput, input);
+        }
+        sw.Stop();
+        double msKernel = sw.Elapsed.TotalMilliseconds / iterations;
+        _output.WriteLine($"ReLU backward 1M (SIMD kernel only): {msKernel:F3}ms");
     }
 
     [Fact(Skip = "Benchmark — run manually, not in CI")]
