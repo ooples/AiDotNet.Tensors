@@ -937,7 +937,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void SinCos<T>(Vector<T> vector, out Vector<T> sinResult, out Vector<T> cosResult)
+    public virtual void SinCos<T>(Vector<T> vector, out Vector<T> sinResult, out Vector<T> cosResult)
     {
         // For now, compute separately (can be optimized later with simultaneous computation)
         sinResult = Sin(vector);
@@ -945,7 +945,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void Sin(ReadOnlySpan<float> x, Span<float> destination)
+    public virtual void Sin(ReadOnlySpan<float> x, Span<float> destination)
     {
         TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorFloat>(x, destination);
     }
@@ -1254,7 +1254,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void Tanh(ReadOnlySpan<float> x, Span<float> destination)
+    public virtual void Tanh(ReadOnlySpan<float> x, Span<float> destination)
     {
         TensorPrimitivesCore.InvokeSpanIntoSpan<TanhOperatorFloat>(x, destination);
     }
@@ -1302,7 +1302,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void Reciprocal(ReadOnlySpan<float> x, Span<float> destination)
+    public virtual void Reciprocal(ReadOnlySpan<float> x, Span<float> destination)
     {
         TensorPrimitivesCore.InvokeSpanIntoSpan<ReciprocalOperatorFloat>(x, destination);
     }
@@ -1887,7 +1887,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Tensor Operations (Phase B: Epic 3)
 
     /// <inheritdoc/>
-    public Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
+    public virtual Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (newShape == null) throw new ArgumentNullException(nameof(newShape));
@@ -1899,7 +1899,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> BatchMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2075,7 +2075,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2195,7 +2195,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2306,7 +2306,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2318,7 +2318,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2331,7 +2331,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2344,7 +2344,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorBroadcastMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2545,7 +2545,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
+    public virtual void LeakyReLUInPlace<T>(Tensor<T> tensor, T alpha)
     {
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -2830,7 +2830,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2907,7 +2907,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -2985,7 +2985,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3097,7 +3097,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3360,7 +3360,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
+    public virtual Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3388,7 +3388,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
+    public virtual unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -3632,7 +3632,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Tensor Element-wise Math Operations
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorLog<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorLog<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3662,7 +3662,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorExp<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3692,7 +3692,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3722,7 +3722,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> TensorAbs<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3752,7 +3752,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorNegate<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorNegate<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3767,7 +3767,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
+    public virtual Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -3786,7 +3786,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorPower<T>(Tensor<T> bases, Tensor<T> exponents)
+    public virtual Tensor<T> TensorPower<T>(Tensor<T> bases, Tensor<T> exponents)
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
@@ -3810,7 +3810,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorFloor<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorFloor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -3829,7 +3829,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorCeiling<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorCeiling<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3843,6 +3843,22 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("Ceiling", result, tensor,
             BackwardFunctions<T>.SignBackward); // zero gradient: ceil is piecewise constant
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorRound<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var src = tensor.AsSpan();
+        var dest = result.AsWritableSpan();
+        for (int i = 0; i < src.Length; i++)
+            dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
+        // Round uses straight-through estimator (same as PyTorch) for gradient
+        DifferentiableOps.RecordUnary("Round", result, tensor,
+            BackwardFunctions<T>.StraightThroughBackward);
         return result;
     }
 
@@ -3865,7 +3881,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSin<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorSin<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -3881,7 +3897,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorCos<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorCos<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -4097,7 +4113,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMax<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorMax<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -4119,6 +4135,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.GreaterThan(aVal, bVal) ? aVal : bVal;
         }
 
+        DifferentiableOps.RecordBinary("TensorMax", result, a, b, BackwardFunctions<T>.MaxBackward);
         return result;
     }
 
@@ -4143,7 +4160,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -4165,6 +4182,7 @@ public class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.LessThan(aVal, bVal) ? aVal : bVal;
         }
 
+        DifferentiableOps.RecordBinary("TensorMin", result, a, b, BackwardFunctions<T>.MinBackward);
         return result;
     }
 
@@ -4189,7 +4207,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
+    public virtual Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -4288,7 +4306,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
+    public virtual Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -4761,7 +4779,7 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
-    public Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public virtual Tensor<T> MaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!input.IsContiguous) input = input.Contiguous();
@@ -4870,7 +4888,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (!input.IsContiguous) input = input.Contiguous();
@@ -4992,7 +5010,7 @@ public class CpuEngine : ITensorLevelEngine
     /// 1D convolution via reshape to Conv2D with height=1.
     /// Input: [batch, in_channels, length], Kernel: [out_channels, in_channels, kernel_length]
     /// </summary>
-    public Tensor<T> Conv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
+    public virtual Tensor<T> Conv1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -5037,7 +5055,7 @@ public class CpuEngine : ITensorLevelEngine
         return Reshape(result4D, kernelShape);
     }
 
-    public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
+    public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -5720,7 +5738,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public unsafe Tensor<T> Sigmoid<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> Sigmoid<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -5880,7 +5898,7 @@ public class CpuEngine : ITensorLevelEngine
     /// Uses oneDNN for float tensors when available, otherwise falls back to SIMD.
     /// </summary>
 #if !NETFRAMEWORK
-    public unsafe void SigmoidInPlace<T>(Tensor<T> tensor)
+    public virtual unsafe void SigmoidInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -5915,7 +5933,7 @@ public class CpuEngine : ITensorLevelEngine
         if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensor, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
-    public void SigmoidInPlace<T>(Tensor<T> tensor)
+    public virtual void SigmoidInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6034,7 +6052,7 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    public unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6256,7 +6274,7 @@ public class CpuEngine : ITensorLevelEngine
         return TensorPrimitivesHelper<T>.ELU(vector, alpha);
     }
 
-    public unsafe Tensor<T> GELU<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> GELU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6302,7 +6320,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public unsafe Tensor<T> Mish<T>(Tensor<T> tensor)
+    public virtual unsafe Tensor<T> Mish<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6347,7 +6365,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> Swish<T>(Tensor<T> tensor)
+    public virtual Tensor<T> Swish<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
@@ -6376,7 +6394,7 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    public Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
+    public virtual Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
         if (!tensor.IsContiguous)
         {
@@ -6410,7 +6428,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
+    public virtual unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (!tensor.IsContiguous)
         {
@@ -6967,7 +6985,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Extended Tensor Operations
 
     /// <inheritdoc/>
-    public Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorTranspose<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 2)
@@ -7007,7 +7025,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
+    public virtual Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
@@ -7943,7 +7961,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> ConvTranspose2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] outputPadding)
+    public virtual Tensor<T> ConvTranspose2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] outputPadding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
@@ -9209,7 +9227,7 @@ public class CpuEngine : ITensorLevelEngine
     #region 3D Convolution and Pooling Operations
 
     /// <inheritdoc/>
-    public Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
+    public virtual Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int dilation = 1)
     {
         return Conv3D(input, kernel, [stride, stride, stride], [padding, padding, padding], [dilation, dilation, dilation]);
     }
@@ -10554,7 +10572,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Normalization and Activation Operations
 
     /// <inheritdoc/>
-    public Tensor<T> Softmax<T>(Tensor<T> input, int axis = -1)
+    public virtual Tensor<T> Softmax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -11493,7 +11511,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    public virtual Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
@@ -12207,7 +12225,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    public virtual Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
@@ -12394,7 +12412,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    public virtual Tensor<T> GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
@@ -12635,7 +12653,7 @@ public class CpuEngine : ITensorLevelEngine
 
 
     /// <inheritdoc/>
-    public Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
+    public virtual Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
@@ -14293,7 +14311,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Scatter mean: Aggregates source values at indices using mean.
     /// </summary>
-    public Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim = 0, int? outputSize = null)
+    public virtual Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim = 0, int? outputSize = null)
     {
         if (source == null)
             throw new ArgumentNullException(nameof(source));
@@ -14873,7 +14891,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
+    public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
         // Stride-aware single-axis mean
         if (!input.IsContiguous && axes.Length == 1)
@@ -15419,7 +15437,7 @@ public class CpuEngine : ITensorLevelEngine
     #region Spatial Operations
 
     /// <inheritdoc/>
-    public Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
+    public virtual Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
         var shape = input._shape;
         if (shape.Length < 2)
@@ -15663,7 +15681,7 @@ public class CpuEngine : ITensorLevelEngine
         return grid;
     }
 
-    public Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid)
+    public virtual Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
@@ -15741,7 +15759,7 @@ public class CpuEngine : ITensorLevelEngine
     /// Extracts sliding local blocks (im2col) from a batched input tensor.
     /// Input: [batch, channels, height, width] -> Output: [batch, channels * kH * kW, L]
     /// </summary>
-    public Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
+    public virtual Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
@@ -15816,7 +15834,7 @@ public class CpuEngine : ITensorLevelEngine
     /// Combines sliding local blocks back into a full tensor (col2im).
     /// Input: [batch, channels * kH * kW, L] -> Output: [batch, channels, outputH, outputW]
     /// </summary>
-    public Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
+    public virtual Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (outputSize == null || outputSize.Length < 2) throw new ArgumentException("outputSize must have at least 2 elements.", nameof(outputSize));
@@ -16554,7 +16572,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
+    public virtual Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (multiples == null) throw new ArgumentNullException(nameof(multiples));
@@ -16606,7 +16624,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
+    public virtual Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (start == null) throw new ArgumentNullException(nameof(start));
@@ -16702,7 +16720,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorWhere<T>(Tensor<T> condition, Tensor<T> x, Tensor<T> y)
+    public virtual Tensor<T> TensorWhere<T>(Tensor<T> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
@@ -16819,7 +16837,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
+    public virtual Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (axes == null) throw new ArgumentNullException(nameof(axes));
@@ -16833,7 +16851,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis)
+    public virtual Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -16857,7 +16875,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis = -1)
+    public virtual Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis = -1)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -16887,7 +16905,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis = 0)
+    public virtual Tensor<T> TensorScatterAdd<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> updates, int axis = 0)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
@@ -16930,7 +16948,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis = 0)
+    public virtual Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis = 0)
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
@@ -17006,7 +17024,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims = false)
+    public virtual Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -17324,7 +17342,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
+    public virtual Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -17338,7 +17356,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
+    public virtual Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -17352,7 +17370,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
+    public virtual Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -17544,7 +17562,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorConcatenate<T>(Tensor<T>[] tensors, int axis = 0)
+    public virtual Tensor<T> TensorConcatenate<T>(Tensor<T>[] tensors, int axis = 0)
     {
         if (tensors == null || tensors.Length == 0)
             throw new ArgumentNullException(nameof(tensors));
@@ -17557,7 +17575,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T>[] TensorSplit<T>(Tensor<T> tensor, int numSplits, int axis = 0)
+    public virtual Tensor<T>[] TensorSplit<T>(Tensor<T> tensor, int numSplits, int axis = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
@@ -18040,7 +18058,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
+    public virtual unsafe Tensor<T> TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
@@ -18236,7 +18254,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
+    public virtual Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
@@ -18289,7 +18307,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorStack<T>(Tensor<T>[] tensors, int axis)
+    public virtual Tensor<T> TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
         if (tensors == null || tensors.Length == 0)
             throw new ArgumentException("Tensors array must not be empty.", nameof(tensors));
@@ -18388,7 +18406,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
+    public virtual Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
@@ -20526,7 +20544,7 @@ public class CpuEngine : ITensorLevelEngine
     #region GPU-Accelerated Operations (CPU Fallback Implementations)
 
     /// <inheritdoc/>
-    public Tensor<T> Softplus<T>(Tensor<T> input)
+    public virtual Tensor<T> Softplus<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetFlattenedData();
@@ -20557,7 +20575,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> HardSwish<T>(Tensor<T> input)
+    public virtual Tensor<T> HardSwish<T>(Tensor<T> input)
     {
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -20591,7 +20609,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
+    public virtual unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -20647,7 +20665,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    public virtual Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
@@ -20733,7 +20751,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
+    public virtual Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
@@ -20898,7 +20916,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
+    public virtual Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
@@ -21060,7 +21078,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
+    public virtual Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
@@ -21113,7 +21131,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
+    public virtual Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
         int vocabSize = embeddingTable._shape[0];
         int embeddingDim = embeddingTable._shape[^1];
@@ -21424,7 +21442,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
+    public virtual Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -21778,7 +21796,7 @@ public class CpuEngine : ITensorLevelEngine
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>MSE loss: mean((pred - target)^2). Returns scalar tensor for tape.</summary>
-    public Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
+    public virtual Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
@@ -21795,7 +21813,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>L1 loss: mean(|pred - target|). Returns scalar tensor for tape.</summary>
-    public Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
+    public virtual Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
@@ -21812,7 +21830,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Huber loss: smooth L1 that transitions from L2 to L1 at delta=1.</summary>
-    public Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
+    public virtual Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         Tensor<T> diff;
@@ -21833,7 +21851,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>BCE with logits: sigmoid cross-entropy loss.</summary>
-    public Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
+    public virtual Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
@@ -21853,7 +21871,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Cross-entropy loss with softmax (differentiable). Returns scalar tensor.</summary>
-    public Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
+    public virtual Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = logits._shape[0];
@@ -21874,7 +21892,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>NLL loss: -sum(target * log_probs) / batch_size. Expects log-probabilities.</summary>
-    public Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
+    public virtual Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = logProbs._shape[0];
@@ -21897,7 +21915,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>KL divergence loss: sum(target * (log(target) - input)).</summary>
-    public Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
+    public virtual Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
@@ -21942,7 +21960,7 @@ public class CpuEngine : ITensorLevelEngine
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>SELU activation: scale * (max(0,x) + min(0, alpha*(exp(x)-1)))</summary>
-    public Tensor<T> TensorSELU<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorSELU<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         const double alpha = 1.6732632423543772;
@@ -21959,7 +21977,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>HardSigmoid: clamp(x/6 + 0.5, 0, 1)</summary>
-    public Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -21974,7 +21992,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>ReLU6: min(max(0, x), 6)</summary>
-    public Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -21988,7 +22006,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>PReLU: max(0,x) + alpha * min(0,x) where alpha is a learnable parameter</summary>
-    public Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
+    public virtual Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         // Compute channel-aware alpha indexing for NCHW tensors
@@ -22009,7 +22027,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>RReLU: random leaky ReLU (lower, upper bounds)</summary>
-    public Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true)
+    public virtual Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -22027,7 +22045,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Threshold: x if x > threshold, else value</summary>
-    public Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
+    public virtual Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -22054,7 +22072,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Element-wise sign: -1, 0, or 1</summary>
-    public Tensor<T> TensorSign<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorSign<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.Rent<T>(tensor._shape);
@@ -22072,7 +22090,7 @@ public class CpuEngine : ITensorLevelEngine
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>Flatten tensor to 1D.</summary>
-    public Tensor<T> TensorFlatten<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorFlatten<T>(Tensor<T> tensor)
     {
         var result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
@@ -22080,7 +22098,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Narrow (slice along one axis).</summary>
-    public Tensor<T> TensorNarrow<T>(Tensor<T> tensor, int dim, int start, int length)
+    public virtual Tensor<T> TensorNarrow<T>(Tensor<T> tensor, int dim, int start, int length)
     {
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
@@ -22098,7 +22116,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Constant padding for N-dimensional tensors.</summary>
-    public Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
+    public virtual Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = tensor.Rank;
@@ -22119,7 +22137,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Upsample using bilinear interpolation (4D: NCHW).</summary>
-    public Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
+    public virtual Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
@@ -22157,7 +22175,7 @@ public class CpuEngine : ITensorLevelEngine
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>1D average pooling.</summary>
-    public Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
+    public virtual Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], channels = input._shape[1], width = input._shape[2];
@@ -22182,7 +22200,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>1D max pooling with argmax tracking.</summary>
-    public Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
+    public virtual Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], channels = input._shape[1], width = input._shape[2];
@@ -22243,7 +22261,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Variance of all elements, returns scalar tensor.</summary>
-    public Tensor<T> TensorVar<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorVar<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         double mean = 0;
@@ -22262,7 +22280,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Standard deviation of all elements, returns scalar tensor.</summary>
-    public Tensor<T> TensorStd<T>(Tensor<T> tensor)
+    public virtual Tensor<T> TensorStd<T>(Tensor<T> tensor)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         double mean = 0;
@@ -22322,7 +22340,7 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Adaptive max pool 2D with argmax tracking.</summary>
-    public Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
+    public virtual Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
