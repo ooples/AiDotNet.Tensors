@@ -1164,6 +1164,67 @@ void main() {
     c[idx] = -a[idx] / (x * x);
 }";
 
+    public static string VarBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    d[idx] = a[outer] * 2.0 * (bdata[idx] - c[outer]) / float(reduceSize);
+}";
+
+    public static string StdBackwardGlsl => Header + FiveBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float s = max(d[outer], 1e-8);
+    e[idx] = a[outer] * (bdata[idx] - c[outer]) / (float(reduceSize) * s);
+}";
+
+    public static string MaskedFillBackwardGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    c[idx] = (bdata[idx] != 0.0) ? 0.0 : a[idx];
+}";
+
+    public static string WhereBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float cond = bdata[idx];
+    c[idx] = (cond != 0.0) ? a[idx] : 0.0;
+    d[idx] = (cond != 0.0) ? 0.0 : a[idx];
+}";
+
+    public static string NormBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float n = max(c[outer], 1e-8);
+    d[idx] = a[outer] * bdata[idx] / n;
+}";
+
+    public static string LogSumExpBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float softmax_val = exp(bdata[idx] - c[outer]);
+    d[idx] = a[outer] * softmax_val;
+}";
+
     // =====================================================================
     // Loss function kernels (forward + backward)
     // =====================================================================

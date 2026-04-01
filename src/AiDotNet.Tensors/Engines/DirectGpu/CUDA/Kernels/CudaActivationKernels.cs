@@ -417,6 +417,87 @@ extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const fl
     gradInput[idx] = -gradOutput[idx] / (x * x);
 }
 
+// ===========================================================================
+// Variance backward: dx = gradOutput * 2*(x - mean)/n
+// gradOutput is [outerSize], input is [outerSize * reduceSize], mean is [outerSize]
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void var_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ mean, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float g = gradOutput[outer];
+    float m = mean[outer];
+    float x = input[idx];
+    gradInput[idx] = g * 2.0f * (x - m) / (float)reduceSize;
+}
+
+// ===========================================================================
+// Std backward: dx = gradOutput * (x - mean) / (n * std)
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void std_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ mean, const float* __restrict__ stddev, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float g = gradOutput[outer];
+    float m = mean[outer];
+    float s = stddev[outer];
+    float x = input[idx];
+    gradInput[idx] = g * (x - m) / ((float)reduceSize * fmaxf(s, 1e-8f));
+}
+
+// ===========================================================================
+// MaskedFill backward: zero where mask is nonzero, pass gradient where zero
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void masked_fill_backward(const float* __restrict__ gradOutput, const float* __restrict__ mask, float* __restrict__ gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    gradInput[idx] = (mask[idx] != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// ===========================================================================
+// Where backward: route gradient based on condition
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void where_backward(const float* __restrict__ gradOutput, const float* __restrict__ condition, float* __restrict__ gradX, float* __restrict__ gradY, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float cond = condition[idx];
+    gradX[idx] = (cond != 0.0f) ? gradOutput[idx] : 0.0f;
+    gradY[idx] = (cond != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// ===========================================================================
+// Norm backward: dx = gradOutput * x / norm
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void norm_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ norm, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float n = fmaxf(norm[outer], 1e-8f);
+    gradInput[idx] = gradOutput[outer] * input[idx] / n;
+}
+
+// ===========================================================================
+// LogSumExp backward: dx = gradOutput * softmax(x)
+// softmax_i = exp(x_i - lse) where lse = log(sum(exp(x)))
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void logsumexp_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ lse, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float softmax_val = expf(input[idx] - lse[outer]);
+    gradInput[idx] = gradOutput[outer] * softmax_val;
+}
+
 // Warp-level reduction helpers for maximum performance
 __device__ __forceinline__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -1175,6 +1256,12 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "threshold_forward",
                 "threshold_backward",
                 "reciprocal_backward",
+                "var_backward",
+                "std_backward",
+                "masked_fill_backward",
+                "where_backward",
+                "norm_backward",
+                "logsumexp_backward",
                 // Element-wise binary
                 "add_vectors",
                 "subtract_vectors",

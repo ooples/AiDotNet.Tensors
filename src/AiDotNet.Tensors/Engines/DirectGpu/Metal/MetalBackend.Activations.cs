@@ -670,6 +670,94 @@ public sealed partial class MetalBackend
         enc3.DispatchThreadgroups(tg3, tpg3);
     }
 
+    public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || input is not MetalGpuBuffer inp || mean is not MetalGpuBuffer m || gradInput is not MetalGpuBuffer gi)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "var_backward");
+        int total = outerSize * reduceSize;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(inp, 1); enc.SetBuffer(m, 2); enc.SetBuffer(gi, 3);
+        enc.SetBytes((uint)outerSize, 4); enc.SetBytes((uint)reduceSize, 5);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || input is not MetalGpuBuffer inp || mean is not MetalGpuBuffer m || std is not MetalGpuBuffer s || gradInput is not MetalGpuBuffer gi)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "std_backward");
+        int total = outerSize * reduceSize;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(inp, 1); enc.SetBuffer(m, 2); enc.SetBuffer(s, 3); enc.SetBuffer(gi, 4);
+        enc.SetBytes((uint)outerSize, 5); enc.SetBytes((uint)reduceSize, 6);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || mask is not MetalGpuBuffer m || gradInput is not MetalGpuBuffer gi)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "masked_fill_backward");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(size);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(m, 1); enc.SetBuffer(gi, 2);
+        enc.SetBytes((uint)size, 3);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || condition is not MetalGpuBuffer c || gradX is not MetalGpuBuffer gx || gradY is not MetalGpuBuffer gy)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "where_backward");
+        var (tg, tpg) = pipeline.Calculate1DDispatch(size);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(c, 1); enc.SetBuffer(gx, 2); enc.SetBuffer(gy, 3);
+        enc.SetBytes((uint)size, 4);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || input is not MetalGpuBuffer inp || norm is not MetalGpuBuffer n || gradInput is not MetalGpuBuffer gi)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "norm_backward");
+        int total = outerSize * reduceSize;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(inp, 1); enc.SetBuffer(n, 2); enc.SetBuffer(gi, 3);
+        enc.SetBytes((uint)outerSize, 4); enc.SetBytes((uint)reduceSize, 5);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        ThrowIfDisposed();
+        if (gradOutput is not MetalGpuBuffer go || input is not MetalGpuBuffer inp || lse is not MetalGpuBuffer l || gradInput is not MetalGpuBuffer gi)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "logsumexp_backward");
+        int total = outerSize * reduceSize;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(go, 0); enc.SetBuffer(inp, 1); enc.SetBuffer(l, 2); enc.SetBuffer(gi, 3);
+        enc.SetBytes((uint)outerSize, 4); enc.SetBytes((uint)reduceSize, 5);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
     #endregion
 
     #region Capsule Network Operations

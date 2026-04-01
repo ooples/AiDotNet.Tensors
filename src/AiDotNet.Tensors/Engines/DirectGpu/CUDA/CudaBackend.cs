@@ -6161,6 +6161,88 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue("var_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: var_backward");
+        using var _ = PushContext();
+        int total = outerSize * reduceSize;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, iPtr = input.Handle, mPtr = mean.Handle, giPtr = gradInput.Handle;
+        int os = outerSize, rs = reduceSize;
+        void** args = stackalloc void*[6];
+        args[0] = &goPtr; args[1] = &iPtr; args[2] = &mPtr; args[3] = &giPtr; args[4] = &os; args[5] = &rs;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue("std_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: std_backward");
+        using var _ = PushContext();
+        int total = outerSize * reduceSize;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, iPtr = input.Handle, mPtr = mean.Handle, sPtr = std.Handle, giPtr = gradInput.Handle;
+        int os = outerSize, rs = reduceSize;
+        void** args = stackalloc void*[7];
+        args[0] = &goPtr; args[1] = &iPtr; args[2] = &mPtr; args[3] = &sPtr; args[4] = &giPtr; args[5] = &os; args[6] = &rs;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
+    {
+        if (!_kernelCache.TryGetValue("masked_fill_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: masked_fill_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, mPtr = mask.Handle, giPtr = gradInput.Handle;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &goPtr; args[1] = &mPtr; args[2] = &giPtr; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
+    {
+        if (!_kernelCache.TryGetValue("where_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: where_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, cPtr = condition.Handle, gxPtr = gradX.Handle, gyPtr = gradY.Handle;
+        int n = size;
+        void** args = stackalloc void*[5];
+        args[0] = &goPtr; args[1] = &cPtr; args[2] = &gxPtr; args[3] = &gyPtr; args[4] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue("norm_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: norm_backward");
+        using var _ = PushContext();
+        int total = outerSize * reduceSize;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, iPtr = input.Handle, nPtr = norm.Handle, giPtr = gradInput.Handle;
+        int os = outerSize, rs = reduceSize;
+        void** args = stackalloc void*[6];
+        args[0] = &goPtr; args[1] = &iPtr; args[2] = &nPtr; args[3] = &giPtr; args[4] = &os; args[5] = &rs;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue("logsumexp_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: logsumexp_backward");
+        using var _ = PushContext();
+        int total = outerSize * reduceSize;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, iPtr = input.Handle, lPtr = lse.Handle, giPtr = gradInput.Handle;
+        int os = outerSize, rs = reduceSize;
+        void** args = stackalloc void*[6];
+        args[0] = &goPtr; args[1] = &iPtr; args[2] = &lPtr; args[3] = &giPtr; args[4] = &os; args[5] = &rs;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     #endregion
 
     #region Loss Function GPU Kernel Operations

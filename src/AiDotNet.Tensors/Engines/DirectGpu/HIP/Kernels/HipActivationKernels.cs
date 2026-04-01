@@ -816,6 +816,67 @@ extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const fl
     gradInput[idx] = -gradOutput[idx] / (x * x);
 }
 
+// Variance backward: dx = gradOutput * 2*(x - mean)/n
+extern ""C"" __global__ __launch_bounds__(256) void var_backward(const float* gradOutput, const float* input, const float* mean, float* gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    gradInput[idx] = gradOutput[outer] * 2.0f * (input[idx] - mean[outer]) / (float)reduceSize;
+}
+
+// Std backward: dx = gradOutput * (x - mean) / (n * std)
+extern ""C"" __global__ __launch_bounds__(256) void std_backward(const float* gradOutput, const float* input, const float* mean, const float* stddev, float* gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float s = stddev[outer];
+    gradInput[idx] = gradOutput[outer] * (input[idx] - mean[outer]) / ((float)reduceSize * fmaxf(s, 1e-8f));
+}
+
+// MaskedFill backward: zero where mask is nonzero
+extern ""C"" __global__ __launch_bounds__(256) void masked_fill_backward(const float* gradOutput, const float* mask, float* gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    gradInput[idx] = (mask[idx] != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// Where backward: route gradient based on condition
+extern ""C"" __global__ __launch_bounds__(256) void where_backward(const float* gradOutput, const float* condition, float* gradX, float* gradY, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float cond = condition[idx];
+    gradX[idx] = (cond != 0.0f) ? gradOutput[idx] : 0.0f;
+    gradY[idx] = (cond != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// Norm backward: dx = gradOutput * x / norm
+extern ""C"" __global__ __launch_bounds__(256) void norm_backward(const float* gradOutput, const float* input, const float* norm, float* gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float n = fmaxf(norm[outer], 1e-8f);
+    gradInput[idx] = gradOutput[outer] * input[idx] / n;
+}
+
+// LogSumExp backward: dx = gradOutput * softmax(x)
+extern ""C"" __global__ __launch_bounds__(256) void logsumexp_backward(const float* gradOutput, const float* input, const float* lse, float* gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float softmax_val = expf(input[idx] - lse[outer]);
+    gradInput[idx] = gradOutput[outer] * softmax_val;
+}
+
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
@@ -1047,6 +1108,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "rrelu", "rrelu_backward",
             "threshold_forward", "threshold_backward",
             "reciprocal_backward",
+            "var_backward", "std_backward", "masked_fill_backward",
+            "where_backward", "norm_backward", "logsumexp_backward",
             "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary

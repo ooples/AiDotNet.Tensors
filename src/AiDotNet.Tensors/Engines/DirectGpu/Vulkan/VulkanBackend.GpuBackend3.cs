@@ -397,6 +397,28 @@ public sealed unsafe partial class VulkanBackend
     public void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
         => GlslBinaryOp(VulkanGlslKernels.ReciprocalBackward, gradOutput, input, gradInput, size);
 
+    public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
+        => GlslQuadOp(VulkanGlslKernels.VarBackwardGlsl, gradOutput, input, mean, gradInput,
+            outerSize * reduceSize, new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
+
+    public void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
+        => GlslQuintOp(VulkanGlslKernels.StdBackwardGlsl, gradOutput, input, mean, std, gradInput,
+            outerSize * reduceSize, new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
+
+    public void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
+        => GlslBinaryOp(VulkanGlslKernels.MaskedFillBackwardGlsl, gradOutput, mask, gradInput, size);
+
+    public void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
+        => GlslQuadOp(VulkanGlslKernels.WhereBackwardGlsl, gradOutput, condition, gradX, gradY, size);
+
+    public void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
+        => GlslQuadOp(VulkanGlslKernels.NormBackwardGlsl, gradOutput, input, norm, gradInput,
+            outerSize * reduceSize, new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
+
+    public void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
+        => GlslQuadOp(VulkanGlslKernels.LogSumExpBackwardGlsl, gradOutput, input, lse, gradInput,
+            outerSize * reduceSize, new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
+
     public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
         var pushData = new uint[] { (uint)batchSize, (uint)numFeatures };

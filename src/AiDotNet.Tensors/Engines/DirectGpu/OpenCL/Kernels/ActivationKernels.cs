@@ -1098,6 +1098,48 @@ __kernel void reciprocal_backward(__global const float* gradOutput, __global con
     float x = input[idx]; gradInput[idx] = -gradOutput[idx] / (x * x);
 }
 
+__kernel void var_backward(__global const float* gradOutput, __global const float* input, __global const float* mean, __global float* gradInput, const int outerSize, const int reduceSize)
+{
+    const int idx = get_global_id(0); int total = outerSize * reduceSize; if (idx >= total) return;
+    int outer = idx / reduceSize;
+    gradInput[idx] = gradOutput[outer] * 2.0f * (input[idx] - mean[outer]) / (float)reduceSize;
+}
+
+__kernel void std_backward(__global const float* gradOutput, __global const float* input, __global const float* mean, __global const float* stddev, __global float* gradInput, const int outerSize, const int reduceSize)
+{
+    const int idx = get_global_id(0); int total = outerSize * reduceSize; if (idx >= total) return;
+    int outer = idx / reduceSize; float s = max(stddev[outer], 1e-8f);
+    gradInput[idx] = gradOutput[outer] * (input[idx] - mean[outer]) / ((float)reduceSize * s);
+}
+
+__kernel void masked_fill_backward(__global const float* gradOutput, __global const float* mask, __global float* gradInput, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    gradInput[idx] = (mask[idx] != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+__kernel void where_backward(__global const float* gradOutput, __global const float* condition, __global float* gradX, __global float* gradY, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float cond = condition[idx];
+    gradX[idx] = (cond != 0.0f) ? gradOutput[idx] : 0.0f;
+    gradY[idx] = (cond != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+__kernel void norm_backward(__global const float* gradOutput, __global const float* input, __global const float* norm, __global float* gradInput, const int outerSize, const int reduceSize)
+{
+    const int idx = get_global_id(0); int total = outerSize * reduceSize; if (idx >= total) return;
+    int outer = idx / reduceSize; float n = max(norm[outer], 1e-8f);
+    gradInput[idx] = gradOutput[outer] * input[idx] / n;
+}
+
+__kernel void logsumexp_backward(__global const float* gradOutput, __global const float* input, __global const float* lse, __global float* gradInput, const int outerSize, const int reduceSize)
+{
+    const int idx = get_global_id(0); int total = outerSize * reduceSize; if (idx >= total) return;
+    int outer = idx / reduceSize;
+    gradInput[idx] = gradOutput[outer] * exp(input[idx] - lse[outer]);
+}
+
 // ============================================================================
 // Single-kernel fused softmax for large rows.
 // All workgroups cooperate within ONE kernel launch:
@@ -1326,6 +1368,8 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "rrelu", "rrelu_backward",
                 "threshold_forward", "threshold_backward",
                 "reciprocal_backward",
+                "var_backward", "std_backward", "masked_fill_backward",
+                "where_backward", "norm_backward", "logsumexp_backward",
                 // Element-wise binary
                 "add_vectors", "subtract_vectors", "multiply_vectors",
                 "divide_vectors", "min_vectors", "max_vectors",
