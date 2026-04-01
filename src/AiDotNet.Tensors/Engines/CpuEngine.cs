@@ -3850,6 +3850,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorRound<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         var src = tensor.AsSpan();

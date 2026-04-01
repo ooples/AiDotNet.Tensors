@@ -1754,12 +1754,11 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // max(a,b): grad goes to a where a >= b, to b otherwise
-        // Use the output (which equals max(a,b)) to create masks via comparison
+        // Use saved input clones if available (safe against in-place mutation)
+        var a = savedState is { Length: >= 1 } && savedState[0] is Tensor<T> sa ? sa : inputs[0];
         var numOps = MathHelper.GetNumericOperations<T>();
         var zeros = engine.TensorMultiplyScalar(gradOutput, numOps.Zero);
-        // Mask where a was the max: output == a means a >= b
-        var diff = engine.TensorSubtract(output, inputs[0]);
+        var diff = engine.TensorSubtract(output, a);
         var absDiff = engine.TensorAbs(diff);
         var maskSign = engine.TensorSign(absDiff);
         var aOnes = engine.TensorAddScalar(zeros, numOps.One);
@@ -1776,10 +1775,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // min(a,b): grad goes to a where a <= b, to b otherwise
+        var a = savedState is { Length: >= 1 } && savedState[0] is Tensor<T> sa ? sa : inputs[0];
         var numOps = MathHelper.GetNumericOperations<T>();
         var zeros = engine.TensorMultiplyScalar(gradOutput, numOps.Zero);
-        var diff = engine.TensorSubtract(output, inputs[0]);
+        var diff = engine.TensorSubtract(output, a);
         var absDiff = engine.TensorAbs(diff);
         var maskSign = engine.TensorSign(absDiff);
         var aOnes = engine.TensorAddScalar(zeros, numOps.One);

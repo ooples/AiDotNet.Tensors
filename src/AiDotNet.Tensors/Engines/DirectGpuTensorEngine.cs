@@ -11298,6 +11298,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorAdd(a, b);
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Add(ia, ib, o, size));
@@ -11314,6 +11316,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorSubtract(a, b);
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Subtract(ia, ib, o, size));
@@ -11330,6 +11334,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorMultiply(a, b);
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Multiply(ia, ib, o, size));
@@ -11346,6 +11352,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!ShapesMatch(a.Shape._dims, b.Shape._dims))
+            return base.TensorDivide(a, b);
         try
         {
             var result = TryRunBinary(a, b, static (backend, ia, ib, o, size) => backend.Divide(ia, ib, o, size));
@@ -12120,7 +12128,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
-                Autodiff.DifferentiableOps.RecordBinary("TensorMax", output, a, b, Autodiff.BackwardFunctions<T>.MaxBackward);
+                // Save clones of inputs in savedState for gradient correctness
+                // when inputs are mutated in-place after the forward pass
+                Autodiff.DifferentiableOps.RecordBinary("TensorMax", output, a, b,
+                    Autodiff.BackwardFunctions<T>.MaxBackward,
+                    new object[] { a.Clone(), b.Clone() });
                 return output;
             }
         }
@@ -12136,7 +12148,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (result != null)
             {
                 var output = new Tensor<T>(result, a.Shape._dims);
-                Autodiff.DifferentiableOps.RecordBinary("TensorMin", output, a, b, Autodiff.BackwardFunctions<T>.MinBackward);
+                Autodiff.DifferentiableOps.RecordBinary("TensorMin", output, a, b,
+                    Autodiff.BackwardFunctions<T>.MinBackward,
+                    new object[] { a.Clone(), b.Clone() });
                 return output;
             }
         }
