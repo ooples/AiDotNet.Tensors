@@ -33,6 +33,8 @@ public readonly struct DeviceInfo : IEquatable<DeviceInfo>
     /// </summary>
     public DeviceInfo(TensorDevice type, int index = 0)
     {
+        if (type != TensorDevice.CPU && index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index), "Device index must be non-negative for GPU devices.");
         Type = type;
         Index = type == TensorDevice.CPU ? -1 : index;
     }
@@ -73,8 +75,15 @@ public readonly struct DeviceInfo : IEquatable<DeviceInfo>
             return CPU;
 
         var parts = deviceString.Trim().ToLowerInvariant().Split(':');
+        if (parts.Length > 2)
+            throw new ArgumentException($"Invalid device string format: {deviceString}. Expected 'type' or 'type:index'.");
         var typeName = parts[0];
-        int index = parts.Length > 1 && int.TryParse(parts[1], out var idx) ? idx : 0;
+        int index = 0;
+        if (parts.Length > 1)
+        {
+            if (!int.TryParse(parts[1], out index) || index < 0)
+                throw new ArgumentException($"Invalid device index in: {deviceString}. Index must be a non-negative integer.");
+        }
 
         var type = typeName switch
         {

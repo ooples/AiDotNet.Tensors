@@ -98,7 +98,7 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Returns true if this tensor's data currently resides on a GPU device.
     /// </summary>
-    public bool IsGpuResident => _device != TensorDevice.CPU;
+    public bool IsGpuResident => Device != TensorDevice.CPU;
 
     /// <summary>
     /// Gets the full device info including device index for multi-GPU scenarios.

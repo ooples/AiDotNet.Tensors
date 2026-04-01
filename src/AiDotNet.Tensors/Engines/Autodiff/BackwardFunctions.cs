@@ -1427,9 +1427,11 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var noise = (Tensor<T>)savedState[0];
         // RReLU: x >= 0 ? grad : grad * noise
-        // Build positive mask via ReLU derivative: clamp(sign(x), 0, 1) gives 1 for x>0, 0 for x<=0
-        var relu = engine.TensorReLU(inputs[0]);
-        var sign = engine.TensorSign(relu);
+        // Build positive mask: step(x) = clamp(sign(x) + 1, 0, 2) / 2 gives 1 for x>=0, 0 for x<0
+        var rawSign = engine.TensorSign(inputs[0]);
+        var shifted = engine.TensorAddScalar(rawSign, numOps.One);
+        var sign = engine.TensorClamp(shifted, numOps.Zero, numOps.FromDouble(2.0));
+        sign = engine.TensorMultiplyScalar(sign, numOps.FromDouble(0.5));
         // posGrad = grad * sign(relu(x))  (gradient where x >= 0)
         var posGrad = engine.TensorMultiply(gradOutput, sign);
         // negMask = 1 - sign  (1 where x < 0, 0 where x >= 0)

@@ -7922,6 +7922,9 @@ KERNEL VARIANTS (A/B testing):
 
         public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
         {
+            // Initialize output and counts to zero before accumulation
+            Fill(output, 0f, outputSize * featureSize);
+            Fill(counts, 0f, outputSize);
             var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
             k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
             k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);

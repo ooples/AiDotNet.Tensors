@@ -69,6 +69,8 @@ public sealed class AutocastScope : IDisposable
     /// <param name="precision">The target precision for GPU operations.</param>
     public AutocastScope(PrecisionMode precision = PrecisionMode.Float16)
     {
+        if (precision == PrecisionMode.BFloat16)
+            throw new NotSupportedException("BFloat16 autocast is not yet implemented. Use Float16 instead.");
         Precision = precision;
         _previous = _current;
         _current = this;

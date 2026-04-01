@@ -21111,6 +21111,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
     {
+        if (axes is { Length: > 0 })
+            throw new NotSupportedException("VarBackward with non-global axes is not yet supported. Use global variance backward.");
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
         var result = new T[n];
@@ -21130,6 +21132,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> StdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> std, int[] axes)
     {
+        if (axes is { Length: > 0 })
+            throw new NotSupportedException("StdBackward with non-global axes is not yet supported. Use global std backward.");
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
         var result = new T[n];

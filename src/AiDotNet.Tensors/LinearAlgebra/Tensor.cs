@@ -91,7 +91,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>
     /// Creates a GPU-resident tensor with zero CPU allocation.
     /// </summary>
-    internal static Tensor<T> CreateGpuResident(int[] shape) => new Tensor<T>(shape, TensorDevice.CUDA);
+    internal static Tensor<T> CreateGpuResident(int[] shape, TensorDevice device = TensorDevice.CUDA)
+        => new Tensor<T>(shape, device);
 
     private Tensor(int[] shape, TensorDevice gpuDevice) : base(shape, gpuDevice) { }
 

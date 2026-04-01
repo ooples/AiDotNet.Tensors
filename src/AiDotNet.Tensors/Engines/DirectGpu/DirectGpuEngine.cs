@@ -61,10 +61,11 @@ public sealed class DirectGpuEngine : IDisposable
     public IDirectGpuBackend? Backend => _backend;
 
     /// <summary>
-    /// Gets the number of available GPU devices across all backends.
-    /// For CUDA, this is the number of NVIDIA GPUs. Equivalent to torch.cuda.device_count().
+    /// Gets the number of available CUDA GPU devices. For non-CUDA backends
+    /// (OpenCL, HIP, Vulkan, Metal, WebGPU), use the backend-specific device enumeration.
+    /// Equivalent to torch.cuda.device_count().
     /// </summary>
-    public static int DeviceCount
+    public static int CudaDeviceCount
     {
         get
         {

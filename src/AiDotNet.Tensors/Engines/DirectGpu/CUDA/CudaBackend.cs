@@ -6248,7 +6248,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("avg_pool1d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: avg_pool1d");
         using var _ = PushContext();
-        int total = batch * channels * outLength;
+        long totalL = (long)batch * channels * outLength; int total = checked((int)totalL);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, oPtr = output.Handle;
         void** args = stackalloc void*[8];
@@ -6262,7 +6262,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("max_pool1d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: max_pool1d");
         using var _ = PushContext();
-        int total = batch * channels * outLength;
+        long totalL = (long)batch * channels * outLength; int total = checked((int)totalL);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, oPtr = output.Handle;
         void** args = stackalloc void*[8];
@@ -6276,7 +6276,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: bilinear_upsample2d");
         using var _ = PushContext();
-        int total = batch * channels * outH * outW;
+        long totalL2 = (long)batch * channels * outH * outW; int total = checked((int)totalL2);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, oPtr = output.Handle;
         void** args = stackalloc void*[8];

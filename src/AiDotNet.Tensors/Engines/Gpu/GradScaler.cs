@@ -124,7 +124,7 @@ public sealed class GradScaler
     {
         if (_foundInfOrNan)
         {
-            _scale *= _backoffFactor;
+            _scale = Math.Max(_scale * _backoffFactor, 1.0);
             _consecutiveGoodSteps = 0;
         }
         else

@@ -62,10 +62,12 @@ public sealed class CudaGraphScope : IDisposable
     /// Creates a new CUDA graph scope.
     /// </summary>
     /// <param name="backend">The GPU backend to use for graph operations.</param>
-    /// <param name="stream">The CUDA stream to capture on. Use IntPtr.Zero for the default stream.</param>
-    public CudaGraphScope(IGpuBatchExecution backend, IntPtr stream = default)
+    /// <param name="stream">The CUDA stream to capture on. Must be a user-created stream, not the default/null stream (CUDA requires this for graph capture).</param>
+    public CudaGraphScope(IGpuBatchExecution backend, IntPtr stream)
     {
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        if (stream == IntPtr.Zero)
+            throw new ArgumentException("CUDA graph capture requires a user-created stream, not the default stream (IntPtr.Zero). Create a stream via cuStreamCreate first.", nameof(stream));
         _stream = stream;
 
         // Check if this is actually a CUDA backend that supports graph capture (CUDA 10.0+)
@@ -162,8 +164,13 @@ public sealed class CudaGraphScope : IDisposable
 
         if (_isCapturing)
         {
-            // Cancel the capture
-            try { CudaNativeBindings.cuStreamEndCapture(_stream, out var discardGraph); }
+            // Cancel the capture and destroy the leaked graph handle
+            try
+            {
+                var result = CudaNativeBindings.cuStreamEndCapture(_stream, out var discardGraph);
+                if (result == CudaResult.Success && discardGraph != IntPtr.Zero)
+                    CudaNativeBindings.cuGraphDestroy(discardGraph);
+            }
             catch { }
             _isCapturing = false;
         }

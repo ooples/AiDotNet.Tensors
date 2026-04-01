@@ -1042,10 +1042,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Create GPU-resident tensor with ZERO CPU allocation.
         // The backing array is only allocated when CPU code actually accesses the data.
-        var tensor = Tensor<T>.CreateGpuResident(shape);
-        tensor._gpuBuffer = outputBuffer;
-        tensor._gpuBackend = backend;
-        tensor._device = backend.BackendName?.ToUpperInvariant() switch
+        var deviceType = backend.BackendName?.ToUpperInvariant() switch
         {
             "CUDA" or "NVIDIA" => TensorDevice.CUDA,
             "OPENCL" => TensorDevice.OpenCL,
@@ -1056,6 +1053,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             "DIRECTML" or "DML" => TensorDevice.DirectML,
             _ => TensorDevice.CUDA
         };
+        var tensor = Tensor<T>.CreateGpuResident(shape, deviceType);
+        tensor._gpuBuffer = outputBuffer;
+        tensor._gpuBackend = backend;
 
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU
