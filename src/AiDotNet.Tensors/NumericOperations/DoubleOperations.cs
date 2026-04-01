@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.Operators;
@@ -813,6 +814,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise addition using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Add(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
@@ -840,6 +842,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise subtraction using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Subtract(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
@@ -866,6 +869,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise multiplication using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Multiply(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
@@ -892,6 +896,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Performs element-wise division using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Divide(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
     {
         int length = x.Length;
@@ -929,6 +934,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes sum using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public double Sum(ReadOnlySpan<double> x)
     {
         int length = x.Length;
@@ -991,6 +997,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes exponential using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Exp(ReadOnlySpan<double> x, Span<double> destination)
     {
         // Call SimdKernels.Exp for the FULL array — VML (vmdExp) internally parallelizes.
@@ -1001,6 +1008,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes natural logarithm using VML-accelerated SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Log(ReadOnlySpan<double> x, Span<double> destination)
     {
         Engines.Simd.SimdKernels.Log(x, destination);
@@ -1009,6 +1017,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes hyperbolic tangent with parallel processing for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Tanh(ReadOnlySpan<double> x, Span<double> destination)
     {
         // Call SimdKernels.Tanh for the FULL array — VML internally parallelizes.
@@ -1020,6 +1029,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes sigmoid using SIMD-optimized SimdKernels.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Sigmoid(ReadOnlySpan<double> x, Span<double> destination)
     {
         // Call SimdKernels.Sigmoid for the FULL array — VML internally parallelizes.
@@ -1209,6 +1219,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes LeakyReLU activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void LeakyReLU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
     {
         if (x.Length != destination.Length)
@@ -1238,6 +1249,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes GELU activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void GELU(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
@@ -1266,6 +1278,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes Mish activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Mish(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
@@ -1294,6 +1307,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes Swish/SiLU activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void Swish(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
@@ -1322,6 +1336,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes ELU activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void ELU(ReadOnlySpan<double> x, double alpha, Span<double> destination)
     {
         if (x.Length != destination.Length)
@@ -1351,6 +1366,7 @@ public class DoubleOperations : INumericOperations<double>
     /// <summary>
     /// Computes ReLU activation with parallel chunking for large arrays.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public unsafe void ReLU(ReadOnlySpan<double> x, Span<double> destination)
     {
         if (x.Length != destination.Length)
