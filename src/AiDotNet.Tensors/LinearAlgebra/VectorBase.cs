@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
@@ -21,19 +21,22 @@ public abstract class VectorBase<T>
 {
     /// <summary>
     /// The internal memory that stores the vector's elements.
+    /// May start as Memory&lt;T&gt;.Empty for GPU-resident vectors (lazy allocation).
     /// </summary>
-    /// <remarks>
-    /// <para><b>Issue #693:</b> Memory&lt;T&gt; provides zero-copy slicing, better Span&lt;T&gt; interop,
-    /// and integration with memory pooling.</para>
-    /// </remarks>
-    protected readonly Memory<T> _memory;
+    protected Memory<T> _memory;
 
     /// <summary>
     /// Cached direct reference to the backing array for SIMD fast paths.
     /// Eliminates Memory&lt;T&gt;.Span property overhead (~30ns per access).
-    /// May be null if Memory&lt;T&gt; is not backed by a simple array.
+    /// May be null if Memory&lt;T&gt; is not backed by a simple array or if GPU-resident (lazy).
     /// </summary>
-    internal readonly T[]? _cachedArray;
+    internal T[]? _cachedArray;
+
+    /// <summary>
+    /// The logical length of this vector. For GPU-resident vectors where _memory is empty,
+    /// this stores the actual element count. For CPU-backed vectors, equals _memory.Length.
+    /// </summary>
+    private int _logicalLength;
 
     /// <summary>
     /// Optional memory owner for pooled memory management.
@@ -126,6 +129,7 @@ public abstract class VectorBase<T>
 #endif
         _memory = arr;
         _cachedArray = arr;
+        _logicalLength = length;
     }
 
     /// <summary>
@@ -139,11 +143,7 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
-        // Extract backing array for SIMD fast paths. The array may be LARGER than Length
-        // when backed by ArrayPool (which returns power-of-2 buffers).
-        // INVARIANT: all SIMD consumers MUST pass Length as the element count, never array.Length.
-        // This invariant is enforced by _cachedArray being internal (not public) and all SIMD
-        // paths in VectorBase/MatrixBase/SimdKernels explicitly using Length for bounds.
+        _logicalLength = memory.Length;
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {
@@ -165,7 +165,7 @@ public abstract class VectorBase<T>
     {
         _memoryOwner = memoryOwner;
         _memory = memoryOwner.Memory.Slice(0, length);
-        // Sliced memory — can't cache array (offset != 0 or count != array.Length)
+        _logicalLength = length;
     }
 
     /// <summary>
@@ -181,6 +181,7 @@ public abstract class VectorBase<T>
         var arr = values.ToArray();
         _memory = arr;
         _cachedArray = arr;
+        _logicalLength = arr.Length;
     }
 
     /// <summary>
@@ -190,7 +191,37 @@ public abstract class VectorBase<T>
     /// <para><b>For Beginners:</b> This tells you how many numbers are in your vector.
     /// For example, the vector [1,2,3] has a Length of 3.</para>
     /// </remarks>
-    public int Length => _memory.Length;
+
+    /// <summary>
+    /// Creates a GPU-resident vector with zero CPU allocation.
+    /// The backing array is only allocated when CPU code first accesses the data.
+    /// </summary>
+    /// <param name="logicalLength">The number of elements this vector represents.</param>
+    /// <param name="gpuDevice">The GPU device type for this vector.</param>
+    internal VectorBase(int logicalLength, TensorDevice gpuDevice)
+    {
+        _memory = Memory<T>.Empty;
+        _cachedArray = null;
+        _logicalLength = logicalLength;
+    }
+
+    /// <summary>
+    /// Materializes the CPU backing array for a GPU-resident vector.
+    /// Called by GetDataArray/AsSpan when CPU code needs actual data.
+    /// </summary>
+    internal void MaterializeBacking(T[] data)
+    {
+        _memory = data;
+        _cachedArray = data;
+        // _logicalLength stays the same
+    }
+
+    /// <summary>
+    /// Returns true if this vector has no CPU backing (GPU-resident with lazy allocation).
+    /// </summary>
+    internal bool IsLazyAllocated => _memory.Length == 0 && _logicalLength > 0;
+
+    public int Length => _logicalLength;
 
     /// <summary>
     /// Gets a value indicating whether the vector contains no elements.
@@ -217,11 +248,13 @@ public abstract class VectorBase<T>
         get
         {
             ValidateIndex(index);
+            EnsureMaterialized();
             return _memory.Span[index];
         }
         set
         {
             ValidateIndex(index);
+            EnsureMaterialized();
             _memory.Span[index] = value;
         }
     }
@@ -253,6 +286,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T[] ToArray()
     {
+        EnsureMaterialized();
         return _memory.ToArray();
     }
 
@@ -273,6 +307,13 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
         // Materialize deferred GPU download before exposing CPU data
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
@@ -293,9 +334,45 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        EnsureMaterialized();
+        return _memory.Span;
+    }
+
+    /// <summary>
+    /// Ensures the backing array is allocated and populated for CPU access.
+    /// Call this at the top of any method that reads _memory directly.
+    /// </summary>
+    private void EnsureMaterialized()
+    {
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
-        return _memory.Span;
+    }
+
+    /// <summary>
+    /// Gets the backing array reference WITHOUT triggering deferred GPU materialization.
+    /// Used by DirectGpuTensorEngine to check activation cache before deciding whether
+    /// to download — avoids wasteful GPU-to-CPU transfers for chained GPU operations.
+    /// WARNING: The returned array may contain stale/empty data if a deferred download is pending.
+    /// Only use this for cache key lookups, never for reading actual data.
+    /// </summary>
+    internal T[]? GetBackingArrayUnsafe()
+    {
+        if (_cachedArray is not null)
+            return _cachedArray;
+
+        if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null && segment.Offset == 0)
+        {
+            return segment.Array;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -305,9 +382,17 @@ public abstract class VectorBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            // Try to materialize GPU data into the new array via the vector-keyed callback
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
+
         if (_cachedArray is not null)
         {
-            // Materialize deferred GPU download if pending (populates the array on first CPU access)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _cachedArray;
         }
@@ -339,6 +424,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlyMemory<T> AsMemory()
     {
+        EnsureMaterialized();
         return _memory;
     }
 
@@ -355,6 +441,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        EnsureMaterialized();
         return _memory;
     }
 
@@ -368,6 +455,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<T> Clone()
     {
+        EnsureMaterialized();
         return CreateInstance(_memory.ToArray());
     }
 
@@ -424,8 +512,8 @@ public abstract class VectorBase<T>
         if (length < 0 || startIndex + length > this.Length)
             throw new ArgumentOutOfRangeException(nameof(length), "Length must be non-negative and the range must not exceed the vector bounds.");
 
+        EnsureMaterialized();
         VectorBase<T> subVector = CreateInstance(length);
-        // Use vectorized Copy for efficient memory transfer
         _numOps.Copy(_memory.Span.Slice(startIndex, length), subVector.AsWritableSpan());
 
         return subVector;
@@ -527,6 +615,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T Sum()
     {
+        EnsureMaterialized();
         return _numOps.Sum(_memory.Span);
     }
 
@@ -542,7 +631,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T L2Norm()
     {
-        // Use vectorized Dot product (sum of squares) then Sqrt - 10-15x faster with AVX2
+        EnsureMaterialized();
         var span = _memory.Span;
         T sumOfSquares = _numOps.Dot(span, span);
 
@@ -563,6 +652,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, TResult> function)
     {
+        EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -587,6 +677,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
+        EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -691,6 +782,7 @@ public abstract class VectorBase<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpan());
         return result;
     }
@@ -733,6 +825,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -779,6 +872,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, destination);
     }
 
@@ -801,6 +895,7 @@ public abstract class VectorBase<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
         return result;
     }
@@ -842,6 +937,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -886,6 +982,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, destination);
     }
 
@@ -904,6 +1001,7 @@ public abstract class VectorBase<T>
     public virtual VectorBase<T> Multiply(T scalar)
     {
         var result = CreateInstance(Length);
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
         return result;
     }
@@ -937,6 +1035,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -980,6 +1079,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, destination);
     }
 
@@ -998,6 +1098,7 @@ public abstract class VectorBase<T>
     public virtual VectorBase<T> Divide(T scalar)
     {
         var result = CreateInstance(Length);
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
         return result;
     }
@@ -1011,6 +1112,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void DivideInPlace(T scalar)
     {
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -1028,6 +1130,7 @@ public abstract class VectorBase<T>
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, destination);
     }
 
@@ -1042,6 +1145,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public override string ToString()
     {
+        EnsureMaterialized();
         return $"[{string.Join(", ", _memory.ToArray())}]";
     }
 }

@@ -417,6 +417,178 @@ extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const fl
     gradInput[idx] = -gradOutput[idx] / (x * x);
 }
 
+// ===========================================================================
+// Variance backward: dx = gradOutput * 2*(x - mean)/n
+// gradOutput is [outerSize], input is [outerSize * reduceSize], mean is [outerSize]
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void var_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ mean, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float g = gradOutput[outer];
+    float m = mean[outer];
+    float x = input[idx];
+    gradInput[idx] = g * 2.0f * (x - m) / (float)reduceSize;
+}
+
+// ===========================================================================
+// Std backward: dx = gradOutput * (x - mean) / (n * std)
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void std_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ mean, const float* __restrict__ stddev, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float g = gradOutput[outer];
+    float m = mean[outer];
+    float s = stddev[outer];
+    float x = input[idx];
+    gradInput[idx] = g * (x - m) / ((float)reduceSize * fmaxf(s, 1e-8f));
+}
+
+// ===========================================================================
+// MaskedFill backward: zero where mask is nonzero, pass gradient where zero
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void masked_fill_backward(const float* __restrict__ gradOutput, const float* __restrict__ mask, float* __restrict__ gradInput, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    gradInput[idx] = (mask[idx] != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// ===========================================================================
+// Where backward: route gradient based on condition
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void where_backward(const float* __restrict__ gradOutput, const float* __restrict__ condition, float* __restrict__ gradX, float* __restrict__ gradY, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float cond = condition[idx];
+    gradX[idx] = (cond != 0.0f) ? gradOutput[idx] : 0.0f;
+    gradY[idx] = (cond != 0.0f) ? 0.0f : gradOutput[idx];
+}
+
+// ===========================================================================
+// Norm backward: dx = gradOutput * x / norm
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void norm_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ norm, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float n = fmaxf(norm[outer], 1e-8f);
+    gradInput[idx] = gradOutput[outer] * input[idx] / n;
+}
+
+// ===========================================================================
+// LogSumExp backward: dx = gradOutput * softmax(x)
+// softmax_i = exp(x_i - lse) where lse = log(sum(exp(x)))
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void logsumexp_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, const float* __restrict__ lse, float* __restrict__ gradInput, int outerSize, int reduceSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outerSize * reduceSize;
+    if (idx >= total) return;
+    int outer = idx / reduceSize;
+    float softmax_val = expf(input[idx] - lse[outer]);
+    gradInput[idx] = gradOutput[outer] * softmax_val;
+}
+
+// ===========================================================================
+// 1D Average Pooling
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void avg_pool1d(const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outLength;
+    if (idx >= total) return;
+    int o = idx % outLength;
+    int c = (idx / outLength) % channels;
+    int b = idx / (outLength * channels);
+    int inOffset = (b * channels + c) * inLength;
+    float sum = 0.0f;
+    int count = 0;
+    for (int k = 0; k < kernelSize; k++) {
+        int pos = o * stride + k;
+        if (pos < inLength) { sum += input[inOffset + pos]; count++; }
+    }
+    output[idx] = count > 0 ? sum / (float)count : 0.0f;
+}
+
+// ===========================================================================
+// 1D Max Pooling
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void max_pool1d(const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outLength;
+    if (idx >= total) return;
+    int o = idx % outLength;
+    int c = (idx / outLength) % channels;
+    int b = idx / (outLength * channels);
+    int inOffset = (b * channels + c) * inLength;
+    float maxVal = -3.402823466e+38f;
+    for (int k = 0; k < kernelSize; k++) {
+        int pos = o * stride + k;
+        if (pos < inLength) { maxVal = fmaxf(maxVal, input[inOffset + pos]); }
+    }
+    output[idx] = maxVal;
+}
+
+// ===========================================================================
+// Bilinear Upsample 2D
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int inH, int inW, int outH, int outW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outH * outW;
+    if (idx >= total) return;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int c = (idx / (outW * outH)) % channels;
+    int b = idx / (outW * outH * channels);
+    float h_ratio = (outH > 1) ? (float)(inH - 1) / (float)(outH - 1) : 0.0f;
+    float w_ratio = (outW > 1) ? (float)(inW - 1) / (float)(outW - 1) : 0.0f;
+    float h_in = oh * h_ratio;
+    float w_in = ow * w_ratio;
+    int h0 = (int)h_in; int h1 = min(h0 + 1, inH - 1);
+    int w0 = (int)w_in; int w1 = min(w0 + 1, inW - 1);
+    float hd = h_in - h0; float wd = w_in - w0;
+    int base_idx = (b * channels + c) * inH * inW;
+    float v00 = input[base_idx + h0 * inW + w0];
+    float v01 = input[base_idx + h0 * inW + w1];
+    float v10 = input[base_idx + h1 * inW + w0];
+    float v11 = input[base_idx + h1 * inW + w1];
+    output[idx] = (1-hd)*(1-wd)*v00 + (1-hd)*wd*v01 + hd*(1-wd)*v10 + hd*wd*v11;
+}
+
+// ===========================================================================
+// Scatter Mean: accumulate by index and divide by count
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* __restrict__ source, const int* __restrict__ indices, float* __restrict__ output, int* __restrict__ counts, int sourceSize, int featureSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= sourceSize) return;
+    int row = idx / featureSize;
+    int col = idx % featureSize;
+    int targetRow = indices[row];
+    atomicAdd(&output[targetRow * featureSize + col], source[idx]);
+    if (col == 0) atomicAdd(&counts[targetRow], 1);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_divide(float* __restrict__ output, const int* __restrict__ counts, int outputSize, int featureSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= outputSize) return;
+    int row = idx / featureSize;
+    int cnt = counts[row];
+    if (cnt > 0) output[idx] /= (float)cnt;
+}
+
 // Warp-level reduction helpers for maximum performance
 __device__ __forceinline__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -1175,6 +1347,14 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "threshold_forward",
                 "threshold_backward",
                 "reciprocal_backward",
+                "var_backward",
+                "std_backward",
+                "masked_fill_backward",
+                "where_backward",
+                "norm_backward",
+                "logsumexp_backward",
+                "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
+                "scatter_mean", "scatter_mean_divide",
                 // Element-wise binary
                 "add_vectors",
                 "subtract_vectors",

@@ -89,6 +89,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a GPU-resident tensor with zero CPU allocation.
+    /// </summary>
+    internal static Tensor<T> CreateGpuResident(int[] shape, TensorDevice device = TensorDevice.CUDA)
+        => new Tensor<T>(shape, device);
+
+    private Tensor(int[] shape, TensorDevice gpuDevice) : base(shape, gpuDevice) { }
+
+    /// <summary>
     /// Private constructor for zero-copy tensor creation from a Vector.
     /// </summary>
     private Tensor(Vector<T> data, int[] dimensions) : base(data, dimensions)
@@ -3923,5 +3931,144 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             throw new ArgumentNullException(nameof(shape));
 
         return new Tensor<TResult>(shape);
+    }
+
+    // ================================================================
+    // Device transfer methods (PyTorch-compatible API)
+    // ================================================================
+
+    /// <summary>
+    /// Moves this tensor to the device specified by a DeviceInfo struct.
+    /// Supports multi-GPU: <c>tensor.To(DeviceInfo.Cuda(1))</c> moves to the second CUDA GPU.
+    /// Mutates this tensor in-place and returns it for fluent chaining.
+    /// </summary>
+    /// <param name="deviceInfo">The target device with index.</param>
+    /// <returns>This tensor with device updated.</returns>
+    public Tensor<T> To(DeviceInfo deviceInfo)
+    {
+        if (deviceInfo.Type == TensorDevice.CPU)
+            return Cpu();
+
+        // Validate that the requested backend type matches the available backend
+        var directGpu = Engines.Engine.DirectGpu;
+        if (directGpu is not null && directGpu.IsAvailable && directGpu.Backend is not null)
+        {
+            var actualType = directGpu.Backend.BackendName?.ToUpperInvariant() switch
+            {
+                "CUDA" or "NVIDIA" => TensorDevice.CUDA,
+                "OPENCL" => TensorDevice.OpenCL,
+                "HIP" or "ROCM" => TensorDevice.HIP,
+                "VULKAN" => TensorDevice.Vulkan,
+                "METAL" or "MPS" => TensorDevice.Metal,
+                _ => TensorDevice.CUDA
+            };
+            if (deviceInfo.Type != actualType && deviceInfo.Type != TensorDevice.CUDA)
+                throw new NotSupportedException(
+                    $"Requested device type {deviceInfo.Type} but the active GPU backend is {actualType}. " +
+                    $"Use To(DeviceInfo.{actualType}({deviceInfo.Index})) instead.");
+        }
+
+        var backend = Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
+        if (backend is null)
+            throw new InvalidOperationException($"No GPU backend available at device index {deviceInfo.Index}.");
+
+        var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
+        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
+        _gpuBuffer = backend.AllocateBuffer(floatData);
+        _gpuBackend = backend;
+        _gpuDeviceIndex = deviceInfo.Index;
+        _device = deviceInfo.Type;
+
+        return this;
+    }
+
+    /// <summary>
+    /// Moves this tensor to the device specified by a string like "cuda:0", "cpu", "opencl:1".
+    /// </summary>
+    public Tensor<T> To(string deviceString)
+    {
+        return To(DeviceInfo.Parse(deviceString));
+    }
+
+    public Tensor<T> To(TensorDevice device)
+    {
+        if (Device == device)
+            return this;
+
+        if (device == TensorDevice.CPU)
+            return Cpu();
+
+        // Use the default GPU backend but set the correct device type
+        var result = Gpu();
+        if (result._device != TensorDevice.CPU)
+            result._device = device;
+        return result;
+    }
+
+    /// <summary>
+    /// Moves this tensor to the GPU. If a GPU engine is available, uploads the data and
+    /// caches the GPU buffer. Equivalent to PyTorch's <c>tensor.cuda()</c>.
+    /// </summary>
+    /// <returns>This tensor with GPU buffer attached, or unchanged if no GPU available.</returns>
+    public Tensor<T> Gpu()
+    {
+        if (IsGpuResident)
+            return this;
+
+        var directGpu = Engines.Engine.DirectGpu;
+        if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
+            return this;
+
+        var backend = directGpu.Backend;
+        var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
+        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
+        _gpuBuffer = backend.AllocateBuffer(floatData);
+        _gpuBackend = backend;
+        _device = backend.BackendName?.ToUpperInvariant() switch
+        {
+            "CUDA" or "NVIDIA" => TensorDevice.CUDA,
+            "OPENCL" => TensorDevice.OpenCL,
+            "HIP" or "ROCM" => TensorDevice.HIP,
+            "VULKAN" => TensorDevice.Vulkan,
+            "METAL" or "MPS" => TensorDevice.Metal,
+            "WEBGPU" => TensorDevice.WebGPU,
+            "DIRECTML" or "DML" => TensorDevice.DirectML,
+            _ => TensorDevice.CUDA
+        };
+
+        return this;
+    }
+
+    /// <summary>
+    /// Ensures this tensor's data is on the CPU. If the tensor has a pending deferred GPU download,
+    /// materializes it now. Equivalent to PyTorch's <c>tensor.cpu()</c>.
+    /// </summary>
+    /// <returns>This tensor with CPU data synchronized.</returns>
+    public Tensor<T> Cpu()
+    {
+        if (!IsGpuResident)
+            return this;
+
+        // Force materialization of deferred download if pending
+        var arr = GetDataArray();
+
+        // If the backing array still has a deferred download pending, force it
+        var backingArray = _data.GetBackingArrayUnsafe();
+        if (backingArray is not null)
+        {
+            Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray);
+        }
+
+        // If we have a GPU buffer but data was never materialized through the deferred
+        // path (e.g., tensor was created via .Gpu()), download now
+        if (_gpuBuffer is not null && _gpuBackend is not null && _device != TensorDevice.CPU)
+        {
+            float[] floatData = _gpuBackend.DownloadBuffer(_gpuBuffer);
+            var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
+            Array.Copy(converted, arr, Math.Min(converted.Length, arr.Length));
+        }
+
+        _device = TensorDevice.CPU;
+        return this;
     }
 }

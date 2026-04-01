@@ -1716,6 +1716,209 @@ fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Backward kernels for reductions and gradient routing (4 buffers).
+    /// </summary>
+    public const string ReductionBackward4Source = @"
+@group(0) @binding(0) var<storage, read> rb_a: array<f32>;
+@group(0) @binding(1) var<storage, read> rb_b: array<f32>;
+@group(0) @binding(2) var<storage, read> rb_c: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rb_d: array<f32>;
+
+struct RBParams {
+    p0: u32,
+    p1: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(4) var<uniform> rb_params: RBParams;
+
+@compute @workgroup_size(256)
+fn var_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        rb_d[idx] = rb_a[outer] * 2.0 * (rb_b[idx] - rb_c[outer]) / f32(rb_params.p1);
+    }
+}
+
+@compute @workgroup_size(256)
+fn norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        let n = max(rb_c[outer], 1e-8);
+        rb_d[idx] = rb_a[outer] * rb_b[idx] / n;
+    }
+}
+
+@compute @workgroup_size(256)
+fn logsumexp_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        let softmax_val = exp(rb_b[idx] - rb_c[outer]);
+        rb_d[idx] = rb_a[outer] * softmax_val;
+    }
+}
+
+";
+
+    /// <summary>Where backward needs read_write on both output buffers.</summary>
+    public const string WhereBackward4Source = @"
+@group(0) @binding(0) var<storage, read> wb_a: array<f32>;
+@group(0) @binding(1) var<storage, read> wb_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> wb_c: array<f32>;
+@group(0) @binding(3) var<storage, read_write> wb_d: array<f32>;
+
+struct WBParams {
+    p0: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+@group(0) @binding(4) var<uniform> wb_params: WBParams;
+
+@compute @workgroup_size(256)
+fn where_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < wb_params.p0) {
+        let cond = wb_b[idx];
+        wb_c[idx] = select(0.0, wb_a[idx], cond != 0.0);
+        wb_d[idx] = select(wb_a[idx], 0.0, cond != 0.0);
+    }
+}
+";
+
+    /// <summary>
+    /// Backward kernels needing 5 buffers (StdBackward).
+    /// </summary>
+    public const string ReductionBackward5Source = @"
+@group(0) @binding(0) var<storage, read> rb5_a: array<f32>;
+@group(0) @binding(1) var<storage, read> rb5_b: array<f32>;
+@group(0) @binding(2) var<storage, read> rb5_c: array<f32>;
+@group(0) @binding(3) var<storage, read> rb5_d: array<f32>;
+@group(0) @binding(4) var<storage, read_write> rb5_e: array<f32>;
+
+struct RB5Params {
+    p0: u32,
+    p1: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(5) var<uniform> rb5_params: RB5Params;
+
+@compute @workgroup_size(256)
+fn std_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb5_params.p0 * rb5_params.p1;
+    if (idx < total) {
+        let outer = idx / rb5_params.p1;
+        let s = max(rb5_d[outer], 1e-8);
+        rb5_e[idx] = rb5_a[outer] * (rb5_b[idx] - rb5_c[outer]) / (f32(rb5_params.p1) * s);
+    }
+}
+";
+
+    /// <summary>
+    /// MaskedFill backward (3 buffers).
+    /// </summary>
+    public const string MaskedFillBackwardSource = @"
+@group(0) @binding(0) var<storage, read> mfb_grad: array<f32>;
+@group(0) @binding(1) var<storage, read> mfb_mask: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mfb_out: array<f32>;
+
+struct MFBParams {
+    size: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+@group(0) @binding(3) var<uniform> mfb_params: MFBParams;
+
+@compute @workgroup_size(256)
+fn masked_fill_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < mfb_params.size) {
+        mfb_out[idx] = select(mfb_grad[idx], 0.0, mfb_mask[idx] != 0.0);
+    }
+}
+";
+
+    /// <summary>Pool1D and BilinearUpsample (2 buffers: input, output).</summary>
+    public const string Pool1DSource = @"
+@group(0) @binding(0) var<storage, read> pool_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> pool_out: array<f32>;
+
+struct PoolParams { batch: u32, channels: u32, inLength: u32, outLength: u32, kernelSize: u32, stride: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(2) var<uniform> pool_params: PoolParams;
+
+@compute @workgroup_size(256)
+fn avg_pool1d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = pool_params.batch * pool_params.channels * pool_params.outLength;
+    if (idx >= total) { return; }
+    let o = idx % pool_params.outLength;
+    let c = (idx / pool_params.outLength) % pool_params.channels;
+    let b = idx / (pool_params.outLength * pool_params.channels);
+    let inOff = (b * pool_params.channels + c) * pool_params.inLength;
+    var sum: f32 = 0.0; var cnt: u32 = 0;
+    for (var k: u32 = 0; k < pool_params.kernelSize; k = k + 1) {
+        let pos = o * pool_params.stride + k;
+        if (pos < pool_params.inLength) { sum = sum + pool_in[inOff + pos]; cnt = cnt + 1; }
+    }
+    pool_out[idx] = select(0.0, sum / f32(cnt), cnt > 0);
+}
+
+@compute @workgroup_size(256)
+fn max_pool1d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = pool_params.batch * pool_params.channels * pool_params.outLength;
+    if (idx >= total) { return; }
+    let o = idx % pool_params.outLength;
+    let c = (idx / pool_params.outLength) % pool_params.channels;
+    let b = idx / (pool_params.outLength * pool_params.channels);
+    let inOff = (b * pool_params.channels + c) * pool_params.inLength;
+    var maxVal: f32 = -3.402823466e+38;
+    for (var k: u32 = 0; k < pool_params.kernelSize; k = k + 1) {
+        let pos = o * pool_params.stride + k;
+        if (pos < pool_params.inLength) { maxVal = max(maxVal, pool_in[inOff + pos]); }
+    }
+    pool_out[idx] = maxVal;
+}
+";
+
+    /// <summary>Bilinear upsample 2D (2 buffers: input, output).</summary>
+    public const string BilinearUpsample2DSource = @"
+@group(0) @binding(0) var<storage, read> bu_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> bu_out: array<f32>;
+
+struct BUParams { batch: u32, channels: u32, inH: u32, inW: u32, outH: u32, outW: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(2) var<uniform> bu_params: BUParams;
+
+@compute @workgroup_size(256)
+fn bilinear_upsample2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = bu_params.batch * bu_params.channels * bu_params.outH * bu_params.outW;
+    if (idx >= total) { return; }
+    let ow = idx % bu_params.outW;
+    let oh = (idx / bu_params.outW) % bu_params.outH;
+    let c = (idx / (bu_params.outW * bu_params.outH)) % bu_params.channels;
+    let b = idx / (bu_params.outW * bu_params.outH * bu_params.channels);
+    let h_ratio = select(0.0, f32(bu_params.inH - 1) / f32(bu_params.outH - 1), bu_params.outH > 1);
+    let w_ratio = select(0.0, f32(bu_params.inW - 1) / f32(bu_params.outW - 1), bu_params.outW > 1);
+    let h_in = f32(oh) * h_ratio; let w_in = f32(ow) * w_ratio;
+    let h0 = u32(h_in); let h1 = min(h0 + 1, bu_params.inH - 1);
+    let w0 = u32(w_in); let w1 = min(w0 + 1, bu_params.inW - 1);
+    let hd = h_in - f32(h0); let wd = w_in - f32(w0);
+    let base_idx = (b * bu_params.channels + c) * bu_params.inH * bu_params.inW;
+    bu_out[idx] = (1-hd)*(1-wd)*bu_in[base_idx+h0*bu_params.inW+w0] + (1-hd)*wd*bu_in[base_idx+h0*bu_params.inW+w1] + hd*(1-wd)*bu_in[base_idx+h1*bu_params.inW+w0] + hd*wd*bu_in[base_idx+h1*bu_params.inW+w1];
+}
+";
+
+    /// <summary>
     /// PReLU/RReLU forward kernels (3 buffers: input, alpha/noise, output).
     /// </summary>
     public const string PReluForwardSource = @"
@@ -7873,7 +8076,8 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                LerpFusedSource + AddScaledSource +
                GatedActivationSource + SoftmaxVariantsSource +
                ShapeOpsSource + ReductionExtSource +
-               StridedOpsSource;
+               StridedOpsSource +
+               Pool1DSource + BilinearUpsample2DSource;
     }
 
     // ============================================================================

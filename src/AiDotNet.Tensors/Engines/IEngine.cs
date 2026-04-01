@@ -1677,6 +1677,46 @@ public interface IEngine
     /// <returns>The gradient with respect to the input.</returns>
     Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope);
 
+    /// <summary>Backward pass for Swish/SiLU activation.</summary>
+    Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for Mish activation.</summary>
+    Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for Softplus activation.</summary>
+    Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for HardSwish activation.</summary>
+    Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for SELU activation.</summary>
+    Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for HardSigmoid activation.</summary>
+    Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for ReLU6 activation.</summary>
+    Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input);
+
+    /// <summary>Backward pass for ELU activation.</summary>
+    Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha);
+
+    /// <summary>Backward pass for Threshold activation. Uses double threshold to match forward pass precision.</summary>
+    Tensor<T> ThresholdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double threshold);
+
+    /// <summary>Backward pass for Reciprocal.</summary>
+    Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output);
+
+    /// <summary>Backward pass for PReLU: returns (inputGrad, alphaGrad).</summary>
+    (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha);
+
+    /// <summary>Backward pass for global variance reduction. For axis-specific backward, see ReduceVarianceBackward.
+    /// This method handles the common case of global variance used by autograd.</summary>
+    Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes);
+
+    /// <summary>Backward pass for Std reduction.</summary>
+    Tensor<T> StdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> std, int[] axes);
+
     #endregion
 
     #region Matrix Operations (Phase B: Epic 2)
@@ -2484,6 +2524,9 @@ public interface IEngine
     /// </para>
     /// </remarks>
     Tensor<T> TensorCeiling<T>(Tensor<T> tensor);
+
+    /// <summary>Element-wise round to nearest integer using MidpointRounding.ToEven (banker's rounding). GPU backends use hardware rounding which matches this mode.</summary>
+    Tensor<T> TensorRound<T>(Tensor<T> tensor);
 
     /// <summary>
     /// Computes the element-wise fractional part of a tensor (x - floor(x)).

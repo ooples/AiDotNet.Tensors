@@ -61,6 +61,72 @@ public sealed class DirectGpuEngine : IDisposable
     public IDirectGpuBackend? Backend => _backend;
 
     /// <summary>
+    /// Gets the number of available CUDA GPU devices. For non-CUDA backends
+    /// (OpenCL, HIP, Vulkan, Metal, WebGPU), use the backend-specific device enumeration.
+    /// Equivalent to torch.cuda.device_count().
+    /// </summary>
+    public static int CudaDeviceCount
+    {
+        get
+        {
+            try
+            {
+                if (!CUDA.CudaNativeBindings.IsAvailable)
+                    return 0;
+
+                var result = CuBlasNative.cuDeviceGetCount(out int count);
+                return result == CudaResult.Success ? count : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates a backend for a specific GPU device index.
+    /// Use this for multi-GPU scenarios where tensors need to be placed on specific devices.
+    /// </summary>
+    /// <param name="deviceIndex">The GPU device index (0 = first GPU, 1 = second, etc.).</param>
+    /// <returns>A GPU backend for the specified device, or null if unavailable.</returns>
+    public static IDirectGpuBackend? CreateBackendForDevice(int deviceIndex)
+    {
+        try
+        {
+            if (CUDA.CudaNativeBindings.IsAvailable)
+            {
+                var backend = new CUDA.CudaBackend(deviceIndex);
+                if (backend.IsAvailable)
+                    return backend;
+                backend.Dispose();
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if peer-to-peer access is possible between two CUDA devices.
+    /// When true, cuMemcpyPeerAsync can transfer data directly between GPUs
+    /// without staging through host memory.
+    /// </summary>
+    public static bool CanAccessPeer(int device, int peerDevice)
+    {
+        try
+        {
+            var result = CUDA.CudaNativeBindings.cuDeviceCanAccessPeer(
+                out int canAccess, device, peerDevice);
+            return result == CudaResult.Success && canAccess != 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Gets the GPU vendor.
     /// </summary>
     public string DeviceVendor => _backend?.DeviceVendor ?? "None";

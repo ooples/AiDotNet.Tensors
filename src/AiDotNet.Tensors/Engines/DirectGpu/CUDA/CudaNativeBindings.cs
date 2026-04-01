@@ -167,4 +167,124 @@ internal static class CudaNativeBindings
     // Stream flag constants
     public const uint CU_STREAM_DEFAULT = 0;
     public const uint CU_STREAM_NON_BLOCKING = 1;
+
+    // ──────────────────────────────────────────────────────────────
+    // Driver version detection
+    // ──────────────────────────────────────────────────────────────
+
+    [DllImport(CudaLibrary, EntryPoint = "cuDriverGetVersion")]
+    public static extern CudaResult cuDriverGetVersion(out int driverVersion);
+
+    /// <summary>
+    /// Gets the CUDA driver version. Returns 0 if unavailable.
+    /// Version format: major*1000 + minor*10 (e.g., 12040 = CUDA 12.4).
+    /// </summary>
+    public static int DriverVersion
+    {
+        get
+        {
+            try
+            {
+                if (!IsAvailable) return 0;
+                var result = cuDriverGetVersion(out int version);
+                return result == CudaResult.Success ? version : 0;
+            }
+            catch { return 0; }
+        }
+    }
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports graph capture (requires CUDA 10.0+, version >= 10000).
+    /// </summary>
+    public static bool SupportsGraphCapture => DriverVersion >= 10000;
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports peer access (requires CUDA 4.0+, version >= 4000).
+    /// </summary>
+    public static bool SupportsPeerAccess => DriverVersion >= 4000;
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports pinned host memory (requires CUDA 2.0+).
+    /// </summary>
+    public static bool SupportsPinnedMemory => DriverVersion >= 2000;
+
+    // ──────────────────────────────────────────────────────────────
+    // CUDA Graph APIs (cuStreamBeginCapture/cuGraphLaunch)
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>Stream capture mode for cuStreamBeginCapture.</summary>
+    public const int CU_STREAM_CAPTURE_MODE_GLOBAL = 0;
+    public const int CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1;
+    public const int CU_STREAM_CAPTURE_MODE_RELAXED = 2;
+
+    [DllImport(CudaLibrary, EntryPoint = "cuStreamBeginCapture")]
+    public static extern CudaResult cuStreamBeginCapture(IntPtr stream, int mode);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuStreamEndCapture")]
+    public static extern CudaResult cuStreamEndCapture(IntPtr stream, out IntPtr graph);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphInstantiateWithFlags")]
+    public static extern CudaResult cuGraphInstantiate(
+        out IntPtr graphExec, IntPtr graph, ulong flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphLaunch")]
+    public static extern CudaResult cuGraphLaunch(IntPtr graphExec, IntPtr stream);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphDestroy")]
+    public static extern CudaResult cuGraphDestroy(IntPtr graph);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphExecDestroy")]
+    public static extern CudaResult cuGraphExecDestroy(IntPtr graphExec);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuStreamIsCapturing")]
+    public static extern CudaResult cuStreamIsCapturing(IntPtr stream, out int captureStatus);
+
+    // ──────────────────────────────────────────────────────────────
+    // Multi-GPU context management
+    // ──────────────────────────────────────────────────────────────
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxSetCurrent")]
+    public static extern CudaResult cuCtxSetCurrent(IntPtr ctx);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxGetCurrent")]
+    public static extern CudaResult cuCtxGetCurrent(out IntPtr ctx);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxPushCurrent_v2")]
+    public static extern CudaResult cuCtxPushCurrent(IntPtr ctx);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxPopCurrent_v2")]
+    public static extern CudaResult cuCtxPopCurrent(out IntPtr ctx);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemcpyPeerAsync")]
+    public static extern CudaResult cuMemcpyPeerAsync(
+        IntPtr dstDevice, IntPtr dstContext,
+        IntPtr srcDevice, IntPtr srcContext,
+        ulong byteCount, IntPtr stream);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuCtxEnablePeerAccess")]
+    public static extern CudaResult cuCtxEnablePeerAccess(IntPtr peerContext, uint flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuDeviceCanAccessPeer")]
+    public static extern CudaResult cuDeviceCanAccessPeer(out int canAccessPeer, int device, int peerDevice);
+
+    // ──────────────────────────────────────────────────────────────
+    // Pinned (page-locked) memory
+    // ──────────────────────────────────────────────────────────────
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAllocHost_v2")]
+    public static extern CudaResult cuMemAllocHost(out IntPtr pp, ulong bytesize);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemFreeHost")]
+    public static extern CudaResult cuMemFreeHost(IntPtr p);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemHostRegister_v2")]
+    public static extern CudaResult cuMemHostRegister(IntPtr p, ulong bytesize, uint flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemHostUnregister")]
+    public static extern CudaResult cuMemHostUnregister(IntPtr p);
+
+    /// <summary>Flag for cuMemHostRegister: memory is portable across contexts.</summary>
+    public const uint CU_MEMHOSTREGISTER_PORTABLE = 1;
+    /// <summary>Flag for cuMemHostRegister: memory is mapped into device address space.</summary>
+    public const uint CU_MEMHOSTREGISTER_DEVICEMAP = 2;
 }

@@ -27,6 +27,12 @@ public abstract class TensorBase<T> : IDisposable
     protected readonly Vector<T> _data;
 
     /// <summary>
+    /// Internal accessor for the backing vector. Used by DirectGpuTensorEngine to check
+    /// activation cache without triggering CPU materialization.
+    /// </summary>
+    internal Vector<T> DataVector => _data;
+
+    /// <summary>
     /// Internal shape array. Direct access for same-assembly code (CpuEngine, etc.) — zero overhead.
     /// External consumers use the Shape property which returns an immutable TensorShape wrapper.
     /// </summary>
@@ -44,6 +50,59 @@ public abstract class TensorBase<T> : IDisposable
     /// Zero for non-view tensors. Non-zero for sliced views.
     /// </summary>
     internal readonly int _storageOffset;
+
+    /// <summary>
+    /// Tracks the device where this tensor's data currently resides.
+    /// Set to GPU by DirectGpuTensorEngine when a GPU op defers its download.
+    /// Reset to CPU when the data is materialized to the CPU-side array.
+    /// </summary>
+    internal TensorDevice _device = TensorDevice.CPU;
+
+    /// <summary>
+    /// Optional GPU buffer reference for GPU-resident tensors.
+    /// When non-null, this tensor's authoritative data is on the GPU — the CPU-side
+    /// _data array may be empty/stale until explicitly synchronized.
+    /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
+    /// </summary>
+    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
+
+    /// <summary>
+    /// Backend that owns the GPU buffer. Required for downloading data to CPU.
+    /// </summary>
+    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
+
+    /// <summary>
+    /// Gets or sets the device where this tensor's data resides.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> This tells you whether the tensor's data is on the CPU
+    /// (regular computer memory) or on the GPU (graphics card memory). When a GPU operation
+    /// produces a result, the tensor is marked as GPU-resident. Reading the data from CPU
+    /// code triggers a lazy download, and the device changes back to CPU.</para>
+    /// </remarks>
+    public TensorDevice Device
+    {
+        get => _device;
+        internal set => _device = value;
+    }
+
+    /// <summary>
+    /// Returns true if this tensor's data is believed to reside on a GPU device.
+    /// After CPU materialization (e.g., via AsSpan/GetDataArray), call Cpu()
+    /// to update the device state. The tensor does not auto-detect materialization.
+    /// </summary>
+    public bool IsGpuResident => _device != TensorDevice.CPU;
+
+    /// <summary>
+    /// Gets the full device info including device index for multi-GPU scenarios.
+    /// Equivalent to PyTorch's <c>tensor.device</c> which returns e.g. <c>device(type='cuda', index=0)</c>.
+    /// </summary>
+    public DeviceInfo DeviceInfo => new DeviceInfo(Device, _gpuDeviceIndex);
+
+    /// <summary>
+    /// The device index for multi-GPU scenarios (0 = first GPU, 1 = second, etc.).
+    /// </summary>
+    internal int _gpuDeviceIndex;
 
     /// <summary>
     /// Monotonically increasing version counter. Incremented by in-place mutation operations.
@@ -214,6 +273,28 @@ public abstract class TensorBase<T> : IDisposable
         if (_data.Length != expectedSize)
             throw new ArgumentException("The number of values does not match the specified shape.");
         _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
+    /// Creates a GPU-resident tensor with zero CPU memory allocation.
+    /// The backing array is allocated lazily when CPU code first accesses the data.
+    /// Used by DirectGpuTensorEngine for GPU-only intermediate results.
+    /// </summary>
+    internal TensorBase(int[] shape, TensorDevice gpuDevice)
+    {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        ValidateShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
+        int expectedSize = ComputeProduct(shape);
+        Length = expectedSize;
+        _data = Vector<T>.CreateGpuResident(expectedSize);
+        _storage = new TensorStorage<T>(_data);
+        _device = gpuDevice;
     }
 
     /// <summary>

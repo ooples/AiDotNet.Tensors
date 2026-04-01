@@ -1532,6 +1532,36 @@ public interface IDirectGpuBackend : IDisposable
     void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size);
     void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size);
 
+    /// <summary>Backward for variance: dx = gradOutput * 2*(x - mean)/n</summary>
+    void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize);
+
+    /// <summary>Backward for standard deviation: dx = gradOutput * (x - mean)/(n * std)</summary>
+    void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize);
+
+    /// <summary>Backward for masked fill: zero where mask is true, pass gradient through where false</summary>
+    void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size);
+
+    /// <summary>Backward for where: route gradient to x where condition is true, to y where false</summary>
+    void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size);
+
+    /// <summary>Backward for L2 norm reduction: dx = gradOutput * x / norm</summary>
+    void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize);
+
+    /// <summary>Backward for log-sum-exp: dx = gradOutput * softmax(x)</summary>
+    void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize);
+
+    /// <summary>1D average pooling: [batch, channels, length] -> [batch, channels, outLength]</summary>
+    void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride);
+
+    /// <summary>1D max pooling: [batch, channels, length] -> [batch, channels, outLength]</summary>
+    void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride);
+
+    /// <summary>Bilinear upsampling for 2D spatial data: [batch, channels, inH, inW] -> [batch, channels, outH, outW]</summary>
+    void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW);
+
+    /// <summary>Fused scatter-mean: accumulates values by index and divides by count</summary>
+    void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize);
+
     #endregion
 
     #region Loss Functions

@@ -1164,6 +1164,151 @@ void main() {
     c[idx] = -a[idx] / (x * x);
 }";
 
+    public static string VarBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    d[idx] = a[outer] * 2.0 * (bdata[idx] - c[outer]) / float(reduceSize);
+}";
+
+    public static string StdBackwardGlsl => Header + FiveBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float s = max(d[outer], 1e-8);
+    e[idx] = a[outer] * (bdata[idx] - c[outer]) / (float(reduceSize) * s);
+}";
+
+    public static string MaskedFillBackwardGlsl => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    c[idx] = (bdata[idx] != 0.0) ? 0.0 : a[idx];
+}";
+
+    public static string WhereBackwardGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) buffer D { float d[]; };
+layout(push_constant) uniform Params { uint size; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float cond = bdata[idx];
+    c[idx] = (cond != 0.0) ? a[idx] : 0.0;
+    d[idx] = (cond != 0.0) ? 0.0 : a[idx];
+}";
+
+    public static string NormBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float n = max(c[outer], 1e-8);
+    d[idx] = a[outer] * bdata[idx] / n;
+}";
+
+    public static string LogSumExpBackwardGlsl => Header + FourBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = outerSize * reduceSize;
+    if (idx >= total) return;
+    uint outer = idx / reduceSize;
+    float softmax_val = exp(bdata[idx] - c[outer]);
+    d[idx] = a[outer] * softmax_val;
+}";
+
+    public static string AvgPool1DGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inLength; uint outLength; uint kernelSize; uint stride; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batch * channels * outLength;
+    if (idx >= total) return;
+    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint b = idx / (outLength * channels);
+    uint inOff = (b * channels + ch) * inLength;
+    float sum = 0.0; uint cnt = 0;
+    for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) { sum += a[inOff + pos]; cnt++; } }
+    b[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
+}";
+
+    public static string MaxPool1DGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inLength; uint outLength; uint kernelSize; uint stride; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batch * channels * outLength;
+    if (idx >= total) return;
+    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint b = idx / (outLength * channels);
+    uint inOff = (b * channels + ch) * inLength;
+    float maxVal = -3.402823466e+38;
+    for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, a[inOff + pos]); }
+    b[idx] = maxVal;
+}";
+
+    public static string BilinearUpsample2DGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint outH; uint outW; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = batch * channels * outH * outW;
+    if (idx >= total) return;
+    uint ow = idx % outW; uint oh = (idx / outW) % outH; uint ch = (idx / (outW * outH)) % channels; uint b = idx / (outW * outH * channels);
+    float h_ratio = (outH > 1) ? float(inH - 1) / float(outH - 1) : 0.0;
+    float w_ratio = (outW > 1) ? float(inW - 1) / float(outW - 1) : 0.0;
+    float h_in = float(oh) * h_ratio; float w_in = float(ow) * w_ratio;
+    uint h0 = uint(h_in); uint h1 = min(h0 + 1, inH - 1); uint w0 = uint(w_in); uint w1 = min(w0 + 1, inW - 1);
+    float hd = h_in - float(h0); float wd = w_in - float(w0);
+    uint base_idx = (b * channels + ch) * inH * inW;
+    b[idx] = (1-hd)*(1-wd)*a[base_idx+h0*inW+w0] + (1-hd)*wd*a[base_idx+h0*inW+w1] + hd*(1-wd)*a[base_idx+h1*inW+w0] + hd*wd*a[base_idx+h1*inW+w1];
+}";
+
+    public static string ScatterMeanGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { int bdata[]; };
+layout(set = 0, binding = 2) buffer C { uint c_bits[]; };
+layout(set = 0, binding = 3) buffer D { uint d_counts[]; };
+layout(push_constant) uniform Params { uint sourceSize; uint featureSize; };
+
+// CAS-based atomic float add using uint reinterpretation (no GL_EXT_shader_atomic_float needed)
+void atomicAddFloat(uint index, float val) {
+    uint oldBits = c_bits[index];
+    uint newBits;
+    do {
+        float oldVal = uintBitsToFloat(oldBits);
+        newBits = floatBitsToUint(oldVal + val);
+    } while ((oldBits = atomicCompSwap(c_bits[index], oldBits, newBits)) != oldBits);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= sourceSize) return;
+    uint row = idx / featureSize; uint col = idx % featureSize;
+    uint targetRow = uint(bdata[row]);
+    atomicAddFloat(targetRow * featureSize + col, a[idx]);
+    if (col == 0) atomicAdd(d_counts[targetRow], 1u);
+}";
+
+    public static string ScatterMeanDivideGlsl => Header + @"
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(push_constant) uniform Params { uint outputSize; uint featureSize; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= outputSize) return;
+    uint row = idx / featureSize;
+    float cnt = b[row];
+    if (cnt > 0.0) a[idx] /= cnt;
+}";
+
     // =====================================================================
     // Loss function kernels (forward + backward)
     // =====================================================================

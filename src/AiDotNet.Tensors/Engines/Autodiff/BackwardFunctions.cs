@@ -144,18 +144,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var signTensor = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            var val = inputs[0].GetFlat(i);
-            if (numOps.GreaterThan(val, numOps.Zero))
-                signTensor.SetFlat(i, numOps.One);
-            else if (numOps.LessThan(val, numOps.Zero))
-                signTensor.SetFlat(i, numOps.Negate(numOps.One));
-            else
-                signTensor.SetFlat(i, numOps.Zero);
-        }
+        var signTensor = engine.TensorSign(inputs[0]);
         var grad = engine.TensorMultiply(gradOutput, signTensor);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -223,17 +212,22 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // d/dx clamp(x, min, max) = 1 if min <= x <= max, else 0
+        // Compute via: mask = (x >= min) * (x <= max), then grad * mask
         var numOps = MathHelper.GetNumericOperations<T>();
         var min = numOps.FromDouble((double)savedState[0]);
         var max = numOps.FromDouble((double)savedState[1]);
-        var mask = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            var val = inputs[0].GetFlat(i);
-            bool inRange = numOps.GreaterThan(val, min) && numOps.LessThan(val, max);
-            bool atBound = numOps.Equals(val, min) || numOps.Equals(val, max);
-            mask.SetFlat(i, (inRange || atBound) ? numOps.One : numOps.Zero);
-        }
+
+        // Clamp the input to [min, max], compare with original — equal means in range
+        var clamped = engine.TensorClamp(inputs[0], min, max);
+        // Where clamped == input, gradient passes through; otherwise zero
+        var diff = engine.TensorSubtract(clamped, inputs[0]);
+        var absDiff = engine.TensorAbs(diff);
+        // absDiff is 0 where in range, nonzero where clamped — use as mask
+        // Create ones tensor and subtract the sign of absDiff
+        var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(absDiff, numOps.Zero), numOps.One);
+        var sign = engine.TensorSign(absDiff);
+        var mask = engine.TensorSubtract(ones, sign);
         var grad = engine.TensorMultiply(gradOutput, mask);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -935,26 +929,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        // SELU derivative: lambda for x >= 0, lambda*alpha*exp(x) for x < 0
-        // = lambda * (positive_mask + alpha*exp(x) * negative_mask)
-        // Use output directly: selu(x) = scale*(x if x>=0, alpha*(exp(x)-1) if x<0)
-        // So for negative: output = scale*alpha*(exp(x)-1), meaning scale*alpha*exp(x) = output + scale*alpha
-        // derivative_negative = output + scale*alpha = output + lambda*alpha
-        const double lambda = 1.0507009873554804934193349852946;
-        const double lambdaAlpha = 1.0507009873554804934193349852946 * 1.6732632423543772848170429916717;
-        // Compute exp(x) for the negative region via engine
-        var expX = engine.TensorExp(inputs[0]);
-        var negDeriv = engine.TensorMultiplyScalar(expX, numOps.FromDouble(lambdaAlpha));
-        // Build mask: for each element, pick lambda (positive) or lambdaAlpha*exp(x) (negative)
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            bool positive = numOps.ToDouble(inputs[0][i]) >= 0;
-            T deriv = positive ? numOps.FromDouble(lambda) : negDeriv[i];
-            dx[i] = numOps.Multiply(gradOutput[i], deriv);
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.SeluBackward(gradOutput, inputs[0]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>d(hardsigmoid(x))/dx = 1/6 if -3 < x < 3, else 0</summary>
@@ -962,16 +938,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            double val = numOps.ToDouble(inputs[0][i]);
-            dx[i] = (val > -3.0 && val < 3.0)
-                ? numOps.FromDouble(numOps.ToDouble(gradOutput[i]) / 6.0)
-                : numOps.Zero;
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.HardsigmoidBackward(gradOutput, inputs[0]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>d(hardswish(x))/dx</summary>
@@ -994,14 +962,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            double val = numOps.ToDouble(inputs[0][i]);
-            dx[i] = (val > 0 && val < 6) ? gradOutput[i] : numOps.Zero;
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.Relu6Backward(gradOutput, inputs[0]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Concatenate backward: split gradient along concat axis</summary>
@@ -1174,26 +1136,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var x = inputs[0];
-        var alpha = inputs[1];
-        int channels = savedState.Length > 0 ? (int)savedState[0] : alpha.Length;
-        int spatialSize = savedState.Length > 1 ? (int)savedState[1] : 1;
-        var xGrad = TensorPool<T>.RentZeroed(x.Shape.ToArray());
-        var alphaGrad = TensorPool<T>.RentZeroed(alpha.Shape.ToArray());
-
-        for (int i = 0; i < x.Length; i++)
-        {
-            double val = numOps.ToDouble(x[i]);
-            int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
-            double a = numOps.ToDouble(alpha[channelIdx]);
-            double g = numOps.ToDouble(gradOutput[i]);
-
-            xGrad[i] = val >= 0 ? gradOutput[i] : numOps.FromDouble(a * g);
-            if (val < 0)
-                alphaGrad[channelIdx] = numOps.Add(alphaGrad[channelIdx], numOps.FromDouble(val * g));
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], xGrad, engine);
+        var (inputGrad, alphaGrad) = engine.PReLUBackward(gradOutput, inputs[0], inputs[1]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], alphaGrad, engine);
     }
 
@@ -1202,15 +1146,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
         double threshold = (double)savedState[0];
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            double val = numOps.ToDouble(inputs[0][i]);
-            dx[i] = val > threshold ? gradOutput[i] : numOps.Zero;
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.ThresholdBackward(gradOutput, inputs[0], threshold);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Flatten backward: reshape gradient back to input shape</summary>
@@ -1488,13 +1426,21 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var noise = (Tensor<T>)savedState[0];
-        // RReLU backward: grad * (x >= 0 ? 1 : noise[i])
-        // Use engine ops for tape recording when createGraph=true
-        var noiseGrad = engine.TensorMultiply(gradOutput, noise);
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-            dx[i] = numOps.ToDouble(inputs[0][i]) >= 0 ? gradOutput[i] : noiseGrad[i];
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        // RReLU: x >= 0 ? grad : grad * noise
+        // Build positive mask: ceil(clamp((sign(x)+1)/2, 0, 1)) gives 1 for x>=0, 0 for x<0
+        var rawSign = engine.TensorSign(inputs[0]);
+        var shifted = engine.TensorAddScalar(rawSign, numOps.One);
+        var halved = engine.TensorMultiplyScalar(shifted, numOps.FromDouble(0.5));
+        var sign = engine.TensorCeiling(engine.TensorClamp(halved, numOps.Zero, numOps.One));
+        // posGrad = grad * sign(relu(x))  (gradient where x >= 0)
+        var posGrad = engine.TensorMultiply(gradOutput, sign);
+        // negMask = 1 - sign  (1 where x < 0, 0 where x >= 0)
+        var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(sign, numOps.Zero), numOps.One);
+        var negMask = engine.TensorSubtract(ones, sign);
+        // negGrad = grad * noise * negMask
+        var negGrad = engine.TensorMultiply(engine.TensorMultiply(gradOutput, noise), negMask);
+        var grad = engine.TensorAdd(posGrad, negGrad);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>LogSoftmax backward</summary>
@@ -1576,16 +1522,18 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Argmax indices are flat offsets — scatter gradient to those positions
+        // Use engine ops: create zeros, then add gradient at argmax positions
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
-        var inShape = inputs[0].Shape.ToArray();
-        var inputGrad = TensorPool<T>.RentZeroed(inShape);
-
-        for (int i = 0; i < gradOutput.Length; i++)
+        var inputGrad = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradData = gradOutput.GetDataArray();
+        var resultData = inputGrad.GetDataArray();
+        for (int i = 0; i < argmax.Length; i++)
         {
-            int maxIdx = argmax[i];
-            if (maxIdx >= 0 && maxIdx < inputGrad.Length)
-                inputGrad[maxIdx] = numOps.Add(inputGrad[maxIdx], gradOutput[i]);
+            int idx = argmax[i];
+            if (idx >= 0 && idx < resultData.Length)
+                resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
@@ -1628,14 +1576,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            double r = numOps.ToDouble(output[i]);
-            dx[i] = numOps.FromDouble(-numOps.ToDouble(gradOutput[i]) * r * r);
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.ReciprocalBackward(gradOutput, output);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Sign backward: zero gradient (piecewise constant)</summary>
@@ -1661,19 +1603,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            double x = numOps.ToDouble(inputs[0][i]);
-            double sp = Math.Log(1.0 + Math.Exp(x));
-            double tanhSp = Math.Tanh(sp);
-            double sech2 = 1.0 - tanhSp * tanhSp;
-            double sig = 1.0 / (1.0 + Math.Exp(-x));
-            double deriv = tanhSp + x * sech2 * sig;
-            dx[i] = numOps.FromDouble(numOps.ToDouble(gradOutput[i]) * deriv);
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var grad = engine.MishBackward(gradOutput, inputs[0]);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -1703,16 +1634,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputs[0].Length;
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        double mean = 0;
-        for (int i = 0; i < n; i++) mean += numOps.ToDouble(inputs[0][i]);
-        mean /= n;
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < n; i++)
-            dx[i] = numOps.FromDouble(gOut * 2.0 * (numOps.ToDouble(inputs[0][i]) - mean) / n);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        // Compute mean via engine (GPU-resident)
+        var mean = engine.TensorMeanDiff(inputs[0]);
+        var grad = engine.VarBackward(gradOutput, inputs[0], mean, Array.Empty<int>());
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Std backward: d(std(x))/dx_i = (x_i - mean) / (n * std)</summary>
@@ -1720,18 +1645,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputs[0].Length;
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        double stdVal = numOps.ToDouble(output[0]);
-        if (stdVal < 1e-12) stdVal = 1e-12; // avoid division by zero
-        double mean = 0;
-        for (int i = 0; i < n; i++) mean += numOps.ToDouble(inputs[0][i]);
-        mean /= n;
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < n; i++)
-            dx[i] = numOps.FromDouble(gOut * (numOps.ToDouble(inputs[0][i]) - mean) / (n * stdVal));
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var mean = engine.TensorMeanDiff(inputs[0]);
+        var grad = engine.StdBackward(gradOutput, inputs[0], mean, output, Array.Empty<int>());
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Square backward: d(x^2)/dx = 2*x</summary>
@@ -1751,17 +1667,11 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputs[0].Length;
-        double lse = numOps.ToDouble(output[0]);
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        for (int i = 0; i < n; i++)
-        {
-            double softmax_i = Math.Exp(numOps.ToDouble(inputs[0][i]) - lse);
-            dx[i] = numOps.FromDouble(gOut * softmax_i);
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        // dx = gradOutput * exp(x - lse) = gradOutput * softmax(x)
+        var shifted = engine.TensorBroadcastSubtract(inputs[0], output);
+        var softmax = engine.TensorExp(shifted);
+        var grad = engine.TensorBroadcastMultiply(gradOutput, softmax);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Norm backward: d(||x||)/dx_i = x_i / ||x||</summary>
@@ -1769,14 +1679,12 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // dx = gradOutput * x / norm — use broadcast ops for scalar norm
         var numOps = MathHelper.GetNumericOperations<T>();
-        double norm = numOps.ToDouble(output[0]);
-        if (norm < 1e-12) norm = 1e-12;
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-            dx[i] = numOps.FromDouble(gOut * numOps.ToDouble(inputs[0][i]) / norm);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var scaledInput = engine.TensorBroadcastMultiply(gradOutput, inputs[0]);
+        var normClamped = engine.TensorClamp(output, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
+        var grad = engine.TensorBroadcastDivide(scaledInput, normClamped);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>AdaptiveMaxPool2D backward: route gradient to argmax positions</summary>
@@ -1784,16 +1692,19 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Argmax indices are flat offsets — scatter gradient to those positions
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < gradOutput.Length; i++)
+        var inputGrad = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradData = gradOutput.GetDataArray();
+        var resultData = inputGrad.GetDataArray();
+        for (int i = 0; i < argmax.Length; i++)
         {
-            int srcIdx = argmax[i];
-            if (srcIdx >= 0 && srcIdx < dx.Length)
-                dx[srcIdx] = numOps.Add(dx[srcIdx], gradOutput[i]);
+            int idx = argmax[i];
+            if (idx >= 0 && idx < resultData.Length)
+                resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
         }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
     /// <summary>Where backward: gradient flows through the selected branch</summary>
@@ -1802,19 +1713,31 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var condition = (bool[])savedState[0];
-        // inputs[0] = x (true branch), inputs[1] = y (false branch)
-        var gradX = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        var gradY = TensorPool<T>.RentZeroed(inputs[1].Shape.ToArray());
-        for (int i = 0; i < gradOutput.Length; i++)
+        // Convert bool[] condition to float tensor for GPU dispatch
+        if (savedState[0] is Tensor<T> condTensor)
         {
-            if (condition[i])
-                gradX[i] = gradOutput[i];
-            else
-                gradY[i] = gradOutput[i];
+            // Already a tensor — use engine multiply for routing
+            var gradX = engine.TensorMultiply(gradOutput, condTensor);
+            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(condTensor, numOps.Zero), numOps.One);
+            var invCond = engine.TensorSubtract(ones, condTensor);
+            var gradY = engine.TensorMultiply(gradOutput, invCond);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
         }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+        else
+        {
+            var condition = (bool[])savedState[0];
+            var condData = new T[condition.Length];
+            for (int i = 0; i < condition.Length; i++)
+                condData[i] = condition[i] ? numOps.One : numOps.Zero;
+            var condT = new Tensor<T>(condData, inputs[0].Shape.ToArray());
+            var gradX = engine.TensorMultiply(gradOutput, condT);
+            var invCond = engine.TensorSubtract(
+                engine.TensorAddScalar(engine.TensorMultiplyScalar(condT, numOps.Zero), numOps.One), condT);
+            var gradY = engine.TensorMultiply(gradOutput, invCond);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+        }
     }
 
     /// <summary>MaskedFill backward: zero gradient where mask is true</summary>
@@ -1823,10 +1746,69 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var mask = (bool[])savedState[0];
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < gradOutput.Length; i++)
-            dx[i] = mask[i] ? numOps.Zero : gradOutput[i];
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        if (savedState[0] is Tensor<T> maskTensor)
+        {
+            // Tensor mask — use engine multiply: grad * (1 - mask)
+            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(maskTensor, numOps.Zero), numOps.One);
+            var invMask = engine.TensorSubtract(ones, engine.TensorSign(engine.TensorAbs(maskTensor)));
+            var grad = engine.TensorMultiply(gradOutput, invMask);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }
+        else
+        {
+            var mask = (bool[])savedState[0];
+            var maskData = new T[mask.Length];
+            for (int i = 0; i < mask.Length; i++)
+                maskData[i] = mask[i] ? numOps.One : numOps.Zero;
+            var maskT = new Tensor<T>(maskData, inputs[0].Shape.ToArray());
+            var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(maskT, numOps.Zero), numOps.One);
+            var invMask = engine.TensorSubtract(ones, maskT);
+            var grad = engine.TensorMultiply(gradOutput, invMask);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }
     }
+
+    /// <summary>Element-wise max backward: gradient flows to whichever input was larger.
+    /// Ties (a == b) route gradient to inputs[0] (asymmetric subgradient, consistent with PyTorch).</summary>
+    internal static void MaxBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Use saved input clones if available (safe against in-place mutation)
+        var a = savedState is { Length: >= 1 } && savedState[0] is Tensor<T> sa ? sa : inputs[0];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var zeros = engine.TensorMultiplyScalar(gradOutput, numOps.Zero);
+        var diff = engine.TensorSubtract(output, a);
+        var absDiff = engine.TensorAbs(diff);
+        var maskSign = engine.TensorSign(absDiff);
+        var aOnes = engine.TensorAddScalar(zeros, numOps.One);
+        var aMask = engine.TensorSubtract(aOnes, maskSign);
+        var gradA = engine.TensorMultiply(gradOutput, aMask);
+        var bMask = engine.TensorSubtract(aOnes, aMask);
+        var gradB = engine.TensorMultiply(gradOutput, bMask);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+    }
+
+    /// <summary>Element-wise min backward: gradient flows to whichever input was smaller.
+    /// Ties (a == b) route gradient to inputs[0] (asymmetric subgradient, consistent with PyTorch).</summary>
+    internal static void MinBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var a = savedState is { Length: >= 1 } && savedState[0] is Tensor<T> sa ? sa : inputs[0];
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var zeros = engine.TensorMultiplyScalar(gradOutput, numOps.Zero);
+        var diff = engine.TensorSubtract(output, a);
+        var absDiff = engine.TensorAbs(diff);
+        var maskSign = engine.TensorSign(absDiff);
+        var aOnes = engine.TensorAddScalar(zeros, numOps.One);
+        var aMask = engine.TensorSubtract(aOnes, maskSign);
+        var gradA = engine.TensorMultiply(gradOutput, aMask);
+        var bMask = engine.TensorSubtract(aOnes, aMask);
+        var gradB = engine.TensorMultiply(gradOutput, bMask);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+    }
+
 }
