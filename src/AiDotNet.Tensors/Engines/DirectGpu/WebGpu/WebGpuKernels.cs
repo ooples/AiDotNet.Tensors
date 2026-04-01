@@ -1716,6 +1716,121 @@ fn reciprocal_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
     /// <summary>
+    /// Backward kernels for reductions and gradient routing (4 buffers).
+    /// </summary>
+    public const string ReductionBackward4Source = @"
+@group(0) @binding(0) var<storage, read> rb_a: array<f32>;
+@group(0) @binding(1) var<storage, read> rb_b: array<f32>;
+@group(0) @binding(2) var<storage, read> rb_c: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rb_d: array<f32>;
+
+struct RBParams {
+    p0: u32,
+    p1: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(4) var<uniform> rb_params: RBParams;
+
+@compute @workgroup_size(256)
+fn var_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        rb_d[idx] = rb_a[outer] * 2.0 * (rb_b[idx] - rb_c[outer]) / f32(rb_params.p1);
+    }
+}
+
+@compute @workgroup_size(256)
+fn norm_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        let n = max(rb_c[outer], 1e-8);
+        rb_d[idx] = rb_a[outer] * rb_b[idx] / n;
+    }
+}
+
+@compute @workgroup_size(256)
+fn logsumexp_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb_params.p0 * rb_params.p1;
+    if (idx < total) {
+        let outer = idx / rb_params.p1;
+        let softmax_val = exp(rb_b[idx] - rb_c[outer]);
+        rb_d[idx] = rb_a[outer] * softmax_val;
+    }
+}
+
+@compute @workgroup_size(256)
+fn where_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < rb_params.p0) {
+        let cond = rb_b[idx];
+        rb_c[idx] = select(0.0, rb_a[idx], cond != 0.0);
+        rb_d[idx] = select(rb_a[idx], 0.0, cond != 0.0);
+    }
+}
+";
+
+    /// <summary>
+    /// Backward kernels needing 5 buffers (StdBackward).
+    /// </summary>
+    public const string ReductionBackward5Source = @"
+@group(0) @binding(0) var<storage, read> rb5_a: array<f32>;
+@group(0) @binding(1) var<storage, read> rb5_b: array<f32>;
+@group(0) @binding(2) var<storage, read> rb5_c: array<f32>;
+@group(0) @binding(3) var<storage, read> rb5_d: array<f32>;
+@group(0) @binding(4) var<storage, read_write> rb5_e: array<f32>;
+
+struct RB5Params {
+    p0: u32,
+    p1: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(5) var<uniform> rb5_params: RB5Params;
+
+@compute @workgroup_size(256)
+fn std_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = rb5_params.p0 * rb5_params.p1;
+    if (idx < total) {
+        let outer = idx / rb5_params.p1;
+        let s = max(rb5_d[outer], 1e-8);
+        rb5_e[idx] = rb5_a[outer] * (rb5_b[idx] - rb5_c[outer]) / (f32(rb5_params.p1) * s);
+    }
+}
+";
+
+    /// <summary>
+    /// MaskedFill backward (3 buffers).
+    /// </summary>
+    public const string MaskedFillBackwardSource = @"
+@group(0) @binding(0) var<storage, read> mfb_grad: array<f32>;
+@group(0) @binding(1) var<storage, read> mfb_mask: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mfb_out: array<f32>;
+
+struct MFBParams {
+    size: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+@group(0) @binding(3) var<uniform> mfb_params: MFBParams;
+
+@compute @workgroup_size(256)
+fn masked_fill_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < mfb_params.size) {
+        mfb_out[idx] = select(mfb_grad[idx], 0.0, mfb_mask[idx] != 0.0);
+    }
+}
+";
+
+    /// <summary>
     /// PReLU/RReLU forward kernels (3 buffers: input, alpha/noise, output).
     /// </summary>
     public const string PReluForwardSource = @"

@@ -413,37 +413,37 @@ public sealed partial class WebGpuBackend
 
     public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        Dispatch4BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "var_backward",
+        Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "var_backward",
             gradOutput, input, mean, gradInput, MakeUniform2(outerSize, reduceSize), outerSize * reduceSize).GetAwaiter().GetResult();
     }
 
     public void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        Dispatch5BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "std_backward",
+        Dispatch5BufferAsync("ReductionBackward5", WebGpuKernels.ReductionBackward5Source, "std_backward",
             gradOutput, input, mean, std, gradInput, MakeUniform2(outerSize, reduceSize), outerSize * reduceSize).GetAwaiter().GetResult();
     }
 
     public void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
     {
-        Dispatch3BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "masked_fill_backward",
+        Dispatch3BufferAsync("MaskedFillBackward", WebGpuKernels.MaskedFillBackwardSource, "masked_fill_backward",
             gradOutput, mask, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
     {
-        Dispatch4BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "where_backward",
+        Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "where_backward",
             gradOutput, condition, gradX, gradY, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
     public void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        Dispatch4BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "norm_backward",
+        Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "norm_backward",
             gradOutput, input, norm, gradInput, MakeUniform2(outerSize, reduceSize), outerSize * reduceSize).GetAwaiter().GetResult();
     }
 
     public void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        Dispatch4BufferAsync("ActivationBackward", WebGpuKernels.ActivationBackwardSource, "logsumexp_backward",
+        Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "logsumexp_backward",
             gradOutput, input, lse, gradInput, MakeUniform2(outerSize, reduceSize), outerSize * reduceSize).GetAwaiter().GetResult();
     }
 

@@ -815,6 +815,107 @@ kernel void reciprocal_backward(
     }
 }
 
+// Variance backward: dx = gradOutput * 2*(x - mean)/n
+kernel void var_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* mean [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant uint& outerSize [[buffer(4)]],
+    constant uint& reduceSize [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outerSize * reduceSize;
+    if (gid < total) {
+        uint outer = gid / reduceSize;
+        gradInput[gid] = gradOutput[outer] * 2.0f * (input[gid] - mean[outer]) / float(reduceSize);
+    }
+}
+
+// Std backward: dx = gradOutput * (x - mean) / (n * std)
+kernel void std_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* mean [[buffer(2)]],
+    device const float* stddev [[buffer(3)]],
+    device float* gradInput [[buffer(4)]],
+    constant uint& outerSize [[buffer(5)]],
+    constant uint& reduceSize [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outerSize * reduceSize;
+    if (gid < total) {
+        uint outer = gid / reduceSize;
+        float s = max(stddev[outer], 1e-8f);
+        gradInput[gid] = gradOutput[outer] * (input[gid] - mean[outer]) / (float(reduceSize) * s);
+    }
+}
+
+// MaskedFill backward: zero where mask is nonzero
+kernel void masked_fill_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* mask [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        gradInput[gid] = (mask[gid] != 0.0f) ? 0.0f : gradOutput[gid];
+    }
+}
+
+// Where backward: route gradient based on condition
+kernel void where_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* condition [[buffer(1)]],
+    device float* gradX [[buffer(2)]],
+    device float* gradY [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float cond = condition[gid];
+        gradX[gid] = (cond != 0.0f) ? gradOutput[gid] : 0.0f;
+        gradY[gid] = (cond != 0.0f) ? 0.0f : gradOutput[gid];
+    }
+}
+
+// Norm backward: dx = gradOutput * x / norm
+kernel void norm_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* norm [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant uint& outerSize [[buffer(4)]],
+    constant uint& reduceSize [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outerSize * reduceSize;
+    if (gid < total) {
+        uint outer = gid / reduceSize;
+        float n = max(norm[outer], 1e-8f);
+        gradInput[gid] = gradOutput[outer] * input[gid] / n;
+    }
+}
+
+// LogSumExp backward: dx = gradOutput * softmax(x)
+kernel void logsumexp_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* lse [[buffer(2)]],
+    device float* gradInput [[buffer(3)]],
+    constant uint& outerSize [[buffer(4)]],
+    constant uint& reduceSize [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outerSize * reduceSize;
+    if (gid < total) {
+        uint outer = gid / reduceSize;
+        float softmax_val = exp(input[gid] - lse[outer]);
+        gradInput[gid] = gradOutput[outer] * softmax_val;
+    }
+}
+
 // SELU backward
 kernel void selu_backward(
     device const float* gradOutput [[buffer(0)]],
