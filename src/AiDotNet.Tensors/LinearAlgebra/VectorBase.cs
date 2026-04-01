@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
@@ -248,25 +248,13 @@ public abstract class VectorBase<T>
         get
         {
             ValidateIndex(index);
-            if (IsLazyAllocated)
-            {
-                var arr = new T[_logicalLength];
-                MaterializeBacking(arr);
-                Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-            }
-            if (_cachedArray is not null)
-                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+            EnsureMaterialized();
             return _memory.Span[index];
         }
         set
         {
             ValidateIndex(index);
-            if (IsLazyAllocated)
-            {
-                var arr = new T[_logicalLength];
-                MaterializeBacking(arr);
-                Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-            }
+            EnsureMaterialized();
             _memory.Span[index] = value;
         }
     }
@@ -524,8 +512,8 @@ public abstract class VectorBase<T>
         if (length < 0 || startIndex + length > this.Length)
             throw new ArgumentOutOfRangeException(nameof(length), "Length must be non-negative and the range must not exceed the vector bounds.");
 
+        EnsureMaterialized();
         VectorBase<T> subVector = CreateInstance(length);
-        // Use vectorized Copy for efficient memory transfer
         _numOps.Copy(_memory.Span.Slice(startIndex, length), subVector.AsWritableSpan());
 
         return subVector;
@@ -627,6 +615,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T Sum()
     {
+        EnsureMaterialized();
         return _numOps.Sum(_memory.Span);
     }
 
@@ -642,7 +631,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T L2Norm()
     {
-        // Use vectorized Dot product (sum of squares) then Sqrt - 10-15x faster with AVX2
+        EnsureMaterialized();
         var span = _memory.Span;
         T sumOfSquares = _numOps.Dot(span, span);
 
@@ -663,6 +652,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, TResult> function)
     {
+        EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -687,6 +677,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
+        EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -791,6 +782,7 @@ public abstract class VectorBase<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpan());
         return result;
     }
@@ -833,6 +825,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -879,6 +872,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Add(_memory.Span, other._memory.Span, destination);
     }
 
@@ -901,6 +895,7 @@ public abstract class VectorBase<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
         return result;
     }
@@ -942,6 +937,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, _memory.Span);
     }
 
@@ -986,6 +982,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized(); other.EnsureMaterialized();
         _numOps.Subtract(_memory.Span, other._memory.Span, destination);
     }
 
@@ -1004,6 +1001,7 @@ public abstract class VectorBase<T>
     public virtual VectorBase<T> Multiply(T scalar)
     {
         var result = CreateInstance(Length);
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
         return result;
     }
@@ -1037,6 +1035,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -1080,6 +1079,7 @@ public abstract class VectorBase<T>
             }
         }
 #endif
+        EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, destination);
     }
 
@@ -1098,6 +1098,7 @@ public abstract class VectorBase<T>
     public virtual VectorBase<T> Divide(T scalar)
     {
         var result = CreateInstance(Length);
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
         return result;
     }
@@ -1111,6 +1112,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual void DivideInPlace(T scalar)
     {
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
     }
 
@@ -1128,6 +1130,7 @@ public abstract class VectorBase<T>
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
+        EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, destination);
     }
 
@@ -1142,6 +1145,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public override string ToString()
     {
+        EnsureMaterialized();
         return $"[{string.Join(", ", _memory.ToArray())}]";
     }
 }
