@@ -13143,16 +13143,83 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     public override Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
-        => base.TensorAvgPool1D(input, kernelSize, stride);
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 3)
+            return base.TensorAvgPool1D(input, kernelSize, stride);
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1], inLen = input.Shape._dims[2];
+            int outLen = (inLen - kernelSize) / stride + 1;
+            using var bufIn = GetOrAllocateBuffer(backend, input);
+            var bufOut = AllocateOutputBuffer(backend, batch * channels * outLen);
+            backend.AvgPool1D(bufIn.Buffer, bufOut.Buffer, batch, channels, inLen, outLen, kernelSize, stride);
+            var result = FinishGpuOp<T>(backend, bufOut, batch * channels * outLen);
+            return new Tensor<T>(result, new[] { batch, channels, outLen });
+        }
+        catch { return base.TensorAvgPool1D(input, kernelSize, stride); }
+    }
 
     public override Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
-        => base.TensorMaxPool1D(input, kernelSize, stride);
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 3)
+            return base.TensorMaxPool1D(input, kernelSize, stride);
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1], inLen = input.Shape._dims[2];
+            int outLen = (inLen - kernelSize) / stride + 1;
+            using var bufIn = GetOrAllocateBuffer(backend, input);
+            var bufOut = AllocateOutputBuffer(backend, batch * channels * outLen);
+            backend.MaxPool1D(bufIn.Buffer, bufOut.Buffer, batch, channels, inLen, outLen, kernelSize, stride);
+            var result = FinishGpuOp<T>(backend, bufOut, batch * channels * outLen);
+            return new Tensor<T>(result, new[] { batch, channels, outLen });
+        }
+        catch { return base.TensorMaxPool1D(input, kernelSize, stride); }
+    }
 
     public override Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
-        => base.TensorUpsampleBilinear(input, outputSize);
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || input.Rank != 4 || outputSize.Length < 2)
+            return base.TensorUpsampleBilinear(input, outputSize);
+        try
+        {
+            int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+            int inH = input.Shape._dims[2], inW = input.Shape._dims[3];
+            int outH = outputSize[0], outW = outputSize[1];
+            using var bufIn = GetOrAllocateBuffer(backend, input);
+            var bufOut = AllocateOutputBuffer(backend, batch * channels * outH * outW);
+            backend.BilinearUpsample2D(bufIn.Buffer, bufOut.Buffer, batch, channels, inH, inW, outH, outW);
+            var result = FinishGpuOp<T>(backend, bufOut, batch * channels * outH * outW);
+            return new Tensor<T>(result, new[] { batch, channels, outH, outW });
+        }
+        catch { return base.TensorUpsampleBilinear(input, outputSize); }
+    }
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
-        => base.ScatterMean(source, indices, out counts, dim, outputSize);
+    {
+        if (!TryGetBackend(out var backend) || typeof(T) != typeof(float) || dim != 0)
+            return base.ScatterMean(source, indices, out counts, dim, outputSize);
+        try
+        {
+            int outSize = outputSize ?? (indices.Length > 0 ? indices.GetDataArray().Max() + 1 : 0);
+            int featureSize = source.Rank >= 2 ? source.Length / source.Shape._dims[0] : 1;
+            int totalOut = outSize * featureSize;
+            using var bufSrc = GetOrAllocateBuffer(backend, source);
+            using var bufIdx = backend.AllocateIntBuffer(indices.GetDataArray());
+            var bufOut = AllocateOutputBuffer(backend, totalOut);
+            var bufCnt = backend.AllocateBuffer(outSize);
+            backend.Fill(bufOut.Buffer, 0f, totalOut);
+            backend.Fill(bufCnt, 0f, outSize);
+            backend.ScatterMean(bufSrc.Buffer, bufIdx, bufOut.Buffer, bufCnt, source.Length, totalOut, featureSize);
+            var result = FinishGpuOp<T>(backend, bufOut, totalOut);
+            var countData = backend.DownloadBuffer(bufCnt);
+            var countInts = new int[outSize];
+            for (int i = 0; i < outSize; i++) countInts[i] = (int)countData[i];
+            counts = new Tensor<int>(countInts, new[] { outSize });
+            int[] outShape = source.Rank >= 2 ? new[] { outSize }.Concat(source.Shape._dims.Skip(1)).ToArray() : new[] { outSize };
+            return new Tensor<T>(result, outShape);
+        }
+        catch { return base.ScatterMean(source, indices, out counts, dim, outputSize); }
+    }
 
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated non-Tensor-prefix activations

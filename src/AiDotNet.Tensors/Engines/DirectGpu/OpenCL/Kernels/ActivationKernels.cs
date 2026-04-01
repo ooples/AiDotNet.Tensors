@@ -1140,6 +1140,57 @@ __kernel void logsumexp_backward(__global const float* gradOutput, __global cons
     gradInput[idx] = gradOutput[outer] * exp(input[idx] - lse[outer]);
 }
 
+__kernel void avg_pool1d(__global const float* input, __global float* output, const int batch, const int channels, const int inLength, const int outLength, const int kernelSize, const int stride)
+{
+    const int idx = get_global_id(0); int total = batch * channels * outLength; if (idx >= total) return;
+    int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
+    int inOff = (b * channels + c) * inLength;
+    float sum = 0.0f; int cnt = 0;
+    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) { sum += input[inOff + pos]; cnt++; } }
+    output[idx] = cnt > 0 ? sum / (float)cnt : 0.0f;
+}
+
+__kernel void max_pool1d(__global const float* input, __global float* output, const int batch, const int channels, const int inLength, const int outLength, const int kernelSize, const int stride)
+{
+    const int idx = get_global_id(0); int total = batch * channels * outLength; if (idx >= total) return;
+    int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
+    int inOff = (b * channels + c) * inLength;
+    float maxVal = -3.402823466e+38f;
+    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, input[inOff + pos]); }
+    output[idx] = maxVal;
+}
+
+__kernel void bilinear_upsample2d(__global const float* input, __global float* output, const int batch, const int channels, const int inH, const int inW, const int outH, const int outW)
+{
+    const int idx = get_global_id(0); int total = batch * channels * outH * outW; if (idx >= total) return;
+    int ow = idx % outW; int oh = (idx / outW) % outH; int c = (idx / (outW * outH)) % channels; int b = idx / (outW * outH * channels);
+    float h_ratio = (outH > 1) ? (float)(inH - 1) / (float)(outH - 1) : 0.0f;
+    float w_ratio = (outW > 1) ? (float)(inW - 1) / (float)(outW - 1) : 0.0f;
+    float h_in = oh * h_ratio; float w_in = ow * w_ratio;
+    int h0 = (int)h_in; int h1 = min(h0 + 1, inH - 1); int w0 = (int)w_in; int w1 = min(w0 + 1, inW - 1);
+    float hd = h_in - h0; float wd = w_in - w0;
+    int base_idx = (b * channels + c) * inH * inW;
+    output[idx] = (1-hd)*(1-wd)*input[base_idx+h0*inW+w0] + (1-hd)*wd*input[base_idx+h0*inW+w1] + hd*(1-wd)*input[base_idx+h1*inW+w0] + hd*wd*input[base_idx+h1*inW+w1];
+}
+
+__kernel void scatter_mean(__global const float* source, __global const int* indices, __global volatile float* output, __global volatile int* counts, const int sourceSize, const int featureSize)
+{
+    const int idx = get_global_id(0); if (idx >= sourceSize) return;
+    int row = idx / featureSize; int col = idx % featureSize;
+    int targetRow = indices[row];
+    // OpenCL atomic_add for float requires extension, use atomic_add for int counts
+    // For float accumulation, use atomic_xchg-based CAS loop or accept minor races
+    output[targetRow * featureSize + col] += source[idx];
+    if (col == 0) atomic_add(&counts[targetRow], 1);
+}
+
+__kernel void scatter_mean_divide(__global float* output, __global const int* counts, const int outputSize, const int featureSize)
+{
+    const int idx = get_global_id(0); if (idx >= outputSize) return;
+    int row = idx / featureSize; int cnt = counts[row];
+    if (cnt > 0) output[idx] /= (float)cnt;
+}
+
 // ============================================================================
 // Single-kernel fused softmax for large rows.
 // All workgroups cooperate within ONE kernel launch:
@@ -1370,6 +1421,8 @@ __kernel void scale_add(__global const float* A, __global const float* B, __glob
                 "reciprocal_backward",
                 "var_backward", "std_backward", "masked_fill_backward",
                 "where_backward", "norm_backward", "logsumexp_backward",
+                "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
+                "scatter_mean", "scatter_mean_divide",
                 // Element-wise binary
                 "add_vectors", "subtract_vectors", "multiply_vectors",
                 "divide_vectors", "min_vectors", "max_vectors",

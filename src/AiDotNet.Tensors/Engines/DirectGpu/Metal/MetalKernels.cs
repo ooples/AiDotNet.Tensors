@@ -916,6 +916,107 @@ kernel void logsumexp_backward(
     }
 }
 
+// 1D Average Pooling
+kernel void avg_pool1d(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inLength [[buffer(4)]],
+    constant uint& outLength [[buffer(5)]],
+    constant uint& kernelSize [[buffer(6)]],
+    constant uint& stride [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outLength;
+    if (gid < total) {
+        uint o = gid % outLength; uint c = (gid / outLength) % channels; uint b = gid / (outLength * channels);
+        uint inOff = (b * channels + c) * inLength;
+        float sum = 0.0f; uint cnt = 0;
+        for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) { sum += input[inOff + pos]; cnt++; } }
+        output[gid] = cnt > 0 ? sum / float(cnt) : 0.0f;
+    }
+}
+
+// 1D Max Pooling
+kernel void max_pool1d(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inLength [[buffer(4)]],
+    constant uint& outLength [[buffer(5)]],
+    constant uint& kernelSize [[buffer(6)]],
+    constant uint& stride [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outLength;
+    if (gid < total) {
+        uint o = gid % outLength; uint c = (gid / outLength) % channels; uint b = gid / (outLength * channels);
+        uint inOff = (b * channels + c) * inLength;
+        float maxVal = -3.402823466e+38f;
+        for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, input[inOff + pos]); }
+        output[gid] = maxVal;
+    }
+}
+
+// Bilinear Upsample 2D
+kernel void bilinear_upsample2d(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& inH [[buffer(4)]],
+    constant uint& inW [[buffer(5)]],
+    constant uint& outH [[buffer(6)]],
+    constant uint& outW [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * channels * outH * outW;
+    if (gid < total) {
+        uint ow = gid % outW; uint oh = (gid / outW) % outH; uint c = (gid / (outW * outH)) % channels; uint b = gid / (outW * outH * channels);
+        float h_ratio = (outH > 1) ? float(inH - 1) / float(outH - 1) : 0.0f;
+        float w_ratio = (outW > 1) ? float(inW - 1) / float(outW - 1) : 0.0f;
+        float h_in = float(oh) * h_ratio; float w_in = float(ow) * w_ratio;
+        uint h0 = uint(h_in); uint h1 = min(h0 + 1, inH - 1); uint w0 = uint(w_in); uint w1 = min(w0 + 1, inW - 1);
+        float hd = h_in - float(h0); float wd = w_in - float(w0);
+        uint base_idx = (b * channels + c) * inH * inW;
+        output[gid] = (1-hd)*(1-wd)*input[base_idx+h0*inW+w0] + (1-hd)*wd*input[base_idx+h0*inW+w1] + hd*(1-wd)*input[base_idx+h1*inW+w0] + hd*wd*input[base_idx+h1*inW+w1];
+    }
+}
+
+// Scatter Mean (accumulate)
+kernel void scatter_mean(
+    device const float* source [[buffer(0)]],
+    device const int* indices [[buffer(1)]],
+    device atomic_float* output [[buffer(2)]],
+    device atomic_int* counts [[buffer(3)]],
+    constant uint& sourceSize [[buffer(4)]],
+    constant uint& featureSize [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < sourceSize) {
+        uint row = gid / featureSize; uint col = gid % featureSize;
+        int targetRow = indices[row];
+        atomic_fetch_add_explicit(&output[targetRow * featureSize + col], source[gid], memory_order_relaxed);
+        if (col == 0) atomic_fetch_add_explicit(&counts[targetRow], 1, memory_order_relaxed);
+    }
+}
+
+// Scatter Mean Divide
+kernel void scatter_mean_divide(
+    device float* output [[buffer(0)]],
+    device const int* counts [[buffer(1)]],
+    constant uint& outputSize [[buffer(2)]],
+    constant uint& featureSize [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < outputSize) {
+        uint row = gid / featureSize; int cnt = counts[row];
+        if (cnt > 0) output[gid] /= float(cnt);
+    }
+}
+
 // SELU backward
 kernel void selu_backward(
     device const float* gradOutput [[buffer(0)]],

@@ -7887,6 +7887,55 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(outerSize * reduceSize, Math.Min(256, outerSize * reduceSize));
         }
 
+        public void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+        {
+            var k = _kernelCache["avg_pool1d"]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch); k.SetArg(arg++, channels);
+            k.SetArg(arg++, inLength); k.SetArg(arg++, outLength);
+            k.SetArg(arg++, kernelSize); k.SetArg(arg++, stride);
+            k.Execute1D(batch * channels * outLength, Math.Min(256, batch * channels * outLength));
+        }
+
+        public void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+        {
+            var k = _kernelCache["max_pool1d"]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch); k.SetArg(arg++, channels);
+            k.SetArg(arg++, inLength); k.SetArg(arg++, outLength);
+            k.SetArg(arg++, kernelSize); k.SetArg(arg++, stride);
+            k.Execute1D(batch * channels * outLength, Math.Min(256, batch * channels * outLength));
+        }
+
+        public void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
+        {
+            var k = _kernelCache["bilinear_upsample2d"]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batch); k.SetArg(arg++, channels);
+            k.SetArg(arg++, inH); k.SetArg(arg++, inW);
+            k.SetArg(arg++, outH); k.SetArg(arg++, outW);
+            k.Execute1D(batch * channels * outH * outW, Math.Min(256, batch * channels * outH * outW));
+        }
+
+        public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
+        {
+            var k1 = _kernelCache["scatter_mean"]; uint arg1 = 0;
+            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)source).Buffer.Handle);
+            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k1.SetArg(arg1++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+            k1.SetArg(arg1++, sourceSize); k1.SetArg(arg1++, featureSize);
+            k1.Execute1D(sourceSize, Math.Min(256, sourceSize));
+            var k2 = _kernelCache["scatter_mean_divide"]; uint arg2 = 0;
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k2.SetArg(arg2++, ((DirectOpenClGpuBuffer)counts).Buffer.Handle);
+            k2.SetArg(arg2++, outputSize); k2.SetArg(arg2++, featureSize);
+            k2.Execute1D(outputSize, Math.Min(256, outputSize));
+        }
+
         public void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
         {
             var k = _kernelCache["l1_loss"]; uint arg = 0;

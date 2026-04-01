@@ -877,6 +877,63 @@ extern ""C"" __global__ __launch_bounds__(256) void logsumexp_backward(const flo
     gradInput[idx] = gradOutput[outer] * softmax_val;
 }
 
+extern ""C"" __global__ __launch_bounds__(256) void avg_pool1d(const float* input, float* output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outLength;
+    if (idx >= total) return;
+    int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
+    int inOffset = (b * channels + c) * inLength;
+    float sum = 0.0f; int count = 0;
+    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) { sum += input[inOffset + pos]; count++; } }
+    output[idx] = count > 0 ? sum / (float)count : 0.0f;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void max_pool1d(const float* input, float* output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outLength;
+    if (idx >= total) return;
+    int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
+    int inOffset = (b * channels + c) * inLength;
+    float maxVal = -3.402823466e+38f;
+    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) { maxVal = fmaxf(maxVal, input[inOffset + pos]); } }
+    output[idx] = maxVal;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bilinear_upsample2d(const float* input, float* output, int batch, int channels, int inH, int inW, int outH, int outW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels * outH * outW;
+    if (idx >= total) return;
+    int ow = idx % outW; int oh = (idx / outW) % outH; int c = (idx / (outW * outH)) % channels; int b = idx / (outW * outH * channels);
+    float h_ratio = (outH > 1) ? (float)(inH - 1) / (float)(outH - 1) : 0.0f;
+    float w_ratio = (outW > 1) ? (float)(inW - 1) / (float)(outW - 1) : 0.0f;
+    float h_in = oh * h_ratio; float w_in = ow * w_ratio;
+    int h0 = (int)h_in; int h1 = min(h0 + 1, inH - 1); int w0 = (int)w_in; int w1 = min(w0 + 1, inW - 1);
+    float hd = h_in - h0; float wd = w_in - w0;
+    int base_idx = (b * channels + c) * inH * inW;
+    output[idx] = (1-hd)*(1-wd)*input[base_idx+h0*inW+w0] + (1-hd)*wd*input[base_idx+h0*inW+w1] + hd*(1-wd)*input[base_idx+h1*inW+w0] + hd*wd*input[base_idx+h1*inW+w1];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean(const float* source, const int* indices, float* output, int* counts, int sourceSize, int featureSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= sourceSize) return;
+    int row = idx / featureSize; int col = idx % featureSize;
+    int targetRow = indices[row];
+    atomicAdd(&output[targetRow * featureSize + col], source[idx]);
+    if (col == 0) atomicAdd(&counts[targetRow], 1);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void scatter_mean_divide(float* output, const int* counts, int outputSize, int featureSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= outputSize) return;
+    int row = idx / featureSize; int cnt = counts[row];
+    if (cnt > 0) output[idx] /= (float)cnt;
+}
+
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Memory layout: output is [batch, channels, height, width] in row-major order
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
@@ -1110,6 +1167,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "reciprocal_backward",
             "var_backward", "std_backward", "masked_fill_backward",
             "where_backward", "norm_backward", "logsumexp_backward",
+            "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
+            "scatter_mean", "scatter_mean_divide",
             "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary

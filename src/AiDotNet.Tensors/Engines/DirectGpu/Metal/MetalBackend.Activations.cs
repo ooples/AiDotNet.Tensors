@@ -670,6 +670,80 @@ public sealed partial class MetalBackend
         enc3.DispatchThreadgroups(tg3, tpg3);
     }
 
+    public void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer inp || output is not MetalGpuBuffer outp)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "avg_pool1d");
+        int total = batch * channels * outLength;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(inp, 0); enc.SetBuffer(outp, 1);
+        enc.SetBytes((uint)batch, 2); enc.SetBytes((uint)channels, 3);
+        enc.SetBytes((uint)inLength, 4); enc.SetBytes((uint)outLength, 5);
+        enc.SetBytes((uint)kernelSize, 6); enc.SetBytes((uint)stride, 7);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer inp || output is not MetalGpuBuffer outp)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "max_pool1d");
+        int total = batch * channels * outLength;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(inp, 0); enc.SetBuffer(outp, 1);
+        enc.SetBytes((uint)batch, 2); enc.SetBytes((uint)channels, 3);
+        enc.SetBytes((uint)inLength, 4); enc.SetBytes((uint)outLength, 5);
+        enc.SetBytes((uint)kernelSize, 6); enc.SetBytes((uint)stride, 7);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer inp || output is not MetalGpuBuffer outp)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "bilinear_upsample2d");
+        int total = batch * channels * outH * outW;
+        var (tg, tpg) = pipeline.Calculate1DDispatch(total);
+        using var enc = _commandQueue.CreateScopedComputeEncoder();
+        enc.SetPipelineState(pipeline.Handle);
+        enc.SetBuffer(inp, 0); enc.SetBuffer(outp, 1);
+        enc.SetBytes((uint)batch, 2); enc.SetBytes((uint)channels, 3);
+        enc.SetBytes((uint)inH, 4); enc.SetBytes((uint)inW, 5);
+        enc.SetBytes((uint)outH, 6); enc.SetBytes((uint)outW, 7);
+        enc.DispatchThreadgroups(tg, tpg);
+    }
+
+    public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
+    {
+        ThrowIfDisposed();
+        if (source is not MetalGpuBuffer src || indices is not MetalGpuBuffer idx || output is not MetalGpuBuffer outp || counts is not MetalGpuBuffer cnt)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        // Pass 1: scatter-add
+        var p1 = GetPipeline("Activation", _activationLibrary, "scatter_mean");
+        var (tg1, tpg1) = p1.Calculate1DDispatch(sourceSize);
+        using var enc1 = _commandQueue.CreateScopedComputeEncoder();
+        enc1.SetPipelineState(p1.Handle);
+        enc1.SetBuffer(src, 0); enc1.SetBuffer(idx, 1); enc1.SetBuffer(outp, 2); enc1.SetBuffer(cnt, 3);
+        enc1.SetBytes((uint)sourceSize, 4); enc1.SetBytes((uint)featureSize, 5);
+        enc1.DispatchThreadgroups(tg1, tpg1);
+        // Pass 2: divide
+        var p2 = GetPipeline("Activation", _activationLibrary, "scatter_mean_divide");
+        var (tg2, tpg2) = p2.Calculate1DDispatch(outputSize);
+        using var enc2 = _commandQueue.CreateScopedComputeEncoder();
+        enc2.SetPipelineState(p2.Handle);
+        enc2.SetBuffer(outp, 0); enc2.SetBuffer(cnt, 1);
+        enc2.SetBytes((uint)outputSize, 2); enc2.SetBytes((uint)featureSize, 3);
+        enc2.DispatchThreadgroups(tg2, tpg2);
+    }
+
     public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         ThrowIfDisposed();

@@ -1550,6 +1550,18 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Backward for log-sum-exp: dx = gradOutput * softmax(x)</summary>
     void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize);
 
+    /// <summary>1D average pooling: [batch, channels, length] -> [batch, channels, outLength]</summary>
+    void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride);
+
+    /// <summary>1D max pooling: [batch, channels, length] -> [batch, channels, outLength]</summary>
+    void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride);
+
+    /// <summary>Bilinear upsampling for 2D spatial data: [batch, channels, inH, inW] -> [batch, channels, outH, outW]</summary>
+    void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW);
+
+    /// <summary>Fused scatter-mean: accumulates values by index and divides by count</summary>
+    void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize);
+
     #endregion
 
     #region Loss Functions

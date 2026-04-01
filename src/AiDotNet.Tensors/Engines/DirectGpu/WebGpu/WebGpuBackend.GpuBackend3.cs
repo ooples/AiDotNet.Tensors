@@ -411,6 +411,48 @@ public sealed partial class WebGpuBackend
             gradOutput, input, gradInput, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
+    private static float[] MakePoolUniform(int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        return new[] {
+            BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(channels),
+            BitConverter.Int32BitsToSingle(inLength), BitConverter.Int32BitsToSingle(outLength),
+            BitConverter.Int32BitsToSingle(kernelSize), BitConverter.Int32BitsToSingle(stride),
+            0f, 0f
+        };
+    }
+
+    public void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        Dispatch2BufferAsync("Pool1D", WebGpuKernels.Pool1DSource, "avg_pool1d",
+            input, output, MakePoolUniform(batch, channels, inLength, outLength, kernelSize, stride),
+            batch * channels * outLength).GetAwaiter().GetResult();
+    }
+
+    public void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        Dispatch2BufferAsync("Pool1D", WebGpuKernels.Pool1DSource, "max_pool1d",
+            input, output, MakePoolUniform(batch, channels, inLength, outLength, kernelSize, stride),
+            batch * channels * outLength).GetAwaiter().GetResult();
+    }
+
+    public void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
+    {
+        Dispatch2BufferAsync("BilinearUpsample", WebGpuKernels.BilinearUpsample2DSource, "bilinear_upsample2d",
+            input, output, new[] {
+                BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(channels),
+                BitConverter.Int32BitsToSingle(inH), BitConverter.Int32BitsToSingle(inW),
+                BitConverter.Int32BitsToSingle(outH), BitConverter.Int32BitsToSingle(outW), 0f, 0f
+            },
+            batch * channels * outH * outW).GetAwaiter().GetResult();
+    }
+
+    public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
+    {
+        // ScatterMean needs atomic operations which WGSL supports poorly
+        // Fall back to CPU for now via base engine
+        throw new NotSupportedException("ScatterMean not yet supported on WebGPU — use CPU fallback");
+    }
+
     public void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "var_backward",

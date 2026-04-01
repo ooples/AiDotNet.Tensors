@@ -6243,6 +6243,70 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        if (!_kernelCache.TryGetValue("avg_pool1d", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: avg_pool1d");
+        using var _ = PushContext();
+        int total = batch * channels * outLength;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &iPtr; args[1] = &oPtr; args[2] = &batch; args[3] = &channels;
+        args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
+    {
+        if (!_kernelCache.TryGetValue("max_pool1d", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: max_pool1d");
+        using var _ = PushContext();
+        int total = batch * channels * outLength;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &iPtr; args[1] = &oPtr; args[2] = &batch; args[3] = &channels;
+        args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
+    {
+        if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: bilinear_upsample2d");
+        using var _ = PushContext();
+        int total = batch * channels * outH * outW;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &iPtr; args[1] = &oPtr; args[2] = &batch; args[3] = &channels;
+        args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
+    {
+        using var _ = PushContext();
+        // Step 1: scatter-add and count
+        if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
+            throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
+        uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr sPtr = source.Handle, idxPtr = indices.Handle, oPtr = output.Handle, cPtr = counts.Handle;
+        void** args1 = stackalloc void*[6];
+        args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
+        args1[4] = &sourceSize; args1[5] = &featureSize;
+        LaunchKernel(scatterKernel, grid1, DefaultBlockSize, args1);
+
+        // Step 2: divide by counts
+        if (!_kernelCache.TryGetValue("scatter_mean_divide", out var divideKernel))
+            throw new InvalidOperationException("CUDA kernel not found: scatter_mean_divide");
+        uint grid2 = (uint)((outputSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        void** args2 = stackalloc void*[4];
+        args2[0] = &oPtr; args2[1] = &cPtr; args2[2] = &outputSize; args2[3] = &featureSize;
+        LaunchKernel(divideKernel, grid2, DefaultBlockSize, args2);
+    }
+
     #endregion
 
     #region Loss Function GPU Kernel Operations
