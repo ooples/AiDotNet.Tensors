@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -86,7 +87,7 @@ internal static class FusedConvHelper
     /// Tiled GEMM with fused im2col computation.
     /// Uses cache blocking for optimal memory access patterns.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void TiledGemmFusedIm2Col(
         float* A,      // Kernel: [outChannels, K]
         float* input,  // Input: [inChannels, height, width]
@@ -131,7 +132,7 @@ internal static class FusedConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void ProcessMcTile(
         float* A, float* input, float* C,
         int mc, int mcEnd, int M, int N, int K,
@@ -175,7 +176,7 @@ internal static class FusedConvHelper
     /// <summary>
     /// Micro-kernel that computes a small output tile with fused im2col.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void ComputeMicroTileFused(
         float* A, float* input, float* C,
         int mStart, int mEnd, int nStart, int nEnd, int kStart, int kEnd, int K, int N,
@@ -205,7 +206,7 @@ internal static class FusedConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void ComputeMicroTileFusedFma(
         float* A, float* input, float* C,
         int mStart, int mEnd, int nStart, int nEnd, int kStart, int kEnd, int K, int N,
@@ -272,7 +273,7 @@ internal static class FusedConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void ComputeMicroTileFusedScalar(
         float* A, float* input, float* C,
         int mStart, int mEnd, int nStart, int nEnd, int kStart, int kEnd, int K, int N,
@@ -313,7 +314,7 @@ internal static class FusedConvHelper
     /// <summary>
     /// Gather 8 im2col values for AVX2 vectorization.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe Vector256<float> GatherIm2ColValues(
         float* inputChannel, int nBase, int outWidth,
         int kh, int kw, int strideH, int strideW, int padH, int padW,
@@ -333,7 +334,7 @@ internal static class FusedConvHelper
     /// <summary>
     /// Computes a single im2col value on-the-fly.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe float GetIm2ColValue(
         float* inputChannel, int n, int outWidth,
         int kh, int kw, int strideH, int strideW, int padH, int padW,

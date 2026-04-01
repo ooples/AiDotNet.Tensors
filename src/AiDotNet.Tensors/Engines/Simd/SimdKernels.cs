@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -17,7 +18,7 @@ namespace AiDotNet.Tensors.Engines.Simd
     /// </summary>
     public static class SimdKernels
     {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorAdd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -76,7 +77,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Pointer-based VectorAdd — zero bounds-checking overhead for hot paths.
         /// Caller must ensure pointers are valid and length is correct.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorAddUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
@@ -137,7 +138,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based VectorMultiply — zero bounds-checking overhead for hot paths.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorMultiplyUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
@@ -198,7 +199,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based VectorSubtract — zero bounds-checking overhead for hot paths.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorSubtractUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
@@ -259,7 +260,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based ReLU — zero bounds-checking overhead for hot paths.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void ReLUUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -318,7 +319,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based Sigmoid — zero bounds-checking overhead for hot paths.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void SigmoidUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -353,7 +354,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based VectorDivide — zero bounds-checking overhead for hot paths.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorDivideUnsafe(float* a, float* b, float* result, int length)
         {
             int i = 0;
@@ -409,7 +410,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Pointer-based Exp — tries MKL VML first (SVML microcode, zero-overhead function pointer),
         /// falls back to Cephes FastExp256 polynomial approximation.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void ExpUnsafe(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -449,7 +450,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based Log — tries MKL VML first, falls back to FastLog256.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void LogUnsafe(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -488,7 +489,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based Sqrt — 4x unrolled AVX with zero bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void SqrtUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -522,7 +523,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based Abs — 4x unrolled AVX AND with sign mask, zero bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void AbsUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -558,7 +559,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void TanhUnsafe(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -603,7 +604,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Pointer-based LeakyReLU — max(alpha*x, x) with zero bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void LeakyReLUUnsafe(float* input, float* output, int length, float alpha = 0.01f)
         {
             int i = 0;
@@ -645,7 +646,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Pointer-based GELU — fused single-pass with 4x unrolling, zero bounds-checking.
         /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void GELUUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -708,7 +709,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Pointer-based Mish — fused single-pass, no temp buffer allocation.
         /// Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void MishUnsafe(float* input, float* output, int length)
         {
             int i = 0;
@@ -769,7 +770,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Unsafe pointer-based sum with 4-way accumulation. Eliminates Span bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe float SumUnsafe(float* data, int length)
         {
             int i = 0;
@@ -829,7 +830,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Unsafe pointer-based Max with 4-way accumulation. Eliminates Span bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe float MaxUnsafe(float* data, int length)
         {
             int i = 0;
@@ -871,7 +872,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Unsafe pointer-based Min with 4-way accumulation. Eliminates Span bounds-checking.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe float MinUnsafe(float* data, int length)
         {
             int i = 0;
@@ -910,7 +911,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return min;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorSubtract(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -965,7 +966,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorMultiply(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -1020,7 +1021,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorDivide(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -1068,7 +1069,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Adds a scalar to each element: result[i] = a[i] + scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void AddScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
         {
             if (a.Length != result.Length)
@@ -1110,7 +1111,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Multiplies each element by a scalar: result[i] = a[i] * scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void MultiplyScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
         {
             if (a.Length != result.Length)
@@ -1152,7 +1153,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Divides each element by a scalar: result[i] = a[i] / scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void DivideScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
         {
             // Multiply by reciprocal for better performance
@@ -1160,13 +1161,13 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Subtracts a scalar from each element: result[i] = a[i] - scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SubtractScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
         {
             AddScalar(a, -scalar, result);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static float DotProduct(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
         {
             if (a.Length != b.Length)
@@ -1239,7 +1240,13 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             for (; i < length; i++)
             {
+#if NET5_0_OR_GREATER
+                sum = Fma.IsSupported
+                    ? MathF.FusedMultiplyAdd(a[i], b[i], sum)
+                    : sum + (a[i] * b[i]);
+#else
                 sum += a[i] * b[i];
+#endif
             }
 
             return sum;
@@ -1249,7 +1256,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes destination[i] = a[i] + b[i] * scalar for double-precision values using SIMD.
         /// Uses FMA (Fused Multiply-Add) when available for better performance and precision.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ScalarMultiplyAdd(ReadOnlySpan<double> a, ReadOnlySpan<double> b, double scalar, Span<double> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -1303,7 +1310,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ScalarMultiplyAdd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, float scalar, Span<float> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -1357,7 +1364,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ReLU(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -1421,7 +1428,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Processes 32 floats per iteration (4x unrolled) for maximum throughput.
         /// Relative error ~0.01% across the valid range [-87.3, 88.7].
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Exp(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -1473,7 +1480,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes element-wise exp(x) for double precision using scalar Math.Exp fallback.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Exp(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -1512,7 +1519,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes element-wise sigmoid: 1/(1+exp(-x)) using fast vectorized exp.
         /// Processes 32 floats per iteration (4x unrolled).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Sigmoid(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -1559,7 +1566,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes element-wise sigmoid for double precision.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Sigmoid(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -1618,7 +1625,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Pointer-based double Sigmoid — tries MKL VML exp first for SVML performance,
         /// falls back to 4x unrolled AVX2+FMA with FastExpDouble256.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void SigmoidUnsafe(double* input, double* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -1706,7 +1713,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes element-wise tanh using fast vectorized exp: tanh(x) = 2*sigmoid(2x) - 1.
         /// Processes 32 floats per iteration (4x unrolled).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Tanh(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -1758,7 +1765,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes element-wise tanh for double precision.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Tanh(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -1827,7 +1834,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses IEEE 754 exponent manipulation for 2^n reconstruction.
         /// Relative error ~0.01% across [-87.3, 88.7].
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<float> FastExp256(Vector256<float> x)
         {
             // Clamp to avoid inf/nan (exp(-87.3) ~ 1e-38, exp(88.7) ~ 3.4e38)
@@ -1878,7 +1885,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Cephes-style fast exp for Vector256&lt;double&gt; (4 doubles per vector).
         /// Uses 11th-order minimax polynomial for double precision (~1e-16 relative error).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<double> FastExpDouble256(Vector256<double> x)
         {
             // Clamp to avoid inf/nan in polynomial — no per-vector edge-case handling
@@ -1940,7 +1947,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses 7th-order Padé-like rational approximation for log(m) on [sqrt(0.5), sqrt(2)].
         /// Relative error ~1e-14 across the normal double range.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<double> FastLogDouble256(Vector256<double> x)
         {
             // No per-vector edge-case handling — edge cases (zero, negative, NaN, inf)
@@ -2028,7 +2035,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Range reduction to [-pi/2, pi/2] via j = round(x * 2/pi), then 11th-order
         /// minimax polynomial. Relative error ~1e-15 across the full double range.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<double> FastSinDouble256(Vector256<double> x)
         {
             // Guard: fall back to scalar Math.Sin for |x| > 1e9 to avoid int32 overflow
@@ -2113,7 +2120,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Cephes-style fast cos(x) for Vector256&lt;double&gt;.
         /// Uses sin(x + pi/2) identity with the FastSinDouble256 infrastructure.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<double> FastCosDouble256(Vector256<double> x)
         {
             // cos(x) = sin(x + pi/2)
@@ -2125,7 +2132,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Fast vectorized sigmoid using FastExp256: sigmoid(x) = 1 / (1 + exp(-x)).
         /// Uses Cephes-style exp polynomial (~0.01% relative error) for high accuracy.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
             // sigmoid(x) = 1 / (1 + exp(-x))
@@ -2139,7 +2146,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Decomposes x = 2^n * m (1 &lt;= m &lt; 2), then log(x) = n*ln(2) + log(m).
         /// Uses a minimax polynomial to approximate log(m) on [1, 2].
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<float> FastLog256(Vector256<float> x)
         {
             // Extract exponent: n = floor(log2(x))
@@ -2224,7 +2231,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Range reduction to [-pi/2, pi/2] via j = round(x * 2/pi), then 5th-order minimax.
         /// Relative error ~1e-7 across the full float range.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<float> FastSin256(Vector256<float> x)
         {
             // Guard: fall back to scalar for |x| > 1e6 to avoid int32 overflow in quadrant
@@ -2295,7 +2302,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Cephes-style fast cos(x) for Vector256&lt;float&gt;.
         /// cos(x) = sin(x + pi/2).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<float> FastCos256(Vector256<float> x)
         {
             return FastSin256(Avx.Add(x, Vector256.Create(1.5707963267948966f)));
@@ -2306,7 +2313,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes LeakyReLU element-wise using SIMD: max(alpha * x, x).
         /// Uses AVX/SSE for vectorized comparison and blending when available.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void LeakyReLU(ReadOnlySpan<float> input, float alpha, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2373,7 +2380,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         /// Optimized using SIMD vectorization where available.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void GELU(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2432,7 +2439,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes Mish activation element-wise: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x))).
         /// Uses our own fast Exp/Log/Tanh kernels for maximum throughput.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Mish(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2478,7 +2485,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes Swish/SiLU activation element-wise: x * sigmoid(x).
         /// Uses our own fast Sigmoid and VectorMultiply kernels.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Swish(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2505,7 +2512,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes ELU (Exponential Linear Unit) element-wise: x if x > 0, alpha * (exp(x) - 1) otherwise.
         /// Uses FastExp256 for vectorized exp computation.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ELU(ReadOnlySpan<float> input, float alpha, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2557,7 +2564,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static float Sum(ReadOnlySpan<float> data)
         {
             int length = data.Length;
@@ -2633,7 +2640,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of float values.</param>
         /// <param name="output">Destination span for floor results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Floor(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2692,7 +2699,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of float values.</param>
         /// <param name="output">Destination span for ceiling results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Ceiling(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2751,7 +2758,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of float values.</param>
         /// <param name="output">Destination span for fractional part results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Frac(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -2813,7 +2820,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of double values.</param>
         /// <param name="output">Destination span for floor results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Floor(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -2868,7 +2875,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of double values.</param>
         /// <param name="output">Destination span for ceiling results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Ceiling(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -2922,7 +2929,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of double values.</param>
         /// <param name="output">Destination span for fractional part results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Frac(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -2979,7 +2986,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of float values in radians.</param>
         /// <param name="output">Destination span for sine results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Sin(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3017,7 +3024,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of float values in radians.</param>
         /// <param name="output">Destination span for cosine results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Cos(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3057,7 +3064,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="sinOutput">Destination span for sine results.</param>
         /// <param name="cosOutput">Destination span for cosine results.</param>
         /// <exception cref="ArgumentException">Thrown when span lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SinCos(ReadOnlySpan<float> input, Span<float> sinOutput, Span<float> cosOutput)
         {
             if (input.Length != sinOutput.Length || input.Length != cosOutput.Length)
@@ -3098,7 +3105,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of double values in radians.</param>
         /// <param name="output">Destination span for sine results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Sin(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3133,7 +3140,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="input">Source span of double values in radians.</param>
         /// <param name="output">Destination span for cosine results.</param>
         /// <exception cref="ArgumentException">Thrown when input and output lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Cos(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3170,7 +3177,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <param name="sinOutput">Destination span for sine results.</param>
         /// <param name="cosOutput">Destination span for cosine results.</param>
         /// <exception cref="ArgumentException">Thrown when span lengths differ.</exception>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SinCos(ReadOnlySpan<double> input, Span<double> sinOutput, Span<double> cosOutput)
         {
             if (input.Length != sinOutput.Length || input.Length != cosOutput.Length)
@@ -3208,7 +3215,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         #region Missing Math Kernels (Log, Sqrt, Abs, Negate, Clamp, Pow, SoftMax, Max, Min)
 
         /// <summary>Element-wise natural log using SIMD with Cephes-style polynomial approximation.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Log(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3252,7 +3259,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise natural log for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void Log(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3286,7 +3293,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise log base 2 using SIMD: log2(x) = log(x) / ln(2).</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Log2(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3342,7 +3349,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise log base 2 for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Log2(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3376,7 +3383,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise square root using AVX.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Sqrt(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3415,7 +3422,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise square root for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Sqrt(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3442,7 +3449,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise absolute value using AVX bitwise AND with sign mask.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Abs(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3471,7 +3478,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise absolute value for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Abs(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3499,7 +3506,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise negation using AVX XOR with sign bit.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Negate(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3527,7 +3534,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise negation for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Negate(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3555,7 +3562,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise clamp to [min, max] range.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Clamp(ReadOnlySpan<float> input, float min, float max, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3584,7 +3591,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise power: result[i] = base[i] ^ exp[i].</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Pow(ReadOnlySpan<float> baseValues, ReadOnlySpan<float> exponents, Span<float> output)
         {
             if (baseValues.Length != exponents.Length || baseValues.Length != output.Length)
@@ -3632,7 +3639,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise power with scalar exponent: result[i] = base[i] ^ exp.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Pow(ReadOnlySpan<float> baseValues, float exponent, Span<float> output)
         {
             if (baseValues.Length != output.Length)
@@ -3674,7 +3681,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise clamp to [min, max] range for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Clamp(ReadOnlySpan<double> input, double min, double max, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -3703,7 +3710,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise power with scalar exponent for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Pow(ReadOnlySpan<double> baseValues, double exponent, Span<double> output)
         {
             if (baseValues.Length != output.Length)
@@ -3744,7 +3751,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes SoftMax: output[i] = exp(x[i] - max(x)) / sum(exp(x - max(x))).
         /// Numerically stable via max subtraction.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SoftMax(ReadOnlySpan<float> input, Span<float> output)
         {
             if (input.Length != output.Length)
@@ -3768,7 +3775,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Returns the maximum value in the span with 4-way accumulation.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static float Max(ReadOnlySpan<float> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
@@ -3817,7 +3824,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Returns the minimum value in the span with 4-way accumulation.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static float Min(ReadOnlySpan<float> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
@@ -3866,7 +3873,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Cosine similarity: dot(a,b) / (||a|| * ||b||).</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static float CosineSimilarity(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
         {
             if (a.Length != b.Length)
@@ -3889,7 +3896,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         #region Double Precision Arithmetic
 
         /// <summary>Element-wise addition for double precision with 4x unrolling.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorAdd(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -3927,7 +3934,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise subtraction for double precision with 4x unrolling.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorSubtract(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -3965,7 +3972,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise multiplication for double precision with 4x unrolling.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorMultiply(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -4003,7 +4010,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Element-wise division for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void VectorDivide(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
         {
             if (a.Length != b.Length || a.Length != result.Length)
@@ -4041,7 +4048,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Adds a scalar to each double element.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void AddScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
         {
             if (a.Length != result.Length)
@@ -4081,7 +4088,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Multiplies each double element by a scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void MultiplyScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
         {
             if (a.Length != result.Length)
@@ -4125,7 +4132,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses VGATHERDPS to load 8 floats per instruction with computed index vectors.
         /// Falls back to scalar for tail elements and non-AVX2 hardware.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void StridedGatherFloat(float* source, int offset, int stride, float* result, int count)
         {
 #if NET5_0_OR_GREATER
@@ -4167,7 +4174,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// AVX2 hardware gather for double: collects elements at stride intervals.
         /// Uses VGATHERQPD to load 4 doubles per instruction.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void StridedGatherDouble(double* source, int offset, int stride, double* result, int count)
         {
 #if NET5_0_OR_GREATER
@@ -4205,7 +4212,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// No hardware scatter instruction on x86 (scatter is AVX-512 only), so this uses
         /// an unrolled scalar loop for best performance.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void StridedScatterFloat(float* source, float* destination, int offset, int stride, int count)
         {
             int i = 0;
@@ -4227,7 +4234,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Strided scatter for double: writes elements to destination at stride intervals.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void StridedScatterDouble(double* source, double* destination, int offset, int stride, int count)
         {
             int i = 0;
@@ -4246,7 +4253,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Pointer-based MultiplyScalar for float — AVX 8-wide with 4x unroll.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void MultiplyScalarUnsafe(float* a, float scalar, float* result, int length)
         {
             int i = 0;
@@ -4280,7 +4287,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Pointer-based MultiplyScalar for double — zero bounds-checking overhead.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void MultiplyScalarUnsafe(double* a, double scalar, double* result, int length)
         {
             int i = 0;
@@ -4314,7 +4321,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Pointer-based VectorAdd for double — zero bounds-checking overhead.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorAddUnsafe(double* a, double* b, double* result, int length)
         {
             int i = 0;
@@ -4346,7 +4353,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Pointer-based VectorSubtract for double — zero bounds-checking overhead.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorSubtractUnsafe(double* a, double* b, double* result, int length)
         {
             int i = 0;
@@ -4378,7 +4385,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Pointer-based VectorMultiply for double — zero bounds-checking overhead.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static unsafe void VectorMultiplyUnsafe(double* a, double* b, double* result, int length)
         {
             int i = 0;
@@ -4410,21 +4417,21 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Divides each double element by a scalar.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void DivideScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
         {
             MultiplyScalar(a, 1.0 / scalar, result);
         }
 
         /// <summary>Subtracts a scalar from each double element.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SubtractScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
         {
             AddScalar(a, -scalar, result);
         }
 
         /// <summary>Sum for double precision with 4-way parallel accumulation.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static double Sum(ReadOnlySpan<double> data)
         {
             int length = data.Length;
@@ -4470,7 +4477,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Dot product for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static double DotProduct(ReadOnlySpan<double> a, ReadOnlySpan<double> b)
         {
             if (a.Length != b.Length)
@@ -4522,14 +4529,20 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             for (; i < length; i++)
             {
+#if NET5_0_OR_GREATER
+                sum = Fma.IsSupported
+                    ? Math.FusedMultiplyAdd(a[i], b[i], sum)
+                    : sum + (a[i] * b[i]);
+#else
                 sum += a[i] * b[i];
+#endif
             }
 
             return sum;
         }
 
         /// <summary>Max for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static double Max(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
@@ -4542,7 +4555,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Min for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static double Min(ReadOnlySpan<double> data)
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
@@ -4555,7 +4568,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>Cosine similarity for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static double CosineSimilarity(ReadOnlySpan<double> a, ReadOnlySpan<double> b)
         {
             if (a.Length != b.Length)
@@ -4569,7 +4582,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>SoftMax for double precision.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void SoftMax(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4612,7 +4625,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes ReLU element-wise using SIMD: max(0, x).
         /// Uses AVX/SSE for vectorized comparison when available.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ReLU(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4656,7 +4669,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes LeakyReLU element-wise using SIMD: max(alpha * x, x).
         /// Uses AVX/SSE for vectorized comparison and blending when available.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void LeakyReLU(ReadOnlySpan<double> input, double alpha, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4709,7 +4722,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Computes GELU (Gaussian Error Linear Unit) element-wise for double precision.
         /// Uses approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void GELU(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4759,7 +4772,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes Mish activation element-wise for double precision: x * tanh(softplus(x)).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Mish(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4803,7 +4816,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes Swish/SiLU activation element-wise for double precision: x * sigmoid(x).
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void Swish(ReadOnlySpan<double> input, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4843,7 +4856,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes ELU (Exponential Linear Unit) element-wise for double precision.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         public static void ELU(ReadOnlySpan<double> input, double alpha, Span<double> output)
         {
             if (input.Length != output.Length)
@@ -4890,7 +4903,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
 
 #if NET5_0_OR_GREATER
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         internal static Vector256<float> ReadVector256(ReadOnlySpan<float> data, int offset)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
@@ -4898,7 +4911,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref element));
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static void WriteVector256(Span<float> data, int offset, Vector256<float> value)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
@@ -4906,7 +4919,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref element), value);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector128<float> ReadVector128(ReadOnlySpan<float> data, int offset)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
@@ -4914,7 +4927,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return Unsafe.ReadUnaligned<Vector128<float>>(ref Unsafe.As<float, byte>(ref element));
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static void WriteVector128(Span<float> data, int offset, Vector128<float> value)
         {
             ref float start = ref MemoryMarshal.GetReference(data);
@@ -4922,7 +4935,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref element), value);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         internal static float HorizontalSum(Vector256<float> v)
         {
             // SIMD shuffle reduction: no stack spill
@@ -4933,7 +4946,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return HorizontalSum(sum128);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static float HorizontalMax(Vector256<float> v)
         {
             var lo = v.GetLower();
@@ -4947,7 +4960,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return max128.ToScalar();
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static float HorizontalMin(Vector256<float> v)
         {
             var lo = v.GetLower();
@@ -4960,7 +4973,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return min128.ToScalar();
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static float HorizontalSum(Vector128<float> v)
         {
 #if NET8_0_OR_GREATER
@@ -4992,7 +5005,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector256<double> ReadVector256Double(ReadOnlySpan<double> data, int offset)
         {
             ref double start = ref MemoryMarshal.GetReference(data);
@@ -5000,7 +5013,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return Unsafe.ReadUnaligned<Vector256<double>>(ref Unsafe.As<double, byte>(ref element));
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static void WriteVector256Double(Span<double> data, int offset, Vector256<double> value)
         {
             ref double start = ref MemoryMarshal.GetReference(data);
@@ -5008,7 +5021,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref element), value);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static Vector128<double> ReadVector128Double(ReadOnlySpan<double> data, int offset)
         {
             ref double start = ref MemoryMarshal.GetReference(data);
@@ -5016,7 +5029,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return Unsafe.ReadUnaligned<Vector128<double>>(ref Unsafe.As<double, byte>(ref element));
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static void WriteVector128Double(Span<double> data, int offset, Vector128<double> value)
         {
             ref double start = ref MemoryMarshal.GetReference(data);
@@ -5024,7 +5037,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             Unsafe.WriteUnaligned(ref Unsafe.As<double, byte>(ref element), value);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static double HorizontalSum(Vector256<double> v)
         {
             // SIMD shuffle reduction: add upper 128 to lower 128, then reduce 128-bit
@@ -5034,7 +5047,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             return HorizontalSum(sum128);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         private static double HorizontalSum(Vector128<double> v)
         {
 #if NET8_0_OR_GREATER
@@ -5166,7 +5179,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Computes softmax for a single contiguous row using unsafe pointers.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         internal static unsafe void SoftmaxRowUnsafe(float* input, float* output, int length)
         {
             // Tiled softmax: process in L1-cache-sized tiles to maximize data reuse.
@@ -5501,7 +5514,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
         /// Uses inline FastExp256 to avoid per-call overhead.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(HotInline)]
         internal static unsafe void LogSoftmaxRowUnsafe(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER

@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -97,7 +98,7 @@ internal static class DirectConv2DHelper
     /// Process single input channel -> single output channel contribution for 3x3 kernel.
     /// Uses SIMD vectorization for the inner width loop.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static void Conv2D3x3SingleChannel(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> kernel,
@@ -129,7 +130,7 @@ internal static class DirectConv2DHelper
     }
 
 #if NET8_0_OR_GREATER
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv2D3x3SingleChannelPtr(
         float* input,
         float* kernel,
@@ -157,7 +158,7 @@ internal static class DirectConv2DHelper
             k00, k01, k02, k10, k11, k12, k20, k21, k22);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static unsafe void Conv2D3x3SingleChannelAvx2Ptr(
         float* input,
         float* output,
@@ -285,7 +286,7 @@ internal static class DirectConv2DHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe Vector256<float> AddRow3x3Boundary(
         Vector256<float> acc,
         float* row,
@@ -327,14 +328,14 @@ internal static class DirectConv2DHelper
         return acc;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe float GetSafe(float* row, int width, int idx)
     {
         if (row == null || idx < 0 || idx >= width) return 0f;
         return row[idx];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv2D3x3SingleChannelScalarPtr(
         float* input,
         float* output,
@@ -435,7 +436,7 @@ internal static class DirectConv2DHelper
     }
 
 #if NET8_0_OR_GREATER
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static void Conv2D3x3SingleChannelAvx2(
         ReadOnlySpan<float> input,
         Span<float> output,

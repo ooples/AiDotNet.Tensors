@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -402,6 +404,7 @@ internal static class WinogradHelper
     }
 
     // Small matrix multiply routines (unrolled for performance)
+    [MethodImpl(Hot)]
     private static void MatMul4x3_3x3(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c)
     {
         for (int i = 0; i < 4; i++)
@@ -418,6 +421,7 @@ internal static class WinogradHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MatMul4x3_3x4(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c)
     {
         for (int i = 0; i < 4; i++)
@@ -434,6 +438,7 @@ internal static class WinogradHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MatMul4x4_4x4(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c)
     {
         for (int i = 0; i < 4; i++)
@@ -450,6 +455,7 @@ internal static class WinogradHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MatMul2x4_4x4(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c)
     {
         for (int i = 0; i < 2; i++)
@@ -466,6 +472,7 @@ internal static class WinogradHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MatMul2x4_4x2(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c)
     {
         for (int i = 0; i < 2; i++)
