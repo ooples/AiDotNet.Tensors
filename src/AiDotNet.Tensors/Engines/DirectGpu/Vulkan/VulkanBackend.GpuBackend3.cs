@@ -440,6 +440,9 @@ public sealed unsafe partial class VulkanBackend
 
     public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
+        // Initialize output and counts to zero before accumulation
+        Fill(output, 0f, outputSize * featureSize);
+        Fill(counts, 0f, outputSize);
         // Two-pass: scatter-add then divide
         GlslQuadOp(VulkanGlslKernels.ScatterMeanGlsl, source, indices, output, counts,
             sourceSize, new uint[] { (uint)sourceSize, (uint)featureSize }, 2 * sizeof(uint));
