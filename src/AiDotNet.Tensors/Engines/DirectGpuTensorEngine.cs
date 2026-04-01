@@ -721,6 +721,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// If AutocastScope is active, converts a fp32 buffer to fp16 and returns the fp16 buffer.
+    /// If not active, returns null (caller should use the original buffer).
+    /// The caller is responsible for converting outputs back to fp32 via MaybeAutocastOutput.
+    /// </summary>
+    private IGpuBuffer? MaybeAutocastInput(IDirectGpuBackend backend, IGpuBuffer fp32Buffer, int size)
+    {
+        return Gpu.AutocastScope.MaybeConvertInput(backend, fp32Buffer, size);
+    }
+
+    /// <summary>
+    /// If AutocastScope is active, converts an fp16 output buffer back to fp32.
+    /// </summary>
+    private void MaybeAutocastOutput(IDirectGpuBackend backend, IGpuBuffer fp16Output, IGpuBuffer fp32Target, int size)
+    {
+        if (Gpu.AutocastScope.IsEnabled && Gpu.AutocastScope.ActivePrecision != Gpu.PrecisionMode.Float32)
+        {
+            backend.ConvertToFp32(fp16Output, fp32Target, size);
+        }
+    }
+
+    /// <summary>
     /// Validates attention bias shape/rank and uploads to GPU.
     /// Matches CpuEngine validation: rank must be 3 [heads, seqQ, seqK] or 4 [batch, heads, seqQ, seqK].
     /// </summary>
