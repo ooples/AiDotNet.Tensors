@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 
@@ -151,6 +152,7 @@ public static class CpuFusedOperations
     /// Computes a single row of fused GEMM + Bias + Activation.
     /// Uses SIMD dot product for each output element.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void ComputeGemmRowFused(
         float[] A,
         float[] B,
@@ -171,7 +173,11 @@ public static class CpuFusedOperations
             float sum = 0f;
             for (int k = 0; k < K; k++)
             {
+#if NET5_0_OR_GREATER
+                sum = MathF.FusedMultiplyAdd(A[aRowOffset + k], B[k * N + j], sum);
+#else
                 sum += A[aRowOffset + k] * B[k * N + j];
+#endif
             }
 
             // Fused: Add bias
@@ -567,6 +573,7 @@ public static class CpuFusedOperations
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void ComputeGemmRowFusedDouble(
         double[] A,
         double[] B,
@@ -585,7 +592,11 @@ public static class CpuFusedOperations
             double sum = 0.0;
             for (int k = 0; k < K; k++)
             {
+#if NET5_0_OR_GREATER
+                sum = Math.FusedMultiplyAdd(A[aRowOffset + k], B[k * N + j], sum);
+#else
                 sum += A[aRowOffset + k] * B[k * N + j];
+#endif
             }
 
             if (hasBias && bias != null)
