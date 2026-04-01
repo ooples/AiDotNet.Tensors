@@ -3948,8 +3948,21 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <returns>A tensor on the target device.</returns>
     public Tensor<T> To(DeviceInfo deviceInfo)
     {
-        // TODO: Multi-GPU support — use deviceInfo.Index to select specific GPU context
-        return To(deviceInfo.Type);
+        if (deviceInfo.Type == TensorDevice.CPU)
+            return Cpu();
+
+        // Multi-GPU: create backend for the specific device index
+        var backend = Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
+        if (backend is null)
+            return this; // No GPU available at this index
+
+        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(GetDataArray());
+        _gpuBuffer = backend.AllocateBuffer(floatData);
+        _gpuBackend = backend;
+        _gpuDeviceIndex = deviceInfo.Index;
+        _device = deviceInfo.Type;
+
+        return this;
     }
 
     /// <summary>
