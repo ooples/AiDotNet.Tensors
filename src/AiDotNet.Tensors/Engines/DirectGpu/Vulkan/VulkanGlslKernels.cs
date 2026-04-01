@@ -1274,16 +1274,27 @@ void main() {
     public static string ScatterMeanGlsl => Header + @"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
-layout(set = 0, binding = 2) buffer C { float c[]; };
-layout(set = 0, binding = 3) buffer D { float d[]; };
+layout(set = 0, binding = 2) buffer C { uint c_bits[]; };
+layout(set = 0, binding = 3) buffer D { uint d_counts[]; };
 layout(push_constant) uniform Params { uint sourceSize; uint featureSize; };
+
+// CAS-based atomic float add using uint reinterpretation (no GL_EXT_shader_atomic_float needed)
+void atomicAddFloat(uint index, float val) {
+    uint oldBits = c_bits[index];
+    uint newBits;
+    do {
+        float oldVal = uintBitsToFloat(oldBits);
+        newBits = floatBitsToUint(oldVal + val);
+    } while ((oldBits = atomicCompSwap(c_bits[index], oldBits, newBits)) != oldBits);
+}
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= sourceSize) return;
     uint row = idx / featureSize; uint col = idx % featureSize;
     uint targetRow = uint(bdata[row]);
-    c[targetRow * featureSize + col] += a[idx];
-    if (col == 0) d[targetRow] += 1.0;
+    atomicAddFloat(targetRow * featureSize + col, a[idx]);
+    if (col == 0) atomicAdd(d_counts[targetRow], 1u);
 }";
 
     public static string ScatterMeanDivideGlsl => Header + @"

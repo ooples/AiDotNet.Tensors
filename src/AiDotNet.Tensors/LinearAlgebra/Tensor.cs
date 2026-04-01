@@ -3949,10 +3949,28 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (deviceInfo.Type == TensorDevice.CPU)
             return Cpu();
 
-        // Multi-GPU: create backend for the specific device index
+        // Validate that the requested backend type matches the available backend
+        var directGpu = Engines.Engine.DirectGpu;
+        if (directGpu is not null && directGpu.IsAvailable && directGpu.Backend is not null)
+        {
+            var actualType = directGpu.Backend.BackendName?.ToUpperInvariant() switch
+            {
+                "CUDA" or "NVIDIA" => TensorDevice.CUDA,
+                "OPENCL" => TensorDevice.OpenCL,
+                "HIP" or "ROCM" => TensorDevice.HIP,
+                "VULKAN" => TensorDevice.Vulkan,
+                "METAL" or "MPS" => TensorDevice.Metal,
+                _ => TensorDevice.CUDA
+            };
+            if (deviceInfo.Type != actualType && deviceInfo.Type != TensorDevice.CUDA)
+                throw new NotSupportedException(
+                    $"Requested device type {deviceInfo.Type} but the active GPU backend is {actualType}. " +
+                    $"Use To(DeviceInfo.{actualType}({deviceInfo.Index})) instead.");
+        }
+
         var backend = Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
         if (backend is null)
-            return this; // No GPU available at this index
+            throw new InvalidOperationException($"No GPU backend available at device index {deviceInfo.Index}.");
 
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);

@@ -92,8 +92,9 @@ public sealed class GradScaler
             if (gradients[i] is null) continue;
             gradients[i] = engine.TensorMultiplyScalar(gradients[i], invScale);
 
-            // Check for inf/nan via GPU-resident reduction: sum of tensor is NaN/Inf
-            // if any element is NaN/Inf. This avoids forcing GPU->CPU materialization.
+            // Check for inf/nan via GPU-resident reduction: mean of tensor is NaN/Inf
+            // if any element is NaN/Inf. The reduction runs on GPU; only the 1-element
+            // scalar result is downloaded to CPU (not the full gradient tensor).
             var sum = engine.TensorMeanDiff(gradients[i]);
             var sumData = sum.GetDataArray();
             double sumVal = numOps.ToDouble(sumData[0]);

@@ -35,10 +35,8 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </remarks>
 public sealed class CudaGraphScope : IDisposable
 {
-    // Retained for future use when graph replay integrates with backend batch execution
-#pragma warning disable CS0414
-    private readonly IGpuBatchExecution _backend;
-#pragma warning restore CS0414
+    // Backend retained for future graph replay integration with batch execution
+    internal readonly IGpuBatchExecution Backend;
     private readonly IntPtr _stream;
     private IntPtr _graph;
     private IntPtr _graphExec;
@@ -68,7 +66,7 @@ public sealed class CudaGraphScope : IDisposable
     /// <param name="stream">The CUDA stream to capture on. Must be a user-created stream, not the default/null stream (CUDA requires this for graph capture).</param>
     public CudaGraphScope(IGpuBatchExecution backend, IntPtr stream)
     {
-        _backend = backend ?? throw new ArgumentNullException(nameof(backend));
+        Backend = backend ?? throw new ArgumentNullException(nameof(backend));
         if (stream == IntPtr.Zero)
             throw new ArgumentException("CUDA graph capture requires a user-created stream, not the default stream (IntPtr.Zero). Create a stream via cuStreamCreate first.", nameof(stream));
         _stream = stream;

@@ -82,23 +82,16 @@ public abstract class TensorBase<T> : IDisposable
     /// </remarks>
     public TensorDevice Device
     {
-        get
-        {
-            // If data was deferred and has since been materialized, update device to CPU
-            if (_device != TensorDevice.CPU && _data._cachedArray is not null
-                && !Helpers.DeferredArrayMaterializer.IsPending(_data._cachedArray))
-            {
-                _device = TensorDevice.CPU;
-            }
-            return _device;
-        }
+        get => _device;
         internal set => _device = value;
     }
 
     /// <summary>
-    /// Returns true if this tensor's data currently resides on a GPU device.
+    /// Returns true if this tensor's data is believed to reside on a GPU device.
+    /// After CPU materialization (e.g., via AsSpan/GetDataArray), call Cpu()
+    /// to update the device state. The tensor does not auto-detect materialization.
     /// </summary>
-    public bool IsGpuResident => Device != TensorDevice.CPU;
+    public bool IsGpuResident => _device != TensorDevice.CPU;
 
     /// <summary>
     /// Gets the full device info including device index for multi-GPU scenarios.
