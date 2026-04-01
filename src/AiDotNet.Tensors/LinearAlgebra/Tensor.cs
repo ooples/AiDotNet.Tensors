@@ -84,6 +84,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     /// <param name="data">The data to populate the tensor with.</param>
     /// <param name="dimensions">An array specifying the size of each dimension.</param>
+    /// <summary>
+    /// Creates a GPU-resident tensor with zero CPU allocation.
+    /// </summary>
+    internal static Tensor<T> CreateGpuResident(int[] shape) => new Tensor<T>(shape, TensorDevice.CUDA);
+
+    private Tensor(int[] shape, TensorDevice gpuDevice) : base(shape, gpuDevice) { }
+
     public Tensor(T[] data, int[] dimensions) : base(data, dimensions)
     {
     }

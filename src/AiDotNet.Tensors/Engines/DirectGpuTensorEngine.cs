@@ -586,19 +586,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
                 }
             }
-
-            // Not in any cache — we need actual CPU data to upload.
-            // Now it's safe to trigger materialization since we know a transfer is needed.
-            if (_deferredDownloads.ContainsKey(backingArray))
+        }
+        else
+        {
+            // GPU-resident tensor with no backing array — check activation cache by vector key
+            var vector = tensor.DataVector;
+            lock (_activationCacheLock)
             {
-                MaterializeIfDeferred(backingArray);
+                if (_activationCache.TryGetValue(vector, out var activationEntry) &&
+                    ReferenceEquals(activationEntry.Backend, backend))
+                {
+                    return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                }
             }
-
-            float[] floatData = DirectGpuEngine.ToFloatArray(backingArray);
-            return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
         }
 
-        // Fallback: no cached array reference, use GetDataArray() which may materialize
+        // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
         return GetOrAllocateBuffer(backend, tensor.GetDataArray());
     }
 
@@ -750,6 +753,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Thread-safe: uses lock to coordinate with cache lookups.
     /// </summary>
     private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
+        => CacheActivation((object)resultData, buffer, shape, backend);
+
+    private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
     {
         List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
         lock (_activationCacheLock)
@@ -768,7 +774,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bool added = false;
             try
             {
-                added = _activationCache.TryAdd(resultData, entry);
+                added = _activationCache.TryAdd(cacheKey, entry);
             }
             finally
             {
@@ -997,25 +1003,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private Tensor<T> DeferTensorResult<T>(IDirectGpuBackend backend, IGpuBuffer outputBuffer, int elementCount, int[] shape)
     {
-#if !NETFRAMEWORK
-        var result = GC.AllocateUninitializedArray<T>(elementCount);
-#else
-        var result = new T[elementCount];
-#endif
-        CacheActivation(result, outputBuffer, shape, backend);
-        _deferredDownloads.TryAdd(result, new DeferredDownloadEntry(outputBuffer, backend, elementCount));
-
-        Helpers.DeferredArrayMaterializer.Register(result, arr =>
-        {
-            if (_deferredDownloads.TryRemove(arr, out var entry))
-            {
-                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
-                var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
-                Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
-            }
-        });
-
-        var tensor = new Tensor<T>(result, shape);
+        // Create GPU-resident tensor with ZERO CPU allocation.
+        // The backing array is only allocated when CPU code actually accesses the data.
+        var tensor = Tensor<T>.CreateGpuResident(shape);
         tensor._gpuBuffer = outputBuffer;
         tensor._gpuBackend = backend;
         tensor._device = backend.BackendName?.ToUpperInvariant() switch
@@ -1029,6 +1019,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             "DIRECTML" or "DML" => TensorDevice.DirectML,
             _ => TensorDevice.CUDA
         };
+
+        // Register materializer keyed by the vector — when GetDataArray() is called,
+        // it allocates the backing array and then TryMaterialize(vector) downloads from GPU
+        var vector = tensor.DataVector;
+        Helpers.DeferredArrayMaterializer.Register(vector, obj =>
+        {
+            var vec = (LinearAlgebra.VectorBase<T>)obj;
+            if (tensor._gpuBuffer is not null && tensor._gpuBackend is not null)
+            {
+                float[] floatData = tensor._gpuBackend.DownloadBuffer(tensor._gpuBuffer);
+                var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
+                var arr = vec.GetBackingArrayUnsafe();
+                if (arr is not null)
+                    Array.Copy(converted, arr, Math.Min(converted.Length, arr.Length));
+            }
+        });
+
+        // Cache the GPU buffer so GetOrAllocateBuffer finds it
+        // Use the vector as cache key since there's no backing array yet
+        CacheActivation(vector, outputBuffer, shape, backend);
+
         return tensor;
     }
 

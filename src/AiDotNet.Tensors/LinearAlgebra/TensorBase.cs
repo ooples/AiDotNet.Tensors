@@ -283,6 +283,27 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     /// <summary>
+    /// Creates a GPU-resident tensor with zero CPU memory allocation.
+    /// The backing array is allocated lazily when CPU code first accesses the data.
+    /// Used by DirectGpuTensorEngine for GPU-only intermediate results.
+    /// </summary>
+    internal TensorBase(int[] shape, TensorDevice gpuDevice)
+    {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
+        ValidateShape(shape);
+        _shape = (int[])shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(shape);
+        _storageOffset = 0;
+        IsContiguous = true;
+        IsView = false;
+        int expectedSize = ComputeProduct(shape);
+        Length = expectedSize;
+        _data = Vector<T>.CreateGpuResident(expectedSize);
+        _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>

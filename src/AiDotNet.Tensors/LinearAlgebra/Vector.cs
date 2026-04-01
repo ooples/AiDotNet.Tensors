@@ -147,6 +147,19 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a GPU-resident vector with zero CPU allocation.
+    /// The backing array is allocated lazily when CPU code first accesses data.
+    /// </summary>
+    internal static Vector<T> CreateGpuResident(int length)
+    {
+        return new Vector<T>(length, TensorDevice.CUDA);
+    }
+
+    private Vector(int length, TensorDevice gpuDevice) : base(length, gpuDevice)
+    {
+    }
+
+    /// <summary>
     /// Zero-copy factory from Memory&lt;T&gt;. Preserves array identity for GPU deferred materialization.
     /// </summary>
     internal static Vector<T> WrapMemory(Memory<T> memory) => new Vector<T>(memory, false);

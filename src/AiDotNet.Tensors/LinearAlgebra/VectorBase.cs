@@ -21,19 +21,22 @@ public abstract class VectorBase<T>
 {
     /// <summary>
     /// The internal memory that stores the vector's elements.
+    /// May start as Memory&lt;T&gt;.Empty for GPU-resident vectors (lazy allocation).
     /// </summary>
-    /// <remarks>
-    /// <para><b>Issue #693:</b> Memory&lt;T&gt; provides zero-copy slicing, better Span&lt;T&gt; interop,
-    /// and integration with memory pooling.</para>
-    /// </remarks>
-    protected readonly Memory<T> _memory;
+    protected Memory<T> _memory;
 
     /// <summary>
     /// Cached direct reference to the backing array for SIMD fast paths.
     /// Eliminates Memory&lt;T&gt;.Span property overhead (~30ns per access).
-    /// May be null if Memory&lt;T&gt; is not backed by a simple array.
+    /// May be null if Memory&lt;T&gt; is not backed by a simple array or if GPU-resident (lazy).
     /// </summary>
-    internal readonly T[]? _cachedArray;
+    internal T[]? _cachedArray;
+
+    /// <summary>
+    /// The logical length of this vector. For GPU-resident vectors where _memory is empty,
+    /// this stores the actual element count. For CPU-backed vectors, equals _memory.Length.
+    /// </summary>
+    private int _logicalLength;
 
     /// <summary>
     /// Optional memory owner for pooled memory management.
@@ -126,6 +129,7 @@ public abstract class VectorBase<T>
 #endif
         _memory = arr;
         _cachedArray = arr;
+        _logicalLength = length;
     }
 
     /// <summary>
@@ -139,11 +143,7 @@ public abstract class VectorBase<T>
     protected VectorBase(Memory<T> memory)
     {
         _memory = memory;
-        // Extract backing array for SIMD fast paths. The array may be LARGER than Length
-        // when backed by ArrayPool (which returns power-of-2 buffers).
-        // INVARIANT: all SIMD consumers MUST pass Length as the element count, never array.Length.
-        // This invariant is enforced by _cachedArray being internal (not public) and all SIMD
-        // paths in VectorBase/MatrixBase/SimdKernels explicitly using Length for bounds.
+        _logicalLength = memory.Length;
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {
@@ -165,7 +165,7 @@ public abstract class VectorBase<T>
     {
         _memoryOwner = memoryOwner;
         _memory = memoryOwner.Memory.Slice(0, length);
-        // Sliced memory — can't cache array (offset != 0 or count != array.Length)
+        _logicalLength = length;
     }
 
     /// <summary>
@@ -181,6 +181,7 @@ public abstract class VectorBase<T>
         var arr = values.ToArray();
         _memory = arr;
         _cachedArray = arr;
+        _logicalLength = arr.Length;
     }
 
     /// <summary>
@@ -190,7 +191,37 @@ public abstract class VectorBase<T>
     /// <para><b>For Beginners:</b> This tells you how many numbers are in your vector.
     /// For example, the vector [1,2,3] has a Length of 3.</para>
     /// </remarks>
-    public int Length => _memory.Length;
+    /// <summary>
+    /// Creates a GPU-resident vector with zero CPU allocation.
+    /// The backing array is only allocated when CPU code first accesses the data.
+    /// Used by DirectGpuTensorEngine for GPU-resident tensor results.
+    /// </summary>
+    /// <param name="logicalLength">The number of elements this vector represents.</param>
+    /// <param name="gpuResident">Must be true — marker to distinguish from other constructors.</param>
+    internal VectorBase(int logicalLength, TensorDevice gpuDevice)
+    {
+        _memory = Memory<T>.Empty;
+        _cachedArray = null;
+        _logicalLength = logicalLength;
+    }
+
+    /// <summary>
+    /// Materializes the CPU backing array for a GPU-resident vector.
+    /// Called by GetDataArray/AsSpan when CPU code needs actual data.
+    /// </summary>
+    internal void MaterializeBacking(T[] data)
+    {
+        _memory = data;
+        _cachedArray = data;
+        // _logicalLength stays the same
+    }
+
+    /// <summary>
+    /// Returns true if this vector has no CPU backing (GPU-resident with lazy allocation).
+    /// </summary>
+    internal bool IsLazyAllocated => _memory.Length == 0 && _logicalLength > 0;
+
+    public int Length => _logicalLength;
 
     /// <summary>
     /// Gets a value indicating whether the vector contains no elements.
@@ -327,9 +358,17 @@ public abstract class VectorBase<T>
     /// </summary>
     internal T[] GetDataArray()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            // Try to materialize GPU data into the new array via the vector-keyed callback
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
+
         if (_cachedArray is not null)
         {
-            // Materialize deferred GPU download if pending (populates the array on first CPU access)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _cachedArray;
         }
