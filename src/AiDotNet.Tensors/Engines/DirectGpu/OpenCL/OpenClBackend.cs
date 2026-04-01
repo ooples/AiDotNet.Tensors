@@ -7829,7 +7829,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mean).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, outerSize); k.SetArg(arg++, reduceSize);
-            k.Execute1D(outerSize * reduceSize, Math.Min(256, outerSize * reduceSize));
+            k.Execute1D(outerSize * reduceSize, Math.Max(1, Math.Min(256, outerSize * reduceSize)));
         }
 
         public void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
@@ -7841,7 +7841,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)std).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, outerSize); k.SetArg(arg++, reduceSize);
-            k.Execute1D(outerSize * reduceSize, Math.Min(256, outerSize * reduceSize));
+            k.Execute1D(outerSize * reduceSize, Math.Max(1, Math.Min(256, outerSize * reduceSize)));
         }
 
         public void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
@@ -7873,7 +7873,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)norm).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, outerSize); k.SetArg(arg++, reduceSize);
-            k.Execute1D(outerSize * reduceSize, Math.Min(256, outerSize * reduceSize));
+            k.Execute1D(outerSize * reduceSize, Math.Max(1, Math.Min(256, outerSize * reduceSize)));
         }
 
         public void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
@@ -7884,7 +7884,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)lse).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
             k.SetArg(arg++, outerSize); k.SetArg(arg++, reduceSize);
-            k.Execute1D(outerSize * reduceSize, Math.Min(256, outerSize * reduceSize));
+            k.Execute1D(outerSize * reduceSize, Math.Max(1, Math.Min(256, outerSize * reduceSize)));
         }
 
         public void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
@@ -7895,7 +7895,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, batch); k.SetArg(arg++, channels);
             k.SetArg(arg++, inLength); k.SetArg(arg++, outLength);
             k.SetArg(arg++, kernelSize); k.SetArg(arg++, stride);
-            k.Execute1D(batch * channels * outLength, Math.Min(256, batch * channels * outLength));
+            k.Execute1D(batch * channels * outLength, Math.Max(1, Math.Min(256, batch * channels * outLength)));
         }
 
         public void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
@@ -7906,7 +7906,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, batch); k.SetArg(arg++, channels);
             k.SetArg(arg++, inLength); k.SetArg(arg++, outLength);
             k.SetArg(arg++, kernelSize); k.SetArg(arg++, stride);
-            k.Execute1D(batch * channels * outLength, Math.Min(256, batch * channels * outLength));
+            k.Execute1D(batch * channels * outLength, Math.Max(1, Math.Min(256, batch * channels * outLength)));
         }
 
         public void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
@@ -7917,7 +7917,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, batch); k.SetArg(arg++, channels);
             k.SetArg(arg++, inH); k.SetArg(arg++, inW);
             k.SetArg(arg++, outH); k.SetArg(arg++, outW);
-            k.Execute1D(batch * channels * outH * outW, Math.Min(256, batch * channels * outH * outW));
+            k.Execute1D(batch * channels * outH * outW, Math.Max(1, Math.Min(256, batch * channels * outH * outW)));
         }
 
         public void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)

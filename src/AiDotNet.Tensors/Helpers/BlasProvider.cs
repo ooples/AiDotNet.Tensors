@@ -328,8 +328,8 @@ internal static class BlasProvider
     }
 
     /// <summary>
-    /// Sets MKL.NET thread count for deterministic GEMM.
-    /// Separated to prevent JIT from loading MKL.NET types when not available.
+    /// Attempts double-precision GEMM via MKL.NET.
+    /// Returns false if MKL.NET is unavailable or deterministic mode is active.
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
@@ -446,22 +446,22 @@ internal static class BlasProvider
         // non-deterministic results from parallel reduction ordering.
         if (!_deterministicMode)
         {
-        // Wrapped in try-catch because on net471, the JIT may throw FileNotFoundException
-        // when trying to resolve the MKL.NET assembly before entering TryInitializeMklNet's own try-catch
-        try
-        {
-            if (TryInitializeMklNet())
+            // Wrapped in try-catch because on net471, the JIT may throw FileNotFoundException
+            // when trying to resolve the MKL.NET assembly before entering TryInitializeMklNet's own try-catch
+            try
             {
-                Trace("[BLAS] Initialized MKL.NET successfully");
-                _useMklNet = true;
-                return true;
+                if (TryInitializeMklNet())
+                {
+                    Trace("[BLAS] Initialized MKL.NET successfully");
+                    _useMklNet = true;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace($"[BLAS] MKL.NET JIT load failed: {ex.GetType().Name}: {ex.Message}");
             }
         }
-        catch (Exception ex)
-        {
-            Trace($"[BLAS] MKL.NET JIT load failed: {ex.GetType().Name}: {ex.Message}");
-        }
-        } // end if (!_deterministicMode)
         Trace("[BLAS] MKL.NET not available, trying native libraries...");
 
         string? explicitPath = Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PATH");

@@ -2116,7 +2116,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
         if (!_kernelCache.TryGetValue("avg_pool1d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: avg_pool1d");
-        int total = batch * channels * outLength;
+        int total = checked((int)((long)batch * channels * outLength));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2126,7 +2126,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
         if (!_kernelCache.TryGetValue("max_pool1d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: max_pool1d");
-        int total = batch * channels * outLength;
+        int total = checked((int)((long)batch * channels * outLength));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2136,7 +2136,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     public unsafe void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
     {
         if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bilinear_upsample2d");
-        int total = batch * channels * outH * outW;
+        int total = checked((int)((long)batch * channels * outH * outW));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

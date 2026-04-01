@@ -6288,6 +6288,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void ScatterMean(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer output, IGpuBuffer counts, int sourceSize, int outputSize, int featureSize)
     {
         using var _ = PushContext();
+        // Initialize output and counts to zero before accumulation
+        Fill(output, 0f, outputSize * featureSize);
+        Fill(counts, 0f, outputSize);
         // Step 1: scatter-add and count
         if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
             throw new InvalidOperationException("CUDA kernel not found: scatter_mean");

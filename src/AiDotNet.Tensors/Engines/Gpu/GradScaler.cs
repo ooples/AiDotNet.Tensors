@@ -92,17 +92,15 @@ public sealed class GradScaler
             if (gradients[i] is null) continue;
             gradients[i] = engine.TensorMultiplyScalar(gradients[i], invScale);
 
-            // Check for inf/nan in unscaled gradients
-            var data = gradients[i].GetDataArray();
-            int len = gradients[i].Length; // Use logical length, not array length (ArrayPool may over-allocate)
-            for (int j = 0; j < len; j++)
+            // Check for inf/nan via GPU-resident reduction: sum of tensor is NaN/Inf
+            // if any element is NaN/Inf. This avoids forcing GPU->CPU materialization.
+            var sum = engine.TensorMeanDiff(gradients[i]);
+            var sumData = sum.GetDataArray();
+            double sumVal = numOps.ToDouble(sumData[0]);
+            if (double.IsInfinity(sumVal) || double.IsNaN(sumVal))
             {
-                double val = numOps.ToDouble(data[j]);
-                if (double.IsInfinity(val) || double.IsNaN(val))
-                {
-                    _foundInfOrNan = true;
-                    return;
-                }
+                _foundInfOrNan = true;
+                return;
             }
         }
     }

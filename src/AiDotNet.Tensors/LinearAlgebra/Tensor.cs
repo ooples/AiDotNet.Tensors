@@ -3954,7 +3954,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (backend is null)
             return this; // No GPU available at this index
 
-        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(GetDataArray());
+        var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
+        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
         _gpuBackend = backend;
         _gpuDeviceIndex = deviceInfo.Index;
@@ -3979,7 +3980,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (device == TensorDevice.CPU)
             return Cpu();
 
-        return Gpu();
+        // Use the default GPU backend but set the correct device type
+        var result = Gpu();
+        if (result._device != TensorDevice.CPU)
+            result._device = device;
+        return result;
     }
 
     /// <summary>
@@ -3997,7 +4002,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             return this;
 
         var backend = directGpu.Backend;
-        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(GetDataArray());
+        var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
+        var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
         _gpuBackend = backend;
         _device = backend.BackendName?.ToUpperInvariant() switch

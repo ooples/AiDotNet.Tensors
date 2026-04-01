@@ -1751,7 +1751,8 @@ internal static class BackwardFunctions<T>
         }
     }
 
-    /// <summary>Element-wise max backward: gradient flows to whichever input was larger</summary>
+    /// <summary>Element-wise max backward: gradient flows to whichever input was larger.
+    /// Ties (a == b) route gradient to inputs[0] (asymmetric subgradient, consistent with PyTorch).</summary>
     internal static void MaxBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -1772,7 +1773,8 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
     }
 
-    /// <summary>Element-wise min backward: gradient flows to whichever input was smaller</summary>
+    /// <summary>Element-wise min backward: gradient flows to whichever input was smaller.
+    /// Ties (a == b) route gradient to inputs[0] (asymmetric subgradient, consistent with PyTorch).</summary>
     internal static void MinBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)

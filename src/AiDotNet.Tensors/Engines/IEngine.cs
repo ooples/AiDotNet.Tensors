@@ -1701,7 +1701,7 @@ public interface IEngine
     /// <summary>Backward pass for ELU activation.</summary>
     Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha);
 
-    /// <summary>Backward pass for Threshold activation.</summary>
+    /// <summary>Backward pass for Threshold activation. Uses double threshold to match forward pass precision.</summary>
     Tensor<T> ThresholdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double threshold);
 
     /// <summary>Backward pass for Reciprocal.</summary>
@@ -1710,7 +1710,8 @@ public interface IEngine
     /// <summary>Backward pass for PReLU: returns (inputGrad, alphaGrad).</summary>
     (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha);
 
-    /// <summary>Backward pass for Variance reduction.</summary>
+    /// <summary>Backward pass for global variance reduction. For axis-specific backward, see ReduceVarianceBackward.
+    /// This method handles the common case of global variance used by autograd.</summary>
     Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes);
 
     /// <summary>Backward pass for Std reduction.</summary>
@@ -2524,7 +2525,7 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorCeiling<T>(Tensor<T> tensor);
 
-    /// <summary>Element-wise round to nearest integer.</summary>
+    /// <summary>Element-wise round to nearest integer using MidpointRounding.ToEven (banker's rounding). GPU backends use hardware rounding which matches this mode.</summary>
     Tensor<T> TensorRound<T>(Tensor<T> tensor);
 
     /// <summary>

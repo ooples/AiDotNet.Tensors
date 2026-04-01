@@ -20923,6 +20923,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        if (gradOutput.Length != input.Length)
+            throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         var gData = gradOutput.GetDataArray();
@@ -21095,10 +21097,14 @@ public class CpuEngine : ITensorLevelEngine
         var xData = input.GetDataArray();
         var aData = alpha.GetDataArray();
         int alphaSize = alpha.Length;
+        // For NCHW layout, alpha is per-channel: index = (i / spatialSize) % channels
+        int spatialSize = input.Rank >= 4
+            ? input.Shape._dims[input.Rank - 2] * input.Shape._dims[input.Rank - 1]
+            : 1;
         for (int i = 0; i < input.Length; i++)
         {
             double val = numOps.ToDouble(xData[i]);
-            int aIdx = alphaSize == 1 ? 0 : i % alphaSize;
+            int aIdx = alphaSize == 1 ? 0 : (i / spatialSize) % alphaSize;
             double a = numOps.ToDouble(aData[aIdx]);
             double g = numOps.ToDouble(gData[i]);
             xGrad[i] = val >= 0 ? gData[i] : numOps.FromDouble(a * g);

@@ -8076,7 +8076,8 @@ fn reduce_partial_sums(@builtin(local_invocation_id) lid: vec3<u32>) {
                LerpFusedSource + AddScaledSource +
                GatedActivationSource + SoftmaxVariantsSource +
                ShapeOpsSource + ReductionExtSource +
-               StridedOpsSource;
+               StridedOpsSource +
+               Pool1DSource + BilinearUpsample2DSource;
     }
 
     // ============================================================================
