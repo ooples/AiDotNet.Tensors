@@ -248,11 +248,25 @@ public abstract class VectorBase<T>
         get
         {
             ValidateIndex(index);
+            if (IsLazyAllocated)
+            {
+                var arr = new T[_logicalLength];
+                MaterializeBacking(arr);
+                Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+            }
+            if (_cachedArray is not null)
+                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _memory.Span[index];
         }
         set
         {
             ValidateIndex(index);
+            if (IsLazyAllocated)
+            {
+                var arr = new T[_logicalLength];
+                MaterializeBacking(arr);
+                Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+            }
             _memory.Span[index] = value;
         }
     }
@@ -304,6 +318,13 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
         // Materialize deferred GPU download before exposing CPU data
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
@@ -324,6 +345,12 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory.Span;
@@ -400,6 +427,14 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlyMemory<T> AsMemory()
     {
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory;
     }
 
@@ -416,6 +451,14 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        if (IsLazyAllocated)
+        {
+            var arr = new T[_logicalLength];
+            MaterializeBacking(arr);
+            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
+        }
+        if (_cachedArray is not null)
+            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
         return _memory;
     }
 
