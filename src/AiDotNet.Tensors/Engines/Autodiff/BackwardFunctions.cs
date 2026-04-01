@@ -1522,10 +1522,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Argmax indices are flat offsets into the input tensor
+        // Use Reshape to flatten for scatter, then reshape back
         int[] argmax = (int[])savedState[0];
         var indices = new Tensor<int>(argmax, new[] { argmax.Length });
-        var zeros = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        var grad = engine.TensorScatterAdd(zeros, indices, gradOutput);
+        var flatZeros = TensorPool<T>.RentZeroed(new[] { inputs[0].Length });
+        var flatGrad = engine.Reshape(gradOutput, new[] { gradOutput.Length });
+        var scattered = engine.TensorScatterAdd(flatZeros, indices, flatGrad);
+        var grad = engine.Reshape(scattered, inputs[0].Shape.ToArray());
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -1685,8 +1689,10 @@ internal static class BackwardFunctions<T>
     {
         int[] argmax = (int[])savedState[0];
         var indices = new Tensor<int>(argmax, new[] { argmax.Length });
-        var zeros = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        var grad = engine.TensorScatterAdd(zeros, indices, gradOutput);
+        var flatZeros = TensorPool<T>.RentZeroed(new[] { inputs[0].Length });
+        var flatGrad = engine.Reshape(gradOutput, new[] { gradOutput.Length });
+        var scattered = engine.TensorScatterAdd(flatZeros, indices, flatGrad);
+        var grad = engine.Reshape(scattered, inputs[0].Shape.ToArray());
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

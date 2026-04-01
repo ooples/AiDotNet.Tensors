@@ -35,7 +35,10 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// </remarks>
 public sealed class CudaGraphScope : IDisposable
 {
+    // Retained for future use when graph replay integrates with backend batch execution
+#pragma warning disable CS0414
     private readonly IGpuBatchExecution _backend;
+#pragma warning restore CS0414
     private readonly IntPtr _stream;
     private IntPtr _graph;
     private IntPtr _graphExec;
