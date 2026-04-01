@@ -1241,7 +1241,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
-                sum = MathF.FusedMultiplyAdd(a[i], b[i], sum);
+                sum = Fma.IsSupported
+                    ? MathF.FusedMultiplyAdd(a[i], b[i], sum)
+                    : sum + (a[i] * b[i]);
 #else
                 sum += a[i] * b[i];
 #endif
@@ -4528,7 +4530,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
 #if NET5_0_OR_GREATER
-                sum = Math.FusedMultiplyAdd(a[i], b[i], sum);
+                sum = Fma.IsSupported
+                    ? Math.FusedMultiplyAdd(a[i], b[i], sum)
+                    : sum + (a[i] * b[i]);
 #else
                 sum += a[i] * b[i];
 #endif

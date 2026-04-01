@@ -776,12 +776,10 @@ public static class TensorPrimitivesCore
         }
 #endif
 
+        // Scalar tail uses unfused multiply-add to match the SIMD body which uses
+        // Vector256.Add(vSum, Vector256.Multiply(...)) — not FMA intrinsics.
         for (; i < x.Length; i++)
-#if NET5_0_OR_GREATER
-            sum = Math.FusedMultiplyAdd(x[i], y[i], sum);
-#else
             sum += x[i] * y[i];
-#endif
 
         return sum;
     }
@@ -825,12 +823,10 @@ public static class TensorPrimitivesCore
         }
 #endif
 
+        // Scalar tail uses unfused multiply-add to match the SIMD body which uses
+        // Vector256.Add(vSum, Vector256.Multiply(...)) — not FMA intrinsics.
         for (; i < x.Length; i++)
-#if NET5_0_OR_GREATER
-            sum = MathF.FusedMultiplyAdd(x[i], y[i], sum);
-#else
             sum += x[i] * y[i];
-#endif
 
         return sum;
     }

@@ -347,7 +347,9 @@ internal static class SimdConvHelper
                 if (iw >= 0 && iw < width)
                 {
 #if NET5_0_OR_GREATER
-                    sum = MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum);
+                    sum = UseFma
+                        ? MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum)
+                        : sum + (input[ih * width + iw] * kernel[kh * 3 + kw]);
 #else
                     sum += input[ih * width + iw] * kernel[kh * 3 + kw];
 #endif
@@ -449,7 +451,9 @@ internal static class SimdConvHelper
                 if (iw >= 0 && iw < width)
                 {
 #if NET5_0_OR_GREATER
-                    sum = MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum);
+                    sum = UseFma
+                        ? MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum)
+                        : sum + (input[ih * width + iw] * kernel[kh * 3 + kw]);
 #else
                     sum += input[ih * width + iw] * kernel[kh * 3 + kw];
 #endif
