@@ -144,18 +144,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var signTensor = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < inputs[0].Length; i++)
-        {
-            var val = inputs[0].GetFlat(i);
-            if (numOps.GreaterThan(val, numOps.Zero))
-                signTensor.SetFlat(i, numOps.One);
-            else if (numOps.LessThan(val, numOps.Zero))
-                signTensor.SetFlat(i, numOps.Negate(numOps.One));
-            else
-                signTensor.SetFlat(i, numOps.Zero);
-        }
+        var signTensor = engine.TensorSign(inputs[0]);
         var grad = engine.TensorMultiply(gradOutput, signTensor);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
