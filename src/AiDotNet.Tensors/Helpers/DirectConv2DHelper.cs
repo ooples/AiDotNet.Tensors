@@ -97,7 +97,7 @@ internal static class DirectConv2DHelper
     /// Process single input channel -> single output channel contribution for 3x3 kernel.
     /// Uses SIMD vectorization for the inner width loop.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static void Conv2D3x3SingleChannel(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> kernel,
@@ -129,7 +129,7 @@ internal static class DirectConv2DHelper
     }
 
 #if NET8_0_OR_GREATER
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv2D3x3SingleChannelPtr(
         float* input,
         float* kernel,
@@ -285,7 +285,7 @@ internal static class DirectConv2DHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe Vector256<float> AddRow3x3Boundary(
         Vector256<float> acc,
         float* row,
@@ -327,14 +327,14 @@ internal static class DirectConv2DHelper
         return acc;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe float GetSafe(float* row, int width, int idx)
     {
         if (row == null || idx < 0 || idx >= width) return 0f;
         return row[idx];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv2D3x3SingleChannelScalarPtr(
         float* input,
         float* output,

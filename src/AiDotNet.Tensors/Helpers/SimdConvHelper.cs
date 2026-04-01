@@ -104,7 +104,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv3x3Stride1SingleChannel(
         float* input, float* kernelOc, float* outputChannel,
         int inChannels, int height, int width, int outHeight, int outWidth,
@@ -134,7 +134,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv3x3SingleChannelFma(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -327,7 +327,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe float ComputeScalarConv3x3(float* input, float* kernel,
         int height, int width, int oh, int ow, int padH, int padW)
     {
@@ -345,14 +345,18 @@ internal static class SimdConvHelper
                 int iw = iwBase + kw;
                 if (iw >= 0 && iw < width)
                 {
+#if NET5_0_OR_GREATER
+                    sum = MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum);
+#else
                     sum += input[ih * width + iw] * kernel[kh * 3 + kw];
+#endif
                 }
             }
         }
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void ProcessBoundaryRow(float* input, float* kernel, float* outputRow,
         int height, int width, int outWidth, int oh, int padH, int padW, float* boundaryBuffer)
     {
@@ -362,7 +366,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv3x3SingleChannelFmaWithDilation(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -425,7 +429,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe float ComputeScalarConv3x3WithDilation(float* input, float* kernel,
         int height, int width, int oh, int ow, int padH, int padW, int dilationH, int dilationW)
     {
@@ -443,14 +447,18 @@ internal static class SimdConvHelper
                 int iw = iwBase + kw * dilationW;
                 if (iw >= 0 && iw < width)
                 {
+#if NET5_0_OR_GREATER
+                    sum = MathF.FusedMultiplyAdd(input[ih * width + iw], kernel[kh * 3 + kw], sum);
+#else
                     sum += input[ih * width + iw] * kernel[kh * 3 + kw];
+#endif
                 }
             }
         }
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv3x3SingleChannelAvx2(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -559,7 +567,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv3x3SingleChannelAvx2WithDilation(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -622,7 +630,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void Conv1x1Gemm(
         float* input, float* kernel, float* output,
         int outChannels, int inChannels, int spatialSize)
