@@ -1193,7 +1193,11 @@ void main() {
     c[idx] = (bdata[idx] != 0.0) ? 0.0 : a[idx];
 }";
 
-    public static string WhereBackwardGlsl => Header + FourBufferLayout + @"
+    public static string WhereBackwardGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) buffer D { float d[]; };
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -1235,7 +1239,7 @@ void main() {
     uint inOff = (b * channels + ch) * inLength;
     float sum = 0.0; uint cnt = 0;
     for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) { sum += a[inOff + pos]; cnt++; } }
-    b_out[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
+    b[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
 }";
 
     public static string MaxPool1DGlsl => Header + TwoBufferLayout + @"
@@ -1248,7 +1252,7 @@ void main() {
     uint inOff = (b * channels + ch) * inLength;
     float maxVal = -3.402823466e+38;
     for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, a[inOff + pos]); }
-    b_out[idx] = maxVal;
+    b[idx] = maxVal;
 }";
 
     public static string BilinearUpsample2DGlsl => Header + TwoBufferLayout + @"
@@ -1264,28 +1268,33 @@ void main() {
     uint h0 = uint(h_in); uint h1 = min(h0 + 1, inH - 1); uint w0 = uint(w_in); uint w1 = min(w0 + 1, inW - 1);
     float hd = h_in - float(h0); float wd = w_in - float(w0);
     uint base_idx = (b * channels + ch) * inH * inW;
-    b_out[idx] = (1-hd)*(1-wd)*a[base_idx+h0*inW+w0] + (1-hd)*wd*a[base_idx+h0*inW+w1] + hd*(1-wd)*a[base_idx+h1*inW+w0] + hd*wd*a[base_idx+h1*inW+w1];
+    b[idx] = (1-hd)*(1-wd)*a[base_idx+h0*inW+w0] + (1-hd)*wd*a[base_idx+h0*inW+w1] + hd*(1-wd)*a[base_idx+h1*inW+w0] + hd*wd*a[base_idx+h1*inW+w1];
 }";
 
-    public static string ScatterMeanGlsl => Header + FourBufferLayout + @"
+    public static string ScatterMeanGlsl => Header + @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) buffer D { float d[]; };
 layout(push_constant) uniform Params { uint sourceSize; uint featureSize; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= sourceSize) return;
     uint row = idx / featureSize; uint col = idx % featureSize;
     uint targetRow = uint(bdata[row]);
-    // Note: Vulkan doesn't support atomicAdd on float without extension
     c[targetRow * featureSize + col] += a[idx];
     if (col == 0) d[targetRow] += 1.0;
 }";
 
-    public static string ScatterMeanDivideGlsl => Header + TwoBufferLayout + @"
+    public static string ScatterMeanDivideGlsl => Header + @"
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
 layout(push_constant) uniform Params { uint outputSize; uint featureSize; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= outputSize) return;
     uint row = idx / featureSize;
-    float cnt = b_out[row];
+    float cnt = b[row];
     if (cnt > 0.0) a[idx] /= cnt;
 }";
 

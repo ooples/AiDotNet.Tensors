@@ -223,9 +223,9 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamEndCapture")]
     public static extern CudaResult cuStreamEndCapture(IntPtr stream, out IntPtr graph);
 
-    [DllImport(CudaLibrary, EntryPoint = "cuGraphInstantiate")]
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphInstantiateWithFlags")]
     public static extern CudaResult cuGraphInstantiate(
-        out IntPtr graphExec, IntPtr graph, IntPtr logBuffer, IntPtr bufferSize, ulong flags);
+        out IntPtr graphExec, IntPtr graph, ulong flags);
 
     [DllImport(CudaLibrary, EntryPoint = "cuGraphLaunch")]
     public static extern CudaResult cuGraphLaunch(IntPtr graphExec, IntPtr stream);

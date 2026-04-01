@@ -298,6 +298,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual T[] ToArray()
     {
+        EnsureMaterialized();
         return _memory.ToArray();
     }
 
@@ -345,6 +346,16 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Span<T> AsWritableSpan()
     {
+        EnsureMaterialized();
+        return _memory.Span;
+    }
+
+    /// <summary>
+    /// Ensures the backing array is allocated and populated for CPU access.
+    /// Call this at the top of any method that reads _memory directly.
+    /// </summary>
+    private void EnsureMaterialized()
+    {
         if (IsLazyAllocated)
         {
             var arr = new T[_logicalLength];
@@ -353,7 +364,6 @@ public abstract class VectorBase<T>
         }
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
-        return _memory.Span;
     }
 
     /// <summary>
@@ -426,14 +436,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlyMemory<T> AsMemory()
     {
-        if (IsLazyAllocated)
-        {
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        }
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        EnsureMaterialized();
         return _memory;
     }
 
@@ -450,14 +453,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
-        if (IsLazyAllocated)
-        {
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        }
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        EnsureMaterialized();
         return _memory;
     }
 
@@ -471,6 +467,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public virtual VectorBase<T> Clone()
     {
+        EnsureMaterialized();
         return CreateInstance(_memory.ToArray());
     }
 

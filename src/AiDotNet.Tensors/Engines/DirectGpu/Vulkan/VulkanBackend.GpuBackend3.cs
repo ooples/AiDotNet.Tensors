@@ -443,7 +443,7 @@ public sealed unsafe partial class VulkanBackend
         // Two-pass: scatter-add then divide
         GlslQuadOp(VulkanGlslKernels.ScatterMeanGlsl, source, indices, output, counts,
             sourceSize, new uint[] { (uint)sourceSize, (uint)featureSize }, 2 * sizeof(uint));
-        GlslUnaryOp(VulkanGlslKernels.ScatterMeanDivideGlsl, output, output,
+        GlslBinaryOp(VulkanGlslKernels.ScatterMeanDivideGlsl, output, counts, output,
             outputSize, new uint[] { (uint)outputSize, (uint)featureSize }, 2 * sizeof(uint));
     }
 

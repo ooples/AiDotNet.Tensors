@@ -99,6 +99,10 @@ public sealed class AutocastScope : IDisposable
         return _fp16AllowedOps.Contains(operationName);
     }
 
+    /// <summary>
+    /// Converts a fp32 GPU buffer to the active precision for computation.
+    /// Returns null if no conversion is needed. Caller MUST dispose the returned buffer.
+    /// </summary>
     public static IGpuBuffer? MaybeConvertInput(IDirectGpuBackend backend, IGpuBuffer fp32Buffer, int size)
     {
         if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)

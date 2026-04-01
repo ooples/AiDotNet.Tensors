@@ -1173,14 +1173,21 @@ __kernel void bilinear_upsample2d(__global const float* input, __global float* o
     output[idx] = (1-hd)*(1-wd)*input[base_idx+h0*inW+w0] + (1-hd)*wd*input[base_idx+h0*inW+w1] + hd*(1-wd)*input[base_idx+h1*inW+w0] + hd*wd*input[base_idx+h1*inW+w1];
 }
 
+// CAS-based atomic float add for OpenCL (no native float atomics)
+inline void atomic_add_float(__global volatile float* addr, float val) {
+    union { unsigned int u; float f; } oldval, newval;
+    do {
+        oldval.f = *addr;
+        newval.f = oldval.f + val;
+    } while (atomic_cmpxchg((__global volatile unsigned int*)addr, oldval.u, newval.u) != oldval.u);
+}
+
 __kernel void scatter_mean(__global const float* source, __global const int* indices, __global volatile float* output, __global volatile int* counts, const int sourceSize, const int featureSize)
 {
     const int idx = get_global_id(0); if (idx >= sourceSize) return;
     int row = idx / featureSize; int col = idx % featureSize;
     int targetRow = indices[row];
-    // OpenCL atomic_add for float requires extension, use atomic_add for int counts
-    // For float accumulation, use atomic_xchg-based CAS loop or accept minor races
-    output[targetRow * featureSize + col] += source[idx];
+    atomic_add_float(&output[targetRow * featureSize + col], source[idx]);
     if (col == 0) atomic_add(&counts[targetRow], 1);
 }
 

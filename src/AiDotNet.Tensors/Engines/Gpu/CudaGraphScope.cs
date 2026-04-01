@@ -112,7 +112,7 @@ public sealed class CudaGraphScope : IDisposable
 
         // Instantiate the graph for execution
         result = CudaNativeBindings.cuGraphInstantiate(
-            out _graphExec, _graph, IntPtr.Zero, IntPtr.Zero, 0);
+            out _graphExec, _graph, 0);
 
         if (result != CudaResult.Success)
         {

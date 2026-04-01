@@ -1764,13 +1764,30 @@ fn logsumexp_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+";
+
+    /// <summary>Where backward needs read_write on both output buffers.</summary>
+    public const string WhereBackward4Source = @"
+@group(0) @binding(0) var<storage, read> wb_a: array<f32>;
+@group(0) @binding(1) var<storage, read> wb_b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> wb_c: array<f32>;
+@group(0) @binding(3) var<storage, read_write> wb_d: array<f32>;
+
+struct WBParams {
+    p0: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+@group(0) @binding(4) var<uniform> wb_params: WBParams;
+
 @compute @workgroup_size(256)
 fn where_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx < rb_params.p0) {
-        let cond = rb_b[idx];
-        rb_c[idx] = select(0.0, rb_a[idx], cond != 0.0);
-        rb_d[idx] = select(rb_a[idx], 0.0, cond != 0.0);
+    if (idx < wb_params.p0) {
+        let cond = wb_b[idx];
+        wb_c[idx] = select(0.0, wb_a[idx], cond != 0.0);
+        wb_d[idx] = select(wb_a[idx], 0.0, cond != 0.0);
     }
 }
 ";

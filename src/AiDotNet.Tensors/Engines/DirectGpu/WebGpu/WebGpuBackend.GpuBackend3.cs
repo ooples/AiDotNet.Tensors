@@ -473,7 +473,7 @@ public sealed partial class WebGpuBackend
 
     public void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
     {
-        Dispatch4BufferAsync("ReductionBackward4", WebGpuKernels.ReductionBackward4Source, "where_backward",
+        Dispatch4BufferAsync("WhereBackward4", WebGpuKernels.WhereBackward4Source, "where_backward",
             gradOutput, condition, gradX, gradY, MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 
