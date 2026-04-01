@@ -2348,11 +2348,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int inputFeatures = weights.Shape._dims[0];
         int outputFeatures = weights.Shape._dims[1];
 
-        // Use cache-aware buffer allocation (OwnedBuffer auto-disposes only if we allocated)
-        using var inputBuffer = GetOrAllocateBuffer(backend, input.GetDataArray());
+        // Use cache-aware buffer allocation — checks _gpuBuffer and activation cache first
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
         // Auto-cache weights and biases so they stay on GPU for subsequent calls
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
-        using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default;
+        using var weightsBuffer = GetOrAllocateBuffer(backend, weights);
+        using var biasBuffer = bias != null ? GetOrAllocateBuffer(backend, bias) : default;
 
         try
         {

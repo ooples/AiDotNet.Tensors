@@ -78,6 +78,31 @@ public sealed class AutocastScope : IDisposable
     /// Converts a fp32 GPU buffer to the active precision for computation.
     /// Returns the original buffer if no conversion is needed.
     /// </summary>
+    /// <summary>
+    /// Operations that benefit from fp16 compute (PyTorch allowlist).
+    /// Norms, losses, softmax, and reductions must stay fp32 for numerical stability.
+    /// </summary>
+    private static readonly HashSet<string> _fp16AllowedOps = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "MatMul", "BatchMatMul", "Gemm", "Linear", "FusedLinear",
+        "Conv1D", "Conv2D", "Conv3D", "ConvTranspose2D", "DepthwiseConv2D",
+        "Add", "Subtract", "Multiply", "Divide",
+        "ReLU", "GELU", "SiLU", "Swish", "LeakyReLU", "Sigmoid", "Tanh",
+        "Mish", "HardSwish", "ELU", "SELU", "Softplus", "HardSigmoid",
+        "Dropout", "Embedding"
+    };
+
+    /// <summary>
+    /// Returns true if the given operation should use fp16 when autocast is active.
+    /// Norms, losses, softmax, and reductions always stay fp32.
+    /// </summary>
+    public static bool ShouldAutocast(string operationName)
+    {
+        if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)
+            return false;
+        return _fp16AllowedOps.Contains(operationName);
+    }
+
     public static IGpuBuffer? MaybeConvertInput(IDirectGpuBackend backend, IGpuBuffer fp32Buffer, int size)
     {
         if (!IsEnabled || ActivePrecision == PrecisionMode.Float32)
