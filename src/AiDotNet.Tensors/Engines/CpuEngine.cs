@@ -21085,6 +21085,46 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = input.Length;
+        var result = new T[n];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        var mData = mean.GetDataArray();
+        double gOut = numOps.ToDouble(gData[0]);
+        double m = numOps.ToDouble(mData[0]);
+        for (int i = 0; i < n; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            result[i] = numOps.FromDouble(gOut * 2.0 * (x - m) / n);
+        }
+        return new Tensor<T>(result, input.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> StdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> std, int[] axes)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = input.Length;
+        var result = new T[n];
+        var gData = gradOutput.GetDataArray();
+        var iData = input.GetDataArray();
+        var mData = mean.GetDataArray();
+        var sData = std.GetDataArray();
+        double gOut = numOps.ToDouble(gData[0]);
+        double m = numOps.ToDouble(mData[0]);
+        double s = Math.Max(numOps.ToDouble(sData[0]), 1e-8);
+        for (int i = 0; i < n; i++)
+        {
+            double x = numOps.ToDouble(iData[i]);
+            result[i] = numOps.FromDouble(gOut * (x - m) / (n * s));
+        }
+        return new Tensor<T>(result, input.Shape.ToArray());
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         var numOps = MathHelper.GetNumericOperations<T>();

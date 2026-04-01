@@ -1707,6 +1707,12 @@ public interface IEngine
     /// <summary>Backward pass for Reciprocal.</summary>
     Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output);
 
+    /// <summary>Backward pass for Variance reduction.</summary>
+    Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes);
+
+    /// <summary>Backward pass for Std reduction.</summary>
+    Tensor<T> StdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> std, int[] axes);
+
     #endregion
 
     #region Matrix Operations (Phase B: Epic 2)

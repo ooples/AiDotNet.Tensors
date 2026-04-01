@@ -1642,16 +1642,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputs[0].Length;
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        double mean = 0;
-        for (int i = 0; i < n; i++) mean += numOps.ToDouble(inputs[0][i]);
-        mean /= n;
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < n; i++)
-            dx[i] = numOps.FromDouble(gOut * 2.0 * (numOps.ToDouble(inputs[0][i]) - mean) / n);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        // Compute mean via engine (GPU-resident)
+        var mean = engine.TensorMeanDiff(inputs[0]);
+        var grad = engine.VarBackward(gradOutput, inputs[0], mean, Array.Empty<int>());
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Std backward: d(std(x))/dx_i = (x_i - mean) / (n * std)</summary>
@@ -1659,18 +1653,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int n = inputs[0].Length;
-        double gOut = numOps.ToDouble(gradOutput[0]);
-        double stdVal = numOps.ToDouble(output[0]);
-        if (stdVal < 1e-12) stdVal = 1e-12; // avoid division by zero
-        double mean = 0;
-        for (int i = 0; i < n; i++) mean += numOps.ToDouble(inputs[0][i]);
-        mean /= n;
-        var dx = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
-        for (int i = 0; i < n; i++)
-            dx[i] = numOps.FromDouble(gOut * (numOps.ToDouble(inputs[0][i]) - mean) / (n * stdVal));
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+        var mean = engine.TensorMeanDiff(inputs[0]);
+        var grad = engine.StdBackward(gradOutput, inputs[0], mean, output, Array.Empty<int>());
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     /// <summary>Square backward: d(x^2)/dx = 2*x</summary>

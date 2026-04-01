@@ -11879,6 +11879,57 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.ReciprocalBackward(gradOutput, output);
     }
 
+    public override Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                int outerSize = 1;
+                int reduceSize = input.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                using var mBuf = GetOrAllocateBuffer(backend, mean);
+                var oBuf = AllocateOutputBuffer(backend, input.Length);
+                try
+                {
+                    backend.VarBackward(gBuf.Buffer, iBuf.Buffer, mBuf.Buffer, oBuf.Buffer, outerSize, reduceSize);
+                    var result = FinishGpuOp<T>(backend, oBuf, input.Length);
+                    return new Tensor<T>(result, input.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.VarBackward(gradOutput, input, mean, axes);
+    }
+
+    public override Tensor<T> StdBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, Tensor<T> std, int[] axes)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                int outerSize = 1;
+                int reduceSize = input.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                using var mBuf = GetOrAllocateBuffer(backend, mean);
+                using var sBuf = GetOrAllocateBuffer(backend, std);
+                var oBuf = AllocateOutputBuffer(backend, input.Length);
+                try
+                {
+                    backend.StdBackward(gBuf.Buffer, iBuf.Buffer, mBuf.Buffer, sBuf.Buffer, oBuf.Buffer, outerSize, reduceSize);
+                    var result = FinishGpuOp<T>(backend, oBuf, input.Length);
+                    return new Tensor<T>(result, input.Shape._dims);
+                }
+                catch { oBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.StdBackward(gradOutput, input, mean, std, axes);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated trigonometric
     // ──────────────────────────────────────────────────────────────
