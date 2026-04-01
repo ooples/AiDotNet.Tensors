@@ -1109,25 +1109,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (_deferredDownloads.TryRemove(kvp.Key, out var entry))
             {
-                float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
-                // The key is a T[] but we don't know T here — use float path since
-                // most GPU ops work with float arrays internally
-                if (kvp.Key is float[] floatArray)
+                try
                 {
-                    Array.Copy(floatData, floatArray, Math.Min(floatData.Length, floatArray.Length));
-                }
-                else
-                {
-                    // For non-float types, we need the original type conversion
-                    // This is a rare path — most GPU operations use float
-                    var arr = kvp.Key as Array;
-                    if (arr != null)
+                    float[] floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+                    // The key is a T[] but we don't know T here — use float path since
+                    // most GPU ops work with float arrays internally
+                    if (kvp.Key is float[] floatArray)
                     {
-                        for (int i = 0; i < Math.Min(floatData.Length, arr.Length); i++)
+                        Array.Copy(floatData, floatArray, Math.Min(floatData.Length, floatArray.Length));
+                    }
+                    else
+                    {
+                        // For non-float types, we need the original type conversion
+                        // This is a rare path — most GPU operations use float
+                        var arr = kvp.Key as Array;
+                        if (arr != null)
                         {
-                            arr.SetValue(Convert.ChangeType(floatData[i], arr.GetType().GetElementType()!), i);
+                            for (int i = 0; i < Math.Min(floatData.Length, arr.Length); i++)
+                            {
+                                arr.SetValue(Convert.ChangeType(floatData[i], arr.GetType().GetElementType()!), i);
+                            }
                         }
                     }
+                }
+                catch (InvalidOperationException)
+                {
+                    // GPU buffer may already be released (e.g. during Dispose) — skip silently.
+                    // The deferred data was best-effort; callers who need it should have
+                    // materialized before the engine was disposed.
                 }
             }
         }
