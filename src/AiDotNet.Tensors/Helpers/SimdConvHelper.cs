@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -104,7 +105,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv3x3Stride1SingleChannel(
         float* input, float* kernelOc, float* outputChannel,
         int inChannels, int height, int width, int outHeight, int outWidth,
@@ -134,7 +135,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv3x3SingleChannelFma(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -327,7 +328,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe float ComputeScalarConv3x3(float* input, float* kernel,
         int height, int width, int oh, int ow, int padH, int padW)
     {
@@ -356,7 +357,7 @@ internal static class SimdConvHelper
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void ProcessBoundaryRow(float* input, float* kernel, float* outputRow,
         int height, int width, int outWidth, int oh, int padH, int padW, float* boundaryBuffer)
     {
@@ -366,7 +367,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv3x3SingleChannelFmaWithDilation(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -429,7 +430,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe float ComputeScalarConv3x3WithDilation(float* input, float* kernel,
         int height, int width, int oh, int ow, int padH, int padW, int dilationH, int dilationW)
     {
@@ -458,7 +459,7 @@ internal static class SimdConvHelper
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv3x3SingleChannelAvx2(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -567,7 +568,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv3x3SingleChannelAvx2WithDilation(
         float* input, float* kernel, float* output,
         int height, int width, int outHeight, int outWidth,
@@ -630,7 +631,7 @@ internal static class SimdConvHelper
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void Conv1x1Gemm(
         float* input, float* kernel, float* output,
         int outChannels, int inChannels, int spatialSize)

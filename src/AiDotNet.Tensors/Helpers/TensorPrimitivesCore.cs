@@ -6,6 +6,7 @@ using System.Runtime.Intrinsics.Arm;
 #endif
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Interfaces;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 using static AiDotNet.Tensors.ErrorMessages;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -43,7 +44,7 @@ public static class TensorPrimitivesCore
     /// <remarks>
     /// Automatically dispatches to AVX-512, AVX2, SSE, or scalar based on hardware support.
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanIntoSpan<TOperator>(ReadOnlySpan<float> x, Span<float> destination)
         where TOperator : struct, IUnaryOperator<float, float>
     {
@@ -105,7 +106,7 @@ public static class TensorPrimitivesCore
     /// <remarks>
     /// Automatically dispatches to AVX-512, AVX2, SSE, or scalar based on hardware support.
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanIntoSpan<TOperator>(ReadOnlySpan<double> x, Span<double> destination)
         where TOperator : struct, IUnaryOperator<double, double>
     {
@@ -167,7 +168,7 @@ public static class TensorPrimitivesCore
     /// <param name="x">The first input span.</param>
     /// <param name="y">The second input span.</param>
     /// <param name="destination">The destination span to write results to.</param>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<double> x, ReadOnlySpan<double> y, Span<double> destination)
         where TOperator : struct, IBinaryOperator<double, double>
     {
@@ -226,7 +227,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of float values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
         where TOperator : struct, IBinaryOperator<float, float>
     {
@@ -281,7 +282,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of int values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<int> x, ReadOnlySpan<int> y, Span<int> destination)
         where TOperator : struct, IBinaryOperator<int, int>
     {
@@ -336,7 +337,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of long values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<long> x, ReadOnlySpan<long> y, Span<long> destination)
         where TOperator : struct, IBinaryOperator<long, long>
     {
@@ -391,7 +392,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of short values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<short> x, ReadOnlySpan<short> y, Span<short> destination)
         where TOperator : struct, IBinaryOperator<short, short>
     {
@@ -435,7 +436,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of ushort values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<ushort> x, ReadOnlySpan<ushort> y, Span<ushort> destination)
         where TOperator : struct, IBinaryOperator<ushort, ushort>
     {
@@ -479,7 +480,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of uint values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<uint> x, ReadOnlySpan<uint> y, Span<uint> destination)
         where TOperator : struct, IBinaryOperator<uint, uint>
     {
@@ -523,7 +524,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of ulong values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<ulong> x, ReadOnlySpan<ulong> y, Span<ulong> destination)
         where TOperator : struct, IBinaryOperator<ulong, ulong>
     {
@@ -567,7 +568,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of byte values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<byte> x, ReadOnlySpan<byte> y, Span<byte> destination)
         where TOperator : struct, IBinaryOperator<byte, byte>
     {
@@ -611,7 +612,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Applies a binary operator to two spans of sbyte values using the best available SIMD instructions.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static void InvokeSpanSpanIntoSpan<TOperator>(ReadOnlySpan<sbyte> x, ReadOnlySpan<sbyte> y, Span<sbyte> destination)
         where TOperator : struct, IBinaryOperator<sbyte, sbyte>
     {
@@ -659,7 +660,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the sum of all elements in a span of doubles using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static double Sum(ReadOnlySpan<double> x)
     {
         double sum = 0;
@@ -699,7 +700,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the sum of all elements in a span of floats using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static float Sum(ReadOnlySpan<float> x)
     {
         float sum = 0;
@@ -739,7 +740,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the dot product of two spans of doubles using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static double Dot(ReadOnlySpan<double> x, ReadOnlySpan<double> y)
     {
         if (x.Length != y.Length)
@@ -788,7 +789,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the dot product of two spans of floats using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static float Dot(ReadOnlySpan<float> x, ReadOnlySpan<float> y)
     {
         if (x.Length != y.Length)
@@ -837,7 +838,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the maximum value in a span of doubles using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static double Max(ReadOnlySpan<double> x)
     {
         if (x.Length == 0)
@@ -874,7 +875,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the maximum value in a span of floats using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static float Max(ReadOnlySpan<float> x)
     {
         if (x.Length == 0)
@@ -910,7 +911,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the minimum value in a span of doubles using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static double Min(ReadOnlySpan<double> x)
     {
         if (x.Length == 0)
@@ -946,7 +947,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the minimum value in a span of floats using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static float Min(ReadOnlySpan<float> x)
     {
         if (x.Length == 0)
@@ -982,7 +983,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the sum of all elements in a span of ints using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static int Sum(ReadOnlySpan<int> x)
     {
         int sum = 0;
@@ -1022,7 +1023,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the sum of all elements in a span of longs using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static long Sum(ReadOnlySpan<long> x)
     {
         long sum = 0;
@@ -1062,7 +1063,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the dot product of two spans of ints using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static int Dot(ReadOnlySpan<int> x, ReadOnlySpan<int> y)
     {
         if (x.Length != y.Length)
@@ -1107,7 +1108,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Computes the dot product of two spans of longs using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static long Dot(ReadOnlySpan<long> x, ReadOnlySpan<long> y)
     {
         if (x.Length != y.Length)
@@ -1152,7 +1153,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the maximum value in a span of ints using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static int Max(ReadOnlySpan<int> x)
     {
         if (x.Length == 0)
@@ -1188,7 +1189,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the maximum value in a span of longs using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static long Max(ReadOnlySpan<long> x)
     {
         if (x.Length == 0)
@@ -1224,7 +1225,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the minimum value in a span of ints using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static int Min(ReadOnlySpan<int> x)
     {
         if (x.Length == 0)
@@ -1260,7 +1261,7 @@ public static class TensorPrimitivesCore
     /// <summary>
     /// Finds the minimum value in a span of longs using SIMD acceleration.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     public static long Min(ReadOnlySpan<long> x)
     {
         if (x.Length == 0)

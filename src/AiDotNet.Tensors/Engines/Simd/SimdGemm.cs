@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.CpuJit;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -30,7 +31,7 @@ internal static class SimdGemm
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
     /// All matrices are in row-major order. C is cleared before computation.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public static void Sgemm(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -49,7 +50,7 @@ internal static class SimdGemm
     /// lda/ldb are the leading dimensions (row strides) of the source storage.
     /// This enables zero-copy matmul on transposed stride-based views.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public static void Sgemm(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -63,7 +64,7 @@ internal static class SimdGemm
     /// <summary>
     /// Computes C += A * B (accumulates into C without clearing).
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public static void SgemmAdd(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -78,7 +79,7 @@ internal static class SimdGemm
     /// <summary>
     /// Computes C += op(A) * op(B) with stride and transpose support.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public static void SgemmAdd(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -98,7 +99,7 @@ internal static class SimdGemm
     /// <summary>
     /// Scalar GEMM fallback with stride/transpose support.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static void SgemmScalar(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -137,7 +138,7 @@ internal static class SimdGemm
     /// Each row of C is computed as a dot product of a row of A with columns of B,
     /// using SIMD to process 8 columns of B at a time.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static unsafe void SgemmSmallM(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -192,7 +193,7 @@ internal static class SimdGemm
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static void SgemmTiled(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -244,7 +245,7 @@ internal static class SimdGemm
     /// Each worker packs its own B slice and processes all M rows for that column range.
     /// Uses unsafe pinned pointers to avoid array copies for closure capture.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTiledParallelN(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -363,7 +364,7 @@ internal static class SimdGemm
     /// M-dimension parallel GEMM: splits rows across workers.
     /// Ideal for tall matrices (m >= 512). Uses pinned pointers to avoid array copies.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTiledParallelM(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -533,7 +534,7 @@ internal static class SimdGemm
     /// Macro-kernel: iterate over packed panels with Mr x Nr micro-kernel tiles.
     /// Uses JIT-compiled micro-kernel when available for guaranteed optimal register allocation.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static unsafe void MacroKernel(
         float[] packedA,
         float[] packedB,
@@ -603,7 +604,7 @@ internal static class SimdGemm
     /// Uses 12 Vector256 accumulators (6 rows x 2 vectors of 8 floats = 16 columns).
     /// Inner loop over K dimension broadcasts A elements and FMA with B row.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static void MicroKernel6x16(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
@@ -683,8 +684,7 @@ internal static class SimdGemm
     /// <summary>
     /// Scalar micro-kernel for edge cases where tile is smaller than Mr x Nr.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(HotInline)]
     private static void MicroKernelScalar(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,

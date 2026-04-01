@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 using static AiDotNet.Tensors.Helpers.CpuParallelSettings;
 
 namespace AiDotNet.Tensors.NumericOperations;
@@ -923,7 +924,7 @@ public class FloatOperations : INumericOperations<float>
     /// <summary>
     /// Performs element-wise addition using oneDNN when available, falling back to SimdKernels.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public void Add(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
 #if NET8_0_OR_GREATER
@@ -956,7 +957,7 @@ public class FloatOperations : INumericOperations<float>
     /// <summary>
     /// Performs element-wise multiplication using oneDNN when available, falling back to SimdKernels.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public void Multiply(ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> destination)
     {
 #if NET8_0_OR_GREATER
@@ -1219,7 +1220,7 @@ public class FloatOperations : INumericOperations<float>
     /// Computes LeakyReLU element-wise using SIMD-optimized SimdKernels.
     /// Simple comparison operation - single-threaded SIMD saturates memory bandwidth.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public unsafe void LeakyReLU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
     {
         if (x.Length != destination.Length)
@@ -1252,7 +1253,7 @@ public class FloatOperations : INumericOperations<float>
     /// Uses approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public unsafe void GELU(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
@@ -1284,7 +1285,7 @@ public class FloatOperations : INumericOperations<float>
     /// x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
     /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public unsafe void Mish(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
@@ -1316,7 +1317,7 @@ public class FloatOperations : INumericOperations<float>
     /// x * sigmoid(x) = x / (1 + exp(-x))
     /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public unsafe void Swish(ReadOnlySpan<float> x, Span<float> destination)
     {
         if (x.Length != destination.Length)
@@ -1348,7 +1349,7 @@ public class FloatOperations : INumericOperations<float>
     /// x if x > 0, alpha * (exp(x) - 1) otherwise
     /// Zero-copy: uses unsafe pointers to avoid ArrayPool allocation and copy overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     public unsafe void ELU(ReadOnlySpan<float> x, float alpha, Span<float> destination)
     {
         if (x.Length != destination.Length)

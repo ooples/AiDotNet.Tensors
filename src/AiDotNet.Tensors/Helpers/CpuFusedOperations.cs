@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -152,7 +153,7 @@ public static class CpuFusedOperations
     /// Computes a single row of fused GEMM + Bias + Activation.
     /// Uses SIMD dot product for each output element.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static void ComputeGemmRowFused(
         float[] A,
         float[] B,
@@ -573,7 +574,7 @@ public static class CpuFusedOperations
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(Hot)]
     private static void ComputeGemmRowFusedDouble(
         double[] A,
         double[] B,
