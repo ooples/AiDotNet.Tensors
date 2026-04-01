@@ -301,6 +301,7 @@ public abstract class TensorBase<T> : IDisposable
         Length = expectedSize;
         _data = Vector<T>.CreateGpuResident(expectedSize);
         _storage = new TensorStorage<T>(_data);
+        _device = gpuDevice;
     }
 
     /// <summary>

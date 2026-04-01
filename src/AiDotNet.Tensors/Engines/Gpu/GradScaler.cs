@@ -19,11 +19,11 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// using var autocast = new AutocastScope(PrecisionMode.Float16);
 ///
 /// var loss = model.Forward(input);
-/// var scaledLoss = scaler.Scale(loss);          // Multiply loss by scale factor
+/// var scaledLoss = scaler.ScaleLoss(loss, engine); // Multiply loss by scale factor
 /// tape.Backward(scaledLoss);
 ///
-/// scaler.Unscale(gradients, engine);            // Divide gradients by scale factor
-/// if (scaler.Step())                            // Check for inf/nan, update scale
+/// scaler.Unscale(gradients, engine);               // Divide gradients by scale factor
+/// if (scaler.ShouldStep())                         // Check for inf/nan
 ///     optimizer.Step(parameters, gradients);     // Only step if gradients are valid
 /// scaler.Update();                              // Adjust scale factor for next iteration
 /// </code>
@@ -94,7 +94,8 @@ public sealed class GradScaler
 
             // Check for inf/nan in unscaled gradients
             var data = gradients[i].GetDataArray();
-            for (int j = 0; j < data.Length; j++)
+            int len = gradients[i].Length; // Use logical length, not array length (ArrayPool may over-allocate)
+            for (int j = 0; j < len; j++)
             {
                 double val = numOps.ToDouble(data[j]);
                 if (double.IsInfinity(val) || double.IsNaN(val))

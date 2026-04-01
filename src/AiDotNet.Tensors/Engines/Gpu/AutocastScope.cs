@@ -75,10 +75,6 @@ public sealed class AutocastScope : IDisposable
     }
 
     /// <summary>
-    /// Converts a fp32 GPU buffer to the active precision for computation.
-    /// Returns the original buffer if no conversion is needed.
-    /// </summary>
-    /// <summary>
     /// Operations that benefit from fp16 compute (PyTorch allowlist).
     /// Norms, losses, softmax, and reductions must stay fp32 for numerical stability.
     /// </summary>

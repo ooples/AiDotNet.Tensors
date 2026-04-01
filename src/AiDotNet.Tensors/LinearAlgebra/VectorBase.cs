@@ -191,13 +191,13 @@ public abstract class VectorBase<T>
     /// <para><b>For Beginners:</b> This tells you how many numbers are in your vector.
     /// For example, the vector [1,2,3] has a Length of 3.</para>
     /// </remarks>
+
     /// <summary>
     /// Creates a GPU-resident vector with zero CPU allocation.
     /// The backing array is only allocated when CPU code first accesses the data.
-    /// Used by DirectGpuTensorEngine for GPU-resident tensor results.
     /// </summary>
     /// <param name="logicalLength">The number of elements this vector represents.</param>
-    /// <param name="gpuResident">Must be true — marker to distinguish from other constructors.</param>
+    /// <param name="gpuDevice">The GPU device type for this vector.</param>
     internal VectorBase(int logicalLength, TensorDevice gpuDevice)
     {
         _memory = Memory<T>.Empty;
@@ -356,7 +356,6 @@ public abstract class VectorBase<T>
         return _memory.Span;
     }
 
-    /// <summary>
     /// <summary>
     /// Gets the backing array reference WITHOUT triggering deferred GPU materialization.
     /// Used by DirectGpuTensorEngine to check activation cache before deciding whether

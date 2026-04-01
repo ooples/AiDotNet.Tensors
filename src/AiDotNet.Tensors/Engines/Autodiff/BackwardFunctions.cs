@@ -1657,9 +1657,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // dx = gradOutput * exp(x - lse) = gradOutput * softmax(x)
-        var shifted = engine.TensorSubtract(inputs[0], output);
+        var shifted = engine.TensorBroadcastSubtract(inputs[0], output);
         var softmax = engine.TensorExp(shifted);
-        var grad = engine.TensorMultiply(gradOutput, softmax);
+        var grad = engine.TensorBroadcastMultiply(gradOutput, softmax);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -1668,11 +1668,11 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // dx = gradOutput * x / norm — use engine multiply + divide
+        // dx = gradOutput * x / norm — use broadcast ops for scalar norm
         var numOps = MathHelper.GetNumericOperations<T>();
-        var scaledInput = engine.TensorMultiply(gradOutput, inputs[0]);
+        var scaledInput = engine.TensorBroadcastMultiply(gradOutput, inputs[0]);
         var normClamped = engine.TensorClamp(output, numOps.FromDouble(1e-12), numOps.FromDouble(1e30));
-        var grad = engine.TensorDivide(scaledInput, normClamped);
+        var grad = engine.TensorBroadcastDivide(scaledInput, normClamped);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

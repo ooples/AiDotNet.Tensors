@@ -84,16 +84,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     /// <param name="data">The data to populate the tensor with.</param>
     /// <param name="dimensions">An array specifying the size of each dimension.</param>
+    public Tensor(T[] data, int[] dimensions) : base(data, dimensions)
+    {
+    }
+
     /// <summary>
     /// Creates a GPU-resident tensor with zero CPU allocation.
     /// </summary>
     internal static Tensor<T> CreateGpuResident(int[] shape) => new Tensor<T>(shape, TensorDevice.CUDA);
 
     private Tensor(int[] shape, TensorDevice gpuDevice) : base(shape, gpuDevice) { }
-
-    public Tensor(T[] data, int[] dimensions) : base(data, dimensions)
-    {
-    }
 
     /// <summary>
     /// Private constructor for zero-copy tensor creation from a Vector.
@@ -3937,22 +3937,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     // ================================================================
 
     /// <summary>
-    /// Moves this tensor to the specified device. If the tensor is already on the target device,
-    /// returns this tensor without copying. Otherwise creates a new tensor on the target device.
-    /// </summary>
-    /// <param name="device">The target device (e.g., TensorDevice.CUDA, TensorDevice.CPU).</param>
-    /// <returns>A tensor on the target device.</returns>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> This is equivalent to PyTorch's <c>tensor.to('cuda')</c> or
-    /// <c>tensor.to('cpu')</c>. It moves your data to the GPU for faster computation, or back
-    /// to the CPU when you need to inspect the values.</para>
-    /// </remarks>
-    /// <summary>
     /// Moves this tensor to the device specified by a DeviceInfo struct.
     /// Supports multi-GPU: <c>tensor.To(DeviceInfo.Cuda(1))</c> moves to the second CUDA GPU.
+    /// Mutates this tensor in-place and returns it for fluent chaining.
     /// </summary>
     /// <param name="deviceInfo">The target device with index.</param>
-    /// <returns>A tensor on the target device.</returns>
+    /// <returns>This tensor with device updated.</returns>
     public Tensor<T> To(DeviceInfo deviceInfo)
     {
         if (deviceInfo.Type == TensorDevice.CPU)
