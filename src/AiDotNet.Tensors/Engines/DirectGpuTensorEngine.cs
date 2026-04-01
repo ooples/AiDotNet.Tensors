@@ -13080,6 +13080,81 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     // ──────────────────────────────────────────────────────────────
+    // GPU overrides for remaining CpuEngine virtual methods
+    // ──────────────────────────────────────────────────────────────
+
+    // Shape metadata ops — no GPU compute, override for full coverage
+    public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape) => base.Reshape(tensor, newShape);
+    public override Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis) => base.TensorExpandDims(tensor, axis);
+    public override Tensor<T> TensorFlatten<T>(Tensor<T> tensor) => base.TensorFlatten(tensor);
+    public override Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis) => base.TensorSqueeze(tensor, axis);
+
+    public override Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                using var oBuf = GetOrAllocateBuffer(backend, output);
+                var rBuf = AllocateOutputBuffer(backend, gradOutput.Length);
+                try
+                {
+                    backend.EluBackward(gBuf.Buffer, iBuf.Buffer, oBuf.Buffer, rBuf.Buffer, (float)alpha, gradOutput.Length);
+                    var result = FinishGpuOp<T>(backend, rBuf, gradOutput.Length);
+                    return new Tensor<T>(result, gradOutput.Shape._dims);
+                }
+                catch { rBuf.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.EluBackward(gradOutput, input, output, alpha);
+    }
+
+    public override Tensor<T> TensorNarrow<T>(Tensor<T> tensor, int dim, int start, int length)
+    {
+        if (dim == tensor.Rank - 1)
+        {
+            var startArr = new int[tensor.Rank];
+            var lengthArr = new int[tensor.Rank];
+            for (int i = 0; i < tensor.Rank; i++)
+            {
+                startArr[i] = i == dim ? start : 0;
+                lengthArr[i] = i == dim ? length : tensor.Shape._dims[i];
+            }
+            return TensorSlice(tensor, startArr, lengthArr);
+        }
+        return base.TensorNarrow(tensor, dim, start, length);
+    }
+
+    public override Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
+    {
+        if (tensor.Rank == 4 && padding.Length >= 4)
+            return ((IEngine)this).Pad(tensor, padding[2], padding[3], padding[0], padding[1], value);
+        return base.TensorConstantPad(tensor, padding, value);
+    }
+
+    public override void SinCos<T>(Vector<T> vector, out Vector<T> sinResult, out Vector<T> cosResult)
+    {
+        // Dispatch both Sin and Cos through GPU
+        sinResult = ((IEngine)this).Sin(vector);
+        cosResult = ((IEngine)this).Cos(vector);
+    }
+
+    public override Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
+        => base.TensorAvgPool1D(input, kernelSize, stride);
+
+    public override Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
+        => base.TensorMaxPool1D(input, kernelSize, stride);
+
+    public override Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
+        => base.TensorUpsampleBilinear(input, outputSize);
+
+    public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
+        => base.ScatterMean(source, indices, out counts, dim, outputSize);
+
+    // ──────────────────────────────────────────────────────────────
     // GPU-accelerated non-Tensor-prefix activations
     // (ensures GPU dispatch when callers use engine.Sigmoid() directly)
     // ──────────────────────────────────────────────────────────────
