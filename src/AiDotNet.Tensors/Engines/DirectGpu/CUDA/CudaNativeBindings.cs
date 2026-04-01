@@ -169,6 +169,46 @@ internal static class CudaNativeBindings
     public const uint CU_STREAM_NON_BLOCKING = 1;
 
     // ──────────────────────────────────────────────────────────────
+    // Driver version detection
+    // ──────────────────────────────────────────────────────────────
+
+    [DllImport(CudaLibrary, EntryPoint = "cuDriverGetVersion")]
+    public static extern CudaResult cuDriverGetVersion(out int driverVersion);
+
+    /// <summary>
+    /// Gets the CUDA driver version. Returns 0 if unavailable.
+    /// Version format: major*1000 + minor*10 (e.g., 12040 = CUDA 12.4).
+    /// </summary>
+    public static int DriverVersion
+    {
+        get
+        {
+            try
+            {
+                if (!IsAvailable) return 0;
+                var result = cuDriverGetVersion(out int version);
+                return result == CudaResult.Success ? version : 0;
+            }
+            catch { return 0; }
+        }
+    }
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports graph capture (requires CUDA 10.0+, version >= 10000).
+    /// </summary>
+    public static bool SupportsGraphCapture => DriverVersion >= 10000;
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports peer access (requires CUDA 4.0+, version >= 4000).
+    /// </summary>
+    public static bool SupportsPeerAccess => DriverVersion >= 4000;
+
+    /// <summary>
+    /// Gets whether the CUDA driver supports pinned host memory (requires CUDA 2.0+).
+    /// </summary>
+    public static bool SupportsPinnedMemory => DriverVersion >= 2000;
+
+    // ──────────────────────────────────────────────────────────────
     // CUDA Graph APIs (cuStreamBeginCapture/cuGraphLaunch)
     // ──────────────────────────────────────────────────────────────
 

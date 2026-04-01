@@ -68,8 +68,8 @@ public sealed class CudaGraphScope : IDisposable
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _stream = stream;
 
-        // Check if this is actually a CUDA backend that supports graph capture
-        IsSupported = CudaNativeBindings.IsAvailable;
+        // Check if this is actually a CUDA backend that supports graph capture (CUDA 10.0+)
+        IsSupported = CudaNativeBindings.IsAvailable && CudaNativeBindings.SupportsGraphCapture;
     }
 
     /// <summary>
