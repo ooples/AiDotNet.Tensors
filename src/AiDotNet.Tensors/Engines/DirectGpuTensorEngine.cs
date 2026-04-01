@@ -701,6 +701,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer UploadTensorRaw<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         var owned = UploadTensor(backend, tensor);
+        if (owned.OwnsBuffer)
+        {
+            // Fresh upload — cache it so it's managed by the activation cache lifecycle.
+            // Also set the tensor's _gpuBuffer so future operations find it directly.
+            tensor._gpuBuffer = owned.Buffer;
+            tensor._gpuBackend = backend;
+            var backingArray = tensor.DataVector.GetBackingArrayUnsafe();
+            if (backingArray is not null)
+            {
+                CacheActivation(backingArray, owned.Buffer, tensor.Shape.ToArray(), backend);
+            }
+            else
+            {
+                CacheActivation(tensor.DataVector, owned.Buffer, tensor.Shape.ToArray(), backend);
+            }
+        }
         return owned.Buffer;
     }
 
