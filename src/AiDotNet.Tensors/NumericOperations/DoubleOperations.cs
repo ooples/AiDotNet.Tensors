@@ -941,8 +941,10 @@ public class DoubleOperations : INumericOperations<double>
         int length = x.Length;
         if (length >= ParallelThreshold && MaxDegreeOfParallelism > 1)
         {
-            int maxDegree = MaxDegreeOfParallelism;
-            int numChunks = Math.Min(maxDegree, (length + MinChunkSize - 1) / MinChunkSize);
+            // Compute numChunks from length and MinChunkSize only (NOT MaxDegreeOfParallelism)
+            // so that chunk boundaries are deterministic for a given input length,
+            // even if MaxDegreeOfParallelism changes between calls.
+            int numChunks = (length + MinChunkSize - 1) / MinChunkSize;
             if (numChunks <= 1)
             {
                 return Engines.Simd.SimdKernels.Sum(x);
@@ -957,7 +959,7 @@ public class DoubleOperations : INumericOperations<double>
                 fixed (double* xPtr = x)
                 {
                     var xp = xPtr;
-                    Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, i =>
+                    Parallel.For(0, numChunks, new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism }, i =>
                     {
                         int start = i * chunkSize;
                         int count = Math.Min(chunkSize, length - start);

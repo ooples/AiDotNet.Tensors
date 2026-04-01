@@ -4260,8 +4260,10 @@ public class CpuEngine : ITensorLevelEngine
             int length = tensor.Length;
             float result;
 
-            // Use all cores for bandwidth — more threads = more aggregate memory bandwidth.
-            int numChunks = length >= 200_000 ? Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(2, length / 50_000)) : 1;
+            // Compute numChunks from length only (NOT MaxDegreeOfParallelism) so chunk
+            // boundaries are deterministic for a given input length, ensuring FP reproducibility
+            // even if MaxDegreeOfParallelism changes between calls.
+            int numChunks = length >= 200_000 ? Math.Max(2, length / 50_000) : 1;
             if (numChunks >= 2)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
