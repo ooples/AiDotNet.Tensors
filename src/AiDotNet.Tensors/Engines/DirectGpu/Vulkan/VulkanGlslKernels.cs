@@ -1273,7 +1273,7 @@ void main() {
 
     public static string ScatterMeanGlsl => Header + @"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
-layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
+layout(set = 0, binding = 1) readonly buffer B { int bdata[]; };
 layout(set = 0, binding = 2) buffer C { uint c_bits[]; };
 layout(set = 0, binding = 3) buffer D { uint d_counts[]; };
 layout(push_constant) uniform Params { uint sourceSize; uint featureSize; };

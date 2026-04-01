@@ -1522,15 +1522,20 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Argmax indices are flat offsets into the input tensor
-        // Use Reshape to flatten for scatter, then reshape back
+        // Argmax indices are flat offsets — scatter gradient to those positions
+        // Use engine ops: create zeros, then add gradient at argmax positions
+        var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
-        var indices = new Tensor<int>(argmax, new[] { argmax.Length });
-        var flatZeros = TensorPool<T>.RentZeroed(new[] { inputs[0].Length });
-        var flatGrad = engine.Reshape(gradOutput, new[] { gradOutput.Length });
-        var scattered = engine.TensorScatterAdd(flatZeros, indices, flatGrad);
-        var grad = engine.Reshape(scattered, inputs[0].Shape.ToArray());
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        var inputGrad = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradData = gradOutput.GetDataArray();
+        var resultData = inputGrad.GetDataArray();
+        for (int i = 0; i < argmax.Length; i++)
+        {
+            int idx = argmax[i];
+            if (idx >= 0 && idx < resultData.Length)
+                resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
     /// <summary>Cosine similarity backward</summary>
@@ -1687,13 +1692,19 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Argmax indices are flat offsets — scatter gradient to those positions
+        var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
-        var indices = new Tensor<int>(argmax, new[] { argmax.Length });
-        var flatZeros = TensorPool<T>.RentZeroed(new[] { inputs[0].Length });
-        var flatGrad = engine.Reshape(gradOutput, new[] { gradOutput.Length });
-        var scattered = engine.TensorScatterAdd(flatZeros, indices, flatGrad);
-        var grad = engine.Reshape(scattered, inputs[0].Shape.ToArray());
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        var inputGrad = TensorPool<T>.RentZeroed(inputs[0].Shape.ToArray());
+        var gradData = gradOutput.GetDataArray();
+        var resultData = inputGrad.GetDataArray();
+        for (int i = 0; i < argmax.Length; i++)
+        {
+            int idx = argmax[i];
+            if (idx >= 0 && idx < resultData.Length)
+                resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
     /// <summary>Where backward: gradient flows through the selected branch</summary>
