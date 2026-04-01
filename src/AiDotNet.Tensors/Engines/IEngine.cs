@@ -1707,6 +1707,9 @@ public interface IEngine
     /// <summary>Backward pass for Reciprocal.</summary>
     Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output);
 
+    /// <summary>Backward pass for PReLU: returns (inputGrad, alphaGrad).</summary>
+    (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha);
+
     /// <summary>Backward pass for Variance reduction.</summary>
     Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes);
 

@@ -21085,6 +21085,29 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xGrad = new T[input.Length];
+        var aGrad = new T[alpha.Length];
+        var gData = gradOutput.GetDataArray();
+        var xData = input.GetDataArray();
+        var aData = alpha.GetDataArray();
+        int alphaSize = alpha.Length;
+        for (int i = 0; i < input.Length; i++)
+        {
+            double val = numOps.ToDouble(xData[i]);
+            int aIdx = alphaSize == 1 ? 0 : i % alphaSize;
+            double a = numOps.ToDouble(aData[aIdx]);
+            double g = numOps.ToDouble(gData[i]);
+            xGrad[i] = val >= 0 ? gData[i] : numOps.FromDouble(a * g);
+            if (val < 0)
+                aGrad[aIdx] = numOps.Add(aGrad[aIdx], numOps.FromDouble(val * g));
+        }
+        return (new Tensor<T>(xGrad, input.Shape.ToArray()), new Tensor<T>(aGrad, alpha.Shape.ToArray()));
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
     {
         var numOps = MathHelper.GetNumericOperations<T>();

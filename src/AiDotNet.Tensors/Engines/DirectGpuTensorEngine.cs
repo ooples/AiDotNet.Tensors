@@ -11879,6 +11879,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.ReciprocalBackward(gradOutput, output);
     }
 
+    public override (Tensor<T> inputGrad, Tensor<T> alphaGrad) PReLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> alpha)
+    {
+        try
+        {
+            if (TryGetBackend(out var backend) && typeof(T) == typeof(float))
+            {
+                int size = input.Length;
+                int alphaSize = alpha.Length;
+                using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
+                using var iBuf = GetOrAllocateBuffer(backend, input);
+                using var aBuf = GetOrAllocateBuffer(backend, alpha);
+                var giB = AllocateOutputBuffer(backend, size);
+                var gaB = AllocateOutputBuffer(backend, alphaSize);
+                try
+                {
+                    backend.PReluBackwardInput(gBuf.Buffer, iBuf.Buffer, aBuf.Buffer, giB.Buffer, size, alphaSize);
+                    backend.PReluBackwardAlpha(gBuf.Buffer, iBuf.Buffer, gaB.Buffer, size, alphaSize);
+                    var inputGrad = FinishGpuOp<T>(backend, giB, size);
+                    var alphaGrad = FinishGpuOp<T>(backend, gaB, alphaSize);
+                    return (new Tensor<T>(inputGrad, input.Shape._dims), new Tensor<T>(alphaGrad, alpha.Shape._dims));
+                }
+                catch { giB.Dispose(); gaB.Dispose(); throw; }
+            }
+        }
+        catch { }
+        return base.PReLUBackward(gradOutput, input, alpha);
+    }
+
     public override Tensor<T> VarBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> mean, int[] axes)
     {
         try
