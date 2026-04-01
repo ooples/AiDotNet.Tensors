@@ -1107,37 +1107,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var entries = _deferredDownloads.ToArray();
         foreach (var kvp in entries)
         {
-            if (_deferredDownloads.TryRemove(kvp.Key, out var entry))
-            {
-                float[] floatData;
-                try
-                {
-                    floatData = entry.Backend.DownloadBuffer(entry.Buffer);
-                }
-                catch (InvalidOperationException)
-                {
-                    // GPU buffer may already be released (e.g. during Dispose,
-                    // CL_INVALID_MEM_OBJECT / error -38) — skip this entry.
-                    continue;
-                }
+            if (!_deferredDownloads.ContainsKey(kvp.Key))
+                continue;
 
-                // The key is a T[] but we don't know T here — use float path since
-                // most GPU ops work with float arrays internally
-                if (kvp.Key is float[] floatArray)
+            var entry = kvp.Value;
+            float[] floatData;
+            try
+            {
+                floatData = entry.Backend.DownloadBuffer(entry.Buffer);
+            }
+            catch (InvalidOperationException)
+            {
+                // GPU buffer may already be released (e.g. during Dispose,
+                // CL_INVALID_MEM_OBJECT / error -38). Leave the entry so callers
+                // can detect the failure rather than silently returning garbage.
+                continue;
+            }
+
+            // Download succeeded — now remove the entry and copy data
+            _deferredDownloads.TryRemove(kvp.Key, out _);
+
+            // The key is a T[] but we don't know T here — use float path since
+            // most GPU ops work with float arrays internally
+            if (kvp.Key is float[] floatArray)
+            {
+                Array.Copy(floatData, floatArray, Math.Min(floatData.Length, floatArray.Length));
+            }
+            else
+            {
+                // For non-float types, we need the original type conversion
+                // This is a rare path — most GPU operations use float
+                var arr = kvp.Key as Array;
+                if (arr != null)
                 {
-                    Array.Copy(floatData, floatArray, Math.Min(floatData.Length, floatArray.Length));
-                }
-                else
-                {
-                    // For non-float types, we need the original type conversion
-                    // This is a rare path — most GPU operations use float
-                    var arr = kvp.Key as Array;
-                    if (arr != null)
+                    for (int i = 0; i < Math.Min(floatData.Length, arr.Length); i++)
                     {
-                        for (int i = 0; i < Math.Min(floatData.Length, arr.Length); i++)
-                        {
-                            arr.SetValue(Convert.ChangeType(floatData[i], arr.GetType().GetElementType()!), i);
-                        }
+                        arr.SetValue(Convert.ChangeType(floatData[i], arr.GetType().GetElementType()!), i);
                     }
                 }
             }

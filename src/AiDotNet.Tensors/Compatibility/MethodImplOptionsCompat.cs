@@ -17,8 +17,9 @@ namespace AiDotNet.Tensors.Compatibility;
 internal static class MethodImplHelper
 {
     /// <summary>
-    /// AggressiveOptimization — forces Tier1 JIT from the first call.
-    /// Prevents tiered compilation from producing different FP results.
+    /// AggressiveOptimization — hints to the JIT that this method is performance-critical
+    /// and should be optimized aggressively, which can help reduce variability from
+    /// tiered compilation in some environments.
     /// </summary>
     internal const MethodImplOptions Hot =
 #if NETFRAMEWORK
