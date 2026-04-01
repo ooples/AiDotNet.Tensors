@@ -4260,11 +4260,14 @@ public class CpuEngine : ITensorLevelEngine
             int length = tensor.Length;
             float result;
 
-            // Compute numChunks from length only (NOT MaxDegreeOfParallelism) so chunk
-            // boundaries are deterministic for a given input length, ensuring FP reproducibility
-            // even if MaxDegreeOfParallelism changes between calls.
-            int numChunks = length >= 200_000 ? Math.Max(2, length / 50_000) : 1;
-            if (numChunks >= 2)
+            // Compute baseChunks from length so chunk boundaries are deterministic for a given
+            // input length. Then cap by MaxDegreeOfParallelism (when > 0) so that a configured
+            // MaxDegreeOfParallelism can disable or limit parallelism while keeping boundaries
+            // deterministic for a given (length, MaxDegreeOfParallelism) pair.
+            int baseChunks = length >= 200_000 ? Math.Max(2, length / 50_000) : 1;
+            int maxDop = CpuParallelSettings.MaxDegreeOfParallelism;
+            int numChunks = (maxDop > 0) ? Math.Min(baseChunks, maxDop) : baseChunks;
+            if (numChunks >= 2 && maxDop > 1)
             {
                 var handle = System.Runtime.InteropServices.GCHandle.Alloc(fArr, System.Runtime.InteropServices.GCHandleType.Pinned);
                 try
