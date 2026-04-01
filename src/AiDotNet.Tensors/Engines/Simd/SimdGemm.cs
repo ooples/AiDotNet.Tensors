@@ -30,6 +30,7 @@ internal static class SimdGemm
     /// Computes C = A * B where A is [m,k], B is [k,n], C is [m,n].
     /// All matrices are in row-major order. C is cleared before computation.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void Sgemm(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -48,6 +49,7 @@ internal static class SimdGemm
     /// lda/ldb are the leading dimensions (row strides) of the source storage.
     /// This enables zero-copy matmul on transposed stride-based views.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void Sgemm(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -61,6 +63,7 @@ internal static class SimdGemm
     /// <summary>
     /// Computes C += A * B (accumulates into C without clearing).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void SgemmAdd(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -75,6 +78,7 @@ internal static class SimdGemm
     /// <summary>
     /// Computes C += op(A) * op(B) with stride and transpose support.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void SgemmAdd(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -94,6 +98,7 @@ internal static class SimdGemm
     /// <summary>
     /// Scalar GEMM fallback with stride/transpose support.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void SgemmScalar(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -111,7 +116,11 @@ internal static class SimdGemm
                 {
                     // op(B)[p,j]: if transB, read B[j,p] = b[j*ldb+p]; else B[p,j] = b[p*ldb+j]
                     float bpj = transB ? b[j * ldb + p] : b[p * ldb + j];
+#if NET5_0_OR_GREATER
+                    c[cRowBase + j] = MathF.FusedMultiplyAdd(aip, bpj, c[cRowBase + j]);
+#else
                     c[cRowBase + j] += aip * bpj;
+#endif
                 }
             }
         }
@@ -128,6 +137,7 @@ internal static class SimdGemm
     /// Each row of C is computed as a dot product of a row of A with columns of B,
     /// using SIMD to process 8 columns of B at a time.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static unsafe void SgemmSmallM(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -166,7 +176,7 @@ internal static class SimdGemm
                     }
                     Avx.Store(pC + cRow + j, acc);
                 }
-                // Scalar tail
+                // Scalar tail — use FMA to match SIMD rounding behavior
                 for (; j < n; j++)
                 {
                     float sum = 0;
@@ -174,7 +184,7 @@ internal static class SimdGemm
                     {
                         float aVal = transA ? pA[p * lda + i] : pA[i * lda + p];
                         float bVal = transB ? pB[j * ldb + p] : pB[p * ldb + j];
-                        sum += aVal * bVal;
+                        sum = MathF.FusedMultiplyAdd(aVal, bVal, sum);
                     }
                     pC[cRow + j] = sum;
                 }
@@ -182,6 +192,7 @@ internal static class SimdGemm
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void SgemmTiled(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -233,6 +244,7 @@ internal static class SimdGemm
     /// Each worker packs its own B slice and processes all M rows for that column range.
     /// Uses unsafe pinned pointers to avoid array copies for closure capture.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static unsafe void SgemmTiledParallelN(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -351,6 +363,7 @@ internal static class SimdGemm
     /// M-dimension parallel GEMM: splits rows across workers.
     /// Ideal for tall matrices (m >= 512). Uses pinned pointers to avoid array copies.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static unsafe void SgemmTiledParallelM(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -520,7 +533,7 @@ internal static class SimdGemm
     /// Macro-kernel: iterate over packed panels with Mr x Nr micro-kernel tiles.
     /// Uses JIT-compiled micro-kernel when available for guaranteed optimal register allocation.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static unsafe void MacroKernel(
         float[] packedA,
         float[] packedB,
@@ -590,7 +603,7 @@ internal static class SimdGemm
     /// Uses 12 Vector256 accumulators (6 rows x 2 vectors of 8 floats = 16 columns).
     /// Inner loop over K dimension broadcasts A elements and FMA with B row.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private static void MicroKernel6x16(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
@@ -671,6 +684,7 @@ internal static class SimdGemm
     /// Scalar micro-kernel for edge cases where tile is smaller than Mr x Nr.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void MicroKernelScalar(
         float[] packedA, int aOffset,
         float[] packedB, int bOffset,
@@ -687,7 +701,11 @@ internal static class SimdGemm
                 int bIdx = bOffset + p * Nr;
                 for (int j = 0; j < nr; j++)
                 {
+#if NET5_0_OR_GREATER
+                    c[cIdx + j] = MathF.FusedMultiplyAdd(aVal, packedB[bIdx + j], c[cIdx + j]);
+#else
                     c[cIdx + j] += aVal * packedB[bIdx + j];
+#endif
                 }
             }
         }
