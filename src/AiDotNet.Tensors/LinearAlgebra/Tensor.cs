@@ -141,6 +141,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Contiguous()
     {
+        ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
         // Materialize: copy data from strided layout to contiguous row-major
@@ -961,6 +962,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void Fill(T value)
     {
+        ThrowIfSparse();
         _numOps.Fill(_data.AsWritableSpan(), value);
     }
 
@@ -1393,6 +1395,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
+        ThrowIfSparse();
         int newTotal = 1;
         for (int i = 0; i < newShape.Length; i++)
             newTotal *= newShape[i];

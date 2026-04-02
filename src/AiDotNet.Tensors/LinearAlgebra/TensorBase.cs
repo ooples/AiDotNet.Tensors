@@ -418,6 +418,24 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     // ================================================================
+    // Sparse safety
+    // ================================================================
+
+    /// <summary>
+    /// Throws if this tensor is sparse. Call at the top of any method that assumes
+    /// dense storage layout (_data.Length == Length, stride-based indexing is valid).
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    protected void ThrowIfSparse(
+        [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
+    {
+        if (IsSparse)
+            throw new InvalidOperationException(
+                $"{caller} is not supported on sparse tensors. " +
+                "Use SparseTensor-specific APIs or call ToDense() first.");
+    }
+
+    // ================================================================
     // Indexers
     // ================================================================
 
@@ -428,19 +446,13 @@ public abstract class TensorBase<T> : IDisposable
     {
         get
         {
-            if (IsSparse)
-                throw new InvalidOperationException(
-                    "Direct indexing is not supported on sparse tensors. " +
-                    "Use SparseTensor-specific APIs or call ToDense() first.");
+            ThrowIfSparse();
             ValidateIndices(indices);
             return _data[GetFlatIndex(indices)];
         }
         set
         {
-            if (IsSparse)
-                throw new InvalidOperationException(
-                    "Direct indexing is not supported on sparse tensors. " +
-                    "Use SparseTensor-specific APIs or call ToDense() first.");
+            ThrowIfSparse();
             ValidateIndices(indices);
             _data[GetFlatIndex(indices)] = value;
         }
@@ -464,6 +476,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual T[] ToArray()
     {
+        ThrowIfSparse();
         if (Length == 0) return Array.Empty<T>();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
             return _data.ToArray();
@@ -511,10 +524,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public T GetFlat(int flatIndex)
     {
-        if (IsSparse)
-            throw new InvalidOperationException(
-                "GetFlat is not supported on sparse tensors. Use SparseTensor-specific APIs " +
-                "(Values, RowIndices, ColumnIndices) or call ToDense() first.");
+        ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         if (IsContiguous)
@@ -527,6 +537,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public void SetFlat(int flatIndex, T value)
     {
+        ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         if (IsContiguous)
@@ -540,6 +551,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
+        ThrowIfSparse();
         if (Length == 0) return ReadOnlySpan<T>.Empty;
         if (!IsContiguous)
             throw new InvalidOperationException(
@@ -582,6 +594,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual TensorBase<T> Clone()
     {
+        ThrowIfSparse();
         var result = CreateInstance(_shape);
         if (Length == 0) return result;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
@@ -605,6 +618,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
+        ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
@@ -625,6 +639,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public TensorBase<TResult> Transform<TResult>(Func<T, int[], TResult> func)
     {
+        ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
         var indices = new int[Rank];
         for (int i = 0; i < Length; i++)
