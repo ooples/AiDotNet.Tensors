@@ -175,12 +175,51 @@ public sealed class GradientTape<T> : IDisposable
             // Walk tape in reverse (reverse-mode AD)
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
 
+            // Tape backward pruning: when sources are specified, pre-compute which entries
+            // are reachable from source parameters. Skip backward for entries that don't
+            // contribute to any requested gradient. This avoids wasted computation — e.g.,
+            // discriminator ops during GAN generator training.
+            HashSet<Tensor<T>>? relevantTensors = null;
+            if (sources is not null && sources.Length > 0)
+            {
+                relevantTensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources)
+                    relevantTensors.Add(s);
+
+                // Forward pass: mark tensors reachable from sources
+                for (int i = 0; i < _entries.Count; i++)
+                {
+                    var entry = _entries[i];
+                    bool inputRelevant = false;
+                    foreach (var inp in entry.Inputs)
+                    {
+                        if (relevantTensors.Contains(inp))
+                        {
+                            inputRelevant = true;
+                            break;
+                        }
+                    }
+                    if (inputRelevant)
+                    {
+                        relevantTensors.Add(entry.Output);
+                    }
+                }
+            }
+
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
                 var entry = _entries[i];
 
                 // Skip if we don't have a gradient for this entry's output
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    continue;
+                }
+
+                // Tape backward pruning: skip entries that don't contribute to requested sources.
+                // This avoids wasted backward computation through irrelevant subgraphs
+                // (e.g., discriminator ops during GAN generator training).
+                if (relevantTensors is not null && !relevantTensors.Contains(entry.Output))
                 {
                     continue;
                 }
