@@ -3681,13 +3681,27 @@ kernel void octonion_linear_backward_weights(
     if (gid >= total) return;
     uint o = gid / inputFeatures;
     uint i = gid % inputFeatures;
-    uint gwOff = (o * inputFeatures + i) * 8;
-    for (uint c = 0; c < 8; c++) {
-        float sum = 0.0f;
-        for (uint b = 0; b < batchSize; b++)
-            sum += gradOutput[(b * outputFeatures + o) * 8 + c] * input[(b * inputFeatures + i) * 8 + c];
-        gradWeights[gwOff + c] = sum;
+    // Full Jacobian transpose of d(w*a)/dw from octonion multiplication table
+    float gw0=0,gw1=0,gw2=0,gw3=0,gw4=0,gw5=0,gw6=0,gw7=0;
+    for (uint b = 0; b < batchSize; b++) {
+        uint inOff = (b * inputFeatures + i) * 8;
+        uint goOff = (b * outputFeatures + o) * 8;
+        float a0=input[inOff],a1=input[inOff+1],a2=input[inOff+2],a3=input[inOff+3],
+              a4=input[inOff+4],a5=input[inOff+5],a6=input[inOff+6],a7=input[inOff+7];
+        float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
+              g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+        gw0+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
+        gw1+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
+        gw2+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
+        gw3+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
+        gw4+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
+        gw5+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
+        gw6+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
+        gw7+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
     }
+    uint gwOff = (o * inputFeatures + i) * 8;
+    gradWeights[gwOff]=gw0; gradWeights[gwOff+1]=gw1; gradWeights[gwOff+2]=gw2; gradWeights[gwOff+3]=gw3;
+    gradWeights[gwOff+4]=gw4; gradWeights[gwOff+5]=gw5; gradWeights[gwOff+6]=gw6; gradWeights[gwOff+7]=gw7;
 }
 ";
 }

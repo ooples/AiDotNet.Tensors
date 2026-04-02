@@ -1662,28 +1662,28 @@ void main() {
     uint b = tid / inputFeatures;
     uint i = tid % inputFeatures;
 
-    float g0=0,g1=0,g2=0,g3=0,g4=0,g5=0,g6=0,g7=0;
+    // Accumulate gradient via full Jacobian transpose of d(w*a)/da
+    float ga0=0,ga1=0,ga2=0,ga3=0,ga4=0,ga5=0,ga6=0,ga7=0;
     for (uint o = 0; o < outputFeatures; o++) {
         uint goOff = (b * outputFeatures + o) * 8;
         uint wOff = (o * inputFeatures + i) * 8;
-        // d(w*a)/da Jacobian transpose * gradOut
-        // For w*a, the Jacobian d/da gives: J^T * g = conj(w) * g (left multiplication by conjugate)
         float w0=bdata[wOff],w1=bdata[wOff+1],w2=bdata[wOff+2],w3=bdata[wOff+3],
               w4=bdata[wOff+4],w5=bdata[wOff+5],w6=bdata[wOff+6],w7=bdata[wOff+7];
-        float go0=a[goOff],go1=a[goOff+1],go2=a[goOff+2],go3=a[goOff+3],
-              go4=a[goOff+4],go5=a[goOff+5],go6=a[goOff+6],go7=a[goOff+7];
-        // Approximate gradient via Euclidean: gradInput += w^T * gradOut per component
-        for (uint c = 0; c < 8; c++)
-            g0 += bdata[wOff + c] * a[goOff + c];
-        // Distribute across all 8 components using weight transpose
-        g0 += w0*go0+w1*go1+w2*go2+w3*go3+w4*go4+w5*go5+w6*go6+w7*go7;
+        float g0=a[goOff],g1=a[goOff+1],g2=a[goOff+2],g3=a[goOff+3],
+              g4=a[goOff+4],g5=a[goOff+5],g6=a[goOff+6],g7=a[goOff+7];
+        // Jacobian transpose of d(w*a)/da from the octonion multiplication table
+        ga0+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
+        ga1+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
+        ga2+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
+        ga3+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
+        ga4+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
+        ga5+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
+        ga6+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
+        ga7+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
     }
-    // Write gradient (Euclidean approximation - same as CPU backward)
     uint giOff = (b * inputFeatures + i) * 8;
-    // For the Euclidean approximation, distribute accumulated scalar across components
-    float invOF = 1.0 / float(max(outputFeatures, 1u));
-    for (uint cc = 0; cc < 8; cc++)
-        c[giOff + cc] = g0 * invOF;
+    c[giOff]=ga0; c[giOff+1]=ga1; c[giOff+2]=ga2; c[giOff+3]=ga3;
+    c[giOff+4]=ga4; c[giOff+5]=ga5; c[giOff+6]=ga6; c[giOff+7]=ga7;
 }";
 
     /// <summary>
@@ -1700,15 +1700,28 @@ void main() {
     if (tid >= totalPairs) return;
     uint o = tid / inputFeatures;
     uint i = tid % inputFeatures;
-    // Accumulate over batch: sum_b element-wise product of gradOut and input
-    uint gwOff = (o * inputFeatures + i) * 8;
-    for (uint cc = 0; cc < 8; cc++) {
-        float sum = 0.0;
-        for (uint b = 0; b < batchSize; b++) {
-            sum += a[(b * outputFeatures + o) * 8 + cc] * bdata[(b * inputFeatures + i) * 8 + cc];
-        }
-        c[gwOff + cc] = sum;
+    // Accumulate gradient via full Jacobian transpose of d(w*a)/dw
+    float gw0=0,gw1=0,gw2=0,gw3=0,gw4=0,gw5=0,gw6=0,gw7=0;
+    for (uint b = 0; b < batchSize; b++) {
+        uint inOff = (b * inputFeatures + i) * 8;
+        uint goOff = (b * outputFeatures + o) * 8;
+        float a0=bdata[inOff],a1=bdata[inOff+1],a2=bdata[inOff+2],a3=bdata[inOff+3],
+              a4=bdata[inOff+4],a5=bdata[inOff+5],a6=bdata[inOff+6],a7=bdata[inOff+7];
+        float g0=a[goOff],g1=a[goOff+1],g2=a[goOff+2],g3=a[goOff+3],
+              g4=a[goOff+4],g5=a[goOff+5],g6=a[goOff+6],g7=a[goOff+7];
+        // Jacobian transpose of d(w*a)/dw from the octonion multiplication table
+        gw0+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
+        gw1+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
+        gw2+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
+        gw3+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
+        gw4+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
+        gw5+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
+        gw6+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
+        gw7+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
     }
+    uint gwOff = (o * inputFeatures + i) * 8;
+    c[gwOff]=gw0; c[gwOff+1]=gw1; c[gwOff+2]=gw2; c[gwOff+3]=gw3;
+    c[gwOff+4]=gw4; c[gwOff+5]=gw5; c[gwOff+6]=gw6; c[gwOff+7]=gw7;
 }";
 
     /// <summary>
