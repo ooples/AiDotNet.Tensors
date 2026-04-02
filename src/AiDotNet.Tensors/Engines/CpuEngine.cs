@@ -3767,6 +3767,18 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> StopGradient<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Copy data to a new tensor with no tape connection.
+        // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
+        var result = TensorAllocator.Rent<T>(tensor._shape);
+        tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));

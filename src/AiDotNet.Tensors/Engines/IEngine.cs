@@ -2466,6 +2466,33 @@ public interface IEngine
     Tensor<T> TensorNegate<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Returns a tensor with the same values but severed from the gradient tape.
+    /// No backward function is recorded, so gradients do not flow through this operation.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor to detach from the computation graph.</param>
+    /// <returns>A new tensor with identical values but no tape recording.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> When training GANs, you sometimes need to pass data through
+    /// one network (like the discriminator) without updating its weights. StopGradient creates
+    /// a copy of the tensor that the gradient tape can't "see through" — gradients stop here.</para>
+    ///
+    /// <para>This is equivalent to PyTorch's <c>.detach()</c> or TensorFlow's <c>tf.stop_gradient()</c>.</para>
+    ///
+    /// <para><b>Example — GAN generator training:</b></para>
+    /// <code>
+    /// // Generator forward (tape-tracked)
+    /// var fakeImages = generator.ForwardForTraining(noise);
+    ///
+    /// // Pass through discriminator WITHOUT tracking discriminator's ops
+    /// var detachedFakes = engine.StopGradient(fakeImages);
+    /// var discScore = discriminator.Predict(detachedFakes);
+    /// // Gradients flow to generator but NOT through discriminator internals
+    /// </code>
+    /// </remarks>
+    Tensor<T> StopGradient<T>(Tensor<T> tensor);
+
+    /// <summary>
     /// Computes the element-wise power of a tensor raised to a scalar exponent.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
