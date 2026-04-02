@@ -229,7 +229,7 @@ extern ""C"" __global__ void iou_loss_backward(
     gradPredicted[off+3] = grad[3];
 }
 
-// GIoU/DIoU/CIoU backward use same finite-difference pattern
+// Analytical GIoU backward
 extern ""C"" __global__ void giou_loss_backward(
     const float* __restrict__ gradOutput,
     const float* __restrict__ predicted,
@@ -240,28 +240,64 @@ extern ""C"" __global__ void giou_loss_backward(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numBoxes) return;
     int off = i * 4;
-    float eps = 1e-4f;
     float go = gradOutput[i];
+    float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
+    float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
+
+    // IoU gradients (reuse helper)
+    float iouGrad[4];
+    compute_iou_grad(px1,py1,px2,py2, tx1,ty1,tx2,ty2, 1.0f, iouGrad);
+
+    // Enclosing box
+    float encX1=min_f(px1,tx1), encY1=min_f(py1,ty1);
+    float encX2=max_f(px2,tx2), encY2=max_f(py2,ty2);
+    float encW=encX2-encX1, encH=encY2-encY1;
+    float encA=encW*encH+1e-7f;
+
+    // IoU components for penalty term
+    float ix1=max_f(px1,tx1), iy1=max_f(py1,ty1), ix2=min_f(px2,tx2), iy2=min_f(py2,ty2);
+    float iw=max_f(0.0f,ix2-ix1), ih=max_f(0.0f,iy2-iy1), iA=iw*ih;
+    float pw=px2-px1, ph=py2-py1, pA=pw*ph, tA=(tx2-tx1)*(ty2-ty1);
+    float uA=pA+tA-iA+1e-7f;
+    float hasInter=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
+
+    // ∂encA/∂coord
+    float dEncA[4];
+    dEncA[0] = -(px1<tx1?1.0f:0.0f) * encH;  // ∂encA/∂px1
+    dEncA[1] = -(py1<ty1?1.0f:0.0f) * encW;  // ∂encA/∂py1
+    dEncA[2] = (px2>tx2?1.0f:0.0f) * encH;   // ∂encA/∂px2
+    dEncA[3] = (py2>ty2?1.0f:0.0f) * encW;   // ∂encA/∂py2
+
+    // ∂I/∂coord and ∂U/∂coord
+    float dI[4], dU[4];
+    dI[0] = hasInter * (-(px1>tx1?1.0f:0.0f)) * ih;
+    dI[1] = hasInter * (-(py1>ty1?1.0f:0.0f)) * iw;
+    dI[2] = hasInter * (px2<tx2?1.0f:0.0f) * ih;
+    dI[3] = hasInter * (py2<ty2?1.0f:0.0f) * iw;
+    dU[0] = -ph - dI[0]; dU[1] = -pw - dI[1]; dU[2] = ph - dI[2]; dU[3] = pw - dI[3];
+
+    // GIoU penalty: P = (encA - U)/encA = 1 - U/encA
+    // ∂P/∂coord = -(∂U/∂coord * encA - U * ∂encA/∂coord) / encA²
+    float encASq = encA * encA;
     for (int c = 0; c < 4; c++) {
-        float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
-        float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
-        // GIoU at x+eps
-        float cp[4] = {px1,py1,px2,py2}; cp[c] += eps;
-        float interA, unionA;
-        float iou_p = compute_iou(cp[0],cp[1],cp[2],cp[3], tx1,ty1,tx2,ty2, &interA, &unionA);
-        float eX1=min_f(cp[0],tx1), eY1=min_f(cp[1],ty1), eX2=max_f(cp[2],tx2), eY2=max_f(cp[3],ty2);
-        float eA_p = (eX2-eX1)*(eY2-eY1)+1e-7f;
-        float giou_p = iou_p - (eA_p - unionA)/eA_p;
-        // GIoU at x-eps
-        float cm[4] = {px1,py1,px2,py2}; cm[c] -= eps;
-        iou_p = compute_iou(cm[0],cm[1],cm[2],cm[3], tx1,ty1,tx2,ty2, &interA, &unionA);
-        eX1=min_f(cm[0],tx1); eY1=min_f(cm[1],ty1); eX2=max_f(cm[2],tx2); eY2=max_f(cm[3],ty2);
-        float eA_m = (eX2-eX1)*(eY2-eY1)+1e-7f;
-        float giou_m = iou_p - (eA_m - unionA)/eA_m;
-        gradPredicted[off + c] = go * -(giou_p - giou_m) / (2.0f * eps);
+        float dP = -(dU[c] * encA - uA * dEncA[c]) / encASq;
+        // GIoU = IoU - P → loss = 1 - GIoU → ∂loss/∂coord = -(∂IoU/∂coord - ∂P/∂coord)
+        gradPredicted[off+c] = go * -(iouGrad[c]/go - dP);  // iouGrad already has -∂IoU/∂coord * go
+    }
+    // Fix: iouGrad[c] = go * (-∂IoU/∂coord), so ∂IoU/∂coord = -iouGrad[c]/go
+    // ∂loss = -(∂IoU - ∂P) = -(-iouGrad[c]/go) - (-dP) ... let me simplify:
+    // loss = 1 - GIoU = 1 - IoU + P
+    // ∂loss = -∂IoU + ∂P = iouGrad[c]/go + dP (since iouGrad = go * (-∂IoU))
+    for (int c = 0; c < 4; c++) {
+        float dIoU_dc = -iouGrad[c] / go;  // ∂IoU/∂coord (positive when IoU increases)
+        float dP_dc = -(dU[c] * encA - uA * dEncA[c]) / encASq;
+        // ∂loss/∂coord = -∂IoU/∂coord + ∂P/∂coord (since loss = 1 - IoU + P)
+        // Wait: GIoU = IoU - P → loss = 1 - GIoU = 1 - IoU + P
+        gradPredicted[off+c] = go * (-dIoU_dc + dP_dc);
     }
 }
 
+// Analytical DIoU backward
 extern ""C"" __global__ void diou_loss_backward(
     const float* __restrict__ gradOutput,
     const float* __restrict__ predicted,
@@ -269,36 +305,55 @@ extern ""C"" __global__ void diou_loss_backward(
     float* __restrict__ gradPredicted,
     int numBoxes)
 {
-    // DIoU backward via finite differences (same pattern)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numBoxes) return;
     int off = i * 4;
-    float eps = 1e-4f;
     float go = gradOutput[i];
+    float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
     float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
+
+    // IoU gradients
+    float iouGrad[4];
+    compute_iou_grad(px1,py1,px2,py2, tx1,ty1,tx2,ty2, 1.0f, iouGrad);
+
+    // Center distance: ρ² = (pcx-tcx)² + (pcy-tcy)²
+    float pcx=0.5f*(px1+px2), pcy=0.5f*(py1+py2);
+    float tcx=0.5f*(tx1+tx2), tcy=0.5f*(ty1+ty2);
+    float dx=pcx-tcx, dy=pcy-tcy;
+    float rhoSq=dx*dx+dy*dy;
+
+    // ∂ρ²/∂coord: pcx depends on px1,px2; pcy depends on py1,py2
+    float dRho[4];
+    dRho[0] = 2.0f*dx*0.5f;        // ∂ρ²/∂px1 = dx (pcx = 0.5*(px1+px2))
+    dRho[1] = 2.0f*dy*0.5f;        // ∂ρ²/∂py1 = dy
+    dRho[2] = 2.0f*dx*0.5f;        // ∂ρ²/∂px2 = dx
+    dRho[3] = 2.0f*dy*0.5f;        // ∂ρ²/∂py2 = dy
+
+    // Enclosing diagonal: c² = encDx² + encDy²
+    float encX1=min_f(px1,tx1), encY1=min_f(py1,ty1);
+    float encX2=max_f(px2,tx2), encY2=max_f(py2,ty2);
+    float encDx=encX2-encX1, encDy=encY2-encY1;
+    float cSq=encDx*encDx+encDy*encDy+1e-7f;
+
+    // ∂c²/∂coord
+    float dCSq[4];
+    dCSq[0] = 2.0f*encDx*(-(px1<tx1?1.0f:0.0f));  // encX1 = min(px1,tx1)
+    dCSq[1] = 2.0f*encDy*(-(py1<ty1?1.0f:0.0f));
+    dCSq[2] = 2.0f*encDx*(px2>tx2?1.0f:0.0f);      // encX2 = max(px2,tx2)
+    dCSq[3] = 2.0f*encDy*(py2>ty2?1.0f:0.0f);
+
+    // DIoU penalty: P = ρ²/c²
+    // ∂P/∂coord = (∂ρ²/∂coord * c² - ρ² * ∂c²/∂coord) / c⁴
+    float cSqSq = cSq * cSq;
     for (int c = 0; c < 4; c++) {
-        float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
-        // DIoU at x+eps
-        float cp[4] = {px1,py1,px2,py2}; cp[c] += eps;
-        float iou_p = compute_iou(cp[0],cp[1],cp[2],cp[3], tx1,ty1,tx2,ty2, NULL, NULL);
-        float pcx_p=0.5f*(cp[0]+cp[2]), pcy_p=0.5f*(cp[1]+cp[3]);
-        float tcx=0.5f*(tx1+tx2), tcy=0.5f*(ty1+ty2);
-        float cds_p = (pcx_p-tcx)*(pcx_p-tcx) + (pcy_p-tcy)*(pcy_p-tcy);
-        float eX1=min_f(cp[0],tx1), eY1=min_f(cp[1],ty1), eX2=max_f(cp[2],tx2), eY2=max_f(cp[3],ty2);
-        float ds_p = (eX2-eX1)*(eX2-eX1) + (eY2-eY1)*(eY2-eY1) + 1e-7f;
-        float diou_p = iou_p - cds_p/ds_p;
-        // DIoU at x-eps
-        float cm[4] = {px1,py1,px2,py2}; cm[c] -= eps;
-        float iou_m = compute_iou(cm[0],cm[1],cm[2],cm[3], tx1,ty1,tx2,ty2, NULL, NULL);
-        float pcx_m=0.5f*(cm[0]+cm[2]), pcy_m=0.5f*(cm[1]+cm[3]);
-        float cds_m = (pcx_m-tcx)*(pcx_m-tcx) + (pcy_m-tcy)*(pcy_m-tcy);
-        eX1=min_f(cm[0],tx1); eY1=min_f(cm[1],ty1); eX2=max_f(cm[2],tx2); eY2=max_f(cm[3],ty2);
-        float ds_m = (eX2-eX1)*(eX2-eX1) + (eY2-eY1)*(eY2-eY1) + 1e-7f;
-        float diou_m = iou_m - cds_m/ds_m;
-        gradPredicted[off + c] = go * -(diou_p - diou_m) / (2.0f * eps);
+        float dIoU = -iouGrad[c];  // iouGrad = -∂IoU (from loss = 1-IoU convention)
+        float dP = (dRho[c] * cSq - rhoSq * dCSq[c]) / cSqSq;
+        // loss = 1 - DIoU = 1 - IoU + P → ∂loss = -∂IoU + ∂P
+        gradPredicted[off+c] = go * (dIoU + dP);
     }
 }
 
+// Analytical CIoU backward
 extern ""C"" __global__ void ciou_loss_backward(
     const float* __restrict__ gradOutput,
     const float* __restrict__ predicted,
@@ -306,38 +361,67 @@ extern ""C"" __global__ void ciou_loss_backward(
     float* __restrict__ gradPredicted,
     int numBoxes)
 {
-    // CIoU backward via finite differences
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numBoxes) return;
     int off = i * 4;
-    float eps = 1e-4f;
     float go = gradOutput[i];
+    float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
     float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
 
-    // Helper: compute CIoU given box coordinates
-    #define COMPUTE_CIOU(bx1,by1,bx2,by2) ({ \
-        float _iou = compute_iou(bx1,by1,bx2,by2, tx1,ty1,tx2,ty2, NULL,NULL); \
-        float _pcx=0.5f*(bx1+bx2), _pcy=0.5f*(by1+by2); \
-        float _tcx=0.5f*(tx1+tx2), _tcy=0.5f*(ty1+ty2); \
-        float _cds=(_pcx-_tcx)*(_pcx-_tcx)+(_pcy-_tcy)*(_pcy-_tcy); \
-        float _eX1=min_f(bx1,tx1),_eY1=min_f(by1,ty1),_eX2=max_f(bx2,tx2),_eY2=max_f(by2,ty2); \
-        float _ds=(_eX2-_eX1)*(_eX2-_eX1)+(_eY2-_eY1)*(_eY2-_eY1)+1e-7f; \
-        float _pw=bx2-bx1+1e-7f,_ph=by2-by1+1e-7f,_tw=tx2-tx1+1e-7f,_th=ty2-ty1+1e-7f; \
-        float _rd=atanf(_tw/_th)-atanf(_pw/_ph); \
-        float _v=(4.0f/(3.14159265f*3.14159265f))*_rd*_rd; \
-        float _alpha=_v/(1.0f-_iou+_v+1e-7f); \
-        _iou - _cds/_ds - _alpha*_v; \
-    })
+    // IoU + DIoU components (reuse from DIoU backward)
+    float iouGrad[4];
+    compute_iou_grad(px1,py1,px2,py2, tx1,ty1,tx2,ty2, 1.0f, iouGrad);
 
-    float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
+    // Center distance
+    float pcx=0.5f*(px1+px2), pcy=0.5f*(py1+py2);
+    float tcx=0.5f*(tx1+tx2), tcy=0.5f*(ty1+ty2);
+    float dx=pcx-tcx, dy=pcy-tcy, rhoSq=dx*dx+dy*dy;
+    float dRho[4] = {dx, dy, dx, dy};
+
+    // Enclosing diagonal
+    float encDx=max_f(px2,tx2)-min_f(px1,tx1), encDy=max_f(py2,ty2)-min_f(py1,ty1);
+    float cSq=encDx*encDx+encDy*encDy+1e-7f;
+    float dCSq[4];
+    dCSq[0] = 2.0f*encDx*(-(px1<tx1?1.0f:0.0f));
+    dCSq[1] = 2.0f*encDy*(-(py1<ty1?1.0f:0.0f));
+    dCSq[2] = 2.0f*encDx*(px2>tx2?1.0f:0.0f);
+    dCSq[3] = 2.0f*encDy*(py2>ty2?1.0f:0.0f);
+
+    // Aspect ratio: v = (4/π²) * (atan(tw/th) - atan(pw/ph))²
+    float pw=px2-px1+1e-7f, ph=py2-py1+1e-7f;
+    float tw=tx2-tx1+1e-7f, th=ty2-ty1+1e-7f;
+    float atanDiff = atanf(tw/th) - atanf(pw/ph);
+    float fourOverPiSq = 4.0f / (3.14159265f * 3.14159265f);
+    float v = fourOverPiSq * atanDiff * atanDiff;
+
+    // IoU value for alpha
+    float ix1=max_f(px1,tx1), iy1=max_f(py1,ty1), ix2=min_f(px2,tx2), iy2=min_f(py2,ty2);
+    float iw=max_f(0.0f,ix2-ix1), ih=max_f(0.0f,iy2-iy1), iA=iw*ih;
+    float pA=pw*ph, tA=tw*th, uA=pA+tA-iA+1e-7f;
+    float iou=iA/uA;
+    float alpha = v / (1.0f - iou + v + 1e-7f);
+
+    // ∂atan(pw/ph)/∂pw = ph/(pw²+ph²), ∂atan(pw/ph)/∂ph = -pw/(pw²+ph²)
+    float ratioSumSq = pw*pw + ph*ph;
+    float dAtanPw = ph / ratioSumSq;   // ∂atan(pw/ph)/∂pw
+    float dAtanPh = -pw / ratioSumSq;  // ∂atan(pw/ph)/∂ph
+
+    // ∂v/∂coord = 2*fourOverPiSq * atanDiff * (-∂atan(pw/ph)/∂coord)
+    // pw=px2-px1 → ∂pw/∂px1=-1, ∂pw/∂px2=1; ph=py2-py1 → ∂ph/∂py1=-1, ∂ph/∂py2=1
+    float dV[4];
+    dV[0] = 2.0f * fourOverPiSq * atanDiff * (-dAtanPw * (-1.0f));  // ∂v/∂px1 via pw
+    dV[1] = 2.0f * fourOverPiSq * atanDiff * (-dAtanPh * (-1.0f));  // ∂v/∂py1 via ph
+    dV[2] = 2.0f * fourOverPiSq * atanDiff * (-dAtanPw * 1.0f);     // ∂v/∂px2 via pw
+    dV[3] = 2.0f * fourOverPiSq * atanDiff * (-dAtanPh * 1.0f);     // ∂v/∂py2 via ph
+
+    float cSqSq = cSq * cSq;
     for (int c = 0; c < 4; c++) {
-        float cp[4] = {px1,py1,px2,py2}; cp[c] += eps;
-        float ciou_p = COMPUTE_CIOU(cp[0],cp[1],cp[2],cp[3]);
-        float cm[4] = {px1,py1,px2,py2}; cm[c] -= eps;
-        float ciou_m = COMPUTE_CIOU(cm[0],cm[1],cm[2],cm[3]);
-        gradPredicted[off + c] = go * -(ciou_p - ciou_m) / (2.0f * eps);
+        float dIoU = -iouGrad[c];
+        float dDistPenalty = (dRho[c] * cSq - rhoSq * dCSq[c]) / cSqSq;
+        float dAspectPenalty = alpha * dV[c];  // ∂(alpha*v)/∂coord ≈ alpha * ∂v/∂coord (alpha treated as detached)
+        // loss = 1 - CIoU = 1 - IoU + distPenalty + aspectPenalty
+        gradPredicted[off+c] = go * (dIoU + dDistPenalty + dAspectPenalty);
     }
-    #undef COMPUTE_CIOU
 }
 ";
     }
