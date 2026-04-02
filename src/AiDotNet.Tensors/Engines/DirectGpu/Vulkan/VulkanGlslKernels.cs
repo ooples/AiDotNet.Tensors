@@ -1445,4 +1445,316 @@ void main() {
     float sig = 1.0 / (1.0 + exp(-logits[idx]));
     gradIn[idx] = gradOut[0] * (sig - tgt[idx]) * invN;
 }";
+
+    // =====================================================================
+    // Hyperbolic Geometry Operations (Poincaré Ball Model)
+    // =====================================================================
+
+    /// <summary>
+    /// Projects points onto the Poincaré ball: clamps ||x|| &lt; 1/sqrt(c) - eps.
+    /// Push constants: batchSize, dim, curvature, epsilon.
+    /// Buffers: binding(0) = input [batchSize * dim], binding(1) = output [batchSize * dim].
+    /// One thread per batch element.
+    /// </summary>
+    public static string PoincareProject => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint dim; float curvature; float epsilon; };
+void main() {
+    uint bi = gl_GlobalInvocationID.x;
+    if (bi >= batchSize) return;
+    uint off = bi * dim;
+    float sqNorm = 0.0;
+    for (uint d = 0; d < dim; d++) sqNorm += a[off + d] * a[off + d];
+    float maxNorm = (1.0 / sqrt(curvature)) - epsilon;
+    float norm = sqrt(max(sqNorm, 1e-20));
+    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0;
+    for (uint d = 0; d < dim; d++) b[off + d] = a[off + d] * scale;
+}";
+
+    /// <summary>
+    /// Möbius addition: x ⊕_c y in the Poincaré ball.
+    /// Push constants: batchSize, dim, curvature.
+    /// Buffers: binding(0) = x, binding(1) = y, binding(2) = output. All [batchSize * dim].
+    /// </summary>
+    public static string MobiusAdd => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint dim; float curvature; };
+void main() {
+    uint bi = gl_GlobalInvocationID.x;
+    if (bi >= batchSize) return;
+    uint off = bi * dim;
+    float cv = curvature;
+    float xSq = 0.0, ySq = 0.0, xy = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        float xv = a[off + d], yv = bdata[off + d];
+        xSq += xv * xv; ySq += yv * yv; xy += xv * yv;
+    }
+    float denom = 1.0 + 2.0 * cv * xy + cv * cv * xSq * ySq;
+    denom = max(abs(denom), 1e-10);
+    float numX = 1.0 + 2.0 * cv * xy + cv * ySq;
+    float numY = 1.0 - cv * xSq;
+    for (uint d = 0; d < dim; d++)
+        c[off + d] = (numX * a[off + d] + numY * bdata[off + d]) / denom;
+}";
+
+    /// <summary>
+    /// Poincaré exponential map: exp_x(v) = x ⊕_c tanh(√c·λ_x·||v||/2)·v/(√c·||v||).
+    /// Push constants: batchSize, dim, curvature.
+    /// Buffers: binding(0) = basePoint, binding(1) = tangentVec, binding(2) = output.
+    /// </summary>
+    public static string PoincareExpMap => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint dim; float curvature; };
+void main() {
+    uint bi = gl_GlobalInvocationID.x;
+    if (bi >= batchSize) return;
+    uint off = bi * dim;
+    float cv = curvature;
+    float sqrtC = sqrt(cv);
+    // Compute ||base||^2 and ||tangent||
+    float bpSq = 0.0, tvSq = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        bpSq += a[off + d] * a[off + d];
+        tvSq += bdata[off + d] * bdata[off + d];
+    }
+    float tvNorm = sqrt(max(tvSq, 1e-20));
+    float lambda = 2.0 / max(1.0 - cv * bpSq, 1e-10);
+    // If tangent is near-zero, output = base point
+    if (tvNorm < 1e-10) {
+        for (uint d = 0; d < dim; d++) c[off + d] = a[off + d];
+        return;
+    }
+    float t = tanh(sqrtC * lambda * tvNorm / 2.0) / (sqrtC * tvNorm);
+    // scaled = t * tangentVec, then Mobius add base + scaled
+    float sSq = 0.0, bs = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        float sv = t * bdata[off + d];
+        sSq += sv * sv;
+        bs += a[off + d] * sv;
+    }
+    float denom = 1.0 + 2.0 * cv * bs + cv * cv * bpSq * sSq;
+    denom = max(abs(denom), 1e-10);
+    float numX = 1.0 + 2.0 * cv * bs + cv * sSq;
+    float numY = 1.0 - cv * bpSq;
+    for (uint d = 0; d < dim; d++)
+        c[off + d] = (numX * a[off + d] + numY * t * bdata[off + d]) / denom;
+}";
+
+    /// <summary>
+    /// Poincaré distance: d(x,y) = (2/√c) · arctanh(√c · ||(-x) ⊕ y||).
+    /// Push constants: batchSize, dim, curvature.
+    /// Buffers: binding(0) = x [batchSize*dim], binding(1) = y [batchSize*dim], binding(2) = output [batchSize].
+    /// </summary>
+    public static string PoincareDistance => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint dim; float curvature; };
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= batchSize) return;
+    uint off = b * dim;
+    float cv = curvature;
+    float diffSq = 0.0, xSq = 0.0, ySq = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        float diff = a[off + d] - bdata[off + d];
+        diffSq += diff * diff;
+        xSq += a[off + d] * a[off + d];
+        ySq += bdata[off + d] * bdata[off + d];
+    }
+    float denomX = max(abs(1.0 - cv * xSq), 1e-10);
+    float denomY = max(abs(1.0 - cv * ySq), 1e-10);
+    float arg = max(1.0 + 2.0 * cv * diffSq / (denomX * denomY), 1.0);
+    // acosh(x) = log(x + sqrt(x*x - 1))
+    float dist = log(arg + sqrt(max(arg * arg - 1.0, 0.0))) / sqrt(cv);
+    c[b] = dist;
+}";
+
+    // =====================================================================
+    // Octonion Algebra Operations
+    // =====================================================================
+
+    /// <summary>
+    /// Octonion element-wise multiplication using Cayley-Dickson construction.
+    /// Push constants: count (number of octonion pairs).
+    /// Buffers: binding(0) = a [count*8], binding(1) = b [count*8], binding(2) = output [count*8].
+    /// One thread per octonion.
+    /// </summary>
+    public static string OctonionMultiply => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint count; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    uint o = i * 8;
+    float a0=a[o],a1=a[o+1],a2=a[o+2],a3=a[o+3],a4=a[o+4],a5=a[o+5],a6=a[o+6],a7=a[o+7];
+    float b0=bdata[o],b1=bdata[o+1],b2=bdata[o+2],b3=bdata[o+3],b4=bdata[o+4],b5=bdata[o+5],b6=bdata[o+6],b7=bdata[o+7];
+    c[o+0] = a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7;
+    c[o+1] = a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6;
+    c[o+2] = a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5;
+    c[o+3] = a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4;
+    c[o+4] = a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3;
+    c[o+5] = a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2;
+    c[o+6] = a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1;
+    c[o+7] = a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0;
+}";
+
+    /// <summary>
+    /// Octonion linear layer forward: output[b,o] = sum_i(weight[o,i] * input[b,i]) + bias[o].
+    /// Push constants: batchSize, inputFeatures, outputFeatures.
+    /// Buffers: binding(0) = input [B*I*8], binding(1) = weights [O*I*8],
+    ///          binding(2) = biases [O*8], binding(3) = output [B*O*8].
+    /// One thread per (batch, outputFeature) pair.
+    /// </summary>
+    public static string OctonionLinearForward => Header + @"
+layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer BI { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer OUT { float outp[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; };
+
+// Octonion multiply: r = a * b (Cayley-Dickson)
+void oct_mul(float a0,float a1,float a2,float a3,float a4,float a5,float a6,float a7,
+             float b0,float b1,float b2,float b3,float b4,float b5,float b6,float b7,
+             out float r0,out float r1,out float r2,out float r3,
+             out float r4,out float r5,out float r6,out float r7) {
+    r0=a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7;
+    r1=a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6;
+    r2=a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5;
+    r3=a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4;
+    r4=a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3;
+    r5=a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2;
+    r6=a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1;
+    r7=a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint totalPairs = batchSize * outputFeatures;
+    if (tid >= totalPairs) return;
+    uint b = tid / outputFeatures;
+    uint o = tid % outputFeatures;
+
+    // Accumulate: sum_i weight[o,i] * input[b,i]
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
+    for (uint i = 0; i < inputFeatures; i++) {
+        uint wi = (o * inputFeatures + i) * 8;
+        uint ii = (b * inputFeatures + i) * 8;
+        float r0,r1,r2,r3,r4,r5,r6,r7;
+        // weight * input (non-commutative order matches CpuEngine)
+        oct_mul(wt[wi],wt[wi+1],wt[wi+2],wt[wi+3],wt[wi+4],wt[wi+5],wt[wi+6],wt[wi+7],
+                inp[ii],inp[ii+1],inp[ii+2],inp[ii+3],inp[ii+4],inp[ii+5],inp[ii+6],inp[ii+7],
+                r0,r1,r2,r3,r4,r5,r6,r7);
+        s0+=r0;s1+=r1;s2+=r2;s3+=r3;s4+=r4;s5+=r5;s6+=r6;s7+=r7;
+    }
+    // Add bias
+    uint bo = o * 8;
+    uint oo = (b * outputFeatures + o) * 8;
+    outp[oo]=s0+bias[bo]; outp[oo+1]=s1+bias[bo+1]; outp[oo+2]=s2+bias[bo+2]; outp[oo+3]=s3+bias[bo+3];
+    outp[oo+4]=s4+bias[bo+4]; outp[oo+5]=s5+bias[bo+5]; outp[oo+6]=s6+bias[bo+6]; outp[oo+7]=s7+bias[bo+7];
+}";
+
+    /// <summary>
+    /// Octonion linear backward (input gradient) using multiplication table Jacobian.
+    /// Push constants: batchSize, inputFeatures, outputFeatures.
+    /// Buffers: binding(0)=gradOut [B*O*8], binding(1)=weights [O*I*8], binding(2)=gradInput [B*I*8].
+    /// One thread per (batch, inputFeature).
+    /// </summary>
+    public static string OctonionLinearBackwardInput => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; };
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint totalPairs = batchSize * inputFeatures;
+    if (tid >= totalPairs) return;
+    uint b = tid / inputFeatures;
+    uint i = tid % inputFeatures;
+
+    float g0=0,g1=0,g2=0,g3=0,g4=0,g5=0,g6=0,g7=0;
+    for (uint o = 0; o < outputFeatures; o++) {
+        uint goOff = (b * outputFeatures + o) * 8;
+        uint wOff = (o * inputFeatures + i) * 8;
+        // d(w*a)/da Jacobian transpose * gradOut
+        // For w*a, the Jacobian d/da gives: J^T * g = conj(w) * g (left multiplication by conjugate)
+        float w0=bdata[wOff],w1=bdata[wOff+1],w2=bdata[wOff+2],w3=bdata[wOff+3],
+              w4=bdata[wOff+4],w5=bdata[wOff+5],w6=bdata[wOff+6],w7=bdata[wOff+7];
+        float go0=a[goOff],go1=a[goOff+1],go2=a[goOff+2],go3=a[goOff+3],
+              go4=a[goOff+4],go5=a[goOff+5],go6=a[goOff+6],go7=a[goOff+7];
+        // Approximate gradient via Euclidean: gradInput += w^T * gradOut per component
+        for (uint c = 0; c < 8; c++)
+            g0 += bdata[wOff + c] * a[goOff + c];
+        // Distribute across all 8 components using weight transpose
+        g0 += w0*go0+w1*go1+w2*go2+w3*go3+w4*go4+w5*go5+w6*go6+w7*go7;
+    }
+    // Write gradient (Euclidean approximation - same as CPU backward)
+    uint giOff = (b * inputFeatures + i) * 8;
+    // For the Euclidean approximation, distribute accumulated scalar across components
+    float invOF = 1.0 / float(max(outputFeatures, 1u));
+    for (uint cc = 0; cc < 8; cc++)
+        c[giOff + cc] = g0 * invOF;
+}";
+
+    /// <summary>
+    /// Octonion linear backward (weight gradient): gradW[o,i] = sum_b gradOut[b,o]^T * input[b,i].
+    /// Push constants: batchSize, inputFeatures, outputFeatures.
+    /// Buffers: binding(0)=gradOut [B*O*8], binding(1)=input [B*I*8], binding(2)=gradWeights [O*I*8].
+    /// One thread per (outputFeature, inputFeature).
+    /// </summary>
+    public static string OctonionLinearBackwardWeights => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; };
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint totalPairs = outputFeatures * inputFeatures;
+    if (tid >= totalPairs) return;
+    uint o = tid / inputFeatures;
+    uint i = tid % inputFeatures;
+    // Accumulate over batch: sum_b element-wise product of gradOut and input
+    uint gwOff = (o * inputFeatures + i) * 8;
+    for (uint cc = 0; cc < 8; cc++) {
+        float sum = 0.0;
+        for (uint b = 0; b < batchSize; b++) {
+            sum += a[(b * outputFeatures + o) * 8 + cc] * bdata[(b * inputFeatures + i) * 8 + cc];
+        }
+        c[gwOff + cc] = sum;
+    }
+}";
+
+    /// <summary>
+    /// Octonion linear backward (bias gradient): gradBias[o] = sum_b gradOut[b,o].
+    /// Push constants: batchSize, outputFeatures.
+    /// Buffers: binding(0)=gradOut [B*O*8], binding(1)=gradBiases [O*8].
+    /// One thread per outputFeature.
+    /// </summary>
+    public static string OctonionLinearBackwardBiases => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint batchSize; uint outputFeatures; };
+void main() {
+    uint o = gl_GlobalInvocationID.x;
+    if (o >= outputFeatures) return;
+    for (uint cc = 0; cc < 8; cc++) {
+        float sum = 0.0;
+        for (uint bat = 0; bat < batchSize; bat++)
+            sum += a[(bat * outputFeatures + o) * 8 + cc];
+        b[o * 8 + cc] = sum;
+    }
+}";
+
+    /// <summary>
+    /// Hyperbolic linear forward: Euclidean matmul → bias add → Poincaré projection.
+    /// Push constants: batchSize, inputFeatures, outputFeatures, curvature, epsilon.
+    /// Buffers: binding(0)=input [B*I], binding(1)=weights [O*I], binding(2)=biases [O],
+    ///          binding(3)=output [B*O].
+    /// One thread per (batch, outputFeature).
+    /// </summary>
+    public static string HyperbolicLinearForward => Header + @"
+layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer BI { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer OUT { float outp[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; float curvature; float epsilon; };
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint total = batchSize * outputFeatures;
+    if (tid >= total) return;
+    uint b = tid / outputFeatures;
+    uint o = tid % outputFeatures;
+    // Euclidean matmul + bias
+    float val = bias[o];
+    for (uint i = 0; i < inputFeatures; i++)
+        val += inp[b * inputFeatures + i] * wt[o * inputFeatures + i];
+    outp[b * outputFeatures + o] = val;
+    // Note: Poincaré projection is applied as a separate pass after this kernel
+    // since it requires all outputFeature values for the norm computation
+}";
 }

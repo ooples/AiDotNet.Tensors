@@ -51,6 +51,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _comparisonLibrary;
     private IntPtr _randomLibrary;
     private IntPtr _dotProductLibrary;
+    private IntPtr _hyperbolicLibrary;
+    private IntPtr _octonionLibrary;
 
     #region Properties
 
@@ -170,6 +172,12 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
             // Compile dot product operations
             _dotProductLibrary = _shaderLibrary.CompileLibrary("DotProduct", MetalKernels.DotProductKernels);
+
+            // Compile hyperbolic geometry operations
+            _hyperbolicLibrary = _shaderLibrary.CompileLibrary("Hyperbolic", MetalKernels.HyperbolicKernels);
+
+            // Compile octonion algebra operations
+            _octonionLibrary = _shaderLibrary.CompileLibrary("Octonion", MetalKernels.OctonionKernels);
         }
         catch (Exception ex)
         {
