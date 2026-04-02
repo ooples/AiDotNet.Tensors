@@ -1951,4 +1951,332 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // IoU Loss Backward: analytical gradients for bounding box regression
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// IoU loss backward: d(1 - IoU)/d(predicted) with analytical per-coordinate gradients.
+    /// inputs[0] = predicted [N,4], inputs[1] = target [N,4], savedState[0] = IoU per-box [N]
+    /// </summary>
+    internal static void IoULossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0];
+        var target = inputs[1];
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+        var eps = numOps.FromDouble(1e-7);
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            var px1 = predicted[o]; var py1 = predicted[o + 1]; var px2 = predicted[o + 2]; var py2 = predicted[o + 3];
+            var tx1 = target[o]; var ty1 = target[o + 1]; var tx2 = target[o + 2]; var ty2 = target[o + 3];
+
+            // Intersection
+            var ix1 = MaxVal(px1, tx1, numOps); var iy1 = MaxVal(py1, ty1, numOps);
+            var ix2 = MinVal(px2, tx2, numOps); var iy2 = MinVal(py2, ty2, numOps);
+            var iw = MaxVal(numOps.Subtract(ix2, ix1), numOps.Zero, numOps);
+            var ih = MaxVal(numOps.Subtract(iy2, iy1), numOps.Zero, numOps);
+            var iA = numOps.Multiply(iw, ih);
+
+            // Areas
+            var pw = MaxVal(numOps.Subtract(px2, px1), numOps.Zero, numOps);
+            var ph = MaxVal(numOps.Subtract(py2, py1), numOps.Zero, numOps);
+            var predArea = numOps.Multiply(pw, ph);
+            var targArea = numOps.Multiply(MaxVal(numOps.Subtract(tx2, tx1), numOps.Zero, numOps),
+                                           MaxVal(numOps.Subtract(ty2, ty1), numOps.Zero, numOps));
+            var uA = numOps.Add(numOps.Subtract(numOps.Add(predArea, targArea), iA), eps);
+            var uSq = numOps.Multiply(uA, uA);
+
+            // Indicator: intersection has positive area
+            bool hasIntersection = numOps.ToDouble(iw) > 0 && numOps.ToDouble(ih) > 0;
+            var hi = hasIntersection ? numOps.One : numOps.Zero;
+
+            // dIntersection/d(px1,py1,px2,py2)
+            var dI0 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            var dI1 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            var dI2 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            var dI3 = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+
+            // dUnion/d(px1,py1,px2,py2)
+            var dU0 = numOps.Subtract(numOps.Negate(ph), dI0);
+            var dU1 = numOps.Subtract(numOps.Negate(pw), dI1);
+            var dU2 = numOps.Subtract(ph, dI2);
+            var dU3 = numOps.Subtract(pw, dI3);
+
+            // dIoU/d(coord) = (dI*U - I*dU) / U^2, loss = 1 - IoU, so d(loss) = -dIoU
+            var go = gradOutput[i];
+            gradPred[o] = numOps.Multiply(go, numOps.Negate(numOps.Divide(numOps.Subtract(numOps.Multiply(dI0, uA), numOps.Multiply(iA, dU0)), uSq)));
+            gradPred[o + 1] = numOps.Multiply(go, numOps.Negate(numOps.Divide(numOps.Subtract(numOps.Multiply(dI1, uA), numOps.Multiply(iA, dU1)), uSq)));
+            gradPred[o + 2] = numOps.Multiply(go, numOps.Negate(numOps.Divide(numOps.Subtract(numOps.Multiply(dI2, uA), numOps.Multiply(iA, dU2)), uSq)));
+            gradPred[o + 3] = numOps.Multiply(go, numOps.Negate(numOps.Divide(numOps.Subtract(numOps.Multiply(dI3, uA), numOps.Multiply(iA, dU3)), uSq)));
+        }
+
+        var gradTensor = new Tensor<T>(gradPred, new[] { n, 4 });
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
+    }
+
+    /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>
+    internal static void GIoULossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0]; var target = inputs[1];
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+        var eps = numOps.FromDouble(1e-7);
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            var px1 = predicted[o]; var py1 = predicted[o + 1]; var px2 = predicted[o + 2]; var py2 = predicted[o + 3];
+            var tx1 = target[o]; var ty1 = target[o + 1]; var tx2 = target[o + 2]; var ty2 = target[o + 3];
+
+            var ix1 = MaxVal(px1, tx1, numOps); var iy1 = MaxVal(py1, ty1, numOps);
+            var ix2 = MinVal(px2, tx2, numOps); var iy2 = MinVal(py2, ty2, numOps);
+            var iw = MaxVal(numOps.Subtract(ix2, ix1), numOps.Zero, numOps);
+            var ih = MaxVal(numOps.Subtract(iy2, iy1), numOps.Zero, numOps);
+            var iA = numOps.Multiply(iw, ih);
+
+            var pw = MaxVal(numOps.Subtract(px2, px1), numOps.Zero, numOps);
+            var ph = MaxVal(numOps.Subtract(py2, py1), numOps.Zero, numOps);
+            var predArea = numOps.Multiply(pw, ph);
+            var targArea = numOps.Multiply(MaxVal(numOps.Subtract(tx2, tx1), numOps.Zero, numOps),
+                                           MaxVal(numOps.Subtract(ty2, ty1), numOps.Zero, numOps));
+            var uA = numOps.Add(numOps.Subtract(numOps.Add(predArea, targArea), iA), eps);
+            var uSq = numOps.Multiply(uA, uA);
+
+            bool hasIntersection = numOps.ToDouble(iw) > 0 && numOps.ToDouble(ih) > 0;
+            var hi = hasIntersection ? numOps.One : numOps.Zero;
+
+            var dI = new T[4];
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            var dU = new T[] {
+                numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
+                numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
+            };
+
+            // IoU gradient (for -IoU component)
+            var iouGrad = new T[4];
+            for (int c = 0; c < 4; c++)
+                iouGrad[c] = numOps.Divide(numOps.Subtract(numOps.Multiply(dI[c], uA), numOps.Multiply(iA, dU[c])), uSq);
+
+            // Enclosing box
+            var encW = numOps.Subtract(MaxVal(px2, tx2, numOps), MinVal(px1, tx1, numOps));
+            var encH = numOps.Subtract(MaxVal(py2, ty2, numOps), MinVal(py1, ty1, numOps));
+            var encA = numOps.Add(numOps.Multiply(encW, encH), eps);
+            var encASq = numOps.Multiply(encA, encA);
+
+            var dEncA = new T[4];
+            dEncA[0] = numOps.Multiply(numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, encH);
+            dEncA[1] = numOps.Multiply(numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, encW);
+            dEncA[2] = numOps.Multiply(numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, encH);
+            dEncA[3] = numOps.Multiply(numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, encW);
+
+            // GIoU penalty = (U - encA) / encA → d/d(coord) = -(dU*encA - U*dEncA)/encA^2
+            var go = gradOutput[i];
+            for (int c = 0; c < 4; c++)
+            {
+                var dPenalty = numOps.Negate(numOps.Divide(
+                    numOps.Subtract(numOps.Multiply(dU[c], encA), numOps.Multiply(uA, dEncA[c])), encASq));
+                gradPred[o + c] = numOps.Multiply(go, numOps.Subtract(dPenalty, iouGrad[c]));
+            }
+        }
+
+        var gradTensor = new Tensor<T>(gradPred, new[] { n, 4 });
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
+    }
+
+    /// <summary>DIoU loss backward: IoU gradient + distance/diagonal penalty gradient.</summary>
+    internal static void DIoULossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0]; var target = inputs[1];
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+        var eps = numOps.FromDouble(1e-7);
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            var px1 = predicted[o]; var py1 = predicted[o + 1]; var px2 = predicted[o + 2]; var py2 = predicted[o + 3];
+            var tx1 = target[o]; var ty1 = target[o + 1]; var tx2 = target[o + 2]; var ty2 = target[o + 3];
+
+            // IoU gradient (same as IoULossBackward)
+            var ix1 = MaxVal(px1, tx1, numOps); var iy1 = MaxVal(py1, ty1, numOps);
+            var ix2 = MinVal(px2, tx2, numOps); var iy2 = MinVal(py2, ty2, numOps);
+            var iw = MaxVal(numOps.Subtract(ix2, ix1), numOps.Zero, numOps);
+            var ih = MaxVal(numOps.Subtract(iy2, iy1), numOps.Zero, numOps);
+            var iA = numOps.Multiply(iw, ih);
+            var pw = MaxVal(numOps.Subtract(px2, px1), numOps.Zero, numOps);
+            var ph = MaxVal(numOps.Subtract(py2, py1), numOps.Zero, numOps);
+            var predArea = numOps.Multiply(pw, ph);
+            var targArea = numOps.Multiply(MaxVal(numOps.Subtract(tx2, tx1), numOps.Zero, numOps),
+                                           MaxVal(numOps.Subtract(ty2, ty1), numOps.Zero, numOps));
+            var uA = numOps.Add(numOps.Subtract(numOps.Add(predArea, targArea), iA), eps);
+            var uSq = numOps.Multiply(uA, uA);
+            bool hasIntersection = numOps.ToDouble(iw) > 0 && numOps.ToDouble(ih) > 0;
+            var hi = hasIntersection ? numOps.One : numOps.Zero;
+
+            var dI = new T[4];
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            var dU = new T[] {
+                numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
+                numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
+            };
+            var iouGrad = new T[4];
+            for (int c = 0; c < 4; c++)
+                iouGrad[c] = numOps.Divide(numOps.Subtract(numOps.Multiply(dI[c], uA), numOps.Multiply(iA, dU[c])), uSq);
+
+            // Center distance: rho^2 = dx^2 + dy^2 where dx = 0.5*(px1+px2) - 0.5*(tx1+tx2)
+            var half = numOps.FromDouble(0.5);
+            var dx = numOps.Subtract(numOps.Multiply(half, numOps.Add(px1, px2)), numOps.Multiply(half, numOps.Add(tx1, tx2)));
+            var dy = numOps.Subtract(numOps.Multiply(half, numOps.Add(py1, py2)), numOps.Multiply(half, numOps.Add(ty1, ty2)));
+            var rhoSq = numOps.Add(numOps.Multiply(dx, dx), numOps.Multiply(dy, dy));
+            var dRho = new T[] { dx, dy, dx, dy }; // d(rhoSq)/d(px1)=dx, etc.
+
+            // Diagonal of enclosing box: c^2 = encDx^2 + encDy^2
+            var encDx = numOps.Subtract(MaxVal(px2, tx2, numOps), MinVal(px1, tx1, numOps));
+            var encDy = numOps.Subtract(MaxVal(py2, ty2, numOps), MinVal(py1, ty1, numOps));
+            var cSq = numOps.Add(numOps.Add(numOps.Multiply(encDx, encDx), numOps.Multiply(encDy, encDy)), eps);
+            var cSqSq = numOps.Multiply(cSq, cSq);
+
+            var two = numOps.FromDouble(2.0);
+            var dCSq = new T[4];
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+
+            var go = gradOutput[i];
+            for (int c = 0; c < 4; c++)
+            {
+                var dDist = numOps.Divide(numOps.Subtract(numOps.Multiply(dRho[c], cSq), numOps.Multiply(rhoSq, dCSq[c])), cSqSq);
+                gradPred[o + c] = numOps.Multiply(go, numOps.Add(numOps.Negate(iouGrad[c]), dDist));
+            }
+        }
+
+        var gradTensor = new Tensor<T>(gradPred, new[] { n, 4 });
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
+    }
+
+    /// <summary>CIoU loss backward: DIoU gradient + aspect ratio penalty gradient.</summary>
+    internal static void CIoULossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var predicted = inputs[0]; var target = inputs[1];
+        int n = predicted.Shape[0];
+        var gradPred = new T[n * 4];
+        var eps = numOps.FromDouble(1e-7);
+
+        for (int i = 0; i < n; i++)
+        {
+            int o = i * 4;
+            var px1 = predicted[o]; var py1 = predicted[o + 1]; var px2 = predicted[o + 2]; var py2 = predicted[o + 3];
+            var tx1 = target[o]; var ty1 = target[o + 1]; var tx2 = target[o + 2]; var ty2 = target[o + 3];
+
+            // IoU computation
+            var ix1 = MaxVal(px1, tx1, numOps); var iy1 = MaxVal(py1, ty1, numOps);
+            var ix2 = MinVal(px2, tx2, numOps); var iy2 = MinVal(py2, ty2, numOps);
+            var iw = MaxVal(numOps.Subtract(ix2, ix1), numOps.Zero, numOps);
+            var ih = MaxVal(numOps.Subtract(iy2, iy1), numOps.Zero, numOps);
+            var iA = numOps.Multiply(iw, ih);
+            var pw = numOps.Add(MaxVal(numOps.Subtract(px2, px1), numOps.Zero, numOps), eps);
+            var ph = numOps.Add(MaxVal(numOps.Subtract(py2, py1), numOps.Zero, numOps), eps);
+            var predArea = numOps.Multiply(pw, ph);
+            var tw = numOps.Add(MaxVal(numOps.Subtract(tx2, tx1), numOps.Zero, numOps), eps);
+            var th = numOps.Add(MaxVal(numOps.Subtract(ty2, ty1), numOps.Zero, numOps), eps);
+            var targArea = numOps.Multiply(tw, th);
+            var uA = numOps.Add(numOps.Subtract(numOps.Add(predArea, targArea), iA), eps);
+            var uSq = numOps.Multiply(uA, uA);
+            var iou = numOps.Divide(iA, uA);
+            bool hasIntersection = numOps.ToDouble(iw) > 0 && numOps.ToDouble(ih) > 0;
+            var hi = hasIntersection ? numOps.One : numOps.Zero;
+
+            var dI = new T[4];
+            dI[0] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px1) > numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero, ih));
+            dI[1] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py1) > numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero, iw));
+            dI[2] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(px2) < numOps.ToDouble(tx2) ? numOps.One : numOps.Zero, ih));
+            dI[3] = numOps.Multiply(hi, numOps.Multiply(numOps.ToDouble(py2) < numOps.ToDouble(ty2) ? numOps.One : numOps.Zero, iw));
+            var dU = new T[] {
+                numOps.Subtract(numOps.Negate(ph), dI[0]), numOps.Subtract(numOps.Negate(pw), dI[1]),
+                numOps.Subtract(ph, dI[2]), numOps.Subtract(pw, dI[3])
+            };
+            var iouGrad = new T[4];
+            for (int c = 0; c < 4; c++)
+                iouGrad[c] = numOps.Divide(numOps.Subtract(numOps.Multiply(dI[c], uA), numOps.Multiply(iA, dU[c])), uSq);
+
+            // Distance penalty (same as DIoU)
+            var half = numOps.FromDouble(0.5);
+            var dx = numOps.Subtract(numOps.Multiply(half, numOps.Add(px1, px2)), numOps.Multiply(half, numOps.Add(tx1, tx2)));
+            var dy = numOps.Subtract(numOps.Multiply(half, numOps.Add(py1, py2)), numOps.Multiply(half, numOps.Add(ty1, ty2)));
+            var rhoSq = numOps.Add(numOps.Multiply(dx, dx), numOps.Multiply(dy, dy));
+            var dRho = new T[] { dx, dy, dx, dy };
+            var encDx = numOps.Subtract(MaxVal(px2, tx2, numOps), MinVal(px1, tx1, numOps));
+            var encDy = numOps.Subtract(MaxVal(py2, ty2, numOps), MinVal(py1, ty1, numOps));
+            var cSq = numOps.Add(numOps.Add(numOps.Multiply(encDx, encDx), numOps.Multiply(encDy, encDy)), eps);
+            var cSqSq = numOps.Multiply(cSq, cSq);
+            var two = numOps.FromDouble(2.0);
+            var dCSq = new T[4];
+            dCSq[0] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px1) < numOps.ToDouble(tx1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[1] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py1) < numOps.ToDouble(ty1) ? numOps.FromDouble(-1.0) : numOps.Zero);
+            dCSq[2] = numOps.Multiply(numOps.Multiply(two, encDx), numOps.ToDouble(px2) > numOps.ToDouble(tx2) ? numOps.One : numOps.Zero);
+            dCSq[3] = numOps.Multiply(numOps.Multiply(two, encDy), numOps.ToDouble(py2) > numOps.ToDouble(ty2) ? numOps.One : numOps.Zero);
+
+            // Aspect ratio penalty: v = (4/pi^2) * (atan(tw/th) - atan(pw/ph))^2
+            double piSq = Math.PI * Math.PI;
+            var fourOverPiSq = numOps.FromDouble(4.0 / piSq);
+            double predAtan = Math.Atan(numOps.ToDouble(pw) / numOps.ToDouble(ph));
+            double targAtan = Math.Atan(numOps.ToDouble(tw) / numOps.ToDouble(th));
+            double atanDiff = targAtan - predAtan;
+            var v = numOps.FromDouble((4.0 / piSq) * atanDiff * atanDiff);
+            var alpha = numOps.Divide(v, numOps.Add(numOps.Add(numOps.Subtract(numOps.One, iou), v), eps));
+
+            // dv/d(pw) and dv/d(ph) via atan derivative: d(atan(w/h))/dw = h/(w^2+h^2)
+            double rss = numOps.ToDouble(pw) * numOps.ToDouble(pw) + numOps.ToDouble(ph) * numOps.ToDouble(ph);
+            double dAtanPw = numOps.ToDouble(ph) / rss;
+            double dAtanPh = -numOps.ToDouble(pw) / rss;
+            // dv/d(px1) = dv/d(pw) * d(pw)/d(px1) = 2*(4/pi^2)*atanDiff*dAtanPw * (-1)
+            var dV = new T[4];
+            dV[0] = numOps.FromDouble(2.0 * (4.0 / piSq) * atanDiff * dAtanPw); // d(pw)/d(px1) = -1, but pw = px2-px1 so dAtanPw for pw
+            dV[1] = numOps.FromDouble(2.0 * (4.0 / piSq) * atanDiff * dAtanPh);
+            dV[2] = numOps.FromDouble(2.0 * (4.0 / piSq) * atanDiff * (-dAtanPw));
+            dV[3] = numOps.FromDouble(2.0 * (4.0 / piSq) * atanDiff * (-dAtanPh));
+
+            var go = gradOutput[i];
+            for (int c = 0; c < 4; c++)
+            {
+                var dDist = numOps.Divide(numOps.Subtract(numOps.Multiply(dRho[c], cSq), numOps.Multiply(rhoSq, dCSq[c])), cSqSq);
+                var totalGrad = numOps.Add(numOps.Add(numOps.Negate(iouGrad[c]), dDist), numOps.Multiply(alpha, dV[c]));
+                gradPred[o + c] = numOps.Multiply(go, totalGrad);
+            }
+        }
+
+        var gradTensor = new Tensor<T>(gradPred, new[] { n, 4 });
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradTensor, engine);
+    }
+
+    // Helper: max of two scalars
+    private static T MaxVal(T a, T b, INumericOperations<T> ops) =>
+        ops.ToDouble(a) >= ops.ToDouble(b) ? a : b;
+
+    // Helper: min of two scalars
+    private static T MinVal(T a, T b, INumericOperations<T> ops) =>
+        ops.ToDouble(a) <= ops.ToDouble(b) ? a : b;
 }
