@@ -13,7 +13,8 @@ internal static class HipIoUKernels
     public static string GetSource()
     {
         return @"
-
+#include <hip/hip_runtime.h>
+#include <math.h>
 
 // ===========================================================================
 // Device helpers for box coordinate extraction and IoU computation

@@ -6444,6 +6444,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {
+        if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -6459,6 +6460,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {
+        if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid");
         using var _ = PushContext();
@@ -6474,6 +6476,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {
+        if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -6489,6 +6492,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {
+        if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu");
         using var _ = PushContext();
@@ -6504,6 +6508,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batchSize, int inFeatures, int outFeatures)
     {
+        if (batchSize <= 0 || inFeatures <= 0 || outFeatures <= 0) return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
@@ -6705,6 +6710,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("iou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: iou_loss");
         using var _ = PushContext();
@@ -6717,6 +6723,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("giou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: giou_loss");
         using var _ = PushContext();
@@ -6729,6 +6736,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("diou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: diou_loss");
         using var _ = PushContext();
@@ -6741,6 +6749,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("ciou_loss", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: ciou_loss");
         using var _ = PushContext();
@@ -6754,6 +6763,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
         IGpuBuffer gradPredicted, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("iou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: iou_loss_backward");
         using var _ = PushContext();
@@ -6767,6 +6777,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
         IGpuBuffer gradPredicted, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("giou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: giou_loss_backward");
         using var _ = PushContext();
@@ -6780,6 +6791,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
         IGpuBuffer gradPredicted, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("diou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: diou_loss_backward");
         using var _ = PushContext();
@@ -6793,6 +6805,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public unsafe void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
         IGpuBuffer gradPredicted, int numBoxes)
     {
+        if (numBoxes <= 0) return;
         if (!_kernelCache.TryGetValue("ciou_loss_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: ciou_loss_backward");
         using var _ = PushContext();

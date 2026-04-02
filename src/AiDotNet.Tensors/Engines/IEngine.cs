@@ -2556,7 +2556,7 @@ public interface IEngine
     /// <summary>
     /// Fused MatMul + Bias Add + ReLU forward pass.
     /// Records a single tape entry with fused backward instead of three separate entries.
-    /// Saves 2 tape entries and 2 intermediate tensor allocations.
+    /// Saves 2 tape entries; GPU backends also save kernel launch overhead.
     /// </summary>
     Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
 
