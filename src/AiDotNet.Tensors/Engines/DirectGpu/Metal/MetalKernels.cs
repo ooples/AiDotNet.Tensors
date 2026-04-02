@@ -3668,6 +3668,75 @@ kernel void octonion_linear_backward_biases(
     }
 }
 
+kernel void octonion_linear_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& inputFeatures [[buffer(4)]],
+    constant uint& outputFeatures [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * inputFeatures;
+    if (gid >= total) return;
+    uint b = gid / inputFeatures;
+    uint i = gid % inputFeatures;
+    float ga0=0,ga1=0,ga2=0,ga3=0,ga4=0,ga5=0,ga6=0,ga7=0;
+    for (uint o = 0; o < outputFeatures; o++) {
+        uint goOff = (b * outputFeatures + o) * 8;
+        uint wOff = (o * inputFeatures + i) * 8;
+        float w0=weights[wOff],w1=weights[wOff+1],w2=weights[wOff+2],w3=weights[wOff+3],
+              w4=weights[wOff+4],w5=weights[wOff+5],w6=weights[wOff+6],w7=weights[wOff+7];
+        float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
+              g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+        ga0+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
+        ga1+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
+        ga2+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
+        ga3+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
+        ga4+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
+        ga5+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
+        ga6+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
+        ga7+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
+    }
+    uint giOff = (b * inputFeatures + i) * 8;
+    gradInput[giOff]=ga0; gradInput[giOff+1]=ga1; gradInput[giOff+2]=ga2; gradInput[giOff+3]=ga3;
+    gradInput[giOff+4]=ga4; gradInput[giOff+5]=ga5; gradInput[giOff+6]=ga6; gradInput[giOff+7]=ga7;
+}
+
+kernel void octonion_linear_forward_fused_relu(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batchSize [[buffer(4)]],
+    constant uint& inputFeatures [[buffer(5)]],
+    constant uint& outputFeatures [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * outputFeatures;
+    if (gid >= total) return;
+    uint b = gid / outputFeatures;
+    uint o = gid % outputFeatures;
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
+    for (uint i = 0; i < inputFeatures; i++) {
+        uint wi = (o * inputFeatures + i) * 8;
+        uint ii = (b * inputFeatures + i) * 8;
+        float r0,r1,r2,r3,r4,r5,r6,r7;
+        oct_mul(weights[wi],weights[wi+1],weights[wi+2],weights[wi+3],
+                weights[wi+4],weights[wi+5],weights[wi+6],weights[wi+7],
+                input[ii],input[ii+1],input[ii+2],input[ii+3],
+                input[ii+4],input[ii+5],input[ii+6],input[ii+7],
+                r0,r1,r2,r3,r4,r5,r6,r7);
+        s0+=r0;s1+=r1;s2+=r2;s3+=r3;s4+=r4;s5+=r5;s6+=r6;s7+=r7;
+    }
+    uint bo = o * 8;
+    uint oo = (b * outputFeatures + o) * 8;
+    output[oo]=max(s0+biases[bo],0.0f); output[oo+1]=max(s1+biases[bo+1],0.0f);
+    output[oo+2]=max(s2+biases[bo+2],0.0f); output[oo+3]=max(s3+biases[bo+3],0.0f);
+    output[oo+4]=max(s4+biases[bo+4],0.0f); output[oo+5]=max(s5+biases[bo+5],0.0f);
+    output[oo+6]=max(s6+biases[bo+6],0.0f); output[oo+7]=max(s7+biases[bo+7],0.0f);
+}
+
 kernel void octonion_linear_backward_weights(
     device const float* gradOutput [[buffer(0)]],
     device const float* input [[buffer(1)]],

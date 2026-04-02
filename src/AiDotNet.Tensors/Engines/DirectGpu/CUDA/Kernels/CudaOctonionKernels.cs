@@ -632,6 +632,50 @@ extern ""C"" __global__ __launch_bounds__(256) void octonion_modulus_relu_backwa
         gradInput[baseIdx + c] = scale * gradOut[c] + radialFactor * inputLocal[c];
     }
 }
+
+// ===========================================================================
+// FUSED OCTONION LINEAR + RELU KERNEL
+// ===========================================================================
+// Combines matmul + bias + ReLU in a single kernel launch.
+// Eliminates intermediate buffer read/write between forward and activation.
+
+extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_forward_fused_relu(
+    const float* input,
+    const float* weights,
+    const float* biases,
+    float* output,
+    int batch, int inputFeatures, int outputFeatures)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalOutputs = batch * outputFeatures;
+
+    if (gid >= totalOutputs) return;
+
+    int b = gid / outputFeatures;
+    int o = gid % outputFeatures;
+
+    float result[8];
+    for (int c = 0; c < 8; c++) {
+        result[c] = biases[o * 8 + c];
+    }
+
+    for (int i = 0; i < inputFeatures; i++) {
+        float inputOct[8], weightOct[8], product[8];
+        for (int c = 0; c < 8; c++) {
+            inputOct[c] = input[(b * inputFeatures + i) * 8 + c];
+            weightOct[c] = weights[(o * inputFeatures + i) * 8 + c];
+        }
+        octonion_multiply(weightOct, inputOct, product);
+        for (int c = 0; c < 8; c++) {
+            result[c] += product[c];
+        }
+    }
+
+    // Fused ReLU: max(x, 0) applied component-wise
+    for (int c = 0; c < 8; c++) {
+        output[(b * outputFeatures + o) * 8 + c] = fmaxf(result[c], 0.0f);
+    }
+}
 ";
     }
 
@@ -652,7 +696,8 @@ extern ""C"" __global__ __launch_bounds__(256) void octonion_modulus_relu_backwa
             "octonion_split_relu_forward",
             "octonion_split_relu_backward",
             "octonion_modulus_relu_forward",
-            "octonion_modulus_relu_backward"
+            "octonion_modulus_relu_backward",
+            "octonion_linear_forward_fused_relu"
         };
     }
 }

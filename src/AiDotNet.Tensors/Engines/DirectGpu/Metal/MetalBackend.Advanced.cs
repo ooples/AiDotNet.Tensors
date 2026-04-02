@@ -210,39 +210,21 @@ public sealed partial class MetalBackend
     public void OctonionLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        // Full octonion backward via Jacobian — kept as CPU for numerical correctness
         ThrowIfDisposed();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var weightsData = DownloadBuffer(weights);
-        var gradInputData = new float[batchSize * inputFeatures * 8];
-
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                int inputOffset = (b * inputFeatures + i) * 8;
-                var ga = new float[8];
-                for (int o = 0; o < outputFeatures; o++)
-                {
-                    int wOff = (o * inputFeatures + i) * 8;
-                    int goOff = (b * outputFeatures + o) * 8;
-                    float w0=weightsData[wOff],w1=weightsData[wOff+1],w2=weightsData[wOff+2],w3=weightsData[wOff+3],
-                          w4=weightsData[wOff+4],w5=weightsData[wOff+5],w6=weightsData[wOff+6],w7=weightsData[wOff+7];
-                    float g0=gradOutData[goOff],g1=gradOutData[goOff+1],g2=gradOutData[goOff+2],g3=gradOutData[goOff+3],
-                          g4=gradOutData[goOff+4],g5=gradOutData[goOff+5],g6=gradOutData[goOff+6],g7=gradOutData[goOff+7];
-                    ga[0]+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
-                    ga[1]+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
-                    ga[2]+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
-                    ga[3]+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
-                    ga[4]+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
-                    ga[5]+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
-                    ga[6]+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
-                    ga[7]+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
-                }
-                for (int c = 0; c < 8; c++) gradInputData[inputOffset + c] = ga[c];
-            }
-        }
-        UploadToBuffer(gradInput, gradInputData);
+        if (gradOutput is not MetalGpuBuffer gob || weights is not MetalGpuBuffer wb || gradInput is not MetalGpuBuffer gib)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        int totalPairs = batchSize * inputFeatures;
+        var pipeline = GetPipeline("Octonion", _octonionLibrary, "octonion_linear_backward_input");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(totalPairs);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(gob, 0);
+        encoder.SetBuffer(wb, 1);
+        encoder.SetBuffer(gib, 2);
+        encoder.SetBytes((uint)batchSize, 3);
+        encoder.SetBytes((uint)inputFeatures, 4);
+        encoder.SetBytes((uint)outputFeatures, 5);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void OctonionLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
@@ -294,13 +276,23 @@ public sealed partial class MetalBackend
     public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        OctonionLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
-        // Apply ReLU element-wise to all 8 octonion components
         ThrowIfDisposed();
-        var data = DownloadBuffer(output);
-        for (int i = 0; i < data.Length; i++)
-            data[i] = MathF.Max(data[i], 0f);
-        UploadToBuffer(output, data);
+        if (input is not MetalGpuBuffer ib || weights is not MetalGpuBuffer wb ||
+            biases is not MetalGpuBuffer bb || output is not MetalGpuBuffer ob)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        int totalPairs = batchSize * outputFeatures;
+        var pipeline = GetPipeline("Octonion", _octonionLibrary, "octonion_linear_forward_fused_relu");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(totalPairs);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(ib, 0);
+        encoder.SetBuffer(wb, 1);
+        encoder.SetBuffer(bb, 2);
+        encoder.SetBuffer(ob, 3);
+        encoder.SetBytes((uint)batchSize, 4);
+        encoder.SetBytes((uint)inputFeatures, 5);
+        encoder.SetBytes((uint)outputFeatures, 6);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     #endregion

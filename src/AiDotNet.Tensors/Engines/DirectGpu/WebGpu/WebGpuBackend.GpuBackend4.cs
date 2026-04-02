@@ -473,10 +473,15 @@ public sealed partial class WebGpuBackend
     public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        OctonionLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
-        // Apply ReLU in-place via element-wise max(x, 0)
-        int total = batchSize * outputFeatures * 8;
-        Relu(output, output, total);
+        int totalPairs = batchSize * outputFeatures;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inputFeatures),
+            BitConverter.Int32BitsToSingle(outputFeatures),
+        };
+        Dispatch4BufferAsync("OctonionFusedReLU", WebGpuKernels.OctonionFusedSource, "octonion_linear_fused_relu",
+            input, weights, biases, output, uniforms, totalPairs).GetAwaiter().GetResult();
     }
 
     #endregion

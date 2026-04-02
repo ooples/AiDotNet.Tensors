@@ -10240,8 +10240,19 @@ KERNEL VARIANTS (A/B testing):
         public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
             int batchSize, int inputFeatures, int outputFeatures)
         {
-            OctonionLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
-            Relu(output, output, batchSize * outputFeatures * 8);
+            if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_forward_fused_relu");
+
+            int totalOutputs = batchSize * outputFeatures;
+            int localSize = CalculateOptimalWorkGroupSize1D(totalOutputs);
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)biases).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(4u, batchSize);
+            kernel.SetArg(5u, inputFeatures);
+            kernel.SetArg(6u, outputFeatures);
+            kernel.Execute1D(totalOutputs, localSize);
         }
 
         #endregion
