@@ -35,13 +35,15 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// var buffer = new ParameterBuffer&lt;float&gt;(shapes);
 ///
 /// // Replace layer parameter tensors with views into the buffer
-/// int viewIndex = 0;
-/// foreach (var layer in layers)
-///     foreach (var param in layer.GetTrainableParameters())
-///         param.ReplaceStorage(buffer.GetView(viewIndex++));
+/// // Create parameter views backed by the buffer
+/// var views = buffer.CreateAllViews();
 ///
-/// // Second-order optimizer operates directly on the buffer
-/// Vector&lt;float&gt; flatParams = buffer.AsVector();  // zero-copy
+/// // Initialize buffer from existing layer weights
+/// buffer.CopyFrom(existingParams);
+///
+/// // Second-order optimizer operates directly on the buffer — zero copy
+/// Vector&lt;float&gt; flatParams = buffer.AsVector();
+/// Vector&lt;float&gt; flatGrads = buffer.FlattenGradients(views, gradients);
 /// Vector&lt;float&gt; updated = bfgsOptimizer.UpdateParameters(flatParams, flatGrads);
 /// buffer.CopyFrom(updated);  // writes back through views to all layers
 /// </code>
@@ -75,10 +77,18 @@ public sealed class ParameterBuffer<T>
         {
             _shapes[i] = (int[])parameterShapes[i].Clone();
             _offsets[i] = offset;
-            int size = 1;
+            long size = 1;
             foreach (int dim in _shapes[i])
+            {
+                if (dim < 0)
+                    throw new ArgumentException($"Shape dimension must be non-negative, got {dim} in parameter {i}.");
                 size *= dim;
-            offset += size;
+                if (size > int.MaxValue)
+                    throw new OverflowException(
+                        $"Parameter {i} shape produces more than {int.MaxValue} elements. " +
+                        "ParameterBuffer uses int indexing; reduce parameter sizes or use multiple buffers.");
+            }
+            offset = checked(offset + (int)size);
         }
 
         _totalSize = offset;
@@ -108,7 +118,7 @@ public sealed class ParameterBuffer<T>
     internal TensorStorage<T> Storage => _storage;
 
     /// <summary>
-    /// Gets the byte offset into the buffer where the i-th parameter tensor begins.
+    /// Gets the element offset (index) into the buffer where the i-th parameter tensor begins.
     /// </summary>
     /// <param name="index">The parameter index.</param>
     /// <returns>The element offset.</returns>
@@ -118,8 +128,8 @@ public sealed class ParameterBuffer<T>
     /// Gets the shape of the i-th parameter tensor.
     /// </summary>
     /// <param name="index">The parameter index.</param>
-    /// <returns>The shape array.</returns>
-    public int[] GetShape(int index) => _shapes[index];
+    /// <returns>A copy of the shape array.</returns>
+    public int[] GetShape(int index) => (int[])_shapes[index].Clone();
 
     /// <summary>
     /// Creates a tensor view into this buffer at the specified parameter index.
@@ -162,10 +172,17 @@ public sealed class ParameterBuffer<T>
         for (int i = 0; i < parameters.Length; i++)
         {
             var param = parameters[i];
-            // Access the tensor's backing data vector for span-based copy
-            var srcData = param.DataVector;
-            var src = srcData.AsSpan().Slice(param._storageOffset, param.Length);
-            var dst = bufferSpan.Slice(_offsets[i], param.Length);
+            // Ensure contiguous layout before copying raw storage
+            var contiguous = param.IsContiguous ? param : param.Contiguous();
+            var srcData = contiguous.DataVector;
+            var src = srcData.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
+            int expectedSize = 1;
+            foreach (int d in _shapes[i]) expectedSize *= d;
+            if (src.Length != expectedSize)
+                throw new ArgumentException(
+                    $"Parameter {i} length ({src.Length}) does not match expected shape size. " +
+                    "Ensure parameter tensors match the shapes provided at buffer construction.");
+            var dst = bufferSpan.Slice(_offsets[i], contiguous.Length);
             src.CopyTo(dst);
         }
     }
@@ -209,8 +226,9 @@ public sealed class ParameterBuffer<T>
         {
             if (gradients.TryGetValue(parameters[i], out var grad))
             {
-                var srcData = grad.DataVector;
-                var src = srcData.AsSpan().Slice(grad._storageOffset, grad.Length);
+                var contiguous = grad.IsContiguous ? grad : grad.Contiguous();
+                var srcData = contiguous.DataVector;
+                var src = srcData.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
                 int copyLen = Math.Min(src.Length, parameters[i].Length);
                 var dst = gradSpan.Slice(_offsets[i], copyLen);
                 src.Slice(0, copyLen).CopyTo(dst);

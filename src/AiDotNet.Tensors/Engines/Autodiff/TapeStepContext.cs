@@ -26,12 +26,11 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </para>
 /// <para><b>Performance advantages over PyTorch:</b>
 /// <list type="bullet">
-/// <item><b>Graph structure caching</b>: The topological sort order and backward dispatch table
-/// are computed once and reused across re-evaluations. PyTorch rebuilds the graph each closure call.</item>
 /// <item><b>Gradient buffer reuse</b>: Gradient accumulator tensors are pre-allocated on first
-/// evaluation and reused (zeroed) on subsequent calls, eliminating per-step allocation.</item>
-/// <item><b>Selective re-evaluation</b>: Only parameter-dependent subgraphs are replayed during
-/// line search; data-loading and preprocessing are cached.</item>
+/// re-evaluation and reused (with TensorCopy) on subsequent calls, eliminating per-step allocation.
+/// PyTorch's closure pattern allocates new gradient tensors each call.</item>
+/// <item><b>Stale gradient protection</b>: When a parameter stops producing gradients during
+/// re-evaluation, cached buffers are zeroed to prevent stale values from leaking into the optimizer.</item>
 /// <item><b>Integrated HVP</b>: Hessian-vector products are a first-class capability, not
 /// a user-assembled workaround as in PyTorch's <c>torch.autograd.functional.hvp</c>.</item>
 /// <item><b>Contiguous parameter buffer</b>: When a <see cref="ParameterBuffer{T}"/> is attached,
@@ -98,6 +97,9 @@ public sealed class TapeStepContext<T>
         T loss,
         ParameterBuffer<T>? parameterBuffer = null)
     {
+        if (parameterBuffer is not null)
+            ValidateBufferAlignment(parameters, parameterBuffer);
+
         Parameters = parameters;
         Gradients = gradients;
         Loss = loss;
@@ -127,6 +129,9 @@ public sealed class TapeStepContext<T>
         Func<Tensor<T>, Tensor<T>, Tensor<T>> lossFn,
         ParameterBuffer<T>? parameterBuffer = null)
     {
+        if (parameterBuffer is not null)
+            ValidateBufferAlignment(parameters, parameterBuffer);
+
         Parameters = parameters;
         Gradients = gradients;
         Loss = loss;
@@ -174,14 +179,22 @@ public sealed class TapeStepContext<T>
         {
             foreach (var param in Parameters)
             {
-                if (grads.TryGetValue(param, out var newGrad) &&
-                    _cachedGradBuffers.TryGetValue(param, out var cachedBuf))
+                var hasNewGrad = grads.TryGetValue(param, out var newGrad);
+                var hasCached = _cachedGradBuffers.TryGetValue(param, out var cachedBuf);
+
+                if (hasNewGrad && hasCached)
                 {
                     _engine.TensorCopy(newGrad, cachedBuf);
                 }
-                else if (grads.TryGetValue(param, out var g))
+                else if (hasNewGrad)
                 {
-                    _cachedGradBuffers[param] = g;
+                    _cachedGradBuffers[param] = newGrad;
+                }
+                else if (hasCached)
+                {
+                    // Parameter stopped producing gradients — zero the cached buffer
+                    // to prevent stale gradients from leaking into the optimizer step
+                    _engine.TensorFill(cachedBuf, MathHelper.GetNumericOperations<T>().Zero);
                 }
             }
             Gradients = _cachedGradBuffers;
@@ -192,9 +205,12 @@ public sealed class TapeStepContext<T>
             Gradients = grads;
         }
 
-        Loss = lossTensor.Length > 0
-            ? lossTensor[0]
-            : MathHelper.GetNumericOperations<T>().Zero;
+        if (lossTensor.Length != 1)
+            throw new InvalidOperationException(
+                $"Loss tensor must be scalar (length 1), got length {lossTensor.Length}. " +
+                "Reduce the loss to a scalar before computing gradients.");
+
+        Loss = lossTensor[0];
 
         return Loss;
     }
@@ -245,13 +261,14 @@ public sealed class TapeStepContext<T>
     /// <summary>
     /// Returns the flat parameter vector. If a <see cref="ParameterBuffer"/> is attached,
     /// this is zero-copy. Otherwise, flattens parameter tensors into a new vector.
+    /// Non-contiguous parameters are materialized to contiguous form before flattening.
     /// </summary>
     public Vector<T> GetFlatParameters()
     {
         if (ParameterBuffer is not null)
             return ParameterBuffer.AsVector();
 
-        // Fallback: flatten manually
+        // Fallback: flatten manually with contiguity handling
         int total = 0;
         foreach (var p in Parameters) total += p.Length;
         var flat = new Vector<T>(total);
@@ -259,8 +276,9 @@ public sealed class TapeStepContext<T>
         int offset = 0;
         foreach (var p in Parameters)
         {
-            var src = p.DataVector.AsSpan().Slice(p._storageOffset, p.Length);
-            src.CopyTo(span.Slice(offset, p.Length));
+            var contiguous = p.IsContiguous ? p : p.Contiguous();
+            var src = contiguous.DataVector.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
+            src.CopyTo(span.Slice(offset, contiguous.Length));
             offset += p.Length;
         }
         return flat;
@@ -269,24 +287,25 @@ public sealed class TapeStepContext<T>
     /// <summary>
     /// Returns the flat gradient vector aligned with the parameter layout.
     /// If a <see cref="ParameterBuffer"/> is attached, uses its efficient flattening.
+    /// Non-contiguous gradients are materialized to contiguous form before flattening.
     /// </summary>
     public Vector<T> GetFlatGradients()
     {
         if (ParameterBuffer is not null)
             return ParameterBuffer.FlattenGradients(Parameters, Gradients);
 
-        // Fallback: flatten manually
+        // Fallback: flatten manually with contiguity handling
         int total = 0;
         foreach (var p in Parameters) total += p.Length;
         var flat = new Vector<T>(total);
         var span = flat.AsWritableSpan();
         int offset = 0;
-        var numOps = MathHelper.GetNumericOperations<T>();
         foreach (var p in Parameters)
         {
             if (Gradients.TryGetValue(p, out var grad))
             {
-                var src = grad.DataVector.AsSpan().Slice(grad._storageOffset, grad.Length);
+                var contiguous = grad.IsContiguous ? grad : grad.Contiguous();
+                var src = contiguous.DataVector.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
                 int copyLen = Math.Min(src.Length, p.Length);
                 src.Slice(0, copyLen).CopyTo(span.Slice(offset, copyLen));
             }
@@ -299,6 +318,7 @@ public sealed class TapeStepContext<T>
     /// Writes a flat parameter vector back into the parameter tensors.
     /// If a <see cref="ParameterBuffer"/> is attached, this is a single buffer copy.
     /// Otherwise, distributes values into individual parameter tensors.
+    /// Requires contiguous parameters for direct write-back.
     /// </summary>
     /// <param name="flatParams">The flat parameter vector to write back.</param>
     public void SetFlatParameters(Vector<T> flatParams)
@@ -309,14 +329,40 @@ public sealed class TapeStepContext<T>
             return;
         }
 
-        // Fallback: distribute into individual tensors
+        // Validate total length
+        int total = 0;
+        foreach (var p in Parameters) total += p.Length;
+        if (flatParams.Length != total)
+            throw new ArgumentException(
+                $"Flat parameter vector length ({flatParams.Length}) must match total parameter count ({total}).",
+                nameof(flatParams));
+
+        // Distribute into individual tensors
         var src = flatParams.AsSpan();
         int offset = 0;
         foreach (var p in Parameters)
         {
+            if (!p.IsContiguous)
+                throw new InvalidOperationException(
+                    $"SetFlatParameters requires contiguous parameter tensors. " +
+                    $"Call Contiguous() on non-contiguous parameters before using flat access.");
             var dst = p.DataVector.AsWritableSpan().Slice(p._storageOffset, p.Length);
             src.Slice(offset, p.Length).CopyTo(dst);
             offset += p.Length;
         }
+    }
+
+    private static void ValidateBufferAlignment(Tensor<T>[] parameters, ParameterBuffer<T> buffer)
+    {
+        if (buffer.Count != parameters.Length)
+            throw new ArgumentException(
+                $"ParameterBuffer has {buffer.Count} slots but {parameters.Length} parameters were provided. " +
+                "The buffer must have been created with the same parameter shapes in the same order.");
+
+        int expectedTotal = 0;
+        foreach (var p in parameters) expectedTotal += p.Length;
+        if (buffer.TotalSize != expectedTotal)
+            throw new ArgumentException(
+                $"ParameterBuffer total size ({buffer.TotalSize}) does not match parameter total ({expectedTotal}).");
     }
 }
