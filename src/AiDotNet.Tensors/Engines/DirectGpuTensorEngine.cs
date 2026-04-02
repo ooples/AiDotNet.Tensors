@@ -14629,15 +14629,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gi = UploadTensorRaw(backend, input);
                 var gw = UploadTensorRaw(backend, weight);
                 var gb = UploadTensorRaw(backend, bias);
+                // Compute matmul+bias (pre-activation) for backward, then apply ReLU
+                var preActBuf = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.Gemm(gi, gw, preActBuf, batchSize, outFeatures, inFeatures);
+                backend.BiasAdd(preActBuf, gb, preActBuf, batchSize, outFeatures);
+                var preActivation = DeferTensorResult<T>(backend, preActBuf, batchSize * outFeatures, new[] { batchSize, outFeatures });
+
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
-                backend.FusedLinearReLU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                backend.Relu(preActBuf, go, batchSize * outFeatures);
                 var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // ReLU backward derives mask from (value > 0). Post-activation works because
-                // ReLU(x) > 0 iff x > 0, so the mask is identical to pre-activation.
+
                 Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
                     new[] { input, weight, bias },
                     Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward,
-                    new object[] { result });
+                    new object[] { preActivation });
                 return result;
             }
         }
