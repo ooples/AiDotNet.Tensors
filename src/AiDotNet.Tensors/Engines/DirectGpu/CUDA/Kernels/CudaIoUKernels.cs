@@ -33,8 +33,8 @@ __device__ __forceinline__ float compute_iou(
     float interW = max_f(0.0f, interX2 - interX1);
     float interH = max_f(0.0f, interY2 - interY1);
     float interArea = interW * interH;
-    float predArea = (px2 - px1) * (py2 - py1);
-    float targArea = (tx2 - tx1) * (ty2 - ty1);
+    float predArea = max_f(0.0f, px2 - px1) * max_f(0.0f, py2 - py1);
+    float targArea = max_f(0.0f, tx2 - tx1) * max_f(0.0f, ty2 - ty1);
     float unionArea = predArea + targArea - interArea + 1e-7f;
     if (interArea_out) *interArea_out = interArea;
     if (unionArea_out) *unionArea_out = unionArea;

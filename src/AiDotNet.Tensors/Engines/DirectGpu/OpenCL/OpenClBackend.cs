@@ -8131,6 +8131,7 @@ KERNEL VARIANTS (A/B testing):
 
         private void LaunchIoUOcl(string name, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
         {
+            if (numBoxes <= 0) return;
             var k = _kernelCache[name]; uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)predicted).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)target).Buffer.Handle);
@@ -8141,6 +8142,7 @@ KERNEL VARIANTS (A/B testing):
 
         private void LaunchIoUBackwardOcl(string name, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
         {
+            if (numBoxes <= 0) return;
             var k = _kernelCache[name]; uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)predicted).Buffer.Handle);

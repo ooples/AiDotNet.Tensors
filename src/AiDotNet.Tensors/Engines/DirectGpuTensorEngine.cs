@@ -14598,7 +14598,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            if (TryGetBackend(out var backend))
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
             {
                 using var src = GetOrAllocateBuffer(backend, tensor);
                 var dst = AllocateOutputBuffer(backend, tensor.Length);
