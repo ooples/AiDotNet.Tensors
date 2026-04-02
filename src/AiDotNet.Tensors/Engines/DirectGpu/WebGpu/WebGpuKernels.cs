@@ -8690,5 +8690,69 @@ fn nll_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     lf_loss[b] = select(0.0, -lf_pred[b * numClasses + u32(tc)], tc >= 0 && tc < i32(numClasses));
 }
 ";
+
+    // Fused Linear + Activation WGSL kernels
+    public const string FusedLinearReLU = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = max(sum, 0.0);
+}";
+
+    public const string FusedLinearSigmoid = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = 1.0 / (1.0 + exp(-sum));
+}";
+
+    // IoU Loss WGSL kernels
+    public const string IoULossWgsl = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> pred: array<f32>;
+@group(0) @binding(1) var<storage, read> targ: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iW=max(0.0, min(px2,tx2)-max(px1,tx1));
+    let iH=max(0.0, min(py2,ty2)-max(py1,ty1));
+    let iA=iW*iH;
+    let pA=(px2-px1)*(py2-py1);
+    let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7;
+    loss[i] = 1.0 - iA/uA;
+}";
 }
 #endif
