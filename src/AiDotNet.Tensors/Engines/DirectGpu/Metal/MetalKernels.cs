@@ -3773,4 +3773,152 @@ kernel void octonion_linear_backward_weights(
     gradWeights[gwOff+4]=gw4; gradWeights[gwOff+5]=gw5; gradWeights[gwOff+6]=gw6; gradWeights[gwOff+7]=gw7;
 }
 ";
+
+    #region Fused Linear Kernels
+
+    public const string FusedLinearKernels = CommonHeader + @"
+inline float act_relu(float x) { return max(x, 0.0f); }
+inline float act_tanh_fn(float x) { return tanh(x); }
+inline float act_gelu(float x) { return 0.5f * x * (1.0f + tanh(SQRT_2_OVER_PI * (x + GELU_COEF * x * x * x))); }
+inline float act_swish(float x) { return x * sigmoid(x); }
+
+kernel void fused_linear_relu(
+    device const float* input [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* output [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * outFeatures) return;
+    int b = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = bias[j];
+    for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
+    output[idx] = act_relu(sum);
+}
+
+kernel void fused_linear_sigmoid(
+    device const float* input [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* output [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * outFeatures) return;
+    int b = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = bias[j];
+    for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
+    output[idx] = sigmoid(sum);
+}
+
+kernel void fused_linear_tanh(
+    device const float* input [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* output [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * outFeatures) return;
+    int b = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = bias[j];
+    for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
+    output[idx] = act_tanh_fn(sum);
+}
+
+kernel void fused_linear_gelu(
+    device const float* input [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* output [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * outFeatures) return;
+    int b = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = bias[j];
+    for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
+    output[idx] = act_gelu(sum);
+}
+
+kernel void fused_linear_swish(
+    device const float* input [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* output [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * outFeatures) return;
+    int b = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = bias[j];
+    for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
+    output[idx] = act_swish(sum);
+}
+";
+
+    #endregion
+
+    #region IoU Loss Kernels
+
+    public const string IoULossKernels = CommonHeader + @"
+inline float compute_iou_metal(float px1, float py1, float px2, float py2,
+    float tx1, float ty1, float tx2, float ty2)
+{
+    float iW = max(0.0f, min(px2,tx2) - max(px1,tx1));
+    float iH = max(0.0f, min(py2,ty2) - max(py1,ty1));
+    float iA = iW * iH;
+    float uA = (px2-px1)*(py2-py1) + (tx2-tx1)*(ty2-ty1) - iA + EPSILON;
+    return iA / uA;
+}
+
+kernel void iou_loss(device const float* pred [[buffer(0)]], device const float* targ [[buffer(1)]],
+    device float* loss [[buffer(2)]], constant int& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    loss[i] = 1.0f - compute_iou_metal(pred[o],pred[o+1],pred[o+2],pred[o+3], targ[o],targ[o+1],targ[o+2],targ[o+3]);
+}
+
+kernel void giou_loss(device const float* pred [[buffer(0)]], device const float* targ [[buffer(1)]],
+    device float* loss [[buffer(2)]], constant int& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iou = compute_iou_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2);
+    float iW=max(0.0f,min(px2,tx2)-max(px1,tx1)), iH=max(0.0f,min(py2,ty2)-max(py1,ty1));
+    float iA=iW*iH, pA=(px2-px1)*(py2-py1), tA=(tx2-tx1)*(ty2-ty1), uA=pA+tA-iA+EPSILON;
+    float eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+EPSILON;
+    loss[i] = 1.0f - (iou - (eA-uA)/eA);
+}
+
+kernel void diou_loss(device const float* pred [[buffer(0)]], device const float* targ [[buffer(1)]],
+    device float* loss [[buffer(2)]], constant int& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iou = compute_iou_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2);
+    float dx=0.5f*(px1+px2)-0.5f*(tx1+tx2), dy=0.5f*(py1+py2)-0.5f*(ty1+ty2);
+    float cds=dx*dx+dy*dy;
+    float eDx=max(px2,tx2)-min(px1,tx1), eDy=max(py2,ty2)-min(py1,ty1);
+    float ds=eDx*eDx+eDy*eDy+EPSILON;
+    loss[i] = 1.0f - (iou - cds/ds);
+}
+
+kernel void ciou_loss(device const float* pred [[buffer(0)]], device const float* targ [[buffer(1)]],
+    device float* loss [[buffer(2)]], constant int& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iou = compute_iou_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2);
+    float dx=0.5f*(px1+px2)-0.5f*(tx1+tx2), dy=0.5f*(py1+py2)-0.5f*(ty1+ty2);
+    float cds=dx*dx+dy*dy;
+    float eDx=max(px2,tx2)-min(px1,tx1), eDy=max(py2,ty2)-min(py1,ty1);
+    float ds=eDx*eDx+eDy*eDy+EPSILON;
+    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float rd=atan(tw/th)-atan(pw/ph);
+    float v=(4.0f/(PI*PI))*rd*rd;
+    float alpha=v/(1.0f-iou+v+EPSILON);
+    loss[i] = 1.0f - (iou - cds/ds - alpha*v);
+}
+";
+
+    #endregion
 }

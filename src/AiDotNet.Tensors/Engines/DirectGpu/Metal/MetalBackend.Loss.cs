@@ -999,25 +999,65 @@ public sealed partial class MetalBackend
 
     #region StopGradient, Fused Linear, and IoU Operations
 
-    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size) => throw new NotSupportedException("Metal CopyBuffer not yet implemented.");
-    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
+    public unsafe void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
+    {
+        ThrowIfDisposed();
+        var srcBuf = (MetalGpuBuffer)source;
+        var dstBuf = (MetalGpuBuffer)destination;
+        Buffer.MemoryCopy(srcBuf.Contents.ToPointer(), dstBuf.Contents.ToPointer(),
+            (long)size * sizeof(float), (long)size * sizeof(float));
+    }
+
+    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearMetal("fused_linear_relu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearMetal("fused_linear_sigmoid", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearMetal("fused_linear_tanh", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearMetal("fused_linear_gelu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearMetal("fused_linear_swish", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException("Metal fused backward not yet implemented.");
     public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUMetal("iou_loss", predicted, target, loss, numBoxes); }
+    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUMetal("giou_loss", predicted, target, loss, numBoxes); }
+    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUMetal("diou_loss", predicted, target, loss, numBoxes); }
+    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUMetal("ciou_loss", predicted, target, loss, numBoxes); }
+    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException("Metal IoU backward not yet implemented.");
     public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
     public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
     public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+
+    private void LaunchFusedLinearMetal(string kernelName, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetPipeline("FusedLinear", _fusedLinearLibrary, kernelName);
+        int total = batchSize * outFeatures;
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)input, 0);
+        encoder.SetBuffer((MetalGpuBuffer)weight, 1);
+        encoder.SetBuffer((MetalGpuBuffer)bias, 2);
+        encoder.SetBuffer((MetalGpuBuffer)output, 3);
+        encoder.SetBytes(batchSize, 4);
+        encoder.SetBytes(inFeatures, 5);
+        encoder.SetBytes(outFeatures, 6);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    private void LaunchIoUMetal(string kernelName, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetPipeline("IoULoss", _iouLibrary, kernelName);
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(numBoxes);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)predicted, 0);
+        encoder.SetBuffer((MetalGpuBuffer)target, 1);
+        encoder.SetBuffer((MetalGpuBuffer)loss, 2);
+        encoder.SetBytes(numBoxes, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
 
     #endregion
 }
