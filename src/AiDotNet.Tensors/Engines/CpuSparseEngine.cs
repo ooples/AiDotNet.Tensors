@@ -501,8 +501,8 @@ public sealed class CpuSparseEngine : ISparseEngine
     {
         if (sparse is null) throw new ArgumentNullException(nameof(sparse));
 
-        // SparseTensor already has a Transpose method - delegate to it
-        return sparse.Transpose();
+        // SparseTensor.Transpose() overrides Tensor<T>.Transpose() and returns a SparseTensor
+        return (SparseTensor<T>)sparse.Transpose();
     }
 
     #endregion

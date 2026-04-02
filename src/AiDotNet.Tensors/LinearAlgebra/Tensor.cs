@@ -120,6 +120,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Constructor for sparse tensors. The values vector contains only non-zero elements,
+    /// while the logical shape represents the full tensor dimensions.
+    /// Used by <see cref="SparseTensor{T}"/> which inherits from Tensor.
+    /// </summary>
+    internal Tensor(Vector<T> values, int[] logicalShape, bool isSparse)
+        : base(values, logicalShape, isSparse)
+    {
+    }
+
+    /// <summary>
     /// Returns a contiguous tensor with the same data. If already contiguous, returns this
     /// (zero-copy). Otherwise, materializes a new tensor with data in row-major order.
     /// </summary>
@@ -131,6 +141,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Contiguous()
     {
+        ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
         // Materialize: copy data from strided layout to contiguous row-major
@@ -900,6 +911,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSlice(int index, Tensor<T> slice)
     {
+        ThrowIfSparse();
         if (index < 0 || index >= Shape[0])
         {
             throw new ArgumentOutOfRangeException(nameof(index));
@@ -951,6 +963,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void Fill(T value)
     {
+        ThrowIfSparse();
         _numOps.Fill(_data.AsWritableSpan(), value);
     }
 
@@ -1002,6 +1015,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int index)
     {
+        ThrowIfSparse();
         if (Rank == 0)
             throw new InvalidOperationException("Cannot slice a scalar (rank-0) tensor.");
         if (index < 0 || index >= _shape[0])
@@ -1163,6 +1177,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Transpose(int[] permutation)
     {
+        ThrowIfSparse();
         if (permutation.Length != Rank)
             throw new ArgumentException("Permutation array length must match tensor rank.");
 
@@ -1311,6 +1326,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetSlice(int start, int length)
     {
+        ThrowIfSparse();
         if (start < 0 || start >= _data.Length)
             throw new ArgumentOutOfRangeException(nameof(start), "Start index must be within bounds of the tensor data.");
         if (length < 0 || start + length > _data.Length)
@@ -1344,6 +1360,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public (T maxVal, int maxIndex) Max()
     {
+        ThrowIfSparse();
         // Use vectorized Max to find the value quickly (5-15x faster with AVX2)
         T maxVal = _numOps.Max(_data.AsSpan());
 
@@ -1383,6 +1400,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Reshape(params int[] newShape)
     {
+        ThrowIfSparse();
         int newTotal = 1;
         for (int i = 0; i < newShape.Length; i++)
             newTotal *= newShape[i];
@@ -2103,6 +2121,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int startRow, int startCol, int endRow, int endCol)
     {
+        ThrowIfSparse();
         if (this.Rank != 2)
         {
             throw new InvalidOperationException("This Slice method is only applicable for 2D tensors.");
@@ -2598,6 +2617,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> GetSliceAlongDimension(int index, int dimension)
     {
+        ThrowIfSparse();
         if (dimension < 0 || dimension >= Rank)
             throw new ArgumentOutOfRangeException(nameof(dimension), $"Dimension {dimension} is out of range for tensor with {Rank} dimensions.");
         if (index < 0 || index >= _shape[dimension])
@@ -3480,8 +3500,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// ```
     /// </para>
     /// </remarks>
-    public Tensor<T> Transpose()
+    public virtual Tensor<T> Transpose()
     {
+        ThrowIfSparse();
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.
@@ -3515,6 +3536,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> TransposeLast2D()
     {
+        ThrowIfSparse();
         if (Rank < 2)
             throw new InvalidOperationException("Tensor must have at least 2 dimensions to transpose last 2D.");
 
@@ -3655,6 +3677,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSlice(int start, Vector<T> slice)
     {
+        ThrowIfSparse();
         for (int i = 0; i < slice.Length; i++)
         {
             _data[start + i] = slice[i];
@@ -3683,6 +3706,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSlice(int dimension, int index, Tensor<T> slice)
     {
+        ThrowIfSparse();
         if (dimension < 0 || dimension >= Rank)
             throw new ArgumentOutOfRangeException(nameof(dimension), "Dimension is out of range.");
 
@@ -3756,6 +3780,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int axis, int start, int? end = null)
     {
+        ThrowIfSparse();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentException($"Invalid axis. Must be between 0 and {Rank - 1}.");
 
@@ -3859,6 +3884,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MeanOverAxis(int axis)
     {
+        ThrowIfSparse();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 

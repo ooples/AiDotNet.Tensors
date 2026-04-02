@@ -4135,6 +4135,66 @@ fn mobius_add(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Octonion multiply kernel.
     /// </summary>
+    /// <summary>
+    /// Octonion linear forward (no activation). Proper octonion matmul + bias.
+    /// </summary>
+    public const string OctonionLinearForwardSource = @"
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+
+struct Params { batch_size: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn oct_mul_c(
+    a0: f32, a1: f32, a2: f32, a3: f32, a4: f32, a5: f32, a6: f32, a7: f32,
+    b0: f32, b1: f32, b2: f32, b3: f32, b4: f32, b5: f32, b6: f32, b7: f32,
+    comp: u32
+) -> f32 {
+    switch comp {
+        case 0u: { return a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7; }
+        case 1u: { return a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6; }
+        case 2u: { return a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5; }
+        case 3u: { return a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4; }
+        case 4u: { return a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3; }
+        case 5u: { return a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2; }
+        case 6u: { return a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1; }
+        default: { return a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn octonion_linear_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let total = params.batch_size * params.output_features;
+    if (tid >= total) { return; }
+    let b = tid / params.output_features;
+    let o = tid % params.output_features;
+    var s: array<f32, 8>;
+    for (var c: u32 = 0u; c < 8u; c = c + 1u) { s[c] = 0.0; }
+    for (var i: u32 = 0u; i < params.input_features; i = i + 1u) {
+        let wi = (o * params.input_features + i) * 8u;
+        let ii = (b * params.input_features + i) * 8u;
+        let w0=wt[wi]; let w1=wt[wi+1u]; let w2=wt[wi+2u]; let w3=wt[wi+3u];
+        let w4=wt[wi+4u]; let w5=wt[wi+5u]; let w6=wt[wi+6u]; let w7=wt[wi+7u];
+        let a0=inp[ii]; let a1=inp[ii+1u]; let a2=inp[ii+2u]; let a3=inp[ii+3u];
+        let a4=inp[ii+4u]; let a5=inp[ii+5u]; let a6=inp[ii+6u]; let a7=inp[ii+7u];
+        for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+            s[c] = s[c] + oct_mul_c(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,c);
+        }
+    }
+    let bo = o * 8u;
+    let oo = (b * params.output_features + o) * 8u;
+    for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+        outp[oo + c] = s[c] + bias[bo + c];
+    }
+}
+";
+
+    /// <summary>
+    /// Octonion element-wise multiply kernel.
+    /// </summary>
     public const string OctonionSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
@@ -4160,6 +4220,73 @@ fn octonion_multiply(@builtin(global_invocation_id) gid: vec3<u32>) {
     C[off+5u] = a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2;
     C[off+6u] = a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1;
     C[off+7u] = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0;
+}
+";
+
+    /// <summary>
+    /// Fused octonion linear forward + ReLU. Single kernel: matmul + bias + ReLU.
+    /// </summary>
+    public const string OctonionFusedSource = @"
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+
+struct Params { batch_size: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn oct_mul_comp(
+    a0: f32, a1: f32, a2: f32, a3: f32, a4: f32, a5: f32, a6: f32, a7: f32,
+    b0: f32, b1: f32, b2: f32, b3: f32, b4: f32, b5: f32, b6: f32, b7: f32,
+    comp: u32
+) -> f32 {
+    switch comp {
+        case 0u: { return a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7; }
+        case 1u: { return a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6; }
+        case 2u: { return a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5; }
+        case 3u: { return a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4; }
+        case 4u: { return a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3; }
+        case 5u: { return a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2; }
+        case 6u: { return a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1; }
+        default: { return a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn octonion_linear_fused_relu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let total = params.batch_size * params.output_features;
+    if (tid >= total) { return; }
+    let b = tid / params.output_features;
+    let o = tid % params.output_features;
+    var s0: f32 = 0.0; var s1: f32 = 0.0; var s2: f32 = 0.0; var s3: f32 = 0.0;
+    var s4: f32 = 0.0; var s5: f32 = 0.0; var s6: f32 = 0.0; var s7: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.input_features; i = i + 1u) {
+        let wi = (o * params.input_features + i) * 8u;
+        let ii = (b * params.input_features + i) * 8u;
+        let w0=wt[wi]; let w1=wt[wi+1u]; let w2=wt[wi+2u]; let w3=wt[wi+3u];
+        let w4=wt[wi+4u]; let w5=wt[wi+5u]; let w6=wt[wi+6u]; let w7=wt[wi+7u];
+        let a0=inp[ii]; let a1=inp[ii+1u]; let a2=inp[ii+2u]; let a3=inp[ii+3u];
+        let a4=inp[ii+4u]; let a5=inp[ii+5u]; let a6=inp[ii+6u]; let a7=inp[ii+7u];
+        s0=s0+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,0u);
+        s1=s1+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,1u);
+        s2=s2+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,2u);
+        s3=s3+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,3u);
+        s4=s4+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,4u);
+        s5=s5+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,5u);
+        s6=s6+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,6u);
+        s7=s7+oct_mul_comp(w0,w1,w2,w3,w4,w5,w6,w7,a0,a1,a2,a3,a4,a5,a6,a7,7u);
+    }
+    let bo = o * 8u;
+    let oo = (b * params.output_features + o) * 8u;
+    outp[oo]    = max(s0 + bias[bo], 0.0);
+    outp[oo+1u] = max(s1 + bias[bo+1u], 0.0);
+    outp[oo+2u] = max(s2 + bias[bo+2u], 0.0);
+    outp[oo+3u] = max(s3 + bias[bo+3u], 0.0);
+    outp[oo+4u] = max(s4 + bias[bo+4u], 0.0);
+    outp[oo+5u] = max(s5 + bias[bo+5u], 0.0);
+    outp[oo+6u] = max(s6 + bias[bo+6u], 0.0);
+    outp[oo+7u] = max(s7 + bias[bo+7u], 0.0);
 }
 ";
 

@@ -134,6 +134,19 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public bool IsView { get; }
 
+    /// <summary>
+    /// Whether this tensor uses sparse storage (COO, CSR, or CSC format).
+    /// When true, the backing data contains only non-zero values — its length
+    /// is less than the logical element count (product of shape dimensions).
+    /// Dense operations must check this flag and dispatch to sparse kernels.
+    /// </summary>
+    /// <remarks>
+    /// <para>This follows the PyTorch model where <c>tensor.is_sparse</c> indicates
+    /// the storage layout. Sparse tensors inherit the full Tensor interface but
+    /// store data efficiently for matrices with many zero elements.</para>
+    /// </remarks>
+    public bool IsSparse { get; }
+
     // ================================================================
     // Cached derived values
     // ================================================================
@@ -298,6 +311,42 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     /// <summary>
+    /// Constructor for sparse tensors where the backing data contains only non-zero values.
+    /// The logical shape may be larger than the data length (e.g., [1000, 1000] shape
+    /// but only 500 non-zero values stored).
+    /// </summary>
+    /// <param name="values">The non-zero values vector.</param>
+    /// <param name="logicalShape">The full logical shape (e.g., [rows, columns]).</param>
+    /// <remarks>
+    /// <para>This constructor skips the data.Length == product(shape) validation that
+    /// the dense constructors enforce, since sparse tensors intentionally store fewer
+    /// elements than the logical element count.</para>
+    /// </remarks>
+    internal TensorBase(Vector<T> values, int[] logicalShape, bool isSparse)
+    {
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (logicalShape is null) throw new ArgumentNullException(nameof(logicalShape));
+        if (!isSparse) throw new ArgumentException("Use the dense constructor for non-sparse tensors.", nameof(isSparse));
+        ValidateShape(logicalShape);
+
+        _shape = (int[])logicalShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        // Strides describe the logical dense layout for shape queries.
+        // Sparse tensors must NOT use strides for data access — use sparse indices instead.
+        _strides = ComputeRowMajorStrides(logicalShape);
+        _storageOffset = 0;
+        IsContiguous = false; // Sparse tensors are not contiguous in the dense sense
+        IsView = false;
+        IsSparse = true;
+        // Length is the logical element count (product of shape), NOT _data.Length.
+        // Dense APIs (indexers, GetFlat, AsSpan, etc.) check IsSparse and throw
+        // if called on sparse tensors — use SparseTensor-specific APIs instead.
+        Length = ComputeProduct(logicalShape);
+        _data = values;
+        _storage = new TensorStorage<T>(_data);
+    }
+
+    /// <summary>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
@@ -369,6 +418,24 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     // ================================================================
+    // Sparse safety
+    // ================================================================
+
+    /// <summary>
+    /// Throws if this tensor is sparse. Call at the top of any method that assumes
+    /// dense storage layout (_data.Length == Length, stride-based indexing is valid).
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    protected void ThrowIfSparse(
+        [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
+    {
+        if (IsSparse)
+            throw new InvalidOperationException(
+                $"{caller} is not supported on sparse tensors. " +
+                "Use SparseTensor-specific APIs or call ToDense() first.");
+    }
+
+    // ================================================================
     // Indexers
     // ================================================================
 
@@ -379,11 +446,13 @@ public abstract class TensorBase<T> : IDisposable
     {
         get
         {
+            ThrowIfSparse();
             ValidateIndices(indices);
             return _data[GetFlatIndex(indices)];
         }
         set
         {
+            ThrowIfSparse();
             ValidateIndices(indices);
             _data[GetFlatIndex(indices)] = value;
         }
@@ -407,6 +476,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual T[] ToArray()
     {
+        ThrowIfSparse();
         if (Length == 0) return Array.Empty<T>();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
             return _data.ToArray();
@@ -429,6 +499,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual void CopyFromArray(T[] source)
     {
+        ThrowIfSparse();
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (source.Length != Length)
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");
@@ -454,6 +525,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public T GetFlat(int flatIndex)
     {
+        ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         if (IsContiguous)
@@ -466,6 +538,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public void SetFlat(int flatIndex, T value)
     {
+        ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         if (IsContiguous)
@@ -479,6 +552,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
+        ThrowIfSparse();
         if (Length == 0) return ReadOnlySpan<T>.Empty;
         if (!IsContiguous)
             throw new InvalidOperationException(
@@ -521,6 +595,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual TensorBase<T> Clone()
     {
+        ThrowIfSparse();
         var result = CreateInstance(_shape);
         if (Length == 0) return result;
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
@@ -544,6 +619,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
+        ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
         {
@@ -564,6 +640,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public TensorBase<TResult> Transform<TResult>(Func<T, int[], TResult> func)
     {
+        ThrowIfSparse();
         var result = CreateInstance<TResult>(_shape);
         var indices = new int[Rank];
         for (int i = 0; i < Length; i++)

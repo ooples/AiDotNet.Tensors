@@ -655,17 +655,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (curvature <= 0f)
             throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare ball model.");
-        var inp = DownloadBuffer(input); var o = new float[batchSize * dim];
-        float maxNorm = 1f / MathF.Sqrt(curvature) - epsilon;
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * dim; float norm = 0;
-            for (int d = 0; d < dim; d++) norm += inp[off + d] * inp[off + d];
-            norm = MathF.Sqrt(norm);
-            float scale = norm > maxNorm ? maxNorm / norm : 1f;
-            for (int d = 0; d < dim; d++) o[off + d] = inp[off + d] * scale;
-        }
-        UploadToBuffer(o, output);
+        var pc = new uint[] { (uint)batchSize, (uint)dim, FloatBits(curvature), FloatBits(epsilon) };
+        GlslUnaryOp(VulkanGlslKernels.PoincareProject, input, output, batchSize, pc, 4 * sizeof(uint));
     }
 
     public void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
@@ -673,19 +664,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (curvature <= 0f)
             throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Mobius addition.");
-        var xd = DownloadBuffer(x); var yd = DownloadBuffer(y); var o = new float[batchSize * dim];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * dim;
-            float xSq = 0, ySq = 0, xy = 0;
-            for (int d = 0; d < dim; d++) { xSq += xd[off + d] * xd[off + d]; ySq += yd[off + d] * yd[off + d]; xy += xd[off + d] * yd[off + d]; }
-            float c = curvature;
-            float denom = 1f + 2f * c * xy + c * c * xSq * ySq;
-            if (MathF.Abs(denom) < 1e-10f) denom = 1e-10f;
-            for (int d = 0; d < dim; d++)
-                o[off + d] = ((1f + 2f * c * xy + c * ySq) * xd[off + d] + (1f - c * xSq) * yd[off + d]) / denom;
-        }
-        UploadToBuffer(o, output);
+        var pc = new uint[] { (uint)batchSize, (uint)dim, FloatBits(curvature) };
+        GlslBinaryOp(VulkanGlslKernels.MobiusAdd, x, y, output, batchSize, pc, 3 * sizeof(uint));
     }
 
     public void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
@@ -693,26 +673,8 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (curvature <= 0f)
             throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare exponential map.");
-        var bp = DownloadBuffer(basePoint); var tv = DownloadBuffer(tangentVec); var o = new float[batchSize * dim];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * dim;
-            float bpSq = 0, tvNorm = 0;
-            for (int d = 0; d < dim; d++) { bpSq += bp[off + d] * bp[off + d]; tvNorm += tv[off + d] * tv[off + d]; }
-            tvNorm = MathF.Sqrt(tvNorm);
-            float lambda = 2f / (1f - curvature * bpSq);
-            if (tvNorm < 1e-10f) { Array.Copy(bp, off, o, off, dim); continue; }
-            float t = MathF.Tanh(MathF.Sqrt(curvature) * lambda * tvNorm / 2f) / (MathF.Sqrt(curvature) * tvNorm);
-            var scaled = new float[dim];
-            for (int d = 0; d < dim; d++) scaled[d] = t * tv[off + d];
-            float sSq = 0, bs = 0;
-            for (int d = 0; d < dim; d++) { sSq += scaled[d] * scaled[d]; bs += bp[off + d] * scaled[d]; }
-            float denom = 1f + 2f * curvature * bs + curvature * curvature * bpSq * sSq;
-            if (MathF.Abs(denom) < 1e-10f) denom = 1e-10f;
-            for (int d = 0; d < dim; d++)
-                o[off + d] = ((1f + 2f * curvature * bs + curvature * sSq) * bp[off + d] + (1f - curvature * bpSq) * scaled[d]) / denom;
-        }
-        UploadToBuffer(o, output);
+        var pc = new uint[] { (uint)batchSize, (uint)dim, FloatBits(curvature) };
+        GlslBinaryOp(VulkanGlslKernels.PoincareExpMap, basePoint, tangentVec, output, batchSize, pc, 3 * sizeof(uint));
     }
 
     public void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
@@ -720,104 +682,69 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (curvature <= 0f)
             throw new ArgumentOutOfRangeException(nameof(curvature), curvature, "Curvature must be positive for Poincare distance.");
-        var xd = DownloadBuffer(x); var yd = DownloadBuffer(y); var o = new float[batchSize];
-        for (int b = 0; b < batchSize; b++)
-        {
-            int off = b * dim;
-            float diffSq = 0, xSq = 0, ySq = 0;
-            for (int d = 0; d < dim; d++) { float diff = xd[off + d] - yd[off + d]; diffSq += diff * diff; xSq += xd[off + d] * xd[off + d]; ySq += yd[off + d] * yd[off + d]; }
-            float denomX = 1f - curvature * xSq;
-            float denomY = 1f - curvature * ySq;
-            // Clamp denominators to avoid division by zero when points are near the ball boundary
-            if (MathF.Abs(denomX) < 1e-10f) denomX = 1e-10f;
-            if (MathF.Abs(denomY) < 1e-10f) denomY = 1e-10f;
-            float arg = 1f + 2f * curvature * diffSq / (denomX * denomY);
-            // Clamp arg >= 1.0 for numerical safety (acosh domain requirement)
-            o[b] = (float)(AcoshDoubleCompat(Math.Max(1.0, arg)) / Math.Sqrt(curvature));
-        }
-        UploadToBuffer(o, output);
+        var pc = new uint[] { (uint)batchSize, (uint)dim, FloatBits(curvature) };
+        GlslBinaryOp(VulkanGlslKernels.PoincareDistance, x, y, output, batchSize, pc, 3 * sizeof(uint));
     }
 
     public void HyperbolicLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
-        var matResult = AllocateBuffer(batchSize * outputFeatures);
-        Gemm(input, weights, matResult, batchSize, outputFeatures, inputFeatures);
-        var biasResult = AllocateBuffer(batchSize * outputFeatures);
-        BiasAdd(matResult, biases, biasResult, batchSize, outputFeatures);
-        PoincareProject(biasResult, output, batchSize, outputFeatures, curvature, epsilon);
-        matResult.Dispose(); biasResult.Dispose();
+        // Fused GLSL kernel: matmul + bias in one pass
+        int total = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures, FloatBits(curvature), FloatBits(epsilon) };
+        GlslQuadOp(VulkanGlslKernels.HyperbolicLinearForward, input, weights, biases, output, total, pc, 5 * sizeof(uint));
+        // Apply Poincaré projection as a second pass (needs full output vector for norm)
+        PoincareProject(output, output, batchSize, outputFeatures, curvature, epsilon);
     }
 
     public void HyperbolicLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
+        // gradInput = gradOutput * weights^T (Euclidean approximation)
+        // Compute via two GEMMs: create transposed weight buffer then multiply
         EnsureInitialized();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var weightsData = DownloadBuffer(weights);
-        var gradInputData = new float[batchSize * inputFeatures];
-
-        // gradInput = gradOutput * weights^T (standard linear backward through Euclidean approximation)
-        for (int b = 0; b < batchSize; b++)
-        {
+        var wt = DownloadBuffer(weights);
+        var wtT = new float[inputFeatures * outputFeatures];
+        for (int o = 0; o < outputFeatures; o++)
             for (int i = 0; i < inputFeatures; i++)
-            {
-                float sum = 0;
-                for (int o = 0; o < outputFeatures; o++)
-                {
-                    sum += gradOutData[b * outputFeatures + o] * weightsData[o * inputFeatures + i];
-                }
-                gradInputData[b * inputFeatures + i] = sum;
-            }
-        }
-
-        UploadToBuffer(gradInputData, gradInput);
+                wtT[i * outputFeatures + o] = wt[o * inputFeatures + i];
+        var wtTBuf = AllocateBuffer(inputFeatures * outputFeatures);
+        UploadToBuffer(wtT, wtTBuf);
+        Gemm(gradOutput, wtTBuf, gradInput, batchSize, inputFeatures, outputFeatures);
+        wtTBuf.Dispose();
     }
 
     public void HyperbolicLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
+        // gradWeights = gradOutput^T * input
         EnsureInitialized();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gradWeightsData = new float[outputFeatures * inputFeatures];
-
-        // gradWeights = gradOutput^T * input (standard linear backward)
-        for (int o = 0; o < outputFeatures; o++)
-        {
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                float sum = 0;
-                for (int b = 0; b < batchSize; b++)
-                {
-                    sum += gradOutData[b * outputFeatures + o] * inputData[b * inputFeatures + i];
-                }
-                gradWeightsData[o * inputFeatures + i] = sum;
-            }
-        }
-
-        UploadToBuffer(gradWeightsData, gradWeights);
+        var go = DownloadBuffer(gradOutput);
+        var goT = new float[outputFeatures * batchSize];
+        for (int b = 0; b < batchSize; b++)
+            for (int o = 0; o < outputFeatures; o++)
+                goT[o * batchSize + b] = go[b * outputFeatures + o];
+        var goTBuf = AllocateBuffer(outputFeatures * batchSize);
+        UploadToBuffer(goT, goTBuf);
+        Gemm(goTBuf, input, gradWeights, outputFeatures, inputFeatures, batchSize);
+        goTBuf.Dispose();
     }
 
     public void HyperbolicLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradBiases,
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
+        // gradBiases[o] = sum_b gradOutput[b,o]
         EnsureInitialized();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var gradBiasesData = new float[outputFeatures];
-
-        // gradBiases = sum over batch of gradOutput
+        var go = DownloadBuffer(gradOutput);
+        var gb = new float[outputFeatures];
         for (int o = 0; o < outputFeatures; o++)
         {
             float sum = 0;
             for (int b = 0; b < batchSize; b++)
-            {
-                sum += gradOutData[b * outputFeatures + o];
-            }
-            gradBiasesData[o] = sum;
+                sum += go[b * outputFeatures + o];
+            gb[o] = sum;
         }
-
-        UploadToBuffer(gradBiasesData, gradBiases);
+        UploadToBuffer(gb, gradBiases);
     }
 
     #endregion
@@ -827,24 +754,8 @@ public sealed unsafe partial class VulkanBackend
     public void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
         EnsureInitialized();
-        var ad = DownloadBuffer(a); var bd = DownloadBuffer(b); var o = new float[count * 8];
-        for (int i = 0; i < count; i++)
-        {
-            int off = i * 8;
-            float a0 = ad[off], a1 = ad[off+1], a2 = ad[off+2], a3 = ad[off+3],
-                  a4 = ad[off+4], a5 = ad[off+5], a6 = ad[off+6], a7 = ad[off+7];
-            float b0 = bd[off], b1 = bd[off+1], b2 = bd[off+2], b3 = bd[off+3],
-                  b4 = bd[off+4], b5 = bd[off+5], b6 = bd[off+6], b7 = bd[off+7];
-            o[off+0] = a0*b0 - a1*b1 - a2*b2 - a3*b3 - a4*b4 - a5*b5 - a6*b6 - a7*b7;
-            o[off+1] = a0*b1 + a1*b0 + a2*b3 - a3*b2 + a4*b5 - a5*b4 - a6*b7 + a7*b6;
-            o[off+2] = a0*b2 - a1*b3 + a2*b0 + a3*b1 + a4*b6 + a5*b7 - a6*b4 - a7*b5;
-            o[off+3] = a0*b3 + a1*b2 - a2*b1 + a3*b0 + a4*b7 - a5*b6 + a6*b5 - a7*b4;
-            o[off+4] = a0*b4 - a1*b5 - a2*b6 - a3*b7 + a4*b0 + a5*b1 + a6*b2 + a7*b3;
-            o[off+5] = a0*b5 + a1*b4 - a2*b7 + a3*b6 - a4*b1 + a5*b0 - a6*b3 + a7*b2;
-            o[off+6] = a0*b6 + a1*b7 + a2*b4 - a3*b5 - a4*b2 + a5*b3 + a6*b0 - a7*b1;
-            o[off+7] = a0*b7 - a1*b6 + a2*b5 + a3*b4 - a4*b3 - a5*b2 + a6*b1 + a7*b0;
-        }
-        UploadToBuffer(o, output);
+        var pc = new uint[] { (uint)count };
+        GlslBinaryOp(VulkanGlslKernels.OctonionMultiply, a, b, output, count, pc, sizeof(uint));
     }
 
     public void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
@@ -853,119 +764,61 @@ public sealed unsafe partial class VulkanBackend
     public void OctonionLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        Gemm(input, weights, output, batchSize, outputFeatures * 8, inputFeatures * 8);
-        BiasAdd(output, biases, output, batchSize, outputFeatures * 8);
+        EnsureInitialized();
+        int totalPairs = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
+        GlslQuadOp(VulkanGlslKernels.OctonionLinearForward, input, weights, biases, output, totalPairs, pc, 3 * sizeof(uint));
     }
 
     public void OctonionLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,
         int batchSize, int inputFeatures, int outputFeatures)
     {
         EnsureInitialized();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var weightsData = DownloadBuffer(weights);
-        var gradInputData = new float[batchSize * inputFeatures * 8];
-
-        // Full octonion backward: d(prod)/d(a) via the octonion multiplication table Jacobian
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                int inputOffset = (b * inputFeatures + i) * 8;
-                var ga = new float[8];
-
-                for (int o = 0; o < outputFeatures; o++)
-                {
-                    int weightOffset = (o * inputFeatures + i) * 8;
-                    int gradOutOffset = (b * outputFeatures + o) * 8;
-
-                    float w0 = weightsData[weightOffset], w1 = weightsData[weightOffset + 1];
-                    float w2 = weightsData[weightOffset + 2], w3 = weightsData[weightOffset + 3];
-                    float w4 = weightsData[weightOffset + 4], w5 = weightsData[weightOffset + 5];
-                    float w6 = weightsData[weightOffset + 6], w7 = weightsData[weightOffset + 7];
-
-                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
-                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
-                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
-                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
-
-                    // Transpose of the Jacobian d(prod)/d(a), from the octonion multiplication table
-                    ga[0] += g0*w0 + g1*w1 + g2*w2 + g3*w3 + g4*w4 + g5*w5 + g6*w6 + g7*w7;
-                    ga[1] += g0*(-w1) + g1*w0 + g2*(-w3) + g3*w2 + g4*(-w5) + g5*w4 + g6*w7 + g7*(-w6);
-                    ga[2] += g0*(-w2) + g1*w3 + g2*w0 + g3*(-w1) + g4*(-w6) + g5*(-w7) + g6*w4 + g7*w5;
-                    ga[3] += g0*(-w3) + g1*(-w2) + g2*w1 + g3*w0 + g4*(-w7) + g5*w6 + g6*(-w5) + g7*w4;
-                    ga[4] += g0*(-w4) + g1*w5 + g2*w6 + g3*w7 + g4*w0 + g5*(-w1) + g6*(-w2) + g7*(-w3);
-                    ga[5] += g0*(-w5) + g1*(-w4) + g2*w7 + g3*(-w6) + g4*w1 + g5*w0 + g6*w3 + g7*(-w2);
-                    ga[6] += g0*(-w6) + g1*(-w7) + g2*(-w4) + g3*w5 + g4*w2 + g5*(-w3) + g6*w0 + g7*w1;
-                    ga[7] += g0*(-w7) + g1*w6 + g2*(-w5) + g3*(-w4) + g4*w3 + g5*w2 + g6*(-w1) + g7*w0;
-                }
-
-                for (int c = 0; c < 8; c++)
-                    gradInputData[inputOffset + c] = ga[c];
-            }
-        }
-
-        UploadToBuffer(gradInputData, gradInput);
+        int totalPairs = batchSize * inputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
+        GlslBinaryOp(VulkanGlslKernels.OctonionLinearBackwardInput, gradOutput, weights, gradInput, totalPairs, pc, 3 * sizeof(uint));
     }
 
     public void OctonionLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures)
     {
         EnsureInitialized();
-        var gradOutData = DownloadBuffer(gradOutput);
-        var inputData = DownloadBuffer(input);
-        var gradWeightsData = new float[outputFeatures * inputFeatures * 8];
-
-        // Full octonion backward for weights: d(prod)/d(w) Jacobian from multiplication table
-        for (int o = 0; o < outputFeatures; o++)
-        {
-            for (int i = 0; i < inputFeatures; i++)
-            {
-                int weightOffset = (o * inputFeatures + i) * 8;
-                var gw = new float[8];
-
-                for (int b = 0; b < batchSize; b++)
-                {
-                    int inputOffset = (b * inputFeatures + i) * 8;
-                    int gradOutOffset = (b * outputFeatures + o) * 8;
-
-                    float a0 = inputData[inputOffset], a1 = inputData[inputOffset + 1];
-                    float a2 = inputData[inputOffset + 2], a3 = inputData[inputOffset + 3];
-                    float a4 = inputData[inputOffset + 4], a5 = inputData[inputOffset + 5];
-                    float a6 = inputData[inputOffset + 6], a7 = inputData[inputOffset + 7];
-
-                    float g0 = gradOutData[gradOutOffset], g1 = gradOutData[gradOutOffset + 1];
-                    float g2 = gradOutData[gradOutOffset + 2], g3 = gradOutData[gradOutOffset + 3];
-                    float g4 = gradOutData[gradOutOffset + 4], g5 = gradOutData[gradOutOffset + 5];
-                    float g6 = gradOutData[gradOutOffset + 6], g7 = gradOutData[gradOutOffset + 7];
-
-                    // Transpose of Jacobian d(prod)/d(w), from the octonion multiplication table
-                    gw[0] += g0*a0 + g1*a1 + g2*a2 + g3*a3 + g4*a4 + g5*a5 + g6*a6 + g7*a7;
-                    gw[1] += g0*(-a1) + g1*a0 + g2*a3 + g3*(-a2) + g4*a5 + g5*(-a4) + g6*(-a7) + g7*a6;
-                    gw[2] += g0*(-a2) + g1*(-a3) + g2*a0 + g3*a1 + g4*a6 + g5*a7 + g6*(-a4) + g7*(-a5);
-                    gw[3] += g0*(-a3) + g1*a2 + g2*(-a1) + g3*a0 + g4*a7 + g5*(-a6) + g6*a5 + g7*(-a4);
-                    gw[4] += g0*(-a4) + g1*(-a5) + g2*(-a6) + g3*(-a7) + g4*a0 + g5*a1 + g6*a2 + g7*a3;
-                    gw[5] += g0*(-a5) + g1*a4 + g2*(-a7) + g3*a6 + g4*(-a1) + g5*a0 + g6*(-a3) + g7*a2;
-                    gw[6] += g0*(-a6) + g1*a7 + g2*a4 + g3*(-a5) + g4*(-a2) + g5*a3 + g6*a0 + g7*(-a1);
-                    gw[7] += g0*(-a7) + g1*(-a6) + g2*a5 + g3*a4 + g4*(-a3) + g5*(-a2) + g6*a1 + g7*a0;
-                }
-
-                for (int c = 0; c < 8; c++)
-                    gradWeightsData[weightOffset + c] = gw[c];
-            }
-        }
-
-        UploadToBuffer(gradWeightsData, gradWeights);
+        int totalPairs = outputFeatures * inputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
+        GlslBinaryOp(VulkanGlslKernels.OctonionLinearBackwardWeights, gradOutput, input, gradWeights, totalPairs, pc, 3 * sizeof(uint));
     }
 
     public void OctonionLinearBackwardBiases(IGpuBuffer gradOutput, IGpuBuffer gradBiases, int batchSize, int outputFeatures)
     {
         EnsureInitialized();
-        var go = DownloadBuffer(gradOutput);
-        var gb = new float[outputFeatures * 8];
-        for (int b = 0; b < batchSize; b++)
-            for (int i = 0; i < outputFeatures * 8; i++)
-                gb[i] += go[b * outputFeatures * 8 + i];
-        UploadToBuffer(gb, gradBiases);
+        var pc = new uint[] { (uint)batchSize, (uint)outputFeatures };
+        GlslUnaryOp(VulkanGlslKernels.OctonionLinearBackwardBiases, gradOutput, gradBiases, outputFeatures, pc, 2 * sizeof(uint));
+    }
+
+    #endregion
+
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+    {
+        // Fused: matmul+bias in one GLSL pass, then projection in second GLSL pass
+        // This eliminates the intermediate buffer allocation of the non-fused 3-pass version
+        int total = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures, FloatBits(curvature), FloatBits(epsilon) };
+        GlslQuadOp(VulkanGlslKernels.HyperbolicLinearForward, input, weights, biases, output, total, pc, 5 * sizeof(uint));
+        // Project in-place (second pass — reads and writes same buffer)
+        var projPc = new uint[] { (uint)batchSize, (uint)outputFeatures, FloatBits(curvature), FloatBits(epsilon) };
+        GlslUnaryOp(VulkanGlslKernels.PoincareProject, output, output, batchSize, projPc, 4 * sizeof(uint));
+    }
+
+    public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        EnsureInitialized();
+        int totalPairs = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
+        GlslQuadOp(VulkanGlslKernels.OctonionLinearForwardFusedReLU, input, weights, biases, output, totalPairs, pc, 3 * sizeof(uint));
     }
 
     #endregion

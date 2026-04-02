@@ -10339,6 +10339,32 @@ KERNEL VARIANTS (A/B testing):
 
         #endregion
 
+        #region Fused Kernel Operations
+
+        public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+            int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+            => HyperbolicLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+
+        public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+            int batchSize, int inputFeatures, int outputFeatures)
+        {
+            if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
+                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_forward_fused_relu");
+
+            int totalOutputs = batchSize * outputFeatures;
+            int localSize = CalculateOptimalWorkGroupSize1D(totalOutputs);
+            kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            kernel.SetArg(1u, ((DirectOpenClGpuBuffer)weights).Buffer.Handle);
+            kernel.SetArg(2u, ((DirectOpenClGpuBuffer)biases).Buffer.Handle);
+            kernel.SetArg(3u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            kernel.SetArg(4u, batchSize);
+            kernel.SetArg(5u, inputFeatures);
+            kernel.SetArg(6u, outputFeatures);
+            kernel.Execute1D(totalOutputs, localSize);
+        }
+
+        #endregion
+
         #region Quantum Computing Operations
 
         public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
