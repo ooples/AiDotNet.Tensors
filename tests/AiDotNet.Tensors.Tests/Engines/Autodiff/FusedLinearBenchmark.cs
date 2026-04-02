@@ -32,7 +32,7 @@ public class FusedLinearBenchmark
         return tensor;
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     [Trait("Category", "Benchmark")]
     public void Benchmark_FusedVsUnfused_ReLU()
     {

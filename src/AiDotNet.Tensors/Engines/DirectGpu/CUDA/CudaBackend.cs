@@ -6528,14 +6528,10 @@ public sealed class CudaBackend : IAsyncGpuBackend
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 0; // ReLU
-        void** argsBias = stackalloc void*[5];
+        void** argsBias = stackalloc void*[6];
         argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
-        argsBias[3] = &batchSize; argsBias[4] = &outFeatures;
-        // Note: activationType passed as 6th arg
-        void** argsBiasFull = stackalloc void*[6];
-        argsBiasFull[0] = &goPtr; argsBiasFull[1] = &paPtr; argsBiasFull[2] = &gbPtr;
-        argsBiasFull[3] = &batchSize; argsBiasFull[4] = &outFeatures; argsBiasFull[5] = &activationType;
-        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBiasFull);
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
 
         // Weight gradient kernel: gradWeight[i,j] = sum_b(input[b,i] * masked_grad[b,j])
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))

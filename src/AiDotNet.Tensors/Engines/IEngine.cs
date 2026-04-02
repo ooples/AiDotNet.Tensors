@@ -2480,15 +2480,15 @@ public interface IEngine
     ///
     /// <para>This is equivalent to PyTorch's <c>.detach()</c> or TensorFlow's <c>tf.stop_gradient()</c>.</para>
     ///
-    /// <para><b>Example — GAN generator training:</b></para>
+    /// <para><b>Example — GAN discriminator training:</b></para>
     /// <code>
-    /// // Generator forward (tape-tracked)
+    /// // Generator forward
     /// var fakeImages = generator.ForwardForTraining(noise);
     ///
-    /// // Pass through discriminator WITHOUT tracking discriminator's ops
+    /// // Detach so discriminator training does NOT update generator weights
     /// var detachedFakes = engine.StopGradient(fakeImages);
-    /// var discScore = discriminator.Predict(detachedFakes);
-    /// // Gradients flow to generator but NOT through discriminator internals
+    /// var discScore = discriminator.ForwardForTraining(detachedFakes);
+    /// // Gradients flow to discriminator only, NOT back through generator
     /// </code>
     /// </remarks>
     Tensor<T> StopGradient<T>(Tensor<T> tensor);

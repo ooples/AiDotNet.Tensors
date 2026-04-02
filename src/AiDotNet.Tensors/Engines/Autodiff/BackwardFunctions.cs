@@ -1846,7 +1846,8 @@ internal static class BackwardFunctions<T>
         var gradB = engine.TensorMatMul(aT, maskedGrad);
 
         // Step 3: Bias gradient = sum of maskedGrad along batch dimension (axis 0)
-        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
@@ -1869,7 +1870,8 @@ internal static class BackwardFunctions<T>
         var aT = engine.TensorTranspose(inputs[0]);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
 
-        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
@@ -1892,7 +1894,8 @@ internal static class BackwardFunctions<T>
         var aT = engine.TensorTranspose(inputs[0]);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
 
-        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
@@ -1915,7 +1918,8 @@ internal static class BackwardFunctions<T>
         var aT = engine.TensorTranspose(inputs[0]);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
 
-        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
@@ -1945,7 +1949,8 @@ internal static class BackwardFunctions<T>
         var aT = engine.TensorTranspose(inputs[0]);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
 
-        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);

@@ -60,8 +60,9 @@ public sealed class GradientTape<T> : IDisposable
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
     /// </summary>
-    public void RemoveLastEntry()
+    internal void RemoveLastEntry()
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
         if (_entries.Count > 0)
             _entries.RemoveAt(_entries.Count - 1);
     }
@@ -185,10 +186,10 @@ public sealed class GradientTape<T> : IDisposable
             // Walk tape in reverse (reverse-mode AD)
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
 
-            // Tape backward pruning: when sources are specified, pre-compute which entries
-            // are reachable from source parameters. Skip backward for entries that don't
-            // contribute to any requested gradient. This avoids wasted computation — e.g.,
-            // discriminator ops during GAN generator training.
+            // Tape backward pruning: when sources are specified, forward-walk to find all tensors
+            // downstream of those sources. During the backward walk, skip entries whose output
+            // is not in this reachable set — their gradients don't contribute to any requested
+            // source gradient. This prunes subgraphs that don't depend on the sources.
             HashSet<Tensor<T>>? relevantTensors = null;
             if (sources is not null && sources.Count > 0)
             {

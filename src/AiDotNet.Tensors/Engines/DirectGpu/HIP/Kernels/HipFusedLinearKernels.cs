@@ -1,11 +1,12 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// CUDA fused linear (MatMul + Bias + Activation) kernels for forward and backward passes.
+// HIP/ROCm fused linear (MatMul + Bias + Activation) kernels for forward and backward passes.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 
 /// <summary>
-/// CUDA kernels for fused linear operations: output = activation(input @ weight + bias).
+/// HIP/ROCm kernels for fused linear operations: output = activation(input @ weight + bias).
 /// Single kernel invocation instead of separate MatMul + Add + Activation calls.
+/// Adapted from CUDA source with HIP-compatible intrinsics.
 /// </summary>
 internal static class HipFusedLinearKernels
 {

@@ -1,10 +1,11 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// CUDA IoU/GIoU/DIoU/CIoU loss kernels for bounding box regression.
+// HIP/ROCm IoU/GIoU/DIoU/CIoU loss kernels for bounding box regression.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 
 /// <summary>
-/// CUDA kernels for differentiable IoU-family losses on [N,4] XYXY bounding boxes.
+/// HIP/ROCm kernels for differentiable IoU-family losses on [N,4] XYXY bounding boxes.
+/// Adapted from CUDA source with HIP-compatible intrinsics.
 /// References: Rezatofighi et al. CVPR 2019 (GIoU), Zheng et al. AAAI 2020 (DIoU/CIoU).
 /// </summary>
 internal static class HipIoUKernels

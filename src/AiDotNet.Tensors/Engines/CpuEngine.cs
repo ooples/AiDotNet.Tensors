@@ -22803,6 +22803,7 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static void RemoveLastNTapeEntries<T>(int n)
     {
+        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
         for (int i = 0; i < n && tape.EntryCount > 0; i++)
