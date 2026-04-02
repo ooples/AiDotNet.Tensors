@@ -1213,25 +1213,92 @@ public sealed partial class WebGpuBackend
 
     #region StopGradient, Fused Linear, and IoU Operations
 
-    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size) => throw new NotSupportedException();
-    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
+    {
+        var src = DownloadBuffer(source);
+        UploadToBuffer(src, destination);
+    }
+
+    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearReLU, input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearSigmoid, input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearTanh, input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearGELU, input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearSwish, input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+
+    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackward(WebGpuKernels.FusedLinearReLUBackwardGradInput, gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 0u); }
+    public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackward(WebGpuKernels.FusedLinearSigmoidBackwardGradInput, gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 1u); }
+    public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackward(WebGpuKernels.FusedLinearTanhBackwardGradInput, gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 2u); }
+    public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackward(WebGpuKernels.FusedLinearGELUBackwardGradInput, gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 3u); }
+    public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackward(WebGpuKernels.FusedLinearSwishBackwardGradInput, gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 4u); }
+
+    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUForward(WebGpuKernels.IoULossWgsl, predicted, target, loss, numBoxes); }
+    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUForward(WebGpuKernels.GIoULossWgsl, predicted, target, loss, numBoxes); }
+    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUForward(WebGpuKernels.DIoULossWgsl, predicted, target, loss, numBoxes); }
+    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUForward(WebGpuKernels.CIoULossWgsl, predicted, target, loss, numBoxes); }
+
+    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward(WebGpuKernels.IoULossBackward, gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward(WebGpuKernels.GIoULossBackward, gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward(WebGpuKernels.DIoULossBackward, gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward(WebGpuKernels.CIoULossBackward, gradOutput, predicted, target, gradPredicted, numBoxes); }
+
+    private void LaunchFusedLinearForward(string wgslSource, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
+    {
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inFeatures),
+            BitConverter.Int32BitsToSingle(outFeatures),
+            0
+        };
+        Dispatch4BufferAsync("FusedLinear", wgslSource, "main", input, weight, bias, output, uniforms, batchSize * outFeatures).GetAwaiter().GetResult();
+    }
+
+    private void LaunchFusedLinearBackward(string gradInputSource, IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer weight, IGpuBuffer saved, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures, uint activationType)
+    {
+        // Kernel 1: grad_input
+        var giUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inFeatures),
+            BitConverter.Int32BitsToSingle(outFeatures),
+            0
+        };
+        Dispatch4BufferAsync("FusedLinearBwGI", gradInputSource, "main", gradOutput, weight, saved, gradInput, giUniforms, batchSize * inFeatures).GetAwaiter().GetResult();
+
+        // Kernel 2: weight gradient
+        var wgUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inFeatures),
+            BitConverter.Int32BitsToSingle(outFeatures),
+            BitConverter.Int32BitsToSingle((int)activationType)
+        };
+        Dispatch4BufferAsync("FusedLinearBwWG", WebGpuKernels.FusedLinearWeightGrad, "main", gradOutput, input, saved, gradWeight, wgUniforms, inFeatures * outFeatures).GetAwaiter().GetResult();
+
+        // Kernel 3: bias gradient
+        var bgUniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(outFeatures),
+            BitConverter.Int32BitsToSingle((int)activationType),
+            0
+        };
+        Dispatch3BufferAsync("FusedLinearBwBG", WebGpuKernels.FusedLinearBiasGrad, "main", gradOutput, saved, gradBias, bgUniforms, outFeatures).GetAwaiter().GetResult();
+    }
+
+    private void LaunchIoUForward(string wgslSource, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(numBoxes), 0, 0, 0 };
+        Dispatch3BufferAsync("IoULoss", wgslSource, "main", predicted, target, loss, uniforms, numBoxes).GetAwaiter().GetResult();
+    }
+
+    private void LaunchIoUBackward(string wgslSource, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
+    {
+        var uniforms = new float[] { BitConverter.Int32BitsToSingle(numBoxes), 0, 0, 0 };
+        Dispatch4BufferAsync("IoULossBw", wgslSource, "main", gradOutput, predicted, target, gradPredicted, uniforms, numBoxes).GetAwaiter().GetResult();
+    }
 
     #endregion
 }

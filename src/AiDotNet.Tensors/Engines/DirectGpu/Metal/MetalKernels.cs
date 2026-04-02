@@ -3846,6 +3846,150 @@ kernel void fused_linear_swish(
     for (int k = 0; k < inFeatures; k++) sum += input[b * inFeatures + k] * weight[k * outFeatures + j];
     output[idx] = act_swish(sum);
 }
+
+// Backward helpers
+inline float bw_relu(float grad, float preact) { return preact > 0.0f ? grad : 0.0f; }
+inline float bw_sigmoid(float grad, float output) { return grad * output * (1.0f - output); }
+inline float bw_tanh_fn(float grad, float output) { return grad * (1.0f - output * output); }
+inline float bw_gelu(float grad, float preact) {
+    float t = tanh(SQRT_2_OVER_PI * (preact + GELU_COEF * preact * preact * preact));
+    float dt = SQRT_2_OVER_PI * (1.0f + 3.0f * GELU_COEF * preact * preact) * (1.0f - t * t);
+    return grad * (0.5f * (1.0f + t) + 0.5f * preact * dt);
+}
+inline float bw_swish(float grad, float preact) {
+    float sig = sigmoid(preact);
+    return grad * (sig + preact * sig * (1.0f - sig));
+}
+
+// Grad input backward: gradInput[b,i] = sum_j(masked_grad[b,j] * weight[i,j])
+kernel void fused_linear_relu_backward_grad_input(
+    device const float* gradOutput [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradInput [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * inFeatures) return;
+    int b = (int)idx / inFeatures, i = (int)idx % inFeatures;
+    float sum = 0.0f;
+    for (int j = 0; j < outFeatures; j++) {
+        float masked = bw_relu(gradOutput[b*outFeatures+j], saved[b*outFeatures+j]);
+        sum += masked * weight[i*outFeatures+j];
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void fused_linear_sigmoid_backward_grad_input(
+    device const float* gradOutput [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradInput [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * inFeatures) return;
+    int b = (int)idx / inFeatures, i = (int)idx % inFeatures;
+    float sum = 0.0f;
+    for (int j = 0; j < outFeatures; j++) {
+        float masked = bw_sigmoid(gradOutput[b*outFeatures+j], saved[b*outFeatures+j]);
+        sum += masked * weight[i*outFeatures+j];
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void fused_linear_tanh_backward_grad_input(
+    device const float* gradOutput [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradInput [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * inFeatures) return;
+    int b = (int)idx / inFeatures, i = (int)idx % inFeatures;
+    float sum = 0.0f;
+    for (int j = 0; j < outFeatures; j++) {
+        float masked = bw_tanh_fn(gradOutput[b*outFeatures+j], saved[b*outFeatures+j]);
+        sum += masked * weight[i*outFeatures+j];
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void fused_linear_gelu_backward_grad_input(
+    device const float* gradOutput [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradInput [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * inFeatures) return;
+    int b = (int)idx / inFeatures, i = (int)idx % inFeatures;
+    float sum = 0.0f;
+    for (int j = 0; j < outFeatures; j++) {
+        float masked = bw_gelu(gradOutput[b*outFeatures+j], saved[b*outFeatures+j]);
+        sum += masked * weight[i*outFeatures+j];
+    }
+    gradInput[idx] = sum;
+}
+
+kernel void fused_linear_swish_backward_grad_input(
+    device const float* gradOutput [[buffer(0)]], device const float* weight [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradInput [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], uint idx [[thread_position_in_grid]])
+{
+    if ((int)idx >= batchSize * inFeatures) return;
+    int b = (int)idx / inFeatures, i = (int)idx % inFeatures;
+    float sum = 0.0f;
+    for (int j = 0; j < outFeatures; j++) {
+        float masked = bw_swish(gradOutput[b*outFeatures+j], saved[b*outFeatures+j]);
+        sum += masked * weight[i*outFeatures+j];
+    }
+    gradInput[idx] = sum;
+}
+
+// Weight gradient
+kernel void fused_linear_weight_grad(
+    device const float* gradOutput [[buffer(0)]], device const float* input [[buffer(1)]],
+    device const float* saved [[buffer(2)]], device float* gradWeight [[buffer(3)]],
+    constant int& batchSize [[buffer(4)]], constant int& inFeatures [[buffer(5)]],
+    constant int& outFeatures [[buffer(6)]], constant int& activationType [[buffer(7)]],
+    uint idx [[thread_position_in_grid]])
+{
+    int total = inFeatures * outFeatures;
+    if ((int)idx >= total) return;
+    int i = (int)idx / outFeatures, j = (int)idx % outFeatures;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++) {
+        float go = gradOutput[b*outFeatures+j], s = saved[b*outFeatures+j];
+        float masked;
+        if (activationType == 0) masked = bw_relu(go, s);
+        else if (activationType == 1) masked = bw_sigmoid(go, s);
+        else if (activationType == 2) masked = bw_tanh_fn(go, s);
+        else if (activationType == 3) masked = bw_gelu(go, s);
+        else if (activationType == 4) masked = bw_swish(go, s);
+        else masked = go;
+        sum += input[b*inFeatures+i] * masked;
+    }
+    gradWeight[idx] = sum;
+}
+
+// Bias gradient
+kernel void fused_linear_bias_grad(
+    device const float* gradOutput [[buffer(0)]], device const float* saved [[buffer(1)]],
+    device float* gradBias [[buffer(2)]], constant int& batchSize [[buffer(3)]],
+    constant int& outFeatures [[buffer(4)]], constant int& activationType [[buffer(5)]],
+    uint j [[thread_position_in_grid]])
+{
+    if ((int)j >= outFeatures) return;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++) {
+        float go = gradOutput[b*outFeatures+(int)j], s = saved[b*outFeatures+(int)j];
+        float masked;
+        if (activationType == 0) masked = bw_relu(go, s);
+        else if (activationType == 1) masked = bw_sigmoid(go, s);
+        else if (activationType == 2) masked = bw_tanh_fn(go, s);
+        else if (activationType == 3) masked = bw_gelu(go, s);
+        else if (activationType == 4) masked = bw_swish(go, s);
+        else masked = go;
+        sum += masked;
+    }
+    gradBias[j] = sum;
+}
 ";
 
     #endregion
@@ -3917,6 +4061,96 @@ kernel void ciou_loss(device const float* pred [[buffer(0)]], device const float
     float v=(4.0f/(PI*PI))*rd*rd;
     float alpha=v/(1.0f-iou+v+EPSILON);
     loss[i] = 1.0f - (iou - cds/ds - alpha*v);
+}
+
+// Analytical IoU backward
+inline void compute_iou_grad_metal(float px1,float py1,float px2,float py2, float tx1,float ty1,float tx2,float ty2, float go, thread float* grad) {
+    float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
+    float iw=max(0.0f,ix2-ix1),ih=max(0.0f,iy2-iy1),iA=iw*ih;
+    float pw=px2-px1,ph=py2-py1,pA=pw*ph,tA=(tx2-tx1)*(ty2-ty1);
+    float uA=pA+tA-iA+EPSILON; float hi=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
+    float dI0=hi*(-(px1>tx1?1.0f:0.0f))*ih, dI1=hi*(-(py1>ty1?1.0f:0.0f))*iw;
+    float dI2=hi*(px2<tx2?1.0f:0.0f)*ih, dI3=hi*(py2<ty2?1.0f:0.0f)*iw;
+    float dU0=-ph-dI0, dU1=-pw-dI1, dU2=ph-dI2, dU3=pw-dI3;
+    float uSq=uA*uA;
+    grad[0]=go*(-(dI0*uA-iA*dU0)/uSq); grad[1]=go*(-(dI1*uA-iA*dU1)/uSq);
+    grad[2]=go*(-(dI2*uA-iA*dU2)/uSq); grad[3]=go*(-(dI3*uA-iA*dU3)/uSq);
+}
+
+kernel void iou_loss_backward(device const float* go [[buffer(0)]], device const float* pred [[buffer(1)]],
+    device const float* targ [[buffer(2)]], device float* gp [[buffer(3)]],
+    constant int& n [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float grad[4];
+    compute_iou_grad_metal(pred[o],pred[o+1],pred[o+2],pred[o+3], targ[o],targ[o+1],targ[o+2],targ[o+3], go[i], grad);
+    gp[o]=grad[0]; gp[o+1]=grad[1]; gp[o+2]=grad[2]; gp[o+3]=grad[3];
+}
+
+kernel void giou_loss_backward(device const float* go [[buffer(0)]], device const float* pred [[buffer(1)]],
+    device const float* targ [[buffer(2)]], device float* gp [[buffer(3)]],
+    constant int& n [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iouGrad[4]; compute_iou_grad_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0f,iouGrad);
+    float encW=max(px2,tx2)-min(px1,tx1),encH=max(py2,ty2)-min(py1,ty1),encA=encW*encH+EPSILON;
+    float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
+    float iw=max(0.0f,ix2-ix1),ih=max(0.0f,iy2-iy1),iA=iw*ih;
+    float pw=px2-px1,ph=py2-py1,uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+EPSILON;
+    float hi=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
+    float dI[4]={hi*(-(px1>tx1?1.0f:0.0f))*ih,hi*(-(py1>ty1?1.0f:0.0f))*iw,hi*(px2<tx2?1.0f:0.0f)*ih,hi*(py2<ty2?1.0f:0.0f)*iw};
+    float dU[4]={-ph-dI[0],-pw-dI[1],ph-dI[2],pw-dI[3]};
+    float dEncA[4]={-(px1<tx1?1.0f:0.0f)*encH,-(py1<ty1?1.0f:0.0f)*encW,(px2>tx2?1.0f:0.0f)*encH,(py2>ty2?1.0f:0.0f)*encW};
+    float encASq=encA*encA;
+    for(int c=0;c<4;c++) { float dP=-(dU[c]*encA-uA*dEncA[c])/encASq; gp[o+c]=go[i]*(-iouGrad[c]+dP); }
+}
+
+kernel void diou_loss_backward(device const float* goB [[buffer(0)]], device const float* pred [[buffer(1)]],
+    device const float* targ [[buffer(2)]], device float* gp [[buffer(3)]],
+    constant int& n [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iouGrad[4]; compute_iou_grad_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0f,iouGrad);
+    float dx=0.5f*(px1+px2)-0.5f*(tx1+tx2),dy=0.5f*(py1+py2)-0.5f*(ty1+ty2);
+    float rhoSq=dx*dx+dy*dy;
+    float dRho[4]={dx,dy,dx,dy};
+    float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
+    float cSq=encDx*encDx+encDy*encDy+EPSILON,cSqSq=cSq*cSq;
+    float dCSq[4]={2.0f*encDx*(-(px1<tx1?1.0f:0.0f)),2.0f*encDy*(-(py1<ty1?1.0f:0.0f)),2.0f*encDx*(px2>tx2?1.0f:0.0f),2.0f*encDy*(py2>ty2?1.0f:0.0f)};
+    for(int c=0;c<4;c++) { float dP=(dRho[c]*cSq-rhoSq*dCSq[c])/cSqSq; gp[o+c]=goB[i]*(-iouGrad[c]+dP); }
+}
+
+kernel void ciou_loss_backward(device const float* goB [[buffer(0)]], device const float* pred [[buffer(1)]],
+    device const float* targ [[buffer(2)]], device float* gp [[buffer(3)]],
+    constant int& n [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+    if ((int)i >= n) return;
+    int o = (int)i * 4;
+    float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3];
+    float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+    float iouGrad[4]; compute_iou_grad_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0f,iouGrad);
+    float dx=0.5f*(px1+px2)-0.5f*(tx1+tx2),dy=0.5f*(py1+py2)-0.5f*(ty1+ty2);
+    float rhoSq=dx*dx+dy*dy, dRho[4]={dx,dy,dx,dy};
+    float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
+    float cSq=encDx*encDx+encDy*encDy+EPSILON,cSqSq=cSq*cSq;
+    float dCSq[4]={2.0f*encDx*(-(px1<tx1?1.0f:0.0f)),2.0f*encDy*(-(py1<ty1?1.0f:0.0f)),2.0f*encDx*(px2>tx2?1.0f:0.0f),2.0f*encDy*(py2>ty2?1.0f:0.0f)};
+    float pw=px2-px1+EPSILON,ph=py2-py1+EPSILON,tw=tx2-tx1+EPSILON,th=ty2-ty1+EPSILON;
+    float atanDiff=atan(tw/th)-atan(pw/ph), fourOverPiSq=4.0f/(PI*PI);
+    float v=fourOverPiSq*atanDiff*atanDiff;
+    float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
+    float iw=max(0.0f,ix2-ix1),ih=max(0.0f,iy2-iy1);
+    float iou=iw*ih/(pw*ph+(tx2-tx1)*(ty2-ty1)-iw*ih+EPSILON);
+    float alpha=v/(1.0f-iou+v+EPSILON);
+    float rss=pw*pw+ph*ph, dAtanPw=ph/rss, dAtanPh=-pw/rss;
+    float dV[4]={2.0f*fourOverPiSq*atanDiff*dAtanPw, 2.0f*fourOverPiSq*atanDiff*dAtanPh, 2.0f*fourOverPiSq*atanDiff*(-dAtanPw), 2.0f*fourOverPiSq*atanDiff*(-dAtanPh)};
+    for(int c=0;c<4;c++) { float dDistP=(dRho[c]*cSq-rhoSq*dCSq[c])/cSqSq; gp[o+c]=goB[i]*(-iouGrad[c]+dDistP+alpha*dV[c]); }
 }
 ";
 

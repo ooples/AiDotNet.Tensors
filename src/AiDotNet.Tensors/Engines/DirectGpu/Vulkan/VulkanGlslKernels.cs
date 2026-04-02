@@ -1849,4 +1849,128 @@ layout(push_constant) uniform Params { uint numBoxes; };
     public static string GIoULoss => Header + IoULayout + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4; float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3]; float iW=max(0.0,min(px2,tx2)-max(px1,tx1)),iH=max(0.0,min(py2,ty2)-max(py1,ty1)); float iA=iW*iH,pA=(px2-px1)*(py2-py1),tA=(tx2-tx1)*(ty2-ty1),uA=pA+tA-iA+1e-7; float iou=iA/uA; float eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+1e-7; loss[i]=1.0-(iou-(eA-uA)/eA); }";
     public static string DIoULoss => Header + IoULayout + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4; float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3]; float iW=max(0.0,min(px2,tx2)-max(px1,tx1)),iH=max(0.0,min(py2,ty2)-max(py1,ty1)); float iA=iW*iH,pA=(px2-px1)*(py2-py1),tA=(tx2-tx1)*(ty2-ty1),uA=pA+tA-iA+1e-7; float iou=iA/uA; float dx=0.5*(px1+px2)-0.5*(tx1+tx2),dy=0.5*(py1+py2)-0.5*(ty1+ty2); float cds=dx*dx+dy*dy; float eDx=max(px2,tx2)-min(px1,tx1),eDy=max(py2,ty2)-min(py1,ty1); float ds=eDx*eDx+eDy*eDy+1e-7; loss[i]=1.0-(iou-cds/ds); }";
     public static string CIoULoss => Header + IoULayout + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4; float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3]; float iW=max(0.0,min(px2,tx2)-max(px1,tx1)),iH=max(0.0,min(py2,ty2)-max(py1,ty1)); float iA=iW*iH,pA=(px2-px1)*(py2-py1),tA=(tx2-tx1)*(ty2-ty1),uA=pA+tA-iA+1e-7; float iou=iA/uA; float dx=0.5*(px1+px2)-0.5*(tx1+tx2),dy=0.5*(py1+py2)-0.5*(ty1+ty2); float cds=dx*dx+dy*dy; float eDx=max(px2,tx2)-min(px1,tx1),eDy=max(py2,ty2)-min(py1,ty1); float ds=eDx*eDx+eDy*eDy+1e-7; float pw=px2-px1+1e-7,ph=py2-py1+1e-7,tw=tx2-tx1+1e-7,th=ty2-ty1+1e-7; float rd=atan(tw/th)-atan(pw/ph); float v=(4.0/(3.14159265*3.14159265))*rd*rd; float alpha=v/(1.0-iou+v+1e-7); loss[i]=1.0-(iou-cds/ds-alpha*v); }";
+
+    // Fused Linear Backward — Grad Input kernels (4 buffers: gradOutput, weight, saved, gradInput)
+    private const string FusedLinearBackwardGradInputLayout = @"
+layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer Saved { float saved[]; };
+layout(set = 0, binding = 3) writeonly buffer GradInput { float gi[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint outFeatures; };
+";
+
+    public static string FusedLinearReLUBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float masked=saved[b*outFeatures+j]>0.0?g:0.0; s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+    public static string FusedLinearSigmoidBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float o=saved[b*outFeatures+j]; float masked=g*o*(1.0-o); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+    public static string FusedLinearTanhBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float o=saved[b*outFeatures+j]; float masked=g*(1.0-o*o); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+    public static string FusedLinearGELUBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float p=saved[b*outFeatures+j]; float t=tanh(0.7978845608*(p+0.044715*p*p*p)); float dt=0.7978845608*(1.0+3.0*0.044715*p*p)*(1.0-t*t); float masked=g*(0.5*(1.0+t)+0.5*p*dt); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+    public static string FusedLinearSwishBackwardGradInput => Header + FusedLinearBackwardGradInputLayout + @"void main() { uint idx=gl_GlobalInvocationID.x; if(idx>=batchSize*inFeatures)return; uint b=idx/inFeatures,i=idx%inFeatures; float s=0.0; for(uint j=0;j<outFeatures;j++){float g=go[b*outFeatures+j]; float p=saved[b*outFeatures+j]; float sig=1.0/(1.0+exp(-p)); float masked=g*(sig+p*sig*(1.0-sig)); s+=masked*wt[i*outFeatures+j];} gi[idx]=s; }";
+
+    // Fused Linear Backward — Weight Gradient kernel (4 buffers: gradOutput, input, saved, gradWeight)
+    // activationType: 0=ReLU, 1=Sigmoid, 2=Tanh, 3=GELU, 4=Swish
+    private const string FusedLinearBackwardWeightGradLayout = @"
+layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
+layout(set = 0, binding = 1) readonly buffer Input { float inp[]; };
+layout(set = 0, binding = 2) readonly buffer Saved { float saved[]; };
+layout(set = 0, binding = 3) writeonly buffer GradWeight { float gw[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inFeatures; uint outFeatures; uint activationType; };
+";
+
+    public static string FusedLinearWeightGrad => Header + FusedLinearBackwardWeightGradLayout + @"
+float applyBackward(float g, float s, uint act) {
+    if(act==0u) return s>0.0?g:0.0;
+    if(act==1u) return g*s*(1.0-s);
+    if(act==2u) return g*(1.0-s*s);
+    if(act==3u){float t=tanh(0.7978845608*(s+0.044715*s*s*s)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
+    if(act==4u){float sig=1.0/(1.0+exp(-s)); return g*(sig+s*sig*(1.0-sig));}
+    return g;
+}
+void main() { uint idx=gl_GlobalInvocationID.x; uint total=inFeatures*outFeatures; if(idx>=total)return; uint i=idx/outFeatures,j=idx%outFeatures; float s=0.0; for(uint b=0;b<batchSize;b++){float masked=applyBackward(go[b*outFeatures+j],saved[b*outFeatures+j],activationType); s+=inp[b*inFeatures+i]*masked;} gw[idx]=s; }";
+
+    // Fused Linear Backward — Bias Gradient kernel (3 buffers: gradOutput, saved, gradBias)
+    private const string FusedLinearBackwardBiasGradLayout = @"
+layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
+layout(set = 0, binding = 1) readonly buffer Saved { float saved[]; };
+layout(set = 0, binding = 2) writeonly buffer GradBias { float gb[]; };
+layout(push_constant) uniform Params { uint batchSize; uint outFeatures; uint activationType; };
+";
+
+    public static string FusedLinearBiasGrad => Header + FusedLinearBackwardBiasGradLayout + @"
+float applyBackwardBias(float g, float s, uint act) {
+    if(act==0u) return s>0.0?g:0.0;
+    if(act==1u) return g*s*(1.0-s);
+    if(act==2u) return g*(1.0-s*s);
+    if(act==3u){float t=tanh(0.7978845608*(s+0.044715*s*s*s)); float dt=0.7978845608*(1.0+3.0*0.044715*s*s)*(1.0-t*t); return g*(0.5*(1.0+t)+0.5*s*dt);}
+    if(act==4u){float sig=1.0/(1.0+exp(-s)); return g*(sig+s*sig*(1.0-sig));}
+    return g;
+}
+void main() { uint j=gl_GlobalInvocationID.x; if(j>=outFeatures)return; float s=0.0; for(uint b=0;b<batchSize;b++){s+=applyBackwardBias(go[b*outFeatures+j],saved[b*outFeatures+j],activationType);} gb[j]=s; }";
+
+    // IoU Loss Backward GLSL kernels (4 buffers: gradOutput, predicted, target, gradPredicted)
+    private const string IoUBackwardLayout = @"
+layout(set = 0, binding = 0) readonly buffer GradOutput { float goB[]; };
+layout(set = 0, binding = 1) readonly buffer Pred { float pred[]; };
+layout(set = 0, binding = 2) readonly buffer Target { float targ[]; };
+layout(set = 0, binding = 3) writeonly buffer GradPred { float gp[]; };
+layout(push_constant) uniform Params { uint numBoxes; };
+";
+
+    private const string IoUGradHelper = @"
+void computeIoUGrad(float px1,float py1,float px2,float py2,float tx1,float ty1,float tx2,float ty2,float goVal,out float g0,out float g1,out float g2,out float g3) {
+    float iw=max(0.0,min(px2,tx2)-max(px1,tx1)),ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+    float iA=iw*ih,pw=px2-px1,ph=py2-py1,pA=pw*ph,tA=(tx2-tx1)*(ty2-ty1),uA=pA+tA-iA+1e-7;
+    float hi=(iw>0.0&&ih>0.0)?1.0:0.0;
+    float dI0=hi*(-(px1>tx1?1.0:0.0))*ih, dI1=hi*(-(py1>ty1?1.0:0.0))*iw;
+    float dI2=hi*((px2<tx2?1.0:0.0))*ih, dI3=hi*((py2<ty2?1.0:0.0))*iw;
+    float dU0=-ph-dI0, dU1=-pw-dI1, dU2=ph-dI2, dU3=pw-dI3;
+    float uSq=uA*uA;
+    g0=goVal*(-(dI0*uA-iA*dU0)/uSq); g1=goVal*(-(dI1*uA-iA*dU1)/uSq);
+    g2=goVal*(-(dI2*uA-iA*dU2)/uSq); g3=goVal*(-(dI3*uA-iA*dU3)/uSq);
+}
+";
+
+    public static string IoULossBackward => Header + IoUBackwardLayout + IoUGradHelper + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4; float g0,g1,g2,g3; computeIoUGrad(pred[o],pred[o+1],pred[o+2],pred[o+3],targ[o],targ[o+1],targ[o+2],targ[o+3],goB[i],g0,g1,g2,g3); gp[o]=g0;gp[o+1]=g1;gp[o+2]=g2;gp[o+3]=g3; }";
+
+    public static string GIoULossBackward => Header + IoUBackwardLayout + IoUGradHelper + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4;
+float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+float ig0,ig1,ig2,ig3; computeIoUGrad(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0,ig0,ig1,ig2,ig3);
+float encW=max(px2,tx2)-min(px1,tx1),encH=max(py2,ty2)-min(py1,ty1),encA=encW*encH+1e-7;
+float iw=max(0.0,min(px2,tx2)-max(px1,tx1)),ih=max(0.0,min(py2,ty2)-max(py1,ty1)),iA=iw*ih;
+float pw=px2-px1,ph=py2-py1,uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+float hi=(iw>0.0&&ih>0.0)?1.0:0.0;
+float dI0=hi*(-(px1>tx1?1.0:0.0))*ih,dI1=hi*(-(py1>ty1?1.0:0.0))*iw,dI2=hi*((px2<tx2?1.0:0.0))*ih,dI3=hi*((py2<ty2?1.0:0.0))*iw;
+float dU0=-ph-dI0,dU1=-pw-dI1,dU2=ph-dI2,dU3=pw-dI3;
+float dEncA0=-(px1<tx1?1.0:0.0)*encH,dEncA1=-(py1<ty1?1.0:0.0)*encW,dEncA2=(px2>tx2?1.0:0.0)*encH,dEncA3=(py2>ty2?1.0:0.0)*encW;
+float encASq=encA*encA;
+float dP0=-(dU0*encA-uA*dEncA0)/encASq,dP1=-(dU1*encA-uA*dEncA1)/encASq,dP2=-(dU2*encA-uA*dEncA2)/encASq,dP3=-(dU3*encA-uA*dEncA3)/encASq;
+gp[o]=goB[i]*(-ig0+dP0);gp[o+1]=goB[i]*(-ig1+dP1);gp[o+2]=goB[i]*(-ig2+dP2);gp[o+3]=goB[i]*(-ig3+dP3); }";
+
+    public static string DIoULossBackward => Header + IoUBackwardLayout + IoUGradHelper + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4;
+float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+float ig0,ig1,ig2,ig3; computeIoUGrad(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0,ig0,ig1,ig2,ig3);
+float dx=0.5*(px1+px2)-0.5*(tx1+tx2),dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+float rhoSq=dx*dx+dy*dy; float dRho0=dx,dRho1=dy,dRho2=dx,dRho3=dy;
+float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
+float cSq=encDx*encDx+encDy*encDy+1e-7,cSqSq=cSq*cSq;
+float dCSq0=2.0*encDx*(-(px1<tx1?1.0:0.0)),dCSq1=2.0*encDy*(-(py1<ty1?1.0:0.0)),dCSq2=2.0*encDx*((px2>tx2?1.0:0.0)),dCSq3=2.0*encDy*((py2>ty2?1.0:0.0));
+float dp0=(dRho0*cSq-rhoSq*dCSq0)/cSqSq,dp1=(dRho1*cSq-rhoSq*dCSq1)/cSqSq,dp2=(dRho2*cSq-rhoSq*dCSq2)/cSqSq,dp3=(dRho3*cSq-rhoSq*dCSq3)/cSqSq;
+gp[o]=goB[i]*(-ig0+dp0);gp[o+1]=goB[i]*(-ig1+dp1);gp[o+2]=goB[i]*(-ig2+dp2);gp[o+3]=goB[i]*(-ig3+dp3); }";
+
+    public static string CIoULossBackward => Header + IoUBackwardLayout + IoUGradHelper + @"void main() { uint i=gl_GlobalInvocationID.x; if(i>=numBoxes)return; uint o=i*4;
+float px1=pred[o],py1=pred[o+1],px2=pred[o+2],py2=pred[o+3]; float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
+float ig0,ig1,ig2,ig3; computeIoUGrad(px1,py1,px2,py2,tx1,ty1,tx2,ty2,1.0,ig0,ig1,ig2,ig3);
+float dx=0.5*(px1+px2)-0.5*(tx1+tx2),dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+float rhoSq=dx*dx+dy*dy; float dRho0=dx,dRho1=dy,dRho2=dx,dRho3=dy;
+float encDx=max(px2,tx2)-min(px1,tx1),encDy=max(py2,ty2)-min(py1,ty1);
+float cSq=encDx*encDx+encDy*encDy+1e-7,cSqSq=cSq*cSq;
+float dCSq0=2.0*encDx*(-(px1<tx1?1.0:0.0)),dCSq1=2.0*encDy*(-(py1<ty1?1.0:0.0)),dCSq2=2.0*encDx*((px2>tx2?1.0:0.0)),dCSq3=2.0*encDy*((py2>ty2?1.0:0.0));
+float pw=px2-px1+1e-7,ph=py2-py1+1e-7,tw=tx2-tx1+1e-7,th=ty2-ty1+1e-7;
+float atanDiff=atan(tw/th)-atan(pw/ph); float fourOverPiSq=4.0/(3.14159265*3.14159265);
+float v=fourOverPiSq*atanDiff*atanDiff;
+float iw=max(0.0,min(px2,tx2)-max(px1,tx1)),ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+float iou=iw*ih/(pw*ph+(tx2-tx1)*(ty2-ty1)-iw*ih+1e-7);
+float alpha=v/(1.0-iou+v+1e-7);
+float rss=pw*pw+ph*ph,dAtanPw=ph/rss,dAtanPh=-pw/rss;
+float dV0=2.0*fourOverPiSq*atanDiff*dAtanPw,dV1=2.0*fourOverPiSq*atanDiff*dAtanPh,dV2=2.0*fourOverPiSq*atanDiff*(-dAtanPw),dV3=2.0*fourOverPiSq*atanDiff*(-dAtanPh);
+float dp0=(dRho0*cSq-rhoSq*dCSq0)/cSqSq,dp1=(dRho1*cSq-rhoSq*dCSq1)/cSqSq,dp2=(dRho2*cSq-rhoSq*dCSq2)/cSqSq,dp3=(dRho3*cSq-rhoSq*dCSq3)/cSqSq;
+gp[o]=goB[i]*(-ig0+dp0+alpha*dV0);gp[o+1]=goB[i]*(-ig1+dp1+alpha*dV1);gp[o+2]=goB[i]*(-ig2+dp2+alpha*dV2);gp[o+3]=goB[i]*(-ig3+dp3+alpha*dV3); }";
 }
