@@ -22723,7 +22723,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
         var linear = TensorMatMul(input, weight);
-        var biased = TensorAdd(linear, bias);
+        var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
         var result = ReLU(biased);
 
@@ -22740,7 +22740,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
         var linear = TensorMatMul(input, weight);
-        var biased = TensorAdd(linear, bias);
+        var biased = TensorBroadcastAdd(linear, bias);
         var result = TensorSigmoid(biased);
 
         RemoveLastNTapeEntries<T>(3);
@@ -22754,7 +22754,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
         var linear = TensorMatMul(input, weight);
-        var biased = TensorAdd(linear, bias);
+        var biased = TensorBroadcastAdd(linear, bias);
         var result = Tanh(biased);
 
         RemoveLastNTapeEntries<T>(3);
@@ -22768,7 +22768,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
         var linear = TensorMatMul(input, weight);
-        var biased = TensorAdd(linear, bias);
+        var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
         var result = GELU(biased);
 
@@ -22784,7 +22784,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
         var linear = TensorMatMul(input, weight);
-        var biased = TensorAdd(linear, bias);
+        var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
         var result = Swish(biased);
 
