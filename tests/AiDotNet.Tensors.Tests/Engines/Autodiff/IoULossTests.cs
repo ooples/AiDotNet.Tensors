@@ -133,6 +133,21 @@ public class IoULossTests
         Assert.Throws<ArgumentException>(() => _engine.TensorIoULoss(pred, targ));
     }
 
+    // ── Slice backward sanity check ──
+
+    [Fact]
+    public void SliceBackward_GradientFlowsToOriginalTensor()
+    {
+        var input = MakeBoxes(new float[,] { { 1, 2, 3, 4 } });
+        using var tape = new GradientTape<float>();
+        var col0 = _engine.TensorSlice(input, new[] { 0, 0 }, new[] { 1, 1 });
+        var col1 = _engine.TensorSlice(input, new[] { 0, 1 }, new[] { 1, 1 });
+        var sum = _engine.TensorAdd(col0, col1);
+        var loss = _engine.ReduceSum(sum, new[] { 0, 1 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss);
+        Assert.True(grads.ContainsKey(input), $"Gradient not found for input. Keys: {grads.Count}");
+    }
+
     // ── Gradient correctness ──
 
     [Fact]
@@ -171,7 +186,13 @@ public class IoULossTests
             var scalarLoss = _engine.ReduceSum(loss, new[] { 0 }, keepDims: false);
             grads = tape.ComputeGradients(scalarLoss);
         }
-        Assert.True(grads.ContainsKey(pred), "Gradient not found for predicted tensor");
+        // Debug: check what keys exist
+        if (!grads.ContainsKey(pred))
+        {
+            var keyShapes = string.Join(", ", grads.Keys.Select(k => $"{k.Shape[0]}x{(k.Shape.Length > 1 ? k.Shape[1].ToString() : "?")}"));
+            Assert.Fail($"Gradient not found for predicted tensor (shape {pred.Shape[0]}x{pred.Shape[1]}). " +
+                        $"Dict has {grads.Count} keys: [{keyShapes}]");
+        }
         var analyticalGrad = grads[pred];
 
         // Finite difference for each coordinate
