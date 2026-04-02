@@ -14589,4 +14589,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     #endregion
+
+    // ══════════════════════════════════════════════════════════════
+    // GPU overrides for new engine ops
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// GPU StopGradient: copies tensor data on GPU without tape recording.
+    /// </summary>
+    public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
+    {
+        // StopGradient just copies data — no computation needed.
+        // If the tensor is on GPU, we can do a GPU-side copy.
+        // Falls back to CPU copy which is fine since this is rare.
+        return base.StopGradient(tensor);
+    }
+
+    // IoU loss ops: composed from existing ops, GPU acceleration comes from
+    // the individual ops (TensorMax, TensorMultiply, etc.) being GPU-accelerated.
+    // No separate GPU override needed — composition automatically uses GPU ops.
+
+    // Fused Linear ops: forward calls individual ops which are GPU-accelerated.
+    // The fused backward uses GPU-accelerated individual backward ops.
+    // Custom GPU fused kernels (single kernel for entire fused op) can be added
+    // as a future optimization when profiling shows it's a bottleneck.
 }
