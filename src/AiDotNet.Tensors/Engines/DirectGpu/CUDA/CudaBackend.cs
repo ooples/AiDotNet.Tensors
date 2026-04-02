@@ -6426,7 +6426,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
         using var _ = PushContext();
-        NativeMethods.cuMemcpyDtoD(destination.Handle, source.Handle, (ulong)(size * sizeof(float)));
+        CuBlasNative.CheckCudaResult(
+            CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, (nuint)(size * sizeof(float))),
+            "cuMemcpyDtoD (CopyBuffer)");
     }
 
     public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
