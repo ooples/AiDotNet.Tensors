@@ -17235,6 +17235,9 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
         numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
 
+        // d(scalar - x)/dx = -1, so gradient is negated
+        DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensor, BackwardFunctions<T>.NegateBackward);
+
         return result;
     }
 

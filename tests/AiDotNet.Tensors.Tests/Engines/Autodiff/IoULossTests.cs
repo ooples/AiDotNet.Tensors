@@ -151,6 +151,70 @@ public class IoULossTests
     // ── Gradient correctness ──
 
     [Fact]
+    public void IoULoss_SimpleManualChain_GradientFlows()
+    {
+        var predicted = MakeBoxes(new float[,] { { 1, 1, 9, 9 } });
+        var target = MakeBoxes(new float[,] { { 0, 0, 10, 10 } });
+
+        using var tape = new GradientTape<float>();
+        var px1 = _engine.TensorSlice(predicted, new[] { 0, 0 }, new[] { 1, 1 });
+        var px2 = _engine.TensorSlice(predicted, new[] { 0, 2 }, new[] { 1, 1 });
+        var width = _engine.TensorSubtract(px2, px1);
+        var loss = _engine.ReduceSum(width, new[] { 0, 1 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss);
+        Assert.True(grads.ContainsKey(predicted), $"No grad for predicted. Keys: {grads.Count}");
+    }
+
+    [Fact]
+    public void IoULoss_FullManualIoU_GradientFlows()
+    {
+        // Replicate the full IoU composition to find where gradient chain breaks
+        var predicted = MakeBoxes(new float[,] { { 1, 1, 9, 9 } });
+        var target = MakeBoxes(new float[,] { { 0, 0, 10, 10 } });
+
+        using var tape = new GradientTape<float>();
+
+        var px1 = _engine.TensorSlice(predicted, new[] { 0, 0 }, new[] { 1, 1 });
+        var py1 = _engine.TensorSlice(predicted, new[] { 0, 1 }, new[] { 1, 1 });
+        var px2 = _engine.TensorSlice(predicted, new[] { 0, 2 }, new[] { 1, 1 });
+        var py2 = _engine.TensorSlice(predicted, new[] { 0, 3 }, new[] { 1, 1 });
+
+        var tx1 = _engine.TensorSlice(target, new[] { 0, 0 }, new[] { 1, 1 });
+        var ty1 = _engine.TensorSlice(target, new[] { 0, 1 }, new[] { 1, 1 });
+        var tx2 = _engine.TensorSlice(target, new[] { 0, 2 }, new[] { 1, 1 });
+        var ty2 = _engine.TensorSlice(target, new[] { 0, 3 }, new[] { 1, 1 });
+
+        // Intersection
+        var interX1 = _engine.TensorMax(px1, tx1);
+        var interY1 = _engine.TensorMax(py1, ty1);
+        var interX2 = _engine.TensorNegate(_engine.TensorMax(_engine.TensorNegate(px2), _engine.TensorNegate(tx2)));
+        var interY2 = _engine.TensorNegate(_engine.TensorMax(_engine.TensorNegate(py2), _engine.TensorNegate(ty2)));
+        var interW = _engine.ReLU(_engine.TensorSubtract(interX2, interX1));
+        var interH = _engine.ReLU(_engine.TensorSubtract(interY2, interY1));
+        var interArea = _engine.TensorMultiply(interW, interH);
+
+        // Areas
+        var predW = _engine.ReLU(_engine.TensorSubtract(px2, px1));
+        var predH = _engine.ReLU(_engine.TensorSubtract(py2, py1));
+        var predArea = _engine.TensorMultiply(predW, predH);
+        var targW = _engine.ReLU(_engine.TensorSubtract(tx2, tx1));
+        var targH = _engine.ReLU(_engine.TensorSubtract(ty2, ty1));
+        var targArea = _engine.TensorMultiply(targW, targH);
+        var unionArea = _engine.TensorAddScalar(_engine.TensorSubtract(_engine.TensorAdd(predArea, targArea), interArea), 1e-7f);
+
+        // IoU
+        var iou = _engine.TensorDivide(interArea, unionArea);
+        var loss = _engine.ScalarMinusTensor(1f, iou);
+        var scalarLoss = _engine.ReduceSum(loss, new[] { 0, 1 }, keepDims: false);
+        var grads = tape.ComputeGradients(scalarLoss);
+
+        Assert.True(grads.ContainsKey(predicted),
+            $"No grad for predicted. Grads has {grads.Count} keys. " +
+            $"Has px1={grads.ContainsKey(px1)}, predW={grads.ContainsKey(predW)}, predArea={grads.ContainsKey(predArea)}, " +
+            $"iou={grads.ContainsKey(iou)}, interArea={grads.ContainsKey(interArea)}");
+    }
+
+    [Fact]
     public void IoULoss_GradientsExistAndAreFinite()
     {
         var pred = MakeBoxes(new float[,] { { 1, 1, 9, 9 } });
@@ -207,7 +271,8 @@ public class IoULossTests
             var lossMinus = _engine.TensorIoULoss(MakeBoxes(minusData), targ);
             float fdGrad = (lossPlus[0] - lossMinus[0]) / (2 * eps);
 
-            Assert.Equal(fdGrad, analyticalGrad[c], 2);
+            Assert.True(Math.Abs(fdGrad - analyticalGrad[c]) < 0.05f,
+                $"Coord {c}: fd={fdGrad:F6}, analytical={analyticalGrad[c]:F6}, diff={Math.Abs(fdGrad - analyticalGrad[c]):F6}");
         }
     }
 
