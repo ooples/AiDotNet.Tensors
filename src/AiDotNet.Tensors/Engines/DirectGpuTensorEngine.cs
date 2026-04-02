@@ -14709,8 +14709,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 backend.FusedLinearGELU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
                 var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
                 // GELU backward needs pre-activation (MatMul+Bias output before GELU).
-                // Compute it on CPU since the GPU already computed post-GELU.
-                var preActivation = base.TensorAdd(base.TensorMatMul(input, weight), bias);
+                // Compute without tape recording to avoid polluting the tape.
+                Tensor<T> preActivation;
+                using (new Autodiff.NoGradScope<T>())
+                {
+                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
+                }
                 Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
                     new[] { input, weight, bias },
                     Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward,
@@ -14737,7 +14741,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 backend.FusedLinearSwish(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
                 var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
                 // Swish backward needs pre-activation to compute sigmoid(x) derivative.
-                var preActivation = base.TensorAdd(base.TensorMatMul(input, weight), bias);
+                // Compute without tape recording to avoid polluting the tape.
+                Tensor<T> preActivation;
+                using (new Autodiff.NoGradScope<T>())
+                {
+                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
+                }
                 Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
                     new[] { input, weight, bias },
                     Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward,
