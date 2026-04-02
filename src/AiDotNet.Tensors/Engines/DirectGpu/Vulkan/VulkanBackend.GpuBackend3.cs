@@ -1060,8 +1060,9 @@ public sealed unsafe partial class VulkanBackend
 
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        // CPU fallback for buffer copy — Vulkan vkCmdCopyBuffer requires command buffer setup
-        throw new NotSupportedException("Vulkan CopyBuffer delegates to CPU StopGradient.");
+        if (size <= 0) return;
+        var data = DownloadBuffer(source);
+        UploadToBuffer(data, destination);
     }
 
     public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearReLU, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
