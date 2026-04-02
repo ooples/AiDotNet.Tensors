@@ -88,7 +88,9 @@ public abstract class TensorBase<T> : IDisposable
     /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
     /// </summary>
     public Engines.DirectGpu.IGpuBuffer Buffer =>
-        _gpuBuffer ?? throw new InvalidOperationException("Tensor is not GPU-resident. Call .Gpu() or .To(device) first.");
+        _device != TensorDevice.CPU && _gpuBuffer is not null
+            ? _gpuBuffer
+            : throw new InvalidOperationException("Tensor is not GPU-resident. Call .Gpu() or .To(device) first.");
 
     /// <summary>
     /// Gets the GPU memory management role for this tensor.

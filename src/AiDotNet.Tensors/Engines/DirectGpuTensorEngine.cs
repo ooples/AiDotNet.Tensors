@@ -2658,7 +2658,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <remarks>
     /// <para>
     /// Use this method to explicitly upload data to GPU for use in GPU-resident operations.
-    /// The returned tensor can be passed to methods like <see cref="FusedLinearGpu{T}(IGpuTensor{T}, Tensor{T}, Tensor{T}?, FusedActivationType)"/>
+    /// The returned tensor can be passed to methods like <see cref="FusedLinearGpu{T}(Tensor{T}, Tensor{T}, Tensor{T}?, FusedActivationType)"/>
     /// to avoid redundant uploads.
     /// </para>
     /// <para>
@@ -10306,14 +10306,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (newSize != input.Length)
             throw new ArgumentException($"Reshape total size mismatch: {input.Length} vs {newSize}");
 
-        // Check input type
-        if (input is Tensor<T> gpuTensor)
-        {
-            return Tensor<T>.FromGpuBuffer(backend, gpuTensor.Buffer, newShape, gpuTensor.Role, ownsBuffer: false);
-        }
-
-        // Fallback: create wrapper
-        return Tensor<T>.FromGpuBuffer(backend, input.Buffer, newShape, GpuTensorRole.Activation, ownsBuffer: false);
+        return Tensor<T>.FromGpuBuffer(backend, input.Buffer, newShape, input.Role, ownsBuffer: false);
     }
 
     #endregion
