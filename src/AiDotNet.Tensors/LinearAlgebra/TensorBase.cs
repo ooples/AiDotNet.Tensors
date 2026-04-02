@@ -72,6 +72,25 @@ public abstract class TensorBase<T> : IDisposable
     internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
 
     /// <summary>
+    /// The GPU memory management role for this tensor (weight, activation, gradient, etc.).
+    /// Used by the GPU memory planner for allocation and eviction decisions.
+    /// </summary>
+    internal Engines.Gpu.GpuTensorRole _gpuRole;
+
+    /// <summary>
+    /// Gets the GPU buffer for this tensor.
+    /// Throws if the tensor is CPU-resident — call <see cref="IsGpuResident"/> first to check,
+    /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
+    /// </summary>
+    public Engines.DirectGpu.IGpuBuffer Buffer =>
+        _gpuBuffer ?? throw new InvalidOperationException("Tensor is not GPU-resident. Call .Gpu() or .To(device) first.");
+
+    /// <summary>
+    /// Gets the GPU memory management role for this tensor.
+    /// </summary>
+    public Engines.Gpu.GpuTensorRole Role => _gpuRole;
+
+    /// <summary>
     /// Gets or sets the device where this tensor's data resides.
     /// </summary>
     /// <remarks>

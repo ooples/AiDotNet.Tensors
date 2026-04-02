@@ -2491,6 +2491,35 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Creates a GPU-resident tensor from an existing GPU buffer.
+    /// The tensor's authoritative data is on the GPU — the CPU-side data array is empty
+    /// until explicitly synchronized via <see cref="TensorBase{T}.GetDataArray"/>.
+    /// This replaces the legacy <c>GpuTensor&lt;T&gt;</c> type with unified Tensor.
+    /// </summary>
+    /// <param name="backend">The GPU backend that owns the buffer.</param>
+    /// <param name="buffer">The existing GPU buffer containing the data.</param>
+    /// <param name="shape">The shape of the tensor.</param>
+    /// <param name="role">The GPU memory management role for allocation decisions.</param>
+    /// <param name="ownsBuffer">If true, the tensor owns the buffer lifetime.</param>
+    /// <returns>A GPU-resident Tensor with deferred CPU synchronization.</returns>
+    internal static Tensor<T> FromGpuBuffer(
+        Engines.DirectGpu.IDirectGpuBackend backend,
+        Engines.DirectGpu.IGpuBuffer buffer,
+        int[] shape,
+        Engines.Gpu.GpuTensorRole role = Engines.Gpu.GpuTensorRole.General,
+        bool ownsBuffer = true)
+    {
+        // Create a tensor with empty CPU data — the GPU buffer is authoritative
+        var tensor = new Tensor<T>(shape);
+        tensor._gpuBuffer = buffer;
+        tensor._gpuBackend = backend;
+        tensor._gpuRole = role;
+        // Mark as non-CPU; the specific device type is determined by the backend at runtime
+        tensor._device = TensorDevice.CUDA;
+        return tensor;
+    }
+
+    /// <summary>
     /// Performs element-wise multiplication of two tensors.
     /// </summary>
     /// <param name="a">The first tensor.</param>

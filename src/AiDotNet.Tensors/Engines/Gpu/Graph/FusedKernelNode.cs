@@ -1,4 +1,5 @@
-using AiDotNet.Tensors.Engines.DirectGpu;
+﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 
@@ -112,11 +113,9 @@ public sealed class FusedKernelNode : ExecutionNode
         // Mark outputs as modified
         foreach (var output in _outputs)
         {
-            if (output is IGpuTensor<float> typedTensor)
+            if (output is Tensor<float> typedTensor)
             {
-                var evt = stream.RecordEvent();
-                var syncPoint = new FusedSyncPoint(evt, stream);
-                typedTensor.MarkModified(syncPoint);
+                typedTensor.IncrementVersion();
             }
         }
 

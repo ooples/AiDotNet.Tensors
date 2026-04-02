@@ -1,4 +1,5 @@
-using AiDotNet.Tensors.Engines.DirectGpu;
+﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 
@@ -113,12 +114,12 @@ public sealed class KernelNode : ExecutionNode
             bool syncPointUsed = false;
             switch (output)
             {
-                case IGpuTensor<float> floatTensor:
-                    floatTensor.MarkModified(syncPoint);
+                case Tensor<float> floatTensor:
+                    floatTensor.IncrementVersion();
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<double> doubleTensor:
-                    doubleTensor.MarkModified(syncPoint);
+                case Tensor<double> doubleTensor:
+                    doubleTensor.IncrementVersion();
                     syncPointUsed = true;
                     break;
                 case IGpuTensor<int> intTensor:
