@@ -610,6 +610,12 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // Compile loss forward kernels (cross-entropy, MSE, BCE, dropout mask, gaussian noise)
         CompileKernelModule(device, CudaLossForwardKernels.GetSource(), "loss_forward_kernels", CudaLossForwardKernels.GetKernelNames());
 
+        // Compile fused linear + activation kernels (MatMul + Bias + ReLU/Sigmoid/Tanh/GELU/Swish)
+        CompileKernelModule(device, Kernels.CudaFusedLinearKernels.GetSource(), "fused_linear_kernels", Kernels.CudaFusedLinearKernels.GetKernelNames());
+
+        // Compile IoU loss kernels (IoU, GIoU, DIoU, CIoU forward + backward)
+        CompileKernelModule(device, Kernels.CudaIoUKernels.GetSource(), "iou_kernels", Kernels.CudaIoUKernels.GetKernelNames());
+
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
 
@@ -6410,6 +6416,331 @@ public sealed class CudaBackend : IAsyncGpuBackend
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr lPtr = logits.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
         void** args = stackalloc void*[6]; args[0] = &goPtr; args[1] = &lPtr; args[2] = &tPtr; args[3] = &giPtr; args[4] = &n; args[5] = &invN;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    #endregion
+
+    #region StopGradient and Fused Linear Operations
+
+    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
+    {
+        using var _ = PushContext();
+        NativeMethods.cuMemcpyDtoD(destination.Handle, source.Handle, (ulong)(size * sizeof(float)));
+    }
+
+    public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu");
+        using var _ = PushContext();
+        int total = batchSize * outFeatures;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid");
+        using var _ = PushContext();
+        int total = batchSize * outFeatures;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh");
+        using var _ = PushContext();
+        int total = batchSize * outFeatures;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu");
+        using var _ = PushContext();
+        int total = batchSize * outFeatures;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish");
+        using var _ = PushContext();
+        int total = batchSize * outFeatures;
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        // Grad input kernel
+        if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu_backward_grad_input");
+        using var _ = PushContext();
+        int totalIn = batchSize * inFeatures;
+        uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, paPtr = preActivation.Handle, giPtr = gradInput.Handle;
+        void** argsIn = stackalloc void*[7];
+        argsIn[0] = &goPtr; argsIn[1] = &wPtr; argsIn[2] = &paPtr; argsIn[3] = &giPtr;
+        argsIn[4] = &batchSize; argsIn[5] = &inFeatures; argsIn[6] = &outFeatures;
+        LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
+
+        // Bias gradient kernel
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+        uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gbPtr = gradBias.Handle;
+        int activationType = 0; // ReLU
+        void** argsBias = stackalloc void*[5];
+        argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures;
+        // Note: activationType passed as 6th arg
+        void** argsBiasFull = stackalloc void*[6];
+        argsBiasFull[0] = &goPtr; argsBiasFull[1] = &paPtr; argsBiasFull[2] = &gbPtr;
+        argsBiasFull[3] = &batchSize; argsBiasFull[4] = &outFeatures; argsBiasFull[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBiasFull);
+    }
+
+    public unsafe void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
+        using var _ = PushContext();
+        int totalIn = batchSize * inFeatures;
+        uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, oPtr = output.Handle, giPtr = gradInput.Handle;
+        void** argsIn = stackalloc void*[7];
+        argsIn[0] = &goPtr; argsIn[1] = &wPtr; argsIn[2] = &oPtr; argsIn[3] = &giPtr;
+        argsIn[4] = &batchSize; argsIn[5] = &inFeatures; argsIn[6] = &outFeatures;
+        LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
+
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+        uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gbPtr = gradBias.Handle;
+        int activationType = 1; // Sigmoid
+        void** argsBias = stackalloc void*[6];
+        argsBias[0] = &goPtr; argsBias[1] = &oPtr; argsBias[2] = &gbPtr;
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+    }
+
+    public unsafe void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
+        using var _ = PushContext();
+        int totalIn = batchSize * inFeatures;
+        uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, oPtr = output.Handle, giPtr = gradInput.Handle;
+        void** argsIn = stackalloc void*[7];
+        argsIn[0] = &goPtr; argsIn[1] = &wPtr; argsIn[2] = &oPtr; argsIn[3] = &giPtr;
+        argsIn[4] = &batchSize; argsIn[5] = &inFeatures; argsIn[6] = &outFeatures;
+        LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
+
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+        uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gbPtr = gradBias.Handle;
+        int activationType = 2; // Tanh
+        void** argsBias = stackalloc void*[6];
+        argsBias[0] = &goPtr; argsBias[1] = &oPtr; argsBias[2] = &gbPtr;
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+    }
+
+    public unsafe void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
+        using var _ = PushContext();
+        int totalIn = batchSize * inFeatures;
+        uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, paPtr = preActivation.Handle, giPtr = gradInput.Handle;
+        void** argsIn = stackalloc void*[7];
+        argsIn[0] = &goPtr; argsIn[1] = &wPtr; argsIn[2] = &paPtr; argsIn[3] = &giPtr;
+        argsIn[4] = &batchSize; argsIn[5] = &inFeatures; argsIn[6] = &outFeatures;
+        LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
+
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+        uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gbPtr = gradBias.Handle;
+        int activationType = 3; // GELU
+        void** argsBias = stackalloc void*[6];
+        argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+    }
+
+    public unsafe void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
+        using var _ = PushContext();
+        int totalIn = batchSize * inFeatures;
+        uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, paPtr = preActivation.Handle, giPtr = gradInput.Handle;
+        void** argsIn = stackalloc void*[7];
+        argsIn[0] = &goPtr; argsIn[1] = &wPtr; argsIn[2] = &paPtr; argsIn[3] = &giPtr;
+        argsIn[4] = &batchSize; argsIn[5] = &inFeatures; argsIn[6] = &outFeatures;
+        LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
+
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+        uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gbPtr = gradBias.Handle;
+        int activationType = 4; // Swish
+        void** argsBias = stackalloc void*[6];
+        argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
+        argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
+        LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+    }
+
+    #endregion
+
+    #region IoU Loss GPU Operations
+
+    public unsafe void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("iou_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: iou_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("giou_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: giou_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("diou_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: diou_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("ciou_loss", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: ciou_loss");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("iou_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: iou_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("giou_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: giou_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("diou_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: diou_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    public unsafe void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue("ciou_loss_backward", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: ciou_loss_backward");
+        using var _ = PushContext();
+        uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

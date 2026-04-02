@@ -2692,6 +2692,100 @@ public interface IDirectGpuBackend : IDisposable
     void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
     void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta);
     void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN);
+
+    // ══════════════════════════════════════════════════════════════
+    // StopGradient: device-to-device copy without tape recording
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>Device-to-device buffer copy for StopGradient.</summary>
+    void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size);
+
+    // ══════════════════════════════════════════════════════════════
+    // Fused Linear + Activation GPU kernels
+    // Single kernel: output = activation(input @ weight + bias)
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>output = ReLU(input @ weight + bias) in a single kernel.</summary>
+    void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>output = Sigmoid(input @ weight + bias) in a single kernel.</summary>
+    void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>output = Tanh(input @ weight + bias) in a single kernel.</summary>
+    void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>output = GELU(input @ weight + bias) in a single kernel.</summary>
+    void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>output = Swish(input @ weight + bias) in a single kernel.</summary>
+    void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
+        int batchSize, int inFeatures, int outFeatures);
+
+    // ══════════════════════════════════════════════════════════════
+    // Fused Linear + Activation backward GPU kernels
+    // Single kernel: computes activation backward + MatMul backward + bias grad
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>Fused backward for ReLU(input @ weight + bias).</summary>
+    void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>Fused backward for Sigmoid(input @ weight + bias).</summary>
+    void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>Fused backward for Tanh(input @ weight + bias).</summary>
+    void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>Fused backward for GELU(input @ weight + bias).</summary>
+    void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures);
+
+    /// <summary>Fused backward for Swish(input @ weight + bias).</summary>
+    void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
+        IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures);
+
+    // ══════════════════════════════════════════════════════════════
+    // IoU Loss GPU kernels
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>IoU loss: loss[i] = 1 - IoU(predicted[i], target[i]) for [N,4] XYXY boxes.</summary>
+    void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes);
+
+    /// <summary>GIoU loss per box. Rezatofighi et al. CVPR 2019.</summary>
+    void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes);
+
+    /// <summary>DIoU loss per box. Zheng et al. AAAI 2020.</summary>
+    void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes);
+
+    /// <summary>CIoU loss per box. Zheng et al. AAAI 2020.</summary>
+    void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes);
+
+    /// <summary>IoU loss backward: gradients w.r.t. predicted box coordinates.</summary>
+    void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes);
+
+    /// <summary>GIoU loss backward.</summary>
+    void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes);
+
+    /// <summary>DIoU loss backward.</summary>
+    void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes);
+
+    /// <summary>CIoU loss backward.</summary>
+    void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
+        IGpuBuffer gradPredicted, int numBoxes);
 }
 
 /// <summary>
