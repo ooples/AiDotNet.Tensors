@@ -276,23 +276,14 @@ extern ""C"" __global__ void giou_loss_backward(
     dI[3] = hasInter * (py2<ty2?1.0f:0.0f) * iw;
     dU[0] = -ph - dI[0]; dU[1] = -pw - dI[1]; dU[2] = ph - dI[2]; dU[3] = pw - dI[3];
 
-    // GIoU penalty: P = (encA - U)/encA = 1 - U/encA
-    // ∂P/∂coord = -(∂U/∂coord * encA - U * ∂encA/∂coord) / encA²
+    // GIoU = IoU - P where P = (encA - U)/encA
+    // loss = 1 - GIoU = 1 - IoU + P
+    // ∂loss/∂coord = -∂IoU/∂coord + ∂P/∂coord
+    // iouGrad[c] = go * (-∂(1-IoU)/∂coord) so ∂IoU/∂coord = -iouGrad[c]/go
     float encASq = encA * encA;
     for (int c = 0; c < 4; c++) {
-        float dP = -(dU[c] * encA - uA * dEncA[c]) / encASq;
-        // GIoU = IoU - P → loss = 1 - GIoU → ∂loss/∂coord = -(∂IoU/∂coord - ∂P/∂coord)
-        gradPredicted[off+c] = go * -(iouGrad[c]/go - dP);  // iouGrad already has -∂IoU/∂coord * go
-    }
-    // Fix: iouGrad[c] = go * (-∂IoU/∂coord), so ∂IoU/∂coord = -iouGrad[c]/go
-    // ∂loss = -(∂IoU - ∂P) = -(-iouGrad[c]/go) - (-dP) ... let me simplify:
-    // loss = 1 - GIoU = 1 - IoU + P
-    // ∂loss = -∂IoU + ∂P = iouGrad[c]/go + dP (since iouGrad = go * (-∂IoU))
-    for (int c = 0; c < 4; c++) {
-        float dIoU_dc = -iouGrad[c] / go;  // ∂IoU/∂coord (positive when IoU increases)
+        float dIoU_dc = -iouGrad[c] / go;
         float dP_dc = -(dU[c] * encA - uA * dEncA[c]) / encASq;
-        // ∂loss/∂coord = -∂IoU/∂coord + ∂P/∂coord (since loss = 1 - IoU + P)
-        // Wait: GIoU = IoU - P → loss = 1 - GIoU = 1 - IoU + P
         gradPredicted[off+c] = go * (-dIoU_dc + dP_dc);
     }
 }
