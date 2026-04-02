@@ -14594,23 +14594,221 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU overrides for new engine ops
     // ══════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// GPU StopGradient: copies tensor data on GPU without tape recording.
-    /// </summary>
     public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
     {
-        // StopGradient just copies data — no computation needed.
-        // If the tensor is on GPU, we can do a GPU-side copy.
-        // Falls back to CPU copy which is fine since this is rare.
+        try
+        {
+            if (TryGetBackend(out var backend))
+            {
+                using var src = GetOrAllocateBuffer(backend, tensor);
+                var dst = AllocateOutputBuffer(backend, tensor.Length);
+                try
+                {
+                    backend.CopyBuffer(src.Buffer, dst.Buffer, tensor.Length);
+                    return DeferTensorResult<T>(backend, dst.Buffer, tensor.Length, tensor.Shape._dims);
+                }
+                catch
+                {
+                    dst.Dispose();
+                    throw;
+                }
+            }
+        }
+        catch { }
         return base.StopGradient(tensor);
     }
 
-    // IoU loss ops: composed from existing ops, GPU acceleration comes from
-    // the individual ops (TensorMax, TensorMultiply, etc.) being GPU-accelerated.
-    // No separate GPU override needed — composition automatically uses GPU ops.
+    public override Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2)
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearReLU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                // Record fused tape entry (GPU path doesn't call individual ops, so no entries to remove)
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward,
+                    new object[] { result }); // preActivation saved for backward
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearReLU(input, weight, bias);
+    }
 
-    // Fused Linear ops: forward calls individual ops which are GPU-accelerated.
-    // The fused backward uses GPU-accelerated individual backward ops.
-    // Custom GPU fused kernels (single kernel for entire fused op) can be added
-    // as a future optimization when profiling shows it's a bottleneck.
+    public override Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2)
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearSigmoid(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSigmoid", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSigmoidBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearSigmoid(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2)
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearTanh(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearTanh", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddTanhBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearTanh(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2)
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearGELU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward,
+                    new object[] { result });
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearGELU(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2)
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearSwish(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward,
+                    new object[] { result });
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearSwish(input, weight, bias);
+    }
+
+    // IoU ops: the CpuEngine implementation composes existing ops (TensorMax, TensorMultiply, etc.)
+    // which are individually GPU-accelerated. The composition automatically uses GPU when available.
+    // Dedicated GPU IoU kernels provide additional speedup by reducing kernel launch overhead.
+    public override Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && predicted.Shape.Length == 2 && predicted.Shape[1] == 4)
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.IoULoss(gp, gt, go, numBoxes);
+                return DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+            }
+        }
+        catch { }
+        return base.TensorIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && predicted.Shape.Length == 2 && predicted.Shape[1] == 4)
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.GIoULoss(gp, gt, go, numBoxes);
+                return DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+            }
+        }
+        catch { }
+        return base.TensorGIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && predicted.Shape.Length == 2 && predicted.Shape[1] == 4)
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.DIoULoss(gp, gt, go, numBoxes);
+                return DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+            }
+        }
+        catch { }
+        return base.TensorDIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && predicted.Shape.Length == 2 && predicted.Shape[1] == 4)
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.CIoULoss(gp, gt, go, numBoxes);
+                return DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+            }
+        }
+        catch { }
+        return base.TensorCIoULoss(predicted, target);
+    }
 }

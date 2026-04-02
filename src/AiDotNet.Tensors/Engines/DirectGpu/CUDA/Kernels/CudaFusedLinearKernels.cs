@@ -107,6 +107,39 @@ FUSED_LINEAR_BACKWARD_GRADIN(fused_linear_tanh_backward, backward_tanh_act, 0)
 FUSED_LINEAR_BACKWARD_GRADIN(fused_linear_gelu_backward, backward_gelu, 1)
 FUSED_LINEAR_BACKWARD_GRADIN(fused_linear_swish_backward, backward_swish, 1)
 
+// Weight gradient: gradWeight[i,j] = sum_b(input[b,i] * masked_grad[b,j])
+// This is equivalent to input^T @ masked_gradient
+extern ""C"" __global__ void fused_linear_weight_grad(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ input,
+    const float* __restrict__ saved,
+    float* __restrict__ gradWeight,
+    int batchSize, int inFeatures, int outFeatures,
+    int activationType)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = inFeatures * outFeatures;
+    if (idx >= total) return;
+    int i = idx / outFeatures;
+    int j = idx % outFeatures;
+    float sum = 0.0f;
+    for (int b = 0; b < batchSize; b++) {
+        float go = __ldg(&gradOutput[b * outFeatures + j]);
+        float s = __ldg(&saved[b * outFeatures + j]);
+        float masked;
+        switch (activationType) {
+            case 0: masked = backward_relu(go, s); break;
+            case 1: masked = backward_sigmoid(go, s); break;
+            case 2: masked = backward_tanh_act(go, s); break;
+            case 3: masked = backward_gelu(go, s); break;
+            case 4: masked = backward_swish(go, s); break;
+            default: masked = go; break;
+        }
+        sum += __ldg(&input[b * inFeatures + i]) * masked;
+    }
+    gradWeight[idx] = sum;
+}
+
 // Bias gradient: sum of activation-masked gradOutput along batch dimension
 extern ""C"" __global__ void fused_linear_bias_grad(
     const float* __restrict__ gradOutput,
@@ -151,6 +184,7 @@ extern ""C"" __global__ void fused_linear_bias_grad(
             "fused_linear_tanh_backward_grad_input",
             "fused_linear_gelu_backward_grad_input",
             "fused_linear_swish_backward_grad_input",
+            "fused_linear_weight_grad",
             "fused_linear_bias_grad",
         };
     }

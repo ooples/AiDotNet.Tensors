@@ -6536,6 +6536,17 @@ public sealed class CudaBackend : IAsyncGpuBackend
         argsBiasFull[0] = &goPtr; argsBiasFull[1] = &paPtr; argsBiasFull[2] = &gbPtr;
         argsBiasFull[3] = &batchSize; argsBiasFull[4] = &outFeatures; argsBiasFull[5] = &activationType;
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBiasFull);
+
+        // Weight gradient kernel: gradWeight[i,j] = sum_b(input[b,i] * masked_grad[b,j])
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsW = stackalloc void*[8];
+        argsW[0] = &goPtr; argsW[1] = &iPtr; argsW[2] = &paPtr; argsW[3] = &gwPtr;
+        argsW[4] = &batchSize; argsW[5] = &inFeatures; argsW[6] = &outFeatures; argsW[7] = &activationType;
+        LaunchKernel(wgKernel, gridW, DefaultBlockSize, argsW);
     }
 
     public unsafe void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
@@ -6562,6 +6573,16 @@ public sealed class CudaBackend : IAsyncGpuBackend
         argsBias[0] = &goPtr; argsBias[1] = &oPtr; argsBias[2] = &gbPtr;
         argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsW = stackalloc void*[8];
+        argsW[0] = &goPtr; argsW[1] = &iPtr; argsW[2] = &oPtr; argsW[3] = &gwPtr;
+        argsW[4] = &batchSize; argsW[5] = &inFeatures; argsW[6] = &outFeatures; argsW[7] = &activationType;
+        LaunchKernel(wgKernel, gridW, DefaultBlockSize, argsW);
     }
 
     public unsafe void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
@@ -6588,6 +6609,16 @@ public sealed class CudaBackend : IAsyncGpuBackend
         argsBias[0] = &goPtr; argsBias[1] = &oPtr; argsBias[2] = &gbPtr;
         argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsW = stackalloc void*[8];
+        argsW[0] = &goPtr; argsW[1] = &iPtr; argsW[2] = &oPtr; argsW[3] = &gwPtr;
+        argsW[4] = &batchSize; argsW[5] = &inFeatures; argsW[6] = &outFeatures; argsW[7] = &activationType;
+        LaunchKernel(wgKernel, gridW, DefaultBlockSize, argsW);
     }
 
     public unsafe void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
@@ -6614,6 +6645,16 @@ public sealed class CudaBackend : IAsyncGpuBackend
         argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
         argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsW = stackalloc void*[8];
+        argsW[0] = &goPtr; argsW[1] = &iPtr; argsW[2] = &paPtr; argsW[3] = &gwPtr;
+        argsW[4] = &batchSize; argsW[5] = &inFeatures; argsW[6] = &outFeatures; argsW[7] = &activationType;
+        LaunchKernel(wgKernel, gridW, DefaultBlockSize, argsW);
     }
 
     public unsafe void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight,
@@ -6640,6 +6681,16 @@ public sealed class CudaBackend : IAsyncGpuBackend
         argsBias[0] = &goPtr; argsBias[1] = &paPtr; argsBias[2] = &gbPtr;
         argsBias[3] = &batchSize; argsBias[4] = &outFeatures; argsBias[5] = &activationType;
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
+
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsW = stackalloc void*[8];
+        argsW[0] = &goPtr; argsW[1] = &iPtr; argsW[2] = &paPtr; argsW[3] = &gwPtr;
+        argsW[4] = &batchSize; argsW[5] = &inFeatures; argsW[6] = &outFeatures; argsW[7] = &activationType;
+        LaunchKernel(wgKernel, gridW, DefaultBlockSize, argsW);
     }
 
     #endregion
