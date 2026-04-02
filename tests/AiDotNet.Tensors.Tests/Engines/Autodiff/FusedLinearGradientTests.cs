@@ -113,4 +113,25 @@ public class FusedLinearGradientTests
             (e, i, w, b) => e.FusedLinearSwish(i, w, b),
             (e, x) => e.Swish(x));
     }
+
+    [Theory]
+    [InlineData(1, 4, 3)]
+    [InlineData(8, 16, 12)]
+    [InlineData(16, 32, 8)]
+    public void FusedLinearReLU_DifferentSizes_ProducesIdenticalGradients(int batch, int inF, int outF)
+    {
+        VerifyFusedMatchesUnfused(
+            (e, i, w, b) => e.FusedLinearReLU(i, w, b),
+            (e, x) => e.ReLU(x), batch, inF, outF);
+    }
+
+    [Theory]
+    [InlineData(1, 4, 3)]
+    [InlineData(8, 16, 12)]
+    public void FusedLinearGELU_DifferentSizes_ProducesIdenticalGradients(int batch, int inF, int outF)
+    {
+        VerifyFusedMatchesUnfused(
+            (e, i, w, b) => e.FusedLinearGELU(i, w, b),
+            (e, x) => e.GELU(x), batch, inF, outF);
+    }
 }

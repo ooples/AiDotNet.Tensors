@@ -1934,14 +1934,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var preActivation = (Tensor<T>)savedState[0];
-        // Swish backward: grad * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))
-        var sigmoid = engine.TensorSigmoid(preActivation);
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var oneMinusSigmoid = engine.ScalarMinusTensor(numOps.One, sigmoid);
-        var xSigmoidDerivative = engine.TensorMultiply(
-            preActivation, engine.TensorMultiply(sigmoid, oneMinusSigmoid));
-        var swishDerivative = engine.TensorAdd(sigmoid, xSigmoidDerivative);
-        var maskedGrad = engine.TensorMultiply(gradOutput, swishDerivative);
+        // Use engine's SwishBackward which computes grad * (sig(x) + x*sig(x)*(1-sig(x))) efficiently
+        var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
 
         var bT = engine.TensorTranspose(inputs[1]);
         var gradA = engine.TensorMatMul(maskedGrad, bT);

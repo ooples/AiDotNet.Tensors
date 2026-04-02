@@ -22831,15 +22831,16 @@ public class CpuEngine : ITensorLevelEngine
         int n = predicted.Shape[0];
 
         // Extract coordinates: [N] tensors for each coordinate
+        // TensorSlice(tensor, start, length) — length is always [n, 1] for single column
         var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         // Intersection: max(0, min(x2_p, x2_t) - max(x1_p, x1_t)) * max(0, min(y2_p, y2_t) - max(y1_p, y1_t))
         var interX1 = TensorMax(px1, tx1);
@@ -22885,14 +22886,14 @@ public class CpuEngine : ITensorLevelEngine
         int n = predicted.Shape[0];
 
         var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         // Intersection
         var interX1 = TensorMax(px1, tx1);
@@ -22944,14 +22945,14 @@ public class CpuEngine : ITensorLevelEngine
         int n = predicted.Shape[0];
 
         var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         // IoU with clamped areas
         var interX1 = TensorMax(px1, tx1);
@@ -23009,14 +23010,14 @@ public class CpuEngine : ITensorLevelEngine
         int n = predicted.Shape[0];
 
         var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
-        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
-        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
-        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 }).Reshape(new[] { n });
 
         // IoU with clamped areas
         var interX1 = TensorMax(px1, tx1);
