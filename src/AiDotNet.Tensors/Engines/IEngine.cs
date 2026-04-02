@@ -7151,7 +7151,8 @@ public interface IEngine
 
     /// <summary>
     /// Exponential map on the Poincaré ball: projects a tangent vector at a point onto the manifold.
-    /// Formula: exp_x(v) = x ⊕ tanh(√c ||v|| / (1 - c||x||²)) * (v / ||v||)
+    /// Formula: exp_x(v) = x ⊕_c tanh(√c · λ_x · ||v|| / 2) · (v / (√c · ||v||))
+    /// where λ_x = 2 / (1 - c||x||²) is the conformal factor and c = |curvature|.
     /// The curvature parameter is the negative sectional curvature (e.g., -1.0 for standard hyperbolic space).
     /// Internally, c = |curvature| is used in formulas where √c appears.
     /// </summary>
@@ -7187,7 +7188,8 @@ public interface IEngine
 
     /// <summary>
     /// Exponential map on the hyperboloid model.
-    /// Formula: exp_x(v) = cosh(||v||_L) * x + sinh(||v||_L) * (v / ||v||_L)
+    /// Formula: exp_x(v) = cosh(√c · ||v||_L) · x + sinh(√c · ||v||_L) · (v / (√c · ||v||_L))
+    /// where c = |curvature| and ||v||_L is the Lorentzian norm of v.
     /// </summary>
     Vector<T> HyperboloidExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature);
 

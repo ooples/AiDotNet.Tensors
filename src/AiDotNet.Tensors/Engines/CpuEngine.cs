@@ -22854,6 +22854,13 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
     {
+        if (input.Rank != 3 || input._shape[2] != 8)
+            throw new ArgumentException($"Input must be rank-3 with last dim 8, got shape [{string.Join(", ", input._shape)}].", nameof(input));
+        if (weight.Rank != 3 || weight._shape[2] != 8)
+            throw new ArgumentException($"Weight must be rank-3 with last dim 8, got shape [{string.Join(", ", weight._shape)}].", nameof(weight));
+        if (input._shape[1] != weight._shape[1])
+            throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // input: [batch, inputFeatures, 8], weight: [outputFeatures, inputFeatures, 8]
@@ -22881,10 +22888,10 @@ public class CpuEngine : ITensorLevelEngine
                         w[c] = weight[o, i, c];
                     }
 
-                    // Octonion multiplication (Cayley-Dickson): result = a * w
-                    // Split into quaternion pairs: a = (p, q), w = (r, s)
-                    // a*w = (p*r - conj(s)*q, s*p + q*conj(r))
-                    var prod = OctonionMultiply(a, w, numOps);
+                    // Octonion multiplication (Cayley-Dickson): result = w * a
+                    // Matches CpuAdvancedAlgebraEngine.OctonionMatMul which uses weight * input.
+                    // Octonion multiply is non-commutative, so order matters.
+                    var prod = OctonionMultiply(w, a, numOps);
 
                     // Accumulate
                     for (int c = 0; c < 8; c++)
