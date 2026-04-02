@@ -22821,6 +22821,10 @@ public class CpuEngine : ITensorLevelEngine
         if (target == null) throw new ArgumentNullException(nameof(target));
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
 
         int n = predicted.Shape[0];
 
@@ -22846,9 +22850,13 @@ public class CpuEngine : ITensorLevelEngine
         var interH = ReLU(TensorSubtract(interY2, interY1));
         var interArea = TensorMultiply(interW, interH);
 
-        // Union: area_p + area_t - intersection
-        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
-        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        // Union: area_p + area_t - intersection, clamp widths/heights >= 0
+        var predW = ReLU(TensorSubtract(px2, px1));
+        var predH = ReLU(TensorSubtract(py2, py1));
+        var predArea = TensorMultiply(predW, predH);
+        var targW = ReLU(TensorSubtract(tx2, tx1));
+        var targH = ReLU(TensorSubtract(ty2, ty1));
+        var targArea = TensorMultiply(targW, targH);
         var eps = MathHelper.GetNumericOperations<T>().FromDouble(1e-7);
         var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
 
@@ -22866,6 +22874,10 @@ public class CpuEngine : ITensorLevelEngine
         if (target == null) throw new ArgumentNullException(nameof(target));
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = predicted.Shape[0];
@@ -22889,9 +22901,9 @@ public class CpuEngine : ITensorLevelEngine
         var interH = ReLU(TensorSubtract(interY2, interY1));
         var interArea = TensorMultiply(interW, interH);
 
-        // Union
-        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
-        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        // Union with clamped widths/heights
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
         var eps = numOps.FromDouble(1e-7);
         var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
 
@@ -22899,7 +22911,6 @@ public class CpuEngine : ITensorLevelEngine
         var iou = TensorDivide(interArea, unionArea);
 
         // Enclosing box
-        // min(x1_p, x1_t): -max(-x1_p, -x1_t)
         var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
         var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
         var encX2 = TensorMax(px2, tx2);
@@ -22922,6 +22933,10 @@ public class CpuEngine : ITensorLevelEngine
         if (target == null) throw new ArgumentNullException(nameof(target));
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = predicted.Shape[0];
@@ -22936,7 +22951,7 @@ public class CpuEngine : ITensorLevelEngine
         var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
         var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
 
-        // IoU (same as above)
+        // IoU with clamped areas
         var interX1 = TensorMax(px1, tx1);
         var interY1 = TensorMax(py1, ty1);
         var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
@@ -22944,8 +22959,8 @@ public class CpuEngine : ITensorLevelEngine
         var interW = ReLU(TensorSubtract(interX2, interX1));
         var interH = ReLU(TensorSubtract(interY2, interY1));
         var interArea = TensorMultiply(interW, interH);
-        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
-        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
         var eps = numOps.FromDouble(1e-7);
         var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
         var iou = TensorDivide(interArea, unionArea);
@@ -22983,6 +22998,10 @@ public class CpuEngine : ITensorLevelEngine
         if (target == null) throw new ArgumentNullException(nameof(target));
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = predicted.Shape[0];
@@ -22997,7 +23016,7 @@ public class CpuEngine : ITensorLevelEngine
         var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
         var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
 
-        // IoU
+        // IoU with clamped areas
         var interX1 = TensorMax(px1, tx1);
         var interY1 = TensorMax(py1, ty1);
         var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
@@ -23005,8 +23024,8 @@ public class CpuEngine : ITensorLevelEngine
         var interW = ReLU(TensorSubtract(interX2, interX1));
         var interH = ReLU(TensorSubtract(interY2, interY1));
         var interArea = TensorMultiply(interW, interH);
-        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
-        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
         var eps = numOps.FromDouble(1e-7);
         var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
         var iou = TensorDivide(interArea, unionArea);
@@ -23033,24 +23052,33 @@ public class CpuEngine : ITensorLevelEngine
         // DIoU penalty
         var distPenalty = TensorDivide(centerDistSq, diagSq);
 
-        // Aspect ratio consistency: v = (4/π²) * (atan(w_t/h_t) - atan(w_p/h_p))²
-        var predW = TensorAddScalar(TensorSubtract(px2, px1), eps);
-        var predH = TensorAddScalar(TensorSubtract(py2, py1), eps);
-        var targW = TensorAddScalar(TensorSubtract(tx2, tx1), eps);
-        var targH = TensorAddScalar(TensorSubtract(ty2, ty1), eps);
+        // Aspect ratio consistency: v = (4/pi^2) * (atan(w_t/h_t) - atan(w_p/h_p))^2
+        // Use proper atan per the CIoU paper (Zheng et al., 2020)
+        var predW = TensorAddScalar(ReLU(TensorSubtract(px2, px1)), eps);
+        var predH = TensorAddScalar(ReLU(TensorSubtract(py2, py1)), eps);
+        var targW = TensorAddScalar(ReLU(TensorSubtract(tx2, tx1)), eps);
+        var targH = TensorAddScalar(ReLU(TensorSubtract(ty2, ty1)), eps);
         var predRatio = TensorDivide(predW, predH);
         var targRatio = TensorDivide(targW, targH);
-        // v computed as scalar per box (atan not available as tensor op, use approximation)
-        // atan(x) ≈ x for small x, which is the ratio. For the penalty we use (ratio_diff)²
-        var ratioDiff = TensorSubtract(targRatio, predRatio);
-        var fourOverPiSq = numOps.FromDouble(4.0 / (Math.PI * Math.PI));
-        var v = TensorMultiplyScalar(TensorMultiply(ratioDiff, ratioDiff), fourOverPiSq);
 
-        // alpha = v / (1 - IoU + v + eps) — detached from gradient for stability
-        // Use approximate alpha: when IoU is high, alpha → v/(v+eps) ≈ 1
-        // For simplicity and gradient stability, use alpha = v / (1 - iou + v + eps)
-        var denomAlpha = TensorAddScalar(TensorAdd(ScalarMinusTensor(numOps.One, iou), v), eps);
-        var alpha = TensorDivide(v, denomAlpha);
+        // Compute atan element-wise (no tensor atan op available, compute per-element)
+        var vData = new T[n];
+        var alphaData = new T[n];
+        var fourOverPiSq = 4.0 / (Math.PI * Math.PI);
+        for (int i = 0; i < n; i++)
+        {
+            double predAtanVal = Math.Atan(numOps.ToDouble(predRatio[i]));
+            double targAtanVal = Math.Atan(numOps.ToDouble(targRatio[i]));
+            double atanDiff = targAtanVal - predAtanVal;
+            double vVal = fourOverPiSq * atanDiff * atanDiff;
+            vData[i] = numOps.FromDouble(vVal);
+            // alpha = v / (1 - IoU + v + eps), detached from gradient per CIoU paper
+            double iouVal = numOps.ToDouble(iou[i]);
+            alphaData[i] = numOps.FromDouble(vVal / (1.0 - iouVal + vVal + 1e-7));
+        }
+        var v = new Tensor<T>(vData, new[] { n });
+        // alpha is detached from gradient (constant w.r.t. backward)
+        var alpha = StopGradient(new Tensor<T>(alphaData, new[] { n }));
 
         // CIoU = IoU - distPenalty - alpha * v
         var aspectPenalty = TensorMultiply(alpha, v);
