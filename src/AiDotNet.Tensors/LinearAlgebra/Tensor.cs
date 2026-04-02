@@ -120,6 +120,16 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Constructor for sparse tensors. The values vector contains only non-zero elements,
+    /// while the logical shape represents the full tensor dimensions.
+    /// Used by <see cref="SparseTensor{T}"/> which inherits from Tensor.
+    /// </summary>
+    internal Tensor(Vector<T> values, int[] logicalShape, bool isSparse)
+        : base(values, logicalShape, isSparse)
+    {
+    }
+
+    /// <summary>
     /// Returns a contiguous tensor with the same data. If already contiguous, returns this
     /// (zero-copy). Otherwise, materializes a new tensor with data in row-major order.
     /// </summary>

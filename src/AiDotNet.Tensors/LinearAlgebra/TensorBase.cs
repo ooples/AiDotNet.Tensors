@@ -134,6 +134,19 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public bool IsView { get; }
 
+    /// <summary>
+    /// Whether this tensor uses sparse storage (COO, CSR, or CSC format).
+    /// When true, the backing data contains only non-zero values — its length
+    /// is less than the logical element count (product of shape dimensions).
+    /// Dense operations must check this flag and dispatch to sparse kernels.
+    /// </summary>
+    /// <remarks>
+    /// <para>This follows the PyTorch model where <c>tensor.is_sparse</c> indicates
+    /// the storage layout. Sparse tensors inherit the full Tensor interface but
+    /// store data efficiently for matrices with many zero elements.</para>
+    /// </remarks>
+    public bool IsSparse { get; }
+
     // ================================================================
     // Cached derived values
     // ================================================================
@@ -295,6 +308,36 @@ public abstract class TensorBase<T> : IDisposable
         _data = Vector<T>.CreateGpuResident(expectedSize);
         _storage = new TensorStorage<T>(_data);
         _device = gpuDevice;
+    }
+
+    /// <summary>
+    /// Constructor for sparse tensors where the backing data contains only non-zero values.
+    /// The logical shape may be larger than the data length (e.g., [1000, 1000] shape
+    /// but only 500 non-zero values stored).
+    /// </summary>
+    /// <param name="values">The non-zero values vector.</param>
+    /// <param name="logicalShape">The full logical shape (e.g., [rows, columns]).</param>
+    /// <remarks>
+    /// <para>This constructor skips the data.Length == product(shape) validation that
+    /// the dense constructors enforce, since sparse tensors intentionally store fewer
+    /// elements than the logical element count.</para>
+    /// </remarks>
+    internal TensorBase(Vector<T> values, int[] logicalShape, bool isSparse)
+    {
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (logicalShape is null) throw new ArgumentNullException(nameof(logicalShape));
+        if (!isSparse) throw new ArgumentException("Use the dense constructor for non-sparse tensors.", nameof(isSparse));
+
+        _shape = (int[])logicalShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(logicalShape);
+        _storageOffset = 0;
+        IsContiguous = false; // Sparse tensors are not contiguous in the dense sense
+        IsView = false;
+        IsSparse = true;
+        Length = ComputeProduct(logicalShape);
+        _data = values;
+        _storage = new TensorStorage<T>(_data);
     }
 
     /// <summary>
