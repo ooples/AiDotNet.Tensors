@@ -3490,8 +3490,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// ```
     /// </para>
     /// </remarks>
-    public Tensor<T> Transpose()
+    public virtual Tensor<T> Transpose()
     {
+
         if (_shape.Length <= 1)
         {
             // 0D/1D tensor: transpose is identity. Return view with same data.

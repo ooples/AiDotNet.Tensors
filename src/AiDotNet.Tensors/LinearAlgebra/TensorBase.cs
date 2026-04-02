@@ -428,11 +428,19 @@ public abstract class TensorBase<T> : IDisposable
     {
         get
         {
+            if (IsSparse)
+                throw new InvalidOperationException(
+                    "Direct indexing is not supported on sparse tensors. " +
+                    "Use SparseTensor-specific APIs or call ToDense() first.");
             ValidateIndices(indices);
             return _data[GetFlatIndex(indices)];
         }
         set
         {
+            if (IsSparse)
+                throw new InvalidOperationException(
+                    "Direct indexing is not supported on sparse tensors. " +
+                    "Use SparseTensor-specific APIs or call ToDense() first.");
             ValidateIndices(indices);
             _data[GetFlatIndex(indices)] = value;
         }
@@ -503,6 +511,10 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public T GetFlat(int flatIndex)
     {
+        if (IsSparse)
+            throw new InvalidOperationException(
+                "GetFlat is not supported on sparse tensors. Use SparseTensor-specific APIs " +
+                "(Values, RowIndices, ColumnIndices) or call ToDense() first.");
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
         if (IsContiguous)

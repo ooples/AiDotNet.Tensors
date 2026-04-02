@@ -21,7 +21,6 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// <item>GPU residency via <c>_gpuBuffer</c> and <c>IsGpuResident</c></item>
 /// <item>Gradient tape tracking via <c>_version</c> counter</item>
 /// <item>RegisterTrainableParameter compatibility in LayerBase</item>
-/// <item>RegisterTrainableParameter compatibility in LayerBase</item>
 /// <item>Engine persistent tensor registration for GPU memory management</item>
 /// </list>
 /// </para>
@@ -373,9 +372,9 @@ public class SparseTensor<T> : Tensor<T>
 
     /// <summary>
     /// Returns a transposed sparse tensor. Format is preserved where possible.
-    /// Hides the base class Transpose which produces a dense transposed view.
+    /// Overrides the base class Transpose to preserve sparse format.
     /// </summary>
-    public new SparseTensor<T> Transpose()
+    public override Tensor<T> Transpose()
     {
         var valuesArray = DataVector.ToArray();
 
