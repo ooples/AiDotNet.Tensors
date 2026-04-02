@@ -494,6 +494,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in LossForwardKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, lossForwardProgram, name);
 
+                // Compile fused linear + activation kernels
+                var fusedLinearProgram = CompileOrLoadCached(Kernels.FusedLinearKernels.GetSource(), optimizationFlags, "Fused linear kernels");
+                _programs.Add(fusedLinearProgram);
+                foreach (var name in Kernels.FusedLinearKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, fusedLinearProgram, name);
+
+                // Compile IoU loss kernels
+                var iouProgram = CompileOrLoadCached(Kernels.IoUKernels.GetSource(), optimizationFlags, "IoU loss kernels");
+                _programs.Add(iouProgram);
+                foreach (var name in Kernels.IoUKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, iouProgram, name);
+
                 // Compile softmax variant + distance kernels
                 var softmaxVarProgram = CompileOrLoadCached(SoftmaxVariantKernels.GetSource(), optimizationFlags, "Softmax variant kernels");
                 _programs.Add(softmaxVarProgram);
@@ -8046,24 +8058,97 @@ KERNEL VARIANTS (A/B testing):
 
         #region StopGradient, Fused Linear, and IoU Operations
 
-        public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-        public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-        public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-        public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-        public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-        public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-        public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-        public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-        public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+        public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearOcl("fused_linear_relu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+        public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearOcl("fused_linear_sigmoid", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+        public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearOcl("fused_linear_tanh", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+        public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearOcl("fused_linear_gelu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+        public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearOcl("fused_linear_swish", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+        public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardOcl("fused_linear_relu_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 0); }
+        public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardOcl("fused_linear_sigmoid_backward_grad_input", gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 1); }
+        public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardOcl("fused_linear_tanh_backward_grad_input", gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 2); }
+        public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardOcl("fused_linear_gelu_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 3); }
+        public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardOcl("fused_linear_swish_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 4); }
+        public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUOcl("iou_loss", predicted, target, loss, numBoxes); }
+        public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUOcl("giou_loss", predicted, target, loss, numBoxes); }
+        public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUOcl("diou_loss", predicted, target, loss, numBoxes); }
+        public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoUOcl("ciou_loss", predicted, target, loss, numBoxes); }
+        public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackwardOcl("iou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+        public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackwardOcl("giou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+        public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackwardOcl("diou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+        public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackwardOcl("ciou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+
+        private void LaunchFusedLinearOcl(string name, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
+        {
+            var k = _kernelCache[name]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weight).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)bias).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, batchSize);
+            k.SetArg(arg++, inFeatures);
+            k.SetArg(arg++, outFeatures);
+            int total = batchSize * outFeatures;
+            k.Execute1D(total, Math.Min(256, total));
+        }
+
+        private void LaunchFusedLinearBackwardOcl(string gradInputKernel, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer saved, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures, int activationType)
+        {
+            // Grad input
+            var k = _kernelCache[gradInputKernel]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)weight).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)saved).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
+            k.SetArg(arg++, batchSize);
+            k.SetArg(arg++, inFeatures);
+            k.SetArg(arg++, outFeatures);
+            int totalIn = batchSize * inFeatures;
+            k.Execute1D(totalIn, Math.Min(256, totalIn));
+
+            // Weight grad
+            var wk = _kernelCache["fused_linear_weight_grad"]; arg = 0;
+            wk.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            wk.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            wk.SetArg(arg++, ((DirectOpenClGpuBuffer)saved).Buffer.Handle);
+            wk.SetArg(arg++, ((DirectOpenClGpuBuffer)gradWeight).Buffer.Handle);
+            wk.SetArg(arg++, batchSize);
+            wk.SetArg(arg++, inFeatures);
+            wk.SetArg(arg++, outFeatures);
+            wk.SetArg(arg++, activationType);
+            int totalW = inFeatures * outFeatures;
+            wk.Execute1D(totalW, Math.Min(256, totalW));
+
+            // Bias grad
+            var bk = _kernelCache["fused_linear_bias_grad"]; arg = 0;
+            bk.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            bk.SetArg(arg++, ((DirectOpenClGpuBuffer)saved).Buffer.Handle);
+            bk.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBias).Buffer.Handle);
+            bk.SetArg(arg++, batchSize);
+            bk.SetArg(arg++, outFeatures);
+            bk.SetArg(arg++, activationType);
+            bk.Execute1D(outFeatures, Math.Min(256, outFeatures));
+        }
+
+        private void LaunchIoUOcl(string name, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+        {
+            var k = _kernelCache[name]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)predicted).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)target).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)loss).Buffer.Handle);
+            k.SetArg(arg++, numBoxes);
+            k.Execute1D(numBoxes, Math.Min(256, numBoxes));
+        }
+
+        private void LaunchIoUBackwardOcl(string name, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
+        {
+            var k = _kernelCache[name]; uint arg = 0;
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)predicted).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)target).Buffer.Handle);
+            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradPredicted).Buffer.Handle);
+            k.SetArg(arg++, numBoxes);
+            k.Execute1D(numBoxes, Math.Min(256, numBoxes));
+        }
 
         #endregion
 
