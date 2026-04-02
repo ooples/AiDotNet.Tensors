@@ -1058,22 +1058,27 @@ public sealed unsafe partial class VulkanBackend
 
     #region StopGradient, Fused Linear, and IoU Operations
 
-    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size) => throw new NotSupportedException("Vulkan CopyBuffer not yet implemented.");
-    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
+    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
+    {
+        // CPU fallback for buffer copy — Vulkan vkCmdCopyBuffer requires command buffer setup
+        throw new NotSupportedException("Vulkan CopyBuffer delegates to CPU StopGradient.");
+    }
+
+    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearReLU, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
+    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearSigmoid, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
+    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearTanh, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
+    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearGELU, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
+    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { GlslQuadOp(VulkanGlslKernels.FusedLinearSwish, input, weight, bias, output, batchSize * outFeatures, new uint[] { (uint)batchSize, (uint)inFeatures, (uint)outFeatures }, 3 * sizeof(uint)); }
+    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException("Vulkan fused backward not yet implemented.");
     public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { GlslBinaryOp(VulkanGlslKernels.IoULoss, predicted, target, loss, numBoxes, new uint[] { (uint)numBoxes }, sizeof(uint)); }
+    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { GlslBinaryOp(VulkanGlslKernels.GIoULoss, predicted, target, loss, numBoxes, new uint[] { (uint)numBoxes }, sizeof(uint)); }
+    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { GlslBinaryOp(VulkanGlslKernels.DIoULoss, predicted, target, loss, numBoxes, new uint[] { (uint)numBoxes }, sizeof(uint)); }
+    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { GlslBinaryOp(VulkanGlslKernels.CIoULoss, predicted, target, loss, numBoxes, new uint[] { (uint)numBoxes }, sizeof(uint)); }
+    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException("Vulkan IoU backward not yet implemented.");
     public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
     public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
     public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
