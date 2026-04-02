@@ -22851,5 +22851,115 @@ public class CpuEngine : ITensorLevelEngine
     public Matrix<T>[] So3AdjointBatch<T>(So3Group<T> group, So3<T>[] rotations)
         => _algebraEngine.So3AdjointBatch(group, rotations);
 
+    /// <inheritdoc />
+    public Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // input: [batch, inputFeatures, 8], weight: [outputFeatures, inputFeatures, 8]
+        int batch = input._shape[0];
+        int inputFeatures = input._shape[1];
+        int outputFeatures = weight._shape[0];
+
+        var output = new Tensor<T>(new[] { batch, outputFeatures, 8 });
+
+        // For each batch and output feature, compute octonion dot product
+        for (int b = 0; b < batch; b++)
+        {
+            for (int o = 0; o < outputFeatures; o++)
+            {
+                // Accumulate octonion product sum
+                var accum = new T[8];
+                for (int i = 0; i < inputFeatures; i++)
+                {
+                    // Get input and weight octonion components
+                    var a = new T[8];
+                    var w = new T[8];
+                    for (int c = 0; c < 8; c++)
+                    {
+                        a[c] = input[b, i, c];
+                        w[c] = weight[o, i, c];
+                    }
+
+                    // Octonion multiplication (Cayley-Dickson): result = a * w
+                    // Split into quaternion pairs: a = (p, q), w = (r, s)
+                    // a*w = (p*r - conj(s)*q, s*p + q*conj(r))
+                    var prod = OctonionMultiply(a, w, numOps);
+
+                    // Accumulate
+                    for (int c = 0; c < 8; c++)
+                        accum[c] = numOps.Add(accum[c], prod[c]);
+                }
+
+                // Write accumulated result
+                for (int c = 0; c < 8; c++)
+                    output[b, o, c] = accum[c];
+            }
+        }
+
+        return output;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> OctonionAddTensor<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Element-wise addition — last dimension is 8 (octonion components)
+        return TensorAdd(a, b);
+    }
+
+    /// <summary>
+    /// Multiplies two octonions represented as T[8] arrays using the Cayley-Dickson construction.
+    /// </summary>
+    private static T[] OctonionMultiply<T>(T[] a, T[] b, INumericOperations<T> ops)
+    {
+        // Cayley-Dickson: split each octonion into two quaternion halves
+        // a = (a0..a3, a4..a7) = (p, q)
+        // b = (b0..b3, b4..b7) = (r, s)
+        // a*b = (p*r - conj(s)*q, s*p + q*conj(r))
+
+        // Quaternion multiply helper
+        static T[] QuatMul(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[]
+            {
+                o.Subtract(o.Subtract(o.Subtract(o.Multiply(x[0], y[0]), o.Multiply(x[1], y[1])), o.Multiply(x[2], y[2])), o.Multiply(x[3], y[3])),
+                o.Add(o.Subtract(o.Add(o.Multiply(x[0], y[1]), o.Multiply(x[1], y[0])), o.Multiply(x[2], y[3])), o.Multiply(x[3], y[2])),
+                o.Add(o.Add(o.Subtract(o.Multiply(x[0], y[2]), o.Multiply(x[1], y[3])), o.Multiply(x[2], y[0])), o.Multiply(x[3], y[1])),
+                o.Subtract(o.Add(o.Add(o.Multiply(x[0], y[3]), o.Multiply(x[1], y[2])), o.Multiply(x[3], y[0])), o.Multiply(x[2], y[1]))
+            };
+        }
+
+        static T[] QuatConj(T[] x, INumericOperations<T> o)
+        {
+            return new T[] { x[0], o.Negate(x[1]), o.Negate(x[2]), o.Negate(x[3]) };
+        }
+
+        static T[] QuatSub(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[] { o.Subtract(x[0], y[0]), o.Subtract(x[1], y[1]), o.Subtract(x[2], y[2]), o.Subtract(x[3], y[3]) };
+        }
+
+        static T[] QuatAdd(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[] { o.Add(x[0], y[0]), o.Add(x[1], y[1]), o.Add(x[2], y[2]), o.Add(x[3], y[3]) };
+        }
+
+        var p = new T[] { a[0], a[1], a[2], a[3] };
+        var q = new T[] { a[4], a[5], a[6], a[7] };
+        var r = new T[] { b[0], b[1], b[2], b[3] };
+        var s = new T[] { b[4], b[5], b[6], b[7] };
+
+        // a*b = (p*r - conj(s)*q, s*p + q*conj(r))
+        var pr = QuatMul(p, r, ops);
+        var conjS_q = QuatMul(QuatConj(s, ops), q, ops);
+        var sp = QuatMul(s, p, ops);
+        var q_conjR = QuatMul(q, QuatConj(r, ops), ops);
+
+        var first = QuatSub(pr, conjS_q, ops);
+        var second = QuatAdd(sp, q_conjR, ops);
+
+        return new T[] { first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3] };
+    }
+
     #endregion
 }
