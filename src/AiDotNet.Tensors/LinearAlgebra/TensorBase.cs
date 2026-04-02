@@ -499,6 +499,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual void CopyFromArray(T[] source)
     {
+        ThrowIfSparse();
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (source.Length != Length)
             throw new ArgumentException($"Source array length ({source.Length}) must match tensor length ({Length}).");

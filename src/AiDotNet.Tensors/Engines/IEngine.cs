@@ -7152,6 +7152,8 @@ public interface IEngine
     /// <summary>
     /// Exponential map on the Poincaré ball: projects a tangent vector at a point onto the manifold.
     /// Formula: exp_x(v) = x ⊕ tanh(√c ||v|| / (1 - c||x||²)) * (v / ||v||)
+    /// The curvature parameter is the negative sectional curvature (e.g., -1.0 for standard hyperbolic space).
+    /// Internally, c = |curvature| is used in formulas where √c appears.
     /// </summary>
     Vector<T> PoincareExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature);
 
@@ -7243,6 +7245,21 @@ public interface IEngine
 
     /// <summary>Octonion-matrix multiplication for neural network layers.</summary>
     Octonion<T>[,] OctonionMatMul<T>(Octonion<T>[,] input, Octonion<T>[,] weight);
+
+    /// <summary>
+    /// Tensor-based octonion matrix multiplication. Input and weight tensors store octonion
+    /// components in the last dimension (size 8). Output tensor has shape [batch, outputFeatures, 8].
+    /// This is the unified Tensor path — no Octonion&lt;T&gt; object allocation needed.
+    /// </summary>
+    /// <param name="input">Input tensor with shape [batch, inputFeatures, 8].</param>
+    /// <param name="weight">Weight tensor with shape [outputFeatures, inputFeatures, 8].</param>
+    /// <returns>Output tensor with shape [batch, outputFeatures, 8].</returns>
+    Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight);
+
+    /// <summary>
+    /// Tensor-based octonion addition. Both tensors must have 8 as last dimension.
+    /// </summary>
+    Tensor<T> OctonionAddTensor<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>Batch geometric product of multivectors.</summary>
     Multivector<T>[] GeometricProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right);
