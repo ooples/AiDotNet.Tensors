@@ -1811,4 +1811,144 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // Fused backward kernels — combine sequential backward ops into
+    // single passes to reduce intermediate allocations and data traversals.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Fused backward for MatMul + Bias Add + ReLU.
+    /// Combines three backward passes into one:
+    /// 1. Apply ReLU mask to gradOutput
+    /// 2. Compute MatMul backward (gradA = maskedGrad @ B^T, gradB = A^T @ maskedGrad)
+    /// 3. Bias gradient = sum of maskedGrad along batch dimension
+    /// Saves 2 intermediate tensor allocations vs separate backward calls.
+    /// </summary>
+    /// <remarks>
+    /// savedState[0] = pre-activation tensor (MatMul + Bias output, before ReLU)
+    /// inputs[0] = input to MatMul (A)
+    /// inputs[1] = weight matrix (B)
+    /// inputs[2] = bias vector
+    /// </remarks>
+    internal static void FusedMatMulAddReLUBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Step 1: Apply ReLU mask — gradient is zero where pre-activation was <= 0
+        var preActivation = (Tensor<T>)savedState[0];
+        var maskedGrad = engine.ReluBackward(gradOutput, preActivation);
+
+        // Step 2: MatMul backward with the already-masked gradient
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
+
+        // Step 3: Bias gradient = sum of maskedGrad along batch dimension (axis 0)
+        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
+
+    /// <summary>
+    /// Fused backward for MatMul + Bias Add + Sigmoid.
+    /// </summary>
+    internal static void FusedMatMulAddSigmoidBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Sigmoid backward: grad * sigmoid(x) * (1 - sigmoid(x)) = grad * output * (1 - output)
+        var maskedGrad = engine.SigmoidBackward(gradOutput, output);
+
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
+
+        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
+
+    /// <summary>
+    /// Fused backward for MatMul + Bias Add + Tanh.
+    /// </summary>
+    internal static void FusedMatMulAddTanhBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Tanh backward: grad * (1 - tanh(x)^2) = grad * (1 - output^2)
+        var maskedGrad = engine.TanhBackward(gradOutput, output);
+
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
+
+        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
+
+    /// <summary>
+    /// Fused backward for MatMul + Bias Add + GELU.
+    /// </summary>
+    internal static void FusedMatMulAddGELUBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var preActivation = (Tensor<T>)savedState[0];
+        var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
+
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
+
+        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
+
+    /// <summary>
+    /// Fused backward for MatMul + Bias Add + Swish/SiLU.
+    /// </summary>
+    internal static void FusedMatMulAddSwishBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var preActivation = (Tensor<T>)savedState[0];
+        // Swish backward: grad * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))
+        var sigmoid = engine.TensorSigmoid(preActivation);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var oneMinusSigmoid = engine.ScalarMinusTensor(numOps.One, sigmoid);
+        var xSigmoidDerivative = engine.TensorMultiply(
+            preActivation, engine.TensorMultiply(sigmoid, oneMinusSigmoid));
+        var swishDerivative = engine.TensorAdd(sigmoid, xSigmoidDerivative);
+        var maskedGrad = engine.TensorMultiply(gradOutput, swishDerivative);
+
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
+
+        var gradBias = engine.ReduceSum(maskedGrad, new[] { 0 }, keepDims: false);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
 }

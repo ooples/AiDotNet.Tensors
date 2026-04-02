@@ -22715,6 +22715,100 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // Fused Linear + Activation Operations
+    // Single tape entry instead of 3, fused backward for performance.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorAdd(linear, bias);
+        var preActivation = biased;
+        var result = ReLU(biased);
+
+        // Replace the 3 separate tape entries with a single fused entry
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddReLUBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorAdd(linear, bias);
+        var result = TensorSigmoid(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearSigmoid", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddSigmoidBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorAdd(linear, bias);
+        var result = Tanh(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearTanh", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddTanhBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorAdd(linear, bias);
+        var preActivation = biased;
+        var result = GELU(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddGELUBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorAdd(linear, bias);
+        var preActivation = biased;
+        var result = Swish(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddSwishBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <summary>
+    /// Removes the last N entries from the active tape. Used by fused ops to replace
+    /// individual entries with a single fused entry.
+    /// </summary>
+    private static void RemoveLastNTapeEntries<T>(int n)
+    {
+        var tape = GradientTape<T>.Current;
+        if (tape is null) return;
+        for (int i = 0; i < n && tape.EntryCount > 0; i++)
+            tape.RemoveLastEntry();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // IoU Loss Operations — Differentiable bounding box regression losses
     // Composed from existing tape-tracked engine ops for automatic backward.
     // ═══════════════════════════════════════════════════════════════════

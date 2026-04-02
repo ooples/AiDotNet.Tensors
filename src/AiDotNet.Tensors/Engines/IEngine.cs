@@ -2553,6 +2553,25 @@ public interface IEngine
     Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
 
     /// <summary>
+    /// Fused MatMul + Bias Add + ReLU forward pass.
+    /// Records a single tape entry with fused backward instead of three separate entries.
+    /// Saves 2 tape entries and 2 intermediate tensor allocations.
+    /// </summary>
+    Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Sigmoid forward pass.</summary>
+    Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Tanh forward pass.</summary>
+    Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + GELU forward pass.</summary>
+    Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Swish/SiLU forward pass.</summary>
+    Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>
     /// Computes the element-wise power of a tensor raised to a scalar exponent.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

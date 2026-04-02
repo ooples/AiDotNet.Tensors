@@ -57,6 +57,16 @@ public sealed class GradientTape<T> : IDisposable
     public int EntryCount => _entries.Count;
 
     /// <summary>
+    /// Removes the last entry from the tape. Used by fused operations to replace
+    /// individual entries with a single fused entry.
+    /// </summary>
+    public void RemoveLastEntry()
+    {
+        if (_entries.Count > 0)
+            _entries.RemoveAt(_entries.Count - 1);
+    }
+
+    /// <summary>
     /// Gets the options for this tape.
     /// </summary>
     public GradientTapeOptions Options => _options;
