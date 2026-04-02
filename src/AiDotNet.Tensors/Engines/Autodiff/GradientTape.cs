@@ -190,7 +190,7 @@ public sealed class GradientTape<T> : IDisposable
             // contribute to any requested gradient. This avoids wasted computation — e.g.,
             // discriminator ops during GAN generator training.
             HashSet<Tensor<T>>? relevantTensors = null;
-            if (sources is not null && sources.Length > 0)
+            if (sources is not null && sources.Count > 0)
             {
                 relevantTensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources)
