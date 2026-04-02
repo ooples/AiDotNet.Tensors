@@ -126,6 +126,14 @@ public sealed class FusedKernelNode : ExecutionNode
                     doubleTensor.MarkModified(markSync);
                     markSyncUsed = true;
                     break;
+                case Tensor<int> intTensor:
+                    intTensor.MarkModified(markSync);
+                    markSyncUsed = true;
+                    break;
+                case Tensor<long> longTensor:
+                    longTensor.MarkModified(markSync);
+                    markSyncUsed = true;
+                    break;
                 case IGpuTensor gpuTensor:
                     gpuTensor.Synchronize();
                     markSyncUsed = true;

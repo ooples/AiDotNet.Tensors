@@ -2492,8 +2492,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
     /// <summary>
     /// Creates a GPU-resident tensor from an existing GPU buffer.
-    /// The tensor's authoritative data is on the GPU — the CPU-side data array is empty
-    /// until explicitly synchronized via <see cref="TensorBase{T}.GetDataArray"/>.
+    /// The tensor's authoritative data is on the GPU — the CPU-side data is a zero-alloc
+    /// placeholder until downloaded via the backend's DownloadBuffer method.
     /// This replaces the legacy <c>GpuTensor&lt;T&gt;</c> type with unified Tensor.
     /// </summary>
     /// <param name="backend">The GPU backend that owns the buffer.</param>

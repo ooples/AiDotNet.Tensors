@@ -10228,11 +10228,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // So I will just implement AddGpu (which I assume exists? No, I saw 'Add' in backend).
         // I need to expose AddGpu (element-wise).
 
-        // Wait, AddGpu probably exists?
-        // I'll check "Element-wise Operations (GPU)" region.
-        // I see SinGpu, CosGpu... AddGpu might be missing from public API in this file?
-        // I will add AddGpu just in case.
-
         int size = a.Length;
         if (size != b.Length)
             throw new ArgumentException($"AddGpu requires matching sizes: {size} vs {b.Length}");

@@ -124,12 +124,20 @@ public sealed class KernelNode : ExecutionNode
                     doubleTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<int> intTensor:
+                case Tensor<int> intTensor:
                     intTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<long> longTensor:
+                case Tensor<long> longTensor:
                     longTensor.MarkModified(syncPoint);
+                    syncPointUsed = true;
+                    break;
+                case IGpuTensor<int> legacyIntTensor:
+                    legacyIntTensor.MarkModified(syncPoint);
+                    syncPointUsed = true;
+                    break;
+                case IGpuTensor<long> legacyLongTensor:
+                    legacyLongTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
             }

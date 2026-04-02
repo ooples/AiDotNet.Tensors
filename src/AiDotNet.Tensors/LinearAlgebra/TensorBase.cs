@@ -165,7 +165,10 @@ public abstract class TensorBase<T> : IDisposable
     internal void MarkModified(Engines.Gpu.GpuSyncPoint? syncPoint)
     {
         IncrementVersion();
+        var previous = _lastWriteSync;
         _lastWriteSync = syncPoint;
+        if (previous is not null && !ReferenceEquals(previous, syncPoint))
+            previous.Dispose();
     }
 
     /// <summary>
@@ -1067,6 +1070,16 @@ public abstract class TensorBase<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Wait for any in-flight GPU operations before releasing the buffer
+        if (_lastWriteSync is not null)
+        {
+            if (!_lastWriteSync.IsComplete)
+                _lastWriteSync.Wait();
+            _lastWriteSync.Dispose();
+            _lastWriteSync = null;
+        }
+
         _storage.Release();
         if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
         {
