@@ -2453,8 +2453,8 @@ public interface IDirectGpuBackend : IDisposable
     #region Fused Kernel Operations
 
     /// <summary>
-    /// Fused hyperbolic linear: matmul + bias + Poincaré projection in a single kernel launch.
-    /// Eliminates intermediate buffer round-trips vs the 3-pass non-fused version.
+    /// Fused hyperbolic linear: matmul + bias + Poincaré projection with no intermediate buffer allocation.
+    /// Uses 2 kernel passes (matmul+bias, then projection) but eliminates the temp buffer of the non-fused version.
     /// </summary>
     void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon);

@@ -494,10 +494,12 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
             }
         }
 
+        var input = RandomFloats(batchSize * inputFeatures * 8, 55, scale: 0.5f);
         using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
+        using var gpuIn = _vulkan.AllocateBuffer(input);
         using var gpuW = _vulkan.AllocateBuffer(weights);
         using var gpuGi = _vulkan.AllocateBuffer(batchSize * inputFeatures * 8);
-        _vulkan.OctonionLinearBackwardInput(gpuGo, default!, gpuW, gpuGi, batchSize, inputFeatures, outputFeatures);
+        _vulkan.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, batchSize, inputFeatures, outputFeatures);
         var gpuGradInput = _vulkan.DownloadBuffer(gpuGi);
 
         AssertArraysClose(cpuGradInput, gpuGradInput, GradTolerance, "OctonionLinearBackwardInput");
@@ -560,21 +562,23 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         SkipIfNoGpu();
         const int B = 2, I = 2, O = 2;
         const float eps = 1e-3f;
+        const float gradTol = 0.05f; // Finite difference tolerance
         var input = RandomFloats(B * I * 8, 42, scale: 0.3f);
         var weights = RandomFloats(O * I * 8, 99, scale: 0.1f);
-        var biases = new float[O * 8]; // zero bias for simplicity
+        var biases = new float[O * 8];
 
-        // Compute forward
+        // Compute forward and analytic gradients via GPU backward
         var output = CpuOctonionLinearForward(input, weights, biases, B, I, O);
+        var gradOutput = (float[])output.Clone(); // dLoss/dOutput = output (for L = ||out||^2 / 2)
 
-        // Scalar loss = sum of output^2 / 2
-        float loss = 0;
-        for (int j = 0; j < output.Length; j++) loss += output[j] * output[j] / 2;
+        // GPU backward for weight gradients
+        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
+        using var gpuIn = _vulkan.AllocateBuffer(input);
+        using var gpuGw = _vulkan.AllocateBuffer(O * I * 8);
+        _vulkan.OctonionLinearBackwardWeights(gpuGo, gpuIn, gpuGw, B, I, O);
+        var analyticGrad = _vulkan.DownloadBuffer(gpuGw);
 
-        // Analytic gradient = output itself (d/d(out) of out^2/2 = out)
-        var gradOutput = (float[])output.Clone();
-
-        // Numerical gradient for weights via finite differences
+        // Compare against numerical gradient via finite differences
         for (int wIdx = 0; wIdx < Math.Min(16, weights.Length); wIdx++)
         {
             var wPlus = (float[])weights.Clone();
@@ -591,10 +595,10 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
             }
             float numericalGrad = (lossPlus - lossMinus) / (2 * eps);
 
-            // Compare against GPU backward
-            // (This validates the Jacobian correctness end-to-end)
             Assert.True(!float.IsNaN(numericalGrad) && !float.IsInfinity(numericalGrad),
                 $"Numerical gradient at weight[{wIdx}] is {numericalGrad}");
+            Assert.True(MathF.Abs(numericalGrad - analyticGrad[wIdx]) < gradTol,
+                $"Gradient mismatch at weight[{wIdx}]: numerical={numericalGrad:G6}, analytic(GPU)={analyticGrad[wIdx]:G6}, diff={MathF.Abs(numericalGrad - analyticGrad[wIdx]):G6}");
         }
     }
 }

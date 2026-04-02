@@ -1772,52 +1772,6 @@ void main() {
 }";
 
     /// <summary>
-    /// Fused hyperbolic linear: matmul + bias + Poincaré projection in a single kernel.
-    /// Each workgroup handles one batch element. Threads within the workgroup cooperate
-    /// to compute all output features, then synchronize to compute the norm and project.
-    /// Push constants: batchSize, inputFeatures, outputFeatures, curvature, epsilon.
-    /// Requires workgroup size >= outputFeatures.
-    /// </summary>
-    public static string HyperbolicLinearForwardFused => @"#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
-layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
-layout(set = 0, binding = 2) readonly buffer BI { float bias[]; };
-layout(set = 0, binding = 3) buffer OUT { float outp[]; };
-layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; float curvature; float epsilon; };
-shared float sharedOutput[256];
-shared float sharedNormSq;
-void main() {
-    uint b = gl_WorkGroupID.x;
-    if (b >= batchSize) return;
-    uint localId = gl_LocalInvocationID.x;
-    uint outBase = b * outputFeatures;
-    // Phase 1: Each thread computes one or more output features (matmul + bias)
-    for (uint o = localId; o < outputFeatures; o += gl_WorkGroupSize.x) {
-        float val = bias[o];
-        for (uint i = 0; i < inputFeatures; i++)
-            val += inp[b * inputFeatures + i] * wt[o * inputFeatures + i];
-        outp[outBase + o] = val;
-        if (o < 256) sharedOutput[o] = val;
-    }
-    barrier();
-    // Phase 2: Compute norm^2 (reduction in shared memory)
-    if (localId == 0) {
-        float sqNorm = 0.0;
-        for (uint o = 0; o < outputFeatures; o++)
-            sqNorm += outp[outBase + o] * outp[outBase + o];
-        sharedNormSq = sqNorm;
-    }
-    barrier();
-    // Phase 3: Project onto Poincaré ball if needed
-    float maxNorm = 1.0 / sqrt(curvature) - epsilon;
-    float norm = sqrt(max(sharedNormSq, 1e-20));
-    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0;
-    for (uint o = localId; o < outputFeatures; o += gl_WorkGroupSize.x)
-        outp[outBase + o] *= scale;
-}";
-
-    /// <summary>
     /// Fused octonion linear forward + ReLU activation.
     /// Combines octonion matmul + bias + ReLU in a single kernel launch.
     /// ReLU is applied component-wise to each of the 8 octonion components.

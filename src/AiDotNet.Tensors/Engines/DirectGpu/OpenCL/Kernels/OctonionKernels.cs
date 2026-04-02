@@ -291,16 +291,14 @@ __kernel void octonion_linear_backward_input(
             weightOct[c] = weights[(o * inputFeatures + i) * 8 + c];
         }
 
-        // Compute Jacobian d(input * weight)/d(input) and apply to gradOutput
-        // Using the transpose of the right multiplication Jacobian
-        float jacA[64];
-        octonion_multiply_jacobian_a(weightOct, jacA);
+        // Forward: r = weight * input, so dr/dinput = jacobian_b(weight)
+        float jacB[64];
+        octonion_multiply_jacobian_b(weightOct, jacB);
 
-        // grad_input += jacA^T * gradOut (matrix-vector multiply)
+        // grad_input += jacB^T * gradOut
         for (int row = 0; row < 8; row++) {
             for (int col = 0; col < 8; col++) {
-                // jacA^T[row, col] = jacA[col, row]
-                gradSum[row] += jacA[col * 8 + row] * gradOut[col];
+                gradSum[row] += jacB[col * 8 + row] * gradOut[col];
             }
         }
     }
@@ -347,16 +345,14 @@ __kernel void octonion_linear_backward_weights(
             inputOct[c] = input[(b * inputFeatures + i) * 8 + c];
         }
 
-        // Compute Jacobian d(input * weight)/d(weight) and apply to gradOutput
-        // Using the transpose of the left multiplication Jacobian evaluated at input
-        float jacB[64];
-        octonion_multiply_jacobian_b(inputOct, jacB);
+        // Forward: r = weight * input, so dr/dweight = jacobian_a(input)
+        float jacA[64];
+        octonion_multiply_jacobian_a(inputOct, jacA);
 
-        // grad_weight += jacB^T * gradOut (matrix-vector multiply)
+        // grad_weight += jacA^T * gradOut
         for (int row = 0; row < 8; row++) {
             for (int col = 0; col < 8; col++) {
-                // jacB^T[row, col] = jacB[col, row]
-                gradSum[row] += jacB[col * 8 + row] * gradOut[col];
+                gradSum[row] += jacA[col * 8 + row] * gradOut[col];
             }
         }
     }
