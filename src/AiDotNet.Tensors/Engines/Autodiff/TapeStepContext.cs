@@ -179,18 +179,18 @@ public sealed class TapeStepContext<T>
         {
             foreach (var param in Parameters)
             {
-                var hasNewGrad = grads.TryGetValue(param, out var newGrad);
-                var hasCached = _cachedGradBuffers.TryGetValue(param, out var cachedBuf);
+                grads.TryGetValue(param, out var newGrad);
+                _cachedGradBuffers.TryGetValue(param, out var cachedBuf);
 
-                if (hasNewGrad && hasCached)
+                if (newGrad is not null && cachedBuf is not null)
                 {
                     _engine.TensorCopy(newGrad, cachedBuf);
                 }
-                else if (hasNewGrad)
+                else if (newGrad is not null)
                 {
                     _cachedGradBuffers[param] = newGrad;
                 }
-                else if (hasCached)
+                else if (cachedBuf is not null)
                 {
                     // Parameter stopped producing gradients — zero the cached buffer
                     // to prevent stale gradients from leaking into the optimizer step
@@ -305,9 +305,12 @@ public sealed class TapeStepContext<T>
             if (Gradients.TryGetValue(p, out var grad))
             {
                 var contiguous = grad.IsContiguous ? grad : grad.Contiguous();
+                if (contiguous.Length != p.Length)
+                    throw new InvalidOperationException(
+                        $"Gradient length ({contiguous.Length}) does not match parameter length ({p.Length}). " +
+                        "Gradient and parameter tensors must have the same number of elements.");
                 var src = contiguous.DataVector.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
-                int copyLen = Math.Min(src.Length, p.Length);
-                src.Slice(0, copyLen).CopyTo(span.Slice(offset, copyLen));
+                src.CopyTo(span.Slice(offset, p.Length));
             }
             offset += p.Length;
         }
@@ -364,5 +367,15 @@ public sealed class TapeStepContext<T>
         if (buffer.TotalSize != expectedTotal)
             throw new ArgumentException(
                 $"ParameterBuffer total size ({buffer.TotalSize}) does not match parameter total ({expectedTotal}).");
+
+        // Verify parameters are actual views into the buffer's storage (shared reference identity)
+        var bufferStorage = buffer.Storage;
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            if (!ReferenceEquals(parameters[i]._storage, bufferStorage))
+                throw new ArgumentException(
+                    $"Parameter {i} is not a view into the provided ParameterBuffer. " +
+                    "Use ParameterBuffer.CreateAllViews() to create parameter tensors backed by the buffer.");
+        }
     }
 }
