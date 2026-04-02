@@ -375,4 +375,32 @@ public class GradientTapeFeatureTests
         Assert.True(Math.Abs(firstDeriv - 12f) < 0.5f,
             $"f'(2) should be ~12, got {firstDeriv}");
     }
+
+    [Fact]
+    public void StopGradient_PreventsGradientFlow()
+    {
+        // y = x * StopGradient(x) should have dy/dx = StopGradient(x) (gradient only flows through first x)
+        var x = new Tensor<float>(new float[] { 3f }, new[] { 1 });
+
+        using var tape = new GradientTape<float>();
+        var stopped = _engine.StopGradient(x);
+        var y = _engine.TensorMultiply(x, stopped);
+
+        var grads = tape.ComputeGradients(y, [x]);
+
+        // dy/dx = stopped = 3 (gradient does NOT flow through the stopped copy)
+        Assert.True(grads.ContainsKey(x), "Should have gradient for x");
+        float grad = grads[x][0];
+        Assert.True(Math.Abs(grad - 3f) < 0.1f,
+            $"dy/dx should be 3 (value of stopped x), got {grad}");
+    }
+
+    [Fact]
+    public void StopGradient_PreservesForwardValue()
+    {
+        var x = new Tensor<float>(new float[] { 5f }, new[] { 1 });
+        var stopped = _engine.StopGradient(x);
+
+        Assert.Equal(5f, stopped[0]);
+    }
 }

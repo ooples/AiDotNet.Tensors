@@ -51,6 +51,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     private IntPtr _comparisonLibrary;
     private IntPtr _randomLibrary;
     private IntPtr _dotProductLibrary;
+    private IntPtr _fusedLinearLibrary;
+    private IntPtr _iouLibrary;
     private IntPtr _hyperbolicLibrary;
     private IntPtr _octonionLibrary;
 
@@ -178,6 +180,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend
 
             // Compile octonion algebra operations
             _octonionLibrary = _shaderLibrary.CompileLibrary("Octonion", MetalKernels.OctonionKernels);
+
+            _fusedLinearLibrary = _shaderLibrary.CompileLibrary("FusedLinear", MetalKernels.FusedLinearKernels);
+            _iouLibrary = _shaderLibrary.CompileLibrary("IoULoss", MetalKernels.IoULossKernels);
         }
         catch (Exception ex)
         {

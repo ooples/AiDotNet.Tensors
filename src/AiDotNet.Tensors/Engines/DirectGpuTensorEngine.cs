@@ -14589,4 +14589,278 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     #endregion
+
+    // ══════════════════════════════════════════════════════════════
+    // GPU overrides for new engine ops
+    // ══════════════════════════════════════════════════════════════
+
+    public override Tensor<T> StopGradient<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
+            {
+                using var src = GetOrAllocateBuffer(backend, tensor);
+                var dst = AllocateOutputBuffer(backend, tensor.Length);
+                try
+                {
+                    backend.CopyBuffer(src.Buffer, dst.Buffer, tensor.Length);
+                    return DeferTensorResult<T>(backend, dst.Buffer, tensor.Length, tensor.Shape._dims);
+                }
+                catch
+                {
+                    dst.Dispose();
+                    throw;
+                }
+            }
+        }
+        catch { }
+        return base.StopGradient(tensor);
+    }
+
+    public override Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+                && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                // Compute matmul+bias (pre-activation) for backward, then apply ReLU
+                var preActBuf = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.Gemm(gi, gw, preActBuf, batchSize, outFeatures, inFeatures);
+                backend.BiasAdd(preActBuf, gb, preActBuf, batchSize, outFeatures);
+                var preActivation = DeferTensorResult<T>(backend, preActBuf, batchSize * outFeatures, new[] { batchSize, outFeatures });
+
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.Relu(preActBuf, go, batchSize * outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward,
+                    new object[] { preActivation });
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearReLU(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+                && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearSigmoid(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                // Sigmoid backward uses output directly: grad * out * (1 - out)
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSigmoid", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSigmoidBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearSigmoid(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+                && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearTanh(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                // Tanh backward uses output directly: grad * (1 - out^2)
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearTanh", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddTanhBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearTanh(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+                && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearGELU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                // GELU backward needs pre-activation (MatMul+Bias output before GELU).
+                // Compute without tape recording to avoid polluting the tape.
+                Tensor<T> preActivation;
+                using (new Autodiff.NoGradScope<T>())
+                {
+                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
+                }
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward,
+                    new object[] { preActivation });
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearGELU(input, weight, bias);
+    }
+
+    public override Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
+                && input.Shape[1] == weight.Shape[0] && bias.Shape.Length == 1 && bias.Shape[0] == weight.Shape[1])
+            {
+                int batchSize = input.Shape[0], inFeatures = input.Shape[1], outFeatures = weight.Shape[1];
+                var gi = UploadTensorRaw(backend, input);
+                var gw = UploadTensorRaw(backend, weight);
+                var gb = UploadTensorRaw(backend, bias);
+                var go = backend.AllocateBuffer(batchSize * outFeatures);
+                backend.FusedLinearSwish(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
+                var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
+                // Swish backward needs pre-activation to compute sigmoid(x) derivative.
+                // Compute without tape recording to avoid polluting the tape.
+                Tensor<T> preActivation;
+                using (new Autodiff.NoGradScope<T>())
+                {
+                    preActivation = base.TensorBroadcastAdd(base.TensorMatMul(input, weight), bias);
+                }
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
+                    new[] { input, weight, bias },
+                    Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward,
+                    new object[] { preActivation });
+                return result;
+            }
+        }
+        catch { }
+        return base.FusedLinearSwish(input, weight, bias);
+    }
+
+    public override Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+                && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
+                && target.Shape.Length == 2 && target.Shape[1] == 4
+                && target.Shape[0] == predicted.Shape[0])
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.IoULoss(gp, gt, go, numBoxes);
+                var result = DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+                Autodiff.DifferentiableOps.RecordIfActive("IoULoss", result,
+                    new[] { predicted, target },
+                    Autodiff.BackwardFunctions<T>.IoULossBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.TensorIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+                && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
+                && target.Shape.Length == 2 && target.Shape[1] == 4
+                && target.Shape[0] == predicted.Shape[0])
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.GIoULoss(gp, gt, go, numBoxes);
+                var result = DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+                Autodiff.DifferentiableOps.RecordIfActive("GIoULoss", result,
+                    new[] { predicted, target },
+                    Autodiff.BackwardFunctions<T>.GIoULossBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.TensorGIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+                && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
+                && target.Shape.Length == 2 && target.Shape[1] == 4
+                && target.Shape[0] == predicted.Shape[0])
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.DIoULoss(gp, gt, go, numBoxes);
+                var result = DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+                Autodiff.DifferentiableOps.RecordIfActive("DIoULoss", result,
+                    new[] { predicted, target },
+                    Autodiff.BackwardFunctions<T>.DIoULossBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.TensorDIoULoss(predicted, target);
+    }
+
+    public override Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        try
+        {
+            if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+                && predicted.Shape.Length == 2 && predicted.Shape[1] == 4
+                && target.Shape.Length == 2 && target.Shape[1] == 4
+                && target.Shape[0] == predicted.Shape[0])
+            {
+                int numBoxes = predicted.Shape[0];
+                var gp = UploadTensorRaw(backend, predicted);
+                var gt = UploadTensorRaw(backend, target);
+                var go = backend.AllocateBuffer(numBoxes);
+                backend.CIoULoss(gp, gt, go, numBoxes);
+                var result = DeferTensorResult<T>(backend, go, numBoxes, new[] { numBoxes });
+                Autodiff.DifferentiableOps.RecordIfActive("CIoULoss", result,
+                    new[] { predicted, target },
+                    Autodiff.BackwardFunctions<T>.CIoULossBackward);
+                return result;
+            }
+        }
+        catch { }
+        return base.TensorCIoULoss(predicted, target);
+    }
 }
