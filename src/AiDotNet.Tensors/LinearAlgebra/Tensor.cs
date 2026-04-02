@@ -2507,15 +2507,15 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Engines.DirectGpu.IGpuBuffer buffer,
         int[] shape,
         Engines.Gpu.GpuTensorRole role = Engines.Gpu.GpuTensorRole.General,
-        bool ownsBuffer = true)
+        bool ownsBuffer = true,
+        TensorDevice device = TensorDevice.CUDA)
     {
-        // Create a tensor with empty CPU data — the GPU buffer is authoritative
-        var tensor = new Tensor<T>(shape);
+        // Create GPU-resident tensor — no CPU backing allocation needed since GPU buffer is authoritative
+        var tensor = new Tensor<T>(shape, device);
         tensor._gpuBuffer = buffer;
         tensor._gpuBackend = backend;
         tensor._gpuRole = role;
-        // Mark as non-CPU; the specific device type is determined by the backend at runtime
-        tensor._device = TensorDevice.CUDA;
+        tensor._ownsGpuBuffer = ownsBuffer;
         return tensor;
     }
 

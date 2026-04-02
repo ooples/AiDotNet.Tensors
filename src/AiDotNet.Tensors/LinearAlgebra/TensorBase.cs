@@ -78,6 +78,11 @@ public abstract class TensorBase<T> : IDisposable
     internal Engines.Gpu.GpuTensorRole _gpuRole;
 
     /// <summary>
+    /// Whether this tensor owns the GPU buffer and should dispose it when the tensor is disposed.
+    /// </summary>
+    internal bool _ownsGpuBuffer;
+
+    /// <summary>
     /// Gets the GPU buffer for this tensor.
     /// Throws if the tensor is CPU-resident — call <see cref="IsGpuResident"/> first to check,
     /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
@@ -1040,6 +1045,11 @@ public abstract class TensorBase<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
         _storage.Release();
+        if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+        {
+            disposableBuffer.Dispose();
+        }
+        _gpuBuffer = null;
         GC.SuppressFinalize(this);
     }
 }
