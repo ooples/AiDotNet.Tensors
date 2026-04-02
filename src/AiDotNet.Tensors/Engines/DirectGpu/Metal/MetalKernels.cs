@@ -4003,7 +4003,7 @@ inline float compute_iou_metal(float px1, float py1, float px2, float py2,
     float iW = max(0.0f, min(px2,tx2) - max(px1,tx1));
     float iH = max(0.0f, min(py2,ty2) - max(py1,ty1));
     float iA = iW * iH;
-    float uA = (px2-px1)*(py2-py1) + (tx2-tx1)*(ty2-ty1) - iA + EPSILON;
+    float uA = max(0.0f,px2-px1)*max(0.0f,py2-py1) + max(0.0f,tx2-tx1)*max(0.0f,ty2-ty1) - iA + EPSILON;
     return iA / uA;
 }
 
@@ -4024,7 +4024,7 @@ kernel void giou_loss(device const float* pred [[buffer(0)]], device const float
     float tx1=targ[o],ty1=targ[o+1],tx2=targ[o+2],ty2=targ[o+3];
     float iou = compute_iou_metal(px1,py1,px2,py2,tx1,ty1,tx2,ty2);
     float iW=max(0.0f,min(px2,tx2)-max(px1,tx1)), iH=max(0.0f,min(py2,ty2)-max(py1,ty1));
-    float iA=iW*iH, pA=(px2-px1)*(py2-py1), tA=(tx2-tx1)*(ty2-ty1), uA=pA+tA-iA+EPSILON;
+    float iA=iW*iH, pA=max(0.0f,px2-px1)*max(0.0f,py2-py1), tA=max(0.0f,tx2-tx1)*max(0.0f,ty2-ty1), uA=pA+tA-iA+EPSILON;
     float eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+EPSILON;
     loss[i] = 1.0f - (iou - (eA-uA)/eA);
 }
@@ -4067,7 +4067,7 @@ kernel void ciou_loss(device const float* pred [[buffer(0)]], device const float
 inline void compute_iou_grad_metal(float px1,float py1,float px2,float py2, float tx1,float ty1,float tx2,float ty2, float go, thread float* grad) {
     float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
     float iw=max(0.0f,ix2-ix1),ih=max(0.0f,iy2-iy1),iA=iw*ih;
-    float pw=px2-px1,ph=py2-py1,pA=pw*ph,tA=(tx2-tx1)*(ty2-ty1);
+    float pw=max(0.0f,px2-px1),ph=max(0.0f,py2-py1),pA=pw*ph,tA=max(0.0f,tx2-tx1)*max(0.0f,ty2-ty1);
     float uA=pA+tA-iA+EPSILON; float hi=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
     float dI0=hi*(-(px1>tx1?1.0f:0.0f))*ih, dI1=hi*(-(py1>ty1?1.0f:0.0f))*iw;
     float dI2=hi*(px2<tx2?1.0f:0.0f)*ih, dI3=hi*(py2<ty2?1.0f:0.0f)*iw;

@@ -1216,7 +1216,8 @@ public sealed partial class WebGpuBackend
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
         var src = DownloadBuffer(source);
-        UploadToBuffer(src, destination);
+        var trimmed = src.Length > size ? src.AsSpan(0, size).ToArray() : src;
+        UploadToBuffer(trimmed, destination);
     }
 
     public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearForward(WebGpuKernels.FusedLinearReLU, input, weight, bias, output, batchSize, inFeatures, outFeatures); }

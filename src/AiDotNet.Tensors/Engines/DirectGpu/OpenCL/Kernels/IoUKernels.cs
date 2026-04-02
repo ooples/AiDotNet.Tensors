@@ -18,8 +18,8 @@ inline float compute_iou_ocl(
     float interW = max(0.0f, interX2 - interX1);
     float interH = max(0.0f, interY2 - interY1);
     float interArea = interW * interH;
-    float predArea = (px2 - px1) * (py2 - py1);
-    float targArea = (tx2 - tx1) * (ty2 - ty1);
+    float predArea = max(0.0f, px2 - px1) * max(0.0f, py2 - py1);
+    float targArea = max(0.0f, tx2 - tx1) * max(0.0f, ty2 - ty1);
     float unionArea = predArea + targArea - interArea + 1e-7f;
     if (interArea_out) *interArea_out = interArea;
     if (unionArea_out) *unionArea_out = unionArea;
@@ -92,8 +92,8 @@ __kernel void ciou_loss(
     float encX1=min(px1,tx1), encY1=min(py1,ty1), encX2=max(px2,tx2), encY2=max(py2,ty2);
     float encDx=encX2-encX1, encDy=encY2-encY1;
     float diagSq = encDx*encDx + encDy*encDy + 1e-7f;
-    float predW=px2-px1+1e-7f, predH=py2-py1+1e-7f;
-    float targW=tx2-tx1+1e-7f, targH=ty2-ty1+1e-7f;
+    float predW=max(px2-px1, 1e-7f), predH=max(py2-py1, 1e-7f);
+    float targW=max(tx2-tx1, 1e-7f), targH=max(ty2-ty1, 1e-7f);
     float rDiff = atan(targW/targH) - atan(predW/predH);
     float v = (4.0f / (3.14159265f * 3.14159265f)) * rDiff * rDiff;
     float alpha = v / (1.0f - iou + v + 1e-7f);
@@ -104,7 +104,7 @@ __kernel void ciou_loss(
 inline void compute_iou_grad_ocl(float px1,float py1,float px2,float py2, float tx1,float ty1,float tx2,float ty2, float go, float* grad) {
     float ix1=max(px1,tx1),iy1=max(py1,ty1),ix2=min(px2,tx2),iy2=min(py2,ty2);
     float iw=max(0.0f,ix2-ix1),ih=max(0.0f,iy2-iy1),iA=iw*ih;
-    float pw=px2-px1,ph=py2-py1,pA=pw*ph,tA=(tx2-tx1)*(ty2-ty1);
+    float pw=max(0.0f,px2-px1),ph=max(0.0f,py2-py1),pA=pw*ph,tA=max(0.0f,tx2-tx1)*max(0.0f,ty2-ty1);
     float uA=pA+tA-iA+1e-7f; float hi=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
     float dI0=hi*(-(px1>tx1?1.0f:0.0f))*ih, dI1=hi*(-(py1>ty1?1.0f:0.0f))*iw;
     float dI2=hi*(px2<tx2?1.0f:0.0f)*ih, dI3=hi*(py2<ty2?1.0f:0.0f)*iw;

@@ -14632,7 +14632,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var go = backend.AllocateBuffer(batchSize * outFeatures);
                 backend.FusedLinearReLU(gi, gw, gb, go, batchSize, inFeatures, outFeatures);
                 var result = DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
-                // ReLU backward derives mask from post-activation output (>0 check), so result is correct here.
+                // ReLU backward derives mask from (value > 0). Post-activation works because
+                // ReLU(x) > 0 iff x > 0, so the mask is identical to pre-activation.
                 Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
                     new[] { input, weight, bias },
                     Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward,

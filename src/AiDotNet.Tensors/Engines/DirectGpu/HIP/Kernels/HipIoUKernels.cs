@@ -35,8 +35,8 @@ __device__ __forceinline__ float compute_iou(
     float interW = max_f(0.0f, interX2 - interX1);
     float interH = max_f(0.0f, interY2 - interY1);
     float interArea = interW * interH;
-    float predArea = (px2 - px1) * (py2 - py1);
-    float targArea = (tx2 - tx1) * (ty2 - ty1);
+    float predArea = max_f(0.0f, px2 - px1) * max_f(0.0f, py2 - py1);
+    float targArea = max_f(0.0f, tx2 - tx1) * max_f(0.0f, ty2 - ty1);
     float unionArea = predArea + targArea - interArea + 1e-7f;
     if (interArea_out) *interArea_out = interArea;
     if (unionArea_out) *unionArea_out = unionArea;
@@ -259,7 +259,7 @@ extern ""C"" __global__ void giou_loss_backward(
     // IoU components for penalty term
     float ix1=max_f(px1,tx1), iy1=max_f(py1,ty1), ix2=min_f(px2,tx2), iy2=min_f(py2,ty2);
     float iw=max_f(0.0f,ix2-ix1), ih=max_f(0.0f,iy2-iy1), iA=iw*ih;
-    float pw=px2-px1, ph=py2-py1, pA=pw*ph, tA=(tx2-tx1)*(ty2-ty1);
+    float pw=max_f(0.0f,px2-px1), ph=max_f(0.0f,py2-py1), pA=pw*ph, tA=max_f(0.0f,tx2-tx1)*max_f(0.0f,ty2-ty1);
     float uA=pA+tA-iA+1e-7f;
     float hasInter=(iw>0.0f&&ih>0.0f)?1.0f:0.0f;
 
@@ -390,7 +390,7 @@ extern ""C"" __global__ void ciou_loss_backward(
     dCSq[3] = 2.0f*encDy*(py2>ty2?1.0f:0.0f);
 
     // Aspect ratio: v = (4/π²) * (atan(tw/th) - atan(pw/ph))²
-    float pw=px2-px1+1e-7f, ph=py2-py1+1e-7f;
+    float pw=max_f(px2-px1, 1e-7f), ph=max_f(py2-py1, 1e-7f);
     float tw=tx2-tx1+1e-7f, th=ty2-ty1+1e-7f;
     float atanDiff = atanf(tw/th) - atanf(pw/ph);
     float fourOverPiSq = 4.0f / (3.14159265f * 3.14159265f);
