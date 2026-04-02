@@ -89,6 +89,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
     public bool IsAvailable { get; }
     public string BackendName => $"HIP ({GetKernelTypeName()})";
+    public TensorDevice DeviceType => TensorDevice.HIP;
     public string DeviceName { get; }
 
     private string GetKernelTypeName()

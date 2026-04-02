@@ -34,6 +34,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual string BackendName => Inner.BackendName;
+    public virtual TensorDevice DeviceType => Inner.DeviceType;
 
     /// <inheritdoc/>
     public virtual string DeviceName => Inner.DeviceName;

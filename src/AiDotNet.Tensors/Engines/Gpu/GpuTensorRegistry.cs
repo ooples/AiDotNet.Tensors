@@ -78,15 +78,23 @@ public sealed class GpuTensorRegistry : IDisposable
     /// <returns>A registration handle that should be kept while the tensor is in use.</returns>
     public TensorRegistration Register<T>(IGpuTensor<T> tensor)
     {
+        return RegisterBuffer(tensor.Buffer, tensor.Role);
+    }
+
+    /// <summary>
+    /// Registers a GPU buffer allocation for memory tracking.
+    /// Works with both legacy IGpuTensor and unified Tensor types.
+    /// </summary>
+    public TensorRegistration RegisterBuffer(DirectGpu.IGpuBuffer buffer, GpuTensorRole role)
+    {
         ThrowIfDisposed();
 
         int id = Interlocked.Increment(ref _nextId);
-        var entry = new TensorEntry(id, tensor.Buffer, tensor.Role, tensor.Buffer.SizeInBytes);
+        var entry = new TensorEntry(id, buffer, role, buffer.SizeInBytes);
         _tensors.TryAdd(id, entry);
 
         Interlocked.Add(ref _totalAllocatedBytes, entry.SizeInBytes);
 
-        // Check memory pressure after registration
         if (IsUnderMemoryPressure)
         {
             TryEvictLeastUsed();

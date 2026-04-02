@@ -65,6 +65,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend
     /// Gets the backend name.
     /// </summary>
     public string BackendName => "Metal";
+    public TensorDevice DeviceType => TensorDevice.Metal;
 
     /// <summary>
     /// Gets the GPU device name.

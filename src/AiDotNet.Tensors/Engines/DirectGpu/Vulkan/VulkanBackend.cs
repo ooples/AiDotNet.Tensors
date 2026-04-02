@@ -74,6 +74,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// Gets the backend name.
     /// </summary>
     public string BackendName => "Vulkan";
+    public TensorDevice DeviceType => TensorDevice.Vulkan;
 
     /// <summary>
     /// Gets the device name.

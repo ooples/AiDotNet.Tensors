@@ -149,6 +149,7 @@ public sealed class GpuExecutionContext : IDisposable
         ThrowIfDisposed();
         var floatData = DirectGpu.DirectGpuEngine.ToFloatArray(tensor.GetDataArray());
         var buffer = _backend.AllocateBuffer(floatData);
+        Registry.RegisterBuffer(buffer, role);
         var gpuTensor = Tensor<T>.FromGpuBuffer(_backend, buffer, tensor._shape, role);
         return gpuTensor;
     }
@@ -161,6 +162,7 @@ public sealed class GpuExecutionContext : IDisposable
         ThrowIfDisposed();
         var floatData = DirectGpu.DirectGpuEngine.ToFloatArray(data);
         var buffer = _backend.AllocateBuffer(floatData);
+        Registry.RegisterBuffer(buffer, role);
         var gpuTensor = Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
         return gpuTensor;
     }
@@ -174,6 +176,7 @@ public sealed class GpuExecutionContext : IDisposable
         int size = 1;
         foreach (var d in shape) size *= d;
         var buffer = _backend.AllocateBuffer(size);
+        Registry.RegisterBuffer(buffer, role);
         return Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
     }
 
@@ -186,6 +189,7 @@ public sealed class GpuExecutionContext : IDisposable
         int size = 1;
         foreach (var d in shape) size *= d;
         var buffer = _backend.AllocateBuffer(new float[size]);
+        Registry.RegisterBuffer(buffer, role);
         return Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
     }
 
