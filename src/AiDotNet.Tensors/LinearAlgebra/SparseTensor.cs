@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// <list type="bullet">
 /// <item>GPU residency via <c>_gpuBuffer</c> and <c>IsGpuResident</c></item>
 /// <item>Gradient tape tracking via <c>_version</c> counter</item>
-/// <item>ParameterBuffer integration for contiguous optimizer access</item>
+/// <item>RegisterTrainableParameter compatibility in LayerBase</item>
 /// <item>RegisterTrainableParameter compatibility in LayerBase</item>
 /// <item>Engine persistent tensor registration for GPU memory management</item>
 /// </list>
@@ -81,10 +81,16 @@ public class SparseTensor<T> : Tensor<T>
     public int NonZeroCount => DataVector.Length;
 
     /// <summary>
+    /// Gets the non-zero values as an array. Backward-compatible accessor.
+    /// For zero-copy span access, use <c>DataVector.AsSpan()</c> instead.
+    /// </summary>
+    public T[] Values => DataVector.ToArray();
+
+    /// <summary>
     /// Creates a COO-format sparse tensor.
     /// </summary>
     public SparseTensor(int rows, int columns, int[] rowIndices, int[] columnIndices, T[] values)
-        : base(new Vector<T>(values ?? throw new ArgumentNullException(nameof(values))),
+        : base(Vector<T>.Wrap(values ?? throw new ArgumentNullException(nameof(values))),
                new[] { rows, columns }, isSparse: true)
     {
         if (rows < 0)
@@ -109,7 +115,7 @@ public class SparseTensor<T> : Tensor<T>
 
     private SparseTensor(int rows, int columns, SparseStorageFormat format,
         int[] rowIndices, int[] columnIndices, int[] rowPointers, int[] columnPointers, T[] values)
-        : base(new Vector<T>(values), new[] { rows, columns }, isSparse: true)
+        : base(Vector<T>.Wrap(values), new[] { rows, columns }, isSparse: true)
     {
         Rows = rows;
         Columns = columns;
@@ -367,8 +373,9 @@ public class SparseTensor<T> : Tensor<T>
 
     /// <summary>
     /// Returns a transposed sparse tensor. Format is preserved where possible.
+    /// Hides the base class Transpose which produces a dense transposed view.
     /// </summary>
-    public SparseTensor<T> TransposeSparse()
+    public new SparseTensor<T> Transpose()
     {
         var valuesArray = DataVector.ToArray();
 
@@ -386,6 +393,7 @@ public class SparseTensor<T> : Tensor<T>
     /// </summary>
     public Tensor<T> ToDense()
     {
+        var ops = MathHelper.GetNumericOperations<T>();
         var dense = new Tensor<T>(new[] { Rows, Columns });
         if (NonZeroCount == 0) return dense;
 
@@ -393,7 +401,10 @@ public class SparseTensor<T> : Tensor<T>
         var cooValues = coo.DataVector.ToArray();
         for (int i = 0; i < cooValues.Length; i++)
         {
-            dense[coo.RowIndices[i], coo.ColumnIndices[i]] = cooValues[i];
+            int r = coo.RowIndices[i];
+            int c = coo.ColumnIndices[i];
+            // Accumulate duplicates instead of overwriting (handles uncoalesced COO)
+            dense[r, c] = ops.Add(dense[r, c], cooValues[i]);
         }
 
         return dense;

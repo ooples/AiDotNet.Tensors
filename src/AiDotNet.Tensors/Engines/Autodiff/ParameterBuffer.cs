@@ -161,15 +161,15 @@ public sealed class ParameterBuffer<T>
     /// Use this to initialize the buffer from a model's current weights.
     /// </summary>
     /// <param name="parameters">The parameter tensors to copy from, in order.</param>
-    public void CopyFrom(Tensor<T>[] parameters)
+    public void CopyFrom(IReadOnlyList<Tensor<T>> parameters)
     {
-        if (parameters.Length != _shapes.Length)
+        if (parameters.Count != _shapes.Length)
             throw new ArgumentException(
-                $"Expected {_shapes.Length} parameter tensors, got {parameters.Length}.",
+                $"Expected {_shapes.Length} parameter tensors, got {parameters.Count}.",
                 nameof(parameters));
 
         var bufferSpan = _data.AsWritableSpan();
-        for (int i = 0; i < parameters.Length; i++)
+        for (int i = 0; i < parameters.Count; i++)
         {
             var param = parameters[i];
             // Ensure contiguous layout before copying raw storage
@@ -217,12 +217,12 @@ public sealed class ParameterBuffer<T>
     /// <param name="parameters">The parameter tensors (same order as buffer).</param>
     /// <param name="gradients">Gradient dictionary keyed by parameter tensor identity.</param>
     /// <returns>A flat gradient vector aligned with the buffer layout.</returns>
-    public Vector<T> FlattenGradients(Tensor<T>[] parameters, Dictionary<Tensor<T>, Tensor<T>> gradients)
+    public Vector<T> FlattenGradients(IReadOnlyList<Tensor<T>> parameters, Dictionary<Tensor<T>, Tensor<T>> gradients)
     {
         var flatGrad = new Vector<T>(_totalSize);
         var gradSpan = flatGrad.AsWritableSpan();
 
-        for (int i = 0; i < parameters.Length; i++)
+        for (int i = 0; i < parameters.Count; i++)
         {
             if (gradients.TryGetValue(parameters[i], out var grad))
             {

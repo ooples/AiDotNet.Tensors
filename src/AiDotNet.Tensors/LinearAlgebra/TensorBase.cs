@@ -327,14 +327,20 @@ public abstract class TensorBase<T> : IDisposable
         if (values is null) throw new ArgumentNullException(nameof(values));
         if (logicalShape is null) throw new ArgumentNullException(nameof(logicalShape));
         if (!isSparse) throw new ArgumentException("Use the dense constructor for non-sparse tensors.", nameof(isSparse));
+        ValidateShape(logicalShape);
 
         _shape = (int[])logicalShape.Clone();
         Shape = TensorShape.WrapUnsafe(_shape);
+        // Strides describe the logical dense layout for shape queries.
+        // Sparse tensors must NOT use strides for data access — use sparse indices instead.
         _strides = ComputeRowMajorStrides(logicalShape);
         _storageOffset = 0;
         IsContiguous = false; // Sparse tensors are not contiguous in the dense sense
         IsView = false;
         IsSparse = true;
+        // Length is the logical element count (product of shape), NOT _data.Length.
+        // Dense APIs (indexers, GetFlat, AsSpan, etc.) check IsSparse and throw
+        // if called on sparse tensors — use SparseTensor-specific APIs instead.
         Length = ComputeProduct(logicalShape);
         _data = values;
         _storage = new TensorStorage<T>(_data);

@@ -59,7 +59,7 @@ public sealed class TapeStepContext<T>
     /// The trainable parameter tensors — same references used in the layer's Forward pass.
     /// Optimizers modify these in-place.
     /// </summary>
-    public Tensor<T>[] Parameters { get; }
+    public IReadOnlyList<Tensor<T>> Parameters { get; }
 
     /// <summary>
     /// Gradients of the loss with respect to each parameter, keyed by tensor reference identity.
@@ -92,7 +92,7 @@ public sealed class TapeStepContext<T>
     /// <param name="loss">Scalar loss value.</param>
     /// <param name="parameterBuffer">Optional contiguous parameter buffer for zero-copy flat access.</param>
     public TapeStepContext(
-        Tensor<T>[] parameters,
+        IReadOnlyList<Tensor<T>> parameters,
         Dictionary<Tensor<T>, Tensor<T>> gradients,
         T loss,
         ParameterBuffer<T>? parameterBuffer = null)
@@ -120,7 +120,7 @@ public sealed class TapeStepContext<T>
     /// <param name="lossFn">Loss function: (prediction, target) → scalar loss tensor.</param>
     /// <param name="parameterBuffer">Optional contiguous parameter buffer for zero-copy flat access.</param>
     public TapeStepContext(
-        Tensor<T>[] parameters,
+        IReadOnlyList<Tensor<T>> parameters,
         Dictionary<Tensor<T>, Tensor<T>> gradients,
         T loss,
         Tensor<T> input,
@@ -355,11 +355,11 @@ public sealed class TapeStepContext<T>
         }
     }
 
-    private static void ValidateBufferAlignment(Tensor<T>[] parameters, ParameterBuffer<T> buffer)
+    private static void ValidateBufferAlignment(IReadOnlyList<Tensor<T>> parameters, ParameterBuffer<T> buffer)
     {
-        if (buffer.Count != parameters.Length)
+        if (buffer.Count != parameters.Count)
             throw new ArgumentException(
-                $"ParameterBuffer has {buffer.Count} slots but {parameters.Length} parameters were provided. " +
+                $"ParameterBuffer has {buffer.Count} slots but {parameters.Count} parameters were provided. " +
                 "The buffer must have been created with the same parameter shapes in the same order.");
 
         int expectedTotal = 0;
@@ -370,7 +370,7 @@ public sealed class TapeStepContext<T>
 
         // Verify parameters are actual views into the buffer's storage (shared reference identity)
         var bufferStorage = buffer.Storage;
-        for (int i = 0; i < parameters.Length; i++)
+        for (int i = 0; i < parameters.Count; i++)
         {
             if (!ReferenceEquals(parameters[i]._storage, bufferStorage))
                 throw new ArgumentException(
