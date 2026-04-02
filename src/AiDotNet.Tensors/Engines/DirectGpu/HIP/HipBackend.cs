@@ -78,6 +78,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _shapeModule;
     private IntPtr _lossModule;
     private IntPtr _softmaxVarModule;
+    private IntPtr _fusedLinearModule;
+    private IntPtr _iouModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -488,6 +490,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             // Compile LSTM sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipLstmKernels.GetSource(), "lstm", ref _lstmModule,
                 HipLstmKernels.GetKernelNames());
+
+            // Compile Fused Linear + Activation kernels
+            CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,
+                Kernels.HipFusedLinearKernels.GetKernelNames());
+
+            // Compile IoU loss kernels
+            CompileKernelModule(Kernels.HipIoUKernels.GetSource(), "iou", ref _iouModule,
+                Kernels.HipIoUKernels.GetKernelNames());
 
             // Compile GRU sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipGruKernels.GetSource(), "gru", ref _gruModule,
@@ -2238,6 +2248,97 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
     }
+
+    #region StopGradient, Fused Linear, and IoU Operations
+
+    public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
+    {
+        if (size <= 0) return;
+        var result = HipNativeBindings.hipMemcpy(destination.Handle, source.Handle, (nuint)(size * sizeof(float)), HipMemcpyKind.DeviceToDevice);
+        HipNativeBindings.CheckError(result, "hipMemcpy CopyBuffer");
+    }
+
+    public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_relu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_sigmoid", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_tanh", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_gelu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_swish", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardHip("fused_linear_relu_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 0); }
+    public unsafe void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardHip("fused_linear_sigmoid_backward_grad_input", gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 1); }
+    public unsafe void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardHip("fused_linear_tanh_backward_grad_input", gradOutput, input, weight, output, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 2); }
+    public unsafe void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardHip("fused_linear_gelu_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 3); }
+    public unsafe void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinearBackwardHip("fused_linear_swish_backward_grad_input", gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias, batchSize, inFeatures, outFeatures, 4); }
+    public unsafe void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("iou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("giou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("diou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("ciou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("iou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("giou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("diou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("ciou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+
+    private unsafe void LaunchFusedLinear(string kernelName, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        int total = batchSize * outFeatures;
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7]; args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(krnl, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
+
+    private unsafe void LaunchIoU(string kernelName, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4]; args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
+
+    private unsafe void LaunchIoUBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
+        LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
+
+    private unsafe void LaunchFusedLinearBackwardHip(string gradInputKernel, IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer weight, IGpuBuffer saved, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
+        int batchSize, int inFeatures, int outFeatures, int activationType)
+    {
+        // Kernel 1: grad_input
+        if (!_kernelCache.TryGetValue(gradInputKernel, out var giKernel))
+            throw new InvalidOperationException($"HIP kernel not found: {gradInputKernel}");
+        int totalIn = batchSize * inFeatures;
+        IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, sPtr = saved.Handle, giPtr = gradInput.Handle;
+        void** argsGI = stackalloc void*[7];
+        argsGI[0] = &goPtr; argsGI[1] = &wPtr; argsGI[2] = &sPtr; argsGI[3] = &giPtr;
+        argsGI[4] = &batchSize; argsGI[5] = &inFeatures; argsGI[6] = &outFeatures;
+        LaunchKernel(giKernel, (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsGI);
+
+        // Kernel 2: weight gradient
+        if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
+            throw new InvalidOperationException("HIP kernel not found: fused_linear_weight_grad");
+        int totalW = inFeatures * outFeatures;
+        IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
+        void** argsWG = stackalloc void*[8];
+        argsWG[0] = &goPtr; argsWG[1] = &iPtr; argsWG[2] = &sPtr; argsWG[3] = &gwPtr;
+        argsWG[4] = &batchSize; argsWG[5] = &inFeatures; argsWG[6] = &outFeatures; argsWG[7] = &activationType;
+        LaunchKernel(wgKernel, (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsWG);
+
+        // Kernel 3: bias gradient
+        if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
+            throw new InvalidOperationException("HIP kernel not found: fused_linear_bias_grad");
+        IntPtr gbPtr = gradBias.Handle;
+        void** argsBG = stackalloc void*[6];
+        argsBG[0] = &goPtr; argsBG[1] = &sPtr; argsBG[2] = &gbPtr;
+        argsBG[3] = &batchSize; argsBG[4] = &outFeatures; argsBG[5] = &activationType;
+        LaunchKernel(bgKernel, (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsBG);
+        Synchronize();
+    }
+
+    #endregion
 
     #region Trigonometric Operations
 
@@ -9900,12 +10001,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _iouModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _iouModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

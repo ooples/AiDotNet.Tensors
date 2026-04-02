@@ -3768,6 +3768,19 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> StopGradient<T>(Tensor<T> tensor)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
+        // Copy data to a new tensor with no tape connection.
+        // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
+        var result = TensorAllocator.Rent<T>(tensor._shape);
+        tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -17222,6 +17235,9 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
         numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
 
+        // d(scalar - x)/dx = -1, so gradient is negated
+        DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensor, BackwardFunctions<T>.NegateBackward);
+
         return result;
     }
 
@@ -22701,6 +22717,380 @@ public class CpuEngine : ITensorLevelEngine
 
             dstData[dstFlat] = srcData[i];
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Fused Linear + Activation Operations
+    // Single tape entry instead of 3, fused backward for performance.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorBroadcastAdd(linear, bias);
+        var preActivation = biased;
+        var result = ReLU(biased);
+
+        // Replace the 3 separate tape entries with a single fused entry
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddReLUBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorBroadcastAdd(linear, bias);
+        var result = TensorSigmoid(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearSigmoid", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddSigmoidBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorBroadcastAdd(linear, bias);
+        var result = Tanh(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearTanh", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddTanhBackward);
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorBroadcastAdd(linear, bias);
+        var preActivation = biased;
+        var result = GELU(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearGELU", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddGELUBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
+    {
+        var linear = TensorMatMul(input, weight);
+        var biased = TensorBroadcastAdd(linear, bias);
+        var preActivation = biased;
+        var result = Swish(biased);
+
+        RemoveLastNTapeEntries<T>(3);
+        DifferentiableOps.RecordIfActive("FusedLinearSwish", result,
+            new[] { input, weight, bias },
+            BackwardFunctions<T>.FusedMatMulAddSwishBackward,
+            new object[] { preActivation });
+        return result;
+    }
+
+    /// <summary>
+    /// Removes the last N entries from the active tape. Used by fused ops to replace
+    /// individual entries with a single fused entry.
+    /// </summary>
+    private static void RemoveLastNTapeEntries<T>(int n)
+    {
+        if (NoGradScope<T>.IsSuppressed) return;
+        var tape = GradientTape<T>.Current;
+        if (tape is null) return;
+        for (int i = 0; i < n && tape.EntryCount > 0; i++)
+            tape.RemoveLastEntry();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // IoU Loss Operations — Differentiable bounding box regression losses
+    // Composed from existing tape-tracked engine ops for automatic backward.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
+
+        int n = predicted.Shape[0];
+
+        // Extract coordinates: [N] tensors for each coordinate
+        // TensorSlice(tensor, start, length) — length is always [n, 1] for single column
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 });
+
+        // Intersection: max(0, min(x2_p, x2_t) - max(x1_p, x1_t)) * max(0, min(y2_p, y2_t) - max(y1_p, y1_t))
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        // min(a,b) = -max(-a,-b)
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+
+        // Union: area_p + area_t - intersection, clamp widths/heights >= 0
+        var predW = ReLU(TensorSubtract(px2, px1));
+        var predH = ReLU(TensorSubtract(py2, py1));
+        var predArea = TensorMultiply(predW, predH);
+        var targW = ReLU(TensorSubtract(tx2, tx1));
+        var targH = ReLU(TensorSubtract(ty2, ty1));
+        var targArea = TensorMultiply(targW, targH);
+        var eps = MathHelper.GetNumericOperations<T>().FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+
+        // IoU = intersection / union
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Loss = 1 - IoU
+        return ScalarMinusTensor(MathHelper.GetNumericOperations<T>().One, iou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 });
+
+        // Intersection
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+
+        // Union with clamped widths/heights
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+
+        // IoU
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Enclosing box
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encArea = TensorAddScalar(
+            TensorMultiply(TensorSubtract(encX2, encX1), TensorSubtract(encY2, encY1)), eps);
+
+        // GIoU = IoU - (enclosing_area - union_area) / enclosing_area
+        var fillRatio = TensorDivide(TensorSubtract(encArea, unionArea), encArea);
+        var giou = TensorSubtract(iou, fillRatio);
+
+        // Loss = 1 - GIoU
+        return ScalarMinusTensor(numOps.One, giou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 });
+
+        // IoU with clamped areas
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Center distance squared
+        var half = numOps.FromDouble(0.5);
+        var pcx = TensorMultiplyScalar(TensorAdd(px1, px2), half);
+        var pcy = TensorMultiplyScalar(TensorAdd(py1, py2), half);
+        var tcx = TensorMultiplyScalar(TensorAdd(tx1, tx2), half);
+        var tcy = TensorMultiplyScalar(TensorAdd(ty1, ty2), half);
+        var dx = TensorSubtract(pcx, tcx);
+        var dy = TensorSubtract(pcy, tcy);
+        var centerDistSq = TensorAdd(TensorMultiply(dx, dx), TensorMultiply(dy, dy));
+
+        // Enclosing diagonal squared
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encDx = TensorSubtract(encX2, encX1);
+        var encDy = TensorSubtract(encY2, encY1);
+        var diagSq = TensorAddScalar(TensorAdd(TensorMultiply(encDx, encDx), TensorMultiply(encDy, encDy)), eps);
+
+        // DIoU = IoU - centerDistSq / diagSq
+        var penalty = TensorDivide(centerDistSq, diagSq);
+        var diou = TensorSubtract(iou, penalty);
+
+        return ScalarMinusTensor(numOps.One, diou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+        if (target.Shape.Length != 2 || target.Shape[1] != 4)
+            throw new ArgumentException("Target must be [N, 4] in (x1, y1, x2, y2) format.", nameof(target));
+        if (target.Shape[0] != predicted.Shape[0])
+            throw new ArgumentException("Target batch size must match predicted batch size.", nameof(target));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 1 });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 1 });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 1 });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 1 });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 1 });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 1 });
+
+        // IoU with clamped areas
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+        var predArea = TensorMultiply(ReLU(TensorSubtract(px2, px1)), ReLU(TensorSubtract(py2, py1)));
+        var targArea = TensorMultiply(ReLU(TensorSubtract(tx2, tx1)), ReLU(TensorSubtract(ty2, ty1)));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Center distance
+        var half = numOps.FromDouble(0.5);
+        var pcx = TensorMultiplyScalar(TensorAdd(px1, px2), half);
+        var pcy = TensorMultiplyScalar(TensorAdd(py1, py2), half);
+        var tcx = TensorMultiplyScalar(TensorAdd(tx1, tx2), half);
+        var tcy = TensorMultiplyScalar(TensorAdd(ty1, ty2), half);
+        var dx = TensorSubtract(pcx, tcx);
+        var dy = TensorSubtract(pcy, tcy);
+        var centerDistSq = TensorAdd(TensorMultiply(dx, dx), TensorMultiply(dy, dy));
+
+        // Enclosing diagonal
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encDx = TensorSubtract(encX2, encX1);
+        var encDy = TensorSubtract(encY2, encY1);
+        var diagSq = TensorAddScalar(TensorAdd(TensorMultiply(encDx, encDx), TensorMultiply(encDy, encDy)), eps);
+
+        // DIoU penalty
+        var distPenalty = TensorDivide(centerDistSq, diagSq);
+
+        // Aspect ratio consistency: v = (4/pi^2) * (atan(w_t/h_t) - atan(w_p/h_p))^2
+        // Use proper atan per the CIoU paper (Zheng et al., 2020)
+        var predW = TensorAddScalar(ReLU(TensorSubtract(px2, px1)), eps);
+        var predH = TensorAddScalar(ReLU(TensorSubtract(py2, py1)), eps);
+        var targW = TensorAddScalar(ReLU(TensorSubtract(tx2, tx1)), eps);
+        var targH = TensorAddScalar(ReLU(TensorSubtract(ty2, ty1)), eps);
+        var predRatio = TensorDivide(predW, predH);
+        var targRatio = TensorDivide(targW, targH);
+
+        // Compute atan element-wise (no tensor atan op available, compute per-element)
+        var vData = new T[n];
+        var alphaData = new T[n];
+        var fourOverPiSq = 4.0 / (Math.PI * Math.PI);
+        for (int i = 0; i < n; i++)
+        {
+            double predAtanVal = Math.Atan(numOps.ToDouble(predRatio[i]));
+            double targAtanVal = Math.Atan(numOps.ToDouble(targRatio[i]));
+            double atanDiff = targAtanVal - predAtanVal;
+            double vVal = fourOverPiSq * atanDiff * atanDiff;
+            vData[i] = numOps.FromDouble(vVal);
+            // alpha = v / (1 - IoU + v + eps), detached from gradient per CIoU paper
+            double iouVal = numOps.ToDouble(iou[i]);
+            alphaData[i] = numOps.FromDouble(vVal / (1.0 - iouVal + vVal + 1e-7));
+        }
+        var v = new Tensor<T>(vData, new[] { n, 1 });
+        // alpha is detached from gradient (constant w.r.t. backward)
+        var alpha = StopGradient(new Tensor<T>(alphaData, new[] { n, 1 }));
+
+        // CIoU = IoU - distPenalty - alpha * v
+        var aspectPenalty = TensorMultiply(alpha, v);
+        var ciou = TensorSubtract(TensorSubtract(iou, distPenalty), aspectPenalty);
+
+        return ScalarMinusTensor(numOps.One, ciou);
     }
 
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)

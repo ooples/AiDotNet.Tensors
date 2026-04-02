@@ -8690,5 +8690,525 @@ fn nll_loss_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     lf_loss[b] = select(0.0, -lf_pred[b * numClasses + u32(tc)], tc >= 0 && tc < i32(numClasses));
 }
 ";
+
+    // Fused Linear + Activation WGSL kernels
+    public const string FusedLinearReLU = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = max(sum, 0.0);
+}";
+
+    public const string FusedLinearSigmoid = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = 1.0 / (1.0 + exp(-sum));
+}";
+
+    public const string FusedLinearTanh = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = tanh(sum);
+}";
+
+    public const string FusedLinearGELU = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = 0.5 * sum * (1.0 + tanh(0.7978845608 * (sum + 0.044715 * sum * sum * sum)));
+}";
+
+    public const string FusedLinearSwish = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> inp: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.outFeatures) { return; }
+    let b = idx / params.outFeatures;
+    let j = idx % params.outFeatures;
+    var sum = bias[j];
+    for (var k: u32 = 0u; k < params.inFeatures; k++) {
+        sum += inp[b * params.inFeatures + k] * wt[k * params.outFeatures + j];
+    }
+    outp[idx] = sum / (1.0 + exp(-sum));
+}";
+
+    // Fused Linear Backward — Grad Input WGSL kernels (4 buffers: gradOutput, weight, saved, gradInput)
+    public const string FusedLinearReLUBackwardGradInput = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gi: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.inFeatures) { return; }
+    let b = idx / params.inFeatures; let i = idx % params.inFeatures;
+    var s: f32 = 0.0;
+    for (var j: u32 = 0u; j < params.outFeatures; j++) {
+        let g = go[b * params.outFeatures + j];
+        let masked = select(0.0, g, saved[b * params.outFeatures + j] > 0.0);
+        s += masked * wt[i * params.outFeatures + j];
+    }
+    gi[idx] = s;
+}";
+
+    public const string FusedLinearSigmoidBackwardGradInput = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gi: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.inFeatures) { return; }
+    let b = idx / params.inFeatures; let i = idx % params.inFeatures;
+    var s: f32 = 0.0;
+    for (var j: u32 = 0u; j < params.outFeatures; j++) {
+        let g = go[b * params.outFeatures + j];
+        let o = saved[b * params.outFeatures + j];
+        let masked = g * o * (1.0 - o);
+        s += masked * wt[i * params.outFeatures + j];
+    }
+    gi[idx] = s;
+}";
+
+    public const string FusedLinearTanhBackwardGradInput = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gi: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.inFeatures) { return; }
+    let b = idx / params.inFeatures; let i = idx % params.inFeatures;
+    var s: f32 = 0.0;
+    for (var j: u32 = 0u; j < params.outFeatures; j++) {
+        let g = go[b * params.outFeatures + j];
+        let o = saved[b * params.outFeatures + j];
+        let masked = g * (1.0 - o * o);
+        s += masked * wt[i * params.outFeatures + j];
+    }
+    gi[idx] = s;
+}";
+
+    public const string FusedLinearGELUBackwardGradInput = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gi: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.inFeatures) { return; }
+    let b = idx / params.inFeatures; let i = idx % params.inFeatures;
+    var s: f32 = 0.0;
+    for (var j: u32 = 0u; j < params.outFeatures; j++) {
+        let g = go[b * params.outFeatures + j];
+        let p = saved[b * params.outFeatures + j];
+        let t = tanh(0.7978845608 * (p + 0.044715 * p * p * p));
+        let dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * p * p) * (1.0 - t * t);
+        let masked = g * (0.5 * (1.0 + t) + 0.5 * p * dt);
+        s += masked * wt[i * params.outFeatures + j];
+    }
+    gi[idx] = s;
+}";
+
+    public const string FusedLinearSwishBackwardGradInput = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gi: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.batchSize * params.inFeatures) { return; }
+    let b = idx / params.inFeatures; let i = idx % params.inFeatures;
+    var s: f32 = 0.0;
+    for (var j: u32 = 0u; j < params.outFeatures; j++) {
+        let g = go[b * params.outFeatures + j];
+        let p = saved[b * params.outFeatures + j];
+        let sig = 1.0 / (1.0 + exp(-p));
+        let masked = g * (sig + p * sig * (1.0 - sig));
+        s += masked * wt[i * params.outFeatures + j];
+    }
+    gi[idx] = s;
+}";
+
+    // Fused Linear Backward — Weight Gradient (4 buffers: gradOutput, input, saved, gradWeight)
+    // activationType: 0=ReLU, 1=Sigmoid, 2=Tanh, 3=GELU, 4=Swish
+    public const string FusedLinearWeightGrad = @"
+struct Params { batchSize: u32, inFeatures: u32, outFeatures: u32, activationType: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> inp: array<f32>;
+@group(0) @binding(2) var<storage, read> saved: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gw: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+fn applyBw(g: f32, sv: f32, act: u32) -> f32 {
+    if (act == 0u) { return select(0.0, g, sv > 0.0); }
+    if (act == 1u) { return g * sv * (1.0 - sv); }
+    if (act == 2u) { return g * (1.0 - sv * sv); }
+    if (act == 3u) {
+        let t = tanh(0.7978845608 * (sv + 0.044715 * sv * sv * sv));
+        let dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * sv * sv) * (1.0 - t * t);
+        return g * (0.5 * (1.0 + t) + 0.5 * sv * dt);
+    }
+    if (act == 4u) { let sig = 1.0 / (1.0 + exp(-sv)); return g * (sig + sv * sig * (1.0 - sig)); }
+    return g;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.inFeatures * params.outFeatures;
+    if (idx >= total) { return; }
+    let i = idx / params.outFeatures; let j = idx % params.outFeatures;
+    var s: f32 = 0.0;
+    for (var b: u32 = 0u; b < params.batchSize; b++) {
+        let masked = applyBw(go[b * params.outFeatures + j], saved[b * params.outFeatures + j], params.activationType);
+        s += inp[b * params.inFeatures + i] * masked;
+    }
+    gw[idx] = s;
+}";
+
+    // Fused Linear Backward — Bias Gradient (3 buffers: gradOutput, saved, gradBias)
+    public const string FusedLinearBiasGrad = @"
+struct Params { batchSize: u32, outFeatures: u32, activationType: u32, }
+@group(0) @binding(0) var<storage, read> go: array<f32>;
+@group(0) @binding(1) var<storage, read> saved: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gb: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn applyBwBias(g: f32, sv: f32, act: u32) -> f32 {
+    if (act == 0u) { return select(0.0, g, sv > 0.0); }
+    if (act == 1u) { return g * sv * (1.0 - sv); }
+    if (act == 2u) { return g * (1.0 - sv * sv); }
+    if (act == 3u) {
+        let t = tanh(0.7978845608 * (sv + 0.044715 * sv * sv * sv));
+        let dt = 0.7978845608 * (1.0 + 3.0 * 0.044715 * sv * sv) * (1.0 - t * t);
+        return g * (0.5 * (1.0 + t) + 0.5 * sv * dt);
+    }
+    if (act == 4u) { let sig = 1.0 / (1.0 + exp(-sv)); return g * (sig + sv * sig * (1.0 - sig)); }
+    return g;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x;
+    if (j >= params.outFeatures) { return; }
+    var s: f32 = 0.0;
+    for (var b: u32 = 0u; b < params.batchSize; b++) {
+        s += applyBwBias(go[b * params.outFeatures + j], saved[b * params.outFeatures + j], params.activationType);
+    }
+    gb[j] = s;
+}";
+
+    // IoU Loss Backward WGSL kernels (4 buffers: gradOutput, predicted, target, gradPredicted)
+    public const string IoULossBackward = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> goB: array<f32>;
+@group(0) @binding(1) var<storage, read> pred: array<f32>;
+@group(0) @binding(2) var<storage, read> targ: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iw*ih; let pw=px2-px1; let ph=py2-py1; let pA=pw*ph; let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7;
+    let hi=select(0.0, 1.0, iw>0.0 && ih>0.0);
+    let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
+    let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
+    let dU0=-ph-dI0; let dU1=-pw-dI1; let dU2=ph-dI2; let dU3=pw-dI3;
+    let uSq=uA*uA;
+    gp[o]=goB[i]*(-(dI0*uA-iA*dU0)/uSq);
+    gp[o+1u]=goB[i]*(-(dI1*uA-iA*dU1)/uSq);
+    gp[o+2u]=goB[i]*(-(dI2*uA-iA*dU2)/uSq);
+    gp[o+3u]=goB[i]*(-(dI3*uA-iA*dU3)/uSq);
+}";
+
+    public const string GIoULossBackward = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> goB: array<f32>;
+@group(0) @binding(1) var<storage, read> pred: array<f32>;
+@group(0) @binding(2) var<storage, read> targ: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iw*ih; let pw=px2-px1; let ph=py2-py1;
+    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+    let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
+    let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
+    let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
+    let dU0=-ph-dI0; let dU1=-pw-dI1; let dU2=ph-dI2; let dU3=pw-dI3;
+    let uSq=uA*uA;
+    let ig0=-(dI0*uA-iA*dU0)/uSq; let ig1=-(dI1*uA-iA*dU1)/uSq;
+    let ig2=-(dI2*uA-iA*dU2)/uSq; let ig3=-(dI3*uA-iA*dU3)/uSq;
+    let encW=max(px2,tx2)-min(px1,tx1); let encH=max(py2,ty2)-min(py1,ty1);
+    let encA=encW*encH+1e-7; let encASq=encA*encA;
+    let dEncA0=select(0.0,-1.0,px1<tx1)*encH; let dEncA1=select(0.0,-1.0,py1<ty1)*encW;
+    let dEncA2=select(0.0,1.0,px2>tx2)*encH; let dEncA3=select(0.0,1.0,py2>ty2)*encW;
+    let dP0=-(dU0*encA-uA*dEncA0)/encASq; let dP1=-(dU1*encA-uA*dEncA1)/encASq;
+    let dP2=-(dU2*encA-uA*dEncA2)/encASq; let dP3=-(dU3*encA-uA*dEncA3)/encASq;
+    gp[o]=goB[i]*(-ig0+dP0); gp[o+1u]=goB[i]*(-ig1+dP1);
+    gp[o+2u]=goB[i]*(-ig2+dP2); gp[o+3u]=goB[i]*(-ig3+dP3);
+}";
+
+    public const string DIoULossBackward = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> goB: array<f32>;
+@group(0) @binding(1) var<storage, read> pred: array<f32>;
+@group(0) @binding(2) var<storage, read> targ: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iw*ih; let pw=px2-px1; let ph=py2-py1;
+    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+    let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
+    let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
+    let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
+    let dU0=-ph-dI0; let dU1=-pw-dI1; let dU2=ph-dI2; let dU3=pw-dI3;
+    let uSq=uA*uA;
+    let ig0=-(dI0*uA-iA*dU0)/uSq; let ig1=-(dI1*uA-iA*dU1)/uSq;
+    let ig2=-(dI2*uA-iA*dU2)/uSq; let ig3=-(dI3*uA-iA*dU3)/uSq;
+    let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+    let rhoSq=dx*dx+dy*dy;
+    let encDx=max(px2,tx2)-min(px1,tx1); let encDy=max(py2,ty2)-min(py1,ty1);
+    let cSq=encDx*encDx+encDy*encDy+1e-7; let cSqSq=cSq*cSq;
+    let dCSq0=2.0*encDx*select(0.0,-1.0,px1<tx1); let dCSq1=2.0*encDy*select(0.0,-1.0,py1<ty1);
+    let dCSq2=2.0*encDx*select(0.0,1.0,px2>tx2); let dCSq3=2.0*encDy*select(0.0,1.0,py2>ty2);
+    let dp0=(dx*cSq-rhoSq*dCSq0)/cSqSq; let dp1=(dy*cSq-rhoSq*dCSq1)/cSqSq;
+    let dp2=(dx*cSq-rhoSq*dCSq2)/cSqSq; let dp3=(dy*cSq-rhoSq*dCSq3)/cSqSq;
+    gp[o]=goB[i]*(-ig0+dp0); gp[o+1u]=goB[i]*(-ig1+dp1);
+    gp[o+2u]=goB[i]*(-ig2+dp2); gp[o+3u]=goB[i]*(-ig3+dp3);
+}";
+
+    public const string CIoULossBackward = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> goB: array<f32>;
+@group(0) @binding(1) var<storage, read> pred: array<f32>;
+@group(0) @binding(2) var<storage, read> targ: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gp: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iw=max(0.0,min(px2,tx2)-max(px1,tx1)); let ih=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iw*ih; let pw=px2-px1+1e-7; let ph=py2-py1+1e-7;
+    let uA=pw*ph+(tx2-tx1)*(ty2-ty1)-iA+1e-7;
+    let hi=select(0.0,1.0,iw>0.0&&ih>0.0);
+    let dI0=hi*select(0.0,-1.0,px1>tx1)*ih; let dI1=hi*select(0.0,-1.0,py1>ty1)*iw;
+    let dI2=hi*select(0.0,1.0,px2<tx2)*ih; let dI3=hi*select(0.0,1.0,py2<ty2)*iw;
+    let dU0=-ph-dI0; let dU1=-pw-dI1; let dU2=ph-dI2; let dU3=pw-dI3;
+    let uSq=uA*uA;
+    let ig0=-(dI0*uA-iA*dU0)/uSq; let ig1=-(dI1*uA-iA*dU1)/uSq;
+    let ig2=-(dI2*uA-iA*dU2)/uSq; let ig3=-(dI3*uA-iA*dU3)/uSq;
+    let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+    let rhoSq=dx*dx+dy*dy;
+    let encDx=max(px2,tx2)-min(px1,tx1); let encDy=max(py2,ty2)-min(py1,ty1);
+    let cSq=encDx*encDx+encDy*encDy+1e-7; let cSqSq=cSq*cSq;
+    let dCSq0=2.0*encDx*select(0.0,-1.0,px1<tx1); let dCSq1=2.0*encDy*select(0.0,-1.0,py1<ty1);
+    let dCSq2=2.0*encDx*select(0.0,1.0,px2>tx2); let dCSq3=2.0*encDy*select(0.0,1.0,py2>ty2);
+    let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let atanDiff=atan(tw/th)-atan(pw/ph); let fourOverPiSq=4.0/(3.14159265*3.14159265);
+    let v=fourOverPiSq*atanDiff*atanDiff;
+    let iou=iA/uA;
+    let alpha=v/(1.0-iou+v+1e-7);
+    let rss=pw*pw+ph*ph; let dAtanPw=ph/rss; let dAtanPh=-pw/rss;
+    let dV0=2.0*fourOverPiSq*atanDiff*dAtanPw; let dV1=2.0*fourOverPiSq*atanDiff*dAtanPh;
+    let dV2=2.0*fourOverPiSq*atanDiff*(-dAtanPw); let dV3=2.0*fourOverPiSq*atanDiff*(-dAtanPh);
+    let dp0=(dx*cSq-rhoSq*dCSq0)/cSqSq; let dp1=(dy*cSq-rhoSq*dCSq1)/cSqSq;
+    let dp2=(dx*cSq-rhoSq*dCSq2)/cSqSq; let dp3=(dy*cSq-rhoSq*dCSq3)/cSqSq;
+    gp[o]=goB[i]*(-ig0+dp0+alpha*dV0); gp[o+1u]=goB[i]*(-ig1+dp1+alpha*dV1);
+    gp[o+2u]=goB[i]*(-ig2+dp2+alpha*dV2); gp[o+3u]=goB[i]*(-ig3+dp3+alpha*dV3);
+}";
+
+    // GIoU, DIoU, CIoU forward WGSL kernels
+    public const string GIoULossWgsl = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> pred: array<f32>;
+@group(0) @binding(1) var<storage, read> targ: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7; let iou=iA/uA;
+    let eA=(max(px2,tx2)-min(px1,tx1))*(max(py2,ty2)-min(py1,ty1))+1e-7;
+    loss[i] = 1.0 - (iou - (eA - uA) / eA);
+}";
+
+    public const string DIoULossWgsl = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> pred: array<f32>;
+@group(0) @binding(1) var<storage, read> targ: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7; let iou=iA/uA;
+    let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+    let cds=dx*dx+dy*dy;
+    let eDx=max(px2,tx2)-min(px1,tx1); let eDy=max(py2,ty2)-min(py1,ty1);
+    let ds=eDx*eDx+eDy*eDy+1e-7;
+    loss[i] = 1.0 - (iou - cds / ds);
+}";
+
+    public const string CIoULossWgsl = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> pred: array<f32>;
+@group(0) @binding(1) var<storage, read> targ: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iW=max(0.0,min(px2,tx2)-max(px1,tx1)); let iH=max(0.0,min(py2,ty2)-max(py1,ty1));
+    let iA=iW*iH; let pA=(px2-px1)*(py2-py1); let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7; let iou=iA/uA;
+    let dx=0.5*(px1+px2)-0.5*(tx1+tx2); let dy=0.5*(py1+py2)-0.5*(ty1+ty2);
+    let cds=dx*dx+dy*dy;
+    let eDx=max(px2,tx2)-min(px1,tx1); let eDy=max(py2,ty2)-min(py1,ty1);
+    let ds=eDx*eDx+eDy*eDy+1e-7;
+    let pw=px2-px1+1e-7; let ph=py2-py1+1e-7; let tw=tx2-tx1+1e-7; let th=ty2-ty1+1e-7;
+    let rd=atan(tw/th)-atan(pw/ph);
+    let v=(4.0/(3.14159265*3.14159265))*rd*rd;
+    let alpha=v/(1.0-iou+v+1e-7);
+    loss[i] = 1.0 - (iou - cds / ds - alpha * v);
+}";
+
+    // IoU Loss WGSL kernels
+    public const string IoULossWgsl = @"
+struct Params { numBoxes: u32, }
+@group(0) @binding(0) var<storage, read> pred: array<f32>;
+@group(0) @binding(1) var<storage, read> targ: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.numBoxes) { return; }
+    let o = i * 4u;
+    let px1=pred[o]; let py1=pred[o+1u]; let px2=pred[o+2u]; let py2=pred[o+3u];
+    let tx1=targ[o]; let ty1=targ[o+1u]; let tx2=targ[o+2u]; let ty2=targ[o+3u];
+    let iW=max(0.0, min(px2,tx2)-max(px1,tx1));
+    let iH=max(0.0, min(py2,ty2)-max(py1,ty1));
+    let iA=iW*iH;
+    let pA=(px2-px1)*(py2-py1);
+    let tA=(tx2-tx1)*(ty2-ty1);
+    let uA=pA+tA-iA+1e-7;
+    loss[i] = 1.0 - iA/uA;
+}";
 }
 #endif

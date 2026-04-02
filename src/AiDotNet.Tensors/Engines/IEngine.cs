@@ -2467,6 +2467,112 @@ public interface IEngine
     Tensor<T> TensorNegate<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Returns a tensor with the same values but severed from the gradient tape.
+    /// No backward function is recorded, so gradients do not flow through this operation.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor to detach from the computation graph.</param>
+    /// <returns>A new tensor with identical values but no tape recording.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> When training GANs, you sometimes need to pass data through
+    /// one network (like the discriminator) without updating its weights. StopGradient creates
+    /// a copy of the tensor that the gradient tape can't "see through" — gradients stop here.</para>
+    ///
+    /// <para>This is equivalent to PyTorch's <c>.detach()</c> or TensorFlow's <c>tf.stop_gradient()</c>.</para>
+    ///
+    /// <para><b>Example — GAN discriminator training:</b></para>
+    /// <code>
+    /// // Generator forward
+    /// var fakeImages = generator.ForwardForTraining(noise);
+    ///
+    /// // Detach so discriminator training does NOT update generator weights
+    /// var detachedFakes = engine.StopGradient(fakeImages);
+    /// var discScore = discriminator.ForwardForTraining(detachedFakes);
+    /// // Gradients flow to discriminator only, NOT back through generator
+    /// </code>
+    /// </remarks>
+    Tensor<T> StopGradient<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes Intersection over Union (IoU) loss for bounding box regression.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>IoU loss per box [N] where loss = 1 - IoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> IoU measures how much two bounding boxes overlap.
+    /// An IoU of 1 means perfect overlap, 0 means no overlap. The loss is 1 - IoU
+    /// so that the optimizer minimizes it toward zero (perfect overlap).</para>
+    /// <para>Reference: Standard IoU metric used in object detection (PASCAL VOC, COCO).</para>
+    /// </remarks>
+    Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Generalized Intersection over Union (GIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>GIoU loss per box [N] where loss = 1 - GIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> GIoU improves on IoU by also penalizing predictions that
+    /// are far away from the target, even when they don't overlap at all. Regular IoU gives
+    /// zero gradient when boxes don't overlap, making learning impossible. GIoU fixes this.</para>
+    /// <para>Reference: Rezatofighi et al., "Generalized Intersection over Union", CVPR 2019.</para>
+    /// </remarks>
+    Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Distance Intersection over Union (DIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>DIoU loss per box [N] where loss = 1 - DIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> DIoU adds a penalty based on the distance between the
+    /// centers of predicted and target boxes. This gives a stronger gradient signal than GIoU,
+    /// especially when boxes overlap partially but centers are misaligned.</para>
+    /// <para>Reference: Zheng et al., "Distance-IoU Loss", AAAI 2020.</para>
+    /// </remarks>
+    Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Complete Intersection over Union (CIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>CIoU loss per box [N] where loss = 1 - CIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> CIoU considers three factors simultaneously:
+    /// overlap (IoU), center distance (DIoU penalty), and aspect ratio consistency.
+    /// This makes it the most comprehensive box regression loss available.</para>
+    /// <para>Reference: Zheng et al., "Distance-IoU Loss", AAAI 2020.</para>
+    /// </remarks>
+    Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Fused MatMul + Bias Add + ReLU forward pass.
+    /// Records a single tape entry with fused backward instead of three separate entries.
+    /// Saves 2 tape entries; GPU backends also save kernel launch overhead.
+    /// </summary>
+    Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Sigmoid forward pass.</summary>
+    Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Tanh forward pass.</summary>
+    Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + GELU forward pass.</summary>
+    Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>Fused MatMul + Bias Add + Swish/SiLU forward pass.</summary>
+    Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias);
+
+    /// <summary>
     /// Computes the element-wise power of a tensor raised to a scalar exponent.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

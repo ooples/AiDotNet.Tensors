@@ -57,6 +57,17 @@ public sealed class GradientTape<T> : IDisposable
     public int EntryCount => _entries.Count;
 
     /// <summary>
+    /// Removes the last entry from the tape. Used by fused operations to replace
+    /// individual entries with a single fused entry.
+    /// </summary>
+    internal void RemoveLastEntry()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (_entries.Count > 0)
+            _entries.RemoveAt(_entries.Count - 1);
+    }
+
+    /// <summary>
     /// Gets the options for this tape.
     /// </summary>
     public GradientTapeOptions Options => _options;
@@ -175,12 +186,51 @@ public sealed class GradientTape<T> : IDisposable
             // Walk tape in reverse (reverse-mode AD)
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
 
+            // Tape backward pruning: when sources are specified, forward-walk to find all tensors
+            // downstream of those sources. During the backward walk, skip entries whose output
+            // is not in this reachable set — their gradients don't contribute to any requested
+            // source gradient. This prunes subgraphs that don't depend on the sources.
+            HashSet<Tensor<T>>? relevantTensors = null;
+            if (sources is not null && sources.Count > 0)
+            {
+                relevantTensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources)
+                    relevantTensors.Add(s);
+
+                // Forward pass: mark tensors reachable from sources
+                for (int i = 0; i < _entries.Count; i++)
+                {
+                    var entry = _entries[i];
+                    bool inputRelevant = false;
+                    foreach (var inp in entry.Inputs)
+                    {
+                        if (relevantTensors.Contains(inp))
+                        {
+                            inputRelevant = true;
+                            break;
+                        }
+                    }
+                    if (inputRelevant)
+                    {
+                        relevantTensors.Add(entry.Output);
+                    }
+                }
+            }
+
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
                 var entry = _entries[i];
 
                 // Skip if we don't have a gradient for this entry's output
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    continue;
+                }
+
+                // Tape backward pruning: skip entries that don't contribute to requested sources.
+                // This avoids wasted backward computation through irrelevant subgraphs
+                // (e.g., discriminator ops during GAN generator training).
+                if (relevantTensors is not null && !relevantTensors.Contains(entry.Output))
                 {
                     continue;
                 }
