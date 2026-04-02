@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// var output = model.Layer3.Forward(h2);
 ///
 /// // Data only downloaded when exiting context or explicitly requested
-/// var predictions = output;  // Triggers sync here
+/// var predictions = output.GetDataArray();  // Triggers GPU-to-CPU sync
 /// </code>
 /// </remarks>
 public sealed class GpuExecutionContext : IDisposable

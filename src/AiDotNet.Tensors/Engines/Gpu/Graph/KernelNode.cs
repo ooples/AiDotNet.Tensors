@@ -110,16 +110,18 @@ public sealed class KernelNode : ExecutionNode
             var evt = stream.RecordEvent();
             var syncPoint = new KernelSyncPoint(evt, stream);
 
-            // Handle common tensor types that support MarkModified
+            // Mark outputs as modified with the sync point (write fence).
+            // TensorBase.MarkModified increments version + stores sync point.
+            // IGpuTensor.MarkModified sets dirty flag + stores sync point.
             bool syncPointUsed = false;
             switch (output)
             {
                 case Tensor<float> floatTensor:
-                    floatTensor.IncrementVersion();
+                    floatTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
                 case Tensor<double> doubleTensor:
-                    doubleTensor.IncrementVersion();
+                    doubleTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
                 case IGpuTensor<int> intTensor:
@@ -130,7 +132,6 @@ public sealed class KernelNode : ExecutionNode
                     longTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                    // Note: Half/bfloat16 types can be added when supported
             }
 
             // Dispose the sync point if it wasn't used (unrecognized tensor type)

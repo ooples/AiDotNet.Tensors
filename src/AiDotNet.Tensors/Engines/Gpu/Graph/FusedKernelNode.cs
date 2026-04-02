@@ -110,13 +110,31 @@ public sealed class FusedKernelNode : ExecutionNode
         AssignedStream = stream;
         _fusedKernelAction(backend, stream);
 
-        // Mark outputs as modified
+        // Mark outputs as modified with sync point (write fence)
+        var markEvt = stream.RecordEvent();
+        var markSync = new FusedSyncPoint(markEvt, stream);
+        bool markSyncUsed = false;
         foreach (var output in _outputs)
         {
-            if (output is Tensor<float> typedTensor)
+            switch (output)
             {
-                typedTensor.IncrementVersion();
+                case Tensor<float> floatTensor:
+                    floatTensor.MarkModified(markSync);
+                    markSyncUsed = true;
+                    break;
+                case Tensor<double> doubleTensor:
+                    doubleTensor.MarkModified(markSync);
+                    markSyncUsed = true;
+                    break;
+                case IGpuTensor gpuTensor:
+                    gpuTensor.Synchronize();
+                    markSyncUsed = true;
+                    break;
             }
+        }
+        if (!markSyncUsed)
+        {
+            markSync.Dispose();
         }
 
         // Record completion for dependents on other streams

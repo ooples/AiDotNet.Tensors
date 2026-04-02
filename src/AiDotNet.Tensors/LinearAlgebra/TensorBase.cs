@@ -83,6 +83,12 @@ public abstract class TensorBase<T> : IDisposable
     internal bool _ownsGpuBuffer;
 
     /// <summary>
+    /// Sync point for the last GPU write operation on this tensor.
+    /// Used by the GPU graph executor to enforce correct ordering.
+    /// </summary>
+    internal Engines.Gpu.GpuSyncPoint? _lastWriteSync;
+
+    /// <summary>
     /// Gets the GPU buffer for this tensor.
     /// Throws if the tensor is CPU-resident — call <see cref="IsGpuResident"/> first to check,
     /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
@@ -146,6 +152,21 @@ public abstract class TensorBase<T> : IDisposable
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
     internal void IncrementVersion() => System.Threading.Interlocked.Increment(ref _version);
+
+    /// <summary>
+    /// Gets the sync point for the last GPU write operation on this tensor.
+    /// </summary>
+    public Engines.Gpu.GpuSyncPoint? LastWriteSync => _lastWriteSync;
+
+    /// <summary>
+    /// Marks this tensor as modified by a GPU operation.
+    /// Increments the version counter and stores the sync point for the write fence.
+    /// </summary>
+    internal void MarkModified(Engines.Gpu.GpuSyncPoint? syncPoint)
+    {
+        IncrementVersion();
+        _lastWriteSync = syncPoint;
+    }
 
     /// <summary>
     /// Whether this tensor's data is contiguous in memory (row-major with no gaps).

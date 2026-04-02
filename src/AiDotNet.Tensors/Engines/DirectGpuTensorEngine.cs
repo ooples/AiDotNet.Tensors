@@ -7047,10 +7047,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var result = GlobalMaxPoolGpuWithGpuIndices(input, out var gpuIndices);
 
-        // Download indices to CPU for backward pass
-        if (gpuIndices is not null)
+        // Download indices from GPU to CPU for backward pass
+        if (gpuIndices is not null && TryGetBackend(out var idxBackend))
         {
-            var indicesFloat = gpuIndices.GetDataArray();
+            var indicesFloat = idxBackend.DownloadBuffer(gpuIndices.Buffer);
             maxIndices = new int[indicesFloat.Length];
             for (int i = 0; i < indicesFloat.Length; i++)
                 maxIndices[i] = (int)indicesFloat[i];
