@@ -149,9 +149,64 @@ extern ""C"" __global__ void ciou_loss(
 }
 
 // ===========================================================================
-// IoU loss backward: gradients w.r.t. predicted box coordinates
-// Uses finite differences for simplicity and correctness
+// Analytical IoU backward: exact gradients w.r.t. predicted box coordinates
+// Derived from quotient rule on IoU = I/U with piecewise max/min derivatives
 // ===========================================================================
+
+// Device helper: compute analytical IoU gradients for one box
+__device__ void compute_iou_grad(
+    float px1, float py1, float px2, float py2,
+    float tx1, float ty1, float tx2, float ty2,
+    float go, float* grad)
+{
+    // Intersection boundaries
+    float ix1 = max_f(px1, tx1), iy1 = max_f(py1, ty1);
+    float ix2 = min_f(px2, tx2), iy2 = min_f(py2, ty2);
+    float iw = max_f(0.0f, ix2 - ix1), ih = max_f(0.0f, iy2 - iy1);
+    float iArea = iw * ih;
+
+    // Predicted area
+    float pw = px2 - px1, ph = py2 - py1;
+    float pArea = pw * ph;
+    float tArea = (tx2 - tx1) * (ty2 - ty1);
+    float uArea = pArea + tArea - iArea + 1e-7f;
+    float iou = iArea / uArea;
+
+    // Indicators for which box contributes to intersection boundary
+    float dix1_dpx1 = (px1 > tx1) ? 1.0f : 0.0f;  // ∂max(px1,tx1)/∂px1
+    float diy1_dpy1 = (py1 > ty1) ? 1.0f : 0.0f;
+    float dix2_dpx2 = (px2 < tx2) ? 1.0f : 0.0f;  // ∂min(px2,tx2)/∂px2
+    float diy2_dpy2 = (py2 < ty2) ? 1.0f : 0.0f;
+
+    // Only non-zero when intersection exists
+    float hasInter = (iw > 0.0f && ih > 0.0f) ? 1.0f : 0.0f;
+
+    // ∂I/∂px1 = (hasInter) * (-dix1_dpx1) * ih
+    float dI_dpx1 = hasInter * (-dix1_dpx1) * ih;
+    float dI_dpy1 = hasInter * (-diy1_dpy1) * iw;
+    float dI_dpx2 = hasInter * dix2_dpx2 * ih;
+    float dI_dpy2 = hasInter * diy2_dpy2 * iw;
+
+    // ∂pArea/∂px1 = -ph, ∂pArea/∂py1 = -pw, ∂pArea/∂px2 = ph, ∂pArea/∂py2 = pw
+    // ∂U/∂coord = ∂pArea/∂coord - ∂I/∂coord
+    float dU_dpx1 = -ph - dI_dpx1;
+    float dU_dpy1 = -pw - dI_dpy1;
+    float dU_dpx2 = ph - dI_dpx2;
+    float dU_dpy2 = pw - dI_dpy2;
+
+    // ∂IoU/∂coord = (∂I/∂coord * U - I * ∂U/∂coord) / U²
+    float uSq = uArea * uArea;
+    float dIoU_dpx1 = (dI_dpx1 * uArea - iArea * dU_dpx1) / uSq;
+    float dIoU_dpy1 = (dI_dpy1 * uArea - iArea * dU_dpy1) / uSq;
+    float dIoU_dpx2 = (dI_dpx2 * uArea - iArea * dU_dpx2) / uSq;
+    float dIoU_dpy2 = (dI_dpy2 * uArea - iArea * dU_dpy2) / uSq;
+
+    // loss = 1 - IoU → ∂loss/∂coord = -∂IoU/∂coord
+    grad[0] = go * (-dIoU_dpx1);
+    grad[1] = go * (-dIoU_dpy1);
+    grad[2] = go * (-dIoU_dpx2);
+    grad[3] = go * (-dIoU_dpy2);
+}
 
 extern ""C"" __global__ void iou_loss_backward(
     const float* __restrict__ gradOutput,
@@ -163,26 +218,15 @@ extern ""C"" __global__ void iou_loss_backward(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numBoxes) return;
     int off = i * 4;
-    float eps = 1e-4f;
-    float go = gradOutput[i];
-    // Compute gradient for each of the 4 box coordinates via finite differences
-    for (int c = 0; c < 4; c++) {
-        float orig = predicted[off + c];
-        // f(x + eps)
-        float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
-        float coords_plus[4] = {px1, py1, px2, py2};
-        coords_plus[c] += eps;
-        float iou_plus = compute_iou(coords_plus[0],coords_plus[1],coords_plus[2],coords_plus[3],
-            target[off],target[off+1],target[off+2],target[off+3], NULL, NULL);
-        // f(x - eps)
-        float coords_minus[4] = {px1, py1, px2, py2};
-        coords_minus[c] -= eps;
-        float iou_minus = compute_iou(coords_minus[0],coords_minus[1],coords_minus[2],coords_minus[3],
-            target[off],target[off+1],target[off+2],target[off+3], NULL, NULL);
-        // loss = 1 - iou, d(loss)/d(coord) = -d(iou)/d(coord)
-        float grad = -(iou_plus - iou_minus) / (2.0f * eps);
-        gradPredicted[off + c] = go * grad;
-    }
+    float grad[4];
+    compute_iou_grad(
+        predicted[off], predicted[off+1], predicted[off+2], predicted[off+3],
+        target[off], target[off+1], target[off+2], target[off+3],
+        gradOutput[i], grad);
+    gradPredicted[off] = grad[0];
+    gradPredicted[off+1] = grad[1];
+    gradPredicted[off+2] = grad[2];
+    gradPredicted[off+3] = grad[3];
 }
 
 // GIoU/DIoU/CIoU backward use same finite-difference pattern
