@@ -9326,6 +9326,39 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+        => HyperbolicLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+
+    public unsafe void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_forward_fused_relu");
+
+        using var _ = PushContext();
+        int totalOutputs = batchSize * outputFeatures;
+        uint grid = (uint)((totalOutputs + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr inputPtr = input.Handle;
+        IntPtr weightsPtr = weights.Handle;
+        IntPtr biasesPtr = biases.Handle;
+        IntPtr outputPtr = output.Handle;
+
+        void** args = stackalloc void*[7];
+        args[0] = &inputPtr;
+        args[1] = &weightsPtr;
+        args[2] = &biasesPtr;
+        args[3] = &outputPtr;
+        args[4] = &batchSize;
+        args[5] = &inputFeatures;
+        args[6] = &outputFeatures;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    #endregion
+
     #region Quantum Computing Operations
 
     public unsafe void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)

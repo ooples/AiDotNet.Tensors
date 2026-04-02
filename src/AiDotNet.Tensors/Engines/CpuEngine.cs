@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -22711,4 +22712,314 @@ public class CpuEngine : ITensorLevelEngine
     {
         return Unsafe.As<Memory<T>, Memory<double>>(ref data);
     }
+
+    #region Hyperbolic Manifold Operations
+
+    private static readonly CpuHyperbolicManifoldEngine _hyperbolicEngine = CpuHyperbolicManifoldEngine.Instance;
+
+    /// <inheritdoc />
+    public Vector<T> PoincareExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature)
+        => _hyperbolicEngine.PoincareExpMap(basePoint, tangentVector, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature)
+        => _hyperbolicEngine.PoincareLogMap(basePoint, targetPoint, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> MobiusAdd<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.MobiusAdd(x, y, curvature);
+
+    /// <inheritdoc />
+    public T PoincareDistance<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.PoincareDistance(x, y, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareParallelTransport<T>(Vector<T> x, Vector<T> y, Vector<T> v, T curvature)
+        => _hyperbolicEngine.PoincareParallelTransport(x, y, v, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareProject<T>(Vector<T> point, T curvature, T epsilon)
+        => _hyperbolicEngine.PoincareProject(point, curvature, epsilon);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature)
+        => _hyperbolicEngine.HyperboloidExpMap(basePoint, tangentVector, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature)
+        => _hyperbolicEngine.HyperboloidLogMap(basePoint, targetPoint, curvature);
+
+    /// <inheritdoc />
+    public T HyperboloidDistance<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.HyperboloidDistance(x, y, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidProject<T>(Vector<T> point, T curvature)
+        => _hyperbolicEngine.HyperboloidProject(point, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareToHyperboloid<T>(Vector<T> poincarePoint, T curvature)
+        => _hyperbolicEngine.PoincareToHyperboloid(poincarePoint, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidToPoincare<T>(Vector<T> hyperboloidPoint, T curvature)
+        => _hyperbolicEngine.HyperboloidToPoincare(hyperboloidPoint, curvature);
+
+    /// <inheritdoc />
+    public Matrix<T> PoincareExpMapBatch<T>(Matrix<T> basePoints, Matrix<T> tangentVectors, T curvature)
+        => _hyperbolicEngine.PoincareExpMapBatch(basePoints, tangentVectors, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareDistanceBatch<T>(Matrix<T> x, Matrix<T> y, T curvature)
+        => _hyperbolicEngine.PoincareDistanceBatch(x, y, curvature);
+
+    #endregion
+
+    #region Advanced Algebra Operations
+
+    private static readonly CpuAdvancedAlgebraEngine _algebraEngine = CpuAdvancedAlgebraEngine.Instance;
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionMultiplyBatch<T>(Octonion<T>[] left, Octonion<T>[] right)
+        => _algebraEngine.OctonionMultiplyBatch(left, right);
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionAddBatch<T>(Octonion<T>[] left, Octonion<T>[] right)
+        => _algebraEngine.OctonionAddBatch(left, right);
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionConjugateBatch<T>(Octonion<T>[] octonions)
+        => _algebraEngine.OctonionConjugateBatch(octonions);
+
+    /// <inheritdoc />
+    public T[] OctonionNormBatch<T>(Octonion<T>[] octonions)
+        => _algebraEngine.OctonionNormBatch(octonions);
+
+    /// <inheritdoc />
+    public Octonion<T>[,] OctonionMatMul<T>(Octonion<T>[,] input, Octonion<T>[,] weight)
+        => _algebraEngine.OctonionMatMul(input, weight);
+
+    /// <inheritdoc />
+    public Multivector<T>[] GeometricProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.GeometricProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] WedgeProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.WedgeProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] InnerProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.InnerProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] MultivectorAddBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.MultivectorAddBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] MultivectorReverseBatch<T>(Multivector<T>[] multivectors)
+        => _algebraEngine.MultivectorReverseBatch(multivectors);
+
+    /// <inheritdoc />
+    public Multivector<T>[] GradeProjectBatch<T>(Multivector<T>[] multivectors, int grade)
+        => _algebraEngine.GradeProjectBatch(multivectors, grade);
+
+    /// <inheritdoc />
+    public So3<T>[] So3ExpBatch<T>(So3Group<T> group, Vector<T>[] tangentVectors)
+        => _algebraEngine.So3ExpBatch(group, tangentVectors);
+
+    /// <inheritdoc />
+    public Vector<T>[] So3LogBatch<T>(So3Group<T> group, So3<T>[] rotations)
+        => _algebraEngine.So3LogBatch(group, rotations);
+
+    /// <inheritdoc />
+    public So3<T>[] So3ComposeBatch<T>(So3Group<T> group, So3<T>[] left, So3<T>[] right)
+        => _algebraEngine.So3ComposeBatch(group, left, right);
+
+    /// <inheritdoc />
+    public Se3<T>[] Se3ExpBatch<T>(Se3Group<T> group, Vector<T>[] tangentVectors)
+        => _algebraEngine.Se3ExpBatch(group, tangentVectors);
+
+    /// <inheritdoc />
+    public Vector<T>[] Se3LogBatch<T>(Se3Group<T> group, Se3<T>[] transforms)
+        => _algebraEngine.Se3LogBatch(group, transforms);
+
+    /// <inheritdoc />
+    public Se3<T>[] Se3ComposeBatch<T>(Se3Group<T> group, Se3<T>[] left, Se3<T>[] right)
+        => _algebraEngine.Se3ComposeBatch(group, left, right);
+
+    /// <inheritdoc />
+    public Matrix<T>[] So3AdjointBatch<T>(So3Group<T> group, So3<T>[] rotations)
+        => _algebraEngine.So3AdjointBatch(group, rotations);
+
+    /// <inheritdoc />
+    public Tensor<T> OctonionMatMulTensor<T>(Tensor<T> input, Tensor<T> weight)
+    {
+        if (input.Rank != 3 || input._shape[2] != 8)
+            throw new ArgumentException($"Input must be rank-3 with last dim 8, got shape [{string.Join(", ", input._shape)}].", nameof(input));
+        if (weight.Rank != 3 || weight._shape[2] != 8)
+            throw new ArgumentException($"Weight must be rank-3 with last dim 8, got shape [{string.Join(", ", weight._shape)}].", nameof(weight));
+        if (input._shape[1] != weight._shape[1])
+            throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+
+        // input: [batch, inputFeatures, 8], weight: [outputFeatures, inputFeatures, 8]
+        int batch = input._shape[0];
+        int inputFeatures = input._shape[1];
+        int outputFeatures = weight._shape[0];
+
+        var output = new Tensor<T>(new[] { batch, outputFeatures, 8 });
+
+        // Pre-allocate reusable buffers outside inner loops to avoid GC pressure.
+        // OctonionMultiply writes into prod; a/w are loaded per iteration.
+        var accum = new T[8];
+        var a = new T[8];
+        var w = new T[8];
+        var prod = new T[8];
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int o = 0; o < outputFeatures; o++)
+            {
+                for (int c = 0; c < 8; c++) accum[c] = default!;
+
+                for (int i = 0; i < inputFeatures; i++)
+                {
+                    for (int c = 0; c < 8; c++)
+                    {
+                        a[c] = input[b, i, c];
+                        w[c] = weight[o, i, c];
+                    }
+
+                    // Octonion multiplication (Cayley-Dickson): result = w * a
+                    // Matches CpuAdvancedAlgebraEngine.OctonionMatMul which uses weight * input.
+                    // Octonion multiply is non-commutative, so order matters.
+                    OctonionMultiplyInPlace(w, a, prod, numOps);
+
+                    for (int c = 0; c < 8; c++)
+                        accum[c] = numOps.Add(accum[c], prod[c]);
+                }
+
+                for (int c = 0; c < 8; c++)
+                    output[b, o, c] = accum[c];
+            }
+        }
+
+        return output;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> OctonionAddTensor<T>(Tensor<T> a, Tensor<T> b)
+    {
+        // Element-wise addition — last dimension is 8 (octonion components)
+        return TensorAdd(a, b);
+    }
+
+    /// <summary>
+    /// Multiplies two octonions represented as T[8] arrays using the Cayley-Dickson construction.
+    /// </summary>
+    private static T[] OctonionMultiply<T>(T[] a, T[] b, INumericOperations<T> ops)
+    {
+        // Cayley-Dickson: split each octonion into two quaternion halves
+        // a = (a0..a3, a4..a7) = (p, q)
+        // b = (b0..b3, b4..b7) = (r, s)
+        // a*b = (p*r - conj(s)*q, s*p + q*conj(r))
+
+        // Quaternion multiply helper
+        static T[] QuatMul(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[]
+            {
+                o.Subtract(o.Subtract(o.Subtract(o.Multiply(x[0], y[0]), o.Multiply(x[1], y[1])), o.Multiply(x[2], y[2])), o.Multiply(x[3], y[3])),
+                o.Add(o.Subtract(o.Add(o.Multiply(x[0], y[1]), o.Multiply(x[1], y[0])), o.Multiply(x[2], y[3])), o.Multiply(x[3], y[2])),
+                o.Add(o.Add(o.Subtract(o.Multiply(x[0], y[2]), o.Multiply(x[1], y[3])), o.Multiply(x[2], y[0])), o.Multiply(x[3], y[1])),
+                o.Subtract(o.Add(o.Add(o.Multiply(x[0], y[3]), o.Multiply(x[1], y[2])), o.Multiply(x[3], y[0])), o.Multiply(x[2], y[1]))
+            };
+        }
+
+        static T[] QuatConj(T[] x, INumericOperations<T> o)
+        {
+            return new T[] { x[0], o.Negate(x[1]), o.Negate(x[2]), o.Negate(x[3]) };
+        }
+
+        static T[] QuatSub(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[] { o.Subtract(x[0], y[0]), o.Subtract(x[1], y[1]), o.Subtract(x[2], y[2]), o.Subtract(x[3], y[3]) };
+        }
+
+        static T[] QuatAdd(T[] x, T[] y, INumericOperations<T> o)
+        {
+            return new T[] { o.Add(x[0], y[0]), o.Add(x[1], y[1]), o.Add(x[2], y[2]), o.Add(x[3], y[3]) };
+        }
+
+        var p = new T[] { a[0], a[1], a[2], a[3] };
+        var q = new T[] { a[4], a[5], a[6], a[7] };
+        var r = new T[] { b[0], b[1], b[2], b[3] };
+        var s = new T[] { b[4], b[5], b[6], b[7] };
+
+        // a*b = (p*r - conj(s)*q, s*p + q*conj(r))
+        var pr = QuatMul(p, r, ops);
+        var conjS_q = QuatMul(QuatConj(s, ops), q, ops);
+        var sp = QuatMul(s, p, ops);
+        var q_conjR = QuatMul(q, QuatConj(r, ops), ops);
+
+        var first = QuatSub(pr, conjS_q, ops);
+        var second = QuatAdd(sp, q_conjR, ops);
+
+        return new T[] { first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3] };
+    }
+
+    /// <summary>
+    /// Zero-allocation octonion multiply that writes result into a pre-allocated destination buffer.
+    /// Uses direct multiplication table instead of Cayley-Dickson decomposition to avoid
+    /// intermediate quaternion allocations.
+    /// </summary>
+    private static void OctonionMultiplyInPlace<T>(T[] a, T[] b, T[] result, INumericOperations<T> ops)
+    {
+        T a0=a[0],a1=a[1],a2=a[2],a3=a[3],a4=a[4],a5=a[5],a6=a[6],a7=a[7];
+        T b0=b[0],b1=b[1],b2=b[2],b3=b[3],b4=b[4],b5=b[5],b6=b[6],b7=b[7];
+
+        // e0
+        result[0] = ops.Subtract(ops.Subtract(ops.Subtract(ops.Subtract(
+            ops.Subtract(ops.Subtract(ops.Subtract(ops.Multiply(a0,b0), ops.Multiply(a1,b1)),
+            ops.Multiply(a2,b2)), ops.Multiply(a3,b3)), ops.Multiply(a4,b4)),
+            ops.Multiply(a5,b5)), ops.Multiply(a6,b6)), ops.Multiply(a7,b7));
+        // e1
+        result[1] = ops.Add(ops.Subtract(ops.Add(ops.Add(
+            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b1), ops.Multiply(a1,b0)),
+            ops.Multiply(a2,b3)), ops.Multiply(a3,b2)), ops.Multiply(a4,b5)),
+            ops.Multiply(a5,b4)), ops.Multiply(a6,b7)), ops.Multiply(a7,b6));
+        // e2
+        result[2] = ops.Subtract(ops.Subtract(ops.Add(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b2), ops.Multiply(a2,b0)),
+            ops.Multiply(a1,b3)), ops.Multiply(a3,b1)), ops.Multiply(a4,b6)),
+            ops.Multiply(a5,b7)), ops.Multiply(a6,b4)), ops.Multiply(a7,b5));
+        // e3
+        result[3] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b3), ops.Multiply(a3,b0)),
+            ops.Multiply(a2,b1)), ops.Multiply(a1,b2)), ops.Multiply(a4,b7)),
+            ops.Multiply(a5,b6)), ops.Multiply(a6,b5)), ops.Multiply(a7,b4));
+        // e4
+        result[4] = ops.Add(ops.Add(ops.Add(ops.Subtract(
+            ops.Subtract(ops.Subtract(ops.Add(ops.Multiply(a0,b4), ops.Multiply(a4,b0)),
+            ops.Multiply(a1,b5)), ops.Multiply(a2,b6)), ops.Multiply(a3,b7)),
+            ops.Multiply(a5,b1)), ops.Multiply(a6,b2)), ops.Multiply(a7,b3));
+        // e5
+        result[5] = ops.Add(ops.Subtract(ops.Subtract(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b5), ops.Multiply(a5,b0)),
+            ops.Multiply(a4,b1)), ops.Multiply(a1,b4)), ops.Multiply(a3,b6)),
+            ops.Multiply(a2,b7)), ops.Multiply(a6,b3)), ops.Multiply(a7,b2));
+        // e6
+        result[6] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
+            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b6), ops.Multiply(a6,b0)),
+            ops.Multiply(a1,b7)), ops.Multiply(a4,b2)), ops.Multiply(a2,b4)),
+            ops.Multiply(a5,b3)), ops.Multiply(a3,b5)), ops.Multiply(a7,b1));
+        // e7
+        result[7] = ops.Add(ops.Subtract(ops.Subtract(ops.Subtract(
+            ops.Add(ops.Add(ops.Add(ops.Multiply(a0,b7), ops.Multiply(a7,b0)),
+            ops.Multiply(a2,b5)), ops.Multiply(a3,b4)), ops.Multiply(a1,b6)),
+            ops.Multiply(a4,b3)), ops.Multiply(a5,b2)), ops.Multiply(a6,b1));
+    }
+
+    #endregion
 }

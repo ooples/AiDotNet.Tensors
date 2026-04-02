@@ -9264,6 +9264,39 @@ public sealed partial class HipBackend : IAsyncGpuBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+        => HyperbolicLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+
+    public unsafe void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: octonion_linear_forward_fused_relu");
+
+        int totalOutputs = batchSize * outputFeatures;
+        uint grid = (uint)((totalOutputs + DefaultBlockSize - 1) / DefaultBlockSize);
+        {
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = weights.Handle;
+            IntPtr _p2 = biases.Handle;
+            IntPtr _p3 = output.Handle;
+            void** args = stackalloc void*[7];
+            args[0] = &_p0;
+            args[1] = &_p1;
+            args[2] = &_p2;
+            args[3] = &_p3;
+            args[4] = &batchSize;
+            args[5] = &inputFeatures;
+            args[6] = &outputFeatures;
+            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        }
+    }
+
+    #endregion
+
     #region Quantum Computing Operations
 
     public unsafe void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)

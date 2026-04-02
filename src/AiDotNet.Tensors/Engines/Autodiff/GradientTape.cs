@@ -134,7 +134,7 @@ public sealed class GradientTape<T> : IDisposable
 #endif
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
         Tensor<T> loss,
-        Tensor<T>[]? sources = null,
+        IReadOnlyList<Tensor<T>>? sources = null,
         bool createGraph = false)
     {
         if (_disposed)

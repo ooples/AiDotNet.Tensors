@@ -3462,4 +3462,315 @@ kernel void strided_dot_product(device const float* a [[buffer(0)]],
     output[0] = sum;
 }
 ";
+
+    public const string HyperbolicKernels = CommonHeader + @"
+// =================================================================
+// Poincare Ball Model - Hyperbolic Geometry Operations
+// =================================================================
+
+kernel void poincare_project(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batchSize [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    constant float& curvature [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize) return;
+    uint off = gid * dim;
+    float sqNorm = 0.0f;
+    for (uint d = 0; d < dim; d++) sqNorm += input[off + d] * input[off + d];
+    float maxNorm = 1.0f / sqrt(curvature) - epsilon;
+    float norm = sqrt(max(sqNorm, 1e-20f));
+    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0f;
+    for (uint d = 0; d < dim; d++) output[off + d] = input[off + d] * scale;
+}
+
+kernel void mobius_add(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    constant float& curvature [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize) return;
+    uint off = gid * dim;
+    float c = curvature;
+    float xSq = 0.0f, ySq = 0.0f, xy = 0.0f;
+    for (uint d = 0; d < dim; d++) {
+        float xv = x[off + d], yv = y[off + d];
+        xSq += xv * xv; ySq += yv * yv; xy += xv * yv;
+    }
+    float denom = 1.0f + 2.0f * c * xy + c * c * xSq * ySq;
+    denom = max(abs(denom), 1e-10f);
+    float numX = 1.0f + 2.0f * c * xy + c * ySq;
+    float numY = 1.0f - c * xSq;
+    for (uint d = 0; d < dim; d++)
+        output[off + d] = (numX * x[off + d] + numY * y[off + d]) / denom;
+}
+
+kernel void poincare_exp_map(
+    device const float* basePoint [[buffer(0)]],
+    device const float* tangentVec [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    constant float& curvature [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize) return;
+    uint off = gid * dim;
+    float c = curvature;
+    float sqrtC = sqrt(c);
+    float bpSq = 0.0f, tvSq = 0.0f;
+    for (uint d = 0; d < dim; d++) {
+        bpSq += basePoint[off + d] * basePoint[off + d];
+        tvSq += tangentVec[off + d] * tangentVec[off + d];
+    }
+    float tvNorm = sqrt(max(tvSq, 1e-20f));
+    float lambda = 2.0f / max(1.0f - c * bpSq, 1e-10f);
+    if (tvNorm < 1e-10f) {
+        for (uint d = 0; d < dim; d++) output[off + d] = basePoint[off + d];
+        return;
+    }
+    float t = tanh(sqrtC * lambda * tvNorm / 2.0f) / (sqrtC * tvNorm);
+    float sSq = 0.0f, bs = 0.0f;
+    for (uint d = 0; d < dim; d++) {
+        float sv = t * tangentVec[off + d];
+        sSq += sv * sv;
+        bs += basePoint[off + d] * sv;
+    }
+    float denom = 1.0f + 2.0f * c * bs + c * c * bpSq * sSq;
+    denom = max(abs(denom), 1e-10f);
+    float numX = 1.0f + 2.0f * c * bs + c * sSq;
+    float numY = 1.0f - c * bpSq;
+    for (uint d = 0; d < dim; d++)
+        output[off + d] = (numX * basePoint[off + d] + numY * t * tangentVec[off + d]) / denom;
+}
+
+kernel void poincare_distance(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& dim [[buffer(4)]],
+    constant float& curvature [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= batchSize) return;
+    uint off = gid * dim;
+    float c = curvature;
+    float diffSq = 0.0f, xSq = 0.0f, ySq = 0.0f;
+    for (uint d = 0; d < dim; d++) {
+        float diff = x[off + d] - y[off + d];
+        diffSq += diff * diff;
+        xSq += x[off + d] * x[off + d];
+        ySq += y[off + d] * y[off + d];
+    }
+    float denomX = max(abs(1.0f - c * xSq), 1e-10f);
+    float denomY = max(abs(1.0f - c * ySq), 1e-10f);
+    float arg = max(1.0f + 2.0f * c * diffSq / (denomX * denomY), 1.0f);
+    output[gid] = log(arg + sqrt(max(arg * arg - 1.0f, 0.0f))) / sqrt(c);
+}
+";
+
+    public const string OctonionKernels = CommonHeader + @"
+// =================================================================
+// Octonion Algebra Operations
+// =================================================================
+
+kernel void octonion_multiply(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    uint o = gid * 8;
+    float a0=a[o],a1=a[o+1],a2=a[o+2],a3=a[o+3],a4=a[o+4],a5=a[o+5],a6=a[o+6],a7=a[o+7];
+    float b0=b[o],b1=b[o+1],b2=b[o+2],b3=b[o+3],b4=b[o+4],b5=b[o+5],b6=b[o+6],b7=b[o+7];
+    output[o+0]=a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7;
+    output[o+1]=a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6;
+    output[o+2]=a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5;
+    output[o+3]=a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4;
+    output[o+4]=a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3;
+    output[o+5]=a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2;
+    output[o+6]=a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1;
+    output[o+7]=a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0;
+}
+
+// Octonion helper function for linear forward kernel
+void oct_mul(float a0,float a1,float a2,float a3,float a4,float a5,float a6,float a7,
+             float b0,float b1,float b2,float b3,float b4,float b5,float b6,float b7,
+             thread float& r0,thread float& r1,thread float& r2,thread float& r3,
+             thread float& r4,thread float& r5,thread float& r6,thread float& r7) {
+    r0=a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7;
+    r1=a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6;
+    r2=a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5;
+    r3=a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4;
+    r4=a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3;
+    r5=a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2;
+    r6=a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1;
+    r7=a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0;
+}
+
+kernel void octonion_linear_forward(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batchSize [[buffer(4)]],
+    constant uint& inputFeatures [[buffer(5)]],
+    constant uint& outputFeatures [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * outputFeatures;
+    if (gid >= total) return;
+    uint b = gid / outputFeatures;
+    uint o = gid % outputFeatures;
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
+    for (uint i = 0; i < inputFeatures; i++) {
+        uint wi = (o * inputFeatures + i) * 8;
+        uint ii = (b * inputFeatures + i) * 8;
+        float r0,r1,r2,r3,r4,r5,r6,r7;
+        oct_mul(weights[wi],weights[wi+1],weights[wi+2],weights[wi+3],
+                weights[wi+4],weights[wi+5],weights[wi+6],weights[wi+7],
+                input[ii],input[ii+1],input[ii+2],input[ii+3],
+                input[ii+4],input[ii+5],input[ii+6],input[ii+7],
+                r0,r1,r2,r3,r4,r5,r6,r7);
+        s0+=r0;s1+=r1;s2+=r2;s3+=r3;s4+=r4;s5+=r5;s6+=r6;s7+=r7;
+    }
+    uint bo = o * 8;
+    uint oo = (b * outputFeatures + o) * 8;
+    output[oo]=s0+biases[bo]; output[oo+1]=s1+biases[bo+1];
+    output[oo+2]=s2+biases[bo+2]; output[oo+3]=s3+biases[bo+3];
+    output[oo+4]=s4+biases[bo+4]; output[oo+5]=s5+biases[bo+5];
+    output[oo+6]=s6+biases[bo+6]; output[oo+7]=s7+biases[bo+7];
+}
+
+kernel void octonion_linear_backward_biases(
+    device const float* gradOutput [[buffer(0)]],
+    device float* gradBiases [[buffer(1)]],
+    constant uint& batchSize [[buffer(2)]],
+    constant uint& outputFeatures [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= outputFeatures) return;
+    for (uint c = 0; c < 8; c++) {
+        float sum = 0.0f;
+        for (uint b = 0; b < batchSize; b++)
+            sum += gradOutput[(b * outputFeatures + gid) * 8 + c];
+        gradBiases[gid * 8 + c] = sum;
+    }
+}
+
+kernel void octonion_linear_backward_input(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& inputFeatures [[buffer(4)]],
+    constant uint& outputFeatures [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * inputFeatures;
+    if (gid >= total) return;
+    uint b = gid / inputFeatures;
+    uint i = gid % inputFeatures;
+    float ga0=0,ga1=0,ga2=0,ga3=0,ga4=0,ga5=0,ga6=0,ga7=0;
+    for (uint o = 0; o < outputFeatures; o++) {
+        uint goOff = (b * outputFeatures + o) * 8;
+        uint wOff = (o * inputFeatures + i) * 8;
+        float w0=weights[wOff],w1=weights[wOff+1],w2=weights[wOff+2],w3=weights[wOff+3],
+              w4=weights[wOff+4],w5=weights[wOff+5],w6=weights[wOff+6],w7=weights[wOff+7];
+        float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
+              g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+        ga0+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
+        ga1+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
+        ga2+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
+        ga3+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
+        ga4+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
+        ga5+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
+        ga6+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
+        ga7+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
+    }
+    uint giOff = (b * inputFeatures + i) * 8;
+    gradInput[giOff]=ga0; gradInput[giOff+1]=ga1; gradInput[giOff+2]=ga2; gradInput[giOff+3]=ga3;
+    gradInput[giOff+4]=ga4; gradInput[giOff+5]=ga5; gradInput[giOff+6]=ga6; gradInput[giOff+7]=ga7;
+}
+
+kernel void octonion_linear_forward_fused_relu(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batchSize [[buffer(4)]],
+    constant uint& inputFeatures [[buffer(5)]],
+    constant uint& outputFeatures [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batchSize * outputFeatures;
+    if (gid >= total) return;
+    uint b = gid / outputFeatures;
+    uint o = gid % outputFeatures;
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
+    for (uint i = 0; i < inputFeatures; i++) {
+        uint wi = (o * inputFeatures + i) * 8;
+        uint ii = (b * inputFeatures + i) * 8;
+        float r0,r1,r2,r3,r4,r5,r6,r7;
+        oct_mul(weights[wi],weights[wi+1],weights[wi+2],weights[wi+3],
+                weights[wi+4],weights[wi+5],weights[wi+6],weights[wi+7],
+                input[ii],input[ii+1],input[ii+2],input[ii+3],
+                input[ii+4],input[ii+5],input[ii+6],input[ii+7],
+                r0,r1,r2,r3,r4,r5,r6,r7);
+        s0+=r0;s1+=r1;s2+=r2;s3+=r3;s4+=r4;s5+=r5;s6+=r6;s7+=r7;
+    }
+    uint bo = o * 8;
+    uint oo = (b * outputFeatures + o) * 8;
+    output[oo]=max(s0+biases[bo],0.0f); output[oo+1]=max(s1+biases[bo+1],0.0f);
+    output[oo+2]=max(s2+biases[bo+2],0.0f); output[oo+3]=max(s3+biases[bo+3],0.0f);
+    output[oo+4]=max(s4+biases[bo+4],0.0f); output[oo+5]=max(s5+biases[bo+5],0.0f);
+    output[oo+6]=max(s6+biases[bo+6],0.0f); output[oo+7]=max(s7+biases[bo+7],0.0f);
+}
+
+kernel void octonion_linear_backward_weights(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradWeights [[buffer(2)]],
+    constant uint& batchSize [[buffer(3)]],
+    constant uint& inputFeatures [[buffer(4)]],
+    constant uint& outputFeatures [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = outputFeatures * inputFeatures;
+    if (gid >= total) return;
+    uint o = gid / inputFeatures;
+    uint i = gid % inputFeatures;
+    // Full Jacobian transpose of d(w*a)/dw from octonion multiplication table
+    float gw0=0,gw1=0,gw2=0,gw3=0,gw4=0,gw5=0,gw6=0,gw7=0;
+    for (uint b = 0; b < batchSize; b++) {
+        uint inOff = (b * inputFeatures + i) * 8;
+        uint goOff = (b * outputFeatures + o) * 8;
+        float a0=input[inOff],a1=input[inOff+1],a2=input[inOff+2],a3=input[inOff+3],
+              a4=input[inOff+4],a5=input[inOff+5],a6=input[inOff+6],a7=input[inOff+7];
+        float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
+              g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+        gw0+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
+        gw1+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
+        gw2+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
+        gw3+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
+        gw4+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
+        gw5+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
+        gw6+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
+        gw7+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
+    }
+    uint gwOff = (o * inputFeatures + i) * 8;
+    gradWeights[gwOff]=gw0; gradWeights[gwOff+1]=gw1; gradWeights[gwOff+2]=gw2; gradWeights[gwOff+3]=gw3;
+    gradWeights[gwOff+4]=gw4; gradWeights[gwOff+5]=gw5; gradWeights[gwOff+6]=gw6; gradWeights[gwOff+7]=gw7;
+}
+";
 }

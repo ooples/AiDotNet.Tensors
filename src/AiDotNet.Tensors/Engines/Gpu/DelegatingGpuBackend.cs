@@ -1017,6 +1017,20 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    /// <inheritdoc/>
+    public virtual void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+        => Inner.HyperbolicLinearForwardFused(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+
+    /// <inheritdoc/>
+    public virtual void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+        => Inner.OctonionLinearForwardFusedReLU(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
+
+    #endregion
+
     #region Quantum Computing Operations
 
     /// <inheritdoc/>
