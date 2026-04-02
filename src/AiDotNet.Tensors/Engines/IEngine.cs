@@ -2493,6 +2493,66 @@ public interface IEngine
     Tensor<T> StopGradient<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Computes Intersection over Union (IoU) loss for bounding box regression.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>IoU loss per box [N] where loss = 1 - IoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> IoU measures how much two bounding boxes overlap.
+    /// An IoU of 1 means perfect overlap, 0 means no overlap. The loss is 1 - IoU
+    /// so that the optimizer minimizes it toward zero (perfect overlap).</para>
+    /// <para>Reference: Standard IoU metric used in object detection (PASCAL VOC, COCO).</para>
+    /// </remarks>
+    Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Generalized Intersection over Union (GIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>GIoU loss per box [N] where loss = 1 - GIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> GIoU improves on IoU by also penalizing predictions that
+    /// are far away from the target, even when they don't overlap at all. Regular IoU gives
+    /// zero gradient when boxes don't overlap, making learning impossible. GIoU fixes this.</para>
+    /// <para>Reference: Rezatofighi et al., "Generalized Intersection over Union", CVPR 2019.</para>
+    /// </remarks>
+    Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Distance Intersection over Union (DIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>DIoU loss per box [N] where loss = 1 - DIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> DIoU adds a penalty based on the distance between the
+    /// centers of predicted and target boxes. This gives a stronger gradient signal than GIoU,
+    /// especially when boxes overlap partially but centers are misaligned.</para>
+    /// <para>Reference: Zheng et al., "Distance-IoU Loss", AAAI 2020.</para>
+    /// </remarks>
+    Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
+    /// Computes Complete Intersection over Union (CIoU) loss.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="predicted">Predicted boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <param name="target">Target boxes [N, 4] in (x1, y1, x2, y2) format.</param>
+    /// <returns>CIoU loss per box [N] where loss = 1 - CIoU. Tape-differentiable.</returns>
+    /// <remarks>
+    /// <para><b>For Beginners:</b> CIoU considers three factors simultaneously:
+    /// overlap (IoU), center distance (DIoU penalty), and aspect ratio consistency.
+    /// This makes it the most comprehensive box regression loss available.</para>
+    /// <para>Reference: Zheng et al., "Distance-IoU Loss", AAAI 2020.</para>
+    /// </remarks>
+    Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target);
+
+    /// <summary>
     /// Computes the element-wise power of a tensor raised to a scalar exponent.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

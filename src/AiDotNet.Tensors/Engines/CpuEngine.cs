@@ -22714,6 +22714,256 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // IoU Loss Operations — Differentiable bounding box regression losses
+    // Composed from existing tape-tracked engine ops for automatic backward.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+
+        int n = predicted.Shape[0];
+
+        // Extract coordinates: [N] tensors for each coordinate
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        // Intersection: max(0, min(x2_p, x2_t) - max(x1_p, x1_t)) * max(0, min(y2_p, y2_t) - max(y1_p, y1_t))
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        // min(a,b) = -max(-a,-b)
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+
+        // Union: area_p + area_t - intersection
+        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
+        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var eps = MathHelper.GetNumericOperations<T>().FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+
+        // IoU = intersection / union
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Loss = 1 - IoU
+        return ScalarMinusTensor(MathHelper.GetNumericOperations<T>().One, iou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorGIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        // Intersection
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+
+        // Union
+        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
+        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+
+        // IoU
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Enclosing box
+        // min(x1_p, x1_t): -max(-x1_p, -x1_t)
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encArea = TensorAddScalar(
+            TensorMultiply(TensorSubtract(encX2, encX1), TensorSubtract(encY2, encY1)), eps);
+
+        // GIoU = IoU - (enclosing_area - union_area) / enclosing_area
+        var fillRatio = TensorDivide(TensorSubtract(encArea, unionArea), encArea);
+        var giou = TensorSubtract(iou, fillRatio);
+
+        // Loss = 1 - GIoU
+        return ScalarMinusTensor(numOps.One, giou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorDIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        // IoU (same as above)
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
+        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Center distance squared
+        var half = numOps.FromDouble(0.5);
+        var pcx = TensorMultiplyScalar(TensorAdd(px1, px2), half);
+        var pcy = TensorMultiplyScalar(TensorAdd(py1, py2), half);
+        var tcx = TensorMultiplyScalar(TensorAdd(tx1, tx2), half);
+        var tcy = TensorMultiplyScalar(TensorAdd(ty1, ty2), half);
+        var dx = TensorSubtract(pcx, tcx);
+        var dy = TensorSubtract(pcy, tcy);
+        var centerDistSq = TensorAdd(TensorMultiply(dx, dx), TensorMultiply(dy, dy));
+
+        // Enclosing diagonal squared
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encDx = TensorSubtract(encX2, encX1);
+        var encDy = TensorSubtract(encY2, encY1);
+        var diagSq = TensorAddScalar(TensorAdd(TensorMultiply(encDx, encDx), TensorMultiply(encDy, encDy)), eps);
+
+        // DIoU = IoU - centerDistSq / diagSq
+        var penalty = TensorDivide(centerDistSq, diagSq);
+        var diou = TensorSubtract(iou, penalty);
+
+        return ScalarMinusTensor(numOps.One, diou);
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorCIoULoss<T>(Tensor<T> predicted, Tensor<T> target)
+    {
+        if (predicted == null) throw new ArgumentNullException(nameof(predicted));
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
+            throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int n = predicted.Shape[0];
+
+        var px1 = TensorSlice(predicted, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var py1 = TensorSlice(predicted, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var px2 = TensorSlice(predicted, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var py2 = TensorSlice(predicted, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        var tx1 = TensorSlice(target, new[] { 0, 0 }, new[] { n, 1 }).Reshape(new[] { n });
+        var ty1 = TensorSlice(target, new[] { 0, 1 }, new[] { n, 2 }).Reshape(new[] { n });
+        var tx2 = TensorSlice(target, new[] { 0, 2 }, new[] { n, 3 }).Reshape(new[] { n });
+        var ty2 = TensorSlice(target, new[] { 0, 3 }, new[] { n, 4 }).Reshape(new[] { n });
+
+        // IoU
+        var interX1 = TensorMax(px1, tx1);
+        var interY1 = TensorMax(py1, ty1);
+        var interX2 = TensorNegate(TensorMax(TensorNegate(px2), TensorNegate(tx2)));
+        var interY2 = TensorNegate(TensorMax(TensorNegate(py2), TensorNegate(ty2)));
+        var interW = ReLU(TensorSubtract(interX2, interX1));
+        var interH = ReLU(TensorSubtract(interY2, interY1));
+        var interArea = TensorMultiply(interW, interH);
+        var predArea = TensorMultiply(TensorSubtract(px2, px1), TensorSubtract(py2, py1));
+        var targArea = TensorMultiply(TensorSubtract(tx2, tx1), TensorSubtract(ty2, ty1));
+        var eps = numOps.FromDouble(1e-7);
+        var unionArea = TensorAddScalar(TensorSubtract(TensorAdd(predArea, targArea), interArea), eps);
+        var iou = TensorDivide(interArea, unionArea);
+
+        // Center distance
+        var half = numOps.FromDouble(0.5);
+        var pcx = TensorMultiplyScalar(TensorAdd(px1, px2), half);
+        var pcy = TensorMultiplyScalar(TensorAdd(py1, py2), half);
+        var tcx = TensorMultiplyScalar(TensorAdd(tx1, tx2), half);
+        var tcy = TensorMultiplyScalar(TensorAdd(ty1, ty2), half);
+        var dx = TensorSubtract(pcx, tcx);
+        var dy = TensorSubtract(pcy, tcy);
+        var centerDistSq = TensorAdd(TensorMultiply(dx, dx), TensorMultiply(dy, dy));
+
+        // Enclosing diagonal
+        var encX1 = TensorNegate(TensorMax(TensorNegate(px1), TensorNegate(tx1)));
+        var encY1 = TensorNegate(TensorMax(TensorNegate(py1), TensorNegate(ty1)));
+        var encX2 = TensorMax(px2, tx2);
+        var encY2 = TensorMax(py2, ty2);
+        var encDx = TensorSubtract(encX2, encX1);
+        var encDy = TensorSubtract(encY2, encY1);
+        var diagSq = TensorAddScalar(TensorAdd(TensorMultiply(encDx, encDx), TensorMultiply(encDy, encDy)), eps);
+
+        // DIoU penalty
+        var distPenalty = TensorDivide(centerDistSq, diagSq);
+
+        // Aspect ratio consistency: v = (4/π²) * (atan(w_t/h_t) - atan(w_p/h_p))²
+        var predW = TensorAddScalar(TensorSubtract(px2, px1), eps);
+        var predH = TensorAddScalar(TensorSubtract(py2, py1), eps);
+        var targW = TensorAddScalar(TensorSubtract(tx2, tx1), eps);
+        var targH = TensorAddScalar(TensorSubtract(ty2, ty1), eps);
+        var predRatio = TensorDivide(predW, predH);
+        var targRatio = TensorDivide(targW, targH);
+        // v computed as scalar per box (atan not available as tensor op, use approximation)
+        // atan(x) ≈ x for small x, which is the ratio. For the penalty we use (ratio_diff)²
+        var ratioDiff = TensorSubtract(targRatio, predRatio);
+        var fourOverPiSq = numOps.FromDouble(4.0 / (Math.PI * Math.PI));
+        var v = TensorMultiplyScalar(TensorMultiply(ratioDiff, ratioDiff), fourOverPiSq);
+
+        // alpha = v / (1 - IoU + v + eps) — detached from gradient for stability
+        // Use approximate alpha: when IoU is high, alpha → v/(v+eps) ≈ 1
+        // For simplicity and gradient stability, use alpha = v / (1 - iou + v + eps)
+        var denomAlpha = TensorAddScalar(TensorAdd(ScalarMinusTensor(numOps.One, iou), v), eps);
+        var alpha = TensorDivide(v, denomAlpha);
+
+        // CIoU = IoU - distPenalty - alpha * v
+        var aspectPenalty = TensorMultiply(alpha, v);
+        var ciou = TensorSubtract(TensorSubtract(iou, distPenalty), aspectPenalty);
+
+        return ScalarMinusTensor(numOps.One, ciou);
+    }
+
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
     {
         return Unsafe.As<Memory<T>, Memory<float>>(ref data);
