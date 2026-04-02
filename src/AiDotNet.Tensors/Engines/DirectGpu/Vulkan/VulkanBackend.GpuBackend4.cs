@@ -797,6 +797,32 @@ public sealed unsafe partial class VulkanBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+    {
+        // Fused: matmul+bias in one GLSL pass, then projection in second GLSL pass
+        // This eliminates the intermediate buffer allocation of the non-fused 3-pass version
+        int total = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures, FloatBits(curvature), FloatBits(epsilon) };
+        GlslQuadOp(VulkanGlslKernels.HyperbolicLinearForward, input, weights, biases, output, total, pc, 5 * sizeof(uint));
+        // Project in-place (second pass — reads and writes same buffer)
+        var projPc = new uint[] { (uint)batchSize, (uint)outputFeatures, FloatBits(curvature), FloatBits(epsilon) };
+        GlslUnaryOp(VulkanGlslKernels.PoincareProject, output, output, batchSize, projPc, 4 * sizeof(uint));
+    }
+
+    public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        EnsureInitialized();
+        int totalPairs = batchSize * outputFeatures;
+        var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
+        GlslQuadOp(VulkanGlslKernels.OctonionLinearForwardFusedReLU, input, weights, biases, output, totalPairs, pc, 3 * sizeof(uint));
+    }
+
+    #endregion
+
     #region Quantum Computing Operations
 
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)

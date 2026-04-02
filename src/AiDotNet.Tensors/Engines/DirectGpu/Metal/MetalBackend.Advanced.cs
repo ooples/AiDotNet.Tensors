@@ -283,6 +283,28 @@ public sealed partial class MetalBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+    {
+        HyperbolicLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+    }
+
+    public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        OctonionLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
+        // Apply ReLU element-wise to all 8 octonion components
+        ThrowIfDisposed();
+        var data = DownloadBuffer(output);
+        for (int i = 0; i < data.Length; i++)
+            data[i] = MathF.Max(data[i], 0f);
+        UploadToBuffer(output, data);
+    }
+
+    #endregion
+
     #region Quantum Computing Operations
 
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)

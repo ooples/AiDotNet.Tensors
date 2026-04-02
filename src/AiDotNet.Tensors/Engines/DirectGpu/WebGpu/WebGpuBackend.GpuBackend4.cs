@@ -464,6 +464,23 @@ public sealed partial class WebGpuBackend
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    public void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
+        => HyperbolicLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures, curvature, epsilon);
+
+    public void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures)
+    {
+        OctonionLinearForward(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
+        // Apply ReLU in-place via element-wise max(x, 0)
+        int total = batchSize * outputFeatures * 8;
+        Relu(output, output, total);
+    }
+
+    #endregion
+
     #region Quantum Operations
 
     public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)

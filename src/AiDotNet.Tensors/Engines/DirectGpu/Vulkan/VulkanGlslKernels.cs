@@ -1750,6 +1750,9 @@ void main() {
     ///          binding(3)=output [B*O].
     /// One thread per (batch, outputFeature).
     /// </summary>
+    /// <summary>
+    /// Non-fused hyperbolic linear: matmul + bias only. Projection done separately.
+    /// </summary>
     public static string HyperbolicLinearForward => Header + @"
 layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
 layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
@@ -1762,12 +1765,106 @@ void main() {
     if (tid >= total) return;
     uint b = tid / outputFeatures;
     uint o = tid % outputFeatures;
-    // Euclidean matmul + bias
     float val = bias[o];
     for (uint i = 0; i < inputFeatures; i++)
         val += inp[b * inputFeatures + i] * wt[o * inputFeatures + i];
     outp[b * outputFeatures + o] = val;
-    // Note: Poincaré projection is applied as a separate pass after this kernel
-    // since it requires all outputFeature values for the norm computation
+}";
+
+    /// <summary>
+    /// Fused hyperbolic linear: matmul + bias + Poincaré projection in a single kernel.
+    /// Each workgroup handles one batch element. Threads within the workgroup cooperate
+    /// to compute all output features, then synchronize to compute the norm and project.
+    /// Push constants: batchSize, inputFeatures, outputFeatures, curvature, epsilon.
+    /// Requires workgroup size >= outputFeatures.
+    /// </summary>
+    public static string HyperbolicLinearForwardFused => @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer BI { float bias[]; };
+layout(set = 0, binding = 3) buffer OUT { float outp[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; float curvature; float epsilon; };
+shared float sharedOutput[256];
+shared float sharedNormSq;
+void main() {
+    uint b = gl_WorkGroupID.x;
+    if (b >= batchSize) return;
+    uint localId = gl_LocalInvocationID.x;
+    uint outBase = b * outputFeatures;
+    // Phase 1: Each thread computes one or more output features (matmul + bias)
+    for (uint o = localId; o < outputFeatures; o += gl_WorkGroupSize.x) {
+        float val = bias[o];
+        for (uint i = 0; i < inputFeatures; i++)
+            val += inp[b * inputFeatures + i] * wt[o * inputFeatures + i];
+        outp[outBase + o] = val;
+        if (o < 256) sharedOutput[o] = val;
+    }
+    barrier();
+    // Phase 2: Compute norm^2 (reduction in shared memory)
+    if (localId == 0) {
+        float sqNorm = 0.0;
+        for (uint o = 0; o < outputFeatures; o++)
+            sqNorm += outp[outBase + o] * outp[outBase + o];
+        sharedNormSq = sqNorm;
+    }
+    barrier();
+    // Phase 3: Project onto Poincaré ball if needed
+    float maxNorm = 1.0 / sqrt(curvature) - epsilon;
+    float norm = sqrt(max(sharedNormSq, 1e-20));
+    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0;
+    for (uint o = localId; o < outputFeatures; o += gl_WorkGroupSize.x)
+        outp[outBase + o] *= scale;
+}";
+
+    /// <summary>
+    /// Fused octonion linear forward + ReLU activation.
+    /// Combines octonion matmul + bias + ReLU in a single kernel launch.
+    /// ReLU is applied component-wise to each of the 8 octonion components.
+    /// </summary>
+    public static string OctonionLinearForwardFusedReLU => Header + @"
+layout(set = 0, binding = 0) readonly buffer IN { float inp[]; };
+layout(set = 0, binding = 1) readonly buffer W  { float wt[]; };
+layout(set = 0, binding = 2) readonly buffer BI { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer OUT { float outp[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint outputFeatures; };
+
+void oct_mul(float a0,float a1,float a2,float a3,float a4,float a5,float a6,float a7,
+             float b0,float b1,float b2,float b3,float b4,float b5,float b6,float b7,
+             out float r0,out float r1,out float r2,out float r3,
+             out float r4,out float r5,out float r6,out float r7) {
+    r0=a0*b0-a1*b1-a2*b2-a3*b3-a4*b4-a5*b5-a6*b6-a7*b7;
+    r1=a0*b1+a1*b0+a2*b3-a3*b2+a4*b5-a5*b4-a6*b7+a7*b6;
+    r2=a0*b2-a1*b3+a2*b0+a3*b1+a4*b6+a5*b7-a6*b4-a7*b5;
+    r3=a0*b3+a1*b2-a2*b1+a3*b0+a4*b7-a5*b6+a6*b5-a7*b4;
+    r4=a0*b4-a1*b5-a2*b6-a3*b7+a4*b0+a5*b1+a6*b2+a7*b3;
+    r5=a0*b5+a1*b4-a2*b7+a3*b6-a4*b1+a5*b0-a6*b3+a7*b2;
+    r6=a0*b6+a1*b7+a2*b4-a3*b5-a4*b2+a5*b3+a6*b0-a7*b1;
+    r7=a0*b7-a1*b6+a2*b5+a3*b4-a4*b3-a5*b2+a6*b1+a7*b0;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint totalPairs = batchSize * outputFeatures;
+    if (tid >= totalPairs) return;
+    uint b = tid / outputFeatures;
+    uint o = tid % outputFeatures;
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
+    for (uint i = 0; i < inputFeatures; i++) {
+        uint wi = (o * inputFeatures + i) * 8;
+        uint ii = (b * inputFeatures + i) * 8;
+        float r0,r1,r2,r3,r4,r5,r6,r7;
+        oct_mul(wt[wi],wt[wi+1],wt[wi+2],wt[wi+3],wt[wi+4],wt[wi+5],wt[wi+6],wt[wi+7],
+                inp[ii],inp[ii+1],inp[ii+2],inp[ii+3],inp[ii+4],inp[ii+5],inp[ii+6],inp[ii+7],
+                r0,r1,r2,r3,r4,r5,r6,r7);
+        s0+=r0;s1+=r1;s2+=r2;s3+=r3;s4+=r4;s5+=r5;s6+=r6;s7+=r7;
+    }
+    uint bo = o * 8;
+    uint oo = (b * outputFeatures + o) * 8;
+    // Fused bias + ReLU
+    outp[oo]  =max(s0+bias[bo],  0.0); outp[oo+1]=max(s1+bias[bo+1],0.0);
+    outp[oo+2]=max(s2+bias[bo+2],0.0); outp[oo+3]=max(s3+bias[bo+3],0.0);
+    outp[oo+4]=max(s4+bias[bo+4],0.0); outp[oo+5]=max(s5+bias[bo+5],0.0);
+    outp[oo+6]=max(s6+bias[bo+6],0.0); outp[oo+7]=max(s7+bias[bo+7],0.0);
 }";
 }

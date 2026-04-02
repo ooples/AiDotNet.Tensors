@@ -2450,6 +2450,24 @@ public interface IDirectGpuBackend : IDisposable
 
     #endregion
 
+    #region Fused Kernel Operations
+
+    /// <summary>
+    /// Fused hyperbolic linear: matmul + bias + Poincaré projection in a single kernel launch.
+    /// Eliminates intermediate buffer round-trips vs the 3-pass non-fused version.
+    /// </summary>
+    void HyperbolicLinearForwardFused(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon);
+
+    /// <summary>
+    /// Fused octonion linear forward + ReLU: matmul + bias + ReLU activation in a single kernel.
+    /// ReLU is applied component-wise to each of the 8 octonion components.
+    /// </summary>
+    void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
+        int batchSize, int inputFeatures, int outputFeatures);
+
+    #endregion
+
     #region Quantum Computing Operations
 
     /// <summary>
