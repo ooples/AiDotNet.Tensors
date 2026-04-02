@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -22711,4 +22712,144 @@ public class CpuEngine : ITensorLevelEngine
     {
         return Unsafe.As<Memory<T>, Memory<double>>(ref data);
     }
+
+    #region Hyperbolic Manifold Operations
+
+    private static readonly CpuHyperbolicManifoldEngine _hyperbolicEngine = CpuHyperbolicManifoldEngine.Instance;
+
+    /// <inheritdoc />
+    public Vector<T> PoincareExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature)
+        => _hyperbolicEngine.PoincareExpMap(basePoint, tangentVector, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature)
+        => _hyperbolicEngine.PoincareLogMap(basePoint, targetPoint, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> MobiusAdd<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.MobiusAdd(x, y, curvature);
+
+    /// <inheritdoc />
+    public T PoincareDistance<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.PoincareDistance(x, y, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareParallelTransport<T>(Vector<T> x, Vector<T> y, Vector<T> v, T curvature)
+        => _hyperbolicEngine.PoincareParallelTransport(x, y, v, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareProject<T>(Vector<T> point, T curvature, T epsilon)
+        => _hyperbolicEngine.PoincareProject(point, curvature, epsilon);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature)
+        => _hyperbolicEngine.HyperboloidExpMap(basePoint, tangentVector, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature)
+        => _hyperbolicEngine.HyperboloidLogMap(basePoint, targetPoint, curvature);
+
+    /// <inheritdoc />
+    public T HyperboloidDistance<T>(Vector<T> x, Vector<T> y, T curvature)
+        => _hyperbolicEngine.HyperboloidDistance(x, y, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidProject<T>(Vector<T> point, T curvature)
+        => _hyperbolicEngine.HyperboloidProject(point, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareToHyperboloid<T>(Vector<T> poincarePoint, T curvature)
+        => _hyperbolicEngine.PoincareToHyperboloid(poincarePoint, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> HyperboloidToPoincare<T>(Vector<T> hyperboloidPoint, T curvature)
+        => _hyperbolicEngine.HyperboloidToPoincare(hyperboloidPoint, curvature);
+
+    /// <inheritdoc />
+    public Matrix<T> PoincareExpMapBatch<T>(Matrix<T> basePoints, Matrix<T> tangentVectors, T curvature)
+        => _hyperbolicEngine.PoincareExpMapBatch(basePoints, tangentVectors, curvature);
+
+    /// <inheritdoc />
+    public Vector<T> PoincareDistanceBatch<T>(Matrix<T> x, Matrix<T> y, T curvature)
+        => _hyperbolicEngine.PoincareDistanceBatch(x, y, curvature);
+
+    #endregion
+
+    #region Advanced Algebra Operations
+
+    private static readonly CpuAdvancedAlgebraEngine _algebraEngine = CpuAdvancedAlgebraEngine.Instance;
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionMultiplyBatch<T>(Octonion<T>[] left, Octonion<T>[] right)
+        => _algebraEngine.OctonionMultiplyBatch(left, right);
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionAddBatch<T>(Octonion<T>[] left, Octonion<T>[] right)
+        => _algebraEngine.OctonionAddBatch(left, right);
+
+    /// <inheritdoc />
+    public Octonion<T>[] OctonionConjugateBatch<T>(Octonion<T>[] octonions)
+        => _algebraEngine.OctonionConjugateBatch(octonions);
+
+    /// <inheritdoc />
+    public T[] OctonionNormBatch<T>(Octonion<T>[] octonions)
+        => _algebraEngine.OctonionNormBatch(octonions);
+
+    /// <inheritdoc />
+    public Octonion<T>[,] OctonionMatMul<T>(Octonion<T>[,] input, Octonion<T>[,] weight)
+        => _algebraEngine.OctonionMatMul(input, weight);
+
+    /// <inheritdoc />
+    public Multivector<T>[] GeometricProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.GeometricProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] WedgeProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.WedgeProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] InnerProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.InnerProductBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] MultivectorAddBatch<T>(Multivector<T>[] left, Multivector<T>[] right)
+        => _algebraEngine.MultivectorAddBatch(left, right);
+
+    /// <inheritdoc />
+    public Multivector<T>[] MultivectorReverseBatch<T>(Multivector<T>[] multivectors)
+        => _algebraEngine.MultivectorReverseBatch(multivectors);
+
+    /// <inheritdoc />
+    public Multivector<T>[] GradeProjectBatch<T>(Multivector<T>[] multivectors, int grade)
+        => _algebraEngine.GradeProjectBatch(multivectors, grade);
+
+    /// <inheritdoc />
+    public So3<T>[] So3ExpBatch<T>(So3Group<T> group, Vector<T>[] tangentVectors)
+        => _algebraEngine.So3ExpBatch(group, tangentVectors);
+
+    /// <inheritdoc />
+    public Vector<T>[] So3LogBatch<T>(So3Group<T> group, So3<T>[] rotations)
+        => _algebraEngine.So3LogBatch(group, rotations);
+
+    /// <inheritdoc />
+    public So3<T>[] So3ComposeBatch<T>(So3Group<T> group, So3<T>[] left, So3<T>[] right)
+        => _algebraEngine.So3ComposeBatch(group, left, right);
+
+    /// <inheritdoc />
+    public Se3<T>[] Se3ExpBatch<T>(Se3Group<T> group, Vector<T>[] tangentVectors)
+        => _algebraEngine.Se3ExpBatch(group, tangentVectors);
+
+    /// <inheritdoc />
+    public Vector<T>[] Se3LogBatch<T>(Se3Group<T> group, Se3<T>[] transforms)
+        => _algebraEngine.Se3LogBatch(group, transforms);
+
+    /// <inheritdoc />
+    public Se3<T>[] Se3ComposeBatch<T>(Se3Group<T> group, Se3<T>[] left, Se3<T>[] right)
+        => _algebraEngine.Se3ComposeBatch(group, left, right);
+
+    /// <inheritdoc />
+    public Matrix<T>[] So3AdjointBatch<T>(So3Group<T> group, So3<T>[] rotations)
+        => _algebraEngine.So3AdjointBatch(group, rotations);
+
+    #endregion
 }

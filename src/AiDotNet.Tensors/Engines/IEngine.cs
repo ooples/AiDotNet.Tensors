@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Groups;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
@@ -7145,6 +7146,144 @@ public interface IEngine
 
     /// <summary>IndexSelect with differentiable backward.</summary>
     Tensor<T> TensorIndexSelectDiff<T>(Tensor<T> source, Tensor<int> indices, int axis);
+
+    #region Hyperbolic Manifold Operations
+
+    /// <summary>
+    /// Exponential map on the Poincaré ball: projects a tangent vector at a point onto the manifold.
+    /// Formula: exp_x(v) = x ⊕ tanh(√c ||v|| / (1 - c||x||²)) * (v / ||v||)
+    /// </summary>
+    Vector<T> PoincareExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature);
+
+    /// <summary>
+    /// Logarithmic map on the Poincaré ball: computes the tangent vector from one point to another.
+    /// Inverse of PoincareExpMap.
+    /// </summary>
+    Vector<T> PoincareLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature);
+
+    /// <summary>
+    /// Möbius addition: the hyperbolic analog of vector addition that stays inside the Poincaré ball.
+    /// Formula: x ⊕ y = ((1 + 2c⟨x,y⟩ + c||y||²)x + (1 - c||x||²)y) / (1 + 2c⟨x,y⟩ + c²||x||²||y||²)
+    /// </summary>
+    Vector<T> MobiusAdd<T>(Vector<T> x, Vector<T> y, T curvature);
+
+    /// <summary>
+    /// Geodesic distance between two points on the Poincaré ball.
+    /// Formula: d(x,y) = (2/√c) * arctanh(√c * ||(-x) ⊕ y||)
+    /// </summary>
+    T PoincareDistance<T>(Vector<T> x, Vector<T> y, T curvature);
+
+    /// <summary>
+    /// Parallel transport: moves a tangent vector from one point to another along the geodesic.
+    /// </summary>
+    Vector<T> PoincareParallelTransport<T>(Vector<T> x, Vector<T> y, Vector<T> v, T curvature);
+
+    /// <summary>
+    /// Projects a point onto the Poincaré ball (clamps to valid region ||x|| &lt; 1/√c).
+    /// </summary>
+    Vector<T> PoincareProject<T>(Vector<T> point, T curvature, T epsilon);
+
+    /// <summary>
+    /// Exponential map on the hyperboloid model.
+    /// Formula: exp_x(v) = cosh(||v||_L) * x + sinh(||v||_L) * (v / ||v||_L)
+    /// </summary>
+    Vector<T> HyperboloidExpMap<T>(Vector<T> basePoint, Vector<T> tangentVector, T curvature);
+
+    /// <summary>
+    /// Logarithmic map on the hyperboloid model.
+    /// </summary>
+    Vector<T> HyperboloidLogMap<T>(Vector<T> basePoint, Vector<T> targetPoint, T curvature);
+
+    /// <summary>
+    /// Geodesic distance on the hyperboloid using the Minkowski inner product.
+    /// Formula: d(x,y) = (1/√c) * arcosh(-c * ⟨x,y⟩_L)
+    /// </summary>
+    T HyperboloidDistance<T>(Vector<T> x, Vector<T> y, T curvature);
+
+    /// <summary>
+    /// Projects a point onto the hyperboloid (ensures constraint: -x₀² + x₁² + ... + xₙ² = -1/c).
+    /// </summary>
+    Vector<T> HyperboloidProject<T>(Vector<T> point, T curvature);
+
+    /// <summary>
+    /// Converts a point from Poincaré ball model to hyperboloid model.
+    /// </summary>
+    Vector<T> PoincareToHyperboloid<T>(Vector<T> poincarePoint, T curvature);
+
+    /// <summary>
+    /// Converts a point from hyperboloid model to Poincaré ball model.
+    /// </summary>
+    Vector<T> HyperboloidToPoincare<T>(Vector<T> hyperboloidPoint, T curvature);
+
+    /// <summary>
+    /// Batched exponential map on the Poincaré ball.
+    /// </summary>
+    Matrix<T> PoincareExpMapBatch<T>(Matrix<T> basePoints, Matrix<T> tangentVectors, T curvature);
+
+    /// <summary>
+    /// Batched geodesic distance computation on the Poincaré ball.
+    /// </summary>
+    Vector<T> PoincareDistanceBatch<T>(Matrix<T> x, Matrix<T> y, T curvature);
+
+    #endregion
+
+    #region Advanced Algebra Operations
+
+    /// <summary>Batch octonion-octonion multiplication (non-associative).</summary>
+    Octonion<T>[] OctonionMultiplyBatch<T>(Octonion<T>[] left, Octonion<T>[] right);
+
+    /// <summary>Batch octonion addition.</summary>
+    Octonion<T>[] OctonionAddBatch<T>(Octonion<T>[] left, Octonion<T>[] right);
+
+    /// <summary>Batch octonion conjugation.</summary>
+    Octonion<T>[] OctonionConjugateBatch<T>(Octonion<T>[] octonions);
+
+    /// <summary>Computes batch octonion norms.</summary>
+    T[] OctonionNormBatch<T>(Octonion<T>[] octonions);
+
+    /// <summary>Octonion-matrix multiplication for neural network layers.</summary>
+    Octonion<T>[,] OctonionMatMul<T>(Octonion<T>[,] input, Octonion<T>[,] weight);
+
+    /// <summary>Batch geometric product of multivectors.</summary>
+    Multivector<T>[] GeometricProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right);
+
+    /// <summary>Batch wedge (outer) product of multivectors.</summary>
+    Multivector<T>[] WedgeProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right);
+
+    /// <summary>Batch inner product of multivectors.</summary>
+    Multivector<T>[] InnerProductBatch<T>(Multivector<T>[] left, Multivector<T>[] right);
+
+    /// <summary>Batch multivector addition.</summary>
+    Multivector<T>[] MultivectorAddBatch<T>(Multivector<T>[] left, Multivector<T>[] right);
+
+    /// <summary>Batch multivector reverse operation.</summary>
+    Multivector<T>[] MultivectorReverseBatch<T>(Multivector<T>[] multivectors);
+
+    /// <summary>Batch grade projection - extracts components of a specific grade.</summary>
+    Multivector<T>[] GradeProjectBatch<T>(Multivector<T>[] multivectors, int grade);
+
+    /// <summary>Batch exponential map for SO(3) (rotation group).</summary>
+    So3<T>[] So3ExpBatch<T>(So3Group<T> group, Vector<T>[] tangentVectors);
+
+    /// <summary>Batch logarithm map for SO(3).</summary>
+    Vector<T>[] So3LogBatch<T>(So3Group<T> group, So3<T>[] rotations);
+
+    /// <summary>Batch group composition for SO(3).</summary>
+    So3<T>[] So3ComposeBatch<T>(So3Group<T> group, So3<T>[] left, So3<T>[] right);
+
+    /// <summary>Batch exponential map for SE(3) (rigid transformation group).</summary>
+    Se3<T>[] Se3ExpBatch<T>(Se3Group<T> group, Vector<T>[] tangentVectors);
+
+    /// <summary>Batch logarithm map for SE(3).</summary>
+    Vector<T>[] Se3LogBatch<T>(Se3Group<T> group, Se3<T>[] transforms);
+
+    /// <summary>Batch group composition for SE(3).</summary>
+    Se3<T>[] Se3ComposeBatch<T>(Se3Group<T> group, Se3<T>[] left, Se3<T>[] right);
+
+    /// <summary>Batch adjoint representation for SO(3).</summary>
+    Matrix<T>[] So3AdjointBatch<T>(So3Group<T> group, So3<T>[] rotations);
+
+    #endregion
 }
 
 /// <summary>
