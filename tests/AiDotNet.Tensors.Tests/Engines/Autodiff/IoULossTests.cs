@@ -166,6 +166,76 @@ public class IoULossTests
     }
 
     [Fact]
+    public void ScalarMinusTensor_GradientFlows()
+    {
+        var x = new Tensor<float>(new float[] { 3f }, new[] { 1, 1 });
+        using var tape = new GradientTape<float>();
+        var y = _engine.ScalarMinusTensor(1f, x);
+        var loss = _engine.ReduceSum(y, new[] { 0 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss);
+        Assert.True(grads.ContainsKey(x), $"No grad for x. Keys: {grads.Count}");
+        // d(1-x)/dx = -1
+        Assert.Equal(-1f, grads[x][0], 4);
+    }
+
+    [Fact]
+    public void DivideAfterScalarMinus_GradientFlows()
+    {
+        var a = new Tensor<float>(new float[] { 6f }, new[] { 1, 1 });
+        var b = new Tensor<float>(new float[] { 10f }, new[] { 1, 1 });
+        using var tape = new GradientTape<float>();
+        var ratio = _engine.TensorDivide(a, b);
+        var y = _engine.ScalarMinusTensor(1f, ratio);
+        var loss = _engine.ReduceSum(y, new[] { 0 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss);
+        Assert.True(grads.ContainsKey(a), $"No grad for a. Keys: {grads.Count}");
+        // d(1 - a/b)/da = -1/b = -0.1
+        Assert.Equal(-0.1f, grads[a][0], 3);
+    }
+
+    [Fact]
+    public void IoUChain_DivideScalarMinusReduceSum_GradientFlows()
+    {
+        // Minimal IoU-like chain: iou = a/b, loss = 1-iou, scalar = sum(loss)
+        var a = new Tensor<float>(new float[] { 36f }, new[] { 1, 1 });
+        var b = new Tensor<float>(new float[] { 100f }, new[] { 1, 1 });
+        using var tape = new GradientTape<float>();
+        var iou = _engine.TensorDivide(a, b);
+        var loss = _engine.ScalarMinusTensor(1f, iou);
+        var scalar = _engine.ReduceSum(loss, new[] { 0 }, keepDims: false);
+        var grads = tape.ComputeGradients(scalar);
+
+        // d(1 - a/b)/da = -1/b = -0.01
+        Assert.True(grads.ContainsKey(a), $"No grad for a");
+        Assert.Equal(-0.01f, grads[a][0], 3);
+    }
+
+    [Fact]
+    public void IoUChain_SliceThroughMultiplyDivide_GradientFlows()
+    {
+        var predicted = MakeBoxes(new float[,] { { 1, 1, 9, 9 } });
+        using var tape = new GradientTape<float>();
+        var px1 = _engine.TensorSlice(predicted, new[] { 0, 0 }, new[] { 1, 1 });
+        var px2 = _engine.TensorSlice(predicted, new[] { 0, 2 }, new[] { 1, 1 });
+        // width = px2 - px1 = 8
+        var width = _engine.TensorSubtract(px2, px1);
+        // Test: does gradient flow through multiply?
+        var area = _engine.TensorMultiply(width, width);
+        var loss = _engine.ReduceSum(area, new[] { 0, 1 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss);
+        // Check each intermediate
+        Assert.True(grads.ContainsKey(area), $"No grad for area");
+        Assert.True(grads.ContainsKey(width), $"No grad for width. area grad exists={grads.ContainsKey(area)}");
+        Assert.True(grads.ContainsKey(px1), $"No grad for px1. width grad exists={grads.ContainsKey(width)}");
+        Assert.True(grads.ContainsKey(predicted), $"No grad for predicted. px1 grad exists={grads.ContainsKey(px1)}");
+        // d(w^2)/dpx1 = 2w * (-1) = 2*8*(-1) = -16
+        Assert.Equal(-16f, grads[predicted][0], 1); // px1
+        Assert.Equal(0f, grads[predicted][1], 1);    // py1 (not used)
+        Assert.Equal(16f, grads[predicted][2], 1);   // px2
+        Assert.Equal(0f, grads[predicted][3], 1);    // py2 (not used)
+    }
+
+    [Fact]
     public void IoULoss_FullManualIoU_GradientFlows()
     {
         // Replicate the full IoU composition to find where gradient chain breaks
@@ -205,13 +275,16 @@ public class IoULossTests
         // IoU
         var iou = _engine.TensorDivide(interArea, unionArea);
         var loss = _engine.ScalarMinusTensor(1f, iou);
-        var scalarLoss = _engine.ReduceSum(loss, new[] { 0, 1 }, keepDims: false);
+        var scalarLoss = _engine.ReduceSum(loss, new[] { 0 }, keepDims: false);
         var grads = tape.ComputeGradients(scalarLoss);
 
         Assert.True(grads.ContainsKey(predicted),
             $"No grad for predicted. Grads has {grads.Count} keys. " +
             $"Has px1={grads.ContainsKey(px1)}, predW={grads.ContainsKey(predW)}, predArea={grads.ContainsKey(predArea)}, " +
-            $"iou={grads.ContainsKey(iou)}, interArea={grads.ContainsKey(interArea)}");
+            $"iou={grads.ContainsKey(iou)}, interArea={grads.ContainsKey(interArea)}, interX1={grads.ContainsKey(interX1)}");
+        // Verify gradient value for px1 coordinate (index 0 in [1,4] tensor)
+        var predGrad = grads[predicted];
+        Assert.False(predGrad[0] == 0f, $"px1 grad is zero but should be ~0.06. Full grad: [{predGrad[0]},{predGrad[1]},{predGrad[2]},{predGrad[3]}]");
     }
 
     [Fact]

@@ -754,10 +754,11 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0].Shape.ToArray();
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Create zeros with input shape, then set the sliced region to gradOutput
-        var grad = TensorPool<T>.RentZeroed(inputShape);
-        engine.TensorFill(grad, numOps.Zero);
-        engine.TensorSetSlice(grad, gradOutput, start);
+        // Create zeros with input shape, set the sliced region to gradOutput.
+        // TensorSetSlice returns a new tensor (does not modify in-place).
+        var data = new T[inputShape.Aggregate(1, (a, b) => a * b)];
+        var zeros = new Tensor<T>(data, inputShape);
+        var grad = engine.TensorSetSlice(zeros, gradOutput, start);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
