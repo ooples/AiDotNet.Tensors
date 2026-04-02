@@ -414,8 +414,15 @@ public sealed partial class WebGpuBackend
     public void OctonionLinearForward(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        Gemm(input, weights, output, batchSize, outputFeatures, inputFeatures);
-        BiasAdd(output, biases, output, batchSize, outputFeatures);
+        int totalPairs = batchSize * outputFeatures;
+        var uniforms = new float[]
+        {
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(inputFeatures),
+            BitConverter.Int32BitsToSingle(outputFeatures),
+        };
+        Dispatch4BufferAsync("OctonionLinearForward", WebGpuKernels.OctonionLinearForwardSource, "octonion_linear_forward",
+            input, weights, biases, output, uniforms, totalPairs).GetAwaiter().GetResult();
     }
 
     public void OctonionLinearBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer gradInput,

@@ -92,10 +92,8 @@ public class SparseTensor<T> : Tensor<T>
         : base(Vector<T>.Wrap(values ?? throw new ArgumentNullException(nameof(values))),
                new[] { rows, columns }, isSparse: true)
     {
-        if (rows < 0)
-            throw new ArgumentOutOfRangeException(nameof(rows), "Rows must be non-negative.");
-        if (columns < 0)
-            throw new ArgumentOutOfRangeException(nameof(columns), "Columns must be non-negative.");
+        // Note: rows/columns non-negative validation is handled by TensorBase.ValidateShape
+        // in the base constructor call above, so no redundant checks here.
         if (rowIndices is null)
             throw new ArgumentNullException(nameof(rowIndices));
         if (columnIndices is null)

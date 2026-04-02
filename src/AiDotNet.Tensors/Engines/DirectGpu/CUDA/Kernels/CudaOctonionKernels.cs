@@ -235,8 +235,8 @@ extern ""C"" __global__ __launch_bounds__(256) void octonion_linear_forward(
             weightOct[c] = weights[(o * inputFeatures + i) * 8 + c];
         }
 
-        // Octonion multiplication
-        octonion_multiply(inputOct, weightOct, product);
+        // Octonion multiplication: weight * input (non-commutative order)
+        octonion_multiply(weightOct, inputOct, product);
 
         // Accumulate
         for (int c = 0; c < 8; c++) {

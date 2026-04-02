@@ -22870,18 +22870,21 @@ public class CpuEngine : ITensorLevelEngine
 
         var output = new Tensor<T>(new[] { batch, outputFeatures, 8 });
 
-        // For each batch and output feature, compute octonion dot product
+        // Pre-allocate reusable buffers outside inner loops to avoid GC pressure.
+        // OctonionMultiply writes into prod; a/w are loaded per iteration.
+        var accum = new T[8];
+        var a = new T[8];
+        var w = new T[8];
+        var prod = new T[8];
+
         for (int b = 0; b < batch; b++)
         {
             for (int o = 0; o < outputFeatures; o++)
             {
-                // Accumulate octonion product sum
-                var accum = new T[8];
+                for (int c = 0; c < 8; c++) accum[c] = default!;
+
                 for (int i = 0; i < inputFeatures; i++)
                 {
-                    // Get input and weight octonion components
-                    var a = new T[8];
-                    var w = new T[8];
                     for (int c = 0; c < 8; c++)
                     {
                         a[c] = input[b, i, c];
@@ -22891,14 +22894,12 @@ public class CpuEngine : ITensorLevelEngine
                     // Octonion multiplication (Cayley-Dickson): result = w * a
                     // Matches CpuAdvancedAlgebraEngine.OctonionMatMul which uses weight * input.
                     // Octonion multiply is non-commutative, so order matters.
-                    var prod = OctonionMultiply(w, a, numOps);
+                    OctonionMultiplyInPlace(w, a, prod, numOps);
 
-                    // Accumulate
                     for (int c = 0; c < 8; c++)
                         accum[c] = numOps.Add(accum[c], prod[c]);
                 }
 
-                // Write accumulated result
                 for (int c = 0; c < 8; c++)
                     output[b, o, c] = accum[c];
             }
@@ -22966,6 +22967,58 @@ public class CpuEngine : ITensorLevelEngine
         var second = QuatAdd(sp, q_conjR, ops);
 
         return new T[] { first[0], first[1], first[2], first[3], second[0], second[1], second[2], second[3] };
+    }
+
+    /// <summary>
+    /// Zero-allocation octonion multiply that writes result into a pre-allocated destination buffer.
+    /// Uses direct multiplication table instead of Cayley-Dickson decomposition to avoid
+    /// intermediate quaternion allocations.
+    /// </summary>
+    private static void OctonionMultiplyInPlace<T>(T[] a, T[] b, T[] result, INumericOperations<T> ops)
+    {
+        T a0=a[0],a1=a[1],a2=a[2],a3=a[3],a4=a[4],a5=a[5],a6=a[6],a7=a[7];
+        T b0=b[0],b1=b[1],b2=b[2],b3=b[3],b4=b[4],b5=b[5],b6=b[6],b7=b[7];
+
+        // e0
+        result[0] = ops.Subtract(ops.Subtract(ops.Subtract(ops.Subtract(
+            ops.Subtract(ops.Subtract(ops.Subtract(ops.Multiply(a0,b0), ops.Multiply(a1,b1)),
+            ops.Multiply(a2,b2)), ops.Multiply(a3,b3)), ops.Multiply(a4,b4)),
+            ops.Multiply(a5,b5)), ops.Multiply(a6,b6)), ops.Multiply(a7,b7));
+        // e1
+        result[1] = ops.Add(ops.Subtract(ops.Add(ops.Add(
+            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b1), ops.Multiply(a1,b0)),
+            ops.Multiply(a2,b3)), ops.Multiply(a3,b2)), ops.Multiply(a4,b5)),
+            ops.Multiply(a5,b4)), ops.Multiply(a6,b7)), ops.Multiply(a7,b6));
+        // e2
+        result[2] = ops.Subtract(ops.Subtract(ops.Add(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b2), ops.Multiply(a2,b0)),
+            ops.Multiply(a1,b3)), ops.Multiply(a3,b1)), ops.Multiply(a4,b6)),
+            ops.Multiply(a5,b7)), ops.Multiply(a6,b4)), ops.Multiply(a7,b5));
+        // e3
+        result[3] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b3), ops.Multiply(a3,b0)),
+            ops.Multiply(a2,b1)), ops.Multiply(a1,b2)), ops.Multiply(a4,b7)),
+            ops.Multiply(a5,b6)), ops.Multiply(a6,b5)), ops.Multiply(a7,b4));
+        // e4
+        result[4] = ops.Add(ops.Add(ops.Add(ops.Subtract(
+            ops.Subtract(ops.Subtract(ops.Add(ops.Multiply(a0,b4), ops.Multiply(a4,b0)),
+            ops.Multiply(a1,b5)), ops.Multiply(a2,b6)), ops.Multiply(a3,b7)),
+            ops.Multiply(a5,b1)), ops.Multiply(a6,b2)), ops.Multiply(a7,b3));
+        // e5
+        result[5] = ops.Add(ops.Subtract(ops.Subtract(ops.Add(
+            ops.Add(ops.Subtract(ops.Add(ops.Multiply(a0,b5), ops.Multiply(a5,b0)),
+            ops.Multiply(a4,b1)), ops.Multiply(a1,b4)), ops.Multiply(a3,b6)),
+            ops.Multiply(a2,b7)), ops.Multiply(a6,b3)), ops.Multiply(a7,b2));
+        // e6
+        result[6] = ops.Subtract(ops.Add(ops.Subtract(ops.Add(
+            ops.Subtract(ops.Add(ops.Add(ops.Multiply(a0,b6), ops.Multiply(a6,b0)),
+            ops.Multiply(a1,b7)), ops.Multiply(a4,b2)), ops.Multiply(a2,b4)),
+            ops.Multiply(a5,b3)), ops.Multiply(a3,b5)), ops.Multiply(a7,b1));
+        // e7
+        result[7] = ops.Add(ops.Subtract(ops.Subtract(ops.Subtract(
+            ops.Add(ops.Add(ops.Add(ops.Multiply(a0,b7), ops.Multiply(a7,b0)),
+            ops.Multiply(a2,b5)), ops.Multiply(a3,b4)), ops.Multiply(a1,b6)),
+            ops.Multiply(a4,b3)), ops.Multiply(a5,b2)), ops.Multiply(a6,b1));
     }
 
     #endregion
