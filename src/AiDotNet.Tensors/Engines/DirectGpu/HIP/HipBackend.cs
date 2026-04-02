@@ -78,6 +78,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend
     private IntPtr _shapeModule;
     private IntPtr _lossModule;
     private IntPtr _softmaxVarModule;
+    private IntPtr _fusedLinearModule;
+    private IntPtr _iouModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
 
@@ -487,6 +489,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             // Compile LSTM sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipLstmKernels.GetSource(), "lstm", ref _lstmModule,
                 HipLstmKernels.GetKernelNames());
+
+            // Compile Fused Linear + Activation kernels
+            CompileKernelModule(Kernels.HipFusedLinearKernels.GetSource(), "fused_linear", ref _fusedLinearModule,
+                Kernels.HipFusedLinearKernels.GetKernelNames());
+
+            // Compile IoU loss kernels
+            CompileKernelModule(Kernels.HipIoUKernels.GetSource(), "iou", ref _iouModule,
+                Kernels.HipIoUKernels.GetKernelNames());
 
             // Compile GRU sequence kernels (forward/backward for BPTT training)
             CompileKernelModule(HipGruKernels.GetSource(), "gru", ref _gruModule,
@@ -2245,24 +2255,50 @@ public sealed partial class HipBackend : IAsyncGpuBackend
         HipNativeBindings.hipMemcpy(destination.Handle, source.Handle, (nuint)(size * sizeof(float)), HipMemcpyKind.DeviceToDevice);
     }
 
-    public void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException("HIP fused linear kernels not yet implemented. CPU fallback will be used.");
-    public void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
+    public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_relu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearSigmoid(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_sigmoid", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearTanh(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_tanh", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearGELU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_gelu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public unsafe void FusedLinearSwish(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_swish", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
+    public void FusedLinearReLUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException("HIP fused backward not yet implemented.");
     public void FusedLinearSigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearTanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer output, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearGELUBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
     public void FusedLinearSwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer preActivation, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias, int batchSize, int inFeatures, int outFeatures) => throw new NotSupportedException();
-    public void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) => throw new NotSupportedException();
-    public void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
-    public void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) => throw new NotSupportedException();
+    public unsafe void IoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("iou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void GIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("giou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void DIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("diou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void CIoULoss(IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes) { LaunchIoU("ciou_loss", predicted, target, loss, numBoxes); }
+    public unsafe void IoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("iou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void GIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("giou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void DIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("diou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+    public unsafe void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes) { LaunchIoUBackward("ciou_loss_backward", gradOutput, predicted, target, gradPredicted, numBoxes); }
+
+    private unsafe void LaunchFusedLinear(string kernelName, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        int total = batchSize * outFeatures;
+        IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
+        void** args = stackalloc void*[7]; args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
+        args[4] = &batchSize; args[5] = &inFeatures; args[6] = &outFeatures;
+        LaunchKernel(krnl, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
+
+    private unsafe void LaunchIoU(string kernelName, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
+        void** args = stackalloc void*[4]; args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
+        LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
+
+    private unsafe void LaunchIoUBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
+        void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
+        LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
+    }
 
     #endregion
 
