@@ -88,10 +88,18 @@ public sealed class GradientTape<T> : IDisposable
     /// The previous tape (if any) is saved and restored when this tape is disposed.
     /// </summary>
     /// <param name="options">Optional configuration. Uses <see cref="GradientTapeOptions.Default"/> if null.</param>
+    // Thread-local arena cache — reused across training steps to avoid per-step allocation.
+    // The arena's backing array grows once during warmup, then reuses indefinitely.
+    [ThreadStatic]
+    private static TapeEntryArena<T>? _cachedArena;
+
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
-        _entries = new TapeEntryArena<T>();
+        // Reuse cached arena if available, otherwise create new one
+        _entries = _cachedArena ?? new TapeEntryArena<T>();
+        _cachedArena = null; // Take ownership — will return on Dispose
+        _entries.Reset();
         _engine = AiDotNetEngine.Current;
         _parent = _current;
 
@@ -491,6 +499,9 @@ public sealed class GradientTape<T> : IDisposable
         if (_disposed) return;
         _disposed = true;
         SetCurrentTape(_parent);
+        // Return arena to thread-local cache for reuse by next GradientTape
+        _entries.Reset();
+        _cachedArena = _entries;
     }
 
     // ──────────────────────────────────────────────────────────────
