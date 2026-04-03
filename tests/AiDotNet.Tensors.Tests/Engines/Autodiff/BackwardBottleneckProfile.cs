@@ -14,7 +14,7 @@ public class BackwardBottleneckProfile
 
     public BackwardBottleneckProfile(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [Fact(Skip = "Profiling benchmark - run manually")]
     public void Profile_FullStep_Microbreakdown()
     {
         var input = Tensor<float>.CreateRandom([32, 128]);
@@ -93,7 +93,7 @@ public class BackwardBottleneckProfile
         _output.WriteLine($"Overhead:       {(totalTapeCreateUs + totalTapeDisposeUs) / iterations:F1}us");
     }
 
-    [Fact]
+    [Fact(Skip = "Profiling benchmark - run manually")]
     public void Profile_BackwardMatMul_Components()
     {
         // The backward for matmul C = A @ B is:

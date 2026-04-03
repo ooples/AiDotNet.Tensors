@@ -21,7 +21,7 @@ public class TrainingThroughputProfile
         _output = output;
     }
 
-    [Fact]
+    [Fact(Skip = "Profiling benchmark - run manually")]
     public void Profile_MLP_StepBreakdown()
     {
         var input = Tensor<float>.CreateRandom([32, 128]);

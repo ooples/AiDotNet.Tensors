@@ -17,6 +17,17 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 internal static class DifferentiableOps
 {
     /// <summary>
+    /// Returns true if a gradient tape is active and not suppressed.
+    /// Use this to guard savedState allocation: only create new object[]
+    /// when IsRecording is true, avoiding unnecessary GC pressure during inference.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsRecording<T>()
+    {
+        return GradientTape<T>.Current is not null && !NoGradScope<T>.IsSuppressed;
+    }
+
+    /// <summary>
     /// Records a variadic operation (4+ inputs) to the current gradient tape if one is active.
     /// The caller must provide the pre-allocated inputs array.
     /// </summary>

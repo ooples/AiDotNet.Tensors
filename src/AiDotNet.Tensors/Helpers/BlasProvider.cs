@@ -175,6 +175,18 @@ internal static class BlasProvider
     {
         if (!EnsureInitialized()) return false;
 
+        // Bounds validation (same as TryGemm)
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+        if (!HasEnoughData(a.Length, aOffset, aRows, aCols, lda) ||
+            !HasEnoughData(b.Length, bOffset, bRows, bCols, ldb) ||
+            !HasEnoughData(c.Length, cOffset, m, n, ldc))
+        {
+            return false;
+        }
+
         int transAFlag = transA ? CblasTrans : CblasNoTrans;
         int transBFlag = transB ? CblasTrans : CblasNoTrans;
 
@@ -182,11 +194,16 @@ internal static class BlasProvider
         {
             try
             {
+                // Apply offsets via Span (same pattern as TryMklNetSgemm)
+                var aSpan = a.AsSpan(aOffset);
+                var bSpan = b.AsSpan(bOffset);
+                var cSpan = c.AsSpan(cOffset);
+
                 Blas.gemm(
                     Layout.RowMajor,
                     transA ? Trans.Yes : Trans.No,
                     transB ? Trans.Yes : Trans.No,
-                    m, n, k, 1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+                    m, n, k, 1.0f, aSpan, lda, bSpan, ldb, 0.0f, cSpan, ldc);
                 return true;
             }
             catch
