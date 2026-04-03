@@ -2794,15 +2794,17 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
-    /// <summary>d(|z|^2)/dz = 2*z (complex magnitude squared)</summary>
+    /// <summary>d(re^2+im^2)/dre = 2*re*grad, d/dim = 2*im*grad</summary>
     internal static void ComplexMagnitudeSquaredBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var two = numOps.FromDouble(2.0);
-        var grad = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[0]), two);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        var gradReal = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[0]), two);
+        var gradImag = engine.TensorMultiplyScalar(engine.TensorMultiply(gradOutput, inputs[1]), two);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradReal, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradImag, engine);
     }
 
     /// <summary>d(a + s*b)/da = grad, d/db = s*grad</summary>
