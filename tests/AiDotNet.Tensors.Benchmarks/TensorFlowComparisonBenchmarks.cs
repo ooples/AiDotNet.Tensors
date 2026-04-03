@@ -20,10 +20,10 @@ public class TensorFlowComparisonBenchmarks
     private readonly Dictionary<int, Tensor<float>> _aiMatricesB = new();
     private readonly Dictionary<int, Tensor<float>> _aiVectorsA = new();
     private readonly Dictionary<int, Tensor<float>> _aiVectorsB = new();
-    private readonly Dictionary<int, IGpuTensor<float>> _aiGpuMatricesA = new();
-    private readonly Dictionary<int, IGpuTensor<float>> _aiGpuMatricesB = new();
-    private readonly Dictionary<int, IGpuTensor<float>> _aiGpuVectorsA = new();
-    private readonly Dictionary<int, IGpuTensor<float>> _aiGpuVectorsB = new();
+    private readonly Dictionary<int, Tensor<float>> _aiGpuMatricesA = new();
+    private readonly Dictionary<int, Tensor<float>> _aiGpuMatricesB = new();
+    private readonly Dictionary<int, Tensor<float>> _aiGpuVectorsA = new();
+    private readonly Dictionary<int, Tensor<float>> _aiGpuVectorsB = new();
     private readonly Dictionary<int, IGpuBuffer> _aiGpuAddOutputs = new();
     private readonly Dictionary<int, IGpuBuffer> _aiGpuMultiplyOutputs = new();
 
@@ -34,7 +34,7 @@ public class TensorFlowComparisonBenchmarks
 
     private Tensor<float>? _aiConvInput;
     private Tensor<float>? _aiConvKernel;
-    private IGpuTensor<float>? _aiGpuConvInput;
+    private Tensor<float>? _aiGpuConvInput;
     private Tensorflow.Tensor? _tfConvInput;
     private Tensorflow.Tensor? _tfConvKernel;
 
@@ -184,33 +184,33 @@ public class TensorFlowComparisonBenchmarks
         var gpuBackend = _gpuBackend ?? throw new InvalidOperationException("GPU backend was not initialized.");
 
         using var matmul = gpuEngine.MatMulGpuTensors(_aiGpuMatricesA[MatrixSizes[0]], _aiGpuMatricesB[MatrixSizes[0]]);
-        matmul.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfMatMul = tf.matmul(_tfMatricesA[MatrixSizes[0]], _tfMatricesB[MatrixSizes[0]]);
         tfMatMul.numpy();
 
         using var add = gpuEngine.AddGpu(_aiGpuVectorsA[VectorSizes[0]], _aiGpuVectorsB[VectorSizes[0]]);
-        add.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfAdd = tf.add(_tfVectorsA[VectorSizes[0]], _tfVectorsB[VectorSizes[0]]);
         tfAdd.numpy();
 
         using var multiply = gpuEngine.MultiplyGpu(_aiGpuVectorsA[VectorSizes[0]], _aiGpuVectorsB[VectorSizes[0]]);
-        multiply.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfMultiply = tf.multiply(_tfVectorsA[VectorSizes[0]], _tfVectorsB[VectorSizes[0]]);
         tfMultiply.numpy();
 
         using var relu = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[0]], FusedActivationType.ReLU);
-        relu.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfRelu = tf.nn.relu(_tfVectorsA[VectorSizes[0]]);
         tfRelu.numpy();
 
         using var sigmoid = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[0]], FusedActivationType.Sigmoid);
-        sigmoid.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfSigmoid = tf.sigmoid(_tfVectorsA[VectorSizes[0]]);
         tfSigmoid.numpy();
 
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[0]], 0);
         using var mean = gpuEngine.DivideScalarGpu(sum, VectorSizes[0]);
-        mean.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfSum = tf.reduce_sum(_tfVectorsA[VectorSizes[0]]);
         tfSum.numpy();
         var tfMean = tf.reduce_mean(_tfVectorsA[VectorSizes[0]]);
@@ -224,7 +224,7 @@ public class TensorFlowComparisonBenchmarks
         using var conv = gpuEngine.FusedConv2DGpu(_aiGpuConvInput, _aiConvKernel, null,
             _convStride, _convStride, _convPadding, _convPadding, _convDilation, _convDilation,
             FusedActivationType.None);
-        conv.Synchronize();
+        _gpuBackend!.Synchronize();
         var tfConvInput = _tfConvInput ?? throw new InvalidOperationException("TensorFlow Conv2D input was not initialized.");
         var tfConvKernel = _tfConvKernel ?? throw new InvalidOperationException("TensorFlow Conv2D kernel was not initialized.");
         var tfConvStrides = _tfConvStrides ?? throw new InvalidOperationException("TensorFlow Conv2D strides were not initialized.");
@@ -292,7 +292,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.MatMulGpuTensors(_aiGpuMatricesA[size], _aiGpuMatricesB[size]);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -312,7 +312,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.AddGpu(_aiGpuVectorsA[size], _aiGpuVectorsB[size]);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -342,7 +342,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.MultiplyGpu(_aiGpuVectorsA[size], _aiGpuVectorsB[size]);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -370,7 +370,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[1]], FusedActivationType.ReLU);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -386,7 +386,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[1]], FusedActivationType.Sigmoid);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -402,7 +402,7 @@ public class TensorFlowComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[1]], 0);
-        sum.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -419,7 +419,7 @@ public class TensorFlowComparisonBenchmarks
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[1]], 0);
         using var mean = gpuEngine.DivideScalarGpu(sum, VectorSizes[1]);
-        mean.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -442,7 +442,7 @@ public class TensorFlowComparisonBenchmarks
         using var result = gpuEngine.FusedConv2DGpu(_aiGpuConvInput, _aiConvKernel, null,
             _convStride, _convStride, _convPadding, _convPadding, _convDilation, _convDilation,
             FusedActivationType.None);
-        result.Synchronize();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
