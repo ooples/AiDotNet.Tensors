@@ -32,24 +32,34 @@ internal static class DifferentiableOps
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
-        // Snapshot version counters for overflow inputs
-        var versions = new int[inputs.Length];
-        for (int i = 0; i < inputs.Length; i++)
-            versions[i] = inputs[i].Version;
+        ref var slot = ref tape.RecordSlot();
+        slot.OperationName = opName;
+        slot.Output = output;
+        slot.Backward = backward;
+        slot.SavedState = savedState;
 
-        var entry = new TapeEntry<T>
+        if (inputs.Length <= 3)
         {
-            OperationName = opName,
-            Output = output,
-            Backward = backward,
-            SavedState = savedState,
-            InputsOverflow = inputs,
-            InputVersionsOverflow = versions,
-            InputCount = 0xFF,
-            Input0 = inputs.Length > 0 ? inputs[0] : null!,
-        };
-
-        tape.Record(entry);
+            // Use inline fields for 1-3 inputs (avoids overflow array)
+            slot.InputCount = (byte)inputs.Length;
+            slot.Input0 = inputs.Length > 0 ? inputs[0] : null!;
+            slot.Input1 = inputs.Length > 1 ? inputs[1] : null;
+            slot.Input2 = inputs.Length > 2 ? inputs[2] : null;
+            slot.Version0 = inputs.Length > 0 ? inputs[0].Version : 0;
+            slot.Version1 = inputs.Length > 1 ? inputs[1].Version : 0;
+            slot.Version2 = inputs.Length > 2 ? inputs[2].Version : 0;
+        }
+        else
+        {
+            // Overflow for 4+ inputs
+            var versions = new int[inputs.Length];
+            for (int i = 0; i < inputs.Length; i++)
+                versions[i] = inputs[i].Version;
+            slot.InputsOverflow = inputs;
+            slot.InputVersionsOverflow = versions;
+            slot.InputCount = 0xFF;
+            slot.Input0 = inputs[0];
+        }
     }
 
     /// <summary>

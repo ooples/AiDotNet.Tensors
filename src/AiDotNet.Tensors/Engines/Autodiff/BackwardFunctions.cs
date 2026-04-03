@@ -1806,6 +1806,16 @@ internal static class BackwardFunctions<T>
             var grad = engine.TensorMultiply(gradOutput, invMask);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
         }
+        else if (savedState[0] is Tensor<bool> boolMask)
+        {
+            var boolSpan = boolMask.AsSpan();
+            var maskData = new T[boolSpan.Length];
+            for (int i = 0; i < boolSpan.Length; i++)
+                maskData[i] = boolSpan[i] ? numOps.Zero : numOps.One;
+            var invMask = new Tensor<T>(maskData, inputs[0].Shape.ToArray());
+            var grad = engine.TensorMultiply(gradOutput, invMask);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }
         else
         {
             var mask = (bool[])savedState[0];
@@ -2803,6 +2813,44 @@ internal static class BackwardFunctions<T>
     // Element-wise math: composed from engine ops (GPU-transparent)
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>Scatter backward: input gets grad with scattered positions zeroed, values gets gathered grad</summary>
+    internal static void ScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = savedState[0] is Tensor<int> idxTensor
+            ? idxTensor.GetFlattenedData()
+            : (int[])savedState[0];
+        var axis = (int)savedState[1];
+
+        // dL/dinput = gradOutput with scattered positions zeroed
+        var gradInput = gradOutput.Clone();
+        var gradInputData = gradInput.GetDataArray();
+        var inputShape = inputs[0].Shape.ToArray();
+        int axisSize = inputShape[axis];
+        int innerSize = 1;
+        for (int i = axis + 1; i < inputShape.Length; i++) innerSize *= inputShape[i];
+        int outerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= inputShape[i];
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        for (int outer = 0; outer < outerSize; outer++)
+        {
+            for (int idx = 0; idx < indices.Length; idx++)
+            {
+                int dstIdx = indices[idx];
+                int dstBase = outer * axisSize * innerSize + dstIdx * innerSize;
+                for (int inner = 0; inner < innerSize; inner++)
+                    gradInputData[dstBase + inner] = numOps.Zero;
+            }
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+
+        // dL/dvalues = gather from gradOutput at indices
+        var gradValues = engine.Gather(gradOutput, new Tensor<int>(new[] { indices.Length }, new Vector<int>(indices)), axis);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradValues, engine);
+    }
+
     /// <summary>d(cosh(x))/dx = sinh(x)</summary>
     internal static void CoshBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -2951,12 +2999,13 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Backward of cumsum along axis is reverse cumsum (suffix sum) of gradient
-        // Without TensorFlip, we compute suffix sum by total_sum - cumsum + current
+        // suffix_sum[i] = total - cumsum[i] + grad[i]
         var axis = (int)savedState[0];
         var totalSum = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
         var cumGrad = engine.TensorCumSum(gradOutput, axis);
-        // suffix_sum[i] = total - cumsum[i] + grad[i]
-        var grad = engine.TensorSubtract(engine.TensorAdd(totalSum, gradOutput), cumGrad);
+        // Use BroadcastAdd since totalSum has keepDims=true (size-1 on axis)
+        var totalPlusGrad = engine.TensorBroadcastAdd(totalSum, gradOutput);
+        var grad = engine.TensorSubtract(totalPlusGrad, cumGrad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3041,12 +3090,16 @@ internal static class BackwardFunctions<T>
         int d = input._shape[1];
         var grad = new Tensor<T>(input._shape);
 
+        // D[i,j] = ||x_i - x_j||^2
+        // dL/dx_i = sum_j 2*(g[i,j] + g[j,i])*(x_i - x_j)
+        // (row contribution from D[i,j] + column contribution from D[j,i])
         for (int i = 0; i < n; i++)
         {
             for (int j = 0; j < n; j++)
             {
-                T g = gradOutput[i, j];
-                var twoG = numOps.Multiply(numOps.FromDouble(2.0), g);
+                // Both g[i,j] and g[j,i] contribute to gradient of x_i
+                T gSum = numOps.Add(gradOutput[i, j], gradOutput[j, i]);
+                var twoG = numOps.Multiply(numOps.FromDouble(2.0), gSum);
                 for (int k = 0; k < d; k++)
                 {
                     T diff = numOps.Subtract(input[i, k], input[j, k]);

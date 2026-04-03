@@ -84,6 +84,22 @@ public class TapeCompletenessTests
         if (returnType.Name.StartsWith("Tensor`"))
             return true;
 
+        // Check for ValueTuple containing Tensor<> (e.g., (Tensor<T>, Tensor<T>))
+        if (returnType.IsGenericType && returnType.FullName is not null && returnType.FullName.StartsWith("System.ValueTuple"))
+        {
+            foreach (var arg in returnType.GetGenericArguments())
+            {
+                if (ReturnsTensor(arg))
+                    return true;
+            }
+        }
+
+        // Check for Tensor<>[] array returns
+        if (returnType.IsArray && returnType.GetElementType() is Type elemType)
+        {
+            return ReturnsTensor(elemType);
+        }
+
         return false;
     }
 }

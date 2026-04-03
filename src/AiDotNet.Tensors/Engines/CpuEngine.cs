@@ -1994,6 +1994,7 @@ public class CpuEngine : ITensorLevelEngine
                 var cFloat = new Span<float>((float[])(object)rArr);
 
                 Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
+                DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
                 return result;
             }
 
@@ -2002,6 +2003,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
                 {
+                    DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
                     return result;
                 }
             }
@@ -19163,7 +19165,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        DifferentiableOps.RecordUnary("Scatter", result, input, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
+        DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis });
         return result;
     }
 
