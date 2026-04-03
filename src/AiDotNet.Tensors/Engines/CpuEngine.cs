@@ -2028,6 +2028,8 @@ public class CpuEngine : ITensorLevelEngine
                     rDataArr[i * n + j] = sum;
                 }
             });
+            DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+                BackwardFunctions<T>.BatchMatMulBackward);
             return result;
         }
 
@@ -5133,6 +5135,8 @@ public class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+                BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
             return result;
         }
 
@@ -5147,6 +5151,8 @@ public class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+                BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
             return result;
         }
 
@@ -5157,6 +5163,8 @@ public class CpuEngine : ITensorLevelEngine
             stride, padding, dilation,
             outputHeight, outputWidth);
 
+        DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+            BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
         return result;
     }
 
@@ -18298,6 +18306,8 @@ public class CpuEngine : ITensorLevelEngine
                 Array.Copy(tensorData, idx * cols, resultData, i * cols, cols);
             });
 
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
             return result;
         }
         else if (tensor.Rank == 2 && axis == 1)
@@ -18319,6 +18329,8 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
             return result;
         }
         else
@@ -18374,6 +18386,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordIfActive("TensorStack", result, tensors,
+            BackwardFunctions<T>.StackBackward, new object[] { axis });
         return result;
     }
 
@@ -18443,6 +18457,8 @@ public class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
+        DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensor,
+            BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
         return result;
     }
 
