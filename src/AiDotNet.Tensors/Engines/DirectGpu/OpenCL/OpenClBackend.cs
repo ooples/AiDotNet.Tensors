@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // OpenCL backend using pure P/Invoke - no managed GPU runtime dependency.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
@@ -10368,7 +10368,57 @@ KERNEL VARIANTS (A/B testing):
 
         #endregion
 
-        #region Quantum Computing Operations
+        #region Complex Tensor Operations
+
+    public void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
+        if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: complex_multiply");
+        int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
+        kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(3u, numPairs);
+        kernel.Execute1D(numPairs, localSize);
+    }
+
+    public void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
+        if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: complex_conjugate");
+        int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, numPairs);
+        kernel.Execute1D(numPairs, localSize);
+    }
+
+    public void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
+        if (numPairs > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
+
+        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
+            throw new InvalidOperationException("OpenCL kernel not found: complex_magnitude");
+        int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
+        kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+        kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+        kernel.SetArg(2u, numPairs);
+        kernel.Execute1D(numPairs, localSize);
+    }
+
+    #endregion
+
+    #region Quantum Computing Operations
 
         public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
         {

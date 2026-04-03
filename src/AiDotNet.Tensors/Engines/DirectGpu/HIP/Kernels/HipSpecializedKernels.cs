@@ -540,6 +540,40 @@ extern ""C"" __global__ __launch_bounds__(256) void measurement_forward(
         out[i] /= totalSum;
     }
 }
+
+// ===========================================================================
+// COMPLEX TENSOR OPERATIONS
+// ===========================================================================
+
+extern ""C"" __global__ __launch_bounds__(256) void complex_multiply(
+    const float* a, const float* b, float* output, int numPairs)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    float aRe = a[idx], aIm = a[idx+1], bRe = b[idx], bIm = b[idx+1];
+    output[idx]   = aRe*bRe - aIm*bIm;
+    output[idx+1] = aRe*bIm + aIm*bRe;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void complex_conjugate(
+    const float* input, float* output, int numPairs)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    output[idx]   = input[idx];
+    output[idx+1] = -input[idx+1];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void complex_magnitude(
+    const float* input, float* output, int numPairs)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    output[i] = sqrtf(input[idx]*input[idx] + input[idx+1]*input[idx+1]);
+}
 ";
     }
 
@@ -562,7 +596,11 @@ extern ""C"" __global__ __launch_bounds__(256) void measurement_forward(
             "normalize_probabilities",
             "complex_matvec",
             "quantum_rotation",
-            "measurement_forward"
+            "measurement_forward",
+            // Complex tensor ops
+            "complex_multiply",
+            "complex_conjugate",
+            "complex_magnitude"
         ];
     }
 }

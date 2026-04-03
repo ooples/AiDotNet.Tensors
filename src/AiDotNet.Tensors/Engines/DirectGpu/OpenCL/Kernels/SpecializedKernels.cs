@@ -557,6 +557,40 @@ __kernel void measurement_forward(
         out[i] /= totalSum;
     }
 }
+
+// ===========================================================================
+// COMPLEX TENSOR OPERATIONS
+// ===========================================================================
+
+__kernel void complex_multiply(
+    __global const float* a, __global const float* b, __global float* output, int numPairs)
+{
+    int i = get_global_id(0);
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    float aRe = a[idx], aIm = a[idx+1], bRe = b[idx], bIm = b[idx+1];
+    output[idx]   = aRe*bRe - aIm*bIm;
+    output[idx+1] = aRe*bIm + aIm*bRe;
+}
+
+__kernel void complex_conjugate(
+    __global const float* input, __global float* output, int numPairs)
+{
+    int i = get_global_id(0);
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    output[idx]   = input[idx];
+    output[idx+1] = -input[idx+1];
+}
+
+__kernel void complex_magnitude(
+    __global const float* input, __global float* output, int numPairs)
+{
+    int i = get_global_id(0);
+    if (i >= numPairs) return;
+    int idx = i * 2;
+    output[i] = sqrt(input[idx]*input[idx] + input[idx+1]*input[idx+1]);
+}
 ";
     }
 
@@ -579,7 +613,11 @@ __kernel void measurement_forward(
             "normalize_probabilities",
             "complex_matvec",
             "quantum_rotation",
-            "measurement_forward"
+            "measurement_forward",
+            // Complex tensor ops
+            "complex_multiply",
+            "complex_conjugate",
+            "complex_magnitude"
         ];
     }
 }

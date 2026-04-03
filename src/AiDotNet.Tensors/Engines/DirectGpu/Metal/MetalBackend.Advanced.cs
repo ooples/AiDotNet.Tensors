@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Metal GPU backend - Hyperbolic Geometry, Octonion Algebra, and Quantum Computing operations.
 // All hyperbolic/octonion ops dispatch to MSL compute kernels on the GPU.
 
@@ -293,6 +293,39 @@ public sealed partial class MetalBackend
         encoder.SetBytes((uint)inputFeatures, 5);
         encoder.SetBytes((uint)outputFeatures, 6);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    #endregion
+
+    #region Complex Tensor Operations
+
+    public void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+    {
+        ThrowIfDisposed();
+        var ad = DownloadBuffer(a); var bd = DownloadBuffer(b); var o = new float[numPairs * 2];
+        for (int i = 0; i < numPairs; i++)
+        {
+            int idx = i * 2;
+            o[idx] = ad[idx]*bd[idx] - ad[idx+1]*bd[idx+1];
+            o[idx+1] = ad[idx]*bd[idx+1] + ad[idx+1]*bd[idx];
+        }
+        UploadToBuffer(output, o);
+    }
+
+    public void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        ThrowIfDisposed();
+        var d = DownloadBuffer(input); var o = new float[numPairs * 2];
+        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[idx] = d[idx]; o[idx+1] = -d[idx+1]; }
+        UploadToBuffer(output, o);
+    }
+
+    public void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        ThrowIfDisposed();
+        var d = DownloadBuffer(input); var o = new float[numPairs];
+        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[i] = MathF.Sqrt(d[idx]*d[idx] + d[idx+1]*d[idx+1]); }
+        UploadToBuffer(output, o);
     }
 
     #endregion

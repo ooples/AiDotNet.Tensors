@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // IDirectGpuBackend implementation part 4: Optimizers, FP16/32, Specialized, Hyperbolic, Octonion, Quantum, FFT, RNN.
 
 #if NET7_0_OR_GREATER
@@ -489,6 +489,47 @@ public sealed partial class WebGpuBackend
         };
         Dispatch4BufferAsync("OctonionFusedReLU", WebGpuKernels.OctonionFusedSource, "octonion_linear_fused_relu",
             input, weights, biases, output, uniforms, totalPairs).GetAwaiter().GetResult();
+    }
+
+    #endregion
+
+    #region Complex Tensor Operations
+
+    public void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
+        var ad = DownloadBuffer(a); var bd = DownloadBuffer(b); var o = new float[numPairs * 2];
+        for (int i = 0; i < numPairs; i++)
+        {
+            int idx = i * 2;
+            o[idx] = ad[idx]*bd[idx] - ad[idx+1]*bd[idx+1];
+            o[idx+1] = ad[idx]*bd[idx+1] + ad[idx+1]*bd[idx];
+        }
+        UploadToBuffer(o, output);
+    }
+
+    public void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
+        var d = DownloadBuffer(input); var o = new float[numPairs * 2];
+        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[idx] = d[idx]; o[idx+1] = -d[idx+1]; }
+        UploadToBuffer(o, output);
+    }
+
+    public void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
+        if (numPairs > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
+        var d = DownloadBuffer(input); var o = new float[numPairs];
+        for (int i = 0; i < numPairs; i++) { int idx = i * 2; o[i] = MathF.Sqrt(d[idx]*d[idx] + d[idx+1]*d[idx+1]); }
+        UploadToBuffer(o, output);
     }
 
     #endregion
