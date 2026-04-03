@@ -9774,22 +9774,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (denseB.Shape._dims[0] != K)
             throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB.Shape._dims[0]} rows");
 
-        // Upload CSR data to GPU
-        var coo = sparseA.ToCoo();
+        // Upload CSR data to GPU (must use ToCsr(), not ToCoo() — CsrSpMM needs row pointers)
+        var csr = sparseA.ToCsr();
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
-        var floatVals = new float[coo.Values.Length];
-        for (int i = 0; i < coo.Values.Length; i++)
-            floatVals[i] = (float)numOps.ToDouble(coo.Values[i]);
-        var valsBuf = backend.AllocateBuffer(floatVals);
-        var colsBuf = backend.AllocateBuffer(coo.ColumnIndices.Select(x => (float)x).ToArray());
-        var rowPtrBuf = backend.AllocateBuffer(coo.RowPointers.Select(x => (float)x).ToArray());
+        var floatVals = new float[csr.Values.Length];
+        for (int i = 0; i < csr.Values.Length; i++)
+            floatVals[i] = (float)numOps.ToDouble(csr.Values[i]);
+
+        using var valsBuf = backend.AllocateBuffer(floatVals);
+        using var colsBuf = backend.AllocateBuffer(csr.ColumnIndices.Select(x => (float)x).ToArray());
+        using var rowPtrBuf = backend.AllocateBuffer(csr.RowPointers.Select(x => (float)x).ToArray());
 
         var outputBuffer = backend.AllocateBuffer(M * N);
-        backend.CsrSpMM(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, outputBuffer, M, K, N, sparseA.NonZeroCount);
-
-        valsBuf.Dispose();
-        colsBuf.Dispose();
-        rowPtrBuf.Dispose();
+        try
+        {
+            backend.CsrSpMM(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, outputBuffer, M, K, N, csr.NonZeroCount);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            throw;
+        }
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
@@ -9827,23 +9832,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (bias.Length != N)
             throw new ArgumentException($"Bias length {bias.Length} must match output columns {N}");
 
-        // Upload CSR data and bias to GPU
-        var coo = sparseA.ToCoo();
+        // Upload CSR data and bias to GPU (must use ToCsr(), not ToCoo() — CsrSpMMBias needs row pointers)
+        var csr = sparseA.ToCsr();
         var numOps = Helpers.MathHelper.GetNumericOperations<T>();
-        var floatVals = new float[coo.Values.Length];
-        for (int i = 0; i < coo.Values.Length; i++)
-            floatVals[i] = (float)numOps.ToDouble(coo.Values[i]);
-        var valsBuf = backend.AllocateBuffer(floatVals);
-        var colsBuf = backend.AllocateBuffer(coo.ColumnIndices.Select(x => (float)x).ToArray());
-        var rowPtrBuf = backend.AllocateBuffer(coo.RowPointers.Select(x => (float)x).ToArray());
+        var floatVals = new float[csr.Values.Length];
+        for (int i = 0; i < csr.Values.Length; i++)
+            floatVals[i] = (float)numOps.ToDouble(csr.Values[i]);
+
+        using var valsBuf = backend.AllocateBuffer(floatVals);
+        using var colsBuf = backend.AllocateBuffer(csr.ColumnIndices.Select(x => (float)x).ToArray());
+        using var rowPtrBuf = backend.AllocateBuffer(csr.RowPointers.Select(x => (float)x).ToArray());
         using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
 
         var outputBuffer = backend.AllocateBuffer(M * N);
-        backend.CsrSpMMBias(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, biasBuffer.Buffer, outputBuffer, M, K, N, sparseA.NonZeroCount);
-
-        valsBuf.Dispose();
-        colsBuf.Dispose();
-        rowPtrBuf.Dispose();
+        try
+        {
+            backend.CsrSpMMBias(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, biasBuffer.Buffer, outputBuffer, M, K, N, csr.NonZeroCount);
+        }
+        catch
+        {
+            outputBuffer.Dispose();
+            throw;
+        }
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
@@ -9939,11 +9949,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var typedValues = new T[edgeValues.Length];
         for (int i = 0; i < edgeValues.Length; i++)
             typedValues[i] = numOps.FromDouble(edgeValues[i]);
-        return new SparseTensor<T>(numNodes, numNodes, sourceIndices, targetIndices, typedValues);
+        // Build COO then convert to CSR for proper row pointer structure
+        var coo = new SparseTensor<T>(numNodes, numNodes, sourceIndices, targetIndices, typedValues);
+        return coo.ToCsr();
     }
 
     /// <summary>
     /// Creates a sparse tensor from a dense tensor by extracting non-zero elements.
+    /// Returns a CSR-format sparse tensor.
     /// </summary>
     public SparseTensor<T> CreateCsrFromDense<T>(Tensor<T> denseTensor, float threshold = 1e-6f)
     {
@@ -9965,7 +9978,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     vals.Add(val);
                 }
             }
-        return new SparseTensor<T>(rows, cols, rowIdx.ToArray(), colIdx.ToArray(), vals.ToArray());
+        // Build COO then convert to CSR for proper row pointer structure
+        var coo = new SparseTensor<T>(rows, cols, rowIdx.ToArray(), colIdx.ToArray(), vals.ToArray());
+        return coo.ToCsr();
     }
 
     #region Element-wise Operations (GPU)

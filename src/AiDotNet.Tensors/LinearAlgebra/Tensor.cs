@@ -2556,11 +2556,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         {
             Synchronize();
             // Trigger deferred materialization — this downloads from GPU
-            var span = _data.AsSpan();
+            _ = _data.AsSpan();
             IsDirty = false;
             return _data.GetDataArray();
         }
-        return _data.GetDataArray();
+        // For CPU tensors, respect view logic (sliced/transposed tensors)
+        return IsContiguous ? _data.GetDataArray() : GetFlattenedData();
     }
 
     /// <summary>
