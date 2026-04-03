@@ -2279,4 +2279,194 @@ internal static class BackwardFunctions<T>
     // Helper: min of two scalars
     private static T MinVal(T a, T b, INumericOperations<T> ops) =>
         ops.ToDouble(a) <= ops.ToDouble(b) ? a : b;
+
+    // =====================================================================
+    // Complex Tensor Backward Functions
+    // =====================================================================
+
+    internal static void ComplexMultiplyBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var a = inputs[0];
+        var b = inputs[1];
+        var ops = MathHelper.GetNumericOperations<T>();
+        int pairs = gradOutput.Length / 2;
+
+        // d(a*b)/da = conj(b), d(a*b)/db = conj(a) — applied via chain rule
+        {
+            var gradA = new Tensor<T>(a._shape);
+            for (int i = 0; i < pairs; i++)
+            {
+                int idx = i * 2;
+                T gRe = gradOutput.GetFlat(idx), gIm = gradOutput.GetFlat(idx + 1);
+                T bRe = b.GetFlat(idx), bIm = b.GetFlat(idx + 1);
+                // grad_a = grad_out * conj(b)
+                gradA.SetFlat(idx, ops.Add(ops.Multiply(gRe, bRe), ops.Multiply(gIm, bIm)));
+                gradA.SetFlat(idx + 1, ops.Subtract(ops.Multiply(gIm, bRe), ops.Multiply(gRe, bIm)));
+            }
+            DifferentiableOps.AccumulateGrad(grads, a, gradA, engine);
+        }
+
+        {
+            var gradB = new Tensor<T>(b._shape);
+            for (int i = 0; i < pairs; i++)
+            {
+                int idx = i * 2;
+                T gRe = gradOutput.GetFlat(idx), gIm = gradOutput.GetFlat(idx + 1);
+                T aRe = a.GetFlat(idx), aIm = a.GetFlat(idx + 1);
+                // grad_b = conj(a) * grad_out
+                gradB.SetFlat(idx, ops.Add(ops.Multiply(aRe, gRe), ops.Multiply(aIm, gIm)));
+                gradB.SetFlat(idx + 1, ops.Subtract(ops.Multiply(aRe, gIm), ops.Multiply(aIm, gRe)));
+            }
+            DifferentiableOps.AccumulateGrad(grads, b, gradB, engine);
+        }
+    }
+
+    internal static void ComplexConjugateBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Conjugate of conjugate gradient: negate odd indices again
+        var grad = engine.TensorComplexConjugate(gradOutput);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    internal static void ComplexMagnitudeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // d|z|/dz = z / |z|, so d|z|/d(re) = re/|z|, d|z|/d(im) = im/|z|
+        var a = (Tensor<T>)savedState[0]; // original input
+        var ops = MathHelper.GetNumericOperations<T>();
+        int pairs = a.Length / 2;
+
+        var gradA = new Tensor<T>(a._shape);
+        for (int i = 0; i < pairs; i++)
+        {
+            int idx = i * 2;
+            T re = a.GetFlat(idx), im = a.GetFlat(idx + 1);
+            T mag = output.GetFlat(i);
+            T gOut = gradOutput.GetFlat(i);
+            T eps = ops.FromDouble(1e-8);
+            T safeMag = ops.Add(mag, eps);
+            gradA.SetFlat(idx, ops.Multiply(gOut, ops.Divide(re, safeMag)));
+            gradA.SetFlat(idx + 1, ops.Multiply(gOut, ops.Divide(im, safeMag)));
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+    }
+
+    // =====================================================================
+    // CTC Loss Backward
+    // =====================================================================
+
+    internal static void CTCLossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var logProbs = (Tensor<T>)savedState[0];
+        var targets = (Tensor<int>)savedState[1];
+        var inputLengths = (int[])savedState[2];
+        var targetLengths = (int[])savedState[3];
+        int blank = (int)savedState[4];
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int maxT = logProbs._shape[0];
+        int batchSize = logProbs._shape[1];
+        int numClasses = logProbs._shape[2];
+
+        var grad = new Tensor<T>(logProbs._shape);
+
+        int targetOffset = 0;
+        for (int n = 0; n < batchSize; n++)
+        {
+            int T_n = inputLengths[n];
+            int U_n = targetLengths[n];
+            int S = 2 * U_n + 1;
+
+            var expandedLabels = new int[S];
+            for (int s = 0; s < S; s++)
+                expandedLabels[s] = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
+
+            double negInf = double.NegativeInfinity;
+
+            // Alpha (forward) pass
+            var alpha = new double[T_n, S];
+            for (int t = 0; t < T_n; t++)
+                for (int s = 0; s < S; s++)
+                    alpha[t, s] = negInf;
+            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
+            if (S > 1) alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
+            for (int t = 1; t < T_n; t++)
+            {
+                for (int s = 0; s < S; s++)
+                {
+                    double lp = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
+                    double prev = alpha[t - 1, s];
+                    if (s >= 1) prev = LogSumExpHelper(prev, alpha[t - 1, s - 1]);
+                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
+                        prev = LogSumExpHelper(prev, alpha[t - 1, s - 2]);
+                    alpha[t, s] = prev + lp;
+                }
+            }
+
+            // Beta (backward) pass
+            var beta = new double[T_n, S];
+            for (int t = 0; t < T_n; t++)
+                for (int s = 0; s < S; s++)
+                    beta[t, s] = negInf;
+            beta[T_n - 1, S - 1] = 0;
+            if (S >= 2) beta[T_n - 1, S - 2] = 0;
+            for (int t = T_n - 2; t >= 0; t--)
+            {
+                for (int s = S - 1; s >= 0; s--)
+                {
+                    double next = beta[t + 1, s] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s]]);
+                    if (s + 1 < S)
+                        next = LogSumExpHelper(next, beta[t + 1, s + 1] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 1]]));
+                    if (s + 2 < S && expandedLabels[s + 2] != blank && expandedLabels[s + 2] != expandedLabels[s])
+                        next = LogSumExpHelper(next, beta[t + 1, s + 2] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 2]]));
+                    beta[t, s] = next;
+                }
+            }
+
+            // Total log prob
+            double logProbTotal = alpha[T_n - 1, S - 1];
+            if (S >= 2) logProbTotal = LogSumExpHelper(logProbTotal, alpha[T_n - 1, S - 2]);
+
+            // Gradient: d(-logP)/d(logProbs[t,n,k]) = prob[t,k] - (1/P) * sum_s(alpha*beta for label s==k)
+            double gOut = ops.ToDouble(gradOutput.GetFlat(n));
+            for (int t = 0; t < T_n; t++)
+            {
+                // Accumulate alpha*beta per class
+                var abSum = new double[numClasses];
+                for (int i = 0; i < numClasses; i++) abSum[i] = negInf;
+                for (int s = 0; s < S; s++)
+                {
+                    int k = expandedLabels[s];
+                    abSum[k] = LogSumExpHelper(abSum[k], alpha[t, s] + beta[t, s]);
+                }
+
+                for (int k = 0; k < numClasses; k++)
+                {
+                    double logProbTK = ops.ToDouble(logProbs[t, n, k]);
+                    double probTK = Math.Exp(logProbTK);
+                    double gradVal = probTK - Math.Exp(abSum[k] - logProbTotal);
+                    grad[t, n, k] = ops.FromDouble(gOut * gradVal);
+                }
+            }
+
+            targetOffset += U_n;
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    private static double LogSumExpHelper(double a, double b)
+    {
+        if (double.IsNegativeInfinity(a)) return b;
+        if (double.IsNegativeInfinity(b)) return a;
+        double max = Math.Max(a, b);
+        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
+    }
 }

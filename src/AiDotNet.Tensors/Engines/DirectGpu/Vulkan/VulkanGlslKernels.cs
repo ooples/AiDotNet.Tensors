@@ -1973,4 +1973,38 @@ float rss=pw*pw+ph*ph,dAtanPw=ph/rss,dAtanPh=-pw/rss;
 float dV0=2.0*fourOverPiSq*atanDiff*dAtanPw,dV1=2.0*fourOverPiSq*atanDiff*dAtanPh,dV2=2.0*fourOverPiSq*atanDiff*(-dAtanPw),dV3=2.0*fourOverPiSq*atanDiff*(-dAtanPh);
 float dp0=(dRho0*cSq-rhoSq*dCSq0)/cSqSq,dp1=(dRho1*cSq-rhoSq*dCSq1)/cSqSq,dp2=(dRho2*cSq-rhoSq*dCSq2)/cSqSq,dp3=(dRho3*cSq-rhoSq*dCSq3)/cSqSq;
 gp[o]=goB[i]*(-ig0+dp0+alpha*dV0);gp[o+1]=goB[i]*(-ig1+dp1+alpha*dV1);gp[o+2]=goB[i]*(-ig2+dp2+alpha*dV2);gp[o+3]=goB[i]*(-ig3+dp3+alpha*dV3); }";
+
+    // =====================================================================
+    // Complex Tensor Operations
+    // =====================================================================
+
+    public static string ComplexMultiply => Header + ThreeBufferLayout + @"
+layout(push_constant) uniform Params { uint numPairs; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= numPairs) return;
+    uint o = i * 2;
+    float aRe=a[o], aIm=a[o+1], bRe=bdata[o], bIm=bdata[o+1];
+    c[o]   = aRe*bRe - aIm*bIm;
+    c[o+1] = aRe*bIm + aIm*bRe;
+}";
+
+    public static string ComplexConjugate => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint numPairs; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= numPairs) return;
+    uint o = i * 2;
+    b[o]   = a[o];
+    b[o+1] = -a[o+1];
+}";
+
+    public static string ComplexMagnitude => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint numPairs; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= numPairs) return;
+    uint o = i * 2;
+    b[i] = sqrt(a[o]*a[o] + a[o+1]*a[o+1]);
+}";
 }

@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Engines;
+﻿using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
@@ -1029,6 +1029,19 @@ public class DelegatingGpuBackend : IDirectGpuBackend
     public virtual void OctonionLinearForwardFusedReLU(IGpuBuffer input, IGpuBuffer weights, IGpuBuffer biases, IGpuBuffer output,
         int batchSize, int inputFeatures, int outputFeatures)
         => Inner.OctonionLinearForwardFusedReLU(input, weights, biases, output, batchSize, inputFeatures, outputFeatures);
+
+    #endregion
+
+    #region Complex Tensor Operations
+
+    public virtual void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+        => Inner.ComplexMultiply(a, b, output, numPairs);
+
+    public virtual void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+        => Inner.ComplexConjugate(input, output, numPairs);
+
+    public virtual void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+        => Inner.ComplexMagnitude(input, output, numPairs);
 
     #endregion
 

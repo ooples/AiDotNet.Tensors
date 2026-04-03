@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // IDirectGpuBackend implementation part 4: Optimizers, Sparse, FFT, RNN, Hyperbolic, Octonion, Quantum.
 
 using System;
@@ -819,6 +819,28 @@ public sealed unsafe partial class VulkanBackend
         int totalPairs = batchSize * outputFeatures;
         var pc = new uint[] { (uint)batchSize, (uint)inputFeatures, (uint)outputFeatures };
         GlslQuadOp(VulkanGlslKernels.OctonionLinearForwardFusedReLU, input, weights, biases, output, totalPairs, pc, 3 * sizeof(uint));
+    }
+
+    #endregion
+
+    #region Complex Tensor Operations
+
+    public void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+    {
+        var pc = new uint[] { (uint)numPairs };
+        GlslBinaryOp(VulkanGlslKernels.ComplexMultiply, a, b, output, numPairs, pc, sizeof(uint));
+    }
+
+    public void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        var pc = new uint[] { (uint)numPairs };
+        GlslUnaryOp(VulkanGlslKernels.ComplexConjugate, input, output, numPairs, pc, sizeof(uint));
+    }
+
+    public void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        var pc = new uint[] { (uint)numPairs };
+        GlslUnaryOp(VulkanGlslKernels.ComplexMagnitude, input, output, numPairs, pc, sizeof(uint));
     }
 
     #endregion
