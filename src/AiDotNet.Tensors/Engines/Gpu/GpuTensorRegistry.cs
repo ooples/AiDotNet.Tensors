@@ -85,7 +85,6 @@ public sealed class GpuTensorRegistry : IDisposable
 
     /// <summary>
     /// Registers a GPU buffer allocation for memory tracking.
-    /// Works with both legacy Tensor<float> and unified Tensor types.
     /// </summary>
     public TensorRegistration RegisterBuffer(DirectGpu.IGpuBuffer buffer, GpuTensorRole role)
     {

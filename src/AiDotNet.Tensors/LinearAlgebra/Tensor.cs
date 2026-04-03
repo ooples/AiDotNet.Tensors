@@ -2560,8 +2560,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             IsDirty = false;
             return _data.GetDataArray();
         }
-        // For CPU tensors, respect view logic (sliced/transposed tensors)
-        return IsContiguous ? _data.GetDataArray() : GetFlattenedData();
+        // For CPU tensors, respect view logic (sliced/transposed/offset tensors)
+        if (IsContiguous && _storageOffset == 0)
+            return _data.GetDataArray();
+        return GetFlattenedData();
     }
 
     /// <summary>

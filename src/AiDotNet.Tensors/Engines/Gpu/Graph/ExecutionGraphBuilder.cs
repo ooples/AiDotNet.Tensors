@@ -1,5 +1,5 @@
-﻿using AiDotNet.Tensors.LinearAlgebra;
-﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 

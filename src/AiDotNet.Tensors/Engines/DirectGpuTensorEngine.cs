@@ -9822,6 +9822,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int i = 0; i < csr.Values.Length; i++)
             floatVals[i] = (float)numOps.ToDouble(csr.Values[i]);
 
+        // Upload indices as bit-exact int32 reinterpreted as float32 —
+        // GPU kernels declare these as int* and read the raw bit pattern.
+        static float[] ReinterpretIntsAsFloats(int[] ints)
+        {
+            var floats = new float[ints.Length];
+            Buffer.BlockCopy(ints, 0, floats, 0, ints.Length * sizeof(int));
+            return floats;
+        }
+
         // Exception-safe allocation: dispose earlier buffers if a later one fails
         IGpuBuffer? valsBuf = null;
         IGpuBuffer? colsBuf = null;
@@ -9829,8 +9838,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             valsBuf = backend.AllocateBuffer(floatVals);
-            colsBuf = backend.AllocateBuffer(csr.ColumnIndices.Select(x => (float)x).ToArray());
-            rowPtrBuf = backend.AllocateBuffer(csr.RowPointers.Select(x => (float)x).ToArray());
+            colsBuf = backend.AllocateBuffer(ReinterpretIntsAsFloats(csr.ColumnIndices));
+            rowPtrBuf = backend.AllocateBuffer(ReinterpretIntsAsFloats(csr.RowPointers));
         }
         catch
         {
