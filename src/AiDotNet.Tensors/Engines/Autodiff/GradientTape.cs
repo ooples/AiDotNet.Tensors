@@ -102,6 +102,12 @@ public sealed class GradientTape<T> : IDisposable
             _retainGrad = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         }
 
+        if (_options.EnableGraphCaching)
+        {
+            _signatureBuilder = new GraphSignatureBuilder();
+            _graphCache = new TrainingGraphCache<T>(_options.GraphCacheCapacity);
+        }
+
         SetCurrentTape(this);
     }
 
@@ -124,6 +130,15 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         _entries.Add(entry);
+
+        // Build rolling hash for graph caching
+        if (_signatureBuilder is not null)
+        {
+            _signatureBuilder.FeedOp(entry.OperationName);
+            foreach (var input in entry.Inputs)
+                _signatureBuilder.FeedShape(input._shape);
+            _signatureBuilder.FeedShape(entry.Output._shape);
+        }
     }
 
     /// <summary>
@@ -185,6 +200,15 @@ public sealed class GradientTape<T> : IDisposable
         {
             // Walk tape in reverse (reverse-mode AD)
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
+
+            // Graph cache: check if we've seen this exact graph structure before.
+            // If so, skip the reachability analysis and use cached traversal order.
+            CachedGraph<T>? cachedGraph = null;
+            if (_signatureBuilder is not null && _graphCache is not null)
+            {
+                var signature = _signatureBuilder.Build();
+                _graphCache.TryGet(signature, out cachedGraph);
+            }
 
             // Tape backward pruning: when sources are specified, forward-walk to find all tensors
             // downstream of those sources. During the backward walk, skip entries whose output
@@ -298,6 +322,19 @@ public sealed class GradientTape<T> : IDisposable
                     }
                 }
             }
+            // Cache the backward traversal plan for future steps (cache miss path)
+            if (cachedGraph is null && _signatureBuilder is not null && _graphCache is not null)
+        {
+            var sig = _signatureBuilder.Build();
+            // Build reachable indices from the backward walk
+            var reachable = new List<int>();
+            for (int ri = _entries.Count - 1; ri >= 0; ri--)
+            {
+                if (grads.ContainsKey(_entries[ri].Output))
+                    reachable.Add(ri);
+            }
+            _graphCache.Put(new CachedGraph<T>(sig, reachable.ToArray(), loss.Shape.ToArray()));
+        }
         }
         finally
         {
@@ -306,6 +343,9 @@ public sealed class GradientTape<T> : IDisposable
                 SetCurrentTape(savedCurrent);
             }
         }
+
+        // Reset signature builder for next step
+        _signatureBuilder?.Reset();
 
         // If sources specified, filter to only those
         if (sources is not null)
@@ -420,6 +460,10 @@ public sealed class GradientTape<T> : IDisposable
     /// Like PyTorch's tensor.retain_grad().
     /// </summary>
     private readonly HashSet<Tensor<T>>? _retainGrad;
+
+    // Graph caching fields
+    private readonly GraphSignatureBuilder? _signatureBuilder;
+    private readonly TrainingGraphCache<T>? _graphCache;
 
     /// <summary>
     /// Registers a hook on a tensor that will be called with its gradient during backward.
