@@ -23415,4 +23415,168 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     #endregion
+
+    #region Complex Tensor Operations
+
+    /// <inheritdoc />
+    public Tensor<T> TensorComplexMultiply<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (a.Length != b.Length)
+            throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
+        if (a.Length % 2 != 0)
+            throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(a._shape);
+        int pairs = a.Length / 2;
+
+        for (int i = 0; i < pairs; i++)
+        {
+            int idx = i * 2;
+            T aRe = a.GetFlat(idx), aIm = a.GetFlat(idx + 1);
+            T bRe = b.GetFlat(idx), bIm = b.GetFlat(idx + 1);
+            // (aRe + aIm*i) * (bRe + bIm*i) = (aRe*bRe - aIm*bIm) + (aRe*bIm + aIm*bRe)*i
+            result.SetFlat(idx, ops.Subtract(ops.Multiply(aRe, bRe), ops.Multiply(aIm, bIm)));
+            result.SetFlat(idx + 1, ops.Add(ops.Multiply(aRe, bIm), ops.Multiply(aIm, bRe)));
+        }
+
+        Autodiff.DifferentiableOps.RecordIfActive("ComplexMultiply", result,
+            new[] { a, b }, Autodiff.BackwardFunctions<T>.ComplexMultiplyBackward);
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> TensorComplexConjugate<T>(Tensor<T> a)
+    {
+        if (a.Length % 2 != 0)
+            throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<T>(a._shape);
+
+        for (int i = 0; i < a.Length; i++)
+        {
+            result.SetFlat(i, (i % 2 == 1) ? ops.Negate(a.GetFlat(i)) : a.GetFlat(i));
+        }
+
+        Autodiff.DifferentiableOps.RecordIfActive("ComplexConjugate", result,
+            new[] { a }, Autodiff.BackwardFunctions<T>.ComplexConjugateBackward);
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Tensor<T> TensorComplexMagnitude<T>(Tensor<T> a)
+    {
+        if (a.Length % 2 != 0)
+            throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int pairs = a.Length / 2;
+        var result = new Tensor<T>(new[] { pairs });
+
+        for (int i = 0; i < pairs; i++)
+        {
+            int idx = i * 2;
+            T re = a.GetFlat(idx), im = a.GetFlat(idx + 1);
+            T magSq = ops.Add(ops.Multiply(re, re), ops.Multiply(im, im));
+            result.SetFlat(i, ops.Sqrt(magSq));
+        }
+
+        Autodiff.DifferentiableOps.RecordIfActive("ComplexMagnitude", result,
+            new[] { a }, Autodiff.BackwardFunctions<T>.ComplexMagnitudeBackward,
+            new object[] { a });
+
+        return result;
+    }
+
+    #endregion
+
+    #region CTC Loss
+
+    /// <inheritdoc />
+    public Tensor<T> TensorCTCLoss<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths, int[] targetLengths, int blank = 0)
+    {
+        if (logProbs.Rank != 3)
+            throw new ArgumentException("logProbs must be 3D [T, N, C].");
+
+        var ops = MathHelper.GetNumericOperations<T>();
+        int maxT = logProbs._shape[0];
+        int batchSize = logProbs._shape[1];
+        int numClasses = logProbs._shape[2];
+
+        if (inputLengths.Length != batchSize || targetLengths.Length != batchSize)
+            throw new ArgumentException("inputLengths and targetLengths must have length == batchSize.");
+
+        var losses = new Tensor<T>(new[] { batchSize });
+
+        // Forward-backward algorithm per batch element
+        int targetOffset = 0;
+        for (int n = 0; n < batchSize; n++)
+        {
+            int T_n = inputLengths[n];
+            int U_n = targetLengths[n];
+            int S = 2 * U_n + 1; // expanded label length with blanks
+
+            // Build expanded label sequence: blank, l1, blank, l2, blank, ...
+            var expandedLabels = new int[S];
+            for (int s = 0; s < S; s++)
+            {
+                expandedLabels[s] = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
+            }
+
+            // Alpha (forward) pass — log domain for numerical stability
+            var alpha = new double[T_n, S];
+            double negInf = double.NegativeInfinity;
+            for (int t = 0; t < T_n; t++)
+                for (int s = 0; s < S; s++)
+                    alpha[t, s] = negInf;
+
+            // Initialize
+            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
+            if (S > 1)
+                alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
+
+            // Forward recursion
+            for (int t = 1; t < T_n; t++)
+            {
+                for (int s = 0; s < S; s++)
+                {
+                    double logProbTS = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
+                    double prevSum = alpha[t - 1, s];
+                    if (s >= 1)
+                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 1]);
+                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
+                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 2]);
+                    alpha[t, s] = prevSum + logProbTS;
+                }
+            }
+
+            // Total log-probability
+            double logProb = alpha[T_n - 1, S - 1];
+            if (S >= 2)
+                logProb = LogSumExp(logProb, alpha[T_n - 1, S - 2]);
+
+            // CTC loss = -log P(labels | input)
+            losses.SetFlat(n, ops.FromDouble(-logProb));
+            targetOffset += U_n;
+        }
+
+        Autodiff.DifferentiableOps.RecordIfActive("CTCLoss", losses,
+            new[] { logProbs }, Autodiff.BackwardFunctions<T>.CTCLossBackward,
+            new object[] { logProbs, targets, inputLengths, targetLengths, blank });
+
+        return losses;
+    }
+
+    private static double LogSumExp(double a, double b)
+    {
+        if (double.IsNegativeInfinity(a)) return b;
+        if (double.IsNegativeInfinity(b)) return a;
+        double max = Math.Max(a, b);
+        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
+    }
+
+    #endregion
 }

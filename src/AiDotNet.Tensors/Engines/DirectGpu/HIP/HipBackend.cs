@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 
@@ -9393,6 +9393,49 @@ public sealed partial class HipBackend : IAsyncGpuBackend
             args[4] = &batchSize;
             args[5] = &inputFeatures;
             args[6] = &outputFeatures;
+            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        }
+    }
+
+    #endregion
+
+    #region Complex Tensor Operations
+
+    public unsafe void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
+    {
+        if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_multiply");
+        uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
+        {
+            IntPtr _p0 = a.Handle, _p1 = b.Handle, _p2 = output.Handle;
+            void** args = stackalloc void*[4];
+            args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &numPairs;
+            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        }
+    }
+
+    public unsafe void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_conjugate");
+        uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
+        {
+            IntPtr _p0 = input.Handle, _p1 = output.Handle;
+            void** args = stackalloc void*[3];
+            args[0] = &_p0; args[1] = &_p1; args[2] = &numPairs;
+            LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
+        }
+    }
+
+    public unsafe void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
+    {
+        if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
+            throw new InvalidOperationException("HIP kernel not found: complex_magnitude");
+        uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
+        {
+            IntPtr _p0 = input.Handle, _p1 = output.Handle;
+            void** args = stackalloc void*[3];
+            args[0] = &_p0; args[1] = &_p1; args[2] = &numPairs;
             LaunchKernel(kernel, grid, (uint)DefaultBlockSize, args);
         }
     }

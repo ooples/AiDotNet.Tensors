@@ -2809,6 +2809,19 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>CIoU loss backward.</summary>
     void CIoULossBackward(IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target,
         IGpuBuffer gradPredicted, int numBoxes);
+
+    #region Complex Tensor Operations
+
+    /// <summary>Element-wise complex multiply on interleaved re/im buffers. Length = numPairs*2.</summary>
+    void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs);
+
+    /// <summary>Complex conjugate — negate odd indices. Length = numPairs*2.</summary>
+    void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs);
+
+    /// <summary>Complex magnitude — sqrt(re^2+im^2) per pair. Output length = numPairs.</summary>
+    void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs);
+
+    #endregion
 }
 
 /// <summary>

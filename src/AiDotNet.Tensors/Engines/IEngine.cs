@@ -7409,6 +7409,47 @@ public interface IEngine
     Matrix<T>[] So3AdjointBatch<T>(So3Group<T> group, So3<T>[] rotations);
 
     #endregion
+
+    #region Complex Tensor Operations
+
+    /// <summary>
+    /// Element-wise complex multiplication on interleaved real/imaginary tensors.
+    /// Input format: [re0, im0, re1, im1, ...] where length must be even.
+    /// (a_re + a_im*i) * (b_re + b_im*i) = (a_re*b_re - a_im*b_im) + (a_re*b_im + a_im*b_re)*i
+    /// </summary>
+    Tensor<T> TensorComplexMultiply<T>(Tensor<T> a, Tensor<T> b);
+
+    /// <summary>
+    /// Complex conjugate on interleaved real/imaginary tensors.
+    /// Negates imaginary components (odd indices): [re0, -im0, re1, -im1, ...]
+    /// </summary>
+    Tensor<T> TensorComplexConjugate<T>(Tensor<T> a);
+
+    /// <summary>
+    /// Complex magnitude on interleaved real/imaginary tensors.
+    /// Computes sqrt(re^2 + im^2) per complex pair.
+    /// Output length is half the input length.
+    /// </summary>
+    Tensor<T> TensorComplexMagnitude<T>(Tensor<T> a);
+
+    #endregion
+
+    #region CTC Loss
+
+    /// <summary>
+    /// Connectionist Temporal Classification (CTC) loss.
+    /// Computes per-batch CTC loss using the forward-backward algorithm over the label lattice.
+    /// </summary>
+    /// <param name="logProbs">Log probabilities tensor [T, N, C] where T=time, N=batch, C=classes.
+    /// Must be log-softmax output (not raw logits).</param>
+    /// <param name="targets">Target label indices (concatenated, no blanks) [sum(targetLengths)].</param>
+    /// <param name="inputLengths">Length of each input sequence [N].</param>
+    /// <param name="targetLengths">Length of each target sequence [N].</param>
+    /// <param name="blank">Index of the blank label (default 0).</param>
+    /// <returns>Per-batch CTC loss tensor [N].</returns>
+    Tensor<T> TensorCTCLoss<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths, int[] targetLengths, int blank = 0);
+
+    #endregion
 }
 
 /// <summary>
