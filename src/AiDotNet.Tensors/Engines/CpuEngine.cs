@@ -2826,6 +2826,7 @@ public class CpuEngine : ITensorLevelEngine
             numOps.Add(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
+        DifferentiableOps.RecordIfActive("TensorAddMany", result, tensors, BackwardFunctions<T>.AddManyBackward);
         return result;
     }
 
@@ -3359,6 +3360,7 @@ public class CpuEngine : ITensorLevelEngine
             numOps.Multiply(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
+        DifferentiableOps.RecordIfActive("TensorMultiplyMany", result, tensors, BackwardFunctions<T>.MultiplyManyBackward);
         return result;
     }
 
@@ -14897,7 +14899,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ReduceMax", reduceMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
+        return reduceMaxResult;
     }
 
     /// <inheritdoc/>
@@ -15625,7 +15629,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("PixelShuffle", psResult, input, BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
+        return psResult;
     }
 
     /// <inheritdoc/>
@@ -16057,7 +16063,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Crop", cropResult, input, BackwardFunctions<T>.CropBackward, new object[] { top, left });
+        return cropResult;
     }
 
     /// <inheritdoc/>
@@ -16145,7 +16153,9 @@ public class CpuEngine : ITensorLevelEngine
         newShape[rank - 2] = newHeight;
         newShape[rank - 1] = newWidth;
 
-        return TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        var padResult = TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Pad", padResult, input, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
+        return padResult;
     }
 
     /// <inheritdoc/>
@@ -16605,6 +16615,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("TensorRepeatElements", result, tensor, BackwardFunctions<T>.RepeatElementsBackward, new object[] { repeats, axis });
         return result;
     }
 
@@ -16839,6 +16850,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("TensorOuterProduct", result, a, b, BackwardFunctions<T>.OuterProductBackward);
         return result;
     }
 
@@ -17057,6 +17069,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
         return result;
     }
 
@@ -19074,6 +19087,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordUnary("Gather", result, input, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
         return result;
     }
 
@@ -19221,6 +19235,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordBinary("TensorOuter", result, a, b, BackwardFunctions<T>.OuterProductBackward);
         return result;
     }
 
