@@ -47,7 +47,8 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
-    /// Records a unary operation (single input). Zero heap allocation.
+    /// Records a unary operation (single input). Zero heap allocation, zero struct copy.
+    /// Writes directly into the arena slot via ref return.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RecordUnary<T>(
@@ -57,26 +58,22 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
-        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
-        if (tape is null) return;
+        if (tape is null || NoGradScope<T>.IsSuppressed) return;
 
-        var entry = new TapeEntry<T>
-        {
-            OperationName = opName,
-            Output = output,
-            Backward = backward,
-            SavedState = savedState,
-            Input0 = input,
-            InputCount = 1,
-            Version0 = input.Version,
-        };
-
-        tape.Record(entry);
+        ref var slot = ref tape.RecordSlot();
+        slot.OperationName = opName;
+        slot.Output = output;
+        slot.Backward = backward;
+        slot.SavedState = savedState;
+        slot.Input0 = input;
+        slot.InputCount = 1;
+        slot.Version0 = input.Version;
     }
 
     /// <summary>
-    /// Records a binary operation (two inputs). Zero heap allocation.
+    /// Records a binary operation (two inputs). Zero heap allocation, zero struct copy.
+    /// Writes directly into the arena slot via ref return.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RecordBinary<T>(
@@ -87,24 +84,19 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
-        if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
-        if (tape is null) return;
+        if (tape is null || NoGradScope<T>.IsSuppressed) return;
 
-        var entry = new TapeEntry<T>
-        {
-            OperationName = opName,
-            Output = output,
-            Backward = backward,
-            SavedState = savedState,
-            Input0 = a,
-            Input1 = b,
-            InputCount = 2,
-            Version0 = a.Version,
-            Version1 = b.Version,
-        };
-
-        tape.Record(entry);
+        ref var slot = ref tape.RecordSlot();
+        slot.OperationName = opName;
+        slot.Output = output;
+        slot.Backward = backward;
+        slot.SavedState = savedState;
+        slot.Input0 = a;
+        slot.Input1 = b;
+        slot.InputCount = 2;
+        slot.Version0 = a.Version;
+        slot.Version1 = b.Version;
     }
 
     /// <summary>

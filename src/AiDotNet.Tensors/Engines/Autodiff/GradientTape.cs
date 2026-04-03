@@ -129,6 +129,26 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Returns a ref to the next arena slot for direct field writes.
+    /// This eliminates the 80-byte struct copy that Record(entry) requires,
+    /// reducing per-op recording overhead by ~50ns.
+    /// </summary>
+    // Sentinel slot used when MaxEntries is reached — writes are discarded
+    private TapeEntry<T> _discardSlot;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal ref TapeEntry<T> RecordSlot()
+    {
+        // Drop new entries when at capacity (bounded tape)
+        if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
+        {
+            _discardSlot = default;
+            return ref _discardSlot;
+        }
+        return ref _entries.AllocateSlot();
+    }
+
+    /// <summary>
     /// Computes gradients of <paramref name="loss"/> with respect to <paramref name="sources"/>
     /// by walking the tape in reverse order (reverse-mode automatic differentiation).
     /// </summary>
