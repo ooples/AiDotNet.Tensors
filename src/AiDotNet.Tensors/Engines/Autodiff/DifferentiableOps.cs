@@ -100,4 +100,40 @@ internal static class DifferentiableOps
             grads[tensor] = grad;
         }
     }
+
+    /// <summary>
+    /// Accumulates gradient into a pre-allocated buffer pool.
+    /// First write copies into the buffer; subsequent writes use in-place addition.
+    /// Falls back to standard AccumulateGrad for unregistered parameters.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void AccumulateGradManaged<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads,
+        Tensor<T> tensor,
+        Tensor<T> grad,
+        IEngine engine,
+        GradientBufferPool<T> pool)
+    {
+        if (pool.TryGetBuffer(tensor, out var buffer, out var isDirty))
+        {
+            if (!isDirty)
+            {
+                // First write this step: copy into pre-allocated buffer
+                engine.TensorCopy(grad, buffer);
+                pool.MarkDirty(tensor);
+            }
+            else
+            {
+                // Subsequent writes: accumulate in-place
+                engine.TensorAddInPlace(buffer, grad);
+            }
+            // Ensure grads dict points to the pool buffer
+            grads[tensor] = buffer;
+        }
+        else
+        {
+            // Not a managed parameter — fall through to standard path
+            AccumulateGrad(grads, tensor, grad, engine);
+        }
+    }
 }

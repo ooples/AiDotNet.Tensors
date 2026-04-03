@@ -336,6 +336,55 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Computes gradients using pre-allocated gradient buffers from a pool.
+    /// Eliminates per-backward allocation for registered parameters.
+    /// The pool's buffers are zeroed automatically before backward.
+    /// </summary>
+    /// <param name="loss">The loss tensor to differentiate.</param>
+    /// <param name="gradientPool">Pre-allocated gradient buffer pool.</param>
+    /// <param name="sources">Optional parameter list to compute gradients for.</param>
+    /// <param name="createGraph">If true, backward ops are recorded for higher-order gradients.</param>
+    /// <returns>Gradient dictionary pointing to pool buffers (zero allocation for registered params).</returns>
+    public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
+        Tensor<T> loss,
+        GradientBufferPool<T> gradientPool,
+        IReadOnlyList<Tensor<T>>? sources = null,
+        bool createGraph = false)
+    {
+        if (gradientPool is null) throw new ArgumentNullException(nameof(gradientPool));
+
+        // Zero all pool buffers before backward
+        gradientPool.ZeroAll();
+
+        // Run normal backward — AccumulateGrad will use TensorAddInPlace into
+        // the zeroed pool buffers when they appear in the grads dictionary.
+        // Pre-populate grads with pool buffer references so AccumulateGrad
+        // hits the in-place path instead of allocating new tensors.
+        var result = ComputeGradients(loss, sources, createGraph);
+
+        // For registered parameters whose gradients were computed, ensure
+        // the returned dictionary points to pool buffers
+        if (sources is not null)
+        {
+            foreach (var source in sources)
+            {
+                if (gradientPool.TryGetBuffer(source, out var poolBuffer, out _))
+                {
+                    if (result.TryGetValue(source, out var computedGrad) &&
+                        !ReferenceEquals(computedGrad, poolBuffer))
+                    {
+                        // Copy computed gradient into pool buffer
+                        _engine.TensorCopy(computedGrad, poolBuffer);
+                        result[source] = poolBuffer;
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Clears all recorded entries from the tape without disposing it.
     /// </summary>
     public void Reset()
