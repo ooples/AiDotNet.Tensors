@@ -57,6 +57,12 @@ public sealed class GradientTape<T> : IDisposable
     public int EntryCount => _entries.Count;
 
     /// <summary>
+    /// Gets the tape entries for dependency analysis. Used by <see cref="DependencyTracker{T}"/>
+    /// and <see cref="SelectiveReplayContext{T}"/> for selective backward optimization.
+    /// </summary>
+    internal IReadOnlyList<TapeEntry<T>> GetEntries() => _entries;
+
+    /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
     /// </summary>
