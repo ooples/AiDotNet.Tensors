@@ -60,6 +60,11 @@ public struct TapeEntry<T>
     /// </summary>
     public Tensor<T>[]? InputsOverflow;
 
+    /// <summary>
+    /// Version counters for overflow inputs. Snapshotted at recording time.
+    /// </summary>
+    public int[]? InputVersionsOverflow;
+
     // ── Inline version counters (zero-alloc) ────────────────────────────
 
     /// <summary>Version counter of Input0 at recording time.</summary>
@@ -112,9 +117,14 @@ public struct TapeEntry<T>
     {
         if (InputsOverflow is not null)
         {
-            for (int i = 0; i < InputsOverflow.Length; i++)
+            // Overflow path uses InputVersionsOverflow if available
+            if (InputVersionsOverflow is not null)
             {
-                // Overflow path: versions not tracked inline (rare ops, best-effort)
+                for (int i = 0; i < InputsOverflow.Length && i < InputVersionsOverflow.Length; i++)
+                {
+                    if (InputsOverflow[i].Version != InputVersionsOverflow[i])
+                        ThrowMutation(i);
+                }
             }
             return;
         }

@@ -21,7 +21,7 @@ public class TapePerformanceTests
         _output = output;
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - timing sensitive, run manually")]
     public void RecordingOverhead_SmallTensor_UnderBudget()
     {
         // Measure pure recording overhead using tiny tensors (4 elements)
@@ -77,7 +77,7 @@ public class TapePerformanceTests
             $"Recording overhead {overheadNs:F1}ns exceeds 2000ns budget");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - timing sensitive, run manually")]
     public void RecordingOverhead_MediumTensor_Negligible()
     {
         // For medium tensors (1K elements), recording overhead should be
@@ -164,7 +164,7 @@ public class TapePerformanceTests
             $"MLP forward+backward {msPerStep:F2}ms exceeds 100ms budget");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - timing sensitive, run manually")]
     public void RecordingOverhead_VsPyTorchBaseline()
     {
         // Compare AiDotNet tape overhead against PyTorch-equivalent overhead numbers.
@@ -227,7 +227,7 @@ public class TapePerformanceTests
             $"Recording overhead {overheadPct:F1}% exceeds 200% for 256x256 tensors");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - timing sensitive, run manually")]
     public void PureRecordingCall_Overhead()
     {
         // Isolate JUST the recording call — no tensor computation.

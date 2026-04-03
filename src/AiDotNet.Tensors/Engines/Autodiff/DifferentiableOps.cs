@@ -32,6 +32,11 @@ internal static class DifferentiableOps
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
+        // Snapshot version counters for overflow inputs
+        var versions = new int[inputs.Length];
+        for (int i = 0; i < inputs.Length; i++)
+            versions[i] = inputs[i].Version;
+
         var entry = new TapeEntry<T>
         {
             OperationName = opName,
@@ -39,6 +44,7 @@ internal static class DifferentiableOps
             Backward = backward,
             SavedState = savedState,
             InputsOverflow = inputs,
+            InputVersionsOverflow = versions,
             InputCount = 0xFF,
             Input0 = inputs.Length > 0 ? inputs[0] : null!,
         };

@@ -5142,7 +5142,7 @@ public class CpuEngine : ITensorLevelEngine
                 stride, padding, dilation,
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
-                BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
+                BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             return result;
         }
 
@@ -5158,7 +5158,7 @@ public class CpuEngine : ITensorLevelEngine
                 stride, padding, dilation,
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
-                BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
+                BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             return result;
         }
 
@@ -5170,7 +5170,7 @@ public class CpuEngine : ITensorLevelEngine
             outputHeight, outputWidth);
 
         DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
-            BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
+            BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
         return result;
     }
 
@@ -15306,7 +15306,12 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var logVarResult = TensorAllocator.Rent<T>(variance._shape, new Vector<T>(varianceData));
-        var mean = ReduceMean(input, axes, keepDims);
+        // Compute mean inside NoGradScope to avoid adding disconnected tape entries
+        Tensor<T> mean;
+        using (new NoGradScope<T>())
+        {
+            mean = ReduceMean(input, axes, keepDims);
+        }
         DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, input, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
         return logVarResult;
     }
@@ -16273,8 +16278,11 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
-        DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),
-            BackwardFunctions<T>.ConcatenateBackward, new object[] { axis });
+        if (GradientTape<T>.Current is not null)
+        {
+            DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),
+                BackwardFunctions<T>.ConcatenateBackward, new object[] { axis });
+        }
         return result;
     }
 
@@ -17849,7 +17857,6 @@ public class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(oneMinusT, log1MinusP)));
         }
 
-        object boxedEps = epsilon is not null ? (object)epsilon : throw new InvalidOperationException("epsilon cannot be null");
         DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictions, targets, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
         return result;
     }

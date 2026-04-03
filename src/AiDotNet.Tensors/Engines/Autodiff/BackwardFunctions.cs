@@ -2901,25 +2901,46 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
     }
 
-    /// <summary>TensorAddMany: gradient is grad for each input</summary>
+    /// <summary>TensorAddMany: gradient is grad for each input (cloned to avoid shared mutation)</summary>
     internal static void AddManyBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        foreach (var input in inputs)
-            DifferentiableOps.AccumulateGrad(grads, input, gradOutput, engine);
+        // Each input gets its own copy of gradOutput to prevent AccumulateGrad
+        // from mutating a shared tensor via TensorAddInPlace
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var grad = i == 0 ? gradOutput : gradOutput.Clone();
+            DifferentiableOps.AccumulateGrad(grads, inputs[i], grad, engine);
+        }
     }
 
-    /// <summary>TensorMultiplyMany: product rule for N inputs</summary>
+    /// <summary>TensorMultiplyMany: product rule for N inputs, handles zeros correctly</summary>
     internal static void MultiplyManyBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // d(a*b*c)/da = grad * b * c = grad * output / a
+        // For each input i, gradient = grad * product_of_all_others
+        // Compute via: grad_i = grad * (product / inputs[i])
+        // But division by zero fails, so compute product_of_others directly
         for (int i = 0; i < inputs.Length; i++)
         {
-            var quotient = engine.TensorDivide(output, inputs[i]);
-            var grad = engine.TensorMultiply(gradOutput, quotient);
+            Tensor<T> productOfOthers;
+            if (inputs.Length == 2)
+            {
+                productOfOthers = inputs[1 - i];
+            }
+            else
+            {
+                // Compute product of all inputs except i
+                productOfOthers = i == 0 ? inputs[1].Clone() : inputs[0].Clone();
+                for (int j = (i == 0 ? 2 : 1); j < inputs.Length; j++)
+                {
+                    if (j == i) continue;
+                    productOfOthers = engine.TensorMultiply(productOfOthers, inputs[j]);
+                }
+            }
+            var grad = engine.TensorMultiply(gradOutput, productOfOthers);
             DifferentiableOps.AccumulateGrad(grads, inputs[i], grad, engine);
         }
     }

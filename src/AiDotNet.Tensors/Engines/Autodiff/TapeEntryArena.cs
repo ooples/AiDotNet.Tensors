@@ -3,20 +3,16 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
-/// Pre-allocated ring buffer for TapeEntry structs. Eliminates per-record GC allocation
-/// by writing entries into a fixed-size array. When the array is full, it doubles in capacity.
+/// Growable array for TapeEntry structs with ref-return slot allocation.
+/// Eliminates per-record GC allocation by writing fields directly into array slots.
 /// </summary>
 /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
 /// <remarks>
-/// <para><b>Performance:</b> Recording an op writes a TapeEntry struct into the next slot
-/// in the backing array — no heap allocation, no GC pressure. The backing array grows
-/// geometrically (like List&lt;T&gt;) but since TapeEntry is a struct, the array stores
-/// entries inline (no boxing, no pointer chasing).</para>
-/// <para><b>Why not List&lt;TapeEntry&gt;?</b> List&lt;T&gt; for value types copies the struct
-/// on every Add (into the backing array). Our arena avoids the copy by returning a ref
-/// to the next slot, which DifferentiableOps writes into directly. However, since C#
-/// doesn't support ref returns from indexers in all TFMs, we use List&lt;T&gt; as the backing
-/// store but pre-size it to avoid resizing allocations.</para>
+/// <para><b>Performance:</b> <see cref="AllocateSlot"/> returns a ref to the next array
+/// element, allowing DifferentiableOps to write 9 fields directly into the backing array
+/// with zero struct copy and zero heap allocation. The backing array grows geometrically
+/// (doubles when full). Thread-local caching in GradientTape ensures the array is reused
+/// across training steps — zero allocation after warmup.</para>
 /// </remarks>
 internal sealed class TapeEntryArena<T>
 {
