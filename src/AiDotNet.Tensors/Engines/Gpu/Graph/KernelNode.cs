@@ -9,18 +9,18 @@ namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 /// </summary>
 public sealed class KernelNode : ExecutionNode
 {
-    private readonly IGpuTensor[] _inputs;
-    private readonly IGpuTensor[] _outputs;
+    private readonly Tensor<float>[] _inputs;
+    private readonly Tensor<float>[] _outputs;
     private readonly Action<IDirectGpuBackend, IGpuStream?> _kernelAction;
 
     /// <inheritdoc/>
     public override ExecutionNodeType NodeType => ExecutionNodeType.Kernel;
 
     /// <inheritdoc/>
-    public override IReadOnlyList<IGpuTensor> InputTensors => _inputs;
+    public override IReadOnlyList<Tensor<float>> InputTensors => _inputs;
 
     /// <inheritdoc/>
-    public override IReadOnlyList<IGpuTensor> OutputTensors => _outputs;
+    public override IReadOnlyList<Tensor<float>> OutputTensors => _outputs;
 
     /// <inheritdoc/>
     public override bool CanFuse => KernelType.CanFuse();
@@ -67,8 +67,8 @@ public sealed class KernelNode : ExecutionNode
     /// <param name="parameters">Additional kernel parameters.</param>
     public KernelNode(
         KernelType kernelType,
-        IGpuTensor[] inputs,
-        IGpuTensor[] outputs,
+        Tensor<float>[] inputs,
+        Tensor<float>[] outputs,
         Action<IDirectGpuBackend, IGpuStream?> kernelAction,
         Dictionary<string, object>? parameters = null)
     {
@@ -110,44 +110,8 @@ public sealed class KernelNode : ExecutionNode
             var evt = stream.RecordEvent();
             var syncPoint = new KernelSyncPoint(evt, stream);
 
-            // Mark outputs as modified with the sync point (write fence).
-            // TensorBase.MarkModified increments version + stores sync point.
-            // IGpuTensor.MarkModified sets dirty flag + stores sync point.
-            bool syncPointUsed = false;
-            switch (output)
-            {
-                case Tensor<float> floatTensor:
-                    floatTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-                case Tensor<double> doubleTensor:
-                    doubleTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-                case Tensor<int> intTensor:
-                    intTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-                case Tensor<long> longTensor:
-                    longTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-                case IGpuTensor<int> legacyIntTensor:
-                    legacyIntTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-                case IGpuTensor<long> legacyLongTensor:
-                    legacyLongTensor.MarkModified(syncPoint);
-                    syncPointUsed = true;
-                    break;
-            }
-
-            // Dispose the sync point if it wasn't used (unrecognized tensor type)
-            // to prevent GPU event resource leaks
-            if (!syncPointUsed)
-            {
-                syncPoint.Dispose();
-            }
+            // Mark output as modified with write fence
+            output.MarkModified(syncPoint);
         }
 
         // Record completion for dependents on other streams
@@ -173,7 +137,7 @@ public sealed class KernelNode : ExecutionNode
     /// Creates a GEMM kernel node.
     /// </summary>
     public static KernelNode CreateGemm(
-        IGpuTensor a, IGpuTensor b, IGpuTensor c,
+        Tensor<float> a, Tensor<float> b, Tensor<float> c,
         int m, int n, int k, float alpha, float beta,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {
@@ -196,7 +160,7 @@ public sealed class KernelNode : ExecutionNode
     /// Creates an activation kernel node.
     /// </summary>
     public static KernelNode CreateActivation(
-        IGpuTensor input, IGpuTensor output,
+        Tensor<float> input, Tensor<float> output,
         FusedActivationType activation,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {
@@ -215,7 +179,7 @@ public sealed class KernelNode : ExecutionNode
     /// Creates an element-wise operation kernel node.
     /// </summary>
     public static KernelNode CreateElementWise(
-        IGpuTensor[] inputs, IGpuTensor output,
+        Tensor<float>[] inputs, Tensor<float> output,
         ElementWiseOp operation,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {

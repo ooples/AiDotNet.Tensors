@@ -90,9 +90,9 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     /// <summary>
     /// Creates a GPU tensor wrapper for a buffer to use in graph nodes.
     /// </summary>
-    private static GpuTensorWrapper CreateTensorWrapper(IGpuBuffer buffer, GpuTensorRole role = GpuTensorRole.Intermediate)
+    private Tensor<float> CreateTensorWrapper(IGpuBuffer buffer, GpuTensorRole role = GpuTensorRole.Intermediate)
     {
-        return new GpuTensorWrapper(buffer, role);
+        return Tensor<float>.FromGpuBuffer(Inner, buffer, new[] { buffer.Size }, role, ownsBuffer: false);
     }
 
     /// <summary>
@@ -722,57 +722,3 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     #endregion
 }
 
-/// <summary>
-/// Simple wrapper to adapt IGpuBuffer to IGpuTensor for graph nodes.
-/// </summary>
-internal sealed class GpuTensorWrapper : IGpuTensor
-{
-    /// <inheritdoc/>
-    public IGpuBuffer Buffer { get; }
-
-    internal readonly int[] _shape;
-
-    /// <inheritdoc/>
-    public TensorShape Shape { get; }
-
-    /// <inheritdoc/>
-    public GpuTensorRole Role { get; }
-
-    /// <inheritdoc/>
-    public int ElementCount => Buffer.Size;
-
-    /// <inheritdoc/>
-    public long SizeInBytes => Buffer.SizeInBytes;
-
-    /// <inheritdoc/>
-    public GpuSyncPoint? LastWriteSync => null;
-
-    /// <inheritdoc/>
-    public bool IsDirty => false;
-
-    /// <inheritdoc/>
-    public Type ElementType => typeof(float);
-
-    /// <summary>
-    /// Creates a new tensor wrapper around a buffer.
-    /// </summary>
-    public GpuTensorWrapper(IGpuBuffer buffer, GpuTensorRole role)
-    {
-        Buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-        _shape = new[] { buffer.Size };
-        Shape = TensorShape.WrapUnsafe(_shape);
-        Role = role;
-    }
-
-    /// <inheritdoc/>
-    public void Synchronize()
-    {
-        // No-op for wrapper - actual sync happens at backend level
-    }
-
-    /// <inheritdoc/>
-    public void Dispose()
-    {
-        // Don't dispose the buffer - we don't own it
-    }
-}

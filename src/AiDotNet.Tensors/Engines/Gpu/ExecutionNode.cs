@@ -1,4 +1,5 @@
 ﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
 
@@ -58,12 +59,12 @@ public abstract class ExecutionNode
     /// <summary>
     /// Gets the input tensors for this node.
     /// </summary>
-    public virtual IReadOnlyList<IGpuTensor> InputTensors => Array.Empty<IGpuTensor>();
+    public virtual IReadOnlyList<Tensor<float>> InputTensors => Array.Empty<Tensor<float>>();
 
     /// <summary>
     /// Gets the output tensors produced by this node.
     /// </summary>
-    public virtual IReadOnlyList<IGpuTensor> OutputTensors => Array.Empty<IGpuTensor>();
+    public virtual IReadOnlyList<Tensor<float>> OutputTensors => Array.Empty<Tensor<float>>();
 
     /// <summary>
     /// Gets a descriptive name for this node (for debugging/profiling).

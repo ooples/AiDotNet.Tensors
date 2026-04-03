@@ -1,4 +1,5 @@
-﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 
@@ -62,7 +63,7 @@ public sealed class ExecutionGraphBuilder : IDisposable
     /// Adds a kernel node for GEMM operation.
     /// </summary>
     public ExecutionGraphBuilder AddGemm(
-        IGpuTensor a, IGpuTensor b, IGpuTensor c,
+        Tensor<float> a, Tensor<float> b, Tensor<float> c,
         int m, int n, int k, float alpha, float beta,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {
@@ -74,7 +75,7 @@ public sealed class ExecutionGraphBuilder : IDisposable
     /// Adds a kernel node for activation function.
     /// </summary>
     public ExecutionGraphBuilder AddActivation(
-        IGpuTensor input, IGpuTensor output,
+        Tensor<float> input, Tensor<float> output,
         FusedActivationType activation,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {
@@ -86,7 +87,7 @@ public sealed class ExecutionGraphBuilder : IDisposable
     /// Adds an element-wise operation kernel node.
     /// </summary>
     public ExecutionGraphBuilder AddElementWise(
-        IGpuTensor[] inputs, IGpuTensor output,
+        Tensor<float>[] inputs, Tensor<float> output,
         ElementWiseOp operation,
         Action<IDirectGpuBackend, IGpuStream?> action)
     {
@@ -99,8 +100,8 @@ public sealed class ExecutionGraphBuilder : IDisposable
     /// </summary>
     public ExecutionGraphBuilder AddKernel(
         KernelType kernelType,
-        IGpuTensor[] inputs,
-        IGpuTensor[] outputs,
+        Tensor<float>[] inputs,
+        Tensor<float>[] outputs,
         Action<IDirectGpuBackend, IGpuStream?> action,
         Dictionary<string, object>? parameters = null)
     {
@@ -411,7 +412,7 @@ public static class ExecutionGraphBuilderExtensions
     /// </summary>
     public static ExecutionGraphBuilder AddLinearLayer(
         this ExecutionGraphBuilder builder,
-        IGpuTensor input, IGpuTensor weights, IGpuTensor bias, IGpuTensor output,
+        Tensor<float> input, Tensor<float> weights, Tensor<float> bias, Tensor<float> output,
         int batchSize, int inputFeatures, int outputFeatures,
         FusedActivationType? activation,
         IDirectGpuBackend backend)

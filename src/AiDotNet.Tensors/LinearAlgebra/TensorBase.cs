@@ -166,12 +166,30 @@ public abstract class TensorBase<T> : IDisposable
     public Engines.Gpu.GpuSyncPoint? LastWriteSync => _lastWriteSync;
 
     /// <summary>
+    /// Whether the GPU data has been modified since the last CPU synchronization.
+    /// True when a GPU operation writes to this tensor; false after CPU data is downloaded.
+    /// </summary>
+    public bool IsDirty { get; internal set; }
+
+    /// <summary>
+    /// Waits for all pending GPU operations on this tensor to complete.
+    /// Call this before reading GPU results to ensure correctness.
+    /// </summary>
+    public void Synchronize()
+    {
+        if (_lastWriteSync is { IsComplete: false })
+            _lastWriteSync.Wait();
+    }
+
+    /// <summary>
     /// Marks this tensor as modified by a GPU operation.
-    /// Increments the version counter and stores the sync point for the write fence.
+    /// Increments the version counter, stores the sync point for the write fence,
+    /// and sets IsDirty so the next CPU read triggers a fresh download.
     /// </summary>
     internal void MarkModified(Engines.Gpu.GpuSyncPoint? syncPoint)
     {
         IncrementVersion();
+        IsDirty = true;
         var previous = _lastWriteSync;
         _lastWriteSync = syncPoint;
         if (previous is not null && !ReferenceEquals(previous, syncPoint))

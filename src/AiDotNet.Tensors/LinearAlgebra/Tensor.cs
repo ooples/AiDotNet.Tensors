@@ -2546,6 +2546,27 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Gets the CPU data for this tensor, downloading from GPU if necessary.
+    /// For GPU-resident tensors, this triggers synchronization and data download.
+    /// For CPU-resident tensors, this returns the backing array directly.
+    /// </summary>
+    public T[] GetCpuData()
+    {
+        if (IsGpuResident)
+        {
+            Synchronize();
+            // Trigger deferred materialization — this downloads from GPU
+            _ = _data.AsSpan();
+            IsDirty = false;
+            return _data.GetDataArray();
+        }
+        // For CPU tensors, respect view logic (sliced/transposed/offset tensors)
+        if (IsContiguous && _storageOffset == 0)
+            return _data.GetDataArray();
+        return GetFlattenedData();
+    }
+
+    /// <summary>
     /// Performs element-wise multiplication of two tensors.
     /// </summary>
     /// <param name="a">The first tensor.</param>
