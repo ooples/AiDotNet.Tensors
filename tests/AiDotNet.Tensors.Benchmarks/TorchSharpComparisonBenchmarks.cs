@@ -204,35 +204,35 @@ public class TorchSharpComparisonBenchmarks
         var gpuBackend = _gpuBackend ?? throw new InvalidOperationException("GPU backend was not initialized.");
 
         using var matmul = gpuEngine.MatMulGpuTensors(_aiGpuMatricesA[MatrixSizes[0]], _aiGpuMatricesB[MatrixSizes[0]]);
-        matmul.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.matmul(_torchMatricesA[MatrixSizes[0]], _torchMatricesB[MatrixSizes[0]]))
         {
             ConsumeTorchResult(result);
         }
 
         using var add = gpuEngine.AddGpu(_aiGpuVectorsA[VectorSizes[0]], _aiGpuVectorsB[VectorSizes[0]]);
-        add.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.add(_torchVectorsA[VectorSizes[0]], _torchVectorsB[VectorSizes[0]]))
         {
             ConsumeTorchResult(result);
         }
 
         using var multiply = gpuEngine.MultiplyGpu(_aiGpuVectorsA[VectorSizes[0]], _aiGpuVectorsB[VectorSizes[0]]);
-        multiply.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.mul(_torchVectorsA[VectorSizes[0]], _torchVectorsB[VectorSizes[0]]))
         {
             ConsumeTorchResult(result);
         }
 
         using var relu = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[0]], FusedActivationType.ReLU);
-        relu.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.nn.functional.relu(_torchVectorsA[VectorSizes[0]]))
         {
             ConsumeTorchResult(result);
         }
 
         using var sigmoid = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[0]], FusedActivationType.Sigmoid);
-        sigmoid.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.nn.functional.sigmoid(_torchVectorsA[VectorSizes[0]]))
         {
             ConsumeTorchResult(result);
@@ -240,7 +240,7 @@ public class TorchSharpComparisonBenchmarks
 
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[0]], 0);
         using var mean = gpuEngine.DivideScalarGpu(sum, VectorSizes[0]);
-        mean.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
         using (var result = torch.sum(_torchVectorsA[VectorSizes[0]]))
         {
             ConsumeTorchResult(result);
@@ -259,7 +259,7 @@ public class TorchSharpComparisonBenchmarks
         using var conv = gpuEngine.FusedConv2DGpu(_aiGpuConvInput, _aiConvKernel, null,
             _convStride, _convStride, _convPadding, _convPadding, _convDilation, _convDilation,
             FusedActivationType.None);
-        conv.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
 
         var torchConvInput = _torchConvInput ?? throw new InvalidOperationException("TorchSharp Conv2D input was not initialized.");
         var torchConvKernel = _torchConvKernel ?? throw new InvalidOperationException("TorchSharp Conv2D kernel was not initialized.");
@@ -341,7 +341,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.MatMulGpuTensors(_aiGpuMatricesA[size], _aiGpuMatricesB[size]);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -360,7 +360,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.AddGpu(_aiGpuVectorsA[size], _aiGpuVectorsB[size]);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -389,7 +389,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.MultiplyGpu(_aiGpuVectorsA[size], _aiGpuVectorsB[size]);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -416,7 +416,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[1]], FusedActivationType.ReLU);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -431,7 +431,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var result = gpuEngine.ActivationGpu(_aiGpuVectorsA[VectorSizes[1]], FusedActivationType.Sigmoid);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -446,7 +446,7 @@ public class TorchSharpComparisonBenchmarks
     {
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[1]], 0);
-        sum.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -462,7 +462,7 @@ public class TorchSharpComparisonBenchmarks
         var gpuEngine = _gpuEngine ?? throw new InvalidOperationException("GPU engine was not initialized.");
         using var sum = gpuEngine.SumAxisGpu(_aiGpuVectorsA[VectorSizes[1]], 0);
         using var mean = gpuEngine.DivideScalarGpu(sum, VectorSizes[1]);
-        mean.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]
@@ -484,7 +484,7 @@ public class TorchSharpComparisonBenchmarks
         using var result = gpuEngine.FusedConv2DGpu(_aiGpuConvInput, _aiConvKernel, null,
             _convStride, _convStride, _convPadding, _convPadding, _convDilation, _convDilation,
             FusedActivationType.None);
-        result.LastWriteSync?.Wait();
+        _gpuBackend!.Synchronize();
     }
 
     [Benchmark]

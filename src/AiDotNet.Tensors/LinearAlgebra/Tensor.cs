@@ -2514,6 +2514,27 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuBackend = backend;
         tensor._gpuRole = role;
         tensor._ownsGpuBuffer = ownsBuffer;
+
+        // Register deferred GPU-to-CPU download so GetDataArray/AsSpan auto-materializes
+        var backingArray = tensor._data.GetDataArray();
+        var capturedBackend = backend;
+        var capturedBuffer = buffer;
+        Helpers.DeferredArrayMaterializer.Register(backingArray, arr =>
+        {
+            var floatData = capturedBackend.DownloadBuffer(capturedBuffer);
+            var typedArr = (T[])arr;
+            if (typeof(T) == typeof(float))
+            {
+                Array.Copy(floatData, 0, typedArr, 0, Math.Min(floatData.Length, typedArr.Length));
+            }
+            else
+            {
+                var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+                for (int i = 0; i < Math.Min(floatData.Length, typedArr.Length); i++)
+                    typedArr[i] = numOps.FromDouble(floatData[i]);
+            }
+        });
+
         return tensor;
     }
 

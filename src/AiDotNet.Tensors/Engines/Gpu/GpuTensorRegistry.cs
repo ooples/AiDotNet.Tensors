@@ -94,7 +94,7 @@ public sealed class GpuTensorRegistry : IDisposable
         int id = Interlocked.Increment(ref _nextId);
         var entry = new TensorEntry(id, buffer, role, buffer.SizeInBytes);
         if (!_tensors.TryAdd(id, entry))
-            return new TensorRegistration(this, -1); // duplicate id — should never happen with Interlocked
+            throw new InvalidOperationException($"GpuTensorRegistry: duplicate registration id {id} — this indicates a concurrency bug.");
 
         Interlocked.Add(ref _totalAllocatedBytes, entry.SizeInBytes);
 

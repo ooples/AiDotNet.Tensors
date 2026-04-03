@@ -110,39 +110,31 @@ public sealed class FusedKernelNode : ExecutionNode
         AssignedStream = stream;
         _fusedKernelAction(backend, stream);
 
-        // Mark outputs as modified with sync point (write fence)
-        var markEvt = stream.RecordEvent();
-        var markSync = new FusedSyncPoint(markEvt, stream);
-        bool markSyncUsed = false;
+        // Mark each output with its own sync point (write fence) to avoid
+        // shared-event double-dispose when MarkModified replaces a previous sync point.
         foreach (var output in _outputs)
         {
             switch (output)
             {
                 case Tensor<float> floatTensor:
-                    floatTensor.MarkModified(markSync);
-                    markSyncUsed = true;
+                    floatTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
                     break;
                 case Tensor<double> doubleTensor:
-                    doubleTensor.MarkModified(markSync);
-                    markSyncUsed = true;
+                    doubleTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
                     break;
                 case Tensor<int> intTensor:
-                    intTensor.MarkModified(markSync);
-                    markSyncUsed = true;
+                    intTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
                     break;
                 case Tensor<long> longTensor:
-                    longTensor.MarkModified(markSync);
-                    markSyncUsed = true;
+                    longTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
+                    break;
+                case IGpuTensor<float> legacyFloat:
+                    legacyFloat.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
                     break;
                 case IGpuTensor gpuTensor:
                     gpuTensor.Synchronize();
-                    markSyncUsed = true;
                     break;
             }
-        }
-        if (!markSyncUsed)
-        {
-            markSync.Dispose();
         }
 
         // Record completion for dependents on other streams
