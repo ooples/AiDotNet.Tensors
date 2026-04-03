@@ -30,7 +30,7 @@ public sealed class CompiledBackwardGraph<T>
     /// <summary>
     /// The tape entries this graph operates on.
     /// </summary>
-    private readonly List<TapeEntry<T>> _entries;
+    private readonly TapeEntryArena<T> _entries;
 
     private readonly IEngine _engine;
 
@@ -38,13 +38,17 @@ public sealed class CompiledBackwardGraph<T>
     /// Compiles a backward graph by analyzing which tape entries are reachable
     /// from the loss tensor. Dead entries are eliminated from the execution plan.
     /// </summary>
-    public CompiledBackwardGraph(
-        List<TapeEntry<T>> entries,
+    internal CompiledBackwardGraph(
+        TapeEntryArena<T> entries,
         Tensor<T> loss,
         Tensor<T>[]? sources,
         IEngine engine)
     {
-        _entries = new List<TapeEntry<T>>(entries); // snapshot to prevent mutation
+        // Arena reference is shared with the owning tape. Safe because:
+        // 1. CompiledBackwardGraph is created inside ComputeGradients which holds the tape
+        // 2. The tape's arena is not Reset() until tape.Dispose() which is after Execute()
+        // 3. For persistent tapes, the arena is not cleared between ComputeGradients calls
+        _entries = entries;
         _loss = loss;
         _sources = sources;
         _engine = engine;
@@ -59,8 +63,17 @@ public sealed class CompiledBackwardGraph<T>
             if (reachable.Contains(entries[i].Output))
             {
                 indices.Add(i);
-                foreach (var input in entries[i].Inputs)
-                    reachable.Add(input);
+                var e = entries[i];
+                if (e.InputsOverflow is not null)
+                {
+                    foreach (var input in e.InputsOverflow) reachable.Add(input);
+                }
+                else
+                {
+                    reachable.Add(e.Input0);
+                    if (e.InputCount >= 2 && e.Input1 is not null) reachable.Add(e.Input1);
+                    if (e.InputCount >= 3 && e.Input2 is not null) reachable.Add(e.Input2);
+                }
             }
         }
 
@@ -84,13 +97,14 @@ public sealed class CompiledBackwardGraph<T>
         // Execute only reachable entries (dead node elimination applied)
         foreach (int i in _reachableEntryIndices)
         {
-            var entry = _entries[i];
+            ref var entry = ref _entries[i];
 
             if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 continue;
 
             entry.ValidateInputVersions(); // same mutation safety check as uncompiled path
-            entry.Backward(gradOutput, entry.Inputs, entry.Output,
+            var inputsArray = entry.GetInputsArray();
+            entry.Backward(gradOutput, inputsArray, entry.Output,
                 entry.SavedState ?? Array.Empty<object>(), _engine, grads);
         }
 

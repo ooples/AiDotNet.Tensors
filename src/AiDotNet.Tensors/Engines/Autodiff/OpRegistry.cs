@@ -1,0 +1,307 @@
+using System.Runtime.CompilerServices;
+
+namespace AiDotNet.Tensors.Engines.Autodiff;
+
+/// <summary>
+/// Static catalog classifying every IEngine Tensor-returning method as Differentiable,
+/// NonDifferentiable, or Delegator. Used by TapeCompletenessTests to enforce that no
+/// future op can silently skip gradient tape recording.
+/// </summary>
+/// <remarks>
+/// <para>When adding a new Tensor-returning method to IEngine, you MUST add it to exactly
+/// one of the three sets below. The TapeCompletenessTests reflection test will fail CI
+/// if any method is unclassified.</para>
+/// </remarks>
+internal static class OpRegistry
+{
+    /// <summary>
+    /// Ops that have DifferentiableOps.Record* calls and BackwardFunction delegates.
+    /// These participate in gradient computation when a tape is active.
+    /// </summary>
+    internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
+    {
+        // Arithmetic
+        "TensorAdd", "TensorSubtract", "TensorMultiply", "TensorDivide",
+        "TensorNegate", "TensorAbs", "TensorSign",
+        "TensorMultiplyScalar", "TensorDivideScalar", "TensorAddScalar", "TensorSubtractScalar",
+        "TensorAddMany", "TensorMultiplyMany", "TensorAddScaled",
+        "TensorBroadcastAdd", "TensorBroadcastSubtract", "TensorBroadcastMultiply", "TensorBroadcastDivide",
+        "TensorMax", "TensorMin", "TensorClamp",
+
+        // Math
+        "TensorExp", "TensorLog", "TensorSqrt", "TensorPower", "TensorPowerTensor",
+        "TensorSin", "TensorCos", "TensorCosh", "TensorSinh",
+        "TensorFrac", "TensorPow",
+
+        // Matrix
+        "TensorMatMul", "BatchMatMul", "TensorOuterProduct", "TensorBatchOuterProduct", "TensorOuter",
+
+        // Activations
+        "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Swish", "Mish",
+        "Softplus", "SELU", "ELU", "HardSigmoid", "HardSwish", "ReLU6",
+        "Softmax", "LogSoftmax",
+        "GLU", "Sparsemax", "TaylorSoftmax",
+
+        // Shape
+        "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims",
+        "TensorFlatten", "TensorSlice", "TensorSliceAxis", "TensorNarrow",
+        "TensorConcatenate", "Concat", "TensorSplit", "TensorStack",
+        "TensorTile", "TensorDiagonal",
+
+        // Reduction
+        "ReduceSum", "ReduceMean", "ReduceMax", "ReduceLogVariance",
+        "TensorMean", "Std", "Var",
+
+        // Pooling
+        "MaxPool2D", "AvgPool2D", "MaxPool2DWithIndices",
+        "MaxPool3DWithIndices", "AvgPool3D",
+        "MaxPool1D", "AvgPool1D",
+        "AdaptiveAvgPool2D", "AdaptiveMaxPool2D",
+
+        // Convolution
+        "Conv2D", "Conv1D", "Conv3D",
+        "DepthwiseConv2D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
+
+        // Normalization
+        "BatchNorm", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
+
+        // Attention/Embedding
+        "Embedding", "Dropout",
+        "GridSample", "Unfold", "Fold",
+
+        // Spatial
+        "Upsample", "Upsample3D", "PixelShuffle", "Crop", "Pad",
+        "TensorCumSum", "TensorRepeatElements",
+
+        // Scatter/Gather
+        "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
+        "TensorIndexSelect", "TensorMaskedFill",
+
+        // Complex
+        "TensorComplexMultiply", "TensorComplexConjugate", "TensorComplexMagnitude",
+        "ComplexMagnitudeSquared",
+
+        // Loss
+        "TensorMSELoss", "TensorBCEWithLogitsLoss", "TensorCrossEntropyLoss",
+        "TensorBinaryCrossEntropy", "TensorL1Loss", "TensorHuberLoss",
+        "TensorKLDivLoss", "TensorNLLLoss", "TensorCTCLoss",
+
+        // Fused
+        "FusedLinearReLU", "FusedLinearSigmoid", "FusedLinearTanh",
+        "FusedLinearGELU", "FusedLinearSwish",
+
+        // Signal
+        "RFFT", "IRFFT",
+
+        // Other differentiable ops
+        "TensorWhere", "TensorTrilinearInterpolate",
+        "RBFKernel", "OctonionMatMulTensor",
+        "CosineSimilarity", "TensorReciprocal",
+        "ScalarMinusTensor",
+        "TensorConstantPad",
+        "TensorCosineSimilarityLoss",
+        "TensorUpsampleBilinear",
+    };
+
+    /// <summary>
+    /// Ops that are correctly non-differentiable — comparisons, constructors, backward helpers,
+    /// random generators, masks, and explicit gradient stops.
+    /// </summary>
+    internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
+    {
+        // Comparison (return bool-like tensors, not differentiable)
+        "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
+        "TensorGreaterOrEqual", "TensorLessOrEqual",
+
+        // Constructors / initializers
+        "TensorRandomUniform", "TensorRandomNormal", "TensorRandomUniformRange",
+        "TensorEye", "TensorDiag", "TensorOneHot", "TensorLinspace",
+        "TensorTriangularMask", "TensorDropoutMask",
+        "PositionalEncoding", "CreateMelFilterbank", "CreateWindow",
+
+        // Explicit gradient stop
+        "StopGradient",
+
+        // Stochastic (Gumbel uses STE)
+        "GumbelSoftmax",
+
+        // Arbitrary user function (cannot auto-diff)
+        "TensorMap",
+
+        // In-place mutation semantics
+        "TensorSetSlice",
+
+        // Discrete selection
+        "TensorTopK", "TensorScatter",
+
+        // Grid/geometry (non-learnable)
+        "AffineGrid",
+
+        // NeRF/3D ops (typically not differentiated through in training)
+        "VolumeRendering", "ImportanceSampling", "RasterizeGaussians",
+        "EvaluateSphericalHarmonics", "ComputeGaussianCovariance",
+        "MultiresolutionHashEncoding", "UpdateOccupancyGrid",
+
+        // Backward helper methods (implementation details, not forward ops)
+        "ReluBackward", "SigmoidBackward", "TanhBackward", "GeluBackward",
+        "LeakyReluBackward", "SwishBackward", "MishBackward", "SoftplusBackward",
+        "HardswishBackward", "SeluBackward", "HardsigmoidBackward", "Relu6Backward",
+        "EluBackward", "ThresholdBackward", "ReciprocalBackward",
+        "SoftmaxBackward", "TensorSoftmaxBackward",
+        "GLUBackward", "GeGLUBackward", "SwiGLUBackward", "ReGLUBackward",
+        "SparsemaxBackward", "TaylorSoftmaxBackward", "SphericalSoftmaxBackward",
+        "GumbelSoftmaxBackward",
+        "MaxPool2DBackward", "AvgPool2DBackward", "MaxPool3DBackward", "AvgPool3DBackward",
+        "Conv1DBackwardInput", "Conv1DBackwardKernel",
+        "Conv2DBackwardInput", "Conv2DBackwardKernel",
+        "Conv3DBackwardInput", "Conv3DBackwardKernel",
+        "ConvTranspose2DBackwardInput", "ConvTranspose2DBackwardKernel",
+        "ConvTranspose3DBackwardInput", "ConvTranspose3DBackwardKernel",
+        "DepthwiseConv2DBackwardInput", "DepthwiseConv2DBackwardKernel",
+        "LocallyConnectedConv2DBackwardInput", "LocallyConnectedConv2DBackwardWeights", "LocallyConnectedConv2DBackwardBias",
+        "DeformableConv2DBackwardInput", "DeformableConv2DBackwardKernel",
+        "DeformableConv2DBackwardOffset", "DeformableConv2DBackwardMask",
+        "GridSampleBackwardInput", "GridSampleBackwardGrid",
+        "BatchNormBackward", "LayerNormBackward", "GroupNormBackward", "RMSNormBackward", "InstanceNormBackward",
+        "DropoutBackward", "EmbeddingBackward",
+        "ReduceMaxBackward", "ReduceMeanBackward", "ReduceVarianceBackward", "ReduceLogVarianceBackward",
+        "UpsampleBackward", "Upsample3DBackward",
+        "CropBackward", "PadBackward", "PixelShuffleBackward",
+        "ScatterAddBackward", "ScatterMeanBackward", "ScatterMaxBackward", "ScatterSoftmaxBackward",
+        "RBFKernelBackward",
+        "TensorBinaryCrossEntropyBackward", "TensorTrilinearInterpolateBackward",
+        "TensorSquashBackward", "TensorEmbeddingLookupBackward",
+        "CrossEntropyBackward", "MseBackward",
+        "ScaledDotProductAttentionBackward", "FlashAttentionBackward",
+        "GraphAttentionBackward", "GroupedQueryAttentionBackward",
+        "FusedLinearBackward",
+        "SpiralConvBackwardInput", "SpiralConvBackwardWeights", "SpiralConvBackwardBias",
+        "DiffusionConvBackward",
+        "PositionalEncodingBackward",
+        "VolumeRenderingBackward", "RasterizeGaussiansBackward",
+        "ComputeGaussianCovarianceBackward", "EvaluateSphericalHarmonicsBackward",
+        "MultiresolutionHashEncodingBackward",
+        "PReLUBackward",
+        "TanhDerivative", "SigmoidDerivative", "ReLUDerivative",
+        "VarBackward", "StdBackward",
+
+        // Discrete / non-differentiable outputs
+        "TensorArgMax", "TensorArgMin", "ArgSort",
+        "GenerateSpiralIndices",
+
+        // Signal processing (non-differentiable spectral ops)
+        "ISTFT", "MelSpectrogram", "GriffinLim",
+
+        // Rounding (non-differentiable, STE would need explicit annotation)
+        "TensorFloor", "TensorCeiling", "TensorRound",
+    };
+
+    /// <summary>
+    /// Ops that delegate to another method which already records.
+    /// These do NOT need their own recording to avoid double-recording.
+    /// Format: "DelegatorName" — the target method handles recording.
+    /// </summary>
+    internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
+    {
+        // IEngine wrappers that delegate to internal methods
+        "TensorSigmoid",     // -> Sigmoid (records)
+        "TensorReLU",        // -> ReLU (records)
+        "TensorGELU",        // -> GELU (records)
+        "TensorSiLU",        // -> Swish (records)
+        "TensorTanh",        // -> Tanh (records)
+        "TensorLeakyReLU",   // -> LeakyReLU (records)
+        "TensorMish",        // -> Mish (records)
+        "TensorHardSwish",   // -> HardSwish (records)
+        "TensorLayerNorm",   // -> LayerNorm (records)
+        "TensorMaxPool2D",   // -> MaxPool2D (records)
+        "TensorAvgPool2D",   // -> AvgPool2D (records)
+        "TensorConv2D",      // -> Conv2D (records)
+
+        // Composed from recorded sub-ops (backward through constituents)
+        "TensorLogSumExp",   // ReduceMax + BroadcastSubtract + TensorExp + ReduceSum + TensorLog + TensorAdd
+        "TensorNorm",        // TensorMultiply + ReduceSum + TensorSqrt
+        "TensorNormalize",   // TensorNorm + TensorDivide
+        "TensorClip",        // TensorClamp (records)
+        "TensorSquare",      // TensorMultiply(x, x) (records)
+        "TensorSquash",      // TensorMultiply + TensorAdd + TensorDivide + ReduceSum (all record)
+        "TensorSoftmax",     // -> Softmax (records)
+        "ReduceStd",         // ReduceVariance + TensorSqrt
+        "ReduceVariance",    // ReduceMean (records) + composed
+        "GlobalAvgPool2D",   // reshape + ReduceMean
+        "GlobalMaxPool2D",   // reshape + ReduceMax
+        "TensorLerp",        // TensorAdd + TensorSubtract + TensorMultiplyScalar
+        "FusedLinear",       // TensorMatMul + TensorBroadcastAdd (both record)
+        "TensorEinsum",      // TensorMatMul / BatchMatMul / Split (record)
+        "OctonionAddTensor",  // TensorAdd (records)
+        "GeGLU",             // composed with GELU + Tanh
+        "SwiGLU",            // composed with Swish
+        "ReGLU",             // composed with ReLU
+        "SphericalSoftmax",  // composed with Softmax
+        "PairwiseDistance",   // TensorSqrt(PairwiseDistanceSquared)
+        "PairwiseDistanceSquared", // direct computation, backward via engine ops
+
+        // MaxPool3D scalar overload delegates to array overload
+        "MaxPool3D",         // -> MaxPool3D(int[]) which records via MaxPool3DWithIndices
+
+        // Attention ops (composed from recorded sub-ops)
+        "TensorScaledDotProductAttention", // TensorMatMul + TensorMultiplyScalar + Softmax
+        "ScaledDotProductAttention",       // composed
+        "FlashAttention",                  // composed
+        "GroupedQueryAttention",           // composed
+        "GraphAttention",                  // composed
+        "MultiHeadGraphAttention",         // composed
+
+        // Loss functions (use NoGradScope + single composite record)
+        "TensorIoULoss",    // composed from TensorMultiply + ReLU + etc.
+        "TensorGIoULoss",
+        "TensorDIoULoss",
+        "TensorCIoULoss",
+
+        // Mesh/graph ops (composed)
+        "SpiralConv", "DiffusionConv", "ComputeMeshLaplacian",
+
+        // Deformable conv (complex, delegates to sub-ops)
+        "DeformableConv2D",
+
+        // Additional delegators for IEngine wrappers
+        "TensorSELU",          // -> SELU (records)
+        "TensorHardSigmoid",   // -> HardSigmoid (records)
+        "TensorReLU6",         // -> ReLU6 (records)
+        "TensorPReLU",         // -> PReLU (records)
+        "TensorRReLU",         // -> RReLU (records)
+        "TensorThreshold",     // -> Threshold (records)
+        "TensorAvgPool1D",     // -> AvgPool1D (records)
+        "TensorMaxPool1D",     // -> MaxPool1D (records)
+        "TensorAdaptiveMaxPool2D", // -> AdaptiveMaxPool2D (records)
+        "TensorBatchMatMul",   // -> BatchMatMul (records)
+        "TensorLogSoftmax",    // -> LogSoftmax (records)
+        "TensorEmbeddingLookup", // -> Embedding (records)
+        "TensorScatterAdd",    // -> ScatterAdd (records)
+        "TensorGather",        // -> Gather (records)
+        "TensorVar",           // -> Var (records)
+        "TensorStd",           // -> Std (records)
+        "TensorUnstack",       // inverse of TensorStack, composed
+
+        // Diff variants (recorded through base ops)
+        "TensorMeanDiff",      // composed
+        "TensorStackDiff",     // composed
+        "TensorIndexSelectDiff", // composed
+
+        // Fused ops (record as single composite entries)
+        "FusedConv2D",         // composed from Conv2D + BatchNorm + activation
+        "FusedConv3D",         // composed
+        "FusedConvTranspose2D", // composed
+        "FusedBatchNorm",      // composed from BatchNorm + activation
+    };
+
+    /// <summary>
+    /// Returns true if the op name is classified in any category.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsClassified(string opName)
+    {
+        return DifferentiableOps.Contains(opName)
+            || NonDifferentiableOps.Contains(opName)
+            || DelegatorOps.Contains(opName);
+    }
+}

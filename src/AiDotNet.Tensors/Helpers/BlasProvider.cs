@@ -12,6 +12,7 @@ internal static class BlasProvider
 {
     private const int CblasRowMajor = 101;
     private const int CblasNoTrans = 111;
+    private const int CblasTrans = 112;
 
     private static readonly object InitLock = new object();
     private static bool _initialized;
@@ -155,6 +156,74 @@ internal static class BlasProvider
                 float* bPtr = bPtrBase + bOffset;
                 float* cPtr = cPtrBase + cOffset;
                 _sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, aPtr, lda, bPtr, ldb, 0.0f, cPtr, ldc);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// GEMM with transpose flags: C = alpha * op(A) * op(B) + beta * C
+    /// where op(X) = X if transX=false, X^T if transX=true.
+    /// This avoids materializing transposed matrices — BLAS handles it internally.
+    /// Critical for backward pass performance (dA = dC @ B^T, dB = A^T @ dC).
+    /// </summary>
+    internal static bool TryGemmEx(int m, int n, int k,
+        float[] a, int aOffset, int lda, bool transA,
+        float[] b, int bOffset, int ldb, bool transB,
+        float[] c, int cOffset, int ldc)
+    {
+        if (!EnsureInitialized()) return false;
+
+        // Bounds validation (same as TryGemm)
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+        if (!HasEnoughData(a.Length, aOffset, aRows, aCols, lda) ||
+            !HasEnoughData(b.Length, bOffset, bRows, bCols, ldb) ||
+            !HasEnoughData(c.Length, cOffset, m, n, ldc))
+        {
+            return false;
+        }
+
+        int transAFlag = transA ? CblasTrans : CblasNoTrans;
+        int transBFlag = transB ? CblasTrans : CblasNoTrans;
+
+        if (_useMklNet)
+        {
+            try
+            {
+                // Apply offsets via Span (same pattern as TryMklNetSgemm)
+                var aSpan = a.AsSpan(aOffset);
+                var bSpan = b.AsSpan(bOffset);
+                var cSpan = c.AsSpan(cOffset);
+
+                Blas.gemm(
+                    Layout.RowMajor,
+                    transA ? Trans.Yes : Trans.No,
+                    transB ? Trans.Yes : Trans.No,
+                    m, n, k, 1.0f, aSpan, lda, bSpan, ldb, 0.0f, cSpan, ldc);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        if (_sgemm == null) return false;
+
+        unsafe
+        {
+            fixed (float* aPtrBase = a)
+            fixed (float* bPtrBase = b)
+            fixed (float* cPtrBase = c)
+            {
+                float* aPtr = aPtrBase + aOffset;
+                float* bPtr = bPtrBase + bOffset;
+                float* cPtr = cPtrBase + cOffset;
+                _sgemm(CblasRowMajor, transAFlag, transBFlag, m, n, k, 1.0f, aPtr, lda, bPtr, ldb, 0.0f, cPtr, ldc);
             }
         }
 

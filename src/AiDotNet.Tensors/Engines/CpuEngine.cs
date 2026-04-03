@@ -1994,6 +1994,7 @@ public class CpuEngine : ITensorLevelEngine
                 var cFloat = new Span<float>((float[])(object)rArr);
 
                 Simd.SimdGemm.Sgemm(aFloat, lda, transA, bFloat, ldb, transB, cFloat, m, k, n);
+                DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
                 return result;
             }
 
@@ -2002,6 +2003,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, k, n))
                 {
+                    DifferentiableOps.RecordBinary("BatchMatMul", result, a, b, BackwardFunctions<T>.BatchMatMulBackward);
                     return result;
                 }
             }
@@ -2028,6 +2030,8 @@ public class CpuEngine : ITensorLevelEngine
                     rDataArr[i * n + j] = sum;
                 }
             });
+            DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
+                BackwardFunctions<T>.BatchMatMulBackward);
             return result;
         }
 
@@ -2824,6 +2828,7 @@ public class CpuEngine : ITensorLevelEngine
             numOps.Add(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
+        DifferentiableOps.RecordIfActive("TensorAddMany", result, tensors, BackwardFunctions<T>.AddManyBackward);
         return result;
     }
 
@@ -3357,6 +3362,7 @@ public class CpuEngine : ITensorLevelEngine
             numOps.Multiply(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
         }
 
+        DifferentiableOps.RecordIfActive("TensorMultiplyMany", result, tensors, BackwardFunctions<T>.MultiplyManyBackward);
         return result;
     }
 
@@ -3892,6 +3898,7 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Frac(src[i]);
 
+        DifferentiableOps.RecordUnary("TensorFrac", result, tensor, BackwardFunctions<T>.FracBackward);
         return result;
     }
 
@@ -3999,6 +4006,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("TensorTrilinearInterpolate", result, grid, BackwardFunctions<T>.TrilinearInterpolateBackward, new object[] { positions });
         return result;
     }
 
@@ -4124,6 +4132,8 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Power(src[i], exponent);
 
+        object boxedExponent = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
+        DifferentiableOps.RecordUnary("TensorPow", result, tensor, BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExponent });
         return result;
     }
 
@@ -5133,6 +5143,8 @@ public class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+                BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             return result;
         }
 
@@ -5147,6 +5159,8 @@ public class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+                BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
             return result;
         }
 
@@ -5157,6 +5171,8 @@ public class CpuEngine : ITensorLevelEngine
             stride, padding, dilation,
             outputHeight, outputWidth);
 
+        DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
+            BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
         return result;
     }
 
@@ -6572,7 +6588,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("GLU", result, input, BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
+        return result;
     }
 
     /// <summary>
@@ -7602,6 +7620,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Assign local variable to out parameter after parallel section
         maxIndices = indices;
+        DifferentiableOps.RecordUnary("MaxPool2DWithIndices", result, input, BackwardFunctions<T>.MaxPool2DWithIndicesBackward, new object[] { maxIndices, poolSize, stride });
         return result;
     }
 
@@ -7834,7 +7853,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        var dwConvResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
+        return dwConvResult;
     }
 
     /// <inheritdoc/>
@@ -9745,6 +9766,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         maxIndices = localMaxIndices;
+        DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input, BackwardFunctions<T>.MaxPool3DBackward, new object[] { maxIndices, poolSize, stride });
         return result;
     }
 
@@ -9893,6 +9915,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("AvgPool3D", result, input, BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
         return result;
     }
 
@@ -10038,7 +10061,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        var up3dResult = TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Upsample3D", up3dResult, input, BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
+        return up3dResult;
     }
 
     /// <inheritdoc/>
@@ -10206,7 +10231,9 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-        return TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, input, kernel, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
+        return ct3dResult;
     }
 
     /// <inheritdoc/>
@@ -10408,6 +10435,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("LocallyConnectedConv2D", result, input, weights, BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { stride });
         return result;
     }
 
@@ -11180,7 +11208,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        var taylorResult = TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("TaylorSoftmax", taylorResult, input, BackwardFunctions<T>.TaylorSoftmaxBackward, new object[] { order, axis });
+        return taylorResult;
     }
 
     /// <inheritdoc/>
@@ -11334,7 +11364,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        var sparsemaxResult = TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Sparsemax", sparsemaxResult, input, BackwardFunctions<T>.SparsemaxBackward, new object[] { axis });
+        return sparsemaxResult;
     }
 
     /// <inheritdoc/>
@@ -14273,7 +14305,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterAddResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ScatterAdd", scatterAddResult, source, BackwardFunctions<T>.ScatterAddBackward, new object[] { indices, actualDim });
+        return scatterAddResult;
     }
 
     /// <summary>
@@ -14406,7 +14440,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         counts = new Tensor<int>([outDimSize], new Vector<int>(countData));
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterMeanResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ScatterMean", scatterMeanResult, source, BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, counts });
+        return scatterMeanResult;
     }
 
     /// <summary>
@@ -14535,7 +14571,9 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         argmax = new Tensor<int>(outputShape, new Vector<int>(argmaxData));
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var scatterMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ScatterMax", scatterMaxResult, source, BackwardFunctions<T>.ScatterMaxBackward, new object[] { indices, argmax });
+        return scatterMaxResult;
     }
 
     /// <summary>
@@ -14676,7 +14714,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(source._shape, new Vector<T>(outputData));
+        var scatterSmResult = TensorAllocator.Rent<T>(source._shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ScatterSoftmax", scatterSmResult, source, BackwardFunctions<T>.ScatterSoftmaxBackward, new object[] { indices });
+        return scatterSmResult;
     }
 
     /// <summary>
@@ -14882,7 +14922,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("ReduceMax", reduceMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
+        return reduceMaxResult;
     }
 
     /// <inheritdoc/>
@@ -15265,7 +15307,15 @@ public class CpuEngine : ITensorLevelEngine
             varianceData[i] = numOps.Log(numOps.Add(varianceData[i], eps));
         }
 
-        return TensorAllocator.Rent<T>(variance._shape, new Vector<T>(varianceData));
+        var logVarResult = TensorAllocator.Rent<T>(variance._shape, new Vector<T>(varianceData));
+        // Compute mean inside NoGradScope to avoid adding disconnected tape entries
+        Tensor<T> mean;
+        using (new NoGradScope<T>())
+        {
+            mean = ReduceMean(input, axes, keepDims);
+        }
+        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, input, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, variance });
+        return logVarResult;
     }
 
     /// <inheritdoc/>
@@ -15610,7 +15660,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        var psResult = TensorAllocator.Rent<T>([batch, newChannels, newHeight, newWidth], new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("PixelShuffle", psResult, input, BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
+        return psResult;
     }
 
     /// <inheritdoc/>
@@ -15987,6 +16039,7 @@ public class CpuEngine : ITensorLevelEngine
             var i = imag[idx];
             output[idx] = numOps.Add(numOps.Multiply(r, r), numOps.Multiply(i, i));
         }
+        DifferentiableOps.RecordBinary("ComplexMagnitudeSquared", output, real, imag, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward);
         return output;
     }
 
@@ -16041,7 +16094,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        var cropResult = TensorAllocator.Rent<T>([batch, channels, height, width], new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Crop", cropResult, input, BackwardFunctions<T>.CropBackward, new object[] { top, left });
+        return cropResult;
     }
 
     /// <inheritdoc/>
@@ -16129,7 +16184,9 @@ public class CpuEngine : ITensorLevelEngine
         newShape[rank - 2] = newHeight;
         newShape[rank - 1] = newWidth;
 
-        return TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        var padResult = TensorAllocator.Rent<T>(newShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Pad", padResult, input, BackwardFunctions<T>.PadBackward, new object[] { padTop, padLeft });
+        return padResult;
     }
 
     /// <inheritdoc/>
@@ -16222,7 +16279,13 @@ public class CpuEngine : ITensorLevelEngine
             axisOffset += tensor._shape[axis];
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        if (GradientTape<T>.Current is not null)
+        {
+            DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),
+                BackwardFunctions<T>.ConcatenateBackward, new object[] { axis });
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -16436,6 +16499,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordIfActive("RBFKernel", output, new[] { input, centers }, BackwardFunctions<T>.RBFKernelBackward, new object[] { numOps.ToDouble(epsilonsData[0]) });
         return output;
     }
 
@@ -16586,6 +16650,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("TensorRepeatElements", result, tensor, BackwardFunctions<T>.RepeatElementsBackward, new object[] { repeats, axis });
         return result;
     }
 
@@ -16820,6 +16885,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("TensorOuterProduct", result, a, b, BackwardFunctions<T>.OuterProductBackward);
         return result;
     }
 
@@ -16851,6 +16917,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordBinary("TensorBatchOuterProduct", result, a, b, BackwardFunctions<T>.OuterProductBackward);
         return result;
     }
 
@@ -17038,6 +17105,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
         return result;
     }
 
@@ -17294,6 +17362,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = tensor[i, i];
         }
 
+        DifferentiableOps.RecordUnary("TensorDiagonal", result, tensor, BackwardFunctions<T>.DiagonalBackward);
         return result;
     }
 
@@ -17790,6 +17859,7 @@ public class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(oneMinusT, log1MinusP)));
         }
 
+        DifferentiableOps.RecordBinary("TensorBinaryCrossEntropy", result, predictions, targets, BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { numOps.ToDouble(epsilon) });
         return result;
     }
 
@@ -17913,6 +17983,7 @@ public class CpuEngine : ITensorLevelEngine
                 throw new ArgumentOutOfRangeException(nameof(axis), "Axis must be 0, 1, or 2 for 3D tensors.");
         }
 
+        DifferentiableOps.RecordUnary("TensorSliceAxis", result, tensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
         return result;
     }
 
@@ -18298,6 +18369,8 @@ public class CpuEngine : ITensorLevelEngine
                 Array.Copy(tensorData, idx * cols, resultData, i * cols, cols);
             });
 
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
             return result;
         }
         else if (tensor.Rank == 2 && axis == 1)
@@ -18319,6 +18392,8 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
             return result;
         }
         else
@@ -18374,6 +18449,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordIfActive("TensorStack", result, tensors,
+            BackwardFunctions<T>.StackBackward, new object[] { axis });
         return result;
     }
 
@@ -18443,6 +18520,8 @@ public class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
+        DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensor,
+            BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
         return result;
     }
 
@@ -19045,6 +19124,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordUnary("Gather", result, input, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
         return result;
     }
 
@@ -19085,6 +19165,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis });
         return result;
     }
 
@@ -19149,6 +19230,7 @@ public class CpuEngine : ITensorLevelEngine
             dstData[i] = numOps.FromDouble(Math.Cosh(numOps.ToDouble(srcData[i])));
         }
 
+        DifferentiableOps.RecordUnary("TensorCosh", result, tensor, BackwardFunctions<T>.CoshBackward);
         return result;
     }
 
@@ -19167,6 +19249,7 @@ public class CpuEngine : ITensorLevelEngine
             dstData[i] = numOps.FromDouble(Math.Sinh(numOps.ToDouble(srcData[i])));
         }
 
+        DifferentiableOps.RecordUnary("TensorSinh", result, tensor, BackwardFunctions<T>.SinhBackward);
         return result;
     }
 
@@ -19190,6 +19273,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordBinary("TensorOuter", result, a, b, BackwardFunctions<T>.OuterProductBackward);
         return result;
     }
 
@@ -19641,6 +19725,13 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("RFFT", result, input, static (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            // RFFT backward is IRFFT
+            var nFftSaved = (int)savedState[0];
+            var grad = engine.IRFFT(gradOutput, nFftSaved);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }, new object[] { n });
         return result;
     }
 
@@ -19697,6 +19788,12 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
+        DifferentiableOps.RecordUnary("IRFFT", result, input, static (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            // IRFFT backward is RFFT
+            var grad = engine.RFFT(gradOutput);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }, Array.Empty<object>());
         return result;
     }
 
@@ -21989,6 +22086,9 @@ public class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(bData[i], scaleB));
         }
 
+        object boxedScaleA = scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null");
+        object boxedScaleB = scaleB is not null ? (object)scaleB : throw new InvalidOperationException("scaleB cannot be null");
+        DifferentiableOps.RecordBinary("TensorAddScaled", result, a, b, BackwardFunctions<T>.AddScaledBackward, new object[] { boxedScaleA, boxedScaleB });
         return result;
     }
 
@@ -22372,10 +22472,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>IndexSelect: select indices along a given axis (differentiable).</summary>
     public Tensor<T> TensorIndexSelectDiff<T>(Tensor<T> source, Tensor<int> indices, int axis)
     {
-        var result = TensorIndexSelect(source, indices, axis);
-        DifferentiableOps.RecordUnary("IndexSelect", result, source, BackwardFunctions<T>.IndexSelectBackward,
-            savedState: new object[] { indices.GetFlattenedData(), axis });
-        return result;
+        // TensorIndexSelect already records to the tape — no additional recording needed
+        return TensorIndexSelect(source, indices, axis);
     }
 
     /// <summary>Constant padding for N-dimensional tensors.</summary>
@@ -22517,10 +22615,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Stack tensors along a new axis (differentiable).</summary>
     public Tensor<T> TensorStackDiff<T>(Tensor<T>[] tensors, int axis = 0)
     {
-        var result = TensorStack(tensors, axis);
-        DifferentiableOps.RecordIfActive("Stack", result, tensors,
-            BackwardFunctions<T>.StackBackward, savedState: new object[] { axis });
-        return result;
+        // TensorStack already records to the tape — no additional recording needed
+        return TensorStack(tensors, axis);
     }
 
     /// <summary>Variance of all elements, returns scalar tensor.</summary>
@@ -23298,6 +23394,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        DifferentiableOps.RecordBinary("OctonionMatMulTensor", output, input, weight, BackwardFunctions<T>.MatMulBackward);
         return output;
     }
 

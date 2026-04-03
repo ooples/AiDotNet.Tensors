@@ -9,7 +9,11 @@ namespace AiDotNet.Tensors.Helpers;
 
 internal static class MatrixMultiplyHelper
 {
-    private const long DefaultBlasWorkThreshold = 128L * 128L * 128L;
+    // BLAS threshold: work = m * k * n must exceed this to use MKL/BLAS.
+    // MKL SGEMM overhead is ~2-3us on modern CPUs. Any matmul with work > 4096
+    // (e.g., 16x16x16) takes >3us naively, so BLAS is worthwhile.
+    // PyTorch uses BLAS for ALL matmuls regardless of size.
+    private const long DefaultBlasWorkThreshold = 4096;
     private const long DefaultBlockedWorkThreshold = 64L * 64L * 64L;
     private const long DefaultParallelThreshold = 16384;
     private static readonly int? BlockSizeOverride = ReadEnvInt("AIDOTNET_MATMUL_BLOCK_SIZE");
