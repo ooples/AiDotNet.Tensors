@@ -1091,6 +1091,14 @@ public abstract class TensorBase<T> : IDisposable
             _lastWriteSync = null;
         }
 
+        // Remove pending deferred materializer to prevent callback on disposed tensor
+        if (_gpuMaterializerKey is not null)
+        {
+            Helpers.DeferredArrayMaterializer.Remove(_gpuMaterializerKey);
+            _gpuMaterializerKey = null;
+            _gpuMaterializerCallback = null;
+        }
+
         _storage.Release();
         if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
         {

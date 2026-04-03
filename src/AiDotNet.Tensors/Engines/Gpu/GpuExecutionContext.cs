@@ -18,9 +18,9 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// var h2 = model.Layer2.Forward(h1);
 /// var output = model.Layer3.Forward(h2);
 ///
-/// // Synchronize and download when needed
+/// // GPU data auto-downloads on first CPU access (deferred materialization)
 /// ctx.Synchronize();
-/// // Access CPU data after sync (requires backend.DownloadBuffer for GPU-resident tensors)
+/// var predictions = output.AsSpan(); // triggers GPU download if needed
 /// </code>
 /// </remarks>
 public sealed class GpuExecutionContext : IDisposable

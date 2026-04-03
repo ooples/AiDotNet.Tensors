@@ -2515,29 +2515,32 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuRole = role;
         tensor._ownsGpuBuffer = ownsBuffer;
 
-        // Register deferred GPU-to-CPU download so GetDataArray/AsSpan auto-materializes.
-        // Store the callback + key on the tensor so MarkModified can re-register after GPU writes.
-        var backingArray = tensor._data.GetDataArray();
-        var capturedBackend = backend;
-        var capturedBuffer = buffer;
-        Action<object> materializeCallback = arr =>
+        // Register deferred GPU-to-CPU download keyed by the Vector (not the backing array,
+        // which doesn't exist yet for GPU-resident tensors). VectorBase.AsSpan() calls
+        // TryMaterialize(this) on first CPU access, which triggers this callback.
+        // The callback reads _gpuBackend/_gpuBuffer from the tensor at materialization time
+        // (not captured at creation) so it stays correct if the buffer is swapped later.
+        var capturedTensor = tensor;
+        Action<object> materializeCallback = _ =>
         {
-            var floatData = capturedBackend.DownloadBuffer(capturedBuffer);
-            var typedArr = (T[])arr;
+            if (capturedTensor._gpuBackend is null || capturedTensor._gpuBuffer is null) return;
+            var floatData = capturedTensor._gpuBackend.DownloadBuffer(capturedTensor._gpuBuffer);
             if (typeof(T) == typeof(float))
             {
-                Array.Copy(floatData, 0, typedArr, 0, Math.Min(floatData.Length, typedArr.Length));
+                capturedTensor._data.MaterializeBacking((T[])(object)floatData);
             }
             else
             {
                 var numOps = Helpers.MathHelper.GetNumericOperations<T>();
-                for (int i = 0; i < Math.Min(floatData.Length, typedArr.Length); i++)
+                var typedArr = new T[floatData.Length];
+                for (int i = 0; i < floatData.Length; i++)
                     typedArr[i] = numOps.FromDouble(floatData[i]);
+                capturedTensor._data.MaterializeBacking(typedArr);
             }
         };
         tensor._gpuMaterializerCallback = materializeCallback;
-        tensor._gpuMaterializerKey = backingArray;
-        Helpers.DeferredArrayMaterializer.Register(backingArray, materializeCallback);
+        tensor._gpuMaterializerKey = tensor._data; // Vector as key — matches VectorBase.AsSpan() TryMaterialize(this)
+        Helpers.DeferredArrayMaterializer.Register(tensor._data, materializeCallback);
 
         return tensor;
     }
