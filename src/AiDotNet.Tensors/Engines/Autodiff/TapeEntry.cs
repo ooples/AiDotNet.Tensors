@@ -96,17 +96,36 @@ public struct TapeEntry<T>
     /// Constructs the input array for the backward function. This allocates, but is only
     /// called during backward (which is already dominated by matrix operations).
     /// </summary>
+    // Thread-local reusable input arrays to avoid per-backward-step allocation.
+    // Safe because backward is single-threaded per tape and the array is consumed
+    // before the next GetInputsArray call in the same backward walk.
+    [ThreadStatic] private static Tensor<T>[]? _reuse1;
+    [ThreadStatic] private static Tensor<T>[]? _reuse2;
+    [ThreadStatic] private static Tensor<T>[]? _reuse3;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T>[] GetInputsArray()
     {
         if (InputsOverflow is not null) return InputsOverflow;
-        return InputCount switch
+        switch (InputCount)
         {
-            1 => new[] { Input0 },
-            2 => new[] { Input0, Input1! },
-            3 => new[] { Input0, Input1!, Input2! },
-            _ => new[] { Input0 }
-        };
+            case 1:
+                var arr1 = _reuse1 ??= new Tensor<T>[1];
+                arr1[0] = Input0;
+                return arr1;
+            case 2:
+                var arr2 = _reuse2 ??= new Tensor<T>[2];
+                arr2[0] = Input0; arr2[1] = Input1!;
+                return arr2;
+            case 3:
+                var arr3 = _reuse3 ??= new Tensor<T>[3];
+                arr3[0] = Input0; arr3[1] = Input1!; arr3[2] = Input2!;
+                return arr3;
+            default:
+                var arrD = _reuse1 ??= new Tensor<T>[1];
+                arrD[0] = Input0;
+                return arrD;
+        }
     }
 
     /// <summary>

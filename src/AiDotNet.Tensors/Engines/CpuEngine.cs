@@ -20744,9 +20744,9 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            // Use fixed instead of Memory.Pin() — avoids GCHandle allocation overhead
-            var gArr = (float[])(object)gradOutput.GetFlattenedData();
-            var iArr = (float[])(object)input.GetFlattenedData();
+            // Already contiguous (ensured above) — use GetDataArray() directly, no copy
+            var gArr = (float[])(object)gradOutput.GetDataArray();
+            var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor.GetDataArray();
             fixed (float* pG = gArr, pI = iArr, pR = rArr)
                 SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
@@ -20770,7 +20770,7 @@ public class CpuEngine : ITensorLevelEngine
         else
         {
             var gradData = gradOutput.GetDataArray();
-            var inputData = input.GetFlattenedData();
+            var inputData = input.GetDataArray();
             var resultData = resultTensor.GetDataArray();
             for (int i = 0; i < length; i++)
             {
