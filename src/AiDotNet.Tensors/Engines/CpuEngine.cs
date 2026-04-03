@@ -23423,8 +23423,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
-        if (a.Length % 2 != 0)
-            throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+        if (a.Length % 2 != 0 || (a.Rank > 0 && a._shape[a.Rank - 1] % 2 != 0))
+            throw new ArgumentException("Complex tensors must have even length with the last axis divisible by 2 (interleaved re/im).");
 
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a._shape);
@@ -23509,6 +23509,16 @@ public class CpuEngine : ITensorLevelEngine
         if (inputLengths.Length != batchSize || targetLengths.Length != batchSize)
             throw new ArgumentException("inputLengths and targetLengths must have length == batchSize.");
 
+        if (blank < 0 || blank >= numClasses)
+            throw new ArgumentOutOfRangeException(nameof(blank), $"Blank index {blank} must be in [0, {numClasses}).");
+
+        // Validate target bounds
+        int totalTargets = 0;
+        for (int n = 0; n < batchSize; n++)
+            totalTargets += targetLengths[n];
+        if (totalTargets > targets.Length)
+            throw new ArgumentException($"Sum of targetLengths ({totalTargets}) exceeds targets length ({targets.Length}).");
+
         var losses = new Tensor<T>(new[] { batchSize });
 
         // Forward-backward algorithm per batch element
@@ -23517,13 +23527,22 @@ public class CpuEngine : ITensorLevelEngine
         {
             int T_n = inputLengths[n];
             int U_n = targetLengths[n];
+
+            if (T_n < 0 || T_n > maxT)
+                throw new ArgumentOutOfRangeException(nameof(inputLengths), $"inputLengths[{n}]={T_n} must be in [0, {maxT}].");
+            if (U_n < 0)
+                throw new ArgumentOutOfRangeException(nameof(targetLengths), $"targetLengths[{n}]={U_n} must be non-negative.");
+
             int S = 2 * U_n + 1; // expanded label length with blanks
 
             // Build expanded label sequence: blank, l1, blank, l2, blank, ...
             var expandedLabels = new int[S];
             for (int s = 0; s < S; s++)
             {
-                expandedLabels[s] = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
+                int label = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
+                if (label < 0 || label >= numClasses)
+                    throw new ArgumentOutOfRangeException(nameof(targets), $"Target label {label} must be in [0, {numClasses}).");
+                expandedLabels[s] = label;
             }
 
             // Alpha (forward) pass — log domain for numerical stability

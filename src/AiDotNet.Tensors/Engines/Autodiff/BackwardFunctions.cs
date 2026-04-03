@@ -2294,7 +2294,6 @@ internal static class BackwardFunctions<T>
         int pairs = gradOutput.Length / 2;
 
         // d(a*b)/da = conj(b), d(a*b)/db = conj(a) — applied via chain rule
-        if (!grads.ContainsKey(a))
         {
             var gradA = new Tensor<T>(a._shape);
             for (int i = 0; i < pairs; i++)
@@ -2306,10 +2305,9 @@ internal static class BackwardFunctions<T>
                 gradA.SetFlat(idx, ops.Add(ops.Multiply(gRe, bRe), ops.Multiply(gIm, bIm)));
                 gradA.SetFlat(idx + 1, ops.Subtract(ops.Multiply(gIm, bRe), ops.Multiply(gRe, bIm)));
             }
-            grads[a] = gradA;
+            DifferentiableOps.AccumulateGrad(grads, a, gradA, engine);
         }
 
-        if (!grads.ContainsKey(b))
         {
             var gradB = new Tensor<T>(b._shape);
             for (int i = 0; i < pairs; i++)
@@ -2321,7 +2319,7 @@ internal static class BackwardFunctions<T>
                 gradB.SetFlat(idx, ops.Add(ops.Multiply(aRe, gRe), ops.Multiply(aIm, gIm)));
                 gradB.SetFlat(idx + 1, ops.Subtract(ops.Multiply(aRe, gIm), ops.Multiply(aIm, gRe)));
             }
-            grads[b] = gradB;
+            DifferentiableOps.AccumulateGrad(grads, b, gradB, engine);
         }
     }
 
@@ -2330,10 +2328,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Conjugate of conjugate gradient: negate odd indices again
-        if (!grads.ContainsKey(inputs[0]))
-        {
-            grads[inputs[0]] = engine.TensorComplexConjugate(gradOutput);
-        }
+        var grad = engine.TensorComplexConjugate(gradOutput);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     internal static void ComplexMagnitudeBackward(
@@ -2345,22 +2341,19 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
 
-        if (!grads.ContainsKey(inputs[0]))
+        var gradA = new Tensor<T>(a._shape);
+        for (int i = 0; i < pairs; i++)
         {
-            var gradA = new Tensor<T>(a._shape);
-            for (int i = 0; i < pairs; i++)
-            {
-                int idx = i * 2;
-                T re = a.GetFlat(idx), im = a.GetFlat(idx + 1);
-                T mag = output.GetFlat(i);
-                T gOut = gradOutput.GetFlat(i);
-                T eps = ops.FromDouble(1e-8);
-                T safeMag = ops.Add(mag, eps);
-                gradA.SetFlat(idx, ops.Multiply(gOut, ops.Divide(re, safeMag)));
-                gradA.SetFlat(idx + 1, ops.Multiply(gOut, ops.Divide(im, safeMag)));
-            }
-            grads[inputs[0]] = gradA;
+            int idx = i * 2;
+            T re = a.GetFlat(idx), im = a.GetFlat(idx + 1);
+            T mag = output.GetFlat(i);
+            T gOut = gradOutput.GetFlat(i);
+            T eps = ops.FromDouble(1e-8);
+            T safeMag = ops.Add(mag, eps);
+            gradA.SetFlat(idx, ops.Multiply(gOut, ops.Divide(re, safeMag)));
+            gradA.SetFlat(idx + 1, ops.Multiply(gOut, ops.Divide(im, safeMag)));
         }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
     }
 
     // =====================================================================
@@ -2376,8 +2369,6 @@ internal static class BackwardFunctions<T>
         var inputLengths = (int[])savedState[2];
         var targetLengths = (int[])savedState[3];
         int blank = (int)savedState[4];
-
-        if (grads.ContainsKey(inputs[0])) return;
 
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];
@@ -2468,7 +2459,7 @@ internal static class BackwardFunctions<T>
             targetOffset += U_n;
         }
 
-        grads[inputs[0]] = grad;
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
     private static double LogSumExpHelper(double a, double b)

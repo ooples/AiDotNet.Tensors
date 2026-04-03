@@ -9767,6 +9767,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void ComplexMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int numPairs)
     {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_multiply");
         using var _ = PushContext();
@@ -9779,6 +9782,9 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void ComplexConjugate(IGpuBuffer input, IGpuBuffer output, int numPairs)
     {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_conjugate");
         using var _ = PushContext();
@@ -9791,6 +9797,11 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public unsafe void ComplexMagnitude(IGpuBuffer input, IGpuBuffer output, int numPairs)
     {
+        if (numPairs <= 0) return;
+        if (numPairs * 2 > input.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but input buffer has {input.Size}.");
+        if (numPairs > output.Size)
+            throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
         if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
         using var _ = PushContext();
