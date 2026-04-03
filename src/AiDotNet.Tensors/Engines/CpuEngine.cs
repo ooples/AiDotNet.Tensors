@@ -22035,6 +22035,9 @@ public class CpuEngine : ITensorLevelEngine
                 numOps.Multiply(bData[i], scaleB));
         }
 
+        object boxedScaleA = scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null");
+        object boxedScaleB = scaleB is not null ? (object)scaleB : throw new InvalidOperationException("scaleB cannot be null");
+        DifferentiableOps.RecordBinary("TensorAddScaled", result, a, b, BackwardFunctions<T>.AddScaledBackward, new object[] { boxedScaleA, boxedScaleB });
         return result;
     }
 

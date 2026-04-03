@@ -2807,14 +2807,16 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradImag, engine);
     }
 
-    /// <summary>d(a + s*b)/da = grad, d/db = s*grad</summary>
+    /// <summary>d(scaleA*a + scaleB*b)/da = scaleA*grad, d/db = scaleB*grad</summary>
     internal static void AddScaledBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var scale = (T)savedState[0];
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
-        var gradB = engine.TensorMultiplyScalar(gradOutput, scale);
+        var scaleA = (T)savedState[0];
+        var scaleB = (T)savedState[1];
+        var gradA = engine.TensorMultiplyScalar(gradOutput, scaleA);
+        var gradB = engine.TensorMultiplyScalar(gradOutput, scaleB);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
     }
 
