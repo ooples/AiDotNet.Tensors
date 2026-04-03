@@ -126,8 +126,10 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
-        // Note: MaxEntries eviction from front is not supported with arena (would require shifting).
-        // For bounded tapes, the arena grows up to MaxEntries then stops recording.
+        // MaxEntries: drops new entries when at capacity (not evict-oldest).
+        // Arena-based storage doesn't support efficient front-eviction (would require O(n) shift).
+        // For bounded tapes used in gradient checkpointing, this is acceptable since
+        // the checkpoint segments are replayed with fresh tapes.
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
             return; // Drop new entries when at capacity

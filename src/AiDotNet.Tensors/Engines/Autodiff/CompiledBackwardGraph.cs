@@ -44,7 +44,11 @@ public sealed class CompiledBackwardGraph<T>
         Tensor<T>[]? sources,
         IEngine engine)
     {
-        _entries = entries; // Arena is owned by tape — no snapshot needed
+        // Arena reference is shared with the owning tape. Safe because:
+        // 1. CompiledBackwardGraph is created inside ComputeGradients which holds the tape
+        // 2. The tape's arena is not Reset() until tape.Dispose() which is after Execute()
+        // 3. For persistent tapes, the arena is not cleared between ComputeGradients calls
+        _entries = entries;
         _loss = loss;
         _sources = sources;
         _engine = engine;
