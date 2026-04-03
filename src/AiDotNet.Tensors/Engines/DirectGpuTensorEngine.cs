@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -402,7 +402,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="tensor">The CPU tensor to upload.</param>
     /// <param name="role">The role of this tensor.</param>
     /// <returns>A GPU-resident tensor, or null if no context is active.</returns>
-    public GpuTensor<T>? UploadToContext<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.General)
+    public Tensor<T>? UploadToContext<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.General)
     {
         var context = GpuExecutionContext.Current;
         return context?.Upload(tensor, role);
@@ -416,7 +416,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="shape">The shape of the tensor.</param>
     /// <param name="role">The role of this tensor.</param>
     /// <returns>A GPU-resident tensor, or null if no context is active.</returns>
-    public GpuTensor<T>? UploadToContext<T>(T[] data, int[] shape, GpuTensorRole role = GpuTensorRole.General)
+    public Tensor<T>? UploadToContext<T>(T[] data, int[] shape, GpuTensorRole role = GpuTensorRole.General)
     {
         var context = GpuExecutionContext.Current;
         return context?.Upload(data, shape, role);
@@ -429,7 +429,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="shape">The shape of the tensor.</param>
     /// <param name="role">The role of this tensor.</param>
     /// <returns>A GPU-resident tensor with uninitialized data, or null if no context is active.</returns>
-    public GpuTensor<T>? EmptyInContext<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
+    public Tensor<T>? EmptyInContext<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
     {
         var context = GpuExecutionContext.Current;
         return context?.Empty<T>(shape, role);
@@ -442,7 +442,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="shape">The shape of the tensor.</param>
     /// <param name="role">The role of this tensor.</param>
     /// <returns>A GPU-resident tensor filled with zeros, or null if no context is active.</returns>
-    public GpuTensor<T>? ZerosInContext<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
+    public Tensor<T>? ZerosInContext<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
     {
         var context = GpuExecutionContext.Current;
         return context?.Zeros<T>(shape, role);
@@ -2453,7 +2453,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// disposed when no longer needed to prevent GPU memory leaks. Use 'using' statements or explicit
     /// Dispose() calls to ensure proper cleanup.
     /// </remarks>
-    public IGpuTensor<T> FusedLinearGpu<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    public Tensor<T> FusedLinearGpu<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FusedLinearGpu");
@@ -2477,7 +2477,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Return GPU-resident tensor - NO DOWNLOAD
         // IMPORTANT: Caller is responsible for disposing the returned tensor to free GPU memory
-        return new GpuTensor<T>(backend, resultBuffer, new[] { batchSize, outputFeatures },
+        return Tensor<T>.FromGpuBuffer(backend, resultBuffer, new[] { batchSize, outputFeatures },
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -2496,32 +2496,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// disposed when no longer needed to prevent GPU memory leaks. Use 'using' statements or explicit
     /// Dispose() calls to ensure proper cleanup.
     /// </remarks>
-    public IGpuTensor<T> FusedLinearGpu<T>(IGpuTensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
-    {
-        if (!TryGetBackend(out var backend))
-            throw new InvalidOperationException("No GPU backend available for FusedLinearGpu");
-
-        if (input.Shape._dims.Length < 1 || weights.Rank != 2)
-            throw new ArgumentException("Invalid tensor dimensions for FusedLinearGpu");
-
-        int batchSize = input.Shape._dims[0];
-        int inputFeatures = weights.Shape._dims[0];
-        int outputFeatures = weights.Shape._dims[1];
-
-        // Input is already on GPU - use its buffer directly
-        // Auto-cache weights and biases so they stay on GPU for subsequent calls
-        using var weightsBuffer = GetOrCacheWeightBuffer(backend, weights.GetDataArray(), PersistentTensorRole.Weights);
-        using var biasBuffer = bias != null ? GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases) : default;
-
-        // Execute the fused kernel and get result buffer
-        var resultBuffer = ExecuteFusedLinearKernel(backend, input.Buffer, weightsBuffer.Buffer,
-            biasBuffer.Buffer, batchSize, outputFeatures, inputFeatures, activation);
-
-        // Return GPU-resident tensor - NO DOWNLOAD
-        return new GpuTensor<T>(backend, resultBuffer, new[] { batchSize, outputFeatures },
-            GpuTensorRole.Activation, ownsBuffer: true);
-    }
-
     /// <summary>
     /// Executes the fused linear kernel and returns the result buffer.
     /// Shared implementation for both CPU and GPU input variants.
@@ -2684,14 +2658,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <remarks>
     /// <para>
     /// Use this method to explicitly upload data to GPU for use in GPU-resident operations.
-    /// The returned tensor can be passed to methods like <see cref="FusedLinearGpu{T}(IGpuTensor{T}, Tensor{T}, Tensor{T}?, FusedActivationType)"/>
+    /// The returned tensor can be passed to methods like <see cref="FusedLinearGpu{T}(Tensor{T}, Tensor{T}, Tensor{T}?, FusedActivationType)"/>
     /// to avoid redundant uploads.
     /// </para>
     /// <para>
     /// The caller is responsible for disposing the returned GPU tensor when done.
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> UploadToGpu<T>(Tensor<T> tensor, GpuTensorRole role)
+    public Tensor<T> UploadToGpu<T>(Tensor<T> tensor, GpuTensorRole role)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UploadToGpu");
@@ -2701,7 +2675,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var buffer = backend.AllocateBuffer(floatData);
 
         // Return GPU tensor that owns the buffer
-        return new GpuTensor<T>(backend, buffer, tensor.Shape.ToArray(), role, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, buffer, tensor.Shape.ToArray(), role, ownsBuffer: true);
     }
 
     /// <summary>
@@ -2713,13 +2687,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="role">The role of this tensor for memory management.</param>
     /// <returns>A GPU-resident tensor that can be used in subsequent GPU operations.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public IGpuTensor<T> UploadToGpu<T>(float[] data, int[] shape, GpuTensorRole role)
+    public Tensor<T> UploadToGpu<T>(float[] data, int[] shape, GpuTensorRole role)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UploadToGpu");
 
         var buffer = backend.AllocateBuffer(data);
-        return new GpuTensor<T>(backend, buffer, shape, role, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, buffer, shape, role, ownsBuffer: true);
     }
 
     /// <summary>
@@ -2738,7 +2712,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
     /// <exception cref="ArgumentException">Thrown when an unsupported role is passed (e.g., General, Activation, Gradient).</exception>
-    public IGpuTensor<T> GetOrCacheWeightsGpu<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.Weight)
+    public Tensor<T> GetOrCacheWeightsGpu<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.Weight)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GetOrCacheWeightsGpu");
@@ -2758,7 +2732,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Propagate ownership: if cache owns buffer, GpuTensor shouldn't dispose;
         // if we own buffer (race condition fallback), GpuTensor should take ownership
-        return new GpuTensor<T>(backend, ownedBuffer.Buffer, tensor.Shape.ToArray(), role, ownsBuffer: ownedBuffer.OwnsBuffer);
+        return Tensor<T>.FromGpuBuffer(backend, ownedBuffer.Buffer, tensor.Shape.ToArray(), role, ownsBuffer: ownedBuffer.OwnsBuffer);
     }
 
     /// <summary>
@@ -2810,13 +2784,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// without downloading data to CPU. Supported activations: ReLU, LeakyReLU, Sigmoid, Tanh, GELU, Swish.
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> ActivationGpu<T>(IGpuTensor<T> input, FusedActivationType activation)
+    public Tensor<T> ActivationGpu<T>(Tensor<T> input, FusedActivationType activation)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ActivationGpu");
 
         // Allocate output buffer
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         if (activation == FusedActivationType.None)
@@ -2830,7 +2804,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // Return new GPU tensor
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -2843,8 +2817,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="seed">Random seed for mask generation (use different seed per batch for variety).</param>
     /// <returns>A tuple of (output tensor, mask tensor) for use in backward pass.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public (IGpuTensor<T> Output, IGpuTensor<T> Mask) DropoutGpu<T>(
-        IGpuTensor<T> input,
+    public (Tensor<T> Output, Tensor<T> Mask) DropoutGpu<T>(
+        Tensor<T> input,
         float dropoutRate,
         bool isTraining,
         ulong seed)
@@ -2852,7 +2826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DropoutGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
 
         // Allocate output and mask buffers
         var outputBuffer = backend.AllocateBuffer(size);
@@ -2862,8 +2836,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Dropout(input.Buffer, outputBuffer, maskBuffer, size, dropoutRate, seed, isTraining);
 
         // Return GPU tensors
-        var output = new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
-        var mask = new GpuTensor<T>(backend, maskBuffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: true);
+        var output = Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
+        var mask = Tensor<T>.FromGpuBuffer(backend, maskBuffer, input.Shape._dims, GpuTensorRole.Intermediate, true);
 
         return (output, mask);
     }
@@ -2877,20 +2851,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="dropoutRate">The dropout rate used in forward pass.</param>
     /// <returns>The gradient with respect to the input.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public IGpuTensor<T> DropoutBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> mask,
+    public Tensor<T> DropoutBackwardGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> mask,
         float dropoutRate)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DropoutBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var gradInputBuffer = backend.AllocateBuffer(size);
 
         backend.DropoutBackward(gradOutput.Buffer, mask.Buffer, gradInputBuffer, size, dropoutRate);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -2902,8 +2876,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="stride">Stride [height, width].</param>
     /// <param name="gpuIndices">Output GPU buffer containing pooling indices.</param>
     /// <returns>The pooled output as GPU-resident tensor.</returns>
-    public IGpuTensor<T> MaxPool2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> MaxPool2DGpu<T>(
+        Tensor<T> input,
         int[] poolSize,
         int[] stride,
         out IGpuBuffer gpuIndices)
@@ -2938,7 +2912,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShape = new[] { batch, channels, outHeight, outWidth };
         gpuIndices = indicesBuffer;
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -2951,8 +2925,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="poolSize">Pool size [height, width].</param>
     /// <param name="stride">Stride [height, width].</param>
     /// <returns>The gradient with respect to input as GPU-resident tensor.</returns>
-    public IGpuTensor<T> MaxPool2DBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> MaxPool2DBackwardGpu<T>(
+        Tensor<T> gradOutput,
         IGpuBuffer gpuIndices,
         int[] inputShape,
         int[] poolSize,
@@ -2978,7 +2952,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             poolSize[0], poolSize[1],
             stride[0], stride[1], 0, 0);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -2990,8 +2964,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="stride">Stride [depth, height, width].</param>
     /// <param name="gpuIndices">Output GPU buffer containing flat pooling indices.</param>
     /// <returns>The pooled output as GPU-resident tensor.</returns>
-    public IGpuTensor<T> MaxPool3DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> MaxPool3DGpu<T>(
+        Tensor<T> input,
         int[] poolSize,
         int[] stride,
         out IGpuBuffer gpuIndices)
@@ -3027,7 +3001,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], stride[2]);
 
         var outputShape = new[] { batch, channels, outDepth, outHeight, outWidth };
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -3040,8 +3014,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="poolSize">Pool size [depth, height, width].</param>
     /// <param name="stride">Stride [depth, height, width].</param>
     /// <returns>The gradient with respect to input as GPU-resident tensor.</returns>
-    public IGpuTensor<T> MaxPool3DBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> MaxPool3DBackwardGpu<T>(
+        Tensor<T> gradOutput,
         IGpuBuffer gpuIndices,
         int[] inputShape,
         int[] poolSize,
@@ -3067,7 +3041,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             inDepth, inHeight, inWidth,
             gradOutput.Shape._dims[2], gradOutput.Shape._dims[3], gradOutput.Shape._dims[4]);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -3079,8 +3053,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="scaleHeight">Scale factor for height dimension.</param>
     /// <param name="scaleWidth">Scale factor for width dimension.</param>
     /// <returns>The upsampled output as GPU-resident tensor.</returns>
-    public IGpuTensor<T> NearestNeighborUpsample3DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> NearestNeighborUpsample3DGpu<T>(
+        Tensor<T> input,
         int scaleDepth,
         int scaleHeight,
         int scaleWidth)
@@ -3113,7 +3087,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             scaleDepth, scaleHeight, scaleWidth);
 
         var outputShape = new[] { batch, channels, outDepth, outHeight, outWidth };
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -3126,8 +3100,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="scaleHeight">Scale factor for height dimension.</param>
     /// <param name="scaleWidth">Scale factor for width dimension.</param>
     /// <returns>The gradient with respect to input as GPU-resident tensor.</returns>
-    public IGpuTensor<T> NearestNeighborUpsample3DBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> NearestNeighborUpsample3DBackwardGpu<T>(
+        Tensor<T> gradOutput,
         int[] inputShape,
         int scaleDepth,
         int scaleHeight,
@@ -3153,7 +3127,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             inDepth, inHeight, inWidth,
             scaleDepth, scaleHeight, scaleWidth);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -3164,8 +3138,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="poolSize">Pool size [height, width].</param>
     /// <param name="stride">Stride [height, width].</param>
     /// <returns>The pooled output as GPU-resident tensor.</returns>
-    public IGpuTensor<T> AvgPool2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> AvgPool2DGpu<T>(
+        Tensor<T> input,
         int[] poolSize,
         int[] stride)
     {
@@ -3197,7 +3171,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             countIncludePad: true);
 
         var outputShape = new[] { batch, channels, outHeight, outWidth };
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -3209,8 +3183,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="poolSize">Pool size [height, width].</param>
     /// <param name="stride">Stride [height, width].</param>
     /// <returns>The gradient with respect to input as GPU-resident tensor.</returns>
-    public IGpuTensor<T> AvgPool2DBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> AvgPool2DBackwardGpu<T>(
+        Tensor<T> gradOutput,
         int[] inputShape,
         int[] poolSize,
         int[] stride)
@@ -3236,7 +3210,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], 0, 0,
             countIncludePad: true);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -3380,8 +3354,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="dilationW">Horizontal dilation.</param>
     /// <param name="activation">Activation function to fuse.</param>
     /// <returns>GPU-resident output tensor.</returns>
-    public IGpuTensor<T> FusedConv2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> FusedConv2DGpu<T>(
+        Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
         int strideH, int strideW,
@@ -3446,7 +3420,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Return GPU-resident tensor - NO DOWNLOAD
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -3599,8 +3573,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="dilationW">Width dilation.</param>
     /// <param name="activation">Fused activation type.</param>
     /// <returns>GPU-resident output tensor [batch, outChannels, outDepth, outHeight, outWidth].</returns>
-    public IGpuTensor<T> FusedConv3DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> FusedConv3DGpu<T>(
+        Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
         int strideD, int strideH, int strideW,
@@ -3670,7 +3644,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Return GPU-resident tensor - NO DOWNLOAD
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, outChannels, outDepth, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, outChannels, outDepth, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -3813,8 +3787,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="outputPadW">Horizontal output padding.</param>
     /// <param name="activation">Activation function to fuse.</param>
     /// <returns>GPU-resident output tensor.</returns>
-    public IGpuTensor<T> FusedConvTranspose2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> FusedConvTranspose2DGpu<T>(
+        Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
         int strideH, int strideW,
@@ -3877,7 +3851,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Return GPU-resident tensor - NO DOWNLOAD
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -4295,8 +4269,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="padW">Horizontal padding.</param>
     /// <param name="activation">Activation function to fuse.</param>
     /// <returns>GPU-resident output tensor.</returns>
-    public IGpuTensor<T> DepthwiseConv2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> DepthwiseConv2DGpu<T>(
+        Tensor<T> input,
         Tensor<T> kernel,
         Tensor<T>? bias,
         int strideH, int strideW,
@@ -4356,7 +4330,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Return GPU-resident tensor - NO DOWNLOAD
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, channels, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, channels, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -4607,8 +4581,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="strideW">Horizontal stride</param>
     /// <param name="activation">Fused activation type</param>
     /// <returns>Output GPU tensor [batch, outChannels, outHeight, outWidth]</returns>
-    public IGpuTensor<T> LocallyConnectedConv2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> LocallyConnectedConv2DGpu<T>(
+        Tensor<T> input,
         Tensor<T> weights,
         Tensor<T>? bias,
         int strideH, int strideW,
@@ -4657,7 +4631,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 ApplyGpuActivation(backend, outputBuffer, outputSize, activation);
             }
 
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -5058,8 +5032,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="deformGroups">Number of deformable groups</param>
     /// <param name="activation">Fused activation type</param>
     /// <returns>Output GPU tensor [batch, outChannels, outHeight, outWidth]</returns>
-    public IGpuTensor<T> DeformableConv2DGpu<T>(
-        IGpuTensor<T> input,
+    public Tensor<T> DeformableConv2DGpu<T>(
+        Tensor<T> input,
         Tensor<T> weights,
         Tensor<T> offsets,
         Tensor<T>? mask,
@@ -5126,7 +5100,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 ApplyGpuActivation(backend, outputBuffer, outputSize, activation);
             }
 
-            return new GpuTensor<T>(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, outChannels, outHeight, outWidth },
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         catch
@@ -5518,10 +5492,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="scale">Scaling factor (typically 1/sqrt(headDim)).</param>
     /// <param name="isCausal">If true, applies causal masking.</param>
     /// <returns>GPU-resident output tensor [batch, heads, seqQ, headDim].</returns>
-    public IGpuTensor<T> ScaledDotProductAttentionGpu<T>(
-        IGpuTensor<T> query,
-        IGpuTensor<T> key,
-        IGpuTensor<T> value,
+    public Tensor<T> ScaledDotProductAttentionGpu<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
         double scale,
         bool isCausal = false)
     {
@@ -5552,7 +5526,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         attnWeightsBuffer.Dispose();
 
         // Return GPU-resident output
-        return new GpuTensor<T>(backend, outputBuffer, new[] { batch, heads, seqQ, headDim },
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, heads, seqQ, headDim },
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -5568,12 +5542,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="attentionWeights">Output: GPU-resident attention weights tensor [batch, heads, seqQ, seqK].</param>
     /// <param name="isCausal">If true, applies causal masking.</param>
     /// <returns>GPU-resident output tensor [batch, heads, seqQ, headDim].</returns>
-    public IGpuTensor<T> ScaledDotProductAttentionGpu<T>(
-        IGpuTensor<T> query,
-        IGpuTensor<T> key,
-        IGpuTensor<T> value,
+    public Tensor<T> ScaledDotProductAttentionGpu<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
         double scale,
-        out IGpuTensor<T> attentionWeights,
+        out Tensor<T> attentionWeights,
         bool isCausal = false)
     {
         if (!TryGetBackend(out var backend))
@@ -5600,10 +5574,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batch, heads, seqQ, headDim, (float)scale, isCausal);
 
         // Return both output and attention weights as GPU-resident tensors
-        attentionWeights = new GpuTensor<T>(backend, attnWeightsBuffer, new[] { batch, heads, seqQ, seqK },
+        attentionWeights = Tensor<T>.FromGpuBuffer(backend, attnWeightsBuffer, new[] { batch, heads, seqQ, seqK },
             GpuTensorRole.Activation, ownsBuffer: true);
 
-        return new GpuTensor<T>(backend, outputBuffer, new[] { batch, heads, seqQ, headDim },
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, new[] { batch, heads, seqQ, headDim },
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -5620,12 +5594,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="scale">Scale factor (typically 1/sqrt(headDim)).</param>
     /// <param name="isCausal">Whether to use causal masking.</param>
     /// <returns>Tuple of (gradQuery, gradKey, gradValue) GPU-resident tensors.</returns>
-    public (IGpuTensor<T> GradQuery, IGpuTensor<T> GradKey, IGpuTensor<T> GradValue) ScaledDotProductAttentionBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> query,
-        IGpuTensor<T> key,
-        IGpuTensor<T> value,
-        IGpuTensor<T> attentionWeights,
+    public (Tensor<T> GradQuery, Tensor<T> GradKey, Tensor<T> GradValue) ScaledDotProductAttentionBackwardGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        Tensor<T> attentionWeights,
         double scale,
         bool isCausal = false)
     {
@@ -5661,9 +5635,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 batch, heads, seqLen, headDim, (float)scale, isCausal);
 
             // Return GPU-resident gradient tensors
-            var gradQuery = new GpuTensor<T>(backend, gradQueryBuffer, qShape, GpuTensorRole.Gradient, ownsBuffer: true);
-            var gradKey = new GpuTensor<T>(backend, gradKeyBuffer, qShape, GpuTensorRole.Gradient, ownsBuffer: true);
-            var gradValue = new GpuTensor<T>(backend, gradValueBuffer, qShape, GpuTensorRole.Gradient, ownsBuffer: true);
+            var gradQuery = Tensor<T>.FromGpuBuffer(backend, gradQueryBuffer, qShape, GpuTensorRole.Gradient, true);
+            var gradKey = Tensor<T>.FromGpuBuffer(backend, gradKeyBuffer, qShape, GpuTensorRole.Gradient, true);
+            var gradValue = Tensor<T>.FromGpuBuffer(backend, gradValueBuffer, qShape, GpuTensorRole.Gradient, true);
 
             // Ownership transferred to tensors
             gradQueryBuffer = null;
@@ -5688,7 +5662,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor.</param>
     /// <param name="permutation">Permutation of dimensions (e.g., [0, 2, 1, 3] for [B,H,S,D] -> [B,S,H,D]).</param>
     /// <returns>GPU-resident permuted tensor.</returns>
-    public IGpuTensor<T> PermuteGpu<T>(IGpuTensor<T> input, int[] permutation)
+    public Tensor<T> PermuteGpu<T>(Tensor<T> input, int[] permutation)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for PermuteGpu");
@@ -5708,8 +5682,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(totalElements);
         backend.Permute(input.Buffer, outputBuffer, input.Shape._dims, permutation);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape,
-            GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -5720,7 +5693,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor [batch, seq, inputDim] or 2D [batch*seq, inputDim].</param>
     /// <param name="weights">Weight tensor [inputDim, outputDim].</param>
     /// <returns>GPU-resident output tensor.</returns>
-    public IGpuTensor<T> BatchedMatMulGpu<T>(IGpuTensor<T> input, Tensor<T> weights)
+    public Tensor<T> BatchedMatMulGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BatchedMatMulGpu");
@@ -5752,8 +5725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputShape[i] = input.Shape._dims[i];
         outputShape[^1] = outputDim;
 
-        return new GpuTensor<T>(backend, resultBuffer, outputShape,
-            GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, resultBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -5764,7 +5736,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor.</param>
     /// <param name="newShape">New shape (total elements must match).</param>
     /// <returns>GPU-resident reshaped tensor (shares buffer with input).</returns>
-    public void CopyGpu<T>(IGpuTensor<T> source, IGpuTensor<T> destination, int size)
+    public void CopyGpu<T>(Tensor<T> source, Tensor<T> destination, int size)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CopyGpu");
@@ -5772,7 +5744,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Copy(source.Buffer, destination.Buffer, size);
     }
 
-    public void CopyGpu<T>(IGpuTensor<T> source, int srcOffset, IGpuTensor<T> destination, int destOffset, int size)
+    public void CopyGpu<T>(Tensor<T> source, int srcOffset, Tensor<T> destination, int destOffset, int size)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CopyGpu");
@@ -5780,7 +5752,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Copy(source.Buffer, srcOffset, destination.Buffer, destOffset, size);
     }
 
-    public void FillGpu<T>(IGpuTensor<T> buffer, float value, int size)
+    public void FillGpu<T>(Tensor<T> buffer, float value, int size)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for FillGpu");
@@ -5801,7 +5773,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor.</param>
     /// <param name="bias">Bias tensor (1D, length must match input's last dimension).</param>
     /// <returns>GPU-resident output tensor with bias added.</returns>
-    public IGpuTensor<T> AddBiasGpu<T>(IGpuTensor<T> input, Tensor<T> bias)
+    public Tensor<T> AddBiasGpu<T>(Tensor<T> input, Tensor<T> bias)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AddBiasGpu");
@@ -5828,8 +5800,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numVectors = totalElements / lastDim;
         backend.BiasAdd(input.Buffer, biasBuffer.Buffer, outputBuffer, numVectors, lastDim);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape.ToArray(),
-            GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape.ToArray(), GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -5840,7 +5811,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor with shape [..., height, width].</param>
     /// <param name="scaleFactor">Scale factor for both height and width.</param>
     /// <returns>GPU-resident upsampled tensor.</returns>
-    public IGpuTensor<T> UpsampleGpu<T>(IGpuTensor<T> input, int scaleFactor)
+    public Tensor<T> UpsampleGpu<T>(Tensor<T> input, int scaleFactor)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleGpu");
@@ -5880,8 +5851,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batchChannels, inHeight, inWidth,
             scaleFactor);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape,
-            GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -5893,7 +5863,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="inputWidth">Original input width before upsampling.</param>
     /// <param name="scaleFactor">Scale factor used during forward pass.</param>
     /// <returns>GPU-resident gradient input tensor with original input shape.</returns>
-    public IGpuTensor<T> UpsampleBackwardGpu<T>(IGpuTensor<T> gradOutput, int inputHeight, int inputWidth, int scaleFactor)
+    public Tensor<T> UpsampleBackwardGpu<T>(Tensor<T> gradOutput, int inputHeight, int inputWidth, int scaleFactor)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpsampleBackwardGpu");
@@ -5951,8 +5921,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batchChannels, inputHeight, inputWidth,
             scaleFactor);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     #endregion
@@ -6951,7 +6920,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Tiles the input tensor to create a larger output tensor with the specified number of repeats.
     /// Output shape: [repeats * batchSize, ...] where input shape is [batchSize, ...].
     /// </summary>
-    public IGpuTensor<T> TileBatchGpu<T>(IGpuTensor<T> input, int repeats)
+    public Tensor<T> TileBatchGpu<T>(Tensor<T> input, int repeats)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TileBatchGpu");
@@ -6960,7 +6929,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be positive");
 
         int batchSize = input.Shape._dims[0];
-        int innerSize = input.ElementCount / batchSize;
+        int innerSize = input.Length / batchSize;
         int outputTotalSize = repeats * batchSize * innerSize;
 
         int[] outputShape = new int[input.Shape._dims.Length];
@@ -6971,14 +6940,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(outputTotalSize);
         backend.TileBatch(input.Buffer, outputBuffer, repeats * batchSize, innerSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
     /// GPU-resident tensor tiling (repeating) along a specific axis.
     /// Tiles the input tensor by repeating elements along the specified axis.
     /// </summary>
-    public IGpuTensor<T> TileAxisGpu<T>(IGpuTensor<T> input, int axis, int repeats)
+    public Tensor<T> TileAxisGpu<T>(Tensor<T> input, int axis, int repeats)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TileAxisGpu");
@@ -7006,14 +6975,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(outputTotalSize);
         backend.TileAxis(input.Buffer, outputBuffer, outerSize, axisSize, innerSize, repeats);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
     /// GPU-resident global average pooling operation.
     /// Reduces spatial dimensions (all except batch and last) to 1 using mean.
     /// </summary>
-    public IGpuTensor<T> GlobalMeanPoolGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> GlobalMeanPoolGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMeanPoolGpu");
@@ -7034,7 +7003,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axes.Length == 0)
         {
             // No reduction needed - return input with new shape
-            return new GpuTensor<T>(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
+            return Tensor<T>.FromGpuBuffer(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
         }
 
         // Calculate output shape and sizes
@@ -7066,7 +7035,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(outputSize);
         backend.MeanAxis(input.Buffer, outputBuffer, totalOuter, reduceSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -7074,14 +7043,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Reduces spatial dimensions (all except batch and last) to 1 using max.
     /// Returns CPU indices for backward pass compatibility.
     /// </summary>
-    public IGpuTensor<T> GlobalMaxPoolGpu<T>(IGpuTensor<T> input, out int[] maxIndices)
+    public Tensor<T> GlobalMaxPoolGpu<T>(Tensor<T> input, out int[] maxIndices)
     {
         var result = GlobalMaxPoolGpuWithGpuIndices(input, out var gpuIndices);
 
-        // Download indices to CPU for backward pass
-        if (gpuIndices is not null)
+        // Download indices from GPU to CPU for backward pass
+        if (gpuIndices is not null && TryGetBackend(out var idxBackend))
         {
-            var indicesFloat = gpuIndices.GetCpuData();
+            var indicesFloat = idxBackend.DownloadBuffer(gpuIndices.Buffer);
             maxIndices = new int[indicesFloat.Length];
             for (int i = 0; i < indicesFloat.Length; i++)
                 maxIndices[i] = (int)indicesFloat[i];
@@ -7103,7 +7072,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">Input GPU tensor.</param>
     /// <param name="gpuIndices">GPU tensor containing argmax indices (as floats). Null if no reduction needed.</param>
     /// <returns>GPU tensor containing the max-pooled values.</returns>
-    public IGpuTensor<T> GlobalMaxPoolGpuWithGpuIndices<T>(IGpuTensor<T> input, out IGpuTensor<float>? gpuIndices)
+    public Tensor<T> GlobalMaxPoolGpuWithGpuIndices<T>(Tensor<T> input, out Tensor<float>? gpuIndices)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMaxPoolGpu");
@@ -7124,7 +7093,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axes.Length == 0)
         {
             gpuIndices = null;
-            return new GpuTensor<T>(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
+            return Tensor<T>.FromGpuBuffer(backend, input.Buffer, input.Shape._dims, GpuTensorRole.Intermediate, ownsBuffer: false);
         }
 
         // Calculate output shape and sizes
@@ -7158,9 +7127,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Compute argmax indices on GPU and keep them GPU-resident
         var indicesBuffer = backend.AllocateBuffer(outputSize);
         backend.ArgMax(input.Buffer, indicesBuffer, totalOuter, reduceSize);
-        gpuIndices = new GpuTensor<float>(backend, indicesBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        gpuIndices = Tensor<float>.FromGpuBuffer(backend, indicesBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Intermediate, true);
     }
 
     /// <summary>
@@ -7171,7 +7140,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident gradient of shape [batch, 1, 1, channels] or [batch, channels].</param>
     /// <param name="inputShape">Original input shape to broadcast to.</param>
     /// <returns>GPU-resident gradient of same shape as original input.</returns>
-    public IGpuTensor<T> GlobalMeanPoolBackwardGpu<T>(IGpuTensor<T> gradOutput, int[] inputShape)
+    public Tensor<T> GlobalMeanPoolBackwardGpu<T>(Tensor<T> gradOutput, int[] inputShape)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMeanPoolBackwardGpu");
@@ -7202,14 +7171,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (axes.Length == 0)
         {
             // No reduction was done - return gradient as-is
-            return new GpuTensor<T>(backend, gradOutput.Buffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: false);
+            return Tensor<T>.FromGpuBuffer(backend, gradOutput.Buffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: false);
         }
 
         // Calculate sizes
         int reduceSize = 1;
         foreach (int axis in axes) reduceSize *= inputShape[axis];
         int totalSize = inputShape.Aggregate(1, (a, b) => a * b);
-        int outerSize = gradOutput.ElementCount;
+        int outerSize = gradOutput.Length;
 
         // Allocate output buffer
         var outputBuffer = backend.AllocateBuffer(totalSize);
@@ -7225,7 +7194,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Scale the output by 1/reduceSize
         backend.Scale(outputBuffer, outputBuffer, scale, totalSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -7237,7 +7206,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="maxIndices">CPU indices of max positions from forward pass.</param>
     /// <param name="inputShape">Original input shape.</param>
     /// <returns>GPU-resident gradient of same shape as original input.</returns>
-    public IGpuTensor<T> GlobalMaxPoolBackwardGpu<T>(IGpuTensor<T> gradOutput, int[] maxIndices, int[] inputShape)
+    public Tensor<T> GlobalMaxPoolBackwardGpu<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GlobalMaxPoolBackwardGpu");
@@ -7276,7 +7245,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // sourceSize = number of gradients, destSize = total output size
         backend.ScatterAdd(gradOutput.Buffer, indicesBuffer, outputBuffer, maxIndices.Length, totalSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, inputShape, GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -7287,7 +7256,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">Input GPU tensor with shape [outerSize, reduceSize].</param>
     /// <param name="axis">Axis along which to find argmax.</param>
     /// <returns>GPU tensor containing argmax indices as floats.</returns>
-    public IGpuTensor<float> ArgMaxGpu<T>(IGpuTensor<T> input, int axis = -1)
+    public Tensor<float> ArgMaxGpu<T>(Tensor<T> input, int axis = -1)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ArgMaxGpu");
@@ -7320,7 +7289,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var indicesBuffer = backend.AllocateBuffer(totalOuter);
         backend.ArgMax(input.Buffer, indicesBuffer, totalOuter, reduceSize);
 
-        return new GpuTensor<float>(backend, indicesBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
+        return Tensor<float>.FromGpuBuffer(backend, indicesBuffer, outputShape, GpuTensorRole.Intermediate, ownsBuffer: true);
     }
 
     /// <summary>
@@ -7596,8 +7565,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// For 4D input [batch, channels, H, W], spatialSize = H * W. For 2D input [batch, features], spatialSize = 1.
     /// </para>
     /// </remarks>
-    public (IGpuTensor<T> Output, Tensor<T>? SaveMean, Tensor<T>? SaveVar) FusedBatchNormGpu<T>(
-        IGpuTensor<T> input,
+    public (Tensor<T> Output, Tensor<T>? SaveMean, Tensor<T>? SaveVar) FusedBatchNormGpu<T>(
+        Tensor<T> input,
         Tensor<T> gamma,
         Tensor<T> beta,
         ref Tensor<T> runningMean,
@@ -7625,7 +7594,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var runningVarBuffer = GetOrCacheWeightBuffer(backend, runningVar.GetDataArray(), PersistentTensorRole.NormalizationParams);
 
         // Allocate output and save buffers
-        int outputSize = input.ElementCount;
+        int outputSize = input.Length;
         var outputBuffer = backend.AllocateBuffer(outputSize);
         using var saveMeanBuffer = AllocateOutputBuffer(backend, channels);
         using var saveVarBuffer = AllocateOutputBuffer(backend, channels);
@@ -7656,7 +7625,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // Return GPU-resident output tensor
-        var outputTensor = new GpuTensor<T>(backend, outputBuffer, shape, GpuTensorRole.Activation, ownsBuffer: true);
+        var outputTensor = Tensor<T>.FromGpuBuffer(backend, outputBuffer, shape, GpuTensorRole.Activation, true);
         return (outputTensor, saveMean, saveVar);
     }
 
@@ -7675,8 +7644,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// - SaveMean: Mean values per sample (for backward pass, downloaded to CPU)
     /// - SaveInvVar: Inverse variance per sample (for backward pass, downloaded to CPU)
     /// </returns>
-    public (IGpuTensor<T> Output, Tensor<T> SaveMean, Tensor<T> SaveInvVar) LayerNormGpu<T>(
-        IGpuTensor<T> input,
+    public (Tensor<T> Output, Tensor<T> SaveMean, Tensor<T> SaveInvVar) LayerNormGpu<T>(
+        Tensor<T> input,
         Tensor<T> gamma,
         Tensor<T> beta,
         double epsilon)
@@ -7699,7 +7668,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var betaBuffer = GetOrCacheWeightBuffer(backend, beta.GetDataArray(), PersistentTensorRole.Biases);
 
         // Allocate output and save buffers
-        int outputSize = input.ElementCount;
+        int outputSize = input.Length;
         var outputBuffer = backend.AllocateBuffer(outputSize);
         using var saveMeanBuffer = AllocateOutputBuffer(backend, batchSize);
         using var saveInvVarBuffer = AllocateOutputBuffer(backend, batchSize);
@@ -7717,7 +7686,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var saveInvVar = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(saveInvVarFloat), new[] { batchSize });
 
         // Return GPU-resident output tensor
-        var outputTensor = new GpuTensor<T>(backend, outputBuffer, shape, GpuTensorRole.Activation, ownsBuffer: true);
+        var outputTensor = Tensor<T>.FromGpuBuffer(backend, outputBuffer, shape, GpuTensorRole.Activation, true);
         return (outputTensor, saveMean, saveInvVar);
     }
 
@@ -7732,9 +7701,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="saveInvVar">Saved inverse variance from forward pass.</param>
     /// <param name="epsilon">Epsilon for numerical stability.</param>
     /// <returns>Tuple of (gradInput, gradGamma, gradBeta) GPU-resident tensors.</returns>
-    public (IGpuTensor<T> GradInput, Tensor<T> GradGamma, Tensor<T> GradBeta) LayerNormBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
+    public (Tensor<T> GradInput, Tensor<T> GradGamma, Tensor<T> GradBeta) LayerNormBackwardGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
         Tensor<T> gamma,
         Tensor<T> saveMean,
         Tensor<T> saveInvVar,
@@ -7779,7 +7748,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             saveInvVarBuffer = backend.AllocateBuffer(saveInvVarFloat);
 
             // Allocate output buffers
-            int inputSize = gradOutput.ElementCount;
+            int inputSize = gradOutput.Length;
             gradInputBuffer = backend.AllocateBuffer(inputSize);
             gradGammaBuffer = backend.AllocateBuffer(normalizedSize);
             gradBetaBuffer = backend.AllocateBuffer(normalizedSize);
@@ -7809,7 +7778,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var gradBeta = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(gradBetaFloat), new[] { normalizedSize });
 
             // Return GPU-resident gradInput tensor
-            var gradInputTensor = new GpuTensor<T>(backend, gradInputBuffer, shape, GpuTensorRole.Gradient, ownsBuffer: true);
+            var gradInputTensor = Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, shape, GpuTensorRole.Gradient, true);
             gradInputBuffer = null; // Ownership transferred to tensor
             return (gradInputTensor, gradGamma, gradBeta);
         }
@@ -7831,17 +7800,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="a">First GPU-resident input tensor.</param>
     /// <param name="b">Second GPU-resident input tensor.</param>
     /// <returns>A GPU-resident output tensor with the element-wise sum.</returns>
-    public IGpuTensor<T> AddGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
+    public Tensor<T> AddGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AddGpu");
 
-        int size = a.ElementCount;
+        int size = a.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.Add(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7851,17 +7820,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="a">First GPU-resident input tensor.</param>
     /// <param name="b">Second GPU-resident input tensor.</param>
     /// <returns>A GPU-resident output tensor with the element-wise product.</returns>
-    public IGpuTensor<T> MultiplyGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
+    public Tensor<T> MultiplyGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MultiplyGpu");
 
-        int size = a.ElementCount;
+        int size = a.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.Multiply(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7871,17 +7840,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor.</param>
     /// <param name="scalar">Scalar value to multiply by.</param>
     /// <returns>A GPU-resident output tensor with the scaled values.</returns>
-    public IGpuTensor<T> ScaleGpu<T>(IGpuTensor<T> input, float scalar)
+    public Tensor<T> ScaleGpu<T>(Tensor<T> input, float scalar)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScaleGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.Scale(input.Buffer, outputBuffer, scalar, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7890,7 +7859,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="input">GPU-resident input tensor of shape [batch, features].</param>
     /// <returns>A GPU-resident output tensor with softmax applied.</returns>
-    public IGpuTensor<T> SoftmaxGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> SoftmaxGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxGpu");
@@ -7899,11 +7868,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batchSize = input.Shape._dims[0];
         int features = input.Shape._dims.Length > 1 ? input.Shape._dims[1] : input.Shape._dims[0];
 
-        var outputBuffer = backend.AllocateBuffer(input.ElementCount);
+        var outputBuffer = backend.AllocateBuffer(input.Length);
 
         backend.Softmax(input.Buffer, outputBuffer, batchSize, features);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7915,7 +7884,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="indices">Output GPU buffer containing the indices of top-k elements.</param>
     /// <param name="sorted">Whether to return sorted results (default true).</param>
     /// <returns>A GPU-resident output tensor with the top-k values.</returns>
-    public IGpuTensor<T> TopKGpu<T>(IGpuTensor<T> input, int k, out IGpuTensor<int> indices, bool sorted = true)
+    public Tensor<T> TopKGpu<T>(Tensor<T> input, int k, out Tensor<int> indices, bool sorted = true)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TopKGpu");
@@ -7933,8 +7902,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Create output shape [batch, k]
         int[] outputShape = input.Shape._dims.Length > 1 ? [outerSize, k] : [k];
 
-        indices = new GpuTensor<int>(backend, indicesBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
-        return new GpuTensor<T>(backend, valuesBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        indices = Tensor<int>.FromGpuBuffer(backend, indicesBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, valuesBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7945,19 +7914,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor [batch, features].</param>
     /// <param name="weights">GPU-resident weight tensor [batch, 1] to broadcast.</param>
     /// <returns>A GPU-resident output tensor with broadcast multiplication.</returns>
-    public IGpuTensor<T> BroadcastMultiplyColumnGpu<T>(IGpuTensor<T> input, IGpuTensor<T> weights)
+    public Tensor<T> BroadcastMultiplyColumnGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastMultiplyColumnGpu");
 
         int outerSize = input.Shape._dims[0];
-        int innerSize = input.ElementCount / outerSize;
+        int innerSize = input.Length / outerSize;
 
-        var outputBuffer = backend.AllocateBuffer(input.ElementCount);
+        var outputBuffer = backend.AllocateBuffer(input.Length);
 
         backend.BroadcastMultiplyFirstAxis(input.Buffer, weights.Buffer, outputBuffer, outerSize, innerSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -7968,7 +7937,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor [batch, features].</param>
     /// <param name="columnIndex">Column index to extract.</param>
     /// <returns>A GPU-resident output tensor [batch, 1].</returns>
-    public IGpuTensor<T> SliceColumnGpu<T>(IGpuTensor<T> input, int columnIndex)
+    public Tensor<T> SliceColumnGpu<T>(Tensor<T> input, int columnIndex)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SliceColumnGpu");
@@ -7995,7 +7964,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         indicesBuffer.Dispose();
 
-        return new GpuTensor<T>(backend, outputBuffer, [batchSize, 1], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [batchSize, 1], GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -8008,7 +7977,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="start">Starting index (inclusive).</param>
     /// <param name="end">Ending index (exclusive).</param>
     /// <returns>A GPU-resident sliced tensor.</returns>
-    public IGpuTensor<T> SliceGpu<T>(IGpuTensor<T> input, int axis, int start, int end)
+    public Tensor<T> SliceGpu<T>(Tensor<T> input, int axis, int start, int end)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SliceGpu");
@@ -8059,7 +8028,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var indicesBuffer = backend.AllocateIntBuffer(indices);
         backend.Gather(input.Buffer, indicesBuffer, outputBuffer, totalOutputSize, 1);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8073,9 +8042,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="epsilon">Small constant for numerical stability.</param>
     /// <returns>The estimated spectral norm (largest singular value).</returns>
     public float PowerIterationGpu<T>(
-        IGpuTensor<T> weights,
-        ref IGpuTensor<T> u,
-        ref IGpuTensor<T> v,
+        Tensor<T> weights,
+        ref Tensor<T> u,
+        ref Tensor<T> v,
         int numIterations,
         float epsilon = 1e-12f)
     {
@@ -8104,7 +8073,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Scale(vNewBuffer, vNewBuffer, 1.0f / vNormSafe, cols);
 
             // Update v - the old buffer will be cleaned up by GC/finalizer
-            v = new GpuTensor<T>(backend, vNewBuffer, [cols], GpuTensorRole.Activation, ownsBuffer: true);
+            v = Tensor<T>.FromGpuBuffer(backend, vNewBuffer, [cols], GpuTensorRole.Activation, true);
 
             // Step 2: u_new = W @ v
             // W is [rows, cols], v is [cols, 1], result is [rows, 1]
@@ -8117,7 +8086,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Scale(uNewBuffer, uNewBuffer, 1.0f / uNormSafe, rows);
 
             // Update u - the old buffer will be cleaned up by GC/finalizer
-            u = new GpuTensor<T>(backend, uNewBuffer, [rows], GpuTensorRole.Activation, ownsBuffer: true);
+            u = Tensor<T>.FromGpuBuffer(backend, uNewBuffer, [rows], GpuTensorRole.Activation, true);
         }
 
         // Clean up transpose buffer
@@ -8152,19 +8121,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-resident scalar division: B = A / scalar
     /// </summary>
-    public IGpuTensor<T> DivideScalarGpu<T>(IGpuTensor<T> input, float scalar)
+    public Tensor<T> DivideScalarGpu<T>(Tensor<T> input, float scalar)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DivideScalarGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         // Use Scale with 1/scalar
         float invScalar = 1.0f / scalar;
         backend.Scale(input.Buffer, outputBuffer, invScalar, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8177,7 +8146,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="outputHeight">Height of the output grid.</param>
     /// <param name="outputWidth">Width of the output grid.</param>
     /// <returns>A GPU-resident output grid [batch, outputHeight, outputWidth, 2].</returns>
-    public IGpuTensor<T> AffineGridGpu<T>(IGpuTensor<T> theta, int batch, int outputHeight, int outputWidth)
+    public Tensor<T> AffineGridGpu<T>(Tensor<T> theta, int batch, int outputHeight, int outputWidth)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for AffineGridGpu");
@@ -8188,7 +8157,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.AffineGrid(theta.Buffer, gridBuffer, batch, outputHeight, outputWidth);
 
-        return new GpuTensor<T>(backend, gridBuffer, [batch, outputHeight, outputWidth, 2], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gridBuffer, [batch, outputHeight, outputWidth, 2], GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -8201,7 +8170,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="paddingMode">Padding mode: 0=zeros, 1=border, 2=reflection.</param>
     /// <param name="alignCorners">If true, [-1, 1] maps to corner pixels.</param>
     /// <returns>A GPU-resident output tensor [batch, channels, outHeight, outWidth].</returns>
-    public IGpuTensor<T> GridSampleGpu<T>(IGpuTensor<T> input, IGpuTensor<T> grid, int paddingMode = 0, bool alignCorners = false)
+    public Tensor<T> GridSampleGpu<T>(Tensor<T> input, Tensor<T> grid, int paddingMode = 0, bool alignCorners = false)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GridSampleGpu");
@@ -8224,7 +8193,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batch, channels, inHeight, inWidth, outHeight, outWidth,
             paddingMode, alignCorners);
 
-        return new GpuTensor<T>(backend, outputBuffer, [batch, channels, outHeight, outWidth], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [batch, channels, outHeight, outWidth], GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -8240,11 +8209,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="paddingMode">Padding mode: 0=zeros, 1=border, 2=reflection.</param>
     /// <param name="alignCorners">If true, [-1, 1] maps to corner pixels.</param>
     public void GridSampleBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
-        IGpuTensor<T> grid,
-        out IGpuTensor<T> gradInput,
-        out IGpuTensor<T> gradGrid,
+        Tensor<T> gradOutput,
+        Tensor<T> input,
+        Tensor<T> grid,
+        out Tensor<T> gradInput,
+        out Tensor<T> gradGrid,
         int paddingMode = 0,
         bool alignCorners = false)
     {
@@ -8262,19 +8231,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outWidth = grid.Shape._dims[2];
 
         // Allocate gradient buffers
-        var gradInputBuffer = backend.AllocateBuffer(input.ElementCount);
-        var gradGridBuffer = backend.AllocateBuffer(grid.ElementCount);
+        var gradInputBuffer = backend.AllocateBuffer(input.Length);
+        var gradGridBuffer = backend.AllocateBuffer(grid.Length);
 
         // Initialize gradInput to zero
-        backend.Fill(gradInputBuffer, 0f, input.ElementCount);
+        backend.Fill(gradInputBuffer, 0f, input.Length);
 
         backend.GridSampleBackward(gradOutput.Buffer, input.Buffer, grid.Buffer,
             gradInputBuffer, gradGridBuffer,
             batch, channels, inHeight, inWidth, outHeight, outWidth,
             paddingMode, alignCorners);
 
-        gradInput = new GpuTensor<T>(backend, gradInputBuffer, input.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
-        gradGrid = new GpuTensor<T>(backend, gradGridBuffer, grid.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true);
+        gradInput = Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, input.Shape._dims, GpuTensorRole.Gradient, true);
+        gradGrid = Tensor<T>.FromGpuBuffer(backend, gradGridBuffer, grid.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -8283,17 +8252,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="input">GPU-resident input tensor.</param>
     /// <returns>A GPU-resident output tensor with ReLU applied.</returns>
-    public IGpuTensor<T> ReluGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> ReluGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReluGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.Relu(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8302,17 +8271,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="input">GPU-resident input tensor.</param>
     /// <returns>A GPU-resident output tensor with Tanh applied.</returns>
-    public IGpuTensor<T> TanhGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> TanhGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TanhGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.Tanh(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8322,7 +8291,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input tensor.</param>
     /// <param name="axis">Axis to reduce (0 for sum over rows, 1 for sum over columns).</param>
     /// <returns>A GPU-resident output tensor with reduced dimensions.</returns>
-    public IGpuTensor<T> SumAxisGpu<T>(IGpuTensor<T> input, int axis)
+    public Tensor<T> SumAxisGpu<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SumAxisGpu");
@@ -8373,7 +8342,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SumAxis(input.Buffer, outputBuffer, outerSize, innerSize);
         }
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8386,7 +8355,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="numIndices">Number of indices to gather.</param>
     /// <param name="featureSize">Size of each feature vector.</param>
     /// <returns>A GPU-resident output tensor [numIndices, featureSize] with gathered values.</returns>
-    public IGpuTensor<T> GatherGpu<T>(IGpuTensor<T> source, IGpuBuffer indices, int numIndices, int featureSize)
+    public Tensor<T> GatherGpu<T>(Tensor<T> source, IGpuBuffer indices, int numIndices, int featureSize)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GatherGpu");
@@ -8395,7 +8364,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.Gather(source.Buffer, indices, outputBuffer, numIndices, featureSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, [numIndices, featureSize], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [numIndices, featureSize], GpuTensorRole.Activation, ownsBuffer: true);
     }
 
     /// <summary>
@@ -8407,12 +8376,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="indices">GPU-resident indices buffer.</param>
     /// <param name="destSize">Size of the destination buffer.</param>
     /// <returns>A GPU-resident output tensor with scattered values.</returns>
-    public IGpuTensor<T> ScatterAddGpu<T>(IGpuTensor<T> source, IGpuBuffer indices, int destSize)
+    public Tensor<T> ScatterAddGpu<T>(Tensor<T> source, IGpuBuffer indices, int destSize)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ScatterAddGpu");
 
-        int sourceSize = source.ElementCount;
+        int sourceSize = source.Length;
 
         var outputBuffer = backend.AllocateBuffer(destSize);
 
@@ -8421,7 +8390,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.ScatterAdd(source.Buffer, indices, outputBuffer, sourceSize, destSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, [destSize], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [destSize], GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8430,7 +8399,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="shape">Shape of the tensor to create.</param>
     /// <returns>A GPU-resident tensor filled with zeros.</returns>
-    public IGpuTensor<T> ZerosGpu<T>(int[] shape)
+    public Tensor<T> ZerosGpu<T>(int[] shape)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ZerosGpu");
@@ -8442,7 +8411,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Fill(outputBuffer, 0f, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, shape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8453,27 +8422,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="a">GPU-resident input tensor [batchSize, features].</param>
     /// <param name="b">GPU-resident divisor tensor [batchSize, 1] to broadcast.</param>
     /// <returns>A GPU-resident output tensor with element-wise division.</returns>
-    public IGpuTensor<T> DivideByBroadcastGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
+    public Tensor<T> DivideByBroadcastGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for DivideByBroadcastGpu");
 
         int outerSize = a.Shape._dims[0];
-        int innerSize = a.ElementCount / outerSize;
-        int bSize = b.ElementCount;
+        int innerSize = a.Length / outerSize;
+        int bSize = b.Length;
 
         // Compute reciprocal of b: 1/b
         var reciprocalBuffer = backend.AllocateBuffer(bSize);
         backend.Reciprocal(b.Buffer, reciprocalBuffer, bSize);
 
         // Multiply a by broadcast reciprocal: a * (1/b) = a / b
-        var outputBuffer = backend.AllocateBuffer(a.ElementCount);
+        var outputBuffer = backend.AllocateBuffer(a.Length);
         backend.BroadcastMultiplyFirstAxis(a.Buffer, reciprocalBuffer, outputBuffer, outerSize, innerSize);
 
         // Clean up intermediate buffer
         reciprocalBuffer.Dispose();
 
-        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, true);
     }
 
     #endregion
@@ -8742,7 +8711,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the output will have shape [batch, seqLen, 512].
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> EmbeddingLookupGpu<T>(Tensor<T> embeddingTable, Tensor<int> indices)
+    public Tensor<T> EmbeddingLookupGpu<T>(Tensor<T> embeddingTable, Tensor<int> indices)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingLookupGpu");
@@ -8766,7 +8735,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputShape[i] = indices.Shape._dims[i];
         outputShape[^1] = embeddingDim;
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8779,7 +8748,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="embeddingDim">The dimension of each embedding vector.</param>
     /// <returns>A GPU-resident tensor containing the embeddings for the given indices.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public IGpuTensor<T> EmbeddingLookupGpu<T>(IGpuTensor<T> embeddingTableGpu, Tensor<int> indices, int embeddingDim)
+    public Tensor<T> EmbeddingLookupGpu<T>(Tensor<T> embeddingTableGpu, Tensor<int> indices, int embeddingDim)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingLookupGpu");
@@ -8801,7 +8770,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputShape[i] = indices.Shape._dims[i];
         outputShape[^1] = embeddingDim;
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -8815,7 +8784,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="embeddingDim">The dimension of each embedding vector.</param>
     /// <returns>A GPU-resident gradient tensor for the embedding table.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public IGpuTensor<T> EmbeddingBackwardGpu<T>(IGpuTensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
+    public Tensor<T> EmbeddingBackwardGpu<T>(Tensor<T> gradOutput, Tensor<int> indices, int vocabSize, int embeddingDim)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EmbeddingBackwardGpu");
@@ -8832,7 +8801,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Perform scatter-add for gradient accumulation
         backend.EmbeddingBackward(gradOutput.Buffer, indicesBuffer, gradEmbeddingBuffer, numIndices, embeddingDim, vocabSize);
 
-        return new GpuTensor<T>(backend, gradEmbeddingBuffer, [vocabSize, embeddingDim], GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradEmbeddingBuffer, [vocabSize, embeddingDim], GpuTensorRole.Gradient, ownsBuffer: true);
     }
 
     #endregion
@@ -9787,7 +9756,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="sparseA">CSR sparse tensor A [M, K].</param>
     /// <param name="denseB">GPU-resident dense tensor B [K, N].</param>
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
-    public IGpuTensor<T> SparseDenseMatMulGpu<T>(ICsrGpuTensor<T> sparseA, IGpuTensor<T> denseB)
+    public Tensor<T> SparseDenseMatMulGpu<T>(ICsrGpuTensor<T> sparseA, Tensor<T> denseB)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulGpu");
@@ -9818,7 +9787,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer,
             M, K, N, sparseA.Nnz);
 
-        return new GpuTensor<T>(backend, outputBuffer, [M, N],
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -9831,7 +9800,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="denseB">GPU-resident dense tensor B [K, N].</param>
     /// <param name="bias">Bias tensor [N].</param>
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
-    public IGpuTensor<T> SparseDenseMatMulBiasGpu<T>(ICsrGpuTensor<T> sparseA, IGpuTensor<T> denseB, Tensor<T> bias)
+    public Tensor<T> SparseDenseMatMulBiasGpu<T>(ICsrGpuTensor<T> sparseA, Tensor<T> denseB, Tensor<T> bias)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulBiasGpu");
@@ -9870,7 +9839,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer,
             M, K, N, sparseA.Nnz);
 
-        return new GpuTensor<T>(backend, outputBuffer, [M, N],
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -9884,8 +9853,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="targetIndices">Target node indices for each edge [numEdges].</param>
     /// <param name="edgeValues">Optional edge weights [numEdges]. If null, uses 1.0 for all edges.</param>
     /// <returns>GPU-resident aggregated node features [numNodes, features].</returns>
-    public IGpuTensor<T> ScatterAddGpu<T>(
-        IGpuTensor<T> nodeFeatures,
+    public Tensor<T> ScatterAddGpu<T>(
+        Tensor<T> nodeFeatures,
         int[] sourceIndices,
         int[] targetIndices,
         float[]? edgeValues = null)
@@ -9935,7 +9904,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 outputBuffer,
                 numNodes, numEdges, features);
 
-            return new GpuTensor<T>(backend, outputBuffer, [numNodes, features],
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [numNodes, features],
                 GpuTensorRole.Activation, ownsBuffer: true);
         }
         finally
@@ -9982,74 +9951,74 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     #region Element-wise Operations (GPU)
 
-    public IGpuTensor<T> ExpGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> ExpGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ExpGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Exp(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> SubtractGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
+    public Tensor<T> SubtractGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SubtractGpu");
 
-        int size = a.ElementCount;
+        int size = a.Length;
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Subtract(a.Buffer, b.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> BroadcastMultiplyRowGpu<T>(IGpuTensor<T> input, IGpuTensor<T> weights)
+    public Tensor<T> BroadcastMultiplyRowGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastMultiplyRowGpu");
 
         int outerSize = input.Shape._dims[0];
-        int innerSize = input.ElementCount / outerSize;
+        int innerSize = input.Length / outerSize;
 
-        var outputBuffer = backend.AllocateBuffer(input.ElementCount);
+        var outputBuffer = backend.AllocateBuffer(input.Length);
         backend.BroadcastMultiplyLastAxis(input.Buffer, weights.Buffer, outputBuffer, outerSize, innerSize);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> SinGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> SinGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SinGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Sin(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> CosGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> CosGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CosGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Cos(input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> GreaterThanScalarGpu<T>(IGpuTensor<T> input, float scalar)
+    public Tensor<T> GreaterThanScalarGpu<T>(Tensor<T> input, float scalar)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GreaterThanScalarGpu");
 
-        int size = input.ElementCount;
+        int size = input.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         using var scalarBuffer = backend.AllocateBuffer(size);
@@ -10057,10 +10026,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         backend.GreaterThan(input.Buffer, scalarBuffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape._dims, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> ConcatGpu<T>(IGpuTensor<T>[] inputs, int axis)
+    public Tensor<T> ConcatGpu<T>(Tensor<T>[] inputs, int axis)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ConcatGpu");
@@ -10082,7 +10051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool needsPermute = actualAxis != rank - 1;
         int[]? permutation = null;
         int[]? invPermutation = null;
-        IGpuTensor<T>[] processedInputs = inputs;
+        Tensor<T>[] processedInputs = inputs;
 
         if (needsPermute)
         {
@@ -10096,7 +10065,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             permutation[rank - 1] = actualAxis;
             for (int i = 0; i < rank; i++) invPermutation[permutation[i]] = i;
 
-            processedInputs = new IGpuTensor<T>[inputs.Length];
+            processedInputs = new Tensor<T>[inputs.Length];
             for (int i = 0; i < inputs.Length; i++)
             {
                 processedInputs[i] = PermuteGpu(inputs[i], permutation);
@@ -10133,13 +10102,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Array.Copy(outputShape, tempShape, rank);
         }
 
-        var result = new GpuTensor<T>(backend, outputBuffer, tempShape, GpuTensorRole.Activation, ownsBuffer: true);
+        var result = Tensor<T>.FromGpuBuffer(backend, outputBuffer, tempShape, GpuTensorRole.Activation, true);
 
         if (needsPermute)
         {
             var permutedResult = PermuteGpu(result, invPermutation!);
             result.Dispose();
-            result = (GpuTensor<T>)permutedResult;
+            result = (Tensor<T>)permutedResult;
 
             foreach (var pInput in processedInputs) pInput.Dispose();
         }
@@ -10149,7 +10118,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     #endregion
 
-    public IGpuTensor<T> ArgMaxAxisGpu<T>(IGpuTensor<T> input, int axis)
+    public Tensor<T> ArgMaxAxisGpu<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ArgMaxAxisGpu");
@@ -10165,7 +10134,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // If axis is last, optimal.
         // If not, Permute.
-        IGpuTensor<T> processedInput = input;
+        Tensor<T> processedInput = input;
         bool needsPermute = axis != inputRank - 1;
 
         if (needsPermute)
@@ -10179,7 +10148,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // Calculate outer size (product of all dims except axis)
-        outerSize = processedInput.ElementCount / reduceSize;
+        outerSize = processedInput.Length / reduceSize;
 
         var outputBuffer = backend.AllocateBuffer(outerSize);
         backend.ArgMaxAxis(processedInput.Buffer, outputBuffer, outerSize, reduceSize);
@@ -10201,10 +10170,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> MaxAxisGpu<T>(IGpuTensor<T> input, int axis)
+    public Tensor<T> MaxAxisGpu<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MaxAxisGpu");
@@ -10214,7 +10183,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outerSize = 1;
         int reduceSize = inputShape[axis];
 
-        IGpuTensor<T> processedInput = input;
+        Tensor<T> processedInput = input;
         bool needsPermute = axis != inputRank - 1;
 
         if (needsPermute)
@@ -10227,7 +10196,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             processedInput = PermuteGpu(input, perm);
         }
 
-        outerSize = processedInput.ElementCount / reduceSize;
+        outerSize = processedInput.Length / reduceSize;
         var outputBuffer = backend.AllocateBuffer(outerSize);
         backend.MaxAxis(processedInput.Buffer, outputBuffer, outerSize, reduceSize);
 
@@ -10238,10 +10207,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (i != axis) outputShapeList.Add(inputShape[i]);
         if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
-        return new GpuTensor<T>(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> BroadcastAddGpu<T>(IGpuTensor<T> a, IGpuTensor<T> b)
+    public Tensor<T> BroadcastAddGpu<T>(Tensor<T> a, Tensor<T> b)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for BroadcastAddGpu");
@@ -10259,18 +10228,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // So I will just implement AddGpu (which I assume exists? No, I saw 'Add' in backend).
         // I need to expose AddGpu (element-wise).
 
-        // Wait, AddGpu probably exists?
-        // I'll check "Element-wise Operations (GPU)" region.
-        // I see SinGpu, CosGpu... AddGpu might be missing from public API in this file?
-        // I will add AddGpu just in case.
-
-        int size = a.ElementCount;
-        if (size != b.ElementCount)
-            throw new ArgumentException($"AddGpu requires matching sizes: {size} vs {b.ElementCount}");
+        int size = a.Length;
+        if (size != b.Length)
+            throw new ArgumentException($"AddGpu requires matching sizes: {size} vs {b.Length}");
 
         var outputBuffer = backend.AllocateBuffer(size);
         backend.Add(a.Buffer, b.Buffer, outputBuffer, size);
-        return new GpuTensor<T>(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, a.Shape._dims, GpuTensorRole.Activation, true);
     }
 
 
@@ -10288,7 +10252,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="max">Maximum value (exclusive).</param>
     /// <param name="seed">Random seed.</param>
     /// <returns>A GPU-resident tensor.</returns>
-    public IGpuTensor<T> RandomUniformGpu<T>(int[] shape, float min, float max, ulong seed)
+    public Tensor<T> RandomUniformGpu<T>(int[] shape, float min, float max, ulong seed)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RandomUniformGpu");
@@ -10299,7 +10263,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.GenerateRandomUniform(outputBuffer, size, min, max, seed);
 
-        return new GpuTensor<T>(backend, outputBuffer, shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, shape, GpuTensorRole.Activation, true);
     }
 
     /// <summary>
@@ -10311,7 +10275,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="stdDev">Standard deviation of the distribution.</param>
     /// <param name="seed">Random seed.</param>
     /// <returns>A GPU-resident tensor.</returns>
-    public IGpuTensor<T> RandomNormalGpu<T>(int[] shape, float mean, float stdDev, ulong seed)
+    public Tensor<T> RandomNormalGpu<T>(int[] shape, float mean, float stdDev, ulong seed)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RandomNormalGpu");
@@ -10322,10 +10286,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(size);
         backend.GenerateRandomNormal(outputBuffer, size, mean, stdDev, seed);
 
-        return new GpuTensor<T>(backend, outputBuffer, shape, GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, shape, GpuTensorRole.Activation, true);
     }
 
-    public IGpuTensor<T> ReshapeGpu<T>(IGpuTensor<T> input, int[] newShape)
+    public Tensor<T> ReshapeGpu<T>(Tensor<T> input, int[] newShape)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReshapeGpu");
@@ -10334,17 +10298,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int newSize = 1;
         foreach (var dim in newShape) newSize *= dim;
 
-        if (newSize != input.ElementCount)
-            throw new ArgumentException($"Reshape total size mismatch: {input.ElementCount} vs {newSize}");
+        if (newSize != input.Length)
+            throw new ArgumentException($"Reshape total size mismatch: {input.Length} vs {newSize}");
 
-        // Check input type
-        if (input is GpuTensor<T> gpuTensor)
-        {
-            return gpuTensor.CreateView(0, newShape);
-        }
-
-        // Fallback: create wrapper
-        return new GpuTensor<T>(backend, input.Buffer, newShape, GpuTensorRole.Activation, ownsBuffer: false);
+        return Tensor<T>.FromGpuBuffer(backend, input.Buffer, newShape, input.Role, ownsBuffer: false);
     }
 
     #endregion
@@ -10368,7 +10325,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     #region Specialized Layer Operations
 
-    public IGpuTensor<T> RbfKernelGpu<T>(IGpuTensor<T> input, Tensor<T> centers, Tensor<T> widths)
+    public Tensor<T> RbfKernelGpu<T>(Tensor<T> input, Tensor<T> centers, Tensor<T> widths)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for RbfKernelGpu");
@@ -10401,23 +10358,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer,
             batch, numCenters, inputDim);
 
-        return new GpuTensor<T>(backend, outputBuffer, [batch, numCenters], GpuTensorRole.Activation, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [batch, numCenters], GpuTensorRole.Activation, ownsBuffer: true);
     }
 
-    public void UpdateTracesGpu<T>(IGpuTensor<T> traces, IGpuTensor<T> spikes, IGpuTensor<T> input, float decay, float threshold)
+    public void UpdateTracesGpu<T>(Tensor<T> traces, Tensor<T> spikes, Tensor<T> input, float decay, float threshold)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for UpdateTracesGpu");
 
-        backend.UpdateTraces(traces.Buffer, spikes.Buffer, input.Buffer, decay, threshold, input.ElementCount);
+        backend.UpdateTraces(traces.Buffer, spikes.Buffer, input.Buffer, decay, threshold, input.Length);
     }
 
     public void StdpUpdateGpu<T>(
         Tensor<T> weights,
-        IGpuTensor<T> preTrace,
-        IGpuTensor<T> postTrace,
-        IGpuTensor<T> preSpike,
-        IGpuTensor<T> postSpike,
+        Tensor<T> preTrace,
+        Tensor<T> postTrace,
+        Tensor<T> preSpike,
+        Tensor<T> postSpike,
         double ltpRate,
         double ltdRate,
         double homeostasisRate,
@@ -10483,7 +10440,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="input">GPU-resident 2D input tensor [rows, cols].</param>
     /// <returns>GPU-resident transposed tensor [cols, rows].</returns>
-    public IGpuTensor<T> TransposeGpu<T>(IGpuTensor<T> input)
+    public Tensor<T> TransposeGpu<T>(Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TransposeGpu");
@@ -10497,7 +10454,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputBuffer = backend.AllocateBuffer(rows * cols);
         backend.Transpose(input.Buffer, outputBuffer, rows, cols);
 
-        return new GpuTensor<T>(backend, outputBuffer, [cols, rows],
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [cols, rows],
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -10509,7 +10466,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="A">GPU-resident tensor A [M, K].</param>
     /// <param name="B">GPU-resident tensor B [K, N].</param>
     /// <returns>GPU-resident output tensor C [M, N].</returns>
-    public IGpuTensor<T> MatMulGpuTensors<T>(IGpuTensor<T> A, IGpuTensor<T> B)
+    public Tensor<T> MatMulGpuTensors<T>(Tensor<T> A, Tensor<T> B)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for MatMulGpuTensors");
@@ -10526,7 +10483,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var resultBuffer = backend.MatMul(A.Buffer, B.Buffer, M, N, K);
 
-        return new GpuTensor<T>(backend, resultBuffer, [M, N],
+        return Tensor<T>.FromGpuBuffer(backend, resultBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
     }
 
@@ -10538,18 +10495,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="input">GPU-resident input from forward pass (pre-activation).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> ReluBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> input)
+    public Tensor<T> ReluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for ReluBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.ReluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10560,18 +10516,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="output">GPU-resident output from forward pass (post-activation sigmoid output).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> SigmoidBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> output)
+    public Tensor<T> SigmoidBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SigmoidBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.SigmoidBackward(gradOutput.Buffer, output.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10582,18 +10537,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="output">GPU-resident output from forward pass (post-activation tanh output).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> TanhBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> output)
+    public Tensor<T> TanhBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for TanhBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.TanhBackward(gradOutput.Buffer, output.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10605,18 +10559,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="input">GPU-resident input from forward pass (pre-activation).</param>
     /// <param name="alpha">Negative slope parameter.</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> LeakyReluBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> input, float alpha = 0.01f)
+    public Tensor<T> LeakyReluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input, float alpha = 0.01f)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for LeakyReluBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.LeakyReluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, alpha, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10626,18 +10579,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="input">GPU-resident input from forward pass (pre-activation).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> GeluBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> input)
+    public Tensor<T> GeluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for GeluBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.GeluBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10647,20 +10599,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="output">GPU-resident output from forward pass (post-activation softmax output).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> SoftmaxBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> output)
+    public Tensor<T> SoftmaxBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxBackwardGpu");
 
         int batchSize = gradOutput.Shape._dims[0];
         int features = gradOutput.Shape._dims.Length > 1 ? gradOutput.Shape._dims[1] : 1;
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.SoftmaxBackward(gradOutput.Buffer, output.Buffer, outputBuffer, batchSize, features);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10670,18 +10621,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="gradOutput">GPU-resident output gradient.</param>
     /// <param name="input">GPU-resident input from forward pass (pre-activation).</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> SwishBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> input)
+    public Tensor<T> SwishBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SwishBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.SwishBackward(gradOutput.Buffer, input.Buffer, outputBuffer, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10693,18 +10643,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="output">GPU-resident output from forward pass (post-activation).</param>
     /// <param name="alpha">ELU alpha parameter.</param>
     /// <returns>GPU-resident input gradient.</returns>
-    public IGpuTensor<T> EluBackwardGpu<T>(IGpuTensor<T> gradOutput, IGpuTensor<T> input, IGpuTensor<T> output, float alpha = 1.0f)
+    public Tensor<T> EluBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, float alpha = 1.0f)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for EluBackwardGpu");
 
-        int size = gradOutput.ElementCount;
+        int size = gradOutput.Length;
         var outputBuffer = backend.AllocateBuffer(size);
 
         backend.EluBackward(gradOutput.Buffer, input.Buffer, output.Buffer, outputBuffer, alpha, size);
 
-        return new GpuTensor<T>(backend, outputBuffer, gradOutput.Shape._dims,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true);
     }
 
     #endregion
@@ -10723,12 +10672,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="saveInvVar">Running inverse variance saved from forward pass [C].</param>
     /// <param name="epsilon">Epsilon for numerical stability.</param>
     /// <returns>Tuple of (gradInput, gradGamma, gradBeta).</returns>
-    public (IGpuTensor<T> gradInput, IGpuTensor<T> gradGamma, IGpuTensor<T> gradBeta) BatchNormBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
+    public (Tensor<T> gradInput, Tensor<T> gradGamma, Tensor<T> gradBeta) BatchNormBackwardGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
         Tensor<T> gamma,
-        IGpuTensor<T> saveMean,
-        IGpuTensor<T> saveInvVar,
+        Tensor<T> saveMean,
+        Tensor<T> saveInvVar,
         float epsilon)
     {
         if (!TryGetBackend(out var backend))
@@ -10758,13 +10707,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Validate parameter lengths match channels to prevent out-of-bounds kernel access
         if (gamma.Length != channels)
             throw new ArgumentException($"gamma.Length ({gamma.Length}) must match channels ({channels}).", nameof(gamma));
-        if (saveMean.ElementCount != channels)
-            throw new ArgumentException($"saveMean.ElementCount ({saveMean.ElementCount}) must match channels ({channels}).", nameof(saveMean));
-        if (saveInvVar.ElementCount != channels)
-            throw new ArgumentException($"saveInvVar.ElementCount ({saveInvVar.ElementCount}) must match channels ({channels}).", nameof(saveInvVar));
+        if (saveMean.Length != channels)
+            throw new ArgumentException($"saveMean.Length ({saveMean.Length}) must match channels ({channels}).", nameof(saveMean));
+        if (saveInvVar.Length != channels)
+            throw new ArgumentException($"saveInvVar.Length ({saveInvVar.Length}) must match channels ({channels}).", nameof(saveInvVar));
 
         // Allocate output buffers
-        var gradInputBuffer = backend.AllocateBuffer(gradOutput.ElementCount);
+        var gradInputBuffer = backend.AllocateBuffer(gradOutput.Length);
         var gradGammaBuffer = backend.AllocateBuffer(channels);
         var gradBetaBuffer = backend.AllocateBuffer(channels);
 
@@ -10778,9 +10727,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             batch, channels, spatialSize, epsilon);
 
         return (
-            new GpuTensor<T>(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, ownsBuffer: true),
-            new GpuTensor<T>(backend, gradGammaBuffer, [channels], GpuTensorRole.Gradient, ownsBuffer: true),
-            new GpuTensor<T>(backend, gradBetaBuffer, [channels], GpuTensorRole.Gradient, ownsBuffer: true)
+            Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, gradOutput.Shape._dims, GpuTensorRole.Gradient, true),
+            Tensor<T>.FromGpuBuffer(backend, gradGammaBuffer, [channels], GpuTensorRole.Gradient, true),
+            Tensor<T>.FromGpuBuffer(backend, gradBetaBuffer, [channels], GpuTensorRole.Gradient, true)
         );
     }
 
@@ -10800,8 +10749,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="padding">Padding [padH, padW].</param>
     /// <param name="dilation">Dilation [dilationH, dilationW].</param>
     /// <returns>GPU-resident gradient with respect to input.</returns>
-    public IGpuTensor<T> Conv2DBackwardInputGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> Conv2DBackwardInputGpu<T>(
+        Tensor<T> gradOutput,
         Tensor<T> kernel,
         int[] inputShape,
         int[] stride,
@@ -10845,8 +10794,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], padding[0], padding[1],
             dilation[0], dilation[1]);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10861,9 +10809,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="padding">Padding [padH, padW].</param>
     /// <param name="dilation">Dilation [dilationH, dilationW].</param>
     /// <returns>GPU-resident gradient with respect to kernels.</returns>
-    public IGpuTensor<T> Conv2DBackwardKernelGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
+    public Tensor<T> Conv2DBackwardKernelGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
         int[] kernelShape,
         int[] stride,
         int[] padding,
@@ -10904,8 +10852,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], padding[0], padding[1],
             dilation[0], dilation[1]);
 
-        return new GpuTensor<T>(backend, gradKernelBuffer, kernelShape,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradKernelBuffer, kernelShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10915,7 +10862,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="gradOutput">GPU-resident output gradient [B, outC, outH, outW].</param>
     /// <returns>GPU-resident gradient with respect to bias [outC].</returns>
-    public IGpuTensor<T> Conv2DBackwardBiasGpu<T>(IGpuTensor<T> gradOutput)
+    public Tensor<T> Conv2DBackwardBiasGpu<T>(Tensor<T> gradOutput)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for Conv2DBackwardBiasGpu");
@@ -10954,8 +10901,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Create new GPU buffer with the computed bias gradients
         var gradBiasBuffer = backend.AllocateBuffer(gradBiasData);
 
-        return new GpuTensor<T>(backend, gradBiasBuffer, [outChannels],
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradBiasBuffer, [outChannels], GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -10970,8 +10916,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="padding">Padding [padH, padW].</param>
     /// <param name="outputPadding">Output padding [outputPadH, outputPadW].</param>
     /// <returns>GPU-resident gradient with respect to input.</returns>
-    public IGpuTensor<T> ConvTranspose2DBackwardInputGpu<T>(
-        IGpuTensor<T> gradOutput,
+    public Tensor<T> ConvTranspose2DBackwardInputGpu<T>(
+        Tensor<T> gradOutput,
         Tensor<T> kernel,
         int[] inputShape,
         int[] stride,
@@ -11008,8 +10954,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], padding[0], padding[1],
             outputPadding[0], outputPadding[1]);
 
-        return new GpuTensor<T>(backend, gradInputBuffer, inputShape,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, inputShape, GpuTensorRole.Gradient, true);
     }
 
     /// <summary>
@@ -11024,9 +10969,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="padding">Padding [padH, padW].</param>
     /// <param name="outputPadding">Output padding [outputPadH, outputPadW].</param>
     /// <returns>GPU-resident gradient with respect to kernels.</returns>
-    public IGpuTensor<T> ConvTranspose2DBackwardKernelGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
+    public Tensor<T> ConvTranspose2DBackwardKernelGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
         int[] kernelShape,
         int[] stride,
         int[] padding,
@@ -11060,8 +11005,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             stride[0], stride[1], padding[0], padding[1],
             outputPadding[0], outputPadding[1]);
 
-        return new GpuTensor<T>(backend, gradKernelBuffer, kernelShape,
-            GpuTensorRole.Gradient, ownsBuffer: true);
+        return Tensor<T>.FromGpuBuffer(backend, gradKernelBuffer, kernelShape, GpuTensorRole.Gradient, true);
     }
 
     #endregion

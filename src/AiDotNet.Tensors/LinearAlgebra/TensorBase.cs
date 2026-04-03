@@ -72,6 +72,38 @@ public abstract class TensorBase<T> : IDisposable
     internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
 
     /// <summary>
+    /// The GPU memory management role for this tensor (weight, activation, gradient, etc.).
+    /// Used by the GPU memory planner for allocation and eviction decisions.
+    /// </summary>
+    internal Engines.Gpu.GpuTensorRole _gpuRole;
+
+    /// <summary>
+    /// Whether this tensor owns the GPU buffer and should dispose it when the tensor is disposed.
+    /// </summary>
+    internal bool _ownsGpuBuffer;
+
+    /// <summary>
+    /// Sync point for the last GPU write operation on this tensor.
+    /// Used by the GPU graph executor to enforce correct ordering.
+    /// </summary>
+    internal Engines.Gpu.GpuSyncPoint? _lastWriteSync;
+
+    /// <summary>
+    /// Gets the GPU buffer for this tensor.
+    /// Throws if the tensor is CPU-resident — call <see cref="IsGpuResident"/> first to check,
+    /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
+    /// </summary>
+    public Engines.DirectGpu.IGpuBuffer Buffer =>
+        _device != TensorDevice.CPU && _gpuBuffer is not null
+            ? _gpuBuffer
+            : throw new InvalidOperationException("Tensor is not GPU-resident. Call .Gpu() or .To(device) first.");
+
+    /// <summary>
+    /// Gets the GPU memory management role for this tensor.
+    /// </summary>
+    public Engines.Gpu.GpuTensorRole Role => _gpuRole;
+
+    /// <summary>
     /// Gets or sets the device where this tensor's data resides.
     /// </summary>
     /// <remarks>
@@ -120,6 +152,24 @@ public abstract class TensorBase<T> : IDisposable
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
     internal void IncrementVersion() => System.Threading.Interlocked.Increment(ref _version);
+
+    /// <summary>
+    /// Gets the sync point for the last GPU write operation on this tensor.
+    /// </summary>
+    public Engines.Gpu.GpuSyncPoint? LastWriteSync => _lastWriteSync;
+
+    /// <summary>
+    /// Marks this tensor as modified by a GPU operation.
+    /// Increments the version counter and stores the sync point for the write fence.
+    /// </summary>
+    internal void MarkModified(Engines.Gpu.GpuSyncPoint? syncPoint)
+    {
+        IncrementVersion();
+        var previous = _lastWriteSync;
+        _lastWriteSync = syncPoint;
+        if (previous is not null && !ReferenceEquals(previous, syncPoint))
+            previous.Dispose();
+    }
 
     /// <summary>
     /// Whether this tensor's data is contiguous in memory (row-major with no gaps).
@@ -1020,7 +1070,22 @@ public abstract class TensorBase<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Wait for any in-flight GPU operations before releasing the buffer
+        if (_lastWriteSync is not null)
+        {
+            if (!_lastWriteSync.IsComplete)
+                _lastWriteSync.Wait();
+            _lastWriteSync.Dispose();
+            _lastWriteSync = null;
+        }
+
         _storage.Release();
+        if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+        {
+            disposableBuffer.Dispose();
+        }
+        _gpuBuffer = null;
         GC.SuppressFinalize(this);
     }
 }

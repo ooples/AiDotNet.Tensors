@@ -1,4 +1,5 @@
-using AiDotNet.Tensors.Engines.DirectGpu;
+﻿using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 
@@ -109,27 +110,36 @@ public sealed class KernelNode : ExecutionNode
             var evt = stream.RecordEvent();
             var syncPoint = new KernelSyncPoint(evt, stream);
 
-            // Handle common tensor types that support MarkModified
+            // Mark outputs as modified with the sync point (write fence).
+            // TensorBase.MarkModified increments version + stores sync point.
+            // IGpuTensor.MarkModified sets dirty flag + stores sync point.
             bool syncPointUsed = false;
             switch (output)
             {
-                case IGpuTensor<float> floatTensor:
+                case Tensor<float> floatTensor:
                     floatTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<double> doubleTensor:
+                case Tensor<double> doubleTensor:
                     doubleTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<int> intTensor:
+                case Tensor<int> intTensor:
                     intTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                case IGpuTensor<long> longTensor:
+                case Tensor<long> longTensor:
                     longTensor.MarkModified(syncPoint);
                     syncPointUsed = true;
                     break;
-                    // Note: Half/bfloat16 types can be added when supported
+                case IGpuTensor<int> legacyIntTensor:
+                    legacyIntTensor.MarkModified(syncPoint);
+                    syncPointUsed = true;
+                    break;
+                case IGpuTensor<long> legacyLongTensor:
+                    legacyLongTensor.MarkModified(syncPoint);
+                    syncPointUsed = true;
+                    break;
             }
 
             // Dispose the sync point if it wasn't used (unrecognized tensor type)

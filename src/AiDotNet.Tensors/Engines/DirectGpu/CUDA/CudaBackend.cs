@@ -62,6 +62,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
 
     public bool IsAvailable { get; }
     public string BackendName => "CUDA";
+    public TensorDevice DeviceType => TensorDevice.CUDA;
     public string DeviceName { get; }
     public string DeviceVendor => "NVIDIA";
     public int ComputeUnits { get; }

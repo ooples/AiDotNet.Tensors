@@ -31,6 +31,11 @@ public interface IDirectGpuBackend : IDisposable
     string BackendName { get; }
 
     /// <summary>
+    /// Gets the tensor device type for this backend.
+    /// </summary>
+    TensorDevice DeviceType { get; }
+
+    /// <summary>
     /// Gets the GPU device name.
     /// </summary>
     string DeviceName { get; }

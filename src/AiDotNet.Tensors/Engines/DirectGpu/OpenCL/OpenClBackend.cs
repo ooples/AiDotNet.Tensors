@@ -72,6 +72,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public bool IsAvailable { get; }
         public string BackendName => "OpenCL";
+        public TensorDevice DeviceType => TensorDevice.OpenCL;
         public string DeviceName { get; }
         public string DeviceVendor { get; }
         public int ComputeUnits { get; }

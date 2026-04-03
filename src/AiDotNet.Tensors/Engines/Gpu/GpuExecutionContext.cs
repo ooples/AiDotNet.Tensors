@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Engines.DirectGpu;
+﻿using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// var output = model.Layer3.Forward(h2);
 ///
 /// // Data only downloaded when exiting context or explicitly requested
-/// var predictions = output.ToTensor();  // Triggers sync here
+/// var predictions = output.GetDataArray();  // Triggers GPU-to-CPU sync
 /// </code>
 /// </remarks>
 public sealed class GpuExecutionContext : IDisposable
@@ -144,62 +144,53 @@ public sealed class GpuExecutionContext : IDisposable
     /// <param name="tensor">The CPU tensor to upload.</param>
     /// <param name="role">The role of this tensor.</param>
     /// <returns>A GPU-resident tensor.</returns>
-    public GpuTensor<T> Upload<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.General)
+    public Tensor<T> Upload<T>(Tensor<T> tensor, GpuTensorRole role = GpuTensorRole.General)
     {
         ThrowIfDisposed();
-
-        var gpuTensor = new GpuTensor<T>(_backend, tensor, role);
-        Registry.Register(gpuTensor);
+        var floatData = DirectGpu.DirectGpuEngine.ToFloatArray(tensor.GetDataArray());
+        var buffer = _backend.AllocateBuffer(floatData);
+        Registry.RegisterBuffer(buffer, role);
+        var gpuTensor = Tensor<T>.FromGpuBuffer(_backend, buffer, tensor._shape, role);
         return gpuTensor;
     }
 
     /// <summary>
     /// Uploads CPU data to GPU.
     /// </summary>
-    /// <typeparam name="T">The element type.</typeparam>
-    /// <param name="data">The CPU data to upload.</param>
-    /// <param name="shape">The shape of the tensor.</param>
-    /// <param name="role">The role of this tensor.</param>
-    /// <returns>A GPU-resident tensor.</returns>
-    public GpuTensor<T> Upload<T>(T[] data, int[] shape, GpuTensorRole role = GpuTensorRole.General)
+    public Tensor<T> Upload<T>(T[] data, int[] shape, GpuTensorRole role = GpuTensorRole.General)
     {
         ThrowIfDisposed();
-
-        var gpuTensor = new GpuTensor<T>(_backend, data, shape, role);
-        Registry.Register(gpuTensor);
+        var floatData = DirectGpu.DirectGpuEngine.ToFloatArray(data);
+        var buffer = _backend.AllocateBuffer(floatData);
+        Registry.RegisterBuffer(buffer, role);
+        var gpuTensor = Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
         return gpuTensor;
     }
 
     /// <summary>
     /// Creates an empty GPU tensor.
     /// </summary>
-    /// <typeparam name="T">The element type.</typeparam>
-    /// <param name="shape">The shape of the tensor.</param>
-    /// <param name="role">The role of this tensor.</param>
-    /// <returns>A GPU-resident tensor with uninitialized data.</returns>
-    public GpuTensor<T> Empty<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
+    public Tensor<T> Empty<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
     {
         ThrowIfDisposed();
-
-        var gpuTensor = GpuTensorFactory.Empty<T>(_backend, shape, role);
-        Registry.Register(gpuTensor);
-        return gpuTensor;
+        int size = 1;
+        foreach (var d in shape) size *= d;
+        var buffer = _backend.AllocateBuffer(size);
+        Registry.RegisterBuffer(buffer, role);
+        return Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
     }
 
     /// <summary>
     /// Creates a GPU tensor filled with zeros.
     /// </summary>
-    /// <typeparam name="T">The element type.</typeparam>
-    /// <param name="shape">The shape of the tensor.</param>
-    /// <param name="role">The role of this tensor.</param>
-    /// <returns>A GPU-resident tensor filled with zeros.</returns>
-    public GpuTensor<T> Zeros<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
+    public Tensor<T> Zeros<T>(int[] shape, GpuTensorRole role = GpuTensorRole.Intermediate)
     {
         ThrowIfDisposed();
-
-        var gpuTensor = GpuTensorFactory.Zeros<T>(_backend, shape, role);
-        Registry.Register(gpuTensor);
-        return gpuTensor;
+        int size = 1;
+        foreach (var d in shape) size *= d;
+        var buffer = _backend.AllocateBuffer(new float[size]);
+        Registry.RegisterBuffer(buffer, role);
+        return Tensor<T>.FromGpuBuffer(_backend, buffer, shape, role);
     }
 
     /// <summary>

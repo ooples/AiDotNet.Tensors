@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Engines.DirectGpu;
+﻿using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -26,7 +26,7 @@ public partial class DirectGpuTensorEngine
     /// that the entity represented by the capsule exists.
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> SquashGpu<T>(IGpuTensor<T> input, int axis = -1, float epsilon = 1e-8f)
+    public Tensor<T> SquashGpu<T>(Tensor<T> input, int axis = -1, float epsilon = 1e-8f)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SquashGpu");
@@ -40,12 +40,12 @@ public partial class DirectGpuTensorEngine
         if (axis == rank - 1)
         {
             int capsuleDim = input.Shape[rank - 1];
-            int numCapsules = input.ElementCount / capsuleDim;
+            int numCapsules = input.Length / capsuleDim;
 
-            var outputBuffer = backend.AllocateBuffer(input.ElementCount);
+            var outputBuffer = backend.AllocateBuffer(input.Length);
             backend.Squash(input.Buffer, outputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, outputBuffer, input.Shape.ToArray(), GpuTensorRole.Activation, ownsBuffer: true);
+            return Tensor<T>.FromGpuBuffer(backend, outputBuffer, input.Shape.ToArray(), GpuTensorRole.Activation, ownsBuffer: true);
         }
 
         // For squash over a non-last axis, we need to permute the tensor
@@ -62,12 +62,12 @@ public partial class DirectGpuTensorEngine
         var permutedInput = PermuteGpu(input, permutation);
 
         int permutedCapsuleDim = permutedInput.Shape[rank - 1];
-        int permutedNumCapsules = permutedInput.ElementCount / permutedCapsuleDim;
+        int permutedNumCapsules = permutedInput.Length / permutedCapsuleDim;
 
-        var permutedOutputBuffer = backend.AllocateBuffer(permutedInput.ElementCount);
+        var permutedOutputBuffer = backend.AllocateBuffer(permutedInput.Length);
         backend.Squash(permutedInput.Buffer, permutedOutputBuffer, permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedOutput = new GpuTensor<T>(backend, permutedOutputBuffer, permutedInput.Shape.ToArray(), GpuTensorRole.Intermediate, ownsBuffer: true);
+        var permutedOutput = Tensor<T>.FromGpuBuffer(backend, permutedOutputBuffer, permutedInput.Shape.ToArray(), GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back
         var inversePermutation = new int[rank];
@@ -95,9 +95,9 @@ public partial class DirectGpuTensorEngine
     /// <param name="epsilon">Small value for numerical stability (default: 1e-8).</param>
     /// <returns>The gradient with respect to the input.</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public IGpuTensor<T> SquashBackwardGpu<T>(
-        IGpuTensor<T> gradOutput,
-        IGpuTensor<T> input,
+    public Tensor<T> SquashBackwardGpu<T>(
+        Tensor<T> gradOutput,
+        Tensor<T> input,
         int axis = -1,
         float epsilon = 1e-8f)
     {
@@ -113,12 +113,12 @@ public partial class DirectGpuTensorEngine
         if (axis == rank - 1)
         {
             int capsuleDim = input.Shape[rank - 1];
-            int numCapsules = input.ElementCount / capsuleDim;
+            int numCapsules = input.Length / capsuleDim;
 
-            var gradInputBuffer = backend.AllocateBuffer(input.ElementCount);
+            var gradInputBuffer = backend.AllocateBuffer(input.Length);
             backend.SquashBackward(gradOutput.Buffer, input.Buffer, gradInputBuffer, numCapsules, capsuleDim, epsilon);
 
-            return new GpuTensor<T>(backend, gradInputBuffer, input.Shape.ToArray(), GpuTensorRole.Gradient, ownsBuffer: true);
+            return Tensor<T>.FromGpuBuffer(backend, gradInputBuffer, input.Shape.ToArray(), GpuTensorRole.Gradient, ownsBuffer: true);
         }
 
         // For squash backward over a non-last axis, permute to move axis to end
@@ -134,13 +134,13 @@ public partial class DirectGpuTensorEngine
         var permutedInput = PermuteGpu(input, permutation);
 
         int permutedCapsuleDim = permutedInput.Shape[rank - 1];
-        int permutedNumCapsules = permutedInput.ElementCount / permutedCapsuleDim;
+        int permutedNumCapsules = permutedInput.Length / permutedCapsuleDim;
 
-        var permutedGradInputBuffer = backend.AllocateBuffer(permutedInput.ElementCount);
+        var permutedGradInputBuffer = backend.AllocateBuffer(permutedInput.Length);
         backend.SquashBackward(permutedGradOutput.Buffer, permutedInput.Buffer, permutedGradInputBuffer,
             permutedNumCapsules, permutedCapsuleDim, epsilon);
 
-        var permutedGradInput = new GpuTensor<T>(backend, permutedGradInputBuffer, permutedInput.Shape.ToArray(),
+        var permutedGradInput = Tensor<T>.FromGpuBuffer(backend, permutedGradInputBuffer, permutedInput.Shape.ToArray(),
             GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Build inverse permutation and permute back
@@ -170,8 +170,8 @@ public partial class DirectGpuTensorEngine
     /// <param name="epsilon">Small value for numerical stability.</param>
     /// <returns>A tuple of (output capsules, coupling coefficients).</returns>
     /// <exception cref="InvalidOperationException">Thrown when no GPU backend is available.</exception>
-    public (IGpuTensor<T> Output, IGpuTensor<T> Couplings) DynamicRoutingGpu<T>(
-        IGpuTensor<T> predictions,
+    public (Tensor<T> Output, Tensor<T> Couplings) DynamicRoutingGpu<T>(
+        Tensor<T> predictions,
         int numIterations = 3,
         float epsilon = 1e-8f)
     {
@@ -191,10 +191,10 @@ public partial class DirectGpuTensorEngine
         int couplingsSize = batchSize * inputCapsules * outputCapsules;
         var couplingsBuffer = backend.AllocateBuffer(couplingsSize);
         backend.Fill(couplingsBuffer, 0.0f, couplingsSize);
-        IGpuTensor<T> couplings = new GpuTensor<T>(backend, couplingsBuffer,
+        Tensor<T> couplings = Tensor<T>.FromGpuBuffer(backend, couplingsBuffer,
             [batchSize, inputCapsules, outputCapsules], GpuTensorRole.Intermediate, ownsBuffer: true);
 
-        IGpuTensor<T>? output = null;
+        Tensor<T>? output = null;
 
         for (int iter = 0; iter < numIterations; iter++)
         {
@@ -264,7 +264,7 @@ public partial class DirectGpuTensorEngine
     /// Uses a dedicated GPU kernel for maximum parallelism.
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> CapsulePredictionsGpu<T>(IGpuTensor<T> input, Tensor<T> weights)
+    public Tensor<T> CapsulePredictionsGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
@@ -305,7 +305,7 @@ public partial class DirectGpuTensorEngine
         backend.CapsulePredictions(input.Buffer, weightsBuffer, outputBuffer,
             batchSize, inputCapsules, inputDim, outputCapsules, outputDim);
 
-        return new GpuTensor<T>(backend, outputBuffer,
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer,
             [batchSize, inputCapsules, outputCapsules, outputDim],
             GpuTensorRole.Intermediate, ownsBuffer: true);
     }
@@ -319,7 +319,7 @@ public partial class DirectGpuTensorEngine
     /// <param name="outputCapsules">Number of output capsules.</param>
     /// <param name="outputDim">Dimension of each output capsule.</param>
     /// <returns>GPU-resident predictions tensor [batch, inputCapsules, outputCapsules, outputDim].</returns>
-    public IGpuTensor<T> CapsulePredictionsGpu<T>(IGpuTensor<T> input, IGpuBuffer weightsBuffer, int outputCapsules, int outputDim)
+    public Tensor<T> CapsulePredictionsGpu<T>(Tensor<T> input, IGpuBuffer weightsBuffer, int outputCapsules, int outputDim)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsulePredictionsGpu");
@@ -339,7 +339,7 @@ public partial class DirectGpuTensorEngine
         backend.CapsulePredictions(input.Buffer, weightsBuffer, outputBuffer,
             batchSize, inputCapsules, inputDim, outputCapsules, outputDim);
 
-        return new GpuTensor<T>(backend, outputBuffer,
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer,
             [batchSize, inputCapsules, outputCapsules, outputDim],
             GpuTensorRole.Intermediate, ownsBuffer: true);
     }
@@ -358,7 +358,7 @@ public partial class DirectGpuTensorEngine
     /// Uses a dedicated GPU kernel for maximum parallelism.
     /// </para>
     /// </remarks>
-    public IGpuTensor<T> CapsuleTransformGpu<T>(IGpuTensor<T> input, Tensor<T> weights)
+    public Tensor<T> CapsuleTransformGpu<T>(Tensor<T> input, Tensor<T> weights)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
@@ -399,7 +399,7 @@ public partial class DirectGpuTensorEngine
         backend.CapsuleTransform(input.Buffer, weightsBuffer, outputBuffer,
             batchSize, inputCapsules, inputDim, numCapsules, capsuleDim);
 
-        return new GpuTensor<T>(backend, outputBuffer,
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer,
             [batchSize, inputCapsules, numCapsules, capsuleDim],
             GpuTensorRole.Intermediate, ownsBuffer: true);
     }
@@ -413,7 +413,7 @@ public partial class DirectGpuTensorEngine
     /// <param name="numCapsules">Number of output capsules.</param>
     /// <param name="capsuleDim">Dimension of each output capsule.</param>
     /// <returns>GPU-resident transformed tensor [batch, inputCapsules, numCapsules, capsuleDim].</returns>
-    public IGpuTensor<T> CapsuleTransformGpu<T>(IGpuTensor<T> input, IGpuBuffer weightsBuffer, int numCapsules, int capsuleDim)
+    public Tensor<T> CapsuleTransformGpu<T>(Tensor<T> input, IGpuBuffer weightsBuffer, int numCapsules, int capsuleDim)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for CapsuleTransformGpu");
@@ -433,7 +433,7 @@ public partial class DirectGpuTensorEngine
         backend.CapsuleTransform(input.Buffer, weightsBuffer, outputBuffer,
             batchSize, inputCapsules, inputDim, numCapsules, capsuleDim);
 
-        return new GpuTensor<T>(backend, outputBuffer,
+        return Tensor<T>.FromGpuBuffer(backend, outputBuffer,
             [batchSize, inputCapsules, numCapsules, capsuleDim],
             GpuTensorRole.Intermediate, ownsBuffer: true);
     }
@@ -448,8 +448,8 @@ public partial class DirectGpuTensorEngine
     /// <param name="numIterations">Number of routing iterations.</param>
     /// <param name="epsilon">Small value for numerical stability.</param>
     /// <returns>Output capsules [batch, numCapsules, capsuleDim].</returns>
-    public IGpuTensor<T> CapsuleRoutingGpu<T>(
-        IGpuTensor<T> transformedInput,
+    public Tensor<T> CapsuleRoutingGpu<T>(
+        Tensor<T> transformedInput,
         Tensor<T> bias,
         int numIterations = 3,
         float epsilon = 1e-8f)
@@ -471,7 +471,7 @@ public partial class DirectGpuTensorEngine
         float uniformCoeff = 1.0f / numCapsules;
         backend.Fill(couplingsBuffer, uniformCoeff, couplingsSize);
 
-        IGpuTensor<T> couplings = new GpuTensor<T>(backend, couplingsBuffer,
+        Tensor<T> couplings = Tensor<T>.FromGpuBuffer(backend, couplingsBuffer,
             [batchSize, inputCapsules, numCapsules], GpuTensorRole.Intermediate, ownsBuffer: true);
 
         // Upload bias to GPU (reshape from [numCapsules*capsuleDim] to [1, numCapsules, capsuleDim])
@@ -480,10 +480,10 @@ public partial class DirectGpuTensorEngine
         for (int i = 0; i < bias.Length; i++)
             biasData[i] = Convert.ToSingle(biasArray[i]);
         using var biasBuffer = backend.AllocateBuffer(biasData);
-        var biasGpu = new GpuTensor<T>(backend, biasBuffer,
+        var biasGpu = Tensor<T>.FromGpuBuffer(backend, biasBuffer,
             [1, numCapsules, capsuleDim], GpuTensorRole.Bias, ownsBuffer: false);
 
-        IGpuTensor<T>? output = null;
+        Tensor<T>? output = null;
 
         for (int iter = 0; iter < numIterations; iter++)
         {
@@ -547,7 +547,7 @@ public partial class DirectGpuTensorEngine
     /// <summary>
     /// GPU-resident softmax over a specific axis.
     /// </summary>
-    private IGpuTensor<T> SoftmaxAxisGpu<T>(IGpuTensor<T> input, int axis)
+    private Tensor<T> SoftmaxAxisGpu<T>(Tensor<T> input, int axis)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SoftmaxAxisGpu");

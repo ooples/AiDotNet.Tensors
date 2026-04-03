@@ -63,6 +63,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
 
     /// <inheritdoc/>
     public string BackendName => "WebGPU";
+    public TensorDevice DeviceType => TensorDevice.WebGPU;
 
     /// <summary>
     /// Gets the backend type identifier.
