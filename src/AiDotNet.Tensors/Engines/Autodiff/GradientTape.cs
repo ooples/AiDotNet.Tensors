@@ -46,7 +46,7 @@ public sealed class GradientTape<T> : IDisposable
     private static void SetCurrentTape(GradientTape<T>? tape) => _current = tape;
 
     private readonly GradientTape<T>? _parent;
-    private readonly List<TapeEntry<T>> _entries;
+    private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
     private readonly IEngine _engine;
     private bool _disposed;
@@ -56,6 +56,7 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     public int EntryCount => _entries.Count;
 
+
     /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
@@ -63,8 +64,7 @@ public sealed class GradientTape<T> : IDisposable
     internal void RemoveLastEntry()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
-        if (_entries.Count > 0)
-            _entries.RemoveAt(_entries.Count - 1);
+        _entries.RemoveLast();
     }
 
     /// <summary>
@@ -91,7 +91,7 @@ public sealed class GradientTape<T> : IDisposable
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
-        _entries = new List<TapeEntry<T>>();
+        _entries = new TapeEntryArena<T>();
         _engine = AiDotNetEngine.Current;
         _parent = _current;
 
@@ -118,9 +118,11 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
+        // Note: MaxEntries eviction from front is not supported with arena (would require shifting).
+        // For bounded tapes, the arena grows up to MaxEntries then stops recording.
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
-            _entries.RemoveAt(0);
+            return; // Drop new entries when at capacity
         }
 
         _entries.Add(entry);
@@ -332,7 +334,7 @@ public sealed class GradientTape<T> : IDisposable
 
             if (!_options.Persistent)
             {
-                _entries.Clear();
+                _entries.Reset();
             }
 
             return filtered;
@@ -340,7 +342,7 @@ public sealed class GradientTape<T> : IDisposable
 
         if (!_options.Persistent)
         {
-            _entries.Clear();
+            _entries.Reset();
         }
 
         return grads;
@@ -356,7 +358,7 @@ public sealed class GradientTape<T> : IDisposable
             throw new ObjectDisposedException(nameof(GradientTape<T>));
         }
 
-        _entries.Clear();
+        _entries.Reset();
     }
 
     /// <summary>

@@ -1251,7 +1251,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        int[] indices = (int[])savedState[0];
+        int[] indices = savedState[0] is Tensor<int> indicesTensor
+            ? indicesTensor.GetFlattenedData()
+            : (int[])savedState[0];
         int dim = (int)savedState[1];
         var inShape = inputs[0].Shape.ToArray();
         var inputGrad = TensorPool<T>.RentZeroed(inShape);

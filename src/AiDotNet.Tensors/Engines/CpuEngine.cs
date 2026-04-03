@@ -22463,10 +22463,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>IndexSelect: select indices along a given axis (differentiable).</summary>
     public Tensor<T> TensorIndexSelectDiff<T>(Tensor<T> source, Tensor<int> indices, int axis)
     {
-        var result = TensorIndexSelect(source, indices, axis);
-        DifferentiableOps.RecordUnary("IndexSelect", result, source, BackwardFunctions<T>.IndexSelectBackward,
-            savedState: new object[] { indices.GetFlattenedData(), axis });
-        return result;
+        // TensorIndexSelect already records to the tape — no additional recording needed
+        return TensorIndexSelect(source, indices, axis);
     }
 
     /// <summary>Constant padding for N-dimensional tensors.</summary>
@@ -22608,10 +22606,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Stack tensors along a new axis (differentiable).</summary>
     public Tensor<T> TensorStackDiff<T>(Tensor<T>[] tensors, int axis = 0)
     {
-        var result = TensorStack(tensors, axis);
-        DifferentiableOps.RecordIfActive("Stack", result, tensors,
-            BackwardFunctions<T>.StackBackward, savedState: new object[] { axis });
-        return result;
+        // TensorStack already records to the tape — no additional recording needed
+        return TensorStack(tensors, axis);
     }
 
     /// <summary>Variance of all elements, returns scalar tensor.</summary>

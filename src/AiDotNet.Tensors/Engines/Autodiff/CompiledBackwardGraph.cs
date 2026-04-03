@@ -30,7 +30,7 @@ public sealed class CompiledBackwardGraph<T>
     /// <summary>
     /// The tape entries this graph operates on.
     /// </summary>
-    private readonly List<TapeEntry<T>> _entries;
+    private readonly TapeEntryArena<T> _entries;
 
     private readonly IEngine _engine;
 
@@ -38,13 +38,13 @@ public sealed class CompiledBackwardGraph<T>
     /// Compiles a backward graph by analyzing which tape entries are reachable
     /// from the loss tensor. Dead entries are eliminated from the execution plan.
     /// </summary>
-    public CompiledBackwardGraph(
-        List<TapeEntry<T>> entries,
+    internal CompiledBackwardGraph(
+        TapeEntryArena<T> entries,
         Tensor<T> loss,
         Tensor<T>[]? sources,
         IEngine engine)
     {
-        _entries = new List<TapeEntry<T>>(entries); // snapshot to prevent mutation
+        _entries = entries; // Arena is owned by tape — no snapshot needed
         _loss = loss;
         _sources = sources;
         _engine = engine;
