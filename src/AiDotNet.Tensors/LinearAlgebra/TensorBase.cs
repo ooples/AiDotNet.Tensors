@@ -89,6 +89,13 @@ public abstract class TensorBase<T> : IDisposable
     internal Engines.Gpu.GpuSyncPoint? _lastWriteSync;
 
     /// <summary>
+    /// Cached deferred materializer callback for re-registration after GPU writes.
+    /// Stored so MarkModified can invalidate CPU data and set up fresh download.
+    /// </summary>
+    internal Action<object>? _gpuMaterializerCallback;
+    internal object? _gpuMaterializerKey;
+
+    /// <summary>
     /// Gets the GPU buffer for this tensor.
     /// Throws if the tensor is CPU-resident — call <see cref="IsGpuResident"/> first to check,
     /// or use <see cref="Tensor{T}.Gpu()"/> / <see cref="Tensor{T}.To(DeviceInfo)"/> to move to GPU.
@@ -169,6 +176,10 @@ public abstract class TensorBase<T> : IDisposable
         _lastWriteSync = syncPoint;
         if (previous is not null && !ReferenceEquals(previous, syncPoint))
             previous.Dispose();
+
+        // Re-register deferred materializer so next CPU read downloads fresh GPU data
+        if (_gpuMaterializerCallback is not null && _gpuMaterializerKey is not null)
+            Helpers.DeferredArrayMaterializer.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
     }
 
     /// <summary>

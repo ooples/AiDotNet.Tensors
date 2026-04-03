@@ -2515,11 +2515,12 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuRole = role;
         tensor._ownsGpuBuffer = ownsBuffer;
 
-        // Register deferred GPU-to-CPU download so GetDataArray/AsSpan auto-materializes
+        // Register deferred GPU-to-CPU download so GetDataArray/AsSpan auto-materializes.
+        // Store the callback + key on the tensor so MarkModified can re-register after GPU writes.
         var backingArray = tensor._data.GetDataArray();
         var capturedBackend = backend;
         var capturedBuffer = buffer;
-        Helpers.DeferredArrayMaterializer.Register(backingArray, arr =>
+        Action<object> materializeCallback = arr =>
         {
             var floatData = capturedBackend.DownloadBuffer(capturedBuffer);
             var typedArr = (T[])arr;
@@ -2533,7 +2534,10 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 for (int i = 0; i < Math.Min(floatData.Length, typedArr.Length); i++)
                     typedArr[i] = numOps.FromDouble(floatData[i]);
             }
-        });
+        };
+        tensor._gpuMaterializerCallback = materializeCallback;
+        tensor._gpuMaterializerKey = backingArray;
+        Helpers.DeferredArrayMaterializer.Register(backingArray, materializeCallback);
 
         return tensor;
     }
