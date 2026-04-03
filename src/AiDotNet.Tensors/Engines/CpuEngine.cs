@@ -11347,7 +11347,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        var sparsemaxResult = TensorAllocator.Rent<T>(shape, new Vector<T>(outputData));
+        DifferentiableOps.RecordUnary("Sparsemax", sparsemaxResult, input, BackwardFunctions<T>.SparsemaxBackward, new object[] { axis });
+        return sparsemaxResult;
     }
 
     /// <inheritdoc/>
@@ -16236,7 +16238,10 @@ public class CpuEngine : ITensorLevelEngine
             axisOffset += tensor._shape[axis];
         }
 
-        return TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
+        DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),
+            BackwardFunctions<T>.ConcatenateBackward, new object[] { axis });
+        return result;
     }
 
     /// <inheritdoc/>
