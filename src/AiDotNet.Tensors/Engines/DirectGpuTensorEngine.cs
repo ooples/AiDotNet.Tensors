@@ -32,6 +32,36 @@ internal sealed class GpuBufferCacheEntry : IDisposable
 }
 
 /// <summary>
+/// Composite key for CSR buffer cache, binding a sparse tensor to a specific GPU backend.
+/// Uses reference equality for both fields so we only reuse buffers for the exact same objects.
+/// </summary>
+internal sealed class CsrCacheKey : IEquatable<CsrCacheKey>
+{
+    private readonly object _sparse;
+    private readonly IDirectGpuBackend _backend;
+
+    public CsrCacheKey(object sparse, IDirectGpuBackend backend)
+    {
+        _sparse = sparse;
+        _backend = backend;
+    }
+
+    public bool Equals(CsrCacheKey? other) =>
+        other is not null && ReferenceEquals(_sparse, other._sparse) && ReferenceEquals(_backend, other._backend);
+
+    public override bool Equals(object? obj) => Equals(obj as CsrCacheKey);
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            return (System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(_sparse) * 397)
+                 ^ System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(_backend);
+        }
+    }
+}
+
+/// <summary>
 /// Cached CSR GPU buffers for a sparse tensor so repeated SpMM calls skip re-upload.
 /// </summary>
 internal sealed class CsrGpuCache : IDisposable
@@ -192,8 +222,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly ConcurrentDictionary<object, int> _tensorVersions = new();
 
     // CSR buffer cache for sparse tensors — avoids re-uploading static sparse matrices every call.
-    // Key: SparseTensor instance reference, Value: (valsBuf, colsBuf, rowPtrBuf, nnz)
-    private readonly ConcurrentDictionary<object, CsrGpuCache> _csrBufferCache = new();
+    // Key: CsrCacheKey (SparseTensor + Backend reference pair) to avoid cross-backend buffer reuse.
+    private readonly ConcurrentDictionary<CsrCacheKey, CsrGpuCache> _csrBufferCache = new();
 
     // Activation cache for intermediate tensors - enables GPU-resident layer chaining
     // Key: tensor data array reference, Value: (buffer, shape, timestamp)
@@ -9778,10 +9808,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Gets or uploads CSR GPU buffers for a sparse tensor, caching for repeated calls.
+    /// Cache key includes the backend instance to avoid cross-backend buffer reuse.
     /// </summary>
     private CsrGpuCache GetOrUploadCsrBuffers<T>(IDirectGpuBackend backend, SparseTensor<T> sparse)
     {
-        if (_csrBufferCache.TryGetValue(sparse, out var existing))
+        var key = new CsrCacheKey(sparse, backend);
+        if (_csrBufferCache.TryGetValue(key, out var existing))
             return existing;
 
         var csr = sparse.ToCsr();
@@ -9790,16 +9822,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int i = 0; i < csr.Values.Length; i++)
             floatVals[i] = (float)numOps.ToDouble(csr.Values[i]);
 
-        var valsBuf = backend.AllocateBuffer(floatVals);
-        var colsBuf = backend.AllocateBuffer(csr.ColumnIndices.Select(x => (float)x).ToArray());
-        var rowPtrBuf = backend.AllocateBuffer(csr.RowPointers.Select(x => (float)x).ToArray());
+        // Exception-safe allocation: dispose earlier buffers if a later one fails
+        IGpuBuffer? valsBuf = null;
+        IGpuBuffer? colsBuf = null;
+        IGpuBuffer? rowPtrBuf = null;
+        try
+        {
+            valsBuf = backend.AllocateBuffer(floatVals);
+            colsBuf = backend.AllocateBuffer(csr.ColumnIndices.Select(x => (float)x).ToArray());
+            rowPtrBuf = backend.AllocateBuffer(csr.RowPointers.Select(x => (float)x).ToArray());
+        }
+        catch
+        {
+            valsBuf?.Dispose();
+            colsBuf?.Dispose();
+            rowPtrBuf?.Dispose();
+            throw;
+        }
 
         var cache = new CsrGpuCache(valsBuf, colsBuf, rowPtrBuf, csr.NonZeroCount);
-        if (!_csrBufferCache.TryAdd(sparse, cache))
+        if (!_csrBufferCache.TryAdd(key, cache))
         {
             // Another thread beat us — dispose ours and use theirs
             cache.Dispose();
-            return _csrBufferCache[sparse];
+            return _csrBufferCache[key];
         }
         return cache;
     }
@@ -14214,6 +14260,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         _persistentBufferCache.Clear();
         _tensorVersions.Clear();
+
+        // Dispose cached CSR GPU buffers
+        foreach (var entry in _csrBufferCache.Values)
+        {
+            entry.Dispose();
+        }
+        _csrBufferCache.Clear();
 
         if (_ownsDirectGpu)
             _directGpu?.Dispose();
