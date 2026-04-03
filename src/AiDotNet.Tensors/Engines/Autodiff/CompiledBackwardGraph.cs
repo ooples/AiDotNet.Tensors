@@ -59,8 +59,17 @@ public sealed class CompiledBackwardGraph<T>
             if (reachable.Contains(entries[i].Output))
             {
                 indices.Add(i);
-                foreach (var input in entries[i].Inputs)
-                    reachable.Add(input);
+                var e = entries[i];
+                if (e.InputsOverflow is not null)
+                {
+                    foreach (var input in e.InputsOverflow) reachable.Add(input);
+                }
+                else
+                {
+                    reachable.Add(e.Input0);
+                    if (e.InputCount >= 2 && e.Input1 is not null) reachable.Add(e.Input1);
+                    if (e.InputCount >= 3 && e.Input2 is not null) reachable.Add(e.Input2);
+                }
             }
         }
 
@@ -90,7 +99,8 @@ public sealed class CompiledBackwardGraph<T>
                 continue;
 
             entry.ValidateInputVersions(); // same mutation safety check as uncompiled path
-            entry.Backward(gradOutput, entry.Inputs, entry.Output,
+            var inputsArray = entry.GetInputsArray();
+            entry.Backward(gradOutput, inputsArray, entry.Output,
                 entry.SavedState ?? Array.Empty<object>(), _engine, grads);
         }
 

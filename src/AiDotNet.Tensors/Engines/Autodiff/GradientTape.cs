@@ -198,18 +198,26 @@ public sealed class GradientTape<T> : IDisposable
                     relevantTensors.Add(s);
 
                 // Forward pass: mark tensors reachable from sources
+                // Uses inline input fields to avoid per-entry array allocation
                 for (int i = 0; i < _entries.Count; i++)
                 {
                     var entry = _entries[i];
                     bool inputRelevant = false;
-                    foreach (var inp in entry.Inputs)
+
+                    if (entry.InputsOverflow is not null)
                     {
-                        if (relevantTensors.Contains(inp))
+                        foreach (var inp in entry.InputsOverflow)
                         {
-                            inputRelevant = true;
-                            break;
+                            if (relevantTensors.Contains(inp)) { inputRelevant = true; break; }
                         }
                     }
+                    else
+                    {
+                        if (relevantTensors.Contains(entry.Input0)) inputRelevant = true;
+                        else if (entry.InputCount >= 2 && entry.Input1 is not null && relevantTensors.Contains(entry.Input1)) inputRelevant = true;
+                        else if (entry.InputCount >= 3 && entry.Input2 is not null && relevantTensors.Contains(entry.Input2)) inputRelevant = true;
+                    }
+
                     if (inputRelevant)
                     {
                         relevantTensors.Add(entry.Output);
@@ -253,8 +261,11 @@ public sealed class GradientTape<T> : IDisposable
                     opSw = System.Diagnostics.Stopwatch.StartNew();
                 }
 
+                // Construct input array once for this entry's backward pass
+                var inputsArray = entry.GetInputsArray();
+
                 // Invoke the backward function to propagate gradients to inputs
-                entry.Backward(gradOutput, entry.Inputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
+                entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
 
                 if (opSw is not null)
                 {
@@ -265,7 +276,7 @@ public sealed class GradientTape<T> : IDisposable
                 // Anomaly detection: check for NaN/Inf in computed input gradients
                 if (numOpsForAnomaly is not null)
                 {
-                    foreach (var input in entry.Inputs)
+                    foreach (var input in inputsArray)
                     {
                         if (grads.TryGetValue(input, out var inputGrad))
                         {
@@ -284,7 +295,7 @@ public sealed class GradientTape<T> : IDisposable
                 // Retain gradient for non-leaf tensors if requested
                 if (_retainGrad is not null)
                 {
-                    foreach (var input in entry.Inputs)
+                    foreach (var input in inputsArray)
                     {
                         if (_retainGrad.Contains(input) && grads.TryGetValue(input, out var retained))
                         {

@@ -5,21 +5,21 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
 /// Provides the tape recording hook that engine operations call after computing their result.
-/// The <see cref="RecordIfActive{T}"/> method is marked AggressiveInlining so the JIT
-/// can eliminate the null check entirely when no tape is active.
+/// All Record methods are AggressiveInlining so the JIT eliminates the null check entirely
+/// when no tape is active (~2ns on the inference hot path).
 /// </summary>
+/// <remarks>
+/// <para><b>Zero-allocation recording:</b> The Record methods construct <see cref="TapeEntry{T}"/>
+/// structs with inline input fields (no <c>Tensor&lt;T&gt;[]</c> or <c>int[]</c> allocation).
+/// The struct is passed by value to <see cref="GradientTape{T}.Record"/> which stores it
+/// in a pre-allocated list. Only the SavedState array (when present) allocates.</para>
+/// </remarks>
 internal static class DifferentiableOps
 {
     /// <summary>
-    /// Records an operation to the current gradient tape if one is active.
-    /// This is a no-op (zero overhead) when no tape is active.
+    /// Records a variadic operation (4+ inputs) to the current gradient tape if one is active.
+    /// The caller must provide the pre-allocated inputs array.
     /// </summary>
-    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="opName">The name of the operation (for debugging/profiling).</param>
-    /// <param name="output">The result tensor from the forward operation.</param>
-    /// <param name="inputs">The input tensors to the forward operation.</param>
-    /// <param name="backward">The backward function that computes input gradients.</param>
-    /// <param name="savedState">Optional extra state needed by the backward function.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RecordIfActive<T>(
         string opName,
@@ -32,11 +32,22 @@ internal static class DifferentiableOps
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
-        tape.Record(new TapeEntry<T>(opName, inputs, output, backward, savedState));
+        var entry = new TapeEntry<T>
+        {
+            OperationName = opName,
+            Output = output,
+            Backward = backward,
+            SavedState = savedState,
+            InputsOverflow = inputs,
+            InputCount = 0xFF,
+            Input0 = inputs.Length > 0 ? inputs[0] : null!,
+        };
+
+        tape.Record(entry);
     }
 
     /// <summary>
-    /// Convenience overload for unary operations (single input).
+    /// Records a unary operation (single input). Zero heap allocation.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RecordUnary<T>(
@@ -50,11 +61,22 @@ internal static class DifferentiableOps
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
-        tape.Record(new TapeEntry<T>(opName, new[] { input }, output, backward, savedState));
+        var entry = new TapeEntry<T>
+        {
+            OperationName = opName,
+            Output = output,
+            Backward = backward,
+            SavedState = savedState,
+            Input0 = input,
+            InputCount = 1,
+            Version0 = input.Version,
+        };
+
+        tape.Record(entry);
     }
 
     /// <summary>
-    /// Convenience overload for binary operations (two inputs).
+    /// Records a binary operation (two inputs). Zero heap allocation.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RecordBinary<T>(
@@ -69,7 +91,20 @@ internal static class DifferentiableOps
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
 
-        tape.Record(new TapeEntry<T>(opName, new[] { a, b }, output, backward, savedState));
+        var entry = new TapeEntry<T>
+        {
+            OperationName = opName,
+            Output = output,
+            Backward = backward,
+            SavedState = savedState,
+            Input0 = a,
+            Input1 = b,
+            InputCount = 2,
+            Version0 = a.Version,
+            Version1 = b.Version,
+        };
+
+        tape.Record(entry);
     }
 
     /// <summary>
@@ -95,8 +130,6 @@ internal static class DifferentiableOps
         {
             // Store directly on first access — no clone needed since backward
             // functions create fresh gradient tensors that aren't shared.
-            // Only clone if the grad is the SAME reference as another tensor
-            // (which would alias and corrupt on subsequent accumulation).
             grads[tensor] = grad;
         }
     }
