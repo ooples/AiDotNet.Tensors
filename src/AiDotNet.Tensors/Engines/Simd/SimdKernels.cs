@@ -5727,6 +5727,68 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Fused ReLU backward with scalar gradient — eliminates the intermediate fill tensor.
+        /// Computes: output[i] = (input[i] > 0) ? scale : 0
+        /// This is equivalent to MeanBackward + ReLU backward but reads only 1 array instead of 2,
+        /// halving memory bandwidth and eliminating a 4MB allocation for 1M-element tensors.
+        /// </summary>
+        public static unsafe void ReluBackwardScalarUnsafe(float scale, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx512F.IsSupported)
+            {
+                var vzero = Vector512<float>.Zero;
+                var vscale = Vector512.Create(scale);
+                var vscaleBytes = vscale.AsByte();
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    var m0 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsByte();
+                    var m1 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 16), vzero).AsByte();
+                    var m2 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 32), vzero).AsByte();
+                    var m3 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 48), vzero).AsByte();
+                    Avx512F.Store(output + i, Avx512F.And(vscaleBytes, m0).AsSingle());
+                    Avx512F.Store(output + i + 16, Avx512F.And(vscaleBytes, m1).AsSingle());
+                    Avx512F.Store(output + i + 32, Avx512F.And(vscaleBytes, m2).AsSingle());
+                    Avx512F.Store(output + i + 48, Avx512F.And(vscaleBytes, m3).AsSingle());
+                }
+                int simd16 = length & ~15;
+                for (; i < simd16; i += 16)
+                {
+                    var m = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsByte();
+                    Avx512F.Store(output + i, Avx512F.And(vscaleBytes, m).AsSingle());
+                }
+            }
+            else if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                var vscale = Vector256.Create(scale);
+                int simd32 = length & ~31;
+                for (; i < simd32; i += 32)
+                {
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(vscale, mask0));
+                    Avx.Store(output + i + 8, Avx.And(vscale, mask1));
+                    Avx.Store(output + i + 16, Avx.And(vscale, mask2));
+                    Avx.Store(output + i + 24, Avx.And(vscale, mask3));
+                }
+                int simd8 = length & ~7;
+                for (; i < simd8; i += 8)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(vscale, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] > 0 ? scale : 0;
+        }
+
+        /// <summary>
         /// SIMD-accelerated GELU backward using the tanh approximation.
         /// d/dx[GELU(x)] = 0.5*(1 + tanh(k)) + 0.5*x*(1 - tanh(k)^2)*k'
         /// where k = sqrt(2/pi)*(x + 0.044715*x^3)

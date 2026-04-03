@@ -965,6 +965,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         ThrowIfSparse();
         _numOps.Fill(_data.AsWritableSpan(), value);
+        UniformFillValue = _numOps.ToDouble(value);
     }
 
     /// <summary>

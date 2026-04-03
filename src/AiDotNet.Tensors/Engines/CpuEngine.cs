@@ -20735,19 +20735,34 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
-        int length = gradOutput.Length;
+        int length = input.Length;
+
+        // Fused scalar path: when gradOutput is a uniform-fill tensor (e.g., from MeanBackward),
+        // every element is the same value. Use scalar kernel that reads only the input array,
+        // eliminating 4MB of grad reads and the fill allocation for 1M-element tensors.
+        if (typeof(T) == typeof(float) && gradOutput.UniformFillValue.HasValue)
+        {
+            float scale = (float)gradOutput.UniformFillValue.Value;
+            var resultTensor = TensorAllocator.RentUninitialized<T>(input._shape);
+            var iArr = (float[])(object)input.GetDataArray();
+            var rArr = (float[])(object)resultTensor.GetDataArray();
+            fixed (float* pI = iArr, pR = rArr)
+                SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pR, length);
+            return resultTensor;
+        }
+
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         // Use RentUninitialized — backward kernel writes every element
-        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+        var resultTensor2 = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
 
         if (typeof(T) == typeof(float))
         {
             // Already contiguous (ensured above) — use GetDataArray() directly, no copy
             var gArr = (float[])(object)gradOutput.GetDataArray();
             var iArr = (float[])(object)input.GetDataArray();
-            var rArr = (float[])(object)resultTensor.GetDataArray();
+            var rArr = (float[])(object)resultTensor2.GetDataArray();
             fixed (float* pG = gArr, pI = iArr, pR = rArr)
                 SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
@@ -20756,7 +20771,7 @@ public class CpuEngine : ITensorLevelEngine
             // Double SIMD backward (AVX2: 4 doubles per vector)
             var gMem = AsDoubleMemory(gradOutput.Data);
             var iMem = AsDoubleMemory(input.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
+            var rMem = AsDoubleMemory(resultTensor2.Data);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -20771,7 +20786,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             var gradData = gradOutput.GetDataArray();
             var inputData = input.GetDataArray();
-            var resultData = resultTensor.GetDataArray();
+            var resultData = resultTensor2.GetDataArray();
             for (int i = 0; i < length; i++)
             {
                 double inputVal = numOps.ToDouble(inputData[i]);
@@ -20779,7 +20794,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return resultTensor;
+        return resultTensor2;
     }
 
     /// <inheritdoc/>

@@ -172,6 +172,14 @@ public abstract class TensorBase<T> : IDisposable
     public bool IsDirty { get; internal set; }
 
     /// <summary>
+    /// When non-null, indicates this tensor was created by a uniform Fill operation and
+    /// every element has this value. Backward kernels can use the scalar directly instead
+    /// of reading N identical elements from memory (saves bandwidth for fused backward paths).
+    /// Reset to null by any non-fill mutation.
+    /// </summary>
+    internal double? UniformFillValue { get; set; }
+
+    /// <summary>
     /// Waits for all pending GPU operations on this tensor to complete.
     /// Call this before reading GPU results to ensure correctness.
     /// </summary>
