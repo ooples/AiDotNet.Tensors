@@ -231,7 +231,7 @@ public sealed class GradientTape<T> : IDisposable
                 // Uses inline input fields to avoid per-entry array allocation
                 for (int i = 0; i < _entries.Count; i++)
                 {
-                    var entry = _entries[i];
+                    ref var entry = ref _entries[i];
                     bool inputRelevant = false;
 
                     if (entry.InputsOverflow is not null)
@@ -257,7 +257,7 @@ public sealed class GradientTape<T> : IDisposable
 
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
-                var entry = _entries[i];
+                ref var entry = ref _entries[i];
 
                 // Skip if we don't have a gradient for this entry's output
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))

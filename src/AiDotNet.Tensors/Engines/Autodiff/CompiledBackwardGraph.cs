@@ -93,7 +93,7 @@ public sealed class CompiledBackwardGraph<T>
         // Execute only reachable entries (dead node elimination applied)
         foreach (int i in _reachableEntryIndices)
         {
-            var entry = _entries[i];
+            ref var entry = ref _entries[i];
 
             if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 continue;
