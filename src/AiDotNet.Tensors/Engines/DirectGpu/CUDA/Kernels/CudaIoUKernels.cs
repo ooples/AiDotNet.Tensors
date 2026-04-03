@@ -276,24 +276,16 @@ extern ""C"" __global__ void giou_loss_backward(
     dI[3] = hasInter * (py2<ty2?1.0f:0.0f) * iw;
     dU[0] = -ph - dI[0]; dU[1] = -pw - dI[1]; dU[2] = ph - dI[2]; dU[3] = pw - dI[3];
 
-    // GIoU penalty: P = (encA - U)/encA = 1 - U/encA
-    // ∂P/∂coord = -(∂U/∂coord * encA - U * ∂encA/∂coord) / encA²
+    // GIoU = IoU - P where P = (encA - U)/encA
+    // loss = 1 - GIoU = 1 - IoU + P
+    // ∂loss/∂coord = -∂IoU/∂coord + ∂P/∂coord
+    // compute_iou_grad(..., 1.0f, iouGrad) gives iouGrad[c] = -∂IoU/∂coord (go=1 inside helper)
     float encASq = encA * encA;
     for (int c = 0; c < 4; c++) {
-        float dP = -(dU[c] * encA - uA * dEncA[c]) / encASq;
-        // GIoU = IoU - P → loss = 1 - GIoU → ∂loss/∂coord = -(∂IoU/∂coord - ∂P/∂coord)
-        gradPredicted[off+c] = go * -(iouGrad[c]/go - dP);  // iouGrad already has -∂IoU/∂coord * go
-    }
-    // Fix: iouGrad[c] = go * (-∂IoU/∂coord), so ∂IoU/∂coord = -iouGrad[c]/go
-    // ∂loss = -(∂IoU - ∂P) = -(-iouGrad[c]/go) - (-dP) ... let me simplify:
-    // loss = 1 - GIoU = 1 - IoU + P
-    // ∂loss = -∂IoU + ∂P = iouGrad[c]/go + dP (since iouGrad = go * (-∂IoU))
-    for (int c = 0; c < 4; c++) {
-        float dIoU_dc = -iouGrad[c] / go;  // ∂IoU/∂coord (positive when IoU increases)
         float dP_dc = -(dU[c] * encA - uA * dEncA[c]) / encASq;
-        // ∂loss/∂coord = -∂IoU/∂coord + ∂P/∂coord (since loss = 1 - IoU + P)
-        // Wait: GIoU = IoU - P → loss = 1 - GIoU = 1 - IoU + P
-        gradPredicted[off+c] = go * (-dIoU_dc + dP_dc);
+        // iouGrad[c] = -∂IoU/∂coord, so ∂(1-IoU)/∂coord = iouGrad[c]
+        // ∂loss/∂coord = ∂(1-IoU)/∂coord + ∂P/∂coord = iouGrad[c] + dP_dc
+        gradPredicted[off+c] = go * (iouGrad[c] + dP_dc);
     }
 }
 
@@ -346,10 +338,10 @@ extern ""C"" __global__ void diou_loss_backward(
     // ∂P/∂coord = (∂ρ²/∂coord * c² - ρ² * ∂c²/∂coord) / c⁴
     float cSqSq = cSq * cSq;
     for (int c = 0; c < 4; c++) {
-        float dIoU = -iouGrad[c];  // iouGrad = -∂IoU (from loss = 1-IoU convention)
         float dP = (dRho[c] * cSq - rhoSq * dCSq[c]) / cSqSq;
         // loss = 1 - DIoU = 1 - IoU + P → ∂loss = -∂IoU + ∂P
-        gradPredicted[off+c] = go * (dIoU + dP);
+        // iouGrad[c] = -∂IoU/∂coord = ∂(1-IoU)/∂coord, so ∂loss = iouGrad[c] + dP
+        gradPredicted[off+c] = go * (iouGrad[c] + dP);
     }
 }
 
@@ -416,11 +408,11 @@ extern ""C"" __global__ void ciou_loss_backward(
 
     float cSqSq = cSq * cSq;
     for (int c = 0; c < 4; c++) {
-        float dIoU = -iouGrad[c];
         float dDistPenalty = (dRho[c] * cSq - rhoSq * dCSq[c]) / cSqSq;
-        float dAspectPenalty = alpha * dV[c];  // ∂(alpha*v)/∂coord ≈ alpha * ∂v/∂coord (alpha treated as detached)
+        float dAspectPenalty = alpha * dV[c];  // alpha detached per CIoU paper
         // loss = 1 - CIoU = 1 - IoU + distPenalty + aspectPenalty
-        gradPredicted[off+c] = go * (dIoU + dDistPenalty + dAspectPenalty);
+        // iouGrad[c] = -∂IoU/∂coord = ∂(1-IoU)/∂coord
+        gradPredicted[off+c] = go * (iouGrad[c] + dDistPenalty + dAspectPenalty);
     }
 }
 ";

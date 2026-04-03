@@ -22869,8 +22869,9 @@ public class CpuEngine : ITensorLevelEngine
         // IoU = intersection / union
         var iou = TensorDivide(interArea, unionArea);
 
-        // Loss = 1 - IoU
-        return ScalarMinusTensor(MathHelper.GetNumericOperations<T>().One, iou);
+        // Loss = 1 - IoU, reshape from [N,1] to [N] via tape-tracked engine op
+        var loss = ScalarMinusTensor(MathHelper.GetNumericOperations<T>().One, iou);
+        return Reshape(loss, new[] { n });
     }
 
     /// <inheritdoc/>
@@ -22928,8 +22929,8 @@ public class CpuEngine : ITensorLevelEngine
         var fillRatio = TensorDivide(TensorSubtract(encArea, unionArea), encArea);
         var giou = TensorSubtract(iou, fillRatio);
 
-        // Loss = 1 - GIoU
-        return ScalarMinusTensor(numOps.One, giou);
+        // Loss = 1 - GIoU, reshape from [N,1] to [N]
+        return Reshape(ScalarMinusTensor(numOps.One, giou), new[] { n });
     }
 
     /// <inheritdoc/>
@@ -22994,7 +22995,8 @@ public class CpuEngine : ITensorLevelEngine
         var penalty = TensorDivide(centerDistSq, diagSq);
         var diou = TensorSubtract(iou, penalty);
 
-        return ScalarMinusTensor(numOps.One, diou);
+        // Reshape from [N,1] to [N]
+        return Reshape(ScalarMinusTensor(numOps.One, diou), new[] { n });
     }
 
     /// <inheritdoc/>
@@ -23090,7 +23092,8 @@ public class CpuEngine : ITensorLevelEngine
         var aspectPenalty = TensorMultiply(alpha, v);
         var ciou = TensorSubtract(TensorSubtract(iou, distPenalty), aspectPenalty);
 
-        return ScalarMinusTensor(numOps.One, ciou);
+        // Reshape from [N,1] to [N]
+        return Reshape(ScalarMinusTensor(numOps.One, ciou), new[] { n });
     }
 
     private static Memory<float> AsFloatMemory<T>(Memory<T> data)
