@@ -9,8 +9,8 @@ namespace AiDotNet.Tensors.Engines.Gpu.Graph;
 /// </summary>
 public sealed class FusedKernelNode : ExecutionNode
 {
-    private readonly IGpuTensor[] _inputs;
-    private readonly IGpuTensor[] _outputs;
+    private readonly Tensor<float>[] _inputs;
+    private readonly Tensor<float>[] _outputs;
     private readonly Action<IDirectGpuBackend, IGpuStream?> _fusedKernelAction;
     private readonly List<ExecutionNode> _originalNodes;
 
@@ -18,10 +18,10 @@ public sealed class FusedKernelNode : ExecutionNode
     public override ExecutionNodeType NodeType => ExecutionNodeType.FusedKernel;
 
     /// <inheritdoc/>
-    public override IReadOnlyList<IGpuTensor> InputTensors => _inputs;
+    public override IReadOnlyList<Tensor<float>> InputTensors => _inputs;
 
     /// <inheritdoc/>
-    public override IReadOnlyList<IGpuTensor> OutputTensors => _outputs;
+    public override IReadOnlyList<Tensor<float>> OutputTensors => _outputs;
 
     /// <inheritdoc/>
     public override bool CanFuse => false; // Already fused
@@ -73,8 +73,8 @@ public sealed class FusedKernelNode : ExecutionNode
     /// <param name="parameters">Additional parameters.</param>
     public FusedKernelNode(
         FusedOperationType fusedType,
-        IGpuTensor[] inputs,
-        IGpuTensor[] outputs,
+        Tensor<float>[] inputs,
+        Tensor<float>[] outputs,
         Action<IDirectGpuBackend, IGpuStream?> fusedKernelAction,
         IEnumerable<ExecutionNode>? originalNodes = null,
         FusedActivationType? activation = null,
@@ -114,27 +114,7 @@ public sealed class FusedKernelNode : ExecutionNode
         // shared-event double-dispose when MarkModified replaces a previous sync point.
         foreach (var output in _outputs)
         {
-            switch (output)
-            {
-                case Tensor<float> floatTensor:
-                    floatTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
-                    break;
-                case Tensor<double> doubleTensor:
-                    doubleTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
-                    break;
-                case Tensor<int> intTensor:
-                    intTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
-                    break;
-                case Tensor<long> longTensor:
-                    longTensor.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
-                    break;
-                case IGpuTensor<float> legacyFloat:
-                    legacyFloat.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
-                    break;
-                case IGpuTensor gpuTensor:
-                    gpuTensor.Synchronize();
-                    break;
-            }
+            output.MarkModified(new FusedSyncPoint(stream.RecordEvent(), stream));
         }
 
         // Record completion for dependents on other streams
@@ -167,7 +147,7 @@ public sealed class FusedKernelNode : ExecutionNode
     /// Creates a GEMM+Bias fused node.
     /// </summary>
     public static FusedKernelNode CreateGemmBias(
-        IGpuTensor a, IGpuTensor b, IGpuTensor bias, IGpuTensor output,
+        Tensor<float> a, Tensor<float> b, Tensor<float> bias, Tensor<float> output,
         int m, int n, int k,
         Action<IDirectGpuBackend, IGpuStream?> action,
         IEnumerable<ExecutionNode>? originalNodes = null)
@@ -191,7 +171,7 @@ public sealed class FusedKernelNode : ExecutionNode
     /// Creates a GEMM+Bias+Activation fused node.
     /// </summary>
     public static FusedKernelNode CreateGemmBiasActivation(
-        IGpuTensor a, IGpuTensor b, IGpuTensor bias, IGpuTensor output,
+        Tensor<float> a, Tensor<float> b, Tensor<float> bias, Tensor<float> output,
         int m, int n, int k,
         FusedActivationType activation,
         Action<IDirectGpuBackend, IGpuStream?> action,

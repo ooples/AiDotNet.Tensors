@@ -9756,7 +9756,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="sparseA">CSR sparse tensor A [M, K].</param>
     /// <param name="denseB">GPU-resident dense tensor B [K, N].</param>
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
-    public Tensor<T> SparseDenseMatMulGpu<T>(ICsrGpuTensor<T> sparseA, Tensor<T> denseB)
+    public Tensor<T> SparseDenseMatMulGpu<T>(SparseTensor<T> sparseA, Tensor<T> denseB)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulGpu");
@@ -9764,28 +9764,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (sparseA is null) throw new ArgumentNullException(nameof(sparseA));
         if (denseB is null) throw new ArgumentNullException(nameof(denseB));
 
-        // Validate dimensions: A[M,K] @ B[K,N] -> C[M,N]
         if (denseB.Shape._dims.Length != 2)
             throw new ArgumentException("Dense tensor B must be 2D [K, N]");
 
         int M = sparseA.Rows;
-        int K = sparseA.Cols;
+        int K = sparseA.Columns;
         int N = denseB.Shape._dims[1];
 
         if (denseB.Shape._dims[0] != K)
             throw new ArgumentException($"Dimension mismatch: sparse A has {K} columns, but dense B has {denseB.Shape._dims[0]} rows");
 
-        // Allocate output buffer
-        var outputBuffer = backend.AllocateBuffer(M * N);
+        // Upload CSR data to GPU
+        var coo = sparseA.ToCoo();
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+        var floatVals = new float[coo.Values.Length];
+        for (int i = 0; i < coo.Values.Length; i++)
+            floatVals[i] = (float)numOps.ToDouble(coo.Values[i]);
+        var valsBuf = backend.AllocateBuffer(floatVals);
+        var colsBuf = backend.AllocateBuffer(coo.ColumnIndices.Select(x => (float)x).ToArray());
+        var rowPtrBuf = backend.AllocateBuffer(coo.RowPointers.Select(x => (float)x).ToArray());
 
-        // Execute CSR SpMM
-        backend.CsrSpMM(
-            sparseA.Values,
-            sparseA.ColumnIndices,
-            sparseA.RowPointers,
-            denseB.Buffer,
-            outputBuffer,
-            M, K, N, sparseA.Nnz);
+        var outputBuffer = backend.AllocateBuffer(M * N);
+        backend.CsrSpMM(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, outputBuffer, M, K, N, sparseA.NonZeroCount);
+
+        valsBuf.Dispose();
+        colsBuf.Dispose();
+        rowPtrBuf.Dispose();
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
@@ -9800,7 +9804,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="denseB">GPU-resident dense tensor B [K, N].</param>
     /// <param name="bias">Bias tensor [N].</param>
     /// <returns>GPU-resident dense output tensor C [M, N].</returns>
-    public Tensor<T> SparseDenseMatMulBiasGpu<T>(ICsrGpuTensor<T> sparseA, Tensor<T> denseB, Tensor<T> bias)
+    public Tensor<T> SparseDenseMatMulBiasGpu<T>(SparseTensor<T> sparseA, Tensor<T> denseB, Tensor<T> bias)
     {
         if (!TryGetBackend(out var backend))
             throw new InvalidOperationException("No GPU backend available for SparseDenseMatMulBiasGpu");
@@ -9814,7 +9818,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException("Dense tensor B must be 2D [K, N]");
 
         int M = sparseA.Rows;
-        int K = sparseA.Cols;
+        int K = sparseA.Columns;
         int N = denseB.Shape._dims[1];
 
         if (denseB.Shape._dims[0] != K)
@@ -9823,21 +9827,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (bias.Length != N)
             throw new ArgumentException($"Bias length {bias.Length} must match output columns {N}");
 
-        // Upload bias
+        // Upload CSR data and bias to GPU
+        var coo = sparseA.ToCoo();
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+        var floatVals = new float[coo.Values.Length];
+        for (int i = 0; i < coo.Values.Length; i++)
+            floatVals[i] = (float)numOps.ToDouble(coo.Values[i]);
+        var valsBuf = backend.AllocateBuffer(floatVals);
+        var colsBuf = backend.AllocateBuffer(coo.ColumnIndices.Select(x => (float)x).ToArray());
+        var rowPtrBuf = backend.AllocateBuffer(coo.RowPointers.Select(x => (float)x).ToArray());
         using var biasBuffer = GetOrCacheWeightBuffer(backend, bias.GetDataArray(), PersistentTensorRole.Biases);
 
-        // Allocate output buffer
         var outputBuffer = backend.AllocateBuffer(M * N);
+        backend.CsrSpMMBias(valsBuf, colsBuf, rowPtrBuf, denseB.Buffer, biasBuffer.Buffer, outputBuffer, M, K, N, sparseA.NonZeroCount);
 
-        // Execute CSR SpMM with bias
-        backend.CsrSpMMBias(
-            sparseA.Values,
-            sparseA.ColumnIndices,
-            sparseA.RowPointers,
-            denseB.Buffer,
-            biasBuffer.Buffer,
-            outputBuffer,
-            M, K, N, sparseA.Nnz);
+        valsBuf.Dispose();
+        colsBuf.Dispose();
+        rowPtrBuf.Dispose();
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, [M, N],
             GpuTensorRole.Activation, ownsBuffer: true);
@@ -9922,31 +9928,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <param name="values">Edge values (weights). If null, uses 1.0 for all edges.</param>
     /// <param name="numNodes">Number of nodes in the graph.</param>
     /// <returns>CSR GPU tensor representing the adjacency matrix.</returns>
-    public CsrGpuTensor<T> CreateCsrFromEdges<T>(
+    public SparseTensor<T> CreateCsrFromEdges<T>(
         int[] sourceIndices,
         int[] targetIndices,
         float[]? values,
         int numNodes)
     {
-        if (!TryGetBackend(out var backend))
-            throw new InvalidOperationException("No GPU backend available for CreateCsrFromEdges");
-
-        return CsrGpuTensorFactory.FromEdgeIndices<T>(backend, sourceIndices, targetIndices, values, numNodes);
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+        var edgeValues = values ?? Enumerable.Repeat(1f, sourceIndices.Length).ToArray();
+        var typedValues = new T[edgeValues.Length];
+        for (int i = 0; i < edgeValues.Length; i++)
+            typedValues[i] = numOps.FromDouble(edgeValues[i]);
+        return new SparseTensor<T>(numNodes, numNodes, sourceIndices, targetIndices, typedValues);
     }
 
     /// <summary>
-    /// Creates a CSR GPU tensor from a dense tensor by extracting non-zero elements.
+    /// Creates a sparse tensor from a dense tensor by extracting non-zero elements.
     /// </summary>
-    /// <typeparam name="T">The element type.</typeparam>
-    /// <param name="denseTensor">Dense tensor to convert (must be 2D).</param>
-    /// <param name="threshold">Values with absolute value below this are treated as zero.</param>
-    /// <returns>CSR GPU tensor.</returns>
-    public CsrGpuTensor<T> CreateCsrFromDense<T>(Tensor<T> denseTensor, float threshold = 1e-6f)
+    public SparseTensor<T> CreateCsrFromDense<T>(Tensor<T> denseTensor, float threshold = 1e-6f)
     {
-        if (!TryGetBackend(out var backend))
-            throw new InvalidOperationException("No GPU backend available for CreateCsrFromDense");
-
-        return CsrGpuTensorFactory.FromDenseTensor(backend, denseTensor, threshold);
+        if (denseTensor.Rank != 2)
+            throw new ArgumentException("Dense tensor must be 2D for CSR conversion.");
+        int rows = denseTensor._shape[0], cols = denseTensor._shape[1];
+        var numOps = Helpers.MathHelper.GetNumericOperations<T>();
+        var rowIdx = new System.Collections.Generic.List<int>();
+        var colIdx = new System.Collections.Generic.List<int>();
+        var vals = new System.Collections.Generic.List<T>();
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                var val = denseTensor[r, c];
+                if (Math.Abs(numOps.ToDouble(val)) >= threshold)
+                {
+                    rowIdx.Add(r);
+                    colIdx.Add(c);
+                    vals.Add(val);
+                }
+            }
+        return new SparseTensor<T>(rows, cols, rowIdx.ToArray(), colIdx.ToArray(), vals.ToArray());
     }
 
     #region Element-wise Operations (GPU)

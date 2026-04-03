@@ -1,3 +1,4 @@
+﻿using AiDotNet.Tensors.LinearAlgebra;
 using System.Collections.Concurrent;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
@@ -76,7 +77,7 @@ public sealed class GpuTensorRegistry : IDisposable
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="tensor">The tensor to register.</param>
     /// <returns>A registration handle that should be kept while the tensor is in use.</returns>
-    public TensorRegistration Register<T>(IGpuTensor<T> tensor)
+    public TensorRegistration Register(Tensor<float> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         return RegisterBuffer(tensor.Buffer, tensor.Role);
@@ -84,7 +85,7 @@ public sealed class GpuTensorRegistry : IDisposable
 
     /// <summary>
     /// Registers a GPU buffer allocation for memory tracking.
-    /// Works with both legacy IGpuTensor and unified Tensor types.
+    /// Works with both legacy Tensor<float> and unified Tensor types.
     /// </summary>
     public TensorRegistration RegisterBuffer(DirectGpu.IGpuBuffer buffer, GpuTensorRole role)
     {
@@ -112,7 +113,7 @@ public sealed class GpuTensorRegistry : IDisposable
     /// <typeparam name="T">The element type.</typeparam>
     /// <param name="tensor">The tensor to register.</param>
     /// <returns>True if the tensor was registered, false if already registered or disposed.</returns>
-    public bool TryRegister<T>(IGpuTensor<T> tensor)
+    public bool TryRegister(Tensor<float> tensor)
     {
         if (_disposed || tensor.Buffer is null)
         {
