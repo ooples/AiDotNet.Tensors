@@ -409,7 +409,8 @@ public class SparseTensor<T> : Tensor<T>
 
     /// <summary>
     /// Gets or sets the value at the specified (row, col) indices via sparse lookup.
-    /// For COO: linear scan. For CSR: binary search within row. Returns zero for missing entries.
+    /// For CSR: binary search within row's column index range. For COO: linear scan.
+    /// Returns zero for missing entries.
     /// </summary>
     public override T this[params int[] indices]
     {
@@ -418,17 +419,18 @@ public class SparseTensor<T> : Tensor<T>
             if (indices.Length != 2)
                 throw new ArgumentException("SparseTensor indexing requires exactly 2 indices [row, col].");
             int row = indices[0], col = indices[1];
+            if ((uint)row >= (uint)Rows)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Row index {row} out of range [0, {Rows}).");
+            if ((uint)col >= (uint)Columns)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"Column index {col} out of range [0, {Columns}).");
             var ops = MathHelper.GetNumericOperations<T>();
 
             if (Format == SparseStorageFormat.Csr)
             {
                 int start = RowPointers[row], end = RowPointers[row + 1];
-                for (int i = start; i < end; i++)
-                {
-                    if (ColumnIndices[i] == col)
-                        return DataVector[i];
-                }
-                return ops.Zero;
+                // Binary search: CSR column indices are sorted within each row
+                int idx = Array.BinarySearch(ColumnIndices, start, end - start, col);
+                return idx >= 0 ? DataVector[idx] : ops.Zero;
             }
 
             // COO: linear scan
@@ -450,14 +452,15 @@ public class SparseTensor<T> : Tensor<T>
     /// </summary>
     public SparseTensor<T> CloneSparse()
     {
+        // DataVector.ToArray() already returns a new copy — no need to clone again
         var values = DataVector.ToArray();
         return Format switch
         {
             SparseStorageFormat.Coo => new SparseTensor<T>(Rows, Columns,
-                (int[])RowIndices.Clone(), (int[])ColumnIndices.Clone(), (T[])values.Clone()),
+                (int[])RowIndices.Clone(), (int[])ColumnIndices.Clone(), values),
             SparseStorageFormat.Csr => FromCsr(Rows, Columns,
-                (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), (T[])values.Clone()),
-            _ => ToCsr().CloneSparse() // CSC → convert to CSR then clone
+                (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), values),
+            _ => ToCsr().CloneSparse()
         };
     }
 

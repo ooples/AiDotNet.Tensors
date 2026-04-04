@@ -116,7 +116,7 @@ public class SparseTensorAutodiffTests
     }
 
     [Fact]
-    public void SparseTensor_WorksWithGradientTape()
+    public void SparseTensor_ToDense_ThenGradientTape_ProducesGradients()
     {
         // Simulate sparse parameter in a training step
         var sparseWeight = new SparseTensor<float>(3, 3,
