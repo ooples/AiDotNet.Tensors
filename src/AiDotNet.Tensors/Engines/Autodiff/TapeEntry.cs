@@ -100,6 +100,10 @@ public struct TapeEntry<T>
     public Tensor<T>[] GetInputsArray()
     {
         if (InputsOverflow is not null) return InputsOverflow;
+        // Allocate small arrays per call — avoids ThreadStatic reuse issues with
+        // re-entrant backward (gradient checkpointing calls backward inside backward).
+        // For 1-3 element arrays, the allocation is tiny (~40 bytes) and the JIT
+        // may stack-allocate or pool them.
         return InputCount switch
         {
             1 => new[] { Input0 },

@@ -6110,43 +6110,44 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var result = TensorAllocator.Rent<T>(tensor._shape);
+        // RentUninitialized — ReLU writes every element, no need to zero
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
-            using var pinSrc = srcMem.Pin();
-            using var pinDst = dstMem.Pin();
-            float* pSrc = (float*)pinSrc.Pointer;
-            float* pDst = (float*)pinDst.Pointer;
+            var srcArr = (float[])(object)tensor.GetDataArray();
+            var dstArr = (float[])(object)result.GetDataArray();
 
-            if (CpuJitSelfTest.IsVerified && length >= 64)
+            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (reluChunks >= 2)
             {
-                JitUnaryDispatch(pSrc, pDst, length);
+                // Parallel path: must use Pin for lambda capture
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                float* pSrcP = (float*)pinSrc.Pointer;
+                float* pDstP = (float*)pinDst.Pointer;
+                int chunkSize = (length + reluChunks - 1) / reluChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, reluChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.ReLUUnsafe(pSrcP + start, pDstP + start, count);
+                });
             }
             else
             {
-                int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
-                if (reluChunks >= 2)
+                // Single-threaded: fixed avoids GCHandle allocation overhead
+                fixed (float* pSrc = srcArr, pDst = dstArr)
                 {
-                    int chunkSize = (length + reluChunks - 1) / reluChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-
-                    Parallel.For(0, reluChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
-                        }
-                    });
-                }
-                else
-                {
-                    SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                    if (CpuJitSelfTest.IsVerified && length >= 64)
+                        JitUnaryDispatch(pSrc, pDst, length);
+                    else
+                        SimdKernels.ReLUUnsafe(pSrc, pDst, length);
                 }
             }
         }
@@ -20735,19 +20736,33 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
-        int length = gradOutput.Length;
+        int length = input.Length;
 
-        // Use RentUninitialized — backward kernel writes every element
-        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+        // Fused scalar path: when gradOutput is a uniform-fill tensor (e.g., from MeanBackward),
+        // every element is the same value. Use scalar kernel that reads only the input array,
+        // eliminating 4MB of grad reads and the fill allocation for 1M-element tensors.
+        if (typeof(T) == typeof(float) && gradOutput.UniformFillValue.HasValue)
+        {
+            float scale = (float)gradOutput.UniformFillValue.Value;
+            var resultTensor = TensorAllocator.RentUninitialized<T>(input._shape);
+            var iArr = (float[])(object)input.GetDataArray();
+            var rArr = (float[])(object)resultTensor.GetDataArray();
+            fixed (float* pI = iArr, pR = rArr)
+                SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pR, length);
+            return resultTensor;
+        }
+
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+
+        // Allocating path: new output buffer
+        var resultTensor2 = TensorAllocator.RentUninitialized<T>(input._shape);
 
         if (typeof(T) == typeof(float))
         {
-            // Use fixed instead of Memory.Pin() — avoids GCHandle allocation overhead
-            var gArr = (float[])(object)gradOutput.GetFlattenedData();
-            var iArr = (float[])(object)input.GetFlattenedData();
-            var rArr = (float[])(object)resultTensor.GetDataArray();
+            var gArr = (float[])(object)gradOutput.GetDataArray();
+            var iArr = (float[])(object)input.GetDataArray();
+            var rArr = (float[])(object)resultTensor2.GetDataArray();
             fixed (float* pG = gArr, pI = iArr, pR = rArr)
                 SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
         }
@@ -20756,7 +20771,7 @@ public class CpuEngine : ITensorLevelEngine
             // Double SIMD backward (AVX2: 4 doubles per vector)
             var gMem = AsDoubleMemory(gradOutput.Data);
             var iMem = AsDoubleMemory(input.Data);
-            var rMem = AsDoubleMemory(resultTensor.Data);
+            var rMem = AsDoubleMemory(resultTensor2.Data);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -20770,8 +20785,8 @@ public class CpuEngine : ITensorLevelEngine
         else
         {
             var gradData = gradOutput.GetDataArray();
-            var inputData = input.GetFlattenedData();
-            var resultData = resultTensor.GetDataArray();
+            var inputData = input.GetDataArray();
+            var resultData = resultTensor2.GetDataArray();
             for (int i = 0; i < length; i++)
             {
                 double inputVal = numOps.ToDouble(inputData[i]);
@@ -20779,7 +20794,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return resultTensor;
+        return resultTensor2;
     }
 
     /// <inheritdoc/>

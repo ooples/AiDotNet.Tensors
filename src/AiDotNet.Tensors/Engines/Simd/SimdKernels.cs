@@ -5636,7 +5636,39 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            // AVX-512: 16 floats per vector, 128 floats per iteration — 2x throughput vs AVX-256
+            if (Avx512F.IsSupported)
+            {
+                var vzero = Vector512<float>.Zero;
+                int simd128 = length & ~127;
+                for (; i < simd128; i += 128)
+                {
+                    // input > 0 produces all-ones/all-zeros mask; AND with grad zeros out negative lanes
+                    var m0 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    var m1 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 16), vzero).AsInt32();
+                    var m2 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 32), vzero).AsInt32();
+                    var m3 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 48), vzero).AsInt32();
+                    var m4 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 64), vzero).AsInt32();
+                    var m5 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 80), vzero).AsInt32();
+                    var m6 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 96), vzero).AsInt32();
+                    var m7 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 112), vzero).AsInt32();
+                    Avx512F.Store(output + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsInt32(), m0).AsSingle());
+                    Avx512F.Store(output + i + 16, Avx512F.And(Avx512F.LoadVector512(grad + i + 16).AsInt32(), m1).AsSingle());
+                    Avx512F.Store(output + i + 32, Avx512F.And(Avx512F.LoadVector512(grad + i + 32).AsInt32(), m2).AsSingle());
+                    Avx512F.Store(output + i + 48, Avx512F.And(Avx512F.LoadVector512(grad + i + 48).AsInt32(), m3).AsSingle());
+                    Avx512F.Store(output + i + 64, Avx512F.And(Avx512F.LoadVector512(grad + i + 64).AsInt32(), m4).AsSingle());
+                    Avx512F.Store(output + i + 80, Avx512F.And(Avx512F.LoadVector512(grad + i + 80).AsInt32(), m5).AsSingle());
+                    Avx512F.Store(output + i + 96, Avx512F.And(Avx512F.LoadVector512(grad + i + 96).AsInt32(), m6).AsSingle());
+                    Avx512F.Store(output + i + 112, Avx512F.And(Avx512F.LoadVector512(grad + i + 112).AsInt32(), m7).AsSingle());
+                }
+                int simd16 = length & ~15;
+                for (; i < simd16; i += 16)
+                {
+                    var m = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    Avx512F.Store(output + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsInt32(), m).AsSingle());
+                }
+            }
+            if (Avx.IsSupported && i < length)
             {
                 var vzero = Vector256<float>.Zero;
                 // Process 64 floats (2 cache lines) per iteration with prefetch
@@ -5692,6 +5724,126 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
             for (; i < length; i++)
                 output[i] = input[i] > 0 ? grad[i] : 0;
+        }
+
+        /// <summary>
+        /// In-place ReLU backward: grad[i] = (input[i] > 0) ? grad[i] : 0
+        /// Writes directly into the grad buffer, eliminating one memory stream and one allocation.
+        /// Only 2 arrays touched (grad read+write, input read) vs 3 for the allocating path.
+        /// </summary>
+        public static unsafe void ReluBackwardInPlaceUnsafe(float* grad, float* input, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx512F.IsSupported)
+            {
+                var vzero = Vector512<float>.Zero;
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    var m0 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    var m1 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 16), vzero).AsInt32();
+                    var m2 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 32), vzero).AsInt32();
+                    var m3 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 48), vzero).AsInt32();
+                    Avx512F.Store(grad + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsInt32(), m0).AsSingle());
+                    Avx512F.Store(grad + i + 16, Avx512F.And(Avx512F.LoadVector512(grad + i + 16).AsInt32(), m1).AsSingle());
+                    Avx512F.Store(grad + i + 32, Avx512F.And(Avx512F.LoadVector512(grad + i + 32).AsInt32(), m2).AsSingle());
+                    Avx512F.Store(grad + i + 48, Avx512F.And(Avx512F.LoadVector512(grad + i + 48).AsInt32(), m3).AsSingle());
+                }
+                int simd16 = length & ~15;
+                for (; i < simd16; i += 16)
+                {
+                    var m = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    Avx512F.Store(grad + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsInt32(), m).AsSingle());
+                }
+            }
+            if (Avx.IsSupported && i < length)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simd32 = length & ~31;
+                for (; i < simd32; i += 32)
+                {
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(grad + i, Avx.And(Avx.LoadVector256(grad + i), mask0));
+                    Avx.Store(grad + i + 8, Avx.And(Avx.LoadVector256(grad + i + 8), mask1));
+                    Avx.Store(grad + i + 16, Avx.And(Avx.LoadVector256(grad + i + 16), mask2));
+                    Avx.Store(grad + i + 24, Avx.And(Avx.LoadVector256(grad + i + 24), mask3));
+                }
+                int simd8 = length & ~7;
+                for (; i < simd8; i += 8)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(grad + i, Avx.And(Avx.LoadVector256(grad + i), mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                grad[i] = input[i] > 0 ? grad[i] : 0;
+        }
+
+        /// <summary>
+        /// Fused ReLU backward with scalar gradient — eliminates the intermediate fill tensor.
+        /// Computes: output[i] = (input[i] > 0) ? scale : 0
+        /// This is equivalent to MeanBackward + ReLU backward but reads only 1 array instead of 2,
+        /// halving memory bandwidth and eliminating a 4MB allocation for 1M-element tensors.
+        /// </summary>
+        public static unsafe void ReluBackwardScalarUnsafe(float scale, float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx512F.IsSupported)
+            {
+                var vzero = Vector512<float>.Zero;
+                var vscale = Vector512.Create(scale);
+                var vscaleInts = vscale.AsInt32();
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    var m0 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    var m1 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 16), vzero).AsInt32();
+                    var m2 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 32), vzero).AsInt32();
+                    var m3 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 48), vzero).AsInt32();
+                    Avx512F.Store(output + i, Avx512F.And(vscaleInts, m0).AsSingle());
+                    Avx512F.Store(output + i + 16, Avx512F.And(vscaleInts, m1).AsSingle());
+                    Avx512F.Store(output + i + 32, Avx512F.And(vscaleInts, m2).AsSingle());
+                    Avx512F.Store(output + i + 48, Avx512F.And(vscaleInts, m3).AsSingle());
+                }
+                int simd16 = length & ~15;
+                for (; i < simd16; i += 16)
+                {
+                    var m = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsInt32();
+                    Avx512F.Store(output + i, Avx512F.And(vscaleInts, m).AsSingle());
+                }
+            }
+            if (Avx.IsSupported && i < length)
+            {
+                var vzero = Vector256<float>.Zero;
+                var vscale = Vector256.Create(scale);
+                int simd32 = length & ~31;
+                for (; i < simd32; i += 32)
+                {
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(vscale, mask0));
+                    Avx.Store(output + i + 8, Avx.And(vscale, mask1));
+                    Avx.Store(output + i + 16, Avx.And(vscale, mask2));
+                    Avx.Store(output + i + 24, Avx.And(vscale, mask3));
+                }
+                int simd8 = length & ~7;
+                for (; i < simd8; i += 8)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.And(vscale, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] > 0 ? scale : 0;
         }
 
         /// <summary>

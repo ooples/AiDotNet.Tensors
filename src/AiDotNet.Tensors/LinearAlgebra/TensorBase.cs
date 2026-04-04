@@ -158,7 +158,11 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
-    internal void IncrementVersion() => System.Threading.Interlocked.Increment(ref _version);
+    internal void IncrementVersion()
+    {
+        System.Threading.Interlocked.Increment(ref _version);
+        UniformFillValue = null; // Invalidate: tensor data no longer uniform after mutation
+    }
 
     /// <summary>
     /// Gets the sync point for the last GPU write operation on this tensor.
@@ -170,6 +174,15 @@ public abstract class TensorBase<T> : IDisposable
     /// True when a GPU operation writes to this tensor; false after CPU data is downloaded.
     /// </summary>
     public bool IsDirty { get; internal set; }
+
+    /// <summary>
+    /// When non-null, indicates this tensor was created by a uniform Fill operation and
+    /// every element has this value. Backward kernels can use the scalar directly instead
+    /// of reading N identical elements from memory (saves bandwidth for fused backward paths).
+    /// Reset to null by any non-fill mutation.
+    /// </summary>
+    internal double? UniformFillValue { get; set; }
+
 
     /// <summary>
     /// Waits for all pending GPU operations on this tensor to complete.

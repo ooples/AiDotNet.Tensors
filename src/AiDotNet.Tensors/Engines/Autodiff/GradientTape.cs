@@ -196,11 +196,21 @@ public sealed class GradientTape<T> : IDisposable
         // Gradient accumulator: maps each tensor (by reference identity) to its accumulated gradient
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-        // Seed: gradient of loss w.r.t. itself is ones with the same shape
-        var onesData = new T[loss.Length];
-        for (int j = 0; j < onesData.Length; j++)
-            onesData[j] = numOps.One;
-        var seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
+        // Seed: gradient of loss w.r.t. itself is ones with the same shape.
+        // Fast path for scalar loss (the overwhelmingly common case in training).
+        Tensor<T> seedGrad;
+        if (loss.Length == 1)
+        {
+            seedGrad = new Tensor<T>(new[] { numOps.One }, loss.Shape.ToArray());
+        }
+        else
+        {
+            var onesData = new T[loss.Length];
+            var one = numOps.One;
+            for (int j = 0; j < onesData.Length; j++)
+                onesData[j] = one;
+            seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
+        }
         grads[loss] = seedGrad;
 
         // When createGraph=false (default): suspend recording so backward engine calls
@@ -268,8 +278,6 @@ public sealed class GradientTape<T> : IDisposable
                 }
 
                 // Tape backward pruning: skip entries that don't contribute to requested sources.
-                // This avoids wasted backward computation through irrelevant subgraphs
-                // (e.g., discriminator ops during GAN generator training).
                 if (relevantTensors is not null && !relevantTensors.Contains(entry.Output))
                 {
                     continue;
@@ -349,6 +357,7 @@ public sealed class GradientTape<T> : IDisposable
                 SetCurrentTape(savedCurrent);
             }
         }
+
 
         // If sources specified, filter to only those
         if (sources is not null)

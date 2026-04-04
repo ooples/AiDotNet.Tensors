@@ -1062,7 +1062,10 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         T scale = numOps.Divide(gradOutput[0], numOps.FromDouble(inputs[0].Length));
-        var grad = TensorPool<T>.Rent(inputs[0].Shape.ToArray());
+        // Use RentUninitialized to go through TensorArena (cache-hot reuse)
+        // instead of TensorPool (separate pool that misses arena + clears).
+        // Use _shape directly to avoid Shape.ToArray() allocation.
+        var grad = TensorAllocator.RentUninitialized<T>(inputs[0]._shape);
         engine.TensorFill(grad, scale);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }

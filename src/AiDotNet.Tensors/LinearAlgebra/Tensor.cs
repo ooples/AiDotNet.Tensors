@@ -24,6 +24,12 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 public class Tensor<T> : TensorBase<T>, IEnumerable<T>
 {
     /// <summary>
+    /// Accumulated gradient from backward passes. Null until first backward, then
+    /// lazily allocated and reused across training steps to avoid per-step allocation.
+    /// </summary>
+    internal Tensor<T>? Grad;
+
+    /// <summary>
     /// If this tensor was created from a pooled array, holds a reference to it for return.
     /// Null for non-pooled tensors.
     /// </summary>
@@ -965,6 +971,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         ThrowIfSparse();
         _numOps.Fill(_data.AsWritableSpan(), value);
+        UniformFillValue = _numOps.ToDouble(value);
     }
 
     /// <summary>
