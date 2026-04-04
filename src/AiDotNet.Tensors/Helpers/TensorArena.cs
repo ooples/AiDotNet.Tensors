@@ -79,6 +79,22 @@ public sealed class TensorArena : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal T[]? TryAllocate<T>(int elementCount)
     {
+        return TryAllocateCore<T>(elementCount, clear: true);
+    }
+
+    /// <summary>
+    /// Like TryAllocate but skips Array.Clear. Use ONLY when the caller guarantees it will
+    /// write every element before reading (e.g., backward kernels that overwrite the entire buffer).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal T[]? TryAllocateUninitialized<T>(int elementCount)
+    {
+        return TryAllocateCore<T>(elementCount, clear: false);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private T[]? TryAllocateCore<T>(int elementCount, bool clear)
+    {
         if (_disposed) return null;
 
         var key = (typeof(T), elementCount);
@@ -96,8 +112,7 @@ public sealed class TensorArena : IDisposable
             // Reuse path: return existing array, advance cursor
             var existing = (T[])bucket[cursor];
             _cursor[key] = cursor + 1;
-            // Zero the reused array for correctness
-            Array.Clear(existing, 0, elementCount);
+            if (clear) Array.Clear(existing, 0, elementCount);
             return existing;
         }
 

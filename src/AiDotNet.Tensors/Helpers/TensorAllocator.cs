@@ -87,6 +87,58 @@ public static class TensorAllocator
     }
 
     /// <summary>
+    /// Rents a tensor without zeroing its backing array. The caller MUST write every element
+    /// before reading. Use for backward kernels and operations that overwrite the full buffer.
+    /// When a TensorArena is active, reuses arena-allocated arrays without clearing — saving
+    /// ~0.3ms per 1M-element tensor (the Array.Clear cost).
+    /// </summary>
+    public static Tensor<T> RentUninitialized<T>(int[] shape)
+    {
+        int totalSize = 1;
+        for (int i = 0; i < shape.Length; i++)
+            totalSize = checked(totalSize * shape[i]);
+
+        // Arena path: skip Array.Clear entirely
+        var arena = TensorArena.Current;
+        if (arena != null)
+        {
+            T[]? arenaArray = arena.TryAllocateUninitialized<T>(totalSize);
+            if (arenaArray != null)
+            {
+                var memory = new Memory<T>(arenaArray, 0, totalSize);
+                return Tensor<T>.FromMemory(memory, shape);
+            }
+        }
+
+#if NET5_0_OR_GREATER
+        // Thread-local cache: skip Array.Clear
+        T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
+        if (cached is null && totalSize >= ArrayPoolThreshold)
+            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
+        if (cached is not null)
+        {
+            // Skip zeroing — caller will overwrite every element
+            var memory = new Memory<T>(cached, 0, totalSize);
+            return Tensor<T>.FromPooledMemory(memory, shape, cached);
+        }
+
+        if (totalSize >= ArrayPoolThreshold)
+        {
+            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
+            // Skip zeroing
+            var memory = new Memory<T>(pooled, 0, totalSize);
+            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
+        }
+
+        // Small allocation: new T[] is zeroed by CLR but that's unavoidable
+        T[] arr = new T[totalSize];
+        return Tensor<T>.FromMemory(new Memory<T>(arr), shape);
+#else
+        return new Tensor<T>(shape);
+#endif
+    }
+
+    /// <summary>
     /// Computes the ArrayPool bucket size for a given request.
     /// ArrayPool returns power-of-2 sizes, so we need to match on return.
     /// </summary>
@@ -136,50 +188,7 @@ public static class TensorAllocator
         return Rent<T>(shape);
     }
 
-    /// <summary>
-    /// Creates a tensor with the given shape WITHOUT zero-initialization.
-    /// Use ONLY for tensors that will be immediately and fully overwritten
-    /// (e.g., weight initialization with random values, copy targets).
-    /// WARNING: Contains stale/garbage data until overwritten.
-    /// </summary>
-    /// <remarks>
-    /// On .NET 5+, uses <c>GC.AllocateUninitializedArray</c> or <c>ArrayPool</c> to skip zeroing.
-    /// On pre-.NET 5 targets (e.g., net471), <c>GC.AllocateUninitializedArray</c> is unavailable,
-    /// so the fallback returns zero-initialized memory via <c>new T[]</c>. This is safe (callers
-    /// overwrite all elements anyway) but does not provide the performance benefit of skipping
-    /// zero-initialization on older frameworks.
-    /// </remarks>
-    public static Tensor<T> RentUninitialized<T>(int[] shape)
-    {
-        int totalSize = 1;
-        for (int i = 0; i < shape.Length; i++)
-            totalSize = checked(totalSize * shape[i]);
-
-        if (!TensorPool.Enabled || totalSize == 0)
-        {
-            return new Tensor<T>(shape);
-        }
-
-#if NET5_0_OR_GREATER
-        if (totalSize >= ArrayPoolThreshold)
-        {
-            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Clear the full array when T holds references to avoid keeping stale
-            // objects alive — including the tail [totalSize, pooled.Length)
-            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                Array.Clear(pooled, 0, pooled.Length);
-            var memory = new Memory<T>(pooled, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
-        }
-
-        // Skip zero-initialization for immediate-overwrite tensors
-        T[] array = GC.AllocateUninitializedArray<T>(totalSize);
-        var mem = new Memory<T>(array);
-        return Tensor<T>.FromMemory(mem, shape);
-#else
-        return new Tensor<T>(shape);
-#endif
-    }
+    // RentUninitialized is defined above (line ~95) with arena support
 
     /// <summary>
     /// Creates a tensor with the given shape and data from a Vector.
