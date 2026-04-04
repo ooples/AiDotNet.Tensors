@@ -474,11 +474,44 @@ public class GradientTapeBenchmarks
                 for (int i = 0; i < iters; i++)
                     Buffer.MemoryCopy(pI, pO, size * 4, size * 4);
                 sw.Stop();
-                _output.WriteLine($"G4. memcpy 4MB baseline: {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+                _output.WriteLine($"G4. memcpy (pinned managed): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
                 double bwGBs = (size * 4.0 * 2) / (sw.Elapsed.TotalMilliseconds / iters * 1e6);
                 _output.WriteLine($"    Effective bandwidth: {bwGBs:F1} GB/s");
             }
         }
+
+#if NET5_0_OR_GREATER
+        // G5. NativeMemory aligned allocation — measures true hardware bandwidth
+        unsafe
+        {
+            var nSrc = (float*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(size * 4), 64);
+            var nDst = (float*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(size * 4), 64);
+            Buffer.MemoryCopy(nSrc, nDst, size * 4, size * 4); // warmup
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+                Buffer.MemoryCopy(nSrc, nDst, size * 4, size * 4);
+            sw.Stop();
+            double ms5 = sw.Elapsed.TotalMilliseconds / iters;
+            double bw5 = (size * 4.0 * 2) / (ms5 * 1e6);
+            _output.WriteLine($"G5. memcpy (NativeMemory aligned 64B): {ms5:F3}ms ({bw5:F1} GB/s)");
+
+            // G6. Scalar ReLU backward on aligned native memory
+            var nIn = (float*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)(size * 4), 64);
+            for (int i = 0; i < size; i++) nIn[i] = (i % 3 == 0) ? -1f : 1f;
+            float scale = 1.0f / size;
+            AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardScalarUnsafe(scale, nIn, nDst, size); // warmup
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+                AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardScalarUnsafe(scale, nIn, nDst, size);
+            sw.Stop();
+            double ms6 = sw.Elapsed.TotalMilliseconds / iters;
+            _output.WriteLine($"G6. Scalar SIMD (NativeMemory aligned): {ms6:F3}ms");
+
+            System.Runtime.InteropServices.NativeMemory.AlignedFree(nSrc);
+            System.Runtime.InteropServices.NativeMemory.AlignedFree(nDst);
+            System.Runtime.InteropServices.NativeMemory.AlignedFree(nIn);
+        }
+#endif
 
         // H. Allocation count
 #if NET5_0_OR_GREATER
