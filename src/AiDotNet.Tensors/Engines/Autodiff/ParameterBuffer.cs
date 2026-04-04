@@ -172,8 +172,12 @@ public sealed class ParameterBuffer<T>
         for (int i = 0; i < parameters.Count; i++)
         {
             var param = parameters[i];
-            // Ensure contiguous layout before copying raw storage
-            var contiguous = param.IsContiguous ? param : param.Contiguous();
+            // Densify sparse tensors before copying (sparse storage isn't contiguous)
+            Tensor<T> contiguous;
+            if (param.IsSparse)
+                contiguous = ((SparseTensor<T>)param).ToDense();
+            else
+                contiguous = param.IsContiguous ? param : param.Contiguous();
             var srcData = contiguous.DataVector;
             var src = srcData.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
             int expectedSize = 1;
@@ -226,7 +230,11 @@ public sealed class ParameterBuffer<T>
         {
             if (gradients.TryGetValue(parameters[i], out var grad))
             {
-                var contiguous = grad.IsContiguous ? grad : grad.Contiguous();
+                Tensor<T> contiguous;
+                if (grad.IsSparse)
+                    contiguous = ((SparseTensor<T>)grad).ToDense();
+                else
+                    contiguous = grad.IsContiguous ? grad : grad.Contiguous();
                 var srcData = contiguous.DataVector;
                 var src = srcData.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
                 int copyLen = Math.Min(src.Length, parameters[i].Length);

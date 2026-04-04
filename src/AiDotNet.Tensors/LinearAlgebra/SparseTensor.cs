@@ -407,6 +407,60 @@ public class SparseTensor<T> : Tensor<T>
         return dense;
     }
 
+    /// <summary>
+    /// Gets or sets the value at the specified (row, col) indices via sparse lookup.
+    /// For COO: linear scan. For CSR: binary search within row. Returns zero for missing entries.
+    /// </summary>
+    public override T this[params int[] indices]
+    {
+        get
+        {
+            if (indices.Length != 2)
+                throw new ArgumentException("SparseTensor indexing requires exactly 2 indices [row, col].");
+            int row = indices[0], col = indices[1];
+            var ops = MathHelper.GetNumericOperations<T>();
+
+            if (Format == SparseStorageFormat.Csr)
+            {
+                int start = RowPointers[row], end = RowPointers[row + 1];
+                for (int i = start; i < end; i++)
+                {
+                    if (ColumnIndices[i] == col)
+                        return DataVector[i];
+                }
+                return ops.Zero;
+            }
+
+            // COO: linear scan
+            var coo = (Format == SparseStorageFormat.Coo) ? this : ToCoo();
+            for (int i = 0; i < coo.NonZeroCount; i++)
+            {
+                if (coo.RowIndices[i] == row && coo.ColumnIndices[i] == col)
+                    return coo.DataVector[i];
+            }
+            return ops.Zero;
+        }
+        set => throw new NotSupportedException(
+            "SparseTensor does not support setting individual elements. " +
+            "Reconstruct the sparse tensor with updated values or use ToDense().");
+    }
+
+    /// <summary>
+    /// Creates a deep copy of this sparse tensor, preserving the sparse format.
+    /// </summary>
+    public SparseTensor<T> CloneSparse()
+    {
+        var values = DataVector.ToArray();
+        return Format switch
+        {
+            SparseStorageFormat.Coo => new SparseTensor<T>(Rows, Columns,
+                (int[])RowIndices.Clone(), (int[])ColumnIndices.Clone(), (T[])values.Clone()),
+            SparseStorageFormat.Csr => FromCsr(Rows, Columns,
+                (int[])RowPointers.Clone(), (int[])ColumnIndices.Clone(), (T[])values.Clone()),
+            _ => ToCsr().CloneSparse() // CSC → convert to CSR then clone
+        };
+    }
+
     /// <inheritdoc />
     protected override TensorBase<T> CreateInstance(int[] shape) =>
         new Tensor<T>(shape); // Sparse operations that need a new tensor create dense
