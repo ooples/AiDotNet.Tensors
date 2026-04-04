@@ -6110,43 +6110,44 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var result = TensorAllocator.Rent<T>(tensor._shape);
+        // RentUninitialized — ReLU writes every element, no need to zero
+        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
-            using var pinSrc = srcMem.Pin();
-            using var pinDst = dstMem.Pin();
-            float* pSrc = (float*)pinSrc.Pointer;
-            float* pDst = (float*)pinDst.Pointer;
+            var srcArr = (float[])(object)tensor.GetDataArray();
+            var dstArr = (float[])(object)result.GetDataArray();
 
-            if (CpuJitSelfTest.IsVerified && length >= 64)
+            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            if (reluChunks >= 2)
             {
-                JitUnaryDispatch(pSrc, pDst, length);
+                // Parallel path: must use Pin for lambda capture
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                float* pSrcP = (float*)pinSrc.Pointer;
+                float* pDstP = (float*)pinDst.Pointer;
+                int chunkSize = (length + reluChunks - 1) / reluChunks;
+                chunkSize = (chunkSize + 31) & ~31;
+                Parallel.For(0, reluChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = Math.Min(chunkSize, length - start);
+                    if (count > 0)
+                        SimdKernels.ReLUUnsafe(pSrcP + start, pDstP + start, count);
+                });
             }
             else
             {
-                int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
-                if (reluChunks >= 2)
+                // Single-threaded: fixed avoids GCHandle allocation overhead
+                fixed (float* pSrc = srcArr, pDst = dstArr)
                 {
-                    int chunkSize = (length + reluChunks - 1) / reluChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-
-                    Parallel.For(0, reluChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
-                        }
-                    });
-                }
-                else
-                {
-                    SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                    if (CpuJitSelfTest.IsVerified && length >= 64)
+                        JitUnaryDispatch(pSrc, pDst, length);
+                    else
+                        SimdKernels.ReLUUnsafe(pSrc, pDst, length);
                 }
             }
         }

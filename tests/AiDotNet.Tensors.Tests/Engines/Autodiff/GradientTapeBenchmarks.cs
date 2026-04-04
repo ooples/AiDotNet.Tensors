@@ -352,6 +352,155 @@ public class GradientTapeBenchmarks
     }
 
     [Fact(Skip = "Benchmark — run manually, not in CI")]
+    public void Profile_ReLU1M_GranularBreakdown()
+    {
+        int size = 1_000_000;
+        var input = Tensor<float>.CreateRandom([size]);
+        int iters = 100;
+
+        // Warmup everything
+        for (int w = 0; w < 10; w++)
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.ReLU(input);
+            var l = _engine.TensorMeanDiff(o);
+            t.ComputeGradients(l, sources: new[] { input });
+        }
+
+        // A. Isolate each forward op
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++) _engine.ReLU(input); // no tape
+        sw.Stop();
+        _output.WriteLine($"A. ReLU forward 1M (no tape): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+        sw.Restart();
+        for (int i = 0; i < iters; i++) _engine.TensorSum(input);
+        sw.Stop();
+        _output.WriteLine($"B. TensorSum 1M: {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+        // C. ReLU forward WITH tape (measures recording overhead)
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            using var t = new GradientTape<float>();
+            _engine.ReLU(input);
+        }
+        sw.Stop();
+        _output.WriteLine($"C. ReLU forward 1M (with tape): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+        // D. Full forward: ReLU + MeanDiff with tape
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.ReLU(input);
+            _engine.TensorMeanDiff(o);
+        }
+        sw.Stop();
+        double fwdMs = sw.Elapsed.TotalMilliseconds / iters;
+        _output.WriteLine($"D. Forward (ReLU+MeanDiff) with tape: {fwdMs:F3}ms");
+
+        // E. ComputeGradients ONLY (pre-record tape, then time just backward)
+        double bwdMs;
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.ReLU(input);
+            var l = _engine.TensorMeanDiff(o);
+            sw.Restart();
+            t.ComputeGradients(l, sources: new[] { input });
+            sw.Stop();
+            bwdMs = sw.Elapsed.TotalMilliseconds;
+            _output.WriteLine($"E. ComputeGradients (cold): {bwdMs:F3}ms");
+        }
+
+        // F. Full cycle repeated (tape + fwd + bwd)
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.ReLU(input);
+            var l = _engine.TensorMeanDiff(o);
+            t.ComputeGradients(l, sources: new[] { input });
+        }
+        sw.Stop();
+        double totalMs = sw.Elapsed.TotalMilliseconds / iters;
+        _output.WriteLine($"F. Full cycle (tape+fwd+bwd): {totalMs:F3}ms");
+        _output.WriteLine($"   Implied backward cost: {totalMs - fwdMs:F3}ms");
+
+        // G. Raw SIMD kernels with pre-pinned memory (no .NET overhead)
+        unsafe
+        {
+            var iArr = input.GetDataArray();
+            var oArr = new float[size];
+            // Pin once, amortize
+            fixed (float* pI = iArr, pO = oArr)
+            {
+                // G1. 3-array kernel (grad, input, output)
+                var gArr = new float[size];
+                for (int i = 0; i < size; i++) gArr[i] = 1.0f / size;
+                fixed (float* pG = gArr)
+                {
+                    for (int w = 0; w < 10; w++) AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardUnsafe(pG, pI, pO, size);
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++)
+                        AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardUnsafe(pG, pI, pO, size);
+                    sw.Stop();
+                    _output.WriteLine($"G1. Raw 3-array SIMD (pinned): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+                }
+
+                // G2. Scalar kernel (scale, input, output) — 2 arrays
+                float scale = 1.0f / size;
+                for (int w = 0; w < 10; w++) AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pO, size);
+                sw.Restart();
+                for (int i = 0; i < iters; i++)
+                    AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pO, size);
+                sw.Stop();
+                _output.WriteLine($"G2. Raw scalar SIMD (pinned, 2-array): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+                // G3. In-place kernel (grad in-place, input) — 2 arrays, 1 write
+                for (int i = 0; i < size; i++) oArr[i] = scale; // fill as grad
+                for (int w = 0; w < 10; w++) AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardInPlaceUnsafe(pO, pI, size);
+                sw.Restart();
+                for (int i = 0; i < iters; i++)
+                {
+                    for (int j = 0; j < size; j++) oArr[j] = scale; // re-fill
+                    AiDotNet.Tensors.Engines.Simd.SimdKernels.ReluBackwardInPlaceUnsafe(pO, pI, size);
+                }
+                sw.Stop();
+                _output.WriteLine($"G3. Raw in-place SIMD (pinned, 2-array): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+                // G4. Pure memcpy baseline (just copy 4MB — this is the memory bandwidth floor)
+                sw.Restart();
+                for (int i = 0; i < iters; i++)
+                    Buffer.MemoryCopy(pI, pO, size * 4, size * 4);
+                sw.Stop();
+                _output.WriteLine($"G4. memcpy 4MB baseline: {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+                double bwGBs = (size * 4.0 * 2) / (sw.Elapsed.TotalMilliseconds / iters * 1e6);
+                _output.WriteLine($"    Effective bandwidth: {bwGBs:F1} GB/s");
+            }
+        }
+
+        // H. Allocation count
+#if NET5_0_OR_GREATER
+        long allocsBefore = GC.GetAllocatedBytesForCurrentThread();
+        {
+            using var t = new GradientTape<float>();
+            var o = _engine.ReLU(input);
+            var l = _engine.TensorMeanDiff(o);
+            t.ComputeGradients(l, sources: new[] { input });
+        }
+        long allocsAfter = GC.GetAllocatedBytesForCurrentThread();
+        _output.WriteLine($"H. Bytes allocated per full cycle: {allocsAfter - allocsBefore:N0}");
+#else
+        _output.WriteLine("H. Allocation tracking: not available on net471");
+#endif
+
+#if NET5_0_OR_GREATER
+        _output.WriteLine($"I. AVX2: {System.Runtime.Intrinsics.X86.Avx2.IsSupported}, AVX-512: {System.Runtime.Intrinsics.X86.Avx512F.IsSupported}");
+#endif
+    }
+
+    [Fact(Skip = "Benchmark — run manually, not in CI")]
     public void Benchmark_MatMulBackward_VsPyTorch()
     {
         // Target: < 1.80ms (1.17x faster than PyTorch's ~2.10ms)
