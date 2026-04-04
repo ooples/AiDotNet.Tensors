@@ -158,7 +158,11 @@ public abstract class TensorBase<T> : IDisposable
     /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
-    internal void IncrementVersion() => System.Threading.Interlocked.Increment(ref _version);
+    internal void IncrementVersion()
+    {
+        System.Threading.Interlocked.Increment(ref _version);
+        UniformFillValue = null; // Invalidate: tensor data no longer uniform after mutation
+    }
 
     /// <summary>
     /// Gets the sync point for the last GPU write operation on this tensor.
@@ -179,12 +183,6 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal double? UniformFillValue { get; set; }
 
-    /// <summary>
-    /// When true, indicates this gradient tensor's buffer can be overwritten in-place by
-    /// a backward op because no other backward op will read it (refcount == 1).
-    /// Set by ComputeGradients; consumed by backward functions like ReluBackward.
-    /// </summary>
-    internal bool _canReuseBuffer;
 
     /// <summary>
     /// Waits for all pending GPU operations on this tensor to complete.

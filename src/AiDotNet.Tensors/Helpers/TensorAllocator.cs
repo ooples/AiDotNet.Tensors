@@ -117,7 +117,9 @@ public static class TensorAllocator
             cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
-            // Skip zeroing — caller will overwrite every element
+            // Must clear reference types to avoid retaining stale objects
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                Array.Clear(cached, 0, cached.Length);
             var memory = new Memory<T>(cached, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, cached);
         }
@@ -125,7 +127,9 @@ public static class TensorAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Skip zeroing
+            // Must clear reference types to avoid retaining stale objects
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                Array.Clear(pooled, 0, pooled.Length);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Tensor<T>.FromPooledMemory(memory, shape, pooled);
         }

@@ -20745,41 +20745,18 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && gradOutput.UniformFillValue.HasValue)
         {
             float scale = (float)gradOutput.UniformFillValue.Value;
-            // When in-place safe, write into gradOutput's buffer (0 allocation, 2 arrays)
-            if (gradOutput._canReuseBuffer && gradOutput.IsContiguous && gradOutput.Length == length)
-            {
-                var iArr = (float[])(object)input.GetDataArray();
-                var gArr = (float[])(object)gradOutput.GetDataArray();
-                fixed (float* pI = iArr, pG = gArr)
-                    SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pG, length);
-                gradOutput.UniformFillValue = null;
-                gradOutput._canReuseBuffer = false;
-                return gradOutput;
-            }
             var resultTensor = TensorAllocator.RentUninitialized<T>(input._shape);
-            var iArr2 = (float[])(object)input.GetDataArray();
+            var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor.GetDataArray();
-            fixed (float* pI = iArr2, pR = rArr)
+            fixed (float* pI = iArr, pR = rArr)
                 SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pR, length);
             return resultTensor;
         }
 
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
-        // In-place path: reuse gradOutput buffer when refcount == 1 (no other consumer)
-        // This eliminates one tensor allocation and reduces memory streams from 3 to 2
-        if (typeof(T) == typeof(float) && gradOutput._canReuseBuffer && gradOutput.Length == length)
-        {
-            var gArr = (float[])(object)gradOutput.GetDataArray();
-            var iArr = (float[])(object)input.GetDataArray();
-            fixed (float* pG = gArr, pI = iArr)
-                SimdKernels.ReluBackwardInPlaceUnsafe(pG, pI, length);
-            gradOutput._canReuseBuffer = false;
-            return gradOutput;
-        }
-
         // Allocating path: new output buffer
-        var resultTensor2 = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+        var resultTensor2 = TensorAllocator.RentUninitialized<T>(input._shape);
 
         if (typeof(T) == typeof(float))
         {
