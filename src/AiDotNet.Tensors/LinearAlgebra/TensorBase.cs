@@ -180,6 +180,13 @@ public abstract class TensorBase<T> : IDisposable
     internal double? UniformFillValue { get; set; }
 
     /// <summary>
+    /// When true, indicates this gradient tensor's buffer can be overwritten in-place by
+    /// a backward op because no other backward op will read it (refcount == 1).
+    /// Set by ComputeGradients; consumed by backward functions like ReluBackward.
+    /// </summary>
+    internal bool _canReuseBuffer;
+
+    /// <summary>
     /// Waits for all pending GPU operations on this tensor to complete.
     /// Call this before reading GPU results to ensure correctness.
     /// </summary>

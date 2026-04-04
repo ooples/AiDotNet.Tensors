@@ -147,9 +147,11 @@ internal static class DifferentiableOps
         }
         else
         {
-            // Store directly on first access — no clone needed since backward
-            // functions create fresh gradient tensors that aren't shared.
             grads[tensor] = grad;
         }
+
+        // Also write into tensor.Grad for zero-alloc access in training loops.
+        // On first backward this lazily allocates; subsequent steps reuse the same buffer.
+        tensor.Grad = grads[tensor];
     }
 }

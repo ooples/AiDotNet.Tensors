@@ -5727,6 +5727,64 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// In-place ReLU backward: grad[i] = (input[i] > 0) ? grad[i] : 0
+        /// Writes directly into the grad buffer, eliminating one memory stream and one allocation.
+        /// Only 2 arrays touched (grad read+write, input read) vs 3 for the allocating path.
+        /// </summary>
+        public static unsafe void ReluBackwardInPlaceUnsafe(float* grad, float* input, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx512F.IsSupported)
+            {
+                var vzero = Vector512<float>.Zero;
+                int simd64 = length & ~63;
+                for (; i < simd64; i += 64)
+                {
+                    var m0 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsByte();
+                    var m1 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 16), vzero).AsByte();
+                    var m2 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 32), vzero).AsByte();
+                    var m3 = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i + 48), vzero).AsByte();
+                    Avx512F.Store(grad + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsByte(), m0).AsSingle());
+                    Avx512F.Store(grad + i + 16, Avx512F.And(Avx512F.LoadVector512(grad + i + 16).AsByte(), m1).AsSingle());
+                    Avx512F.Store(grad + i + 32, Avx512F.And(Avx512F.LoadVector512(grad + i + 32).AsByte(), m2).AsSingle());
+                    Avx512F.Store(grad + i + 48, Avx512F.And(Avx512F.LoadVector512(grad + i + 48).AsByte(), m3).AsSingle());
+                }
+                int simd16 = length & ~15;
+                for (; i < simd16; i += 16)
+                {
+                    var m = Avx512F.CompareGreaterThan(Avx512F.LoadVector512(input + i), vzero).AsByte();
+                    Avx512F.Store(grad + i, Avx512F.And(Avx512F.LoadVector512(grad + i).AsByte(), m).AsSingle());
+                }
+            }
+            else if (Avx.IsSupported)
+            {
+                var vzero = Vector256<float>.Zero;
+                int simd32 = length & ~31;
+                for (; i < simd32; i += 32)
+                {
+                    var mask0 = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask1 = Avx.Compare(Avx.LoadVector256(input + i + 8), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask2 = Avx.Compare(Avx.LoadVector256(input + i + 16), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var mask3 = Avx.Compare(Avx.LoadVector256(input + i + 24), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(grad + i, Avx.And(Avx.LoadVector256(grad + i), mask0));
+                    Avx.Store(grad + i + 8, Avx.And(Avx.LoadVector256(grad + i + 8), mask1));
+                    Avx.Store(grad + i + 16, Avx.And(Avx.LoadVector256(grad + i + 16), mask2));
+                    Avx.Store(grad + i + 24, Avx.And(Avx.LoadVector256(grad + i + 24), mask3));
+                }
+                int simd8 = length & ~7;
+                for (; i < simd8; i += 8)
+                {
+                    var mask = Avx.Compare(Avx.LoadVector256(input + i), vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(grad + i, Avx.And(Avx.LoadVector256(grad + i), mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                grad[i] = input[i] > 0 ? grad[i] : 0;
+        }
+
+        /// <summary>
         /// Fused ReLU backward with scalar gradient — eliminates the intermediate fill tensor.
         /// Computes: output[i] = (input[i] > 0) ? scale : 0
         /// This is equivalent to MeanBackward + ReLU backward but reads only 1 array instead of 2,

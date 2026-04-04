@@ -267,6 +267,20 @@ public sealed class GradientTape<T> : IDisposable
                 }
             }
 
+            // Precompute gradient consumer refcounts: count how many tape entries read each
+            // output's gradient. When refcount == 1, backward can write in-place into gradOutput.
+            var gradRefCount = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            for (int i = _entries.Count - 1; i >= 0; i--)
+            {
+                ref var e = ref _entries[i];
+                if (relevantTensors is not null && !relevantTensors.Contains(e.Output))
+                    continue;
+                if (gradRefCount.ContainsKey(e.Output))
+                    gradRefCount[e.Output]++;
+                else
+                    gradRefCount[e.Output] = 1;
+            }
+
             for (int i = _entries.Count - 1; i >= 0; i--)
             {
                 ref var entry = ref _entries[i];
@@ -278,8 +292,6 @@ public sealed class GradientTape<T> : IDisposable
                 }
 
                 // Tape backward pruning: skip entries that don't contribute to requested sources.
-                // This avoids wasted backward computation through irrelevant subgraphs
-                // (e.g., discriminator ops during GAN generator training).
                 if (relevantTensors is not null && !relevantTensors.Contains(entry.Output))
                 {
                     continue;
@@ -305,6 +317,11 @@ public sealed class GradientTape<T> : IDisposable
 
                 // Construct input array once for this entry's backward pass
                 var inputsArray = entry.GetInputsArray();
+
+                // If this gradOutput has only one consumer, backward can write in-place
+                bool canWriteInPlace = gradRefCount.TryGetValue(entry.Output, out var rc) && rc <= 1;
+                if (canWriteInPlace && gradOutput.IsContiguous)
+                    gradOutput._canReuseBuffer = true;
 
                 // Invoke the backward function to propagate gradients to inputs
                 entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
