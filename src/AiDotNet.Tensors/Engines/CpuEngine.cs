@@ -2453,6 +2453,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.BroadcastDivide, "TensorBroadcastDivide", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorBroadcastDivide(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BroadcastDivideBackward);
+            }
+        }
+
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -2466,6 +2480,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.BroadcastMultiply, "TensorBroadcastMultiply", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorBroadcastMultiply(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BroadcastMultiplyBackward);
+            }
+        }
+
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -4490,6 +4518,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorMax", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorMax(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MaxBackward);
+            }
+        }
+
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
@@ -4537,6 +4579,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorMin", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorMin(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MinBackward);
+            }
+        }
+
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
@@ -5341,6 +5397,24 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null && input.Rank == 4)
+            {
+                int st = stride == 0 ? poolSize : stride;
+                int oh = (input._shape[2] + 2 * padding - poolSize) / st + 1;
+                int ow = (input._shape[3] + 2 * padding - poolSize) / st + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], oh, ow };
+                var captured = input;
+                int ps = poolSize, s = stride, p = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
+                    (eng, output) => { var r = eng.AvgPool2D(captured, ps, s, p); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AvgPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { st, st } });
+            }
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4)
         {
@@ -5466,6 +5540,23 @@ public class CpuEngine : ITensorLevelEngine
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (input.Rank != 3) throw new ArgumentException($"Conv1D requires 3D input [batch, channels, length]. Got rank {input.Rank}.", nameof(input));
         if (kernel.Rank != 3) throw new ArgumentException($"Conv1D requires 3D kernel [out_ch, in_ch, kernel_len]. Got rank {kernel.Rank}.", nameof(kernel));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int effectiveK = dilation * (kernel._shape[2] - 1) + 1;
+                int outL = (input._shape[2] + 2 * padding - effectiveK) / stride + 1;
+                var outShape = new[] { input._shape[0], kernel._shape[0], outL };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                int s = stride, p = padding, d = dilation;
+                return scope.RecordBinary(LazyNodeType.Custom, "Conv1D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.Conv1D(capturedInput, capturedKernel, s, p, d); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.Conv1DBackward, new object[] { stride, padding, dilation });
+            }
+        }
 
         // Reshape to 4D: [B, C, 1, L] and [Cout, Cin, 1, K]
         var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
@@ -8434,6 +8525,25 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int oH = (input._shape[2] + 2 * padding[0] - kernel._shape[2]) / stride[0] + 1;
+                int oW = (input._shape[3] + 2 * padding[1] - kernel._shape[3]) / stride[1] + 1;
+                int outCh = input._shape[1] * kernel._shape[1];
+                var outShape = new[] { input._shape[0], outCh, oH, oW };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordBinary(LazyNodeType.DepthwiseConv2D, "DepthwiseConv2D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -8653,6 +8763,25 @@ public class CpuEngine : ITensorLevelEngine
         if (outputPadding == null || outputPadding.Length != 2) throw new ArgumentException("OutputPadding must be array of 2 elements", nameof(outputPadding));
         if (outputPadding[0] < 0 || outputPadding[1] < 0) throw new ArgumentException("OutputPadding elements must be non-negative", nameof(outputPadding));
         if (input._shape[1] != kernel._shape[0]) throw new ArgumentException($"Input inChannels ({input._shape[1]}) must match kernel inChannels ({kernel._shape[0]})");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int oH = (input._shape[2] - 1) * stride[0] - 2 * padding[0] + kernel._shape[2] + outputPadding[0];
+                int oW = (input._shape[3] - 1) * stride[1] - 2 * padding[1] + kernel._shape[3] + outputPadding[1];
+                var outShape = new[] { input._shape[0], kernel._shape[1], oH, oW };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                var capturedStride = (int[])stride.Clone();
+                var capturedPadding = (int[])padding.Clone();
+                var capturedOutputPadding = (int[])outputPadding.Clone();
+                return scope.RecordBinary(LazyNodeType.Custom, "ConvTranspose2D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.ConvTranspose2D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedOutputPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ConvTranspose2DBackward, new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -9923,6 +10052,29 @@ public class CpuEngine : ITensorLevelEngine
         if (dilation[0] <= 0 || dilation[1] <= 0 || dilation[2] <= 0) throw new ArgumentException("Dilation elements must be positive.", nameof(dilation));
         if (input._shape[1] != kernel._shape[1]) throw new ArgumentException($"Input channels ({input._shape[1]}) must match kernel in_channels ({kernel._shape[1]}).");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int effKD = dilation[0] * (kernel._shape[2] - 1) + 1;
+                int effKH = dilation[1] * (kernel._shape[3] - 1) + 1;
+                int effKW = dilation[2] * (kernel._shape[4] - 1) + 1;
+                int oD = (input._shape[2] + 2 * padding[0] - effKD) / stride[0] + 1;
+                int oH = (input._shape[3] + 2 * padding[1] - effKH) / stride[1] + 1;
+                int oW = (input._shape[4] + 2 * padding[2] - effKW) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], kernel._shape[0], oD, oH, oW };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                var capturedDilation = dilation;
+                return scope.RecordBinary(LazyNodeType.Custom, "Conv3D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.Conv3D(capturedInput, capturedKernel, capturedStride, capturedPadding, capturedDilation); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.Conv3DBackward, new object[] { stride, padding, dilation });
+            }
+        }
+
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
         int dilationD = dilation[0], dilationH = dilation[1], dilationW = dilation[2];
@@ -10481,6 +10633,25 @@ public class CpuEngine : ITensorLevelEngine
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
         if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
         if (padding == null || padding.Length != 3) throw new ArgumentException("Padding must be array of 3 elements [padD, padH, padW].", nameof(padding));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int oD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
+                int oH = (input._shape[3] + 2 * padding[1] - poolSize[1]) / stride[1] + 1;
+                int oW = (input._shape[4] + 2 * padding[2] - poolSize[2]) / stride[2] + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], oD, oH, oW };
+                var captured = input;
+                var capturedPool = poolSize;
+                var capturedStride = stride;
+                var capturedPadding = padding;
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool3D", input, outShape,
+                    (eng, output) => { var r = eng.AvgPool3D(captured, capturedPool, capturedStride, capturedPadding); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -23224,6 +23395,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>BCE with logits: sigmoid cross-entropy loss.</summary>
     public virtual Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedLogits = logits;
+                var capturedTargets = targets;
+                return scope.RecordBinary(LazyNodeType.Custom, "BCEWithLogitsLoss", logits, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorBCEWithLogitsLoss(capturedLogits, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
         for (int i = 0; i < logits.Length; i++)
@@ -23244,6 +23428,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Cross-entropy loss with softmax (differentiable). Returns scalar tensor.</summary>
     public virtual Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedLogits = logits;
+                var capturedTargets = targets;
+                return scope.RecordBinary(LazyNodeType.CrossEntropyLoss, "CrossEntropyLoss", logits, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorCrossEntropyLoss(capturedLogits, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CrossEntropyLossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = logits._shape[0];
         int numClasses = logits._shape[1];
@@ -23265,6 +23462,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>NLL loss: -sum(target * log_probs) / batch_size. Expects log-probabilities.</summary>
     public virtual Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedLogProbs = logProbs;
+                var capturedTargets = targets;
+                return scope.RecordBinary(LazyNodeType.Custom, "NLLLoss", logProbs, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorNLLLoss(capturedLogProbs, capturedTargets); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NLLLossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batchSize = logProbs._shape[0];
         int numClasses = logProbs._shape[1];
@@ -23288,6 +23498,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>KL divergence loss: sum(target * (log(target) - input)).</summary>
     public virtual Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedInput = input;
+                var capturedTarget = target;
+                return scope.RecordBinary(LazyNodeType.Custom, "KLDivLoss", input, target, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorKLDivLoss(capturedInput, capturedTarget); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.KLDivLossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
         for (int i = 0; i < input.Length; i++)
@@ -23619,6 +23842,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>1D average pooling.</summary>
     public virtual Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int lazyOutW = (input._shape[2] - kernelSize) / stride + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], lazyOutW };
+                var captured = input;
+                int ks = kernelSize, st = stride;
+                return scope.RecordUnary(LazyNodeType.Custom, "AvgPool1D", input, outShape,
+                    (eng, output) => { var r = eng.TensorAvgPool1D(captured, ks, st); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AvgPool1DBackward, new object[] { kernelSize, stride });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], channels = input._shape[1], width = input._shape[2];
         int outW = (width - kernelSize) / stride + 1;
@@ -23644,6 +23882,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>1D max pooling with argmax tracking.</summary>
     public virtual Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int lazyOutW = (input._shape[2] - kernelSize) / stride + 1;
+                var outShape = new[] { input._shape[0], input._shape[1], lazyOutW };
+                var captured = input;
+                int ks = kernelSize, st = stride;
+                return scope.RecordUnary(LazyNodeType.Custom, "MaxPool1D", input, outShape,
+                    (eng, output) => { var r = eng.TensorMaxPool1D(captured, ks, st); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MaxPool1DBackward, new object[] { kernelSize, stride });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], channels = input._shape[1], width = input._shape[2];
         int outW = (width - kernelSize) / stride + 1;
@@ -23855,6 +24108,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Where: select elements from x or y based on condition.</summary>
     public Tensor<T> TensorWhere<T>(bool[] condition, Tensor<T> x, Tensor<T> y)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedX = x;
+                var capturedY = y;
+                var capturedCond = condition;
+                return scope.RecordBinary(LazyNodeType.Custom, "Where", x, y, x._shape,
+                    (eng, output) => { var r = eng.TensorWhere(capturedCond, capturedX, capturedY); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.WhereBackward, new object[] { condition });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(x.Shape.ToArray());
         for (int i = 0; i < x.Length; i++)
