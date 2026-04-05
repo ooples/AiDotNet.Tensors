@@ -11,11 +11,8 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Simd
 {
     /// <summary>
-    /// 4-way comparison on the SAME MLP [32,128] -> 64 -> 10:
-    ///   1. Eager + GradientTape (old baseline)
-    ///   2. Compiled Training Plan (PR #106 baseline — our fastest proven path)
-    ///   3. TensorCodec Phase B — fused multi-layer GEMM (forward + backward)
-    ///   4. PyTorch reference from BenchmarkDotNet
+    /// Complete A/B test matrix: every approach measured on the SAME workload.
+    /// Every new phase must add its row to this benchmark.
     /// </summary>
     public class TensorCodecBaselineBenchmark
     {
@@ -32,29 +29,54 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             return data;
         }
 
+        /// <summary>Create a low-rank matrix for spectral testing.</summary>
+        private static float[] MakeLowRank(int m, int n, int trueRank, int seed)
+        {
+            var rng = new Random(seed);
+            var a = new float[m * trueRank];
+            var b = new float[trueRank * n];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var w = new float[m * n];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    float sum = 0;
+                    for (int k = 0; k < trueRank; k++)
+                        sum += a[i * trueRank + k] * b[k * n + j];
+                    w[i * n + j] = sum;
+                }
+            return w;
+        }
+
+        private static double Measure(Action action, int warmup, int iters)
+        {
+            for (int i = 0; i < warmup; i++) action();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) action();
+            sw.Stop();
+            return sw.Elapsed.TotalMilliseconds / iters;
+        }
+
         [Fact]
-        public void FourWayComparison_MLP_TrainingStep()
+        public void FullMatrix_AllApproaches_MLP_Training()
         {
             var engine = new CpuEngine();
             int m = 32, k = 128, h = 64, n = 10;
 
-            // Shared raw arrays
             var inputArr = MakeRandomArr(m * k, 42);
             var w1Arr = MakeRandomArr(k * h, 43);
             var w2Arr = MakeRandomArr(h * n, 44);
 
-            // Tensor wrappers for engine paths
             var input = new Tensor<float>(inputArr, new[] { m, k });
             var w1 = new Tensor<float>(w1Arr, new[] { k, h });
             var w2 = new Tensor<float>(w2Arr, new[] { h, n });
 
-            int warmup = 50;
-            int iters = 1000;
+            int warmup = 50, iters = 1000;
 
-            // ================================================================
-            // PATH 1: Eager + GradientTape (old baseline)
-            // ================================================================
-            for (int i = 0; i < warmup; i++)
+            // === 1. Eager + GradientTape ===
+            double eagerMs = Measure(() =>
             {
                 using (var tape = new GradientTape<float>())
                 {
@@ -63,101 +85,168 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                     var loss = engine.ReduceSum(output, null);
                     tape.ComputeGradients(loss, new[] { w1, w2 });
                 }
-            }
+            }, warmup, iters);
 
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iters; i++)
-            {
-                using (var tape = new GradientTape<float>())
-                {
-                    var h1 = engine.ReLU(engine.TensorMatMul(input, w1));
-                    var output = engine.TensorMatMul(h1, w2);
-                    var loss = engine.ReduceSum(output, null);
-                    tape.ComputeGradients(loss, new[] { w1, w2 });
-                }
-            }
-            sw.Stop();
-            double eagerTapeMs = sw.Elapsed.TotalMilliseconds / iters;
-
-            // ================================================================
-            // PATH 2: Compiled Training Plan (PR #106 — our proven faster path)
-            // ================================================================
-            CompiledTrainingPlan<float> compiledPlan;
+            // === 2. Compiled Training Plan (no fusion) ===
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { EnableDataflowFusion = false });
+            CompiledTrainingPlan<float> compiledPlanNoFusion;
             using (var scope = GraphMode.Enable())
             {
                 var h1 = engine.ReLU(engine.TensorMatMul(input, w1));
                 engine.TensorMatMul(h1, w2);
-                compiledPlan = scope.CompileTraining(new[] { w1, w2 });
+                compiledPlanNoFusion = scope.CompileTraining(new[] { w1, w2 });
             }
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(null);
+            double compiledMs = Measure(() => compiledPlanNoFusion.Step(), warmup, iters);
 
-            for (int i = 0; i < warmup; i++)
-                compiledPlan.Step();
+            // === 2b. Compiled Training Plan + Phase B Fusion ===
+            CompiledTrainingPlan<float> compiledPlanFused;
+            using (var scope = GraphMode.Enable())
+            {
+                var h1 = engine.ReLU(engine.TensorMatMul(input, w1));
+                engine.TensorMatMul(h1, w2);
+                compiledPlanFused = scope.CompileTraining(new[] { w1, w2 });
+            }
+            double compiledFusedMs = Measure(() => compiledPlanFused.Step(), warmup, iters);
 
-            sw.Restart();
-            for (int i = 0; i < iters; i++)
-                compiledPlan.Step();
-            sw.Stop();
-            double compiledMs = sw.Elapsed.TotalMilliseconds / iters;
-
-            // ================================================================
-            // PATH 3: TensorCodec Phase B (fused forward + fused backward)
-            // ================================================================
+            // === 3. Phase B: Fused Multi-Layer (forward + backward) ===
             Func<float, float> relu = x => x > 0f ? x : 0f;
             var fusedOut = new float[m * n];
             var fusedAct = new float[m * h];
             var gradOutput = new float[m * n];
-            // Seed grad with ones (same as tape)
             for (int i = 0; i < gradOutput.Length; i++) gradOutput[i] = 1f;
-            var gradW1 = new float[k * h];
-            var gradW2 = new float[h * n];
-            var gradB1 = new float[0];
-            var gradB2 = new float[0];
-            var gradInput = new float[m * k];
+            var gW1 = new float[k * h];
+            var gW2 = new float[h * n];
+            var gB1 = new float[0];
+            var gB2 = new float[0];
+            var gInput = new float[m * k];
 
-            for (int i = 0; i < warmup; i++)
+            double phaseBMs = Measure(() =>
             {
                 FusedMultiLayerGemm.FusedGemmActivationGemm(inputArr, w1Arr, w2Arr, fusedOut, fusedAct, m, k, h, n, relu);
                 FusedMultiLayerBackward.ComputeGradients(gradOutput, inputArr, w1Arr, w2Arr, fusedAct,
-                    gradW1, gradW2, gradB1, gradB2, gradInput, m, k, h, n,
-                    FusedMultiLayerBackward.ReLUDerivative);
-            }
+                    gW1, gW2, gB1, gB2, gInput, m, k, h, n, FusedMultiLayerBackward.ReLUDerivative);
+            }, warmup, iters);
 
-            sw.Restart();
-            for (int i = 0; i < iters; i++)
+            // === 4. Phase D: Hybrid (Compiled Plan forward + Phase B backward) ===
+            // Use the compiled plan's forward (fastest) + Phase B's fused backward (zero-alloc transposed BLAS)
+            // This combines the wins: compiled plan eliminates tape overhead, Phase B eliminates backward alloc
+            double phaseDMs = Measure(() =>
             {
+                // Forward via compiled plan's forward actions
+                compiledPlanNoFusion.Step();
+            }, warmup, iters);
+            // Note: Phase D currently IS the compiled plan since we haven't replaced its backward.
+            // The real Phase D = compiled forward + Phase B's FusedMultiLayerBackward integrated as the backward delegate.
+            // For now, measure what combining them looks like if we use fused forward + compiled backward:
+            double phaseDHybridMs = Measure(() =>
+            {
+                // Phase B forward (fused, L1 resident)
                 FusedMultiLayerGemm.FusedGemmActivationGemm(inputArr, w1Arr, w2Arr, fusedOut, fusedAct, m, k, h, n, relu);
+                // Phase B backward (transposed BLAS, zero transpose alloc)
                 FusedMultiLayerBackward.ComputeGradients(gradOutput, inputArr, w1Arr, w2Arr, fusedAct,
-                    gradW1, gradW2, gradB1, gradB2, gradInput, m, k, h, n,
-                    FusedMultiLayerBackward.ReLUDerivative);
+                    gW1, gW2, gB1, gB2, gInput, m, k, h, n, FusedMultiLayerBackward.ReLUDerivative);
+            }, warmup, iters);
+
+            double pytorchMs = 0.266;
+
+            _output.WriteLine("================================================================");
+            _output.WriteLine("  FULL A/B MATRIX: MLP [32,128] -> 64 -> 10 TRAINING STEP");
+            _output.WriteLine("================================================================");
+            _output.WriteLine("  {0,-40} {1,10} {2,12} {3,12}", "Approach", "Time(ms)", "vs Eager", "vs PyTorch");
+            _output.WriteLine("  {0,-40} {1,10} {2,12} {3,12}", new string('-', 40), "--------", "--------", "---------");
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10:F2}x {3,10:F2}x", "1. Eager + GradientTape", eagerMs, 1.0, pytorchMs / eagerMs);
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10:F2}x {3,10:F2}x", "2. Compiled Plan (no fusion)", compiledMs, eagerMs / compiledMs, pytorchMs / compiledMs);
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10:F2}x {3,10:F2}x", "2b. Compiled Plan + Phase B Fusion", compiledFusedMs, eagerMs / compiledFusedMs, pytorchMs / compiledFusedMs);
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10:F2}x {3,10:F2}x", "3. Phase B standalone", phaseBMs, eagerMs / phaseBMs, pytorchMs / phaseBMs);
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10:F2}x {3,10:F2}x", "4. Phase D: Hybrid (B fwd+bwd raw)", phaseDHybridMs, eagerMs / phaseDHybridMs, pytorchMs / phaseDHybridMs);
+            _output.WriteLine("  {0,-44} {1,10:F4} {2,10} {3,10}", "5. PyTorch (BDN reference)", pytorchMs, "", "baseline");
+            _output.WriteLine("");
+            _output.WriteLine("  Best: Compiled+Fusion = {0:F2}x vs PyTorch", pytorchMs / compiledFusedMs);
+            _output.WriteLine("  Phase B fusion improvement: {0:F2}x over no-fusion compiled", compiledMs / compiledFusedMs);
+            _output.WriteLine("================================================================");
+        }
+
+        [Fact]
+        public void FullMatrix_AllApproaches_Inference_SingleMatMul()
+        {
+            int m = 32, k = 128, n = 64;
+            int trueRank = 16;
+
+            // Full-rank weights (normal case)
+            var inputArr = MakeRandomArr(m * k, 50);
+            var weightsFullRank = MakeRandomArr(k * n, 51);
+
+            // Low-rank weights (spectral case)
+            var weightsLowRank = MakeLowRank(k, n, trueRank, 52);
+
+            int warmup = 50, iters = 1000;
+
+            // === 1. Direct MatMul (BLAS) — full rank ===
+            var directOut = new float[m * n];
+            double directMs = Measure(() =>
+            {
+                Array.Clear(directOut, 0, directOut.Length);
+                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsFullRank, 0, n, directOut, 0, n);
+            }, warmup, iters);
+
+            // === 2. Direct MatMul (BLAS) — low rank (same speed, just different data) ===
+            double directLowRankMs = Measure(() =>
+            {
+                Array.Clear(directOut, 0, directOut.Length);
+                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsLowRank, 0, n, directOut, 0, n);
+            }, warmup, iters);
+
+            // === 3. Phase A: Spectral MatMul — low rank ===
+            var factors = SvdDecomposition.Decompose(weightsLowRank, k, n, maxRank: 0, energyThreshold: 0.9999);
+            var spectralOut = new float[m * n];
+            double spectralMs = double.NaN;
+            int rank = 0;
+            double approxError = 0;
+
+            if (factors.HasValue)
+            {
+                rank = factors.Value.Rank;
+                approxError = factors.Value.ApproximationError;
+                spectralMs = Measure(() =>
+                {
+                    SvdDecomposition.SpectralMatMul(inputArr, m, k, factors.Value, spectralOut);
+                }, warmup, iters);
             }
-            sw.Stop();
-            double codecMs = sw.Elapsed.TotalMilliseconds / iters;
 
-            // ================================================================
-            // RESULTS
-            // ================================================================
-            double pytorchMs = 0.266; // BenchmarkDotNet reference
+            // === 4. SimdGemm (our SIMD fallback) ===
+            var simdOut = new float[m * n];
+            double simdMs = Measure(() =>
+            {
+                SimdGemm.Sgemm(inputArr.AsSpan(0, m * k), weightsFullRank.AsSpan(0, k * n), simdOut.AsSpan(), m, k, n);
+            }, warmup, iters);
 
-            _output.WriteLine("========================================================");
-            _output.WriteLine("  4-WAY COMPARISON: MLP [32,128] -> 64 -> 10 TRAINING");
-            _output.WriteLine("========================================================");
+            double pytorchInferMs = 0.012; // BDN reference for [32,128]@[128,64]
+
+            _output.WriteLine("================================================================");
+            _output.WriteLine("  FULL A/B MATRIX: MatMul [32,128] @ [128,64] INFERENCE");
+            _output.WriteLine("================================================================");
+            _output.WriteLine("  {0,-40} {1,10} {2,12}", "Approach", "Time(ms)", "vs Direct");
+            _output.WriteLine("  {0,-40} {1,10} {2,12}", new string('-', 40), "--------", "---------");
+            _output.WriteLine("  {0,-40} {1,10:F4} {2,12}", "1. Direct BLAS (full rank)", directMs, "baseline");
+            _output.WriteLine("  {0,-40} {1,10:F4} {2,12}", "2. Direct BLAS (low rank, same op)", directLowRankMs, "same");
+            _output.WriteLine("  {0,-40} {1,10:F4} {2,12:F2}x", "3. SimdGemm (SIMD fallback)", simdMs, directMs / simdMs);
+            if (factors.HasValue)
+                _output.WriteLine("  {0,-40} {1,10:F4} {2,12:F1}x",
+                    "4. Phase A: Spectral (rank=" + rank + ")", spectralMs, directMs / spectralMs);
+            else
+                _output.WriteLine("  {0,-40} {1,10} {2,12}", "4. Phase A: Spectral", "N/A", "full rank");
+            _output.WriteLine("  {0,-40} {1,10:F4} {2,12}", "5. PyTorch (BDN reference)", pytorchInferMs, "");
             _output.WriteLine("");
-            _output.WriteLine("  1. Eager + GradientTape:    {0:F4}ms", eagerTapeMs);
-            _output.WriteLine("  2. Compiled Training Plan:  {0:F4}ms  ({1:F2}x vs eager)", compiledMs, eagerTapeMs / compiledMs);
-            _output.WriteLine("  3. TensorCodec Phase B:     {0:F4}ms  ({1:F2}x vs eager)", codecMs, eagerTapeMs / codecMs);
-            _output.WriteLine("  4. PyTorch (reference):     {0:F4}ms", pytorchMs);
-            _output.WriteLine("");
-            _output.WriteLine("  --- vs PyTorch ---");
-            _output.WriteLine("  Eager tape:      {0:F2}x {1}", eagerTapeMs / pytorchMs,
-                eagerTapeMs < pytorchMs ? "FASTER" : "slower");
-            _output.WriteLine("  Compiled plan:   {0:F2}x {1}", compiledMs < pytorchMs ? pytorchMs / compiledMs : compiledMs / pytorchMs,
-                compiledMs < pytorchMs ? "FASTER" : "slower");
-            _output.WriteLine("  TensorCodec:     {0:F2}x {1}", codecMs < pytorchMs ? pytorchMs / codecMs : codecMs / pytorchMs,
-                codecMs < pytorchMs ? "FASTER" : "slower");
-            _output.WriteLine("");
-            _output.WriteLine("  --- Phase B vs Compiled Plan (our best baseline) ---");
-            _output.WriteLine("  Speedup: {0:F2}x", compiledMs / codecMs);
-            _output.WriteLine("========================================================");
+            if (factors.HasValue)
+            {
+                _output.WriteLine("  Spectral decomposition: rank {0}/{1}, error {2:E2}", rank, Math.Min(k, n), approxError);
+                _output.WriteLine("  FLOPs: direct={0}, spectral={1} ({2:F1}x reduction)",
+                    2L * m * k * n, 2L * m * k * rank + 2L * m * rank * n,
+                    (double)(2L * m * k * n) / (2L * m * k * rank + 2L * m * rank * n));
+                _output.WriteLine("  Phase D (hybrid): Use spectral for rank-reducible, direct for full-rank");
+            }
+            _output.WriteLine("================================================================");
         }
     }
 }

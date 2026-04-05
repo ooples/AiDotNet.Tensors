@@ -130,20 +130,34 @@ internal sealed class CompiledTrainingPlan<T>
             allGrads.Add(grad);
         }
 
-        // Build forward actions (capture step + output buffer)
-        var forwardActions = new Action<IEngine>[forwardSteps.Count];
+        // Phase B integration: detect MatMul→ReLU→MatMul patterns and replace with fused kernel
+        var fusedForwardActions = new List<Action<IEngine>>();
+        var fusedBackwardActions = new List<Action<IEngine>>();
+        var fusedStepIndices = new HashSet<int>(); // indices consumed by fusion
+
+        if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion)
+        {
+            TryFuseForwardBackward(forwardSteps, gradMap, consumerCount, engine,
+                fusedForwardActions, fusedBackwardActions, fusedStepIndices);
+        }
+
+        // Build forward actions: fused actions first, then remaining unfused steps
+        var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
         for (int i = 0; i < forwardSteps.Count; i++)
         {
+            if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             var output = step.OutputBuffer;
             var exec = step.Execute;
-            forwardActions[i] = eng => exec(eng, output);
+            allForwardActions.Add(eng => exec(eng, output));
         }
+        var forwardActions = allForwardActions.ToArray();
 
-        // Build specialized backward actions
+        // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
+            if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
@@ -152,7 +166,6 @@ internal sealed class CompiledTrainingPlan<T>
                 backwardActions.Add(action);
             else
             {
-                // Fallback: use generic backward function with pre-allocated grad accumulator
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -165,6 +178,8 @@ internal sealed class CompiledTrainingPlan<T>
                 });
             }
         }
+        // Append fused backward actions (they handle their own gradient routing)
+        backwardActions.AddRange(fusedBackwardActions);
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -342,6 +357,129 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         return null; // Not specialized — use generic fallback
+    }
+
+    /// <summary>
+    /// Detects MatMul→ReLU→MatMul patterns in forward steps and replaces them with
+    /// FusedMultiLayerGemm (Phase B dataflow fusion). The fused kernel keeps inter-layer
+    /// data in L1 cache and uses transposed BLAS for zero-alloc backward.
+    /// </summary>
+    private static void TryFuseForwardBackward(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        IEngine engine,
+        List<Action<IEngine>> fusedForward,
+        List<Action<IEngine>> fusedBackward,
+        HashSet<int> consumedIndices)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 2 < steps.Count; i++)
+        {
+            if (consumedIndices.Contains(i)) continue;
+
+            var step0 = steps[i];
+            var step1 = steps[i + 1];
+            var step2 = steps[i + 2];
+
+            // Pattern: MatMul[i] → ReLU[i+1] → MatMul[i+2]
+            // where ReLU's input is MatMul[i]'s output, and MatMul[i+2]'s input is ReLU's output
+            if (step0.OpName != "TensorMatMul" || step1.OpName != "ReLU" || step2.OpName != "TensorMatMul")
+                continue;
+
+            if (step0.Inputs.Length != 2 || step2.Inputs.Length != 2)
+                continue;
+
+            // Verify chain: matmul0.output → relu.input, relu.output → matmul2.input
+            if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0]))
+                continue;
+            if (!ReferenceEquals(step1.OutputBuffer, step2.Inputs[0]))
+                continue;
+
+            // Verify all 2D
+            if (step0.Inputs[0].Rank != 2 || step0.Inputs[1].Rank != 2 ||
+                step2.Inputs[1].Rank != 2)
+                continue;
+
+            // Check hidden dim fits in L1
+            int h = step0.Inputs[1]._shape[1]; // output cols of W1
+            if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden)
+                continue;
+
+            // Extract dimensions
+            var inputTensor = step0.Inputs[0];   // [M, K]
+            var w1Tensor = step0.Inputs[1];      // [K, H]
+            var w2Tensor = step2.Inputs[1];      // [H, N]
+            var outputTensor = step2.OutputBuffer; // [M, N]
+
+            int m = inputTensor._shape[0];
+            int k = inputTensor._shape[1];
+            int n = w2Tensor._shape[1];
+
+            // Pre-allocate activated intermediate buffer
+            var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
+
+            // Capture for closures
+            var capturedInput = inputTensor;
+            var capturedW1 = w1Tensor;
+            var capturedW2 = w2Tensor;
+            var capturedOutput = outputTensor;
+            var capturedActivated = activatedBuffer;
+            int cm = m, ck = k, ch = h, cn = n;
+            var capturedGradMap = gradMap;
+
+            Func<float, float> relu = x => x > 0f ? x : 0f;
+
+            // Fused forward: single kernel call replaces 3 steps
+            fusedForward.Add(eng =>
+            {
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var w1Arr = (float[])(object)capturedW1.GetDataArray();
+                var w2Arr = (float[])(object)capturedW2.GetDataArray();
+                var outArr = (float[])(object)capturedOutput.GetDataArray();
+                var actArr = (float[])(object)capturedActivated.GetDataArray();
+                FusedMultiLayerGemm.FusedGemmActivationGemm(inArr, w1Arr, w2Arr, outArr, actArr, cm, ck, ch, cn, relu);
+            });
+
+            // Fused backward: transposed BLAS for all gradients, zero transpose alloc
+            fusedBackward.Add(eng =>
+            {
+                var gradOut = capturedGradMap.ContainsKey(capturedOutput)
+                    ? capturedGradMap[capturedOutput] : null;
+                if (gradOut == null) return;
+
+                var inArr = (float[])(object)capturedInput.GetDataArray();
+                var w1Arr = (float[])(object)capturedW1.GetDataArray();
+                var w2Arr = (float[])(object)capturedW2.GetDataArray();
+                var actArr = (float[])(object)capturedActivated.GetDataArray();
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+
+                // Pre-allocate or reuse gradient buffers from gradMap
+                var gW1 = capturedGradMap.ContainsKey(capturedW1)
+                    ? (float[])(object)capturedGradMap[capturedW1].GetDataArray() : new float[ck * ch];
+                var gW2 = capturedGradMap.ContainsKey(capturedW2)
+                    ? (float[])(object)capturedGradMap[capturedW2].GetDataArray() : new float[ch * cn];
+                var gInput = capturedGradMap.ContainsKey(capturedInput)
+                    ? (float[])(object)capturedGradMap[capturedInput].GetDataArray() : new float[cm * ck];
+
+                FusedMultiLayerBackward.ComputeGradients(
+                    gOutArr, inArr, w1Arr, w2Arr, actArr,
+                    gW1, gW2, new float[0], new float[0], gInput,
+                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative);
+
+                capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
+                capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;
+                capturedInput.Grad = capturedGradMap.ContainsKey(capturedInput) ? capturedGradMap[capturedInput] : null;
+            });
+
+            consumedIndices.Add(i);
+            consumedIndices.Add(i + 1);
+            consumedIndices.Add(i + 2);
+
+            // Skip past the fused group
+            i += 2;
+        }
     }
 }
 
