@@ -304,6 +304,137 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
+        // TensorAdd forward: direct SIMD into output buffer
+        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorAddInto(o, a, b);
+        }
+
+        // TensorSubtract forward
+        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorSubtractInto(o, a, b);
+        }
+
+        // TensorMultiply forward
+        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorMultiplyInto(o, a, b);
+        }
+
+        // Sigmoid forward: direct SIMD
+        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.SigmoidInto(o, inp);
+        }
+
+        // Tanh forward: direct SIMD
+        if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.TanhInto(o, inp);
+        }
+
+        // Softmax forward
+        if (step.OpName == "Softmax" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                var result = eng.Softmax(inp);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
+        // TensorNegate forward
+        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                MathHelper.GetNumericOperations<T>().Negate(inp.AsSpan(), o.AsWritableSpan());
+            };
+        }
+
+        // TensorTranspose forward: direct cache-blocked transpose
+        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                var result = eng.TensorTranspose(inp);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
+        // TensorDivide forward
+        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                MathHelper.GetNumericOperations<T>().Divide(a.AsSpan(), b.AsSpan(), o.AsWritableSpan());
+            };
+        }
+
+        // BatchMatMul forward
+        if (step.OpName == "BatchMatMul" && step.Inputs.Length == 2)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                var result = eng.BatchMatMul(a, b);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
+        // TensorBroadcastAdd forward
+        if (step.OpName == "TensorBroadcastAdd" && step.Inputs.Length == 2)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                var result = eng.TensorBroadcastAdd(a, b);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
+        // Conv2D forward
+        if (step.OpName == "Conv2D" && step.Inputs.Length == 2)
+        {
+            var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
+            var savedState = step.SavedState;
+            return eng =>
+            {
+                Tensor<T> result;
+                if (savedState != null && savedState.Length == 3
+                    && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
+                    result = eng.Conv2D(inp, kernel, stride, padding, dilation);
+                else
+                    result = eng.Conv2D(inp, kernel, 1, 0, 1);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
+        // MaxPool2D forward
+        if (step.OpName == "MaxPool2D" && step.Inputs.Length == 1)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                var result = eng.MaxPool2D(inp, 2, 2);
+                result.AsSpan().CopyTo(o.AsWritableSpan());
+            };
+        }
+
         return null;
     }
 
@@ -477,6 +608,118 @@ internal sealed class CompiledTrainingPlan<T>
                 gradIn.AsWritableSpan().Fill(gradOut.AsSpan()[0]);
                 input.Grad = gradIn;
             };
+        }
+
+        // Sigmoid backward: grad * sigmoid(out) * (1 - sigmoid(out))
+        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.SigmoidBackward(gradOut, output);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Tanh backward: grad * (1 - tanh(out)^2)
+        if (step.OpName == "Tanh" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.TanhBackward(gradOut, output);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Negate backward: grad = -gradOut
+        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                MathHelper.GetNumericOperations<T>().Negate(gradOut.AsSpan(), gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Transpose backward: grad = transpose(gradOut)
+        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.TensorTranspose(gradOut);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Divide backward: gradA = gradOut / B, gradB = -gradOut * A / (B * B)
+        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputB))
+                return null;
+            var gradOut = gradMap[output];
+            var gradA = gradMap[inputA];
+            var gradB = gradMap[inputB];
+            return eng =>
+            {
+                var gA = eng.TensorDivide(gradOut, inputB);
+                gA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                var negGradTimesA = eng.TensorNegate(eng.TensorMultiply(gradOut, inputA));
+                var bSquared = eng.TensorMultiply(inputB, inputB);
+                var gB = eng.TensorDivide(negGradTimesA, bSquared);
+                gB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                inputA.Grad = gradA;
+                inputB.Grad = gradB;
+            };
+        }
+
+        // Softmax backward
+        if (step.OpName == "Softmax" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            int axis = step.SavedState != null && step.SavedState.Length > 0 ? (int)step.SavedState[0] : -1;
+            return eng =>
+            {
+                var grad = eng.SoftmaxBackward(gradOut, output, axis);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // BatchMatMul backward: same as MatMul but for higher-rank tensors
+        if (step.OpName == "BatchMatMul" && step.Inputs.Length == 2)
+        {
+            // Fall through to generic — BatchMatMul backward is complex
+            return null;
         }
 
         return null; // Not specialized — use generic fallback
