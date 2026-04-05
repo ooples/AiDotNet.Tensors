@@ -113,7 +113,7 @@ public sealed class CompiledBackwardGraph<T>
         Tensor<T> seedGrad;
         if (_loss.Length == 1)
         {
-            seedGrad = new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+            seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])_loss._shape.Clone());
         }
         else
         {

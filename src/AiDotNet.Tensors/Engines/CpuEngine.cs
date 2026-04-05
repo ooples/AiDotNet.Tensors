@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Groups;
@@ -1905,6 +1906,21 @@ public class CpuEngine : ITensorLevelEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null && a.Rank >= 2 && b.Rank >= 2 && a.Rank == b.Rank)
+            {
+                var outShape = ComputeMatMulOutputShape(a._shape, b._shape);
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.BatchMatMul, "BatchMatMul", a, b, outShape,
+                    (eng, output) => { var eager = eng.BatchMatMul(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BatchMatMulBackward);
+            }
+        }
+
         // For ND (N>=3) batch matmul, materialize non-contiguous views.
         // 2D stride-aware GEMM is handled below with transA/transB flags.
         if (a.Rank >= 3 && !a.IsContiguous) a = a.Contiguous();
@@ -2108,6 +2124,20 @@ public class CpuEngine : ITensorLevelEngine
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+        }
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Add, "TensorAdd", a, b, a._shape,
+                    (eng, output) => eng.TensorAddInto(output, capturedA, capturedB),
+                    BackwardFunctions<T>.AddBackward);
+            }
         }
 
         // RentUninitialized: kernel writes every element, no need to zero
@@ -2314,7 +2344,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -2327,8 +2357,28 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("All tensor shapes must match.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        int length = a.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            float* pA = (float*)pinA.Pointer;
+            float* pB = (float*)pinB.Pointer;
+            float* pR = (float*)pinR.Pointer;
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
+            else
+                Simd.SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <inheritdoc/>
@@ -2336,6 +2386,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, a._shape,
+                    (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BroadcastAddBackward);
+            }
+        }
 
         // Use optimized Tensor.BroadcastAdd which handles broadcasting logic
         var result = a.BroadcastAdd(b);
@@ -2545,12 +2609,25 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void TanhInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+
+        int length = input.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.TanhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <inheritdoc/>
@@ -2761,13 +2838,28 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+
+        int length = a.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorSubtractUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <summary>Divide into pre-allocated destination. Zero allocation.</summary>
@@ -2867,6 +2959,20 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Subtract, "TensorSubtract", a, b, a._shape,
+                    (eng, output) => eng.TensorSubtractInto(output, capturedA, capturedB),
+                    BackwardFunctions<T>.SubtractBackward);
+            }
+        }
+
         var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
@@ -2942,6 +3048,20 @@ public class CpuEngine : ITensorLevelEngine
         {
             // Shapes don't match — fall through to broadcasting (NumPy/PyTorch behavior)
             return TensorBroadcastMultiply(a, b);
+        }
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Multiply, "TensorMultiply", a, b, a._shape,
+                    (eng, output) => eng.TensorMultiplyInto(output, capturedA, capturedB),
+                    BackwardFunctions<T>.MultiplyBackward);
+            }
         }
 
         var result = TensorAllocator.RentUninitialized<T>(a._shape);
@@ -3101,7 +3221,7 @@ public class CpuEngine : ITensorLevelEngine
     #if !NETFRAMEWORK
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
 #endif
-    public void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -3114,8 +3234,22 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("All tensor shapes must match.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        int length = a.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <summary>
@@ -3424,6 +3558,20 @@ public class CpuEngine : ITensorLevelEngine
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
+        }
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.Divide, "TensorDivide", a, b, a._shape,
+                    (eng, output) => { MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpan(), capturedB.AsSpan(), output.AsWritableSpan()); },
+                    BackwardFunctions<T>.DivideBackward);
+            }
         }
 
         var result = TensorAllocator.RentUninitialized<T>(a._shape);
@@ -3783,6 +3931,19 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorNegate<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Negate, "TensorNegate", tensor, tensor._shape,
+                    (eng, output) => { MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NegateBackward);
+            }
+        }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -4857,6 +5018,21 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int ps = poolSize, st = stride, pd = padding;
+                return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2D", input, outputShape,
+                    (eng, output) => { var eager = eng.MaxPool2D(captured, ps, st, pd); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
+            }
+        }
+
         var result = TensorAllocator.RentUninitialized<T>(outputShape);
 
         // When tape is active, use WithIndices variant so backward can access max indices
@@ -5149,6 +5325,22 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"Invalid convolution parameters. Output dimensions would be {outputHeight}x{outputWidth}. " +
                 $"Ensure stride={stride}, padding={padding}, dilation={dilation} are compatible with input size {height}x{width} and kernel size {kernelHeight}x{kernelWidth}.");
+        }
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                int s = stride, p = padding, d = dilation;
+                return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
+                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
+            }
         }
 
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
@@ -5752,6 +5944,19 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Tanh, "Tanh", tensor, tensor._shape,
+                    (eng, output) => eng.TanhInto(output, captured),
+                    BackwardFunctions<T>.TanhBackward);
+            }
+        }
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -5797,6 +6002,19 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Sigmoid, "Sigmoid", tensor, tensor._shape,
+                    (eng, output) => eng.SigmoidInto(output, captured),
+                    BackwardFunctions<T>.SigmoidBackward);
+            }
+        }
 
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
@@ -6094,23 +6312,50 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Applies Sigmoid activation to input, storing in destination. Zero allocation.
     /// </summary>
-    public void SigmoidInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void SigmoidInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
         if (!ShapesMatch(destination._shape, input._shape))
         {
             throw new ArgumentException("Tensor shapes must match.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+        int length = input.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.SigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     public virtual unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.ReLU, "ReLU", tensor, tensor._shape,
+                    (eng, output) => eng.ReLUInto(output, captured),
+                    BackwardFunctions<T>.ReLUBackward);
+            }
+        }
 
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
@@ -6283,7 +6528,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Applies ReLU activation to input, storing in destination. Zero allocation.
     /// </summary>
-    public void ReLUInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void ReLUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -6294,8 +6539,25 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensor shapes must match.");
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(input.AsSpan(), destination.AsWritableSpan());
+        int length = input.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            if (CpuJitSelfTest.IsVerified && length >= 64)
+                JitUnaryDispatch(pSrc, pDst, length);
+            else
+                Simd.SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.ReLU(input.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     public Vector<T> GELU<T>(Vector<T> vector)
@@ -7049,6 +7311,21 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor.Rank != 2)
             throw new ArgumentException($"TensorTranspose requires a 2D tensor. Got rank {tensor.Rank}.");
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                int rows0 = tensor._shape[0];
+                int cols0 = tensor._shape[1];
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Transpose, "TensorTranspose", tensor, new[] { cols0, rows0 },
+                    (eng, output) => { var eager = eng.TensorTranspose(captured); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TransposeBackward);
+            }
+        }
+
         int rows = tensor._shape[0];
         int cols = tensor._shape[1];
         var result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
@@ -7090,6 +7367,21 @@ public class CpuEngine : ITensorLevelEngine
         if (a.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {a.Rank} for first tensor.");
         if (b.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {b.Rank} for second tensor.");
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var outShape = ComputeMatMulOutputShape(a._shape, b._shape);
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMul", a, b, outShape,
+                    (eng, output) => { var eager = eng.TensorMatMul(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MatMulBackward);
+            }
+        }
+
         // Materialize non-contiguous views so downstream paths can use .Data safely.
         // BatchMatMul already does this for rank >= 3; TensorMatMul2D did not.
         if (!a.IsContiguous) a = a.Contiguous();
@@ -7124,6 +7416,29 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <summary>Eagerly computes the output shape of a matmul without executing it.</summary>
+    private static int[] ComputeMatMulOutputShape(int[] aShape, int[] bShape)
+    {
+        int aRank = aShape.Length;
+        int bRank = bShape.Length;
+        if (aRank == 2 && bRank == 2)
+            return new[] { aShape[0], bShape[1] };
+        if (bRank == 2)
+        {
+            // ND x 2D: batch dims from a, last dim from b
+            var shape = new int[aRank];
+            Array.Copy(aShape, shape, aRank - 1);
+            shape[aRank - 1] = bShape[1];
+            return shape;
+        }
+        // ND x ND: same batch dims, matmul last two
+        var outShape = new int[aRank];
+        Array.Copy(aShape, outShape, aRank - 2);
+        outShape[aRank - 2] = aShape[aRank - 2];
+        outShape[aRank - 1] = bShape[bRank - 1];
+        return outShape;
+    }
+
     /// <summary>
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
@@ -7140,7 +7455,8 @@ public class CpuEngine : ITensorLevelEngine
         if (n != b._shape[0])
             throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b._shape[0]},{p}]");
 
-        var result = TensorAllocator.Rent<T>(new[] { m, p });
+        // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
+        var result = TensorAllocator.RentUninitialized<T>(new[] { m, p });
 
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
@@ -7149,6 +7465,8 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Fallback to parallel loops for non-float/double or when BLAS unavailable
+        // Must zero for accumulation pattern
+        result.AsWritableSpan().Clear();
         var aData = a.GetDataArray();
         var bData = b.GetDataArray();
         var rData = result.GetDataArray();
@@ -7358,6 +7676,24 @@ public class CpuEngine : ITensorLevelEngine
 
         if (outputHeight <= 0 || outputWidth <= 0)
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check kernel size, stride, padding, and dilation parameters.");
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
+                var capturedInput = input;
+                var capturedKernel = kernel;
+                var capturedStride = stride;
+                var capturedPad = padding;
+                var capturedDil = dilation;
+                return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
+                    (eng, output) => { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.Conv2DBackward, new object[] { stride, padding, dilation });
+            }
+        }
 
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetDataArray();
@@ -10641,6 +10977,20 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
+
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capturedAxis = axis;
+                return scope.RecordUnary(LazyNodeType.Softmax, "Softmax", input, input._shape,
+                    (eng, output) => { var eager = eng.Softmax(captured, capturedAxis); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            }
+        }
 
         // Compute outer and inner sizes
         int outerSize = 1, axisSize = input._shape[axis], innerSize = 1;
@@ -19299,57 +19649,48 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
 
+        // Lazy graph mode: record the fused operation for later compilation
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Compute output shape eagerly: [M, K] @ [K, N] = [M, N]
+                int[] outShape;
+                if (input.Rank == 2 && weights.Rank == 2)
+                    outShape = new[] { input._shape[0], weights._shape[1] };
+                else
+                    outShape = ComputeMatMulOutputShape(input._shape, weights._shape);
+
+                var nodeType = ActivationRegistry.GetFusedLinearNodeType(activation);
+
+                var inputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
+                var capturedActivation = activation;
+                return scope.RecordVariadic(nodeType, "FusedLinear", inputs, outShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.FusedLinear(inputs[0], inputs[1],
+                            inputs.Length > 2 ? inputs[2] : null, capturedActivation);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.FusedLinearWithActivationBackward,
+                    activation != FusedActivationType.None ? new object[] { activation } : null);
+            }
+        }
+
         // When a gradient tape is active, decompose into tape-recorded primitives so
         // backward can trace the dependency chain from loss -> output -> parameters.
         // The BLAS fast path below bypasses the tape (operates on raw arrays), so we
         // must use the recorded path during training.
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
-            // Fused tape path: compute via BLAS, record ONE entry instead of 2-3.
-            if (!input.IsContiguous) input = input.Contiguous();
-            if (!weights.IsContiguous) weights = weights.Contiguous();
-
-            Tensor<T> fusedResult;
-            if (input.Rank == 2 && weights.Rank == 2 && typeof(T) == typeof(float))
-            {
-                int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
-                fusedResult = TensorAllocator.RentUninitialized<T>(new[] { M, N });
-                var inArr = (float[])(object)input.GetDataArray();
-                var wArr = (float[])(object)weights.GetDataArray();
-                var outArr = (float[])(object)fusedResult.GetDataArray();
-
-                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                    Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
-
-                // Save pre-activation for backward (needed for activation derivative)
-                Tensor<T>? preActivation = null;
-                if (activation != FusedActivationType.None)
-                {
-                    // Clone before applying activation in-place
-                    if (bias != null)
-                    {
-                        // Apply bias first (no activation yet)
-                        var bArr = (float[])(object)bias.GetDataArray();
-                        CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, FusedActivationType.None);
-                    }
-                    preActivation = fusedResult; // save reference before activation
-                    // Now apply activation
-                    ApplyFusedActivationInPlace(fusedResult, activation);
-                }
-                else if (bias != null)
-                {
-                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr,
-                        (float[])(object)bias.GetDataArray(), M, N, FusedActivationType.None);
-                }
-            }
-            else
-            {
-                // Non-float or non-2D: use engine ops then consolidate tape entries
-                fusedResult = TensorMatMul(input, weights);
-                if (bias != null) fusedResult = TensorBroadcastAdd(fusedResult, bias);
-                if (activation != FusedActivationType.None) ApplyFusedActivationInPlace(fusedResult, activation);
-                RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
-            }
+            // Fused tape path: use the exact same TensorMatMul code path as unfused
+            // to avoid BLAS accumulation divergence, then consolidate tape entries
+            // into a single fused entry for backward.
+            Tensor<T> fusedResult = TensorMatMul(input, weights);
+            if (bias != null) fusedResult = TensorBroadcastAdd(fusedResult, bias);
+            if (activation != FusedActivationType.None) ApplyFusedActivationInPlace(fusedResult, activation);
+            RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info for backward
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
@@ -19729,22 +20070,13 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> activationOutput, FusedActivationType activation)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-
-        return activation switch
-        {
-            FusedActivationType.None => gradOutput,
-            FusedActivationType.ReLU => TensorMultiply(gradOutput, ReLUDerivative(preActivation)),
-            FusedActivationType.GELU => TensorMultiply(gradOutput, GELUDerivative(preActivation)),
-            FusedActivationType.Sigmoid => TensorMultiply(gradOutput, SigmoidDerivative(Sigmoid(preActivation))),
-            FusedActivationType.Tanh => TensorMultiply(gradOutput, TanhDerivative(Tanh(preActivation))),
-            FusedActivationType.LeakyReLU => TensorMultiply(gradOutput, LeakyReLUDerivative(preActivation, numOps.FromDouble(0.01))),
-            FusedActivationType.Swish => TensorMultiply(gradOutput, SwishDerivative(preActivation)),
-            FusedActivationType.Softmax => throw new NotSupportedException("Softmax backward requires special handling via cross-entropy"),
-            _ => throw new ArgumentException($"Unknown activation type: {activation}")
-        };
+        // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
+        // Each activation handler knows how to compute its own backward.
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return gradOutput; // None
+        return handler.ApplyBackward(this, gradOutput, activationOutput);
     }
 
     /// <summary>

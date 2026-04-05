@@ -472,21 +472,36 @@ public static class CpuFusedOperations
     /// Applies the specified activation function to a single value.
     /// Inline for performance in fused operations.
     /// </summary>
+    /// <summary>
+    /// OCP-compliant activation dispatch table. Register new activations here.
+    /// Resolved once before loop, then called per-element with zero lookup overhead.
+    /// </summary>
+    private static readonly Dictionary<FusedActivationType, Func<float, float>> _floatActivations = new()
+    {
+        { FusedActivationType.None, x => x },
+        { FusedActivationType.ReLU, x => x > 0f ? x : 0f },
+        { FusedActivationType.GELU, ApplyGelu },
+        { FusedActivationType.Sigmoid, x => 1f / (1f + MathF.Exp(-x)) },
+        { FusedActivationType.Tanh, MathF.Tanh },
+        { FusedActivationType.LeakyReLU, x => x > 0f ? x : 0.01f * x },
+        { FusedActivationType.Swish, x => x / (1f + MathF.Exp(-x)) },
+        { FusedActivationType.Softmax, x => x },
+    };
+
+    /// <summary>Gets the float activation function delegate for use in tight loops.</summary>
+    internal static Func<float, float> GetFloatActivation(FusedActivationType activation)
+    {
+        if (_floatActivations.TryGetValue(activation, out var fn))
+            return fn;
+        return x => x;
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static float ApplyActivation(float x, FusedActivationType activation)
     {
-        return activation switch
-        {
-            FusedActivationType.None => x,
-            FusedActivationType.ReLU => x > 0f ? x : 0f,
-            FusedActivationType.GELU => ApplyGelu(x),
-            FusedActivationType.Sigmoid => 1f / (1f + MathF.Exp(-x)),
-            FusedActivationType.Tanh => MathF.Tanh(x),
-            FusedActivationType.LeakyReLU => x > 0f ? x : 0.01f * x,
-            FusedActivationType.Swish => x / (1f + MathF.Exp(-x)),
-            FusedActivationType.Softmax => x, // Softmax needs full row, handled separately
-            _ => x
-        };
+        // Delegate through the registered table for OCP compliance.
+        // JIT inlines this for the common case since the delegate is a static field.
+        return GetFloatActivation(activation)(x);
     }
 
     /// <summary>
@@ -608,21 +623,31 @@ public static class CpuFusedOperations
         }
     }
 
+    /// <summary>OCP-compliant double activation dispatch table.</summary>
+    private static readonly Dictionary<FusedActivationType, Func<double, double>> _doubleActivations = new()
+    {
+        { FusedActivationType.None, x => x },
+        { FusedActivationType.ReLU, x => x > 0.0 ? x : 0.0 },
+        { FusedActivationType.GELU, ApplyGeluDouble },
+        { FusedActivationType.Sigmoid, x => 1.0 / (1.0 + Math.Exp(-x)) },
+        { FusedActivationType.Tanh, Math.Tanh },
+        { FusedActivationType.LeakyReLU, x => x > 0.0 ? x : 0.01 * x },
+        { FusedActivationType.Swish, x => x / (1.0 + Math.Exp(-x)) },
+        { FusedActivationType.Softmax, x => x },
+    };
+
+    /// <summary>Gets the double activation function delegate for use in tight loops.</summary>
+    internal static Func<double, double> GetDoubleActivation(FusedActivationType activation)
+    {
+        if (_doubleActivations.TryGetValue(activation, out var fn))
+            return fn;
+        return x => x;
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static double ApplyActivationDouble(double x, FusedActivationType activation)
     {
-        return activation switch
-        {
-            FusedActivationType.None => x,
-            FusedActivationType.ReLU => x > 0.0 ? x : 0.0,
-            FusedActivationType.GELU => ApplyGeluDouble(x),
-            FusedActivationType.Sigmoid => 1.0 / (1.0 + Math.Exp(-x)),
-            FusedActivationType.Tanh => Math.Tanh(x),
-            FusedActivationType.LeakyReLU => x > 0.0 ? x : 0.01 * x,
-            FusedActivationType.Swish => x / (1.0 + Math.Exp(-x)),
-            FusedActivationType.Softmax => x,
-            _ => x
-        };
+        return GetDoubleActivation(activation)(x);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

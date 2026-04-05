@@ -24,6 +24,12 @@ internal abstract class ActivationHandler
         var result = Apply(engine, input);
         result.AsSpan().CopyTo(input.AsWritableSpan());
     }
+
+    /// <summary>
+    /// Computes the backward pass: gradOutput * activation'(activationOutput).
+    /// activationOutput is the post-activation tensor from the forward pass.
+    /// </summary>
+    public abstract Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput);
 }
 
 /// <summary>
@@ -60,6 +66,49 @@ internal static class ActivationRegistry
     {
         _handlers[type] = handler;
     }
+
+    /// <summary>
+    /// Maps a FusedActivationType to its corresponding fused LazyNodeType.
+    /// OCP-compliant: add new mappings here when registering new activations.
+    /// </summary>
+    private static readonly ConcurrentDictionary<FusedActivationType, Compilation.LazyNodeType> _lazyNodeMap = new(
+        new[]
+        {
+            new KeyValuePair<FusedActivationType, Compilation.LazyNodeType>(FusedActivationType.ReLU, Compilation.LazyNodeType.FusedLinearReLU),
+            new KeyValuePair<FusedActivationType, Compilation.LazyNodeType>(FusedActivationType.GELU, Compilation.LazyNodeType.FusedLinearGELU),
+            new KeyValuePair<FusedActivationType, Compilation.LazyNodeType>(FusedActivationType.Sigmoid, Compilation.LazyNodeType.FusedLinearSigmoid),
+        });
+
+    /// <summary>Gets the fused LazyNodeType for an activation, defaulting to FusedLinear for unknown.</summary>
+    public static Compilation.LazyNodeType GetFusedLinearNodeType(FusedActivationType activation)
+    {
+        if (_lazyNodeMap.TryGetValue(activation, out var nodeType))
+            return nodeType;
+        return Compilation.LazyNodeType.FusedLinear;
+    }
+
+    /// <summary>
+    /// Maps a LazyNodeType (activation op) to its corresponding FusedActivationType.
+    /// Returns null if the node type is not a recognized activation.
+    /// OCP-compliant: add new mappings here when registering new activations.
+    /// </summary>
+    private static readonly ConcurrentDictionary<Compilation.LazyNodeType, FusedActivationType> _nodeToActivation = new(
+        new[]
+        {
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.ReLU, FusedActivationType.ReLU),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.GELU, FusedActivationType.GELU),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.Sigmoid, FusedActivationType.Sigmoid),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.Tanh, FusedActivationType.Tanh),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.Swish, FusedActivationType.Swish),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.LeakyReLU, FusedActivationType.LeakyReLU),
+            new KeyValuePair<Compilation.LazyNodeType, FusedActivationType>(Compilation.LazyNodeType.Softmax, FusedActivationType.Softmax),
+        });
+
+    /// <summary>Tries to map a LazyNodeType to a FusedActivationType. Returns false for non-activation ops.</summary>
+    public static bool TryGetActivationType(Compilation.LazyNodeType nodeType, out FusedActivationType activation)
+    {
+        return _nodeToActivation.TryGetValue(nodeType, out activation);
+    }
 }
 
 // ==================== Concrete Handlers ====================
@@ -69,36 +118,50 @@ internal sealed class ReLUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.ReLU(input);
     public override void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input) => engine.ReLUInPlace(input);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.ReluBackward(gradOutput, activationOutput);
 }
 
 internal sealed class GELUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.GELU(input);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.GeluBackward(gradOutput, activationOutput);
 }
 
 internal sealed class SigmoidActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Sigmoid(input);
     public override void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input) => engine.SigmoidInPlace(input);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.SigmoidBackward(gradOutput, activationOutput);
 }
 
 internal sealed class TanhActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Tanh(input);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.TanhBackward(gradOutput, activationOutput);
 }
 
 internal sealed class LeakyReLUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input)
         => engine.LeakyReLU(input, Helpers.MathHelper.GetNumericOperations<T>().FromDouble(0.01));
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.LeakyReluBackward(gradOutput, activationOutput, 0.01);
 }
 
 internal sealed class SwishActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Swish(input);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.SwishBackward(gradOutput, activationOutput);
 }
 
 internal sealed class SoftmaxActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Softmax(input, -1);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
+        => engine.SoftmaxBackward(gradOutput, activationOutput, -1);
 }

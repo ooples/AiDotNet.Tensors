@@ -49,10 +49,7 @@ public sealed class NativeInferencePool : IDisposable
     }
 
     /// <summary>
-    /// Pins a double weight array permanently.
-    /// </summary>
-    /// <summary>
-    /// Gets a cached pinned pointer for an array, pinning it on first access.
+    /// Gets a cached pinned pointer for a float array, pinning it on first access.
     /// </summary>
     public unsafe float* GetOrPin(float[] array)
     {
@@ -77,11 +74,13 @@ public sealed class NativeInferencePool : IDisposable
     /// </summary>
     public unsafe float* GetActivationBuffer(int floatCount)
     {
-        int byteCount = floatCount * sizeof(float);
-        if (!_nativeBuffers.TryGetValue(byteCount, out var ptr))
+        // Use negative key space for float to avoid collision with double buffers
+        int key = -floatCount;
+        if (!_nativeBuffers.TryGetValue(key, out var ptr))
         {
+            int byteCount = floatCount * sizeof(float);
             ptr = (IntPtr)NativeMemory.AlignedAlloc((nuint)byteCount, 64);
-            _nativeBuffers[byteCount] = ptr;
+            _nativeBuffers[key] = ptr;
         }
         return (float*)ptr;
     }
@@ -91,11 +90,13 @@ public sealed class NativeInferencePool : IDisposable
     /// </summary>
     public unsafe double* GetActivationBufferDouble(int doubleCount)
     {
-        int byteCount = doubleCount * sizeof(double);
-        if (!_nativeBuffers.TryGetValue(byteCount, out var ptr))
+        // Use positive key space for double (element count, not byte count)
+        int key = doubleCount;
+        if (!_nativeBuffers.TryGetValue(key, out var ptr))
         {
+            int byteCount = doubleCount * sizeof(double);
             ptr = (IntPtr)NativeMemory.AlignedAlloc((nuint)byteCount, 64);
-            _nativeBuffers[byteCount] = ptr;
+            _nativeBuffers[key] = ptr;
         }
         return (double*)ptr;
     }

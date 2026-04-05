@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -57,6 +58,13 @@ public abstract class TensorBase<T> : IDisposable
     /// Reset to CPU when the data is materialized to the CPU-side array.
     /// </summary>
     internal TensorDevice _device = TensorDevice.CPU;
+
+    /// <summary>
+    /// Lazy computation graph node that will produce this tensor's data when realized.
+    /// When non-null, this tensor's data is not yet computed — accessing it via AsSpan()
+    /// or GetDataArray() will auto-materialize by calling Realize() on the lazy node.
+    /// </summary>
+    internal ILazyNode? LazySource;
 
     /// <summary>
     /// Index into the flat gradient array during backward pass. Assigned by the tape
@@ -651,6 +659,10 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
+        // Auto-materialize lazy tensors on data access
+        if (LazySource is ILazyNode node && !node.IsRealized)
+            node.Realize(AiDotNetEngine.Current);
+
         ThrowIfSparse();
         if (Length == 0) return ReadOnlySpan<T>.Empty;
         if (!IsContiguous)
@@ -666,6 +678,10 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal Span<T> AsWritableSpan()
     {
+        // Auto-materialize lazy tensors on data access
+        if (LazySource is ILazyNode node && !node.IsRealized)
+            node.Realize(AiDotNetEngine.Current);
+
         if (Length == 0) return Span<T>.Empty;
         if (!IsContiguous)
             throw new InvalidOperationException(
@@ -680,6 +696,10 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
+        // Auto-materialize lazy tensors on data access
+        if (LazySource is ILazyNode node && !node.IsRealized)
+            node.Realize(AiDotNetEngine.Current);
+
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
             return ToArray();
         return _storage.GetDataArray();

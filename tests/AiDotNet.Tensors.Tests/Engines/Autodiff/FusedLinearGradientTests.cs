@@ -54,10 +54,16 @@ public class FusedLinearGradientTests
             fusedGrads = tape.ComputeGradients(loss, [input, weight, bias]);
         }
 
-        // Verify forward output matches
+        // Verify forward output matches within float32 tolerance.
+        // BLAS GEMM with different accumulation order (fused vs unfused) can diverge
+        // by up to K * machine_epsilon (~32 * 1.2e-7 ≈ 4e-6 for K=32).
         Assert.Equal(unfusedOutput.Length, fusedOutput.Length);
         for (int i = 0; i < unfusedOutput.Length; i++)
-            Assert.Equal(unfusedOutput[i], fusedOutput[i], 5);
+        {
+            double diff = Math.Abs((double)unfusedOutput[i] - (double)fusedOutput[i]);
+            Assert.True(diff < 1e-5,
+                $"Forward output [{i}]: unfused={unfusedOutput[i]:R} fused={fusedOutput[i]:R} diff={diff:E3}");
+        }
 
         // Verify gradients match for each parameter
         foreach (var param in new[] { input, weight, bias })
