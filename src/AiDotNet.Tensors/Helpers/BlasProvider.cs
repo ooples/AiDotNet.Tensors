@@ -182,6 +182,33 @@ internal static class BlasProvider
     internal static bool HasMklNet => _available && _useMklNet;
 
     /// <summary>
+    /// True after MKL has been verified working. Use IsMklVerified + MklSgemmZeroOffset
+    /// to bypass TryGemm entirely when offsets are always 0 (FusedLinear hot path).
+    /// </summary>
+    internal static bool IsMklVerified => _mklVerified;
+
+    /// <summary>
+    /// Absolute fastest MKL path: zero-offset spans, no TryGemm dispatch, no validation.
+    /// Only call when IsMklVerified is true and all arrays start at offset 0.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void MklSgemmZeroOffset(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+    {
+        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+            1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+    }
+
+    /// <summary>
+    /// Absolute fastest MKL path for double.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void MklDgemmZeroOffset(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
+    {
+        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+            1.0, a, lda, b, ldb, 0.0, c, ldc);
+    }
+
+    /// <summary>
     /// Direct MKL.NET SGEMM with zero-offset spans. Skips TryGemm overhead (validation,
     /// init check, try/catch, AsSpan offset). Caller must ensure arrays are correctly sized.
     /// </summary>

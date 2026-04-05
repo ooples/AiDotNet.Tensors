@@ -19313,10 +19313,15 @@ public class CpuEngine : ITensorLevelEngine
                             BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
                     }
                 }
-                // Tier 2: Any BLAS (MKL.NET or native with validation)
+                // Tier 2: MKL verified — call Blas.gemm directly with zero-offset spans
+                else if (BlasProvider.IsMklVerified)
+                {
+                    BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                }
+                // Tier 3: Any BLAS with validation
                 else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
-                    // Tier 3: SIMD tiled GEMM fallback
+                    // Tier 4: SIMD tiled GEMM fallback
                     Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
                 }
 
@@ -19345,6 +19350,10 @@ public class CpuEngine : ITensorLevelEngine
                         fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
                             BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
                     }
+                }
+                else if (BlasProvider.IsMklVerified)
+                {
+                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
                 }
                 else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
