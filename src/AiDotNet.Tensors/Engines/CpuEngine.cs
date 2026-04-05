@@ -19296,35 +19296,58 @@ public class CpuEngine : ITensorLevelEngine
             if (weights._shape[0] != K)
                 throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
 
-            // Use optimized fused operations for float type: BLAS GEMM + fused bias+activation
+            // Ultra-fast path for float: pin arrays once, BLAS direct, zero-alloc after warmup
             if (typeof(T) == typeof(float))
             {
-                // Allocate result tensor ONCE — BLAS writes directly into its backing array
-                var result = TensorAllocator.RentUninitialized<T>([M, N]);
-                var inputArray = (float[])(object)input.GetDataArray();
-                var weightsArray = (float[])(object)weights.GetDataArray();
-                var biasArray = bias != null ? (float[])(object)bias.GetDataArray() : null;
-                var outputArray = (float[])(object)result.GetDataArray();
+                var inArr = (float[])(object)input.GetDataArray();
+                var wArr = (float[])(object)weights.GetDataArray();
 
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inputArray, weightsArray, biasArray, outputArray,
-                    M, N, K, activation);
+                // Get or create pinned output — reused across training steps (ThreadStatic)
+                int outSize = M * N;
+                unsafe
+                {
+                    float* outPtr = CpuFusedOperations.GetPinnedFloatBuffer(outSize);
+                    float[] outArr = CpuFusedOperations.PinnedFloatArray!;
 
-                return result;
+                    // BLAS writes directly to pinned memory
+                    if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, outSize), M, K, N);
+
+                    // Fused bias + activation
+                    if (bias != null || activation != FusedActivationType.None)
+                    {
+                        var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation);
+                    }
+
+                    // Wrap pinned array in tensor — zero copy via Vector.Wrap
+                    var typedOut = Unsafe.As<float[], T[]>(ref outArr);
+                    return new Tensor<T>(Vector<T>.Wrap(typedOut), [M, N]);
+                }
             }
 
-            // Use optimized fused operations for double type
+            // Ultra-fast path for double: same pattern
             if (typeof(T) == typeof(double))
             {
                 var result = TensorAllocator.RentUninitialized<T>([M, N]);
-                var inputArray = (double[])(object)input.GetDataArray();
-                var weightsArray = (double[])(object)weights.GetDataArray();
-                var biasArray = bias != null ? (double[])(object)bias.GetDataArray() : null;
-                var outputArray = (double[])(object)result.GetDataArray();
+                var inArr = (double[])(object)input.GetDataArray();
+                var wArr = (double[])(object)weights.GetDataArray();
+                var outArr = (double[])(object)result.GetDataArray();
 
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inputArray, weightsArray, biasArray, outputArray,
-                    M, N, K, activation);
+                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
+                    // No SimdGemm.Dgemm — scalar fallback
+                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
+                        bias != null ? (double[])(object)bias.GetDataArray() : null,
+                        outArr, M, N, K, activation);
+                    return result;
+                }
+
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation);
+                }
 
                 return result;
             }

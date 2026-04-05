@@ -35,6 +35,50 @@ public static class CpuFusedOperations
     // Threshold for parallelization (number of elements)
     private const int PARALLEL_THRESHOLD = 4096;
 
+    // Thread-local pinned output buffer pool. In training loops, FusedLinear is called
+    // with the same dimensions every step. By caching a pinned float[] per thread,
+    // we eliminate: (1) array allocation, (2) GC pinning per call, (3) Array.Clear.
+    // BLAS writes directly to the pinned memory — zero overhead after warmup.
+    [ThreadStatic] private static float[]? _pinnedFloatBuf;
+    [ThreadStatic] private static System.Runtime.InteropServices.GCHandle _pinnedFloatHandle;
+    [ThreadStatic] private static double[]? _pinnedDoubleBuf;
+    [ThreadStatic] private static System.Runtime.InteropServices.GCHandle _pinnedDoubleHandle;
+
+    /// <summary>
+    /// Gets a pinned float buffer of at least the given size. Reused across calls on the same thread.
+    /// </summary>
+    /// <summary>Gets the current pinned float buffer (valid after GetPinnedFloatBuffer call).</summary>
+    internal static float[]? PinnedFloatArray => _pinnedFloatBuf;
+
+    /// <summary>Gets the current pinned double buffer (valid after GetPinnedDoubleBuffer call).</summary>
+    internal static double[]? PinnedDoubleArray => _pinnedDoubleBuf;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe float* GetPinnedFloatBuffer(int minSize)
+    {
+        if (_pinnedFloatBuf == null || _pinnedFloatBuf.Length < minSize)
+        {
+            if (_pinnedFloatHandle.IsAllocated) _pinnedFloatHandle.Free();
+            _pinnedFloatBuf = new float[minSize];
+            _pinnedFloatHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                _pinnedFloatBuf, System.Runtime.InteropServices.GCHandleType.Pinned);
+        }
+        return (float*)_pinnedFloatHandle.AddrOfPinnedObject();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe double* GetPinnedDoubleBuffer(int minSize)
+    {
+        if (_pinnedDoubleBuf == null || _pinnedDoubleBuf.Length < minSize)
+        {
+            if (_pinnedDoubleHandle.IsAllocated) _pinnedDoubleHandle.Free();
+            _pinnedDoubleBuf = new double[minSize];
+            _pinnedDoubleHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                _pinnedDoubleBuf, System.Runtime.InteropServices.GCHandleType.Pinned);
+        }
+        return (double*)_pinnedDoubleHandle.AddrOfPinnedObject();
+    }
+
     #region Fused GEMM + Bias + Activation (Float Arrays)
 
     /// <summary>
@@ -154,7 +198,7 @@ public static class CpuFusedOperations
     }
 
     [MethodImpl(Hot)]
-    private static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
+    internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
     {
         bool hasBias = bias != null;
         bool hasActivation = activation != FusedActivationType.None;
@@ -562,7 +606,7 @@ public static class CpuFusedOperations
     }
 
     [MethodImpl(Hot)]
-    private static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation)
+    internal static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation)
     {
         bool hasBias = bias != null;
         bool hasActivation = activation != FusedActivationType.None;
