@@ -18,6 +18,7 @@ internal static class BlasProvider
     private static bool _initialized;
     private static bool _available;
     private static bool _useMklNet;  // True if using MKL.NET managed bindings
+    private static bool _mklVerified; // True after first successful MKL call — skip try/catch
     private static IntPtr _libraryHandle;
     private static CblasSgemm? _sgemm;
     private static CblasDgemm? _dgemm;
@@ -122,6 +123,13 @@ internal static class BlasProvider
 
     internal static bool TryGemm(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
     {
+        // Hot path: after MKL is verified, skip all validation and init checks
+        if (_mklVerified)
+        {
+            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
+            return true;
+        }
+
         if (!EnsureInitialized())
         {
             return false;
@@ -427,33 +435,31 @@ internal static class BlasProvider
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool TryMklNetSgemm(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
     {
+        // Fast path: after first successful call, skip try/catch entirely
+        if (_mklVerified)
+        {
+            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
+            return true;
+        }
+
         try
         {
-            // Use MKL.NET's managed bindings - it handles native library loading automatically
-            // Create offset views for the arrays
-            var aSpan = a.AsSpan(aOffset);
-            var bSpan = b.AsSpan(bOffset);
-            var cSpan = c.AsSpan(cOffset);
-
-            Blas.gemm(
-                Layout.RowMajor,
-                Trans.No,
-                Trans.No,
-                m, n, k,
-                1.0f,
-                aSpan, lda,
-                bSpan, ldb,
-                0.0f,
-                cSpan, ldc);
-
+            MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
+            _mklVerified = true;
             return true;
         }
         catch (Exception)
         {
-            // If MKL.NET fails, mark it as unavailable and return false
             _useMklNet = false;
             return false;
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void MklNetSgemmCore(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
+    {
+        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+            1.0f, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0f, c.AsSpan(cOffset), ldc);
     }
 
     /// <summary>
@@ -502,6 +508,14 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
+        // Hot path: skip all checks after MKL verified
+        if (_mklVerified)
+        {
+            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
+            return true;
+        }
+
         if (!EnsureInitialized())
         {
             return false;
@@ -549,28 +563,22 @@ internal static class BlasProvider
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool TryMklNetDgemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
+        if (_mklVerified)
+        {
+            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
+            return true;
+        }
+
         try
         {
-            var aSpan = a.AsSpan(aOffset);
-            var bSpan = b.AsSpan(bOffset);
-            var cSpan = c.AsSpan(cOffset);
-
-            Blas.gemm(
-                Layout.RowMajor,
-                Trans.No,
-                Trans.No,
-                m, n, k,
-                1.0,
-                aSpan, lda,
-                bSpan, ldb,
-                0.0,
-                cSpan, ldc);
-
+            Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
+                1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);
+            _mklVerified = true;
             return true;
         }
         catch (Exception)
         {
-            // MKL.NET call failed, disable and fall back to native
             _useMklNet = false;
             return false;
         }

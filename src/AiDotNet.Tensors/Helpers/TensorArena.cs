@@ -44,14 +44,6 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     private readonly Dictionary<(Type, int), int> _cursor = new();
 
-    /// <summary>
-    /// Pool of Tensor objects keyed by (element type, total element count).
-    /// On Reset(), cursors rewind so the same Tensor<T> objects (with their backing arrays) are reused.
-    /// This eliminates both the array allocation AND the Tensor<T>/Vector<T>/int[] construction.
-    /// </summary>
-    private readonly Dictionary<(Type, int), List<object>> _tensorPool = new();
-    private readonly Dictionary<(Type, int), int> _tensorCursor = new();
-
     private bool _disposed;
     private readonly TensorArena? _previous;
 
@@ -131,39 +123,67 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
+    // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes
+    private object[]? _tensorRing;
+    private int[]? _tensorRingSizes;
+    private int[]? _tensorRingCursors;
+    private int _tensorRingCount;
+    private const int MaxTensorRingSlots = 32;
+
     /// <summary>
-    /// Rents a Tensor object from the arena. Returns a cached Tensor<T> with its
-    /// backing array already pooled — zero allocation after warmup. The Tensor object
-    /// itself is reused (same strides, same Vector wrapper, same backing array).
+    /// Rents a Tensor object from the arena. Returns a cached Tensor with its
+    /// backing array already pooled. Uses a flat array with linear scan instead of
+    /// Dictionary — eliminates hash computation overhead for the 3-5 unique sizes
+    /// in a typical training step.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal LinearAlgebra.Tensor<T>? TryRentTensor<T>(int totalSize, int[] shape)
     {
         if (_disposed) return null;
 
-        var key = (typeof(T), totalSize);
-        if (!_tensorPool.TryGetValue(key, out var bucket))
+        // Lazy init
+        if (_tensorRing == null)
         {
-            bucket = new List<object>(4);
-            _tensorPool[key] = bucket;
-            _tensorCursor[key] = 0;
+            _tensorRing = new object[MaxTensorRingSlots];
+            _tensorRingSizes = new int[MaxTensorRingSlots];
+            _tensorRingCursors = new int[MaxTensorRingSlots];
         }
 
-        int cursor = _tensorCursor.TryGetValue(key, out var c) ? c : 0;
-
-        if (cursor < bucket.Count)
+        // Linear scan for matching size (fast for <10 entries)
+        for (int i = 0; i < _tensorRingCount; i++)
         {
-            _tensorCursor[key] = cursor + 1;
-            return (LinearAlgebra.Tensor<T>)bucket[cursor];
+            if (_tensorRingSizes![i] == totalSize && _tensorRing[i] is List<object> bucket)
+            {
+                int cursor = _tensorRingCursors![i];
+                if (cursor < bucket.Count)
+                {
+                    _tensorRingCursors[i] = cursor + 1;
+                    return (LinearAlgebra.Tensor<T>)bucket[cursor];
+                }
+
+                // Need one more tensor of this size
+                var newArr = new T[totalSize];
+                var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
+                bucket.Add(newTensor);
+                _tensorRingCursors[i] = cursor + 1;
+                return newTensor;
+            }
         }
 
-        // Warmup: allocate new tensor, track it
-        var arr = new T[totalSize];
-        var memory = new Memory<T>(arr, 0, totalSize);
-        var tensor = LinearAlgebra.Tensor<T>.FromMemory(memory, shape);
-        bucket.Add(tensor);
-        _tensorCursor[key] = cursor + 1;
-        return tensor;
+        // New size — add slot
+        if (_tensorRingCount < MaxTensorRingSlots)
+        {
+            var arr = new T[totalSize];
+            var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
+            var newBucket = new List<object>(4) { tensor };
+            int idx = _tensorRingCount++;
+            _tensorRing[idx] = newBucket;
+            _tensorRingSizes![idx] = totalSize;
+            _tensorRingCursors![idx] = 1;
+            return tensor;
+        }
+
+        return null; // Arena full — caller falls through to other allocators
     }
 
     /// <summary>
@@ -175,8 +195,12 @@ public sealed class TensorArena : IDisposable
         // Rewind all cursors to 0 — arrays and tensors stay pooled
         foreach (var key in _cursor.Keys)
             _cursor[key] = 0;
-        foreach (var key in _tensorCursor.Keys)
-            _tensorCursor[key] = 0;
+        // Reset flat tensor ring cursors
+        if (_tensorRingCursors != null)
+        {
+            for (int i = 0; i < _tensorRingCount; i++)
+                _tensorRingCursors[i] = 0;
+        }
     }
 
     /// <summary>
