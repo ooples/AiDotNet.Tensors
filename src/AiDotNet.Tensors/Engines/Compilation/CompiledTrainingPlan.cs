@@ -168,7 +168,7 @@ internal sealed class CompiledTrainingPlan<T>
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
-            var specialized = BuildSpecializedForward(step);
+            var specialized = TryBuildSpecializedForward(step);
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
@@ -242,7 +242,7 @@ internal sealed class CompiledTrainingPlan<T>
     /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
     /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
     /// </summary>
-    private static unsafe Action<IEngine>? BuildSpecializedForward(CompiledStep<T> step)
+    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step)
     {
         if (typeof(T) != typeof(float)) return null;
 

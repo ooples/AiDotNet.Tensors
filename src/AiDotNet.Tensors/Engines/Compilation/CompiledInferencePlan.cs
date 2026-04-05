@@ -69,7 +69,32 @@ internal sealed class CompiledInferencePlan<T>
             }
         }
 
+        // Build specialized forward actions (same optimization as CompiledTrainingPlan)
+        var specializedSteps = new CompiledStep<T>[steps.Count];
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var step = steps[i];
+            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step);
+            if (specialized != null)
+            {
+                // Wrap the specialized action as a CompiledStep with the optimized execute
+                var output = step.OutputBuffer;
+                var action = specialized;
+                specializedSteps[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) => action(eng),
+                    output,
+                    step.Inputs,
+                    step.BackwardFn,
+                    step.SavedState);
+            }
+            else
+            {
+                specializedSteps[i] = step;
+            }
+        }
+
         var finalOutput = steps.Count > 0 ? steps[steps.Count - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(steps.ToArray(), finalOutput, engine);
+        return new CompiledInferencePlan<T>(specializedSteps, finalOutput, engine);
     }
 }
