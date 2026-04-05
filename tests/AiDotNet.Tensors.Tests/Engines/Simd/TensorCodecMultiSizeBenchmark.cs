@@ -244,5 +244,73 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                     m, k, n, eagerMs, compiledMs, eagerMs / compiledMs);
             }
         }
+
+        [Fact]
+        public void CNN_Conv2D_ReLU_Pool_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            // Small CNN: [1, 3, 16, 16] input, [8, 3, 3, 3] kernel, stride=1, pad=1
+            var input = Tensor<float>.CreateRandom(new[] { 1, 3, 16, 16 });
+            var kernel = Tensor<float>.CreateRandom(new[] { 8, 3, 3, 3 });
+            int warmup = 20, iters = 200;
+
+            // Eager: Conv2D → ReLU → MaxPool2D
+            double eagerMs = Measure(() =>
+            {
+                var conv = engine.Conv2D(input, kernel, stride: 1, padding: 1, dilation: 1);
+                var relu = engine.ReLU(conv);
+                engine.MaxPool2D(relu, poolSize: 2, stride: 2);
+            }, warmup, iters);
+
+            // Compiled plan
+            CompiledInferencePlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var conv = engine.Conv2D(input, kernel, stride: 1, padding: 1, dilation: 1);
+                var relu = engine.ReLU(conv);
+                engine.MaxPool2D(relu, poolSize: 2, stride: 2);
+                plan = scope.CompileInference<float>();
+            }
+            double compiledMs = Measure(() => plan.Execute(), warmup, iters);
+
+            _output.WriteLine("CNN [1,3,16,16] Conv3x3→ReLU→Pool2x2:");
+            _output.WriteLine("  Eager:    {0:F4}ms", eagerMs);
+            _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
+        }
+
+        [Fact]
+        public void TransformerBlock_MatMul_Softmax_MatMul_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            // Attention-like: Q@K^T → Softmax → @V
+            int batch = 4, heads = 4, seqLen = 16, dHead = 16;
+            var q = Tensor<float>.CreateRandom(new[] { batch * heads, seqLen, dHead });
+            var k = Tensor<float>.CreateRandom(new[] { batch * heads, dHead, seqLen }); // pre-transposed
+            var v = Tensor<float>.CreateRandom(new[] { batch * heads, seqLen, dHead });
+            int warmup = 20, iters = 200;
+
+            // Eager attention
+            double eagerMs = Measure(() =>
+            {
+                var scores = engine.BatchMatMul(q, k);
+                var attn = engine.Softmax(scores, -1);
+                engine.BatchMatMul(attn, v);
+            }, warmup, iters);
+
+            // Compiled
+            CompiledInferencePlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var scores = engine.BatchMatMul(q, k);
+                var attn = engine.Softmax(scores, -1);
+                engine.BatchMatMul(attn, v);
+                plan = scope.CompileInference<float>();
+            }
+            double compiledMs = Measure(() => plan.Execute(), warmup, iters);
+
+            _output.WriteLine("Attention [{0}heads, seq{1}, d{2}]:", heads, seqLen, dHead);
+            _output.WriteLine("  Eager:    {0:F4}ms", eagerMs);
+            _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
+        }
     }
 }
