@@ -431,42 +431,48 @@ internal sealed class CompiledTrainingPlan<T>
 
             Func<float, float> relu = x => x > 0f ? x : 0f;
 
+            // Pre-allocate backward workspace at compile time (zero alloc during replay)
+            var backwardWorkspace = new float[cm * ch]; // grad_h buffer
+            var emptyBias = new float[0];
+
             // Fused forward: single kernel call replaces 3 steps
             fusedForward.Add(eng =>
             {
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var w1Arr = (float[])(object)capturedW1.GetDataArray();
-                var w2Arr = (float[])(object)capturedW2.GetDataArray();
-                var outArr = (float[])(object)capturedOutput.GetDataArray();
-                var actArr = (float[])(object)capturedActivated.GetDataArray();
-                FusedMultiLayerGemm.FusedGemmActivationGemm(inArr, w1Arr, w2Arr, outArr, actArr, cm, ck, ch, cn, relu);
+                var inA = (float[])(object)capturedInput.GetDataArray();
+                var w1A = (float[])(object)capturedW1.GetDataArray();
+                var w2A = (float[])(object)capturedW2.GetDataArray();
+                var outA = (float[])(object)capturedOutput.GetDataArray();
+                var actA = (float[])(object)capturedActivated.GetDataArray();
+                FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, relu);
             });
 
-            // Fused backward: transposed BLAS for all gradients, zero transpose alloc
+            // Fused backward: pre-allocated workspace, zero alloc during replay
             fusedBackward.Add(eng =>
             {
                 var gradOut = capturedGradMap.ContainsKey(capturedOutput)
                     ? capturedGradMap[capturedOutput] : null;
                 if (gradOut == null) return;
 
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var w1Arr = (float[])(object)capturedW1.GetDataArray();
-                var w2Arr = (float[])(object)capturedW2.GetDataArray();
-                var actArr = (float[])(object)capturedActivated.GetDataArray();
                 var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inA = (float[])(object)capturedInput.GetDataArray();
+                var w1A = (float[])(object)capturedW1.GetDataArray();
+                var w2A = (float[])(object)capturedW2.GetDataArray();
+                var actA = (float[])(object)capturedActivated.GetDataArray();
 
-                // Pre-allocate or reuse gradient buffers from gradMap
                 var gW1 = capturedGradMap.ContainsKey(capturedW1)
                     ? (float[])(object)capturedGradMap[capturedW1].GetDataArray() : new float[ck * ch];
                 var gW2 = capturedGradMap.ContainsKey(capturedW2)
                     ? (float[])(object)capturedGradMap[capturedW2].GetDataArray() : new float[ch * cn];
-                var gInput = capturedGradMap.ContainsKey(capturedInput)
+                var gIn = capturedGradMap.ContainsKey(capturedInput)
                     ? (float[])(object)capturedGradMap[capturedInput].GetDataArray() : new float[cm * ck];
 
+                Array.Clear(backwardWorkspace, 0, backwardWorkspace.Length);
+
                 FusedMultiLayerBackward.ComputeGradients(
-                    gOutArr, inArr, w1Arr, w2Arr, actArr,
-                    gW1, gW2, new float[0], new float[0], gInput,
-                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative);
+                    gOutArr, inA, w1A, w2A, actA,
+                    gW1, gW2, emptyBias, emptyBias, gIn,
+                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
+                    backwardWorkspace);
 
                 capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
                 capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;

@@ -45,7 +45,8 @@ internal static class FusedMultiLayerBackward
         float[] gradB2,        // [N] output (nullable via length check)
         float[] gradInput,     // [M, K] output (nullable via length check)
         int m, int k, int h, int n,
-        Func<float, float> activationDerivative)
+        Func<float, float> activationDerivative,
+        float[]? workspace = null) // [M, H] pre-allocated buffer for grad_h to avoid allocation
     {
         // Step 1: gradW2 = activated^T @ gradOutput  [H,M] @ [M,N] = [H,N]
         // Uses TryGemmEx(transA=true) — no transpose allocation
@@ -78,7 +79,7 @@ internal static class FusedMultiLayerBackward
 
         // Step 3: grad_h = gradOutput @ W2^T  [M,N] @ [N,H] = [M,H]
         // Uses TryGemmEx(transB=true) — no transpose allocation
-        var grad_h = new float[m * h];
+        var grad_h = workspace ?? new float[m * h];
         if (!BlasProvider.TryGemmEx(m, h, n,
                 gradOutput, 0, n, false,
                 w2, 0, n, true,
