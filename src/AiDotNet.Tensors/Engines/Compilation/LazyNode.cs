@@ -127,6 +127,10 @@ internal sealed class LazyNode<T> : ILazyNode
         // an infinite recursion: AsWritableSpan → auto-materialize → Realize → Execute → AsWritableSpan.
         IsRealized = true;
 
+        // Suppress GraphMode so Execute delegates call eager engine paths
+        // instead of re-recording into the active scope.
+        var savedScope = GraphMode.Current;
+        GraphMode.SetCurrent(null);
         try
         {
             // Ensure inputs are realized first
@@ -140,6 +144,10 @@ internal sealed class LazyNode<T> : ILazyNode
             // Roll back so a retry or diagnostic access doesn't see stale/uninitialized data.
             IsRealized = false;
             throw;
+        }
+        finally
+        {
+            GraphMode.SetCurrent(savedScope);
         }
     }
 
