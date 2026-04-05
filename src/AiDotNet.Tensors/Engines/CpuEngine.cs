@@ -4202,6 +4202,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorSin(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SinBackward);
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4217,6 +4229,18 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorCos<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorCos(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CosBackward);
+            }
+        }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -4417,6 +4441,21 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorPow<T>(Tensor<T> tensor, T exponent)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedExponent = exponent;
+                object boxedExp = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorPow", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorPow(captured, capturedExponent); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExp });
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15530,6 +15569,30 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                var capturedAxes = axes;
+                bool capturedKeepDims = keepDims;
+                // Compute output shape same as ReduceSum
+                var shapeList = new System.Collections.Generic.List<int>();
+                var axisSet = new System.Collections.Generic.HashSet<int>();
+                foreach (int a in axes) axisSet.Add(a < 0 ? input.Rank + a : a);
+                for (int i = 0; i < input.Rank; i++)
+                {
+                    if (axisSet.Contains(i)) { if (keepDims) shapeList.Add(1); }
+                    else shapeList.Add(input._shape[i]);
+                }
+                var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                return scope.RecordUnary(LazyNodeType.ReduceMean, "ReduceMean", input, outShape,
+                    (eng, output) => { var r = eng.ReduceMean(captured, capturedAxes, capturedKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ReduceMeanBackward, new object[] { axes, keepDims });
+            }
+        }
+
         // Stride-aware single-axis mean
         if (!input.IsContiguous && axes.Length == 1)
         {
@@ -17506,6 +17569,22 @@ public class CpuEngine : ITensorLevelEngine
         if (axes.Length != tensor._shape.Length)
             throw new ArgumentException("Axes length must match tensor rank");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAxes = axes;
+                // Compute permuted output shape
+                var outShape = new int[axes.Length];
+                for (int i = 0; i < axes.Length; i++) outShape[i] = tensor._shape[axes[i]];
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorPermute", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorPermute(captured, capturedAxes); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
+            }
+        }
+
         // Use tensor's built-in Transpose method
         var result = tensor.Transpose(axes);
         DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
@@ -17522,6 +17601,24 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + 1 + axis;
         if (axis < 0 || axis > rank)
             throw new ArgumentOutOfRangeException(nameof(axis), "Axis out of range");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAxis = axis;
+                // Build output shape with 1 inserted at axis
+                var outShape = new int[rank + 1];
+                for (int i = 0; i < capturedAxis; i++) outShape[i] = tensor._shape[i];
+                outShape[capturedAxis] = 1;
+                for (int i = capturedAxis; i < rank; i++) outShape[i + 1] = tensor._shape[i];
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorExpandDims", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorExpandDims(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ExpandDimsBackward, new object[] { capturedAxis });
+            }
+        }
 
         // Build new shape with 1 inserted at axis
         var newShape = new int[rank + 1];
@@ -17540,6 +17637,23 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorSqueeze<T>(Tensor<T> tensor, int axis = -1)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAxis = axis;
+                // Compute squeezed output shape
+                var shapeList = tensor._shape.ToList();
+                if (capturedAxis == -1) { shapeList = shapeList.Where(s => s != 1).ToList(); if (shapeList.Count == 0) shapeList.Add(1); }
+                else { int normAxis = capturedAxis < 0 ? shapeList.Count + capturedAxis : capturedAxis; shapeList.RemoveAt(normAxis); if (shapeList.Count == 0) shapeList.Add(1); }
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSqueeze", tensor, shapeList.ToArray(),
+                    (eng, output) => { var r = eng.TensorSqueeze(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SqueezeBackward, new object[] { capturedAxis });
+            }
+        }
 
         var shape = tensor._shape.ToList();
 
@@ -17650,6 +17764,19 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorCumSum<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAxis = axis;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorCumSum", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorCumSum(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CumSumBackward, new object[] { capturedAxis });
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -18039,6 +18166,19 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedScalar = scalar;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSubtractScalar", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorSubtractScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SubtractScalarBackward);
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -18761,6 +18901,19 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
         if (axis < 0 || axis >= rank)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAxis = axis;
+                return scope.RecordUnary(LazyNodeType.Custom, "LogSoftmax", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorLogSoftmax(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LogSoftmaxBackward);
+            }
+        }
 
         // Compute outer and inner sizes relative to the axis
         int outerSize = 1, axisSize = tensor._shape[axis], innerSize = 1;
@@ -22922,6 +23075,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>MSE loss: mean((pred - target)^2). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedPred = predictions;
+                var capturedTarget = targets;
+                return scope.RecordBinary(LazyNodeType.MSELoss, "MSELoss", predictions, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorMSELoss(capturedPred, capturedTarget); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MSELossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
         using (new NoGradScope<T>())
@@ -22939,6 +23105,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>L1 loss: mean(|pred - target|). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedP = predictions;
+                var capturedT = targets;
+                return scope.RecordBinary(LazyNodeType.Custom, "L1Loss", predictions, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorL1Loss(capturedP, capturedT); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.L1LossBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
         using (new NoGradScope<T>())
@@ -22956,6 +23135,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Huber loss: smooth L1 that transitions from L2 to L1 at delta=1.</summary>
     public virtual Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedP = predictions;
+                var capturedT = targets;
+                double capturedDelta = delta;
+                return scope.RecordBinary(LazyNodeType.Custom, "HuberLoss", predictions, targets, new[] { 1 },
+                    (eng, output) => { var r = eng.TensorHuberLoss(capturedP, capturedT, capturedDelta); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.HuberLossBackward, new object[] { delta });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         Tensor<T> diff;
         using (new NoGradScope<T>()) { diff = TensorSubtract(predictions, targets); }
@@ -23216,6 +23409,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Flatten tensor to 1D.</summary>
     public virtual Tensor<T> TensorFlatten<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var outShape = new int[] { tensor.Length };
+                return scope.RecordUnary(LazyNodeType.Custom, "Flatten", tensor, outShape,
+                    (eng, output) => { var r = captured.Reshape(new int[] { captured.Length }); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.FlattenBackward);
+            }
+        }
+
         var result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
         return result;
