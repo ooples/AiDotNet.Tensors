@@ -2044,13 +2044,31 @@ public class CpuEngine : ITensorLevelEngine
         int matrixSizeB = k * n;
         int matrixSizeResult = m * n;
 
+        // Fast path: for float, do sequential BLAS calls (avoids Parallel.For overhead for small batches)
+        // For B <= 16, the Parallel.For thread pool overhead exceeds the parallelism benefit.
+        if (typeof(T) == typeof(float) && batchSize <= 16)
+        {
+            for (int batch = 0; batch < batchSize; batch++)
+            {
+                int aOffset = batch * matrixSizeA;
+                int bOffset = batch * matrixSizeB;
+                int resultOffset = batch * matrixSizeResult;
+                if (!MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, k, n))
+                {
+                    // BLAS unavailable — fall through to parallel path
+                    goto parallelFallback;
+                }
+            }
+            goto batchDone;
+        }
+
+        parallelFallback:
         Parallel.For(0, batchSize, batch =>
         {
             int aOffset = batch * matrixSizeA;
             int bOffset = batch * matrixSizeB;
             int resultOffset = batch * matrixSizeResult;
 
-            // Try BLAS for each batch slice
             if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, k, n))
             {
                 return;
@@ -2070,6 +2088,8 @@ public class CpuEngine : ITensorLevelEngine
                 }
             }
         });
+
+        batchDone:
 
         DifferentiableOps.RecordBinary("BatchMatMul", result, a, b,
             BackwardFunctions<T>.BatchMatMulBackward);
@@ -19285,27 +19305,13 @@ public class CpuEngine : ITensorLevelEngine
         // must use the recorded path during training.
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
+            // Decompose into tape-recorded primitives. Each op records its own backward.
             var result = TensorMatMul(input, weights);
             if (bias != null)
                 result = TensorBroadcastAdd(result, bias);
-            // Apply activation through recorded ops (each records its own backward)
+            // Apply activation through engine methods that record on tape
             if (activation != FusedActivationType.None)
-            {
-                var numOps = MathHelper.GetNumericOperations<T>();
-                result = activation switch
-                {
-                    FusedActivationType.ReLU => ReLU(result),
-                    FusedActivationType.Sigmoid => Sigmoid(result),
-                    FusedActivationType.Tanh => Tanh(result),
-                    FusedActivationType.GELU => GELU(result),
-                    FusedActivationType.Swish => Swish(result),
-                    FusedActivationType.LeakyReLU => LeakyReLU(result, numOps.FromDouble(0.01)),
-                    FusedActivationType.ELU => ELU(result),
-                    FusedActivationType.Softmax => Softmax(result),
-                    _ => throw new ArgumentOutOfRangeException(nameof(activation), activation,
-                        $"Unsupported activation type {activation} in tape-recorded FusedLinear path")
-                };
-            }
+                result = ApplyActivationRecorded(result, activation);
             return result;
         }
 
@@ -19640,6 +19646,17 @@ public class CpuEngine : ITensorLevelEngine
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return; // None
         handler.ApplyInPlace(this, tensor);
+    }
+
+    /// <summary>
+    /// Applies activation through the engine's recorded activation methods (tape-aware).
+    /// Uses ActivationRegistry dispatch — no switch statement, open/closed compliant.
+    /// </summary>
+    private Tensor<T> ApplyActivationRecorded<T>(Tensor<T> tensor, FusedActivationType activation)
+    {
+        var handler = ActivationRegistry.Get(activation);
+        if (handler is null) return tensor;
+        return handler.Apply(this, tensor);
     }
 
     /// <summary>
