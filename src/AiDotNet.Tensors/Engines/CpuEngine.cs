@@ -4003,6 +4003,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorAbs(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AbsBackward);
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -6798,6 +6810,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Mish", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.Mish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MishBackward);
+            }
+        }
 
         if (!tensor.IsContiguous)
         {
