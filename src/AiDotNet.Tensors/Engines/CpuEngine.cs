@@ -3564,6 +3564,19 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedScalar = scalar;
+                return scope.RecordUnary(LazyNodeType.MultiplyScalar, "TensorMultiplyScalar", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorMultiplyScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
 
@@ -3850,6 +3863,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorLog(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LogBackward);
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -3880,6 +3905,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ExpBackward);
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -3909,6 +3946,18 @@ public class CpuEngine : ITensorLevelEngine
     public virtual unsafe Tensor<T> TensorSqrt<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorSqrt(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SqrtBackward);
+            }
+        }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -17925,6 +17974,19 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedScalar = scalar;
+                return scope.RecordUnary(LazyNodeType.AddScalar, "TensorAddScalar", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorAddScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AddScalarBackward);
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
