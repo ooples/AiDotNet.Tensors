@@ -19321,11 +19321,26 @@ public class CpuEngine : ITensorLevelEngine
                 if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                     Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
 
-                if (bias != null)
-                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr,
-                        (float[])(object)bias.GetDataArray(), M, N, activation);
-                else if (activation != FusedActivationType.None)
+                // Save pre-activation for backward (needed for activation derivative)
+                Tensor<T>? preActivation = null;
+                if (activation != FusedActivationType.None)
+                {
+                    // Clone before applying activation in-place
+                    if (bias != null)
+                    {
+                        // Apply bias first (no activation yet)
+                        var bArr = (float[])(object)bias.GetDataArray();
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, FusedActivationType.None);
+                    }
+                    preActivation = fusedResult; // save reference before activation
+                    // Now apply activation
                     ApplyFusedActivationInPlace(fusedResult, activation);
+                }
+                else if (bias != null)
+                {
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr,
+                        (float[])(object)bias.GetDataArray(), M, N, FusedActivationType.None);
+                }
             }
             else
             {
@@ -19336,10 +19351,13 @@ public class CpuEngine : ITensorLevelEngine
                 RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
             }
 
-            // Record single fused entry — eliminates 2 tensor allocs + 2 tape entries
+            // Record single fused entry with activation info for backward
             var fusedInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
+            object[]? savedState = activation != FusedActivationType.None
+                ? new object[] { activation } // save activation type
+                : null;
             Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fusedResult, fusedInputs,
-                Autodiff.BackwardFunctions<T>.FusedLinearBackward);
+                Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, savedState);
             return fusedResult;
         }
 
@@ -19711,7 +19729,7 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    private Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
 

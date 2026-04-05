@@ -3118,6 +3118,42 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        FusedLinearBackwardCore(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    internal static void FusedLinearWithActivationBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        // Apply activation derivative to gradOutput before linear backward.
+        // savedState[0] = FusedActivationType, output = post-activation values
+        if (savedState is { Length: >= 1 })
+        {
+            var activation = (FusedActivationType)savedState[0];
+            gradOutput = ApplyActivationDerivative(gradOutput, output, activation, engine);
+        }
+
+        FusedLinearBackwardCore(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    private static Tensor<T> ApplyActivationDerivative(
+        Tensor<T> gradOutput, Tensor<T> output, FusedActivationType activation, IEngine engine)
+    {
+        if (activation == FusedActivationType.None) return gradOutput;
+
+        // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
+        // This is OCP-compliant: new activations register themselves, no switch needed here
+        if (engine is CpuEngine cpuEngine)
+            return cpuEngine.ApplyFusedActivationBackward(gradOutput, output, activation);
+
+        // Fallback for non-CPU engines
+        return gradOutput;
+    }
+
+    private static void FusedLinearBackwardCore(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
         // FusedLinear = input @ weight + bias
         // dL/dinput = gradOutput @ weight^T
         var weightT = engine.TensorTranspose(inputs[1]);
