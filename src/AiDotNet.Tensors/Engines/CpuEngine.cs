@@ -4558,6 +4558,49 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        // Lazy graph mode: record and return placeholder
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Compute output shape eagerly
+                int[] outShape;
+                if (axes == null || axes.Length == 0)
+                {
+                    outShape = keepDims ? new int[tensor.Rank] : new[] { 1 };
+                    if (keepDims) for (int i = 0; i < tensor.Rank; i++) outShape[i] = 1;
+                }
+                else
+                {
+                    var shapeList = new System.Collections.Generic.List<int>();
+                    var axisSet = new System.Collections.Generic.HashSet<int>();
+                    foreach (int a in axes) axisSet.Add(a < 0 ? tensor.Rank + a : a);
+                    for (int i = 0; i < tensor.Rank; i++)
+                    {
+                        if (axisSet.Contains(i))
+                        {
+                            if (keepDims) shapeList.Add(1);
+                        }
+                        else shapeList.Add(tensor._shape[i]);
+                    }
+                    outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                }
+
+                var captured = tensor;
+                var capturedAxes = axes;
+                bool capturedKeepDims = keepDims;
+                return scope.RecordUnary(LazyNodeType.ReduceSum, "ReduceSum", tensor, outShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReduceSum(captured, capturedAxes, capturedKeepDims);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.ReduceSumBackward,
+                    new object[] { axes ?? Array.Empty<int>(), keepDims });
+            }
+        }
+
         // Stride-aware: for single-axis reduction on non-contiguous views, use direct stride math
         if (!tensor.IsContiguous && axes != null && axes.Length == 1)
         {
