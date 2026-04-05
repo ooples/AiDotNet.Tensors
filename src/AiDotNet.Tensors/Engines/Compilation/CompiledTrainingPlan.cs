@@ -285,6 +285,25 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
+        // ReduceSum forward: direct sum, skip engine dispatch
+        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && step.OutputBuffer.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+
+            return eng =>
+            {
+                cIn ??= (float[])(object)input.GetDataArray();
+                cOut ??= (float[])(object)output.GetDataArray();
+                float sum = 0;
+                int len = input.Length;
+                for (int j = 0; j < len; j++) sum += cIn[j];
+                cOut[0] = sum;
+            };
+        }
+
         return null;
     }
 
@@ -436,6 +455,27 @@ internal sealed class CompiledTrainingPlan<T>
                 eng.TensorMultiplyInto(gradB, gradOut, inputA);
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
+            };
+        }
+
+        // ReduceSum backward: broadcast scalar gradient to all elements
+        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            int length = input.Length;
+
+            return eng =>
+            {
+                // ReduceSum backward: each input element gets the same scalar gradient
+                gradIn.AsWritableSpan().Fill(gradOut.AsSpan()[0]);
+                input.Grad = gradIn;
             };
         }
 
