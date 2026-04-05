@@ -44,6 +44,14 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     private readonly Dictionary<(Type, int), int> _cursor = new();
 
+    /// <summary>
+    /// Pool of Tensor objects keyed by (element type, total element count).
+    /// On Reset(), cursors rewind so the same Tensor<T> objects (with their backing arrays) are reused.
+    /// This eliminates both the array allocation AND the Tensor<T>/Vector<T>/int[] construction.
+    /// </summary>
+    private readonly Dictionary<(Type, int), List<object>> _tensorPool = new();
+    private readonly Dictionary<(Type, int), int> _tensorCursor = new();
+
     private bool _disposed;
     private readonly TensorArena? _previous;
 
@@ -124,14 +132,51 @@ public sealed class TensorArena : IDisposable
     }
 
     /// <summary>
+    /// Rents a Tensor object from the arena. Returns a cached Tensor<T> with its
+    /// backing array already pooled — zero allocation after warmup. The Tensor object
+    /// itself is reused (same strides, same Vector wrapper, same backing array).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal LinearAlgebra.Tensor<T>? TryRentTensor<T>(int totalSize, int[] shape)
+    {
+        if (_disposed) return null;
+
+        var key = (typeof(T), totalSize);
+        if (!_tensorPool.TryGetValue(key, out var bucket))
+        {
+            bucket = new List<object>(4);
+            _tensorPool[key] = bucket;
+            _tensorCursor[key] = 0;
+        }
+
+        int cursor = _tensorCursor.TryGetValue(key, out var c) ? c : 0;
+
+        if (cursor < bucket.Count)
+        {
+            _tensorCursor[key] = cursor + 1;
+            return (LinearAlgebra.Tensor<T>)bucket[cursor];
+        }
+
+        // Warmup: allocate new tensor, track it
+        var arr = new T[totalSize];
+        var memory = new Memory<T>(arr, 0, totalSize);
+        var tensor = LinearAlgebra.Tensor<T>.FromMemory(memory, shape);
+        bucket.Add(tensor);
+        _tensorCursor[key] = cursor + 1;
+        return tensor;
+    }
+
+    /// <summary>
     /// Resets the arena for the next iteration. After this, subsequent Rent calls
     /// will reuse arrays from the previous iteration — zero allocation.
     /// </summary>
     public void Reset()
     {
-        // Rewind all cursors to 0 — arrays stay pooled
+        // Rewind all cursors to 0 — arrays and tensors stay pooled
         foreach (var key in _cursor.Keys)
             _cursor[key] = 0;
+        foreach (var key in _tensorCursor.Keys)
+            _tensorCursor[key] = 0;
     }
 
     /// <summary>

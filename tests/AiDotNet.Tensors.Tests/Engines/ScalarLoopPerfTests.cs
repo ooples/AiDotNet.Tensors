@@ -25,18 +25,33 @@ public class ScalarLoopPerfTests
         var input = Tensor<float>.CreateRandom([32, 256]);
         var weights = Tensor<float>.CreateRandom([256, 256]);
         var bias = Tensor<float>.CreateRandom([1, 256]);
-        int iters = 50;
+        int iters = 100;
 
-        // Warmup
-        for (int w = 0; w < 5; w++)
+        // Without arena
+        for (int w = 0; w < 10; w++)
             _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
-
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
             _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
         sw.Stop();
-        double ms = sw.Elapsed.TotalMilliseconds / iters;
-        _output.WriteLine($"FusedLinear float 32x256 @ 256x256 + ReLU: {ms:F3}ms");
+        _output.WriteLine($"FusedLinear float 32x256 + ReLU (no arena): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+        // With arena (simulates training loop — zero alloc after warmup)
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            // Warmup: first call allocates, subsequent calls reuse
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            arena.Reset();
+
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                arena.Reset();
+                _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            }
+            sw.Stop();
+            _output.WriteLine($"FusedLinear float 32x256 + ReLU (arena): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+        }
     }
 
     [Fact]
@@ -61,21 +76,32 @@ public class ScalarLoopPerfTests
     [Fact]
     public void Benchmark_FusedLinear_Float_768x768()
     {
-        // Transformer-scale: typical attention projection
         var input = Tensor<float>.CreateRandom([16, 768]);
         var weights = Tensor<float>.CreateRandom([768, 768]);
         var bias = Tensor<float>.CreateRandom([1, 768]);
-        int iters = 20;
+        int iters = 50;
 
-        for (int w = 0; w < 3; w++)
+        for (int w = 0; w < 5; w++)
             _engine.FusedLinear(input, weights, bias, FusedActivationType.GELU);
-
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++)
             _engine.FusedLinear(input, weights, bias, FusedActivationType.GELU);
         sw.Stop();
-        double ms = sw.Elapsed.TotalMilliseconds / iters;
-        _output.WriteLine($"FusedLinear float 16x768 @ 768x768 + GELU: {ms:F3}ms");
+        _output.WriteLine($"FusedLinear float 16x768 + GELU (no arena): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.GELU);
+            arena.Reset();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                arena.Reset();
+                _engine.FusedLinear(input, weights, bias, FusedActivationType.GELU);
+            }
+            sw.Stop();
+            _output.WriteLine($"FusedLinear float 16x768 + GELU (arena): {sw.Elapsed.TotalMilliseconds / iters:F3}ms");
+        }
     }
 
     [Fact]
@@ -209,5 +235,52 @@ public class ScalarLoopPerfTests
         }
         sw.Stop();
         _output.WriteLine($"I. input.Data access: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // J. FusedLinear WITH arena (realistic training loop)
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            arena.Reset();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                arena.Reset();
+                _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            }
+            sw.Stop();
+            _output.WriteLine($"J. FusedLinear (arena): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+        }
+
+        // K. TensorAllocator.RentUninitialized WITH arena
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            TensorAllocator.RentUninitialized<float>([M, N]);
+            arena.Reset();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                arena.Reset();
+                TensorAllocator.RentUninitialized<float>([M, N]);
+            }
+            sw.Stop();
+            _output.WriteLine($"K. RentUninitialized (arena): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+        }
+
+#if NET5_0_OR_GREATER
+        // L. Allocation bytes per FusedLinear call with arena
+        using (var arena = AiDotNet.Tensors.Helpers.TensorArena.Create())
+        {
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            arena.Reset();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 10; i++)
+            {
+                arena.Reset();
+                _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+            }
+            long after = GC.GetAllocatedBytesForCurrentThread();
+            _output.WriteLine($"L. Bytes per FusedLinear (arena): {(after - before) / 10:N0}");
+        }
+#endif
     }
 }

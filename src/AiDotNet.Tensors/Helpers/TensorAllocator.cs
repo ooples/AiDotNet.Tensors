@@ -98,16 +98,12 @@ public static class TensorAllocator
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);
 
-        // Arena path: skip Array.Clear entirely
+        // Arena path: reuse the entire Tensor<T> object + backing array — truly zero alloc
         var arena = TensorArena.Current;
         if (arena != null)
         {
-            T[]? arenaArray = arena.TryAllocateUninitialized<T>(totalSize);
-            if (arenaArray != null)
-            {
-                var memory = new Memory<T>(arenaArray, 0, totalSize);
-                return Tensor<T>.FromMemory(memory, shape);
-            }
+            var pooledTensor = arena.TryRentTensor<T>(totalSize, shape);
+            if (pooledTensor != null) return pooledTensor;
         }
 
 #if NET5_0_OR_GREATER
