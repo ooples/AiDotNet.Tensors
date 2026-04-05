@@ -1471,7 +1471,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(T scalar)
     {
-        return new Tensor<T>(_shape, _data.Multiply(scalar));
+        return AiDotNetEngine.Current.TensorMultiplyScalar(this, scalar);
     }
 
     /// <summary>
@@ -1511,9 +1511,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Divide(T scalar)
     {
-        var result = TensorAllocator.Rent<T>(_shape);
-        _numOps.DivideScalar(_data.AsSpan(), scalar, result._data.AsWritableSpan());
-        return result;
+        return AiDotNetEngine.Current.TensorDivideScalar(this, scalar);
     }
 
     /// <summary>
@@ -3332,6 +3330,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(Tensor<T> other)
     {
+        // Route through engine for BLAS performance + gradient tape recording
+        return AiDotNetEngine.Current.TensorMatMul(this, other);
+    }
+
+    /// <summary>Legacy scalar matmul — kept for Matrix.Multiply which needs specific behavior.</summary>
+    internal Tensor<T> MultiplyDirect(Tensor<T> other)
+    {
         // Support 2D matrix multiplication and 3D batch matrix multiplication
         if (_shape.Length == 2 && other._shape.Length == 2)
         {
@@ -3870,6 +3875,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> SumOverAxis(int axis)
     {
+        // Route through engine for SIMD + tape recording
+        return AiDotNetEngine.Current.ReduceSum(this, new[] { axis }, keepDims: false);
+    }
+
+    /// <summary>Legacy SumOverAxis implementation for internal use.</summary>
+    internal Tensor<T> SumOverAxisDirect(int axis)
+    {
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -3935,6 +3947,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>The resulting tensor has one fewer dimension than the original tensor.</para>
     /// </remarks>
     public Tensor<T> MeanOverAxis(int axis)
+    {
+        // Route through engine for SIMD + tape recording
+        return AiDotNetEngine.Current.ReduceMean(this, new[] { axis }, keepDims: false);
+    }
+
+    /// <summary>Legacy MeanOverAxis for internal use.</summary>
+    internal Tensor<T> MeanOverAxisDirect(int axis)
     {
         ThrowIfSparse();
         if (axis < 0 || axis >= Rank)
