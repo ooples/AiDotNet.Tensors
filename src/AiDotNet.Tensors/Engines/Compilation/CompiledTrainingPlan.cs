@@ -338,15 +338,12 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.TanhInto(o, inp);
         }
 
-        // Softmax forward
+        // Softmax forward: use SoftmaxInto
         if (step.OpName == "Softmax" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                var result = eng.Softmax(inp);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
+            int axis = step.SavedState != null && step.SavedState.Length > 0 ? (int)step.SavedState[0] : -1;
+            return eng => eng.SoftmaxInto(o, inp, axis);
         }
 
         // TensorNegate forward
@@ -391,69 +388,29 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); };
         }
 
-        // TensorTranspose forward: direct cache-blocked transpose
-        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
-        {
-            var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                var result = eng.TensorTranspose(inp);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
-        }
+        // TensorTranspose: don't specialize (no Into variant, allocate+copy is slower)
 
         // TensorDivide: don't specialize — the engine's allocating path with JIT/SIMD is faster
         // than our Into variant for division (SIMD divide is inherently expensive)
 
-        // BatchMatMul forward
-        if (step.OpName == "BatchMatMul" && step.Inputs.Length == 2)
-        {
-            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                var result = eng.BatchMatMul(a, b);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
-        }
+        // BatchMatMul/BroadcastAdd: don't specialize (allocate+copy is slower than eager)
+        // These need proper Into variants to be worth specializing
 
-        // TensorBroadcastAdd forward
-        if (step.OpName == "TensorBroadcastAdd" && step.Inputs.Length == 2)
-        {
-            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                var result = eng.TensorBroadcastAdd(a, b);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
-        }
-
-        // Conv2D forward
+        // Conv2D forward: use Conv2DInto to write directly into output
         if (step.OpName == "Conv2D" && step.Inputs.Length == 2)
         {
             var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
             var savedState = step.SavedState;
-            return eng =>
+            if (savedState != null && savedState.Length == 3
+                && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
             {
-                Tensor<T> result;
-                if (savedState != null && savedState.Length == 3
-                    && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
-                    result = eng.Conv2D(inp, kernel, stride, padding, dilation);
-                else
-                    result = eng.Conv2D(inp, kernel, 1, 0, 1);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
+                int s = stride[0], p = padding[0], d = dilation[0];
+                return eng => eng.Conv2DInto(o, inp, kernel, s, p, d);
+            }
+            return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
         }
 
-        // MaxPool2D forward
-        if (step.OpName == "MaxPool2D" && step.Inputs.Length == 1)
-        {
-            var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                var result = eng.MaxPool2D(inp, 2, 2);
-                result.AsSpan().CopyTo(o.AsWritableSpan());
-            };
-        }
+        // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
         return null;
     }
