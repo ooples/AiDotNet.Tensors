@@ -12058,6 +12058,8 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[features];
         var gradBetaData = new T[features];
         var gradInputData = new T[batch * features];
+        Array.Clear(gradGammaData, 0, gradGammaData.Length);
+        Array.Clear(gradBetaData, 0, gradBetaData.Length);
 
         // Compute gradGamma and gradBeta
         for (int f = 0; f < features; f++)
@@ -12196,6 +12198,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
         var gradInputData = new T[input.Length];
+        Array.Clear(gradInputData, 0, gradInputData.Length);
 
         // Compute gradGamma and gradBeta per channel (generic fallback)
         Parallel.For(0, channels, c =>
@@ -12404,13 +12407,8 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[featureSize];
         var gradBetaData = new T[featureSize];
         var gradInputData = new T[batchSize * featureSize];
-
-        // Initialize gradGamma and gradBeta to zero
-        for (int f = 0; f < featureSize; f++)
-        {
-            gradGammaData[f] = numOps.Zero;
-            gradBetaData[f] = numOps.Zero;
-        }
+        // CLR zeros new T[] already; Array.Clear handles value types efficiently
+        // (no scalar numOps.Zero loop needed)
 
         // Compute gradGamma and gradBeta
         for (int b = 0; b < batchSize; b++)
