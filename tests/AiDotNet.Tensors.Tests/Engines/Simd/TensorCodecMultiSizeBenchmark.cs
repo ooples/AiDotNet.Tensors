@@ -312,5 +312,58 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Eager:    {0:F4}ms", eagerMs);
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
+
+        [Theory]
+        [InlineData("ReLU")]
+        [InlineData("Tanh")]
+        [InlineData("GELU")]
+        [InlineData("LeakyReLU")]
+        public void ThreeLayerMLP_DifferentActivations_CompiledVsEager(string activationName)
+        {
+            var engine = new CpuEngine();
+            int m = 32, d1 = 128, d2 = 64, d3 = 32, dOut = 10;
+            var input = Tensor<float>.CreateRandom(new[] { m, d1 });
+            var w1 = Tensor<float>.CreateRandom(new[] { d1, d2 });
+            var w2 = Tensor<float>.CreateRandom(new[] { d2, d3 });
+            var w3 = Tensor<float>.CreateRandom(new[] { d3, dOut });
+            int warmup = 30, iters = 500;
+
+            Func<Tensor<float>, Tensor<float>> activation = activationName switch
+            {
+                "ReLU" => t => engine.ReLU(t),
+                "Tanh" => t => engine.Tanh(t),
+                "GELU" => t => engine.GELU(t),
+                "LeakyReLU" => t => engine.LeakyReLU(t, 0.01f),
+                _ => t => engine.ReLU(t)
+            };
+
+            // Eager training
+            double eagerMs = Measure(() =>
+            {
+                using (var tape = new GradientTape<float>())
+                {
+                    var h1 = activation(engine.TensorMatMul(input, w1));
+                    var h2 = activation(engine.TensorMatMul(h1, w2));
+                    var output = engine.TensorMatMul(h2, w3);
+                    var loss = engine.ReduceSum(output, null);
+                    tape.ComputeGradients(loss, new[] { w1, w2, w3 });
+                }
+            }, warmup, iters);
+
+            // Compiled training
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h1 = activation(engine.TensorMatMul(input, w1));
+                var h2 = activation(engine.TensorMatMul(h1, w2));
+                var output = engine.TensorMatMul(h2, w3);
+                plan = scope.CompileTraining(new[] { w1, w2, w3 });
+            }
+            double compiledMs = Measure(() => plan.Step(), warmup, iters);
+
+            _output.WriteLine("3-Layer MLP [{0}] {1}x{2}->{3}->{4}->{5}:", activationName, m, d1, d2, d3, dOut);
+            _output.WriteLine("  Eager:    {0:F4}ms", eagerMs);
+            _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
+        }
     }
 }
