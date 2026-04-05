@@ -443,54 +443,52 @@ public sealed class GradientTape<T> : IDisposable
     /// Graph-based backward: walks GradFn pointers on tensors instead of the tape.
     /// Eliminates tape traversal, dictionary lookups, and relevance checks.
     /// </summary>
+    // Cached delegate chain for persistent tapes — avoids topological sort on repeat backward
+    private CompiledDelegateChain<T>? _cachedDelegateChain;
+
     private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsViaGraph(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
     {
-        var engine = _engine;
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var grads = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-
-        // Seed
-        Tensor<T> seedGrad;
-        if (loss.Length == 1)
-            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, new[] { 1 });
-        else
+        // If we have a cached delegate chain from a previous backward, replay it directly
+        if (_cachedDelegateChain is not null)
         {
-            var onesData = new T[loss.Length];
-            var one = numOps.One;
-            for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
-            seedGrad = new Tensor<T>(onesData, loss._shape);
+            return _cachedDelegateChain.Execute(loss, sources, _engine);
         }
-        grads[loss] = seedGrad;
 
-        // Topological sort via DFS from loss.GradFn
+        var engine = _engine;
+
+        // Topological sort via DFS from loss.GradFn — build the execution order
         var visited = new HashSet<GradNode<T>>();
         var topoOrder = new List<GradNode<T>>();
         TopologicalSort(loss.GradFn!, visited, topoOrder);
 
-        // Suspend recording during backward
-        var savedCurrent = _current;
-        SetCurrentTape(null);
-
-        try
+        // Build delegate chain from topological order (capture for replay)
+        var steps = new BackwardStep<T>[topoOrder.Count];
+        for (int i = 0; i < topoOrder.Count; i++)
         {
-            // Walk in reverse topological order (loss first, then dependencies)
-            for (int i = topoOrder.Count - 1; i >= 0; i--)
+            var node = topoOrder[topoOrder.Count - 1 - i]; // reverse for backward order
+            steps[i] = new BackwardStep<T>
             {
-                var node = topoOrder[i];
-                if (!grads.TryGetValue(node.Output, out var gradOutput))
-                    continue;
-
-                var inputsArray = node.GetInputsArray();
-                node.Backward(gradOutput, inputsArray, node.Output,
-                    node.SavedState ?? Array.Empty<object>(), engine, grads);
-            }
+                Output = node.Output,
+                Inputs = node.GetInputsArray(),
+                Backward = node.Backward,
+                SavedState = node.SavedState
+            };
         }
-        finally
+
+        var chain = new CompiledDelegateChain<T>(steps);
+
+        // Cache for persistent tapes (same network structure every step)
+        if (_options.Persistent)
+            _cachedDelegateChain = chain;
+
+        // Execute the chain
+        var result = chain.Execute(loss, sources, engine);
+
+        // Clear GradFn to release graph memory (non-persistent tapes get new graphs each step)
+        if (!_options.Persistent)
         {
-            SetCurrentTape(savedCurrent);
-            // Clear GradFn to release graph memory
             foreach (var node in topoOrder)
             {
                 node.Output.GradFn = null;
@@ -499,17 +497,9 @@ public sealed class GradientTape<T> : IDisposable
             }
         }
 
-        if (sources is not null)
-        {
-            var filtered = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-            foreach (var source in sources)
-                if (grads.TryGetValue(source, out var grad))
-                    filtered[source] = grad;
-            return filtered;
-        }
-
-        return grads;
+        return result;
     }
+
 
     private static void TopologicalSort(GradNode<T> node, HashSet<GradNode<T>> visited, List<GradNode<T>> result)
     {

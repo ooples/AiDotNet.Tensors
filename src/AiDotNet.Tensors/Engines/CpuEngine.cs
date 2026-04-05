@@ -19366,8 +19366,29 @@ public class CpuEngine : ITensorLevelEngine
 
                 bool blasDone = false;
 #if NET5_0_OR_GREATER
+                // Tier -1: NativeInferencePool — pre-pinned weights, zero GC per call
+                var inferPool = NativeInferencePool.Current;
+                if (inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                {
+                    unsafe
+                    {
+                        float* pW = inferPool.GetOrPin(wArr);
+                        float* pOut = inferPool.GetActivationBuffer(M * N);
+                        fixed (float* pIn = inArr)
+                        {
+                            if (BlasProvider.HasRawSgemm)
+                                BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                            else
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                        // Copy result to managed output (needed for Tensor wrapping)
+                        new System.Span<float>(pOut, M * N).CopyTo(outArr.AsSpan());
+                    }
+                    blasDone = true;
+                }
+
                 // Tier 0: Raw function pointer — zero overhead calli (no delegate, no P/Invoke)
-                if (BlasProvider.HasRawSgemm)
+                if (!blasDone && BlasProvider.HasRawSgemm)
                 {
                     unsafe
                     {

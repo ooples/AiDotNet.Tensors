@@ -10,9 +10,32 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 public sealed class NativeInferencePool : IDisposable
 {
+    [ThreadStatic]
+    private static NativeInferencePool? _current;
+
+    /// <summary>Gets the active inference pool for this thread, or null.</summary>
+    internal static NativeInferencePool? Current => _current;
+
+    private NativeInferencePool? _previous;
     private readonly List<GCHandle> _pinnedWeights = new();
-    private readonly Dictionary<int, IntPtr> _nativeBuffers = new(); // size -> native ptr
+    private readonly Dictionary<int, IntPtr> _nativeBuffers = new();
+    // Cache pinned pointers by array reference for O(1) lookup
+    private readonly Dictionary<object, IntPtr> _pinnedPtrCache = new();
     private bool _disposed;
+
+    /// <summary>
+    /// Creates and activates a new inference pool for this thread.
+    /// All inference operations will use pre-pinned/native memory until disposed.
+    /// </summary>
+    public static NativeInferencePool Create()
+    {
+        var pool = new NativeInferencePool();
+        pool._previous = _current;
+        _current = pool;
+        return pool;
+    }
+
+    private NativeInferencePool() { }
 
     /// <summary>
     /// Pins a weight array permanently for the lifetime of this pool.
@@ -28,6 +51,18 @@ public sealed class NativeInferencePool : IDisposable
     /// <summary>
     /// Pins a double weight array permanently.
     /// </summary>
+    /// <summary>
+    /// Gets a cached pinned pointer for an array, pinning it on first access.
+    /// </summary>
+    public unsafe float* GetOrPin(float[] array)
+    {
+        if (_pinnedPtrCache.TryGetValue(array, out var cached))
+            return (float*)cached;
+        var ptr = PinWeights(array);
+        _pinnedPtrCache[array] = (IntPtr)ptr;
+        return ptr;
+    }
+
     public unsafe double* PinWeights(double[] weights)
     {
         var handle = GCHandle.Alloc(weights, GCHandleType.Pinned);
@@ -70,6 +105,9 @@ public sealed class NativeInferencePool : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        if (_current == this)
+            _current = _previous;
 
         foreach (var handle in _pinnedWeights)
         {
