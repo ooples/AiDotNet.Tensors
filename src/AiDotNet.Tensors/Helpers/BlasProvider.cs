@@ -163,6 +163,55 @@ internal static class BlasProvider
     }
 
     /// <summary>
+    /// GEMM with configurable beta: C = A*B + beta*C. When beta=1 and C is pre-filled with bias,
+    /// this fuses bias addition into the GEMM — saving a full O(MN) memory pass.
+    /// </summary>
+    internal static bool TryGemmWithBeta(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc, float beta)
+    {
+        if (!EnsureInitialized()) return false;
+        if (!HasEnoughData(a.Length, aOffset, m, k, lda) ||
+            !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
+            !HasEnoughData(c.Length, cOffset, m, n, ldc))
+            return false;
+
+        if (_useMklNet)
+        {
+            // MKL path: use TryMklNetSgemm which calls alpha=1,beta=0 — need to extend
+            // For now fall through to native path
+        }
+
+        if (_sgemm == null) return false;
+
+        unsafe
+        {
+            fixed (float* ap = a, bp = b, cp = c)
+                _sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, ap + aOffset, lda, bp + bOffset, ldb, beta, cp + cOffset, ldc);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Double GEMM with configurable beta.
+    /// </summary>
+    internal static bool TryGemmWithBeta(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc, double beta)
+    {
+        if (!EnsureInitialized()) return false;
+        if (!HasEnoughData(a.Length, aOffset, m, k, lda) ||
+            !HasEnoughData(b.Length, bOffset, k, n, ldb) ||
+            !HasEnoughData(c.Length, cOffset, m, n, ldc))
+            return false;
+
+        if (_dgemm == null) return false;
+
+        unsafe
+        {
+            fixed (double* ap = a, bp = b, cp = c)
+                _dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, ap + aOffset, lda, bp + bOffset, ldb, beta, cp + cOffset, ldc);
+        }
+        return true;
+    }
+
+    /// <summary>
     /// GEMM with transpose flags: C = alpha * op(A) * op(B) + beta * C
     /// where op(X) = X if transX=false, X^T if transX=true.
     /// This avoids materializing transposed matrices — BLAS handles it internally.

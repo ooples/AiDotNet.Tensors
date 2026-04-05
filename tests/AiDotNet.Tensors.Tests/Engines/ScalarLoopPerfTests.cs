@@ -107,7 +107,107 @@ public class ScalarLoopPerfTests
         double fusedMs = sw.Elapsed.TotalMilliseconds / iters;
 
         _output.WriteLine($"TensorMatMul (BLAS): {matmulMs:F3}ms");
-        _output.WriteLine($"FusedLinear (scalar): {fusedMs:F3}ms");
+        _output.WriteLine($"FusedLinear (BLAS): {fusedMs:F3}ms");
         _output.WriteLine($"Ratio: FusedLinear is {fusedMs / matmulMs:F1}x slower");
+    }
+
+    [Fact]
+    public void Profile_FusedLinear_Breakdown()
+    {
+        int M = 32, K = 256, N = 256;
+        var input = Tensor<float>.CreateRandom([M, K]);
+        var weights = Tensor<float>.CreateRandom([K, N]);
+        var bias = Tensor<float>.CreateRandom([1, N]);
+        int iters = 200;
+
+        // Warmup
+        for (int w = 0; w < 10; w++)
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            _engine.FusedLinear(input, weights, bias, FusedActivationType.ReLU);
+        sw.Stop();
+        _output.WriteLine($"A. Full FusedLinear: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+            _engine.TensorMatMul(input, weights);
+        sw.Stop();
+        _output.WriteLine($"B. TensorMatMul (BLAS): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // C. GetDataArray overhead
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            var _ = input.GetDataArray();
+            var __ = weights.GetDataArray();
+        }
+        sw.Stop();
+        _output.WriteLine($"C. GetDataArray x2: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // D. new float[M*N]
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            var _ = new float[M * N];
+        }
+        sw.Stop();
+        _output.WriteLine($"D. new float[{M * N}]: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // E. Raw BLAS only (pre-allocated arrays, zero overhead)
+        var A = (float[])(object)input.GetDataArray();
+        var B = (float[])(object)weights.GetDataArray();
+        var C = new float[M * N];
+        BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+            BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
+        sw.Stop();
+        _output.WriteLine($"E. Raw BLAS (pre-alloc): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // F. TensorAllocator.Rent
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+            TensorAllocator.Rent<float>([M, N]);
+        sw.Stop();
+        _output.WriteLine($"F. TensorAllocator.Rent: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // G. Vector<T> wrapping + second Rent
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            var vec = new Vector<float>(C);
+            TensorAllocator.Rent<float>([M, N], vec);
+        }
+        sw.Stop();
+        _output.WriteLine($"G. Vector wrap + Rent: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // H. Bias+ReLU pass only
+        var biasArr = (float[])(object)bias.GetDataArray();
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            for (int r = 0; r < M; r++)
+            {
+                int off = r * N;
+                for (int j = 0; j < N; j++)
+                {
+                    float v = C[off + j] + biasArr[j];
+                    C[off + j] = v > 0 ? v : 0;
+                }
+            }
+        }
+        sw.Stop();
+        _output.WriteLine($"H. Bias+ReLU pass: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
+
+        // I. GetUnderlyingArrayOrCopy (the actual method used)
+        sw.Restart();
+        for (int i = 0; i < iters; i++)
+        {
+            var _ = input.Data;
+        }
+        sw.Stop();
+        _output.WriteLine($"I. input.Data access: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
     }
 }

@@ -128,14 +128,13 @@ public static class CpuFusedOperations
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
-        // BLAS dispatches to OpenBLAS cblas_sgemm (AVX2/AVX-512 optimized) — 10-60x faster than scalar.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
             ApplyBiasActivationInPlace(output, bias, M, N, activation);
             return;
         }
 
-        // BLAS unavailable: use SIMD tiled GEMM fallback (BLIS-style, still much faster than scalar)
+        // BLAS unavailable: use SIMD tiled GEMM fallback
         Engines.Simd.SimdGemm.Sgemm(A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
         ApplyBiasActivationInPlace(output, bias, M, N, activation);
     }
@@ -144,6 +143,16 @@ public static class CpuFusedOperations
     /// Applies bias addition and activation function in-place over the GEMM output.
     /// Single O(MN) pass — cheap compared to the O(MNK) GEMM.
     /// </summary>
+    /// <summary>
+    /// Applies activation function in-place over all elements. Used when bias was fused into BLAS.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static void ApplyActivationInPlace(float[] output, int length, FusedActivationType activation)
+    {
+        for (int i = 0; i < length; i++)
+            output[i] = ApplyActivation(output[i], activation);
+    }
+
     [MethodImpl(Hot)]
     private static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
     {
@@ -528,7 +537,6 @@ public static class CpuFusedOperations
             throw new ArgumentException($"output must have at least {M * N} elements", nameof(output));
 
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
-        // BLAS dispatches to OpenBLAS cblas_dgemm (AVX2/AVX-512 optimized) — 10-50x faster than scalar.
         if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
         {
             ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation);
@@ -546,6 +554,13 @@ public static class CpuFusedOperations
     /// <summary>
     /// Applies bias addition and activation function in-place over the double GEMM output.
     /// </summary>
+    [MethodImpl(Hot)]
+    private static void ApplyActivationInPlaceDouble(double[] output, int length, FusedActivationType activation)
+    {
+        for (int i = 0; i < length; i++)
+            output[i] = ApplyActivationDouble(output[i], activation);
+    }
+
     [MethodImpl(Hot)]
     private static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation)
     {

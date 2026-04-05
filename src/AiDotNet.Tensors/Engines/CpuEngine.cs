@@ -19296,42 +19296,37 @@ public class CpuEngine : ITensorLevelEngine
             if (weights._shape[0] != K)
                 throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
 
-            var result = TensorAllocator.Rent<T>([M, N]);
-
-            // Use optimized fused operations for float type
+            // Use optimized fused operations for float type: BLAS GEMM + fused bias+activation
             if (typeof(T) == typeof(float))
             {
-                // Try to get underlying arrays without copying using MemoryMarshal
-                var inputArray = GetUnderlyingArrayOrCopy<T, float>(input.Data);
-                var weightsArray = GetUnderlyingArrayOrCopy<T, float>(weights.Data);
-                var biasArray = bias != null ? GetUnderlyingArrayOrCopy<T, float>(bias.Data) : null;
-                var outputArray = new float[M * N];
+                // Allocate result tensor ONCE — BLAS writes directly into its backing array
+                var result = TensorAllocator.RentUninitialized<T>([M, N]);
+                var inputArray = (float[])(object)input.GetDataArray();
+                var weightsArray = (float[])(object)weights.GetDataArray();
+                var biasArray = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                var outputArray = (float[])(object)result.GetDataArray();
 
                 CpuFusedOperations.FusedGemmBiasActivation(
                     inputArray, weightsArray, biasArray, outputArray,
                     M, N, K, activation);
 
-                // Reinterpret float[] as T[] using Unsafe.As (safe since T is float)
-                var typedOutput = Unsafe.As<float[], T[]>(ref outputArray);
-                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
+                return result;
             }
 
             // Use optimized fused operations for double type
             if (typeof(T) == typeof(double))
             {
-                // Try to get underlying arrays without copying using MemoryMarshal
-                var inputArray = GetUnderlyingArrayOrCopy<T, double>(input.Data);
-                var weightsArray = GetUnderlyingArrayOrCopy<T, double>(weights.Data);
-                var biasArray = bias != null ? GetUnderlyingArrayOrCopy<T, double>(bias.Data) : null;
-                var outputArray = new double[M * N];
+                var result = TensorAllocator.RentUninitialized<T>([M, N]);
+                var inputArray = (double[])(object)input.GetDataArray();
+                var weightsArray = (double[])(object)weights.GetDataArray();
+                var biasArray = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                var outputArray = (double[])(object)result.GetDataArray();
 
                 CpuFusedOperations.FusedGemmBiasActivation(
                     inputArray, weightsArray, biasArray, outputArray,
                     M, N, K, activation);
 
-                // Reinterpret double[] as T[] using Unsafe.As (safe since T is double)
-                var typedOutput = Unsafe.As<double[], T[]>(ref outputArray);
-                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
+                return result;
             }
         }
 
