@@ -19305,14 +19305,58 @@ public class CpuEngine : ITensorLevelEngine
         // must use the recorded path during training.
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
-            // Decompose into tape-recorded primitives. Each op records its own backward.
-            var result = TensorMatMul(input, weights);
-            if (bias != null)
-                result = TensorBroadcastAdd(result, bias);
-            // Apply activation through engine methods that record on tape
-            if (activation != FusedActivationType.None)
-                result = ApplyActivationRecorded(result, activation);
-            return result;
+            // Fused tape path: compute via BLAS, record ONE entry instead of 2-3.
+            // This cuts tape overhead by 2-3x vs decomposed (MatMul + Add + Activation).
+            if (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
+            {
+                // Compute result using BLAS (same path as inference)
+                if (!input.IsContiguous) input = input.Contiguous();
+                if (!weights.IsContiguous) weights = weights.Contiguous();
+
+                Tensor<T> result;
+                if (input.Rank == 2 && weights.Rank == 2 && typeof(T) == typeof(float))
+                {
+                    int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
+                    result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
+                    var inArr = (float[])(object)input.GetDataArray();
+                    var wArr = (float[])(object)weights.GetDataArray();
+                    var outArr = (float[])(object)result.GetDataArray();
+
+                    if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+
+                    if (bias != null)
+                        CpuFusedOperations.ApplyBiasActivationInPlace(outArr,
+                            (float[])(object)bias.GetDataArray(), M, N, activation);
+                    else if (activation != FusedActivationType.None)
+                        ApplyFusedActivationInPlace(result, activation);
+                }
+                else
+                {
+                    // Non-float or non-2D: fall through to decomposed
+                    result = TensorMatMul(input, weights);
+                    if (bias != null) result = TensorBroadcastAdd(result, bias);
+                    if (activation != FusedActivationType.None) ApplyFusedActivationInPlace(result, activation);
+                    // Remove decomposed entries, record single fused
+                    RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
+                }
+
+                // Record single fused entry with FusedLinearBackward
+                var inputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", result, inputs,
+                    Autodiff.BackwardFunctions<T>.FusedLinearBackward);
+                return result;
+            }
+
+            // For non-trivial activations, decompose (activation backward needs its own entry)
+            {
+                var result = TensorMatMul(input, weights);
+                if (bias != null)
+                    result = TensorBroadcastAdd(result, bias);
+                if (activation != FusedActivationType.None)
+                    result = ApplyActivationRecorded(result, activation);
+                return result;
+            }
         }
 
         if (!input.IsContiguous) input = input.Contiguous();

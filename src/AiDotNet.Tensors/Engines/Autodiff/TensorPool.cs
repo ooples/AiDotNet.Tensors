@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -54,7 +54,7 @@ public static class TensorPool<T>
             var tensor = stack.Pop();
             _totalPooled--;
             // Reshape if shape differs but length matches
-            if (!ShapeEquals(tensor.Shape.ToArray(), shape))
+            if (!ShapeEquals(tensor._shape, shape))
                 tensor = tensor.Reshape(shape);
             return tensor;
         }

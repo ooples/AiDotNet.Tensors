@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -237,7 +237,7 @@ public sealed class GradientTape<T> : IDisposable
             var one = numOps.One;
             for (int j = 0; j < onesData.Length; j++)
                 onesData[j] = one;
-            seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
+            seedGrad = new Tensor<T>(onesData, loss._shape);
         }
         grads[loss] = seedGrad;
         if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
@@ -265,11 +265,13 @@ public sealed class GradientTape<T> : IDisposable
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
 
             // Tape backward pruning: when sources are specified, forward-walk to find all tensors
-            // downstream of those sources. During the backward walk, skip entries whose output
-            // is not in this reachable set — their gradients don't contribute to any requested
-            // source gradient. This prunes subgraphs that don't depend on the sources.
+            // downstream of those sources. Skip entries whose output is not reachable.
+            // For persistent tapes, cache the relevance set since sources are typically the same
+            // across training steps (always the model parameters).
             HashSet<Tensor<T>>? relevantTensors = null;
-            if (sources is not null && sources.Count > 0)
+            // Only build relevance set for large tapes — the O(n) forward-walk cost
+            // exceeds the backward pruning benefit for small tapes (< 100 entries).
+            if (sources is not null && sources.Count > 0 && _entries.Count >= 100)
             {
                 relevantTensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources)

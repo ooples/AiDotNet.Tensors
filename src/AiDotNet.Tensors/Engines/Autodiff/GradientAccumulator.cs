@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -52,7 +52,7 @@ public sealed class GradientAccumulator<T>
     {
         if (!_gradients.ContainsKey(parameter))
         {
-            var grad = new Tensor<T>(new T[parameter.Length], parameter.Shape.ToArray());
+            var grad = new Tensor<T>(new T[parameter.Length], parameter._shape);
             _gradients[parameter] = grad;
         }
     }

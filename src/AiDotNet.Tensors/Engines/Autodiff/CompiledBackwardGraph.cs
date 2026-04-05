@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -92,7 +92,7 @@ public sealed class CompiledBackwardGraph<T>
         var onesData = new T[_loss.Length];
         for (int j = 0; j < onesData.Length; j++)
             onesData[j] = numOps.One;
-        grads[_loss] = new Tensor<T>(onesData, _loss.Shape.ToArray());
+        grads[_loss] = new Tensor<T>(onesData, _loss._shape);
 
         // Execute only reachable entries (dead node elimination applied)
         foreach (int i in _reachableEntryIndices)
