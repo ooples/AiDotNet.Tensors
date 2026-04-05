@@ -768,9 +768,10 @@ internal sealed class CompiledTrainingPlan<T>
                 step2.Inputs[1].Rank != 2)
                 continue;
 
-            // Check hidden dim fits in L1
+            // Check hidden dim: must fit in L1 (max) AND be large enough for L1 benefit (min 128)
+            // Below 128, per-op BLAS is faster. Above 128, L1 residency wins.
             int h = step0.Inputs[1]._shape[1]; // output cols of W1
-            if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden)
+            if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden || h < 128)
                 continue;
 
             // Extract dimensions
