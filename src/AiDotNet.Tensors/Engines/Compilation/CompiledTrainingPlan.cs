@@ -35,6 +35,7 @@ internal sealed class CompiledTrainingPlan<T>
     private T[][]? _cachedGradArrays;
     private T[]? _cachedLossGradSeedArray;
     private T[]? _cachedLossGradDestArray;
+    private readonly Tensor<T>? _lossGradDest; // Pre-allocated gradient buffer for loss output
 
     private CompiledTrainingPlan(
         Action<IEngine>[] forwardActions,
@@ -45,7 +46,8 @@ internal sealed class CompiledTrainingPlan<T>
         Tensor<T>[] preAllocatedGrads,
         Tensor<T>[] gradients,
         Tensor<T> lossGradSeed,
-        int[]? genericGradIndices = null)
+        int[]? genericGradIndices = null,
+        Tensor<T>? lossGradDest = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -56,6 +58,7 @@ internal sealed class CompiledTrainingPlan<T>
         _gradients = gradients;
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
+        _lossGradDest = lossGradDest;
     }
 
     internal Tensor<T>[] Gradients => _gradients;
@@ -81,7 +84,7 @@ internal sealed class CompiledTrainingPlan<T>
                 gradArrays[i] = _preAllocatedGrads[i].GetDataArray();
             _cachedGradArrays = gradArrays;
             _cachedLossGradSeedArray = _lossGradSeed.GetDataArray();
-            _cachedLossGradDestArray = _preAllocatedGrads[_preAllocatedGrads.Length - 1].GetDataArray();
+            _cachedLossGradDestArray = _lossGradDest?.GetDataArray();
         }
 
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
@@ -259,7 +262,8 @@ internal sealed class CompiledTrainingPlan<T>
             allGrads.ToArray(),
             gradients,
             lossGradSeed,
-            genericGradIndices);
+            genericGradIndices,
+            gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null);
     }
 
     /// <summary>
