@@ -4170,6 +4170,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorFloor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4189,6 +4190,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorCeiling<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Ceiling", tensor, tensor._shape, (eng, o) => { var r = eng.TensorCeiling(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -4207,6 +4209,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorRound<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -7208,6 +7211,21 @@ public class CpuEngine : ITensorLevelEngine
         int actualDim = dim < 0 ? input.Rank + dim : dim;
         if (actualDim < 0 || actualDim >= input.Rank)
             throw new ArgumentException($"Invalid dimension {dim} for tensor with rank {input.Rank}");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capDim = dim;
+                var outShape = input.Shape.ToArray();
+                outShape[actualDim] = input._shape[actualDim] / 2;
+                return scope.RecordUnary(LazyNodeType.Custom, "GLU", input, outShape,
+                    (eng, output) => { var r = eng.GLU(captured, capDim); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
+            }
+        }
 
         int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
@@ -10832,6 +10850,21 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 5) throw new ArgumentException($"Upsample3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0) throw new ArgumentException("Scale factors must be positive.");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capD = scaleD, capH = scaleH, capW = scaleW;
+                var outShape = new[] { input._shape[0], input._shape[1],
+                    input._shape[2] * scaleD, input._shape[3] * scaleH, input._shape[4] * scaleW };
+                return scope.RecordUnary(LazyNodeType.Custom, "Upsample3D", input, outShape,
+                    (eng, output) => { var r = eng.Upsample3D(captured, capD, capH, capW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.Upsample3DBackward, new object[] { capD, capH, capW });
+            }
+        }
 
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -16352,6 +16385,22 @@ public class CpuEngine : ITensorLevelEngine
         if (shape.Length < 2)
             throw new ArgumentException("Upsample requires tensor with at least 2 dimensions for height and width.");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capScaleH = scaleH, capScaleW = scaleW;
+                var outShape = (int[])shape.Clone();
+                outShape[shape.Length - 2] *= scaleH;
+                outShape[shape.Length - 1] *= scaleW;
+                return scope.RecordUnary(LazyNodeType.Custom, "Upsample", input, outShape,
+                    (eng, output) => { var r = eng.Upsample(captured, capScaleH, capScaleW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
+            }
+        }
+
         // Industry-standard: last two dimensions are height and width
         int heightIdx = shape.Length - 2;
         int widthIdx = shape.Length - 1;
@@ -16989,6 +17038,24 @@ public class CpuEngine : ITensorLevelEngine
         if (shape.Length < 2)
             throw new ArgumentException("Pad expects at least 2D tensor");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capTop = padTop, capBottom = padBottom, capLeft = padLeft, capRight = padRight;
+                T capValue = padValue;
+                int capRank = shape.Length;
+                var outShape = (int[])shape.Clone();
+                outShape[capRank - 2] += padTop + padBottom;
+                outShape[capRank - 1] += padLeft + padRight;
+                return scope.RecordUnary(LazyNodeType.Custom, "Pad", input, outShape,
+                    (eng, output) => { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
+            }
+        }
+
         int rank = shape.Length;
         int height = shape[rank - 2];
         int width = shape[rank - 1];
@@ -17071,6 +17138,23 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensors == null || tensors.Count == 0)
             throw new ArgumentException("At least one tensor required for concatenation");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensors.ToArray();
+                int capturedAxis = axis < 0 ? tensors[0]._shape.Length + axis : axis;
+                var outShape = (int[])tensors[0]._shape.Clone();
+                int totalAxis = 0;
+                foreach (var t in tensors) totalAxis += t._shape[capturedAxis];
+                outShape[capturedAxis] = totalAxis;
+                return scope.RecordVariadic(LazyNodeType.Custom, "Concat", captured, outShape,
+                    (eng, output) => { var r = eng.Concat(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
+            }
+        }
 
         var firstShape = tensors[0]._shape;
         int rank = firstShape.Length;
@@ -17504,6 +17588,22 @@ public class CpuEngine : ITensorLevelEngine
         if (multiples.Length != tensor._shape.Length)
             throw new ArgumentException($"Multiples length ({multiples.Length}) must match tensor dimensions ({tensor._shape.Length})");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capMultiples = (int[])multiples.Clone();
+                var outShape = new int[tensor._shape.Length];
+                for (int i = 0; i < tensor._shape.Length; i++)
+                    outShape[i] = tensor._shape[i] * multiples[i];
+                return scope.RecordUnary(LazyNodeType.Custom, "Tile", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorTile(captured, capMultiples); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.TileBackward);
+            }
+        }
+
         // Calculate output shape
         var outputShape = new int[tensor._shape.Length];
         for (int i = 0; i < tensor._shape.Length; i++)
@@ -17557,6 +17657,20 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Start length ({start.Length}) must match tensor dimensions ({tensor._shape.Length})");
         if (length.Length != tensor._shape.Length)
             throw new ArgumentException($"Length length ({length.Length}) must match tensor dimensions ({tensor._shape.Length})");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capStart = (int[])start.Clone();
+                var capLength = (int[])length.Clone();
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSlice", tensor, capLength,
+                    (eng, output) => { var r = eng.TensorSlice(captured, capStart, capLength); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SliceBackward, new object[] { capStart });
+            }
+        }
 
         // Validate bounds
         for (int i = 0; i < tensor._shape.Length; i++)
@@ -17931,6 +18045,20 @@ public class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null && axis == 0 && source._shape.Length == 2)
+            {
+                var captured = source;
+                var capIndices = indices;
+                var outShape = new int[] { indices.Length, source._shape[1] };
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorGather", source, outShape,
+                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, 0); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.GatherBackward, new object[] { capIndices, 0 });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Simple 1D gather for embedding lookups
@@ -18018,6 +18146,28 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                int capAxis = axis < 0 ? tensor._shape.Length + axis : axis;
+                bool capKeepDims = keepDims;
+                // Compute output shape after reduction
+                var outShape = new List<int>();
+                for (int d = 0; d < tensor._shape.Length; d++)
+                {
+                    if (d == capAxis) { if (keepDims) outShape.Add(1); }
+                    else outShape.Add(tensor._shape[d]);
+                }
+                if (outShape.Count == 0) outShape.Add(1);
+                return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, outShape.ToArray(),
+                    (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LogSumExpBackward, new object[] { capAxis });
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -18561,6 +18711,27 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                int capAxis = axis < 0 ? tensor._shape.Length + axis : axis;
+                bool capKeepDims = keepDims;
+                var outShape = new List<int>();
+                for (int d = 0; d < tensor._shape.Length; d++)
+                {
+                    if (d == capAxis) { if (keepDims) outShape.Add(1); }
+                    else outShape.Add(tensor._shape[d]);
+                }
+                if (outShape.Count == 0) outShape.Add(1);
+                return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, outShape.ToArray(),
+                    (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NormBackward, new object[] { capAxis });
+            }
+        }
+
         // Compute squared values
         var squared = TensorMultiply(tensor, tensor);
         // Sum along axis
@@ -18600,6 +18771,27 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensors == null || tensors.Length == 0)
             throw new ArgumentNullException(nameof(tensors));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = (Tensor<T>[])tensors.Clone();
+                int capturedAxis = axis;
+                // Compute output shape: same as first tensor except along concat axis
+                var firstShape = tensors[0]._shape;
+                int rank = firstShape.Length;
+                int normAxis = axis < 0 ? rank + axis : axis;
+                var outShape = (int[])firstShape.Clone();
+                int totalAxis = 0;
+                foreach (var t in tensors) totalAxis += t._shape[normAxis];
+                outShape[normAxis] = totalAxis;
+                return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
+                    (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
+            }
+        }
 
         var result = Tensor<T>.Concatenate(tensors, axis);
         DifferentiableOps.RecordIfActive("Concatenate", result, (Tensor<T>[])tensors.Clone(),
@@ -18882,6 +19074,24 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 3) throw new ArgumentException("TensorSliceAxis currently only supports 3D tensors.");
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                int capAxis = axis, capIndex = index;
+                // Output shape: remove the sliced axis dimension
+                var outShape = new int[2];
+                int idx = 0;
+                for (int d = 0; d < 3; d++)
+                    if (d != axis) outShape[idx++] = tensor._shape[d];
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSliceAxis", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
+            }
+        }
 
         int dim0 = tensor._shape[0];
         int dim1 = tensor._shape[1];
@@ -19310,6 +19520,22 @@ public class CpuEngine : ITensorLevelEngine
 
         if (axis < 0) axis = tensor.Rank + axis;
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null && tensor.Rank == 2)
+            {
+                var captured = tensor;
+                var capIndices = indices;
+                int capAxis = axis;
+                var outShape = (int[])tensor._shape.Clone();
+                outShape[axis] = indices.Length;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorIndexSelect", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis });
+            }
+        }
+
         // For 2D tensor with axis=0: select rows
         if (tensor.Rank == 2 && axis == 0)
         {
@@ -19376,6 +19602,24 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (axis < 0) axis = firstShape.Length + 1 + axis;
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = (Tensor<T>[])tensors.Clone();
+                int capAxis = axis;
+                // New shape: insert numTensors at axis position
+                var outShape = new int[firstShape.Length + 1];
+                for (int i = 0; i < axis; i++) outShape[i] = firstShape[i];
+                outShape[axis] = numTensors;
+                for (int i = axis; i < firstShape.Length; i++) outShape[i + 1] = firstShape[i];
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorStack", captured, outShape,
+                    (eng, output) => { var r = eng.TensorStack(captured, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.StackBackward, new object[] { capAxis });
+            }
+        }
 
         // New shape: insert numTensors at axis position
         var newShape = new int[firstShape.Length + 1];
@@ -20049,6 +20293,23 @@ public class CpuEngine : ITensorLevelEngine
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                var capIndices = indices;
+                int capAxis = axis;
+                var outShape = new int[input._shape.Length];
+                for (int i = 0; i < input._shape.Length; i++)
+                    outShape[i] = i == axis ? indices.Length : input._shape[i];
+                return scope.RecordUnary(LazyNodeType.Custom, "Gather", input, outShape,
+                    (eng, output) => { var r = eng.Gather(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
+            }
+        }
+
         // Output shape: input.Shape with axis dimension replaced by indices.Length
         var outputShape = new int[input._shape.Length];
         for (int i = 0; i < input._shape.Length; i++)
@@ -20176,6 +20437,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorCosh<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorCosh", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorCosh(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.CoshBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         var srcData = tensor.GetFlattenedData();
@@ -20194,6 +20467,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorSinh<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorSinh", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorSinh(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SinhBackward);
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
@@ -22944,6 +23229,21 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
         if (!input.IsContiguous) input = input.Contiguous();
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                int capOutH = outputHeight, capOutW = outputWidth;
+                var outShape = new[] { input._shape[0], input._shape[1], outputHeight, outputWidth };
+                return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveAvgPool2D", input, outShape,
+                    (eng, output) => { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -23638,6 +23938,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>PReLU: max(0,x) + alpha * min(0,x) where alpha is a learnable parameter</summary>
     public virtual Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capAlpha = alpha;
+                int capChannels = alpha.Length;
+                int capSpatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
+                return scope.RecordBinary(LazyNodeType.Custom, "PReLU", tensor, alpha, tensor._shape,
+                    (eng, output) => { var r = eng.TensorPReLU(captured, capAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.PReLUBackward, new object[] { capChannels, capSpatialSize });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         // Compute channel-aware alpha indexing for NCHW tensors
         int channels = alpha.Length;
@@ -23659,6 +23974,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>RReLU: random leaky ReLU (lower, upper bounds)</summary>
     public virtual Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                double capLower = lower, capUpper = upper;
+                bool capTraining = training;
+                return scope.RecordUnary(LazyNodeType.Custom, "RReLU", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorRReLU(captured, capLower, capUpper, capTraining); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.RReLUBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         var noise = new Tensor<T>(tensor._shape);
@@ -23677,6 +24006,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Threshold: x if x > threshold, else value</summary>
     public virtual Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                T capThreshold = threshold;
+                T capValue = value;
+                var numOpsLazy = MathHelper.GetNumericOperations<T>();
+                return scope.RecordUnary(LazyNodeType.Custom, "Threshold", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorThreshold(captured, capThreshold, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ThresholdBackward, new object[] { numOpsLazy.ToDouble(threshold) });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
@@ -23767,6 +24111,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Narrow (slice along one axis).</summary>
     public virtual Tensor<T> TensorNarrow<T>(Tensor<T> tensor, int dim, int start, int length)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                int capDim = dim, capStart = start, capLen = length;
+                var outShape = (int[])tensor._shape.Clone();
+                outShape[dim] = length;
+                return scope.RecordUnary(LazyNodeType.Custom, "Narrow", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorNarrow(captured, capDim, capStart, capLen); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NarrowBackward, new object[] { dim, start, length });
+            }
+        }
+
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
@@ -23783,6 +24142,27 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Constant padding for N-dimensional tensors.</summary>
     public virtual Tensor<T> TensorConstantPad<T>(Tensor<T> tensor, int[] padding, T value)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capPadding = (int[])padding.Clone();
+                T capValue = value;
+                int capRank = tensor.Rank;
+                var outShape = tensor._shape.ToArray();
+                for (int i = 0; i < padding.Length / 2 && i < capRank; i++)
+                {
+                    int dim = capRank - 1 - i;
+                    outShape[dim] += padding[2 * i] + padding[2 * i + 1];
+                }
+                return scope.RecordUnary(LazyNodeType.Custom, "ConstantPad", tensor, outShape,
+                    (eng, output) => { var r = eng.TensorConstantPad(captured, capPadding, capValue); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ConstantPadBackward, new object[] { capPadding });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = tensor.Rank;
         // Padding is [before_last, after_last, before_second_last, after_second_last, ...]
@@ -23804,6 +24184,21 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Upsample using bilinear interpolation (4D: NCHW).</summary>
     public virtual Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                var capOutputSize = (int[])outputSize.Clone();
+                int capH = input._shape[2], capW = input._shape[3];
+                var outShape = new[] { input._shape[0], input._shape[1], outputSize[0], outputSize[1] };
+                return scope.RecordUnary(LazyNodeType.Custom, "UpsampleBilinear", input, outShape,
+                    (eng, output) => { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
         int outH = outputSize[0], outW = outputSize[1];
@@ -24040,6 +24435,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>LogSumExp: log(sum(exp(x))). Numerically stable.</summary>
     public Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, new int[] { 1 },
+                    (eng, output) => { var r = eng.TensorLogSumExp(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LogSumExpBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         double maxVal = double.NegativeInfinity;
         for (int i = 0; i < tensor.Length; i++)
@@ -24056,6 +24463,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>L2 norm: sqrt(sum(x^2)).</summary>
     public Tensor<T> TensorNorm<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, new int[] { 1 },
+                    (eng, output) => { var r = eng.TensorNorm(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.NormBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         double sumSq = 0;
         for (int i = 0; i < tensor.Length; i++)
@@ -24071,6 +24490,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Adaptive max pool 2D with argmax tracking.</summary>
     public virtual Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                var capOutputSize = (int[])outputSize.Clone();
+                var outShape = new[] { input._shape[0], input._shape[1], outputSize[0], outputSize[1] };
+                return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveMaxPool2D", input, outShape,
+                    (eng, output) => { var r = eng.TensorAdaptiveMaxPool2D(captured, capOutputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.AdaptiveMaxPool2DBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[0], c = input._shape[1], h = input._shape[2], w = input._shape[3];
         int outH = outputSize[0], outW = outputSize[1];
