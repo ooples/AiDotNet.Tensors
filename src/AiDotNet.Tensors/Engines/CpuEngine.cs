@@ -2592,12 +2592,23 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <inheritdoc/>
@@ -2660,8 +2671,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
+            unsafe { Simd.SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, alphaF); }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
+        }
     }
 
     /// <inheritdoc/>
@@ -6597,6 +6620,18 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.GELU, "GELU", tensor, tensor._shape,
+                    (eng, output) => eng.GELUInto(output, captured),
+                    BackwardFunctions<T>.GELUBackward);
+            }
+        }
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -6688,6 +6723,18 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Swish, "Swish", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.Swish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SwishBackward);
+            }
+        }
+
         if (!tensor.IsContiguous)
         {
             if (tensor.Length <= 4096)
@@ -6714,6 +6761,19 @@ public class CpuEngine : ITensorLevelEngine
 
     public virtual Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                double capturedAlpha = alpha;
+                return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.ELU(captured, capturedAlpha); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ELUBackward, new object[] { alpha });
+            }
+        }
+
         if (!tensor.IsContiguous)
         {
             if (tensor.Length <= 4096)
@@ -6748,6 +6808,19 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedAlpha = alpha;
+                return scope.RecordUnary(LazyNodeType.LeakyReLU, "LeakyReLU", tensor, tensor._shape,
+                    (eng, output) => eng.LeakyReLUInto(output, captured, capturedAlpha),
+                    BackwardFunctions<T>.LeakyReLUBackward, new object[] { MathHelper.GetNumericOperations<T>().ToDouble(alpha) });
+            }
+        }
+
         if (!tensor.IsContiguous)
         {
             if (tensor.Length <= 4096)

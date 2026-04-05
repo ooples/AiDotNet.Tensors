@@ -131,5 +131,118 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 eagerReluMs, compiledReluMs, eagerReluMs / compiledReluMs);
             _output.WriteLine("  Sigmoid: Eager {0:F4}ms", eagerSigMs);
         }
+
+        [Fact]
+        public void AllActivations_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            int size = 100000;
+            var a = Tensor<float>.CreateRandom(new[] { size });
+            int warmup = 30, iters = 500;
+
+            var ops = new (string name, Func<Tensor<float>> eager)[]
+            {
+                ("ReLU", () => engine.ReLU(a)),
+                ("Sigmoid", () => engine.Sigmoid(a)),
+                ("Tanh", () => engine.Tanh(a)),
+                ("GELU", () => engine.GELU(a)),
+                ("Swish", () => engine.Swish(a)),
+                ("LeakyReLU", () => engine.LeakyReLU(a, 0.01f)),
+                ("Softmax", () => engine.Softmax(a, 0)),
+            };
+
+            _output.WriteLine("Activations [{0}] — Compiled vs Eager:", size);
+            _output.WriteLine("  {0,-15} {1,10} {2,10} {3,10}", "Op", "Eager(ms)", "Compiled", "Speedup");
+
+            foreach (var (name, eagerFn) in ops)
+            {
+                double eagerMs = Measure(() => { eagerFn(); }, warmup, iters);
+
+                CompiledInferencePlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    eagerFn();
+                    plan = scope.CompileInference<float>();
+                }
+                double compiledMs = Measure(() => plan.Execute(), warmup, iters);
+
+                _output.WriteLine("  {0,-15} {1,10:F4} {2,10:F4} {3,10:F2}x", name, eagerMs, compiledMs, eagerMs / compiledMs);
+            }
+        }
+
+        [Fact]
+        public void AllBinaryOps_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            int size = 100000;
+            var a = Tensor<float>.CreateRandom(new[] { size });
+            var b = Tensor<float>.CreateRandom(new[] { size });
+            int warmup = 30, iters = 500;
+
+            var ops = new (string name, Func<Tensor<float>> eager)[]
+            {
+                ("Add", () => engine.TensorAdd(a, b)),
+                ("Subtract", () => engine.TensorSubtract(a, b)),
+                ("Multiply", () => engine.TensorMultiply(a, b)),
+                ("Divide", () => engine.TensorDivide(a, b)),
+                ("Negate", () => engine.TensorNegate(a)),
+            };
+
+            _output.WriteLine("Binary/Unary Ops [{0}] — Compiled vs Eager:", size);
+            _output.WriteLine("  {0,-15} {1,10} {2,10} {3,10}", "Op", "Eager(ms)", "Compiled", "Speedup");
+
+            foreach (var (name, eagerFn) in ops)
+            {
+                double eagerMs = Measure(() => { eagerFn(); }, warmup, iters);
+
+                CompiledInferencePlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    eagerFn();
+                    plan = scope.CompileInference<float>();
+                }
+                double compiledMs = Measure(() => plan.Execute(), warmup, iters);
+
+                _output.WriteLine("  {0,-15} {1,10:F4} {2,10:F4} {3,10:F2}x", name, eagerMs, compiledMs, eagerMs / compiledMs);
+            }
+        }
+
+        [Fact]
+        public void MatMul_VaryingSizes_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            int warmup = 30, iters = 500;
+
+            var sizes = new (int m, int k, int n)[]
+            {
+                (8, 32, 16),
+                (32, 128, 64),
+                (64, 256, 128),
+                (128, 512, 256),
+                (256, 1024, 512),
+            };
+
+            _output.WriteLine("MatMul Varying Sizes — Compiled vs Eager:");
+            _output.WriteLine("  {0,-25} {1,10} {2,10} {3,10}", "Size", "Eager(ms)", "Compiled", "Speedup");
+
+            foreach (var (m, k, n) in sizes)
+            {
+                var a = Tensor<float>.CreateRandom(new[] { m, k });
+                var b = Tensor<float>.CreateRandom(new[] { k, n });
+
+                double eagerMs = Measure(() => engine.TensorMatMul(a, b), warmup, iters);
+
+                CompiledInferencePlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    engine.TensorMatMul(a, b);
+                    plan = scope.CompileInference<float>();
+                }
+                double compiledMs = Measure(() => plan.Execute(), warmup, iters);
+
+                _output.WriteLine("  [{0}x{1}]@[{1}x{2}] {3,14:F4} {4,10:F4} {5,10:F2}x",
+                    m, k, n, eagerMs, compiledMs, eagerMs / compiledMs);
+            }
+        }
     }
 }

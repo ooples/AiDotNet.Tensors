@@ -328,12 +328,8 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.TensorMultiplyInto(o, a, b);
         }
 
-        // Sigmoid forward: direct SIMD
-        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
-        {
-            var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => eng.SigmoidInto(o, inp);
-        }
+        // Sigmoid: don't specialize forward — the eager allocating path is faster
+        // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
 
         // Tanh forward: direct SIMD
         if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
@@ -363,6 +359,38 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
+        // GELU forward: direct SIMD
+        if (step.OpName == "GELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.GELUInto(o, inp);
+        }
+
+        // LeakyReLU forward: direct SIMD
+        if (step.OpName == "LeakyReLU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var alpha = step.SavedState != null && step.SavedState.Length > 0
+                ? MathHelper.GetNumericOperations<T>().FromDouble((double)step.SavedState[0])
+                : MathHelper.GetNumericOperations<T>().FromDouble(0.01);
+            return eng => eng.LeakyReLUInto(o, inp, alpha);
+        }
+
+        // Swish forward
+        if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+        }
+
+        // ELU forward
+        if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
+            return eng => { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+        }
+
         // TensorTranspose forward: direct cache-blocked transpose
         if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
         {
@@ -374,16 +402,8 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // TensorDivide forward
-        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
-            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
-        {
-            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            return eng =>
-            {
-                MathHelper.GetNumericOperations<T>().Divide(a.AsSpan(), b.AsSpan(), o.AsWritableSpan());
-            };
-        }
+        // TensorDivide: don't specialize — the engine's allocating path with JIT/SIMD is faster
+        // than our Into variant for division (SIMD divide is inherently expensive)
 
         // BatchMatMul forward
         if (step.OpName == "BatchMatMul" && step.Inputs.Length == 2)
@@ -715,11 +735,62 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // BatchMatMul backward: same as MatMul but for higher-rank tensors
-        if (step.OpName == "BatchMatMul" && step.Inputs.Length == 2)
+        // GELU backward
+        if (step.OpName == "GELU" && step.Inputs.Length == 1)
         {
-            // Fall through to generic — BatchMatMul backward is complex
-            return null;
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.GeluBackward(gradOut, input);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // LeakyReLU backward
+        if (step.OpName == "LeakyReLU" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            double negSlope = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 0.01;
+            return eng =>
+            {
+                var grad = eng.LeakyReluBackward(gradOut, input, negSlope);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Swish backward
+        if (step.OpName == "Swish" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.SwishBackward(gradOut, input);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // ELU backward
+        if (step.OpName == "ELU" && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
+            return eng =>
+            {
+                var grad = eng.EluBackward(gradOut, input, output, alpha);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
         }
 
         return null; // Not specialized — use generic fallback
