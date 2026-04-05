@@ -16,6 +16,18 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 internal static class DifferentiableOps
 {
+    // Indexed gradient array: set by ComputeGradients before backward walk,
+    // read by AccumulateGrad for O(1) access instead of dictionary hash lookup.
+    // ThreadStatic because backward is single-threaded per tape.
+    [ThreadStatic]
+    internal static object?[]? _indexedGrads;
+
+    /// <summary>Sets the indexed gradient array for the current backward pass.</summary>
+    internal static void SetIndexedGrads(object?[] grads) => _indexedGrads = grads;
+
+    /// <summary>Clears the indexed gradient array after backward completes.</summary>
+    internal static void ClearIndexedGrads() => _indexedGrads = null;
+
     /// <summary>
     /// Returns true if a gradient tape is active and not suppressed.
     /// Use this to guard savedState allocation: only create new object[]
@@ -141,10 +153,30 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
-        if (grads.TryGetValue(tensor, out var existing))
+        // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
+        int idx = tensor._gradIndex;
+        if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)
         {
-            engine.TensorAddInPlace(existing, grad);
-            tensor.Grad = existing; // Already accumulated in-place
+            var existing = (Tensor<T>?)_indexedGrads[idx];
+            if (existing != null)
+            {
+                engine.TensorAddInPlace(existing, grad);
+                tensor.Grad = existing;
+            }
+            else
+            {
+                _indexedGrads[idx] = grad;
+                tensor.Grad = grad;
+            }
+            grads[tensor] = tensor.Grad!;
+            return;
+        }
+
+        // Fallback: dictionary path (for ops outside tape or during non-indexed backward)
+        if (grads.TryGetValue(tensor, out var existingDict))
+        {
+            engine.TensorAddInPlace(existingDict, grad);
+            tensor.Grad = existingDict;
         }
         else
         {

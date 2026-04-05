@@ -51,6 +51,7 @@ public sealed class GradientTape<T> : IDisposable
     private readonly IEngine _engine;
     private bool _disposed;
 
+
     /// <summary>
     /// Gets the number of operations recorded on this tape.
     /// </summary>
@@ -197,10 +198,29 @@ public sealed class GradientTape<T> : IDisposable
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Gradient accumulator: maps each tensor (by reference identity) to its accumulated gradient.
-        // Pre-size to entry count to avoid 5-6 dictionary resizes during backward walk.
+        // Assign gradient indices to all tensors that appear in the tape.
+        // This enables O(1) array access in AccumulateGrad instead of dictionary hash lookup.
+        int gradIndexCount = 0;
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var e = ref _entries[i];
+            if (e.Output._gradIndex < 0) e.Output._gradIndex = gradIndexCount++;
+            if (e.Input0 != null && e.Input0._gradIndex < 0) e.Input0._gradIndex = gradIndexCount++;
+            if (e.InputCount >= 2 && e.Input1 != null && e.Input1._gradIndex < 0) e.Input1._gradIndex = gradIndexCount++;
+            if (e.InputCount >= 3 && e.Input2 != null && e.Input2._gradIndex < 0) e.Input2._gradIndex = gradIndexCount++;
+            if (e.InputsOverflow != null)
+                foreach (var inp in e.InputsOverflow)
+                    if (inp._gradIndex < 0) inp._gradIndex = gradIndexCount++;
+        }
+
+        // Flat gradient array: indexed by _gradIndex for O(1) access.
+        var indexedGrads = new object?[gradIndexCount];
+        DifferentiableOps.SetIndexedGrads(indexedGrads);
+
+        // Dictionary facade: backward functions still receive Dictionary<Tensor<T>, Tensor<T>>.
+        // AccumulateGrad writes to both the array and dictionary.
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(
-            Math.Min(_entries.Count + 1, 1024),
+            Math.Min(gradIndexCount + 1, 1024),
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Seed: gradient of loss w.r.t. itself is ones with the same shape.
@@ -220,6 +240,8 @@ public sealed class GradientTape<T> : IDisposable
             seedGrad = new Tensor<T>(onesData, loss.Shape.ToArray());
         }
         grads[loss] = seedGrad;
+        if (loss._gradIndex >= 0 && loss._gradIndex < indexedGrads.Length)
+            indexedGrads[loss._gradIndex] = seedGrad;
 
         // When createGraph=false (default): suspend recording so backward engine calls
         // don't append to this tape — they'd corrupt persistent tapes and shift bounded tapes.
@@ -364,8 +386,19 @@ public sealed class GradientTape<T> : IDisposable
             {
                 SetCurrentTape(savedCurrent);
             }
+            // Clear indexed gradient array and reset tensor grad indices
+            DifferentiableOps.ClearIndexedGrads();
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var e = ref _entries[i];
+                e.Output._gradIndex = -1;
+                if (e.Input0 != null) e.Input0._gradIndex = -1;
+                if (e.InputCount >= 2 && e.Input1 != null) e.Input1._gradIndex = -1;
+                if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
+                if (e.InputsOverflow != null)
+                    foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+            }
         }
-
 
         // If sources specified, filter to only those
         if (sources is not null)
