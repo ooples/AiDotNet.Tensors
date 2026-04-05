@@ -4583,6 +4583,22 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedMin = min;
+                var capturedMax = max;
+                var numOpsLazy = MathHelper.GetNumericOperations<T>();
+                return scope.RecordUnary(LazyNodeType.Custom, "Clamp", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorClamp(captured, capturedMin, capturedMax); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ClampBackward, new object[] { numOpsLazy.ToDouble(min), numOpsLazy.ToDouble(max) });
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -21578,6 +21594,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Softplus<T>(Tensor<T> input)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                return scope.RecordUnary(LazyNodeType.Custom, "Softplus", captured, captured._shape,
+                    (eng, output) => { var r = eng.Softplus(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SoftplusBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetFlattenedData();
         var result = new T[data.Length];
@@ -21609,6 +21637,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> HardSwish<T>(Tensor<T> input)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = input;
+                return scope.RecordUnary(LazyNodeType.Custom, "HardSwish", captured, captured._shape,
+                    (eng, output) => { var r = eng.HardSwish(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.HardSwishBackward);
+            }
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var data = input.GetFlattenedData();
@@ -23293,6 +23333,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>SELU activation: scale * (max(0,x) + min(0, alpha*(exp(x)-1)))</summary>
     public virtual Tensor<T> TensorSELU<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "SELU", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorSELU(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SELUBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         const double alpha = 1.6732632423543772;
         const double scale = 1.0507009873554805;
@@ -23310,6 +23362,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>HardSigmoid: clamp(x/6 + 0.5, 0, 1)</summary>
     public virtual Tensor<T> TensorHardSigmoid<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "HardSigmoid", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorHardSigmoid(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.HardSigmoidBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
@@ -23325,6 +23389,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>ReLU6: min(max(0, x), 6)</summary>
     public virtual Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "ReLU6", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorReLU6(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ReLU6Backward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
@@ -23392,6 +23468,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Element-wise reciprocal: 1/x</summary>
     public Tensor<T> TensorReciprocal<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Reciprocal", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorReciprocal(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ReciprocalBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
@@ -23405,6 +23493,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Element-wise sign: -1, 0, or 1</summary>
     public virtual Tensor<T> TensorSign<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Sign", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorSign(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.SignBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
@@ -23581,6 +23681,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Full mean reduction returning scalar tensor for tape.</summary>
     public Tensor<T> TensorMeanDiff<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Mean", captured, new int[] { 1 },
+                    (eng, output) => { var r = eng.TensorMeanDiff(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MeanBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = TensorSum(tensor);
         T mean = numOps.Divide(sum, numOps.FromDouble(tensor.Length));
@@ -23603,6 +23715,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Variance of all elements, returns scalar tensor.</summary>
     public virtual Tensor<T> TensorVar<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Var", captured, new int[] { 1 },
+                    (eng, output) => { var r = eng.TensorVar(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.VarBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         double mean = 0;
         for (int i = 0; i < tensor.Length; i++) mean += numOps.ToDouble(tensor[i]);
@@ -23622,6 +23746,18 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>Standard deviation of all elements, returns scalar tensor.</summary>
     public virtual Tensor<T> TensorStd<T>(Tensor<T> tensor)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                return scope.RecordUnary(LazyNodeType.Custom, "Std", captured, new int[] { 1 },
+                    (eng, output) => { var r = eng.TensorStd(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.StdBackward);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         double mean = 0;
         for (int i = 0; i < tensor.Length; i++) mean += numOps.ToDouble(tensor[i]);
