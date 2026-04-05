@@ -365,5 +365,48 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Eager:    {0:F4}ms", eagerMs);
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
+
+        [Theory]
+        [InlineData(32, 512, 256, 128, 64, 10, 100)]    // Wide MLP
+        [InlineData(128, 256, 128, 64, 32, 10, 100)]     // Large batch
+        [InlineData(32, 1024, 512, 256, 128, 10, 50)]    // Very deep/wide
+        public void DeepMLP_CompiledVsEager(int m, int d1, int d2, int d3, int d4, int dOut, int iters)
+        {
+            var engine = new CpuEngine();
+            var input = Tensor<float>.CreateRandom(new[] { m, d1 });
+            var w1 = Tensor<float>.CreateRandom(new[] { d1, d2 });
+            var w2 = Tensor<float>.CreateRandom(new[] { d2, d3 });
+            var w3 = Tensor<float>.CreateRandom(new[] { d3, d4 });
+            var w4 = Tensor<float>.CreateRandom(new[] { d4, dOut });
+            int warmup = 20;
+
+            double eagerMs = Measure(() =>
+            {
+                using (var tape = new GradientTape<float>())
+                {
+                    var h1 = engine.ReLU(engine.TensorMatMul(input, w1));
+                    var h2 = engine.ReLU(engine.TensorMatMul(h1, w2));
+                    var h3 = engine.ReLU(engine.TensorMatMul(h2, w3));
+                    var output = engine.TensorMatMul(h3, w4);
+                    var loss = engine.ReduceSum(output, null);
+                    tape.ComputeGradients(loss, new[] { w1, w2, w3, w4 });
+                }
+            }, warmup, iters);
+
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h1 = engine.ReLU(engine.TensorMatMul(input, w1));
+                var h2 = engine.ReLU(engine.TensorMatMul(h1, w2));
+                var h3 = engine.ReLU(engine.TensorMatMul(h2, w3));
+                var output = engine.TensorMatMul(h3, w4);
+                plan = scope.CompileTraining(new[] { w1, w2, w3, w4 });
+            }
+            double compiledMs = Measure(() => plan.Step(), warmup, iters);
+
+            _output.WriteLine("4-Layer MLP [{0}x{1}->{2}->{3}->{4}->{5}]:", m, d1, d2, d3, d4, dOut);
+            _output.WriteLine("  Eager: {0:F4}ms, Compiled: {1:F4}ms ({2:F2}x)",
+                eagerMs, compiledMs, eagerMs / compiledMs);
+        }
     }
 }
