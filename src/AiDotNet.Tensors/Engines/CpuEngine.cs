@@ -2412,6 +2412,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var capturedA = a;
+                var capturedB = b;
+                return scope.RecordBinary(LazyNodeType.BroadcastSubtract, "TensorBroadcastSubtract", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorBroadcastSubtract(capturedA, capturedB); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BroadcastSubtractBackward);
+            }
+        }
+
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
@@ -18015,6 +18029,19 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedScalar = scalar;
+                return scope.RecordUnary(LazyNodeType.DivideScalar, "TensorDivideScalar", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorDivideScalar(captured, capturedScalar); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.DivideScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
