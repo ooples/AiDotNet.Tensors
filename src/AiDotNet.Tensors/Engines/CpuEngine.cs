@@ -19277,6 +19277,37 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (weights == null) throw new ArgumentNullException(nameof(weights));
+
+        // When a gradient tape is active, decompose into tape-recorded primitives so
+        // backward can trace the dependency chain from loss -> output -> parameters.
+        // The BLAS fast path below bypasses the tape (operates on raw arrays), so we
+        // must use the recorded path during training.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        {
+            var result = TensorMatMul(input, weights);
+            if (bias != null)
+                result = TensorBroadcastAdd(result, bias);
+            // Apply activation through recorded ops (each records its own backward)
+            if (activation != FusedActivationType.None)
+            {
+                var numOps = MathHelper.GetNumericOperations<T>();
+                result = activation switch
+                {
+                    FusedActivationType.ReLU => ReLU(result),
+                    FusedActivationType.Sigmoid => Sigmoid(result),
+                    FusedActivationType.Tanh => Tanh(result),
+                    FusedActivationType.GELU => GELU(result),
+                    FusedActivationType.Swish => Swish(result),
+                    FusedActivationType.LeakyReLU => LeakyReLU(result, numOps.FromDouble(0.01)),
+                    FusedActivationType.ELU => ELU(result),
+                    FusedActivationType.Softmax => Softmax(result),
+                    _ => throw new ArgumentOutOfRangeException(nameof(activation), activation,
+                        $"Unsupported activation type {activation} in tape-recorded FusedLinear path")
+                };
+            }
+            return result;
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
         if (!weights.IsContiguous) weights = weights.Contiguous();
 
