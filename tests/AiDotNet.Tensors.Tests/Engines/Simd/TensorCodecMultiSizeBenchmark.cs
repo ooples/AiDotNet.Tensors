@@ -408,5 +408,49 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Eager: {0:F4}ms, Compiled: {1:F4}ms ({2:F2}x)",
                 eagerMs, compiledMs, eagerMs / compiledMs);
         }
+
+        [Fact]
+        public void RealisticTraining_MLP_MSELoss_CompiledVsEager()
+        {
+            var engine = new CpuEngine();
+            int m = 32, dIn = 128, dHid = 64, dOut = 10;
+            var input = Tensor<float>.CreateRandom(new[] { m, dIn });
+            var target = Tensor<float>.CreateRandom(new[] { m, dOut });
+            var w1 = Tensor<float>.CreateRandom(new[] { dIn, dHid });
+            var w2 = Tensor<float>.CreateRandom(new[] { dHid, dOut });
+            int warmup = 30, iters = 500;
+
+            // Eager: MLP forward + MSE loss + backward
+            double eagerMs = Measure(() =>
+            {
+                using (var tape = new GradientTape<float>())
+                {
+                    var h = engine.ReLU(engine.TensorMatMul(input, w1));
+                    var pred = engine.TensorMatMul(h, w2);
+                    var diff = engine.TensorSubtract(pred, target);
+                    var sq = engine.TensorMultiply(diff, diff);
+                    var loss = engine.ReduceSum(sq, null);
+                    tape.ComputeGradients(loss, new[] { w1, w2 });
+                }
+            }, warmup, iters);
+
+            // Compiled: same operations
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h = engine.ReLU(engine.TensorMatMul(input, w1));
+                var pred = engine.TensorMatMul(h, w2);
+                var diff = engine.TensorSubtract(pred, target);
+                var sq = engine.TensorMultiply(diff, diff);
+                engine.ReduceSum(sq, null);
+                plan = scope.CompileTraining(new[] { w1, w2 });
+            }
+            double compiledMs = Measure(() => plan.Step(), warmup, iters);
+
+            _output.WriteLine("Realistic MLP + MSE Loss [32,128->64->10]:");
+            _output.WriteLine("  Eager+Tape: {0:F4}ms", eagerMs);
+            _output.WriteLine("  Compiled:   {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
+            _output.WriteLine("  vs PyTorch: ~{0:F2}x (est. PyTorch ~0.35ms)", 0.35 / compiledMs);
+        }
     }
 }
