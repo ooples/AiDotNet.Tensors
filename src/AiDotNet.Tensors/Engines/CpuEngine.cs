@@ -7421,12 +7421,9 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var gradInput = new T[batch * inChannels * height * width];
+        Array.Clear(gradInput, 0, gradInput.Length);
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
-
-        // Initialize to zero
-        for (int i = 0; i < gradInput.Length; i++)
-            gradInput[i] = numOps.Zero;
 
         Parallel.For(0, batch * inChannels, idx =>
         {
@@ -7504,11 +7501,9 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
+        Array.Clear(gradKernel, 0, gradKernel.Length);
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-
-        for (int i = 0; i < gradKernel.Length; i++)
-            gradKernel[i] = numOps.Zero;
 
         Parallel.For(0, outChannels * inChannels, idx =>
         {
