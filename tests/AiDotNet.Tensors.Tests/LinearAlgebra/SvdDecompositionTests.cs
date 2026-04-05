@@ -175,6 +175,43 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra
                 factors.Value.Rank, directMs, spectralMs, directMs / spectralMs);
         }
 
+        [Theory]
+        [InlineData(256, 128, 16)]
+        [InlineData(512, 256, 32)]
+        public void SpectralMatMul_LargerSizes_VsDirect(int k, int n, int trueRank)
+        {
+            int batchSize = 32;
+            var w = MakeLowRank(k, n, trueRank, 60 + k);
+            var x = MakeRandom(batchSize * k, 61 + k);
+
+            var factors = SvdDecomposition.Decompose(w, k, n, maxRank: 0, energyThreshold: 0.9999);
+            Assert.NotNull(factors);
+
+            int warmup = 30, iters = 500;
+            var directOut = new float[batchSize * n];
+            var spectralOut = new float[batchSize * n];
+
+            for (int i = 0; i < warmup; i++)
+                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
+            sw.Stop();
+            double directMs = sw.Elapsed.TotalMilliseconds / iters;
+
+            for (int i = 0; i < warmup; i++)
+                SvdDecomposition.SpectralMatMul(x, batchSize, k, factors.Value, spectralOut);
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+                SvdDecomposition.SpectralMatMul(x, batchSize, k, factors.Value, spectralOut);
+            sw.Stop();
+            double spectralMs = sw.Elapsed.TotalMilliseconds / iters;
+
+            double flopRedux = (double)(2L * batchSize * k * n) / (2L * batchSize * k * factors.Value.Rank + 2L * batchSize * factors.Value.Rank * n);
+            _output.WriteLine("[{0},{1}] rank-{2}: Direct={3:F4}ms, Spectral={4:F4}ms, Speedup={5:F2}x, FLOPs={6:F1}x reduction",
+                k, n, factors.Value.Rank, directMs, spectralMs, directMs / spectralMs, flopRedux);
+        }
+
         [Fact]
         public void SVD_FullRankMatrix_ReturnsNull()
         {
