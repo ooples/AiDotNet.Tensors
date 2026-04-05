@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -7424,10 +7424,6 @@ public class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
 
-        // Initialize to zero
-        for (int i = 0; i < gradInput.Length; i++)
-            gradInput[i] = numOps.Zero;
-
         Parallel.For(0, batch * inChannels, idx =>
         {
             int b = idx / inChannels;
@@ -7506,9 +7502,6 @@ public class CpuEngine : ITensorLevelEngine
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
-
-        for (int i = 0; i < gradKernel.Length; i++)
-            gradKernel[i] = numOps.Zero;
 
         Parallel.For(0, outChannels * inChannels, idx =>
         {
@@ -12409,13 +12402,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[featureSize];
         var gradBetaData = new T[featureSize];
         var gradInputData = new T[batchSize * featureSize];
-
-        // Initialize gradGamma and gradBeta to zero
-        for (int f = 0; f < featureSize; f++)
-        {
-            gradGammaData[f] = numOps.Zero;
-            gradBetaData[f] = numOps.Zero;
-        }
+        // CLR zeros new T[] already — no explicit clearing needed
 
         // Compute gradGamma and gradBeta
         for (int b = 0; b < batchSize; b++)
@@ -19303,42 +19290,109 @@ public class CpuEngine : ITensorLevelEngine
             if (weights._shape[0] != K)
                 throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
 
-            var result = TensorAllocator.Rent<T>([M, N]);
-
-            // Use optimized fused operations for float type
+            // Ultra-fast path for float: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(float))
             {
-                // Try to get underlying arrays without copying using MemoryMarshal
-                var inputArray = GetUnderlyingArrayOrCopy<T, float>(input.Data);
-                var weightsArray = GetUnderlyingArrayOrCopy<T, float>(weights.Data);
-                var biasArray = bias != null ? GetUnderlyingArrayOrCopy<T, float>(bias.Data) : null;
-                var outputArray = new float[M * N];
+                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
+                var inArr = (float[])(object)input.GetDataArray();
+                var wArr = (float[])(object)weights.GetDataArray();
+                var outArr = (float[])(object)result.GetDataArray();
 
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inputArray, weightsArray, biasArray, outputArray,
-                    M, N, K, activation);
+                bool blasDone = false;
+#if NET5_0_OR_GREATER
+                // Tier 0: Raw function pointer — zero overhead calli (no delegate, no P/Invoke)
+                if (BlasProvider.HasRawSgemm)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    blasDone = true;
+                }
+#endif
+                if (!blasDone)
+                {
+                    // Tier 1: Native delegate dispatch
+                    if (BlasProvider.HasNativeSgemm)
+                    {
+                        unsafe
+                        {
+                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                    }
+                    // Tier 2: MKL verified
+                    else if (BlasProvider.IsMklVerified)
+                    {
+                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    }
+                    // Tier 3: Any BLAS with validation
+                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                    {
+                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                    }
+                }
 
-                // Reinterpret float[] as T[] using Unsafe.As (safe since T is float)
-                var typedOutput = Unsafe.As<float[], T[]>(ref outputArray);
-                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
+                // Fused bias + activation in one pass
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlace(outArr, bArr, M, N, activation);
+                }
+
+                return result;
             }
 
-            // Use optimized fused operations for double type
+            // Ultra-fast path for double: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(double))
             {
-                // Try to get underlying arrays without copying using MemoryMarshal
-                var inputArray = GetUnderlyingArrayOrCopy<T, double>(input.Data);
-                var weightsArray = GetUnderlyingArrayOrCopy<T, double>(weights.Data);
-                var biasArray = bias != null ? GetUnderlyingArrayOrCopy<T, double>(bias.Data) : null;
-                var outputArray = new double[M * N];
+                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
+                var inArr = (double[])(object)input.GetDataArray();
+                var wArr = (double[])(object)weights.GetDataArray();
+                var outArr = (double[])(object)result.GetDataArray();
 
-                CpuFusedOperations.FusedGemmBiasActivation(
-                    inputArray, weightsArray, biasArray, outputArray,
-                    M, N, K, activation);
+                bool dBlasDone = false;
+#if NET5_0_OR_GREATER
+                if (BlasProvider.HasRawDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+#endif
+                if (!dBlasDone && BlasProvider.HasNativeDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && BlasProvider.IsMklVerified)
+                {
+                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    dBlasDone = true;
+                }
+                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
+                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
+                        bias != null ? (double[])(object)bias.GetDataArray() : null,
+                        outArr, M, N, K, activation);
+                    return result;
+                }
 
-                // Reinterpret double[] as T[] using Unsafe.As (safe since T is double)
-                var typedOutput = Unsafe.As<double[], T[]>(ref outputArray);
-                return TensorAllocator.Rent<T>([M, N], new Vector<T>(typedOutput));
+                if (bias != null || activation != FusedActivationType.None)
+                {
+                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation);
+                }
+
+                return result;
             }
         }
 

@@ -127,68 +127,39 @@ public static class CpuFusedOperations
         if (bias != null && bias.Length < N)
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
-        bool hasBias = bias != null;
-        int totalElements = M * N;
+        // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
+        if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
+        {
+            ApplyBiasActivationInPlace(output, bias, M, N, activation);
+            return;
+        }
 
-        // Choose parallel or sequential based on problem size
-        if (totalElements >= PARALLEL_THRESHOLD && M > 1)
-        {
-            // Parallel GEMM with fused bias + activation
-            Parallel.For(0, M, i =>
-            {
-                ComputeGemmRowFused(A, B, bias, output, i, M, N, K, hasBias, activation);
-            });
-        }
-        else
-        {
-            // Sequential for small matrices
-            for (int i = 0; i < M; i++)
-            {
-                ComputeGemmRowFused(A, B, bias, output, i, M, N, K, hasBias, activation);
-            }
-        }
+        // BLAS unavailable: use SIMD tiled GEMM fallback
+        Engines.Simd.SimdGemm.Sgemm(A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
+        ApplyBiasActivationInPlace(output, bias, M, N, activation);
     }
 
     /// <summary>
-    /// Computes a single row of fused GEMM + Bias + Activation.
-    /// Uses SIMD dot product for each output element.
+    /// Applies bias addition and activation function in-place over the GEMM output.
+    /// Single O(MN) pass — cheap compared to the O(MNK) GEMM.
     /// </summary>
     [MethodImpl(Hot)]
-    private static void ComputeGemmRowFused(
-        float[] A,
-        float[] B,
-        float[]? bias,
-        float[] output,
-        int row,
-        int M, int N, int K,
-        bool hasBias,
-        FusedActivationType activation)
+    internal static void ApplyBiasActivationInPlace(float[] output, float[]? bias, int M, int N, FusedActivationType activation)
     {
-        int aRowOffset = row * K;
-        int outRowOffset = row * N;
+        bool hasBias = bias != null;
+        bool hasActivation = activation != FusedActivationType.None;
+        if (!hasBias && !hasActivation) return;
 
-        // Compute each output element with fused operations
-        for (int j = 0; j < N; j++)
+        for (int i = 0; i < M; i++)
         {
-            // Compute dot product A[row,:] * B[:,j]
-            float sum = 0f;
-            for (int k = 0; k < K; k++)
+            int rowOffset = i * N;
+            for (int j = 0; j < N; j++)
             {
-#if NET5_0_OR_GREATER
-                sum = MathF.FusedMultiplyAdd(A[aRowOffset + k], B[k * N + j], sum);
-#else
-                sum += A[aRowOffset + k] * B[k * N + j];
-#endif
+                float val = output[rowOffset + j];
+                if (hasBias) val += bias![j];
+                if (hasActivation) val = ApplyActivation(val, activation);
+                output[rowOffset + j] = val;
             }
-
-            // Fused: Add bias
-            if (hasBias && bias != null)
-            {
-                sum += bias[j];
-            }
-
-            // Fused: Apply activation
-            output[outRowOffset + j] = ApplyActivation(sum, activation);
         }
     }
 
@@ -554,10 +525,19 @@ public static class CpuFusedOperations
             throw new ArgumentException($"B must have at least {K * N} elements", nameof(B));
         if (output.Length < M * N)
             throw new ArgumentException($"output must have at least {M * N} elements", nameof(output));
+        if (bias != null && bias.Length < N)
+            throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
+        // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
+        if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
+        {
+            ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation);
+            return;
+        }
+
+        // BLAS unavailable: parallel scalar fallback
         bool hasBias = bias != null;
         int totalElements = M * N;
-
         if (totalElements >= PARALLEL_THRESHOLD && M > 1)
         {
             Parallel.For(0, M, i =>
@@ -568,8 +548,29 @@ public static class CpuFusedOperations
         else
         {
             for (int i = 0; i < M; i++)
-            {
                 ComputeGemmRowFusedDouble(A, B, bias, output, i, M, N, K, hasBias, activation);
+        }
+    }
+
+    /// <summary>
+    /// Applies bias addition and activation function in-place over the double GEMM output.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static void ApplyBiasActivationInPlaceDouble(double[] output, double[]? bias, int M, int N, FusedActivationType activation)
+    {
+        bool hasBias = bias != null;
+        bool hasActivation = activation != FusedActivationType.None;
+        if (!hasBias && !hasActivation) return;
+
+        for (int i = 0; i < M; i++)
+        {
+            int rowOffset = i * N;
+            for (int j = 0; j < N; j++)
+            {
+                double val = output[rowOffset + j];
+                if (hasBias) val += bias![j];
+                if (hasActivation) val = ApplyActivationDouble(val, activation);
+                output[rowOffset + j] = val;
             }
         }
     }
@@ -601,9 +602,7 @@ public static class CpuFusedOperations
             }
 
             if (hasBias && bias != null)
-            {
                 sum += bias[j];
-            }
 
             output[outRowOffset + j] = ApplyActivationDouble(sum, activation);
         }

@@ -123,15 +123,84 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
+    // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes
+    private object[]? _tensorRing;
+    private int[]? _tensorRingSizes;
+    private int[]? _tensorRingCursors;
+    private int _tensorRingCount;
+    private const int MaxTensorRingSlots = 32;
+
+    /// <summary>
+    /// Rents a Tensor object from the arena. Returns a cached Tensor with its
+    /// backing array already pooled. Uses a flat array with linear scan instead of
+    /// Dictionary — eliminates hash computation overhead for the 3-5 unique sizes
+    /// in a typical training step.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal LinearAlgebra.Tensor<T>? TryRentTensor<T>(int totalSize, int[] shape)
+    {
+        if (_disposed) return null;
+
+        // Lazy init
+        if (_tensorRing == null)
+        {
+            _tensorRing = new object[MaxTensorRingSlots];
+            _tensorRingSizes = new int[MaxTensorRingSlots];
+            _tensorRingCursors = new int[MaxTensorRingSlots];
+        }
+
+        // Linear scan for matching size (fast for <10 entries)
+        for (int i = 0; i < _tensorRingCount; i++)
+        {
+            if (_tensorRingSizes![i] == totalSize && _tensorRing[i] is List<object> bucket)
+            {
+                int cursor = _tensorRingCursors![i];
+                if (cursor < bucket.Count)
+                {
+                    _tensorRingCursors[i] = cursor + 1;
+                    return (LinearAlgebra.Tensor<T>)bucket[cursor];
+                }
+
+                // Need one more tensor of this size
+                var newArr = new T[totalSize];
+                var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
+                bucket.Add(newTensor);
+                _tensorRingCursors[i] = cursor + 1;
+                return newTensor;
+            }
+        }
+
+        // New size — add slot
+        if (_tensorRingCount < MaxTensorRingSlots)
+        {
+            var arr = new T[totalSize];
+            var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
+            var newBucket = new List<object>(4) { tensor };
+            int idx = _tensorRingCount++;
+            _tensorRing[idx] = newBucket;
+            _tensorRingSizes![idx] = totalSize;
+            _tensorRingCursors![idx] = 1;
+            return tensor;
+        }
+
+        return null; // Arena full — caller falls through to other allocators
+    }
+
     /// <summary>
     /// Resets the arena for the next iteration. After this, subsequent Rent calls
     /// will reuse arrays from the previous iteration — zero allocation.
     /// </summary>
     public void Reset()
     {
-        // Rewind all cursors to 0 — arrays stay pooled
+        // Rewind all cursors to 0 — arrays and tensors stay pooled
         foreach (var key in _cursor.Keys)
             _cursor[key] = 0;
+        // Reset flat tensor ring cursors
+        if (_tensorRingCursors != null)
+        {
+            for (int i = 0; i < _tensorRingCount; i++)
+                _tensorRingCursors[i] = 0;
+        }
     }
 
     /// <summary>
@@ -158,5 +227,12 @@ public sealed class TensorArena : IDisposable
 
         _pool.Clear();
         _cursor.Clear();
+
+        // Clear tensor ring pools
+        if (_tensorRing != null)
+        {
+            Array.Clear(_tensorRing, 0, _tensorRingCount);
+            _tensorRingCount = 0;
+        }
     }
 }
