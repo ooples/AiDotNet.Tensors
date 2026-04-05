@@ -109,7 +109,10 @@ public class PerformanceProfileTests
         // D. TensorAllocator.Rent overhead
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            TensorAllocator.Rent<float>([size]);
+        {
+            var rented = TensorAllocator.Rent<float>([size]);
+            TensorAllocator.Return(rented);
+        }
         sw.Stop();
         _output.WriteLine($"D. TensorAllocator.Rent [{size}]: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 

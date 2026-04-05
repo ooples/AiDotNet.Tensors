@@ -16,7 +16,7 @@ public class DeepProfileTests
 
     public DeepProfileTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [Fact(Skip = "Profiling test — run manually with --filter DeepProfile")]
     public void Profile_BatchMatMul_WhereWeLose()
     {
         // We: 0.117ms, PyTorch: 0.016ms — 7.3x gap
@@ -106,7 +106,7 @@ public class DeepProfileTests
         }
     }
 
-    [Fact]
+    [Fact(Skip = "Profiling test — run manually with --filter DeepProfile")]
     public void Profile_TensorMatMul_WhereWeLose()
     {
         // We: 0.077ms, PyTorch: 0.029ms — 2.7x gap
@@ -172,7 +172,7 @@ public class DeepProfileTests
         _output.WriteLine($"F. Tensor.MatrixMultiply: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
     }
 
-    [Fact]
+    [Fact(Skip = "Profiling test — run manually with --filter DeepProfile")]
     public void Profile_FusedLinear_WhereWeLose()
     {
         // We: 0.141ms, PyTorch: 0.043ms — 3.3x gap

@@ -25,6 +25,9 @@ public class AutogradComparisonBenchmarks
     private Tensor<float> _aiW1 = null!;
     private Tensor<float> _aiW2 = null!;
     private Tensor<float> _aiW3 = null!;
+    private Tensor<float> _aiB1 = null!;
+    private Tensor<float> _aiB2 = null!;
+    private Tensor<float> _aiB3 = null!;
     private Tensor<float> _aiSmallA = null!;
     private Tensor<float> _aiSmallB = null!;
 
@@ -46,6 +49,9 @@ public class AutogradComparisonBenchmarks
         _aiW1 = Tensor<float>.CreateRandom([128, 64]);
         _aiW2 = Tensor<float>.CreateRandom([64, 32]);
         _aiW3 = Tensor<float>.CreateRandom([32, 10]);
+        _aiB1 = Tensor<float>.CreateRandom([64]);
+        _aiB2 = Tensor<float>.CreateRandom([32]);
+        _aiB3 = Tensor<float>.CreateRandom([10]);
 
         // Small tensors for recording overhead measurement
         _aiSmallA = Tensor<float>.CreateRandom([64]);
@@ -134,6 +140,17 @@ public class AutogradComparisonBenchmarks
         return tape.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
     }
 
+    [Benchmark(Description = "AiDotNet: MLP FusedLinear[32x128->64->32->10] train step")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_MLP_FusedLinear_TrainStep()
+    {
+        using var tape = new GradientTape<float>();
+        var h1 = _engine.FusedLinear(_aiInput, _aiW1, _aiB1, FusedActivationType.ReLU);
+        var h2 = _engine.FusedLinear(h1, _aiW2, _aiB2, FusedActivationType.ReLU);
+        var output = _engine.FusedLinear(h2, _aiW3, _aiB3, FusedActivationType.None);
+        var loss = _engine.ReduceSum(output, null);
+        return tape.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+    }
+
     [Benchmark(Description = "PyTorch: MLP[32x128->64->32->10] train step")]
     public (TorchTensor, TorchTensor, TorchTensor) PyTorch_MLP_TrainStep()
     {
@@ -163,6 +180,85 @@ public class AutogradComparisonBenchmarks
     {
         using var _ = torch.no_grad();
         return torch.matmul(_torchInput, _torchW1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Compiled Plan: Graph compiler + pre-allocated buffer replay
+    // ═══════════════════════════════════════════════════════════════════
+
+    private Engines.Compilation.CompiledInferencePlan<float>? _compiledMlpPlan;
+    private Engines.Compilation.CompiledInferencePlan<float>? _compiledChainPlan;
+
+    [IterationSetup(Target = nameof(AiDotNet_MLP_CompiledPlan))]
+    public void SetupMlpPlan()
+    {
+        if (_compiledMlpPlan is not null) return;
+        using var scope = Engines.Compilation.GraphMode.Enable();
+        var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
+        var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
+        _engine.TensorMatMul(h2, _aiW3);
+        _compiledMlpPlan = scope.CompileInference<float>();
+    }
+
+    [Benchmark(Description = "AiDotNet: MLP[32x128->64->32->10] compiled plan inference")]
+    public Tensor<float> AiDotNet_MLP_CompiledPlan()
+    {
+        return _compiledMlpPlan!.Execute();
+    }
+
+    [IterationSetup(Target = nameof(AiDotNet_ElementwiseChain_CompiledPlan))]
+    public void SetupChainPlan()
+    {
+        if (_compiledChainPlan is not null) return;
+        using var scope = Engines.Compilation.GraphMode.Enable();
+        var r = _engine.TensorAdd(_aiSmallA, _aiSmallB);
+        r = _engine.TensorMultiply(r, _aiSmallA);
+        r = _engine.ReLU(r);
+        r = _engine.TensorSubtract(r, _aiSmallB);
+        _engine.ReLU(r);
+        _compiledChainPlan = scope.CompileInference<float>();
+    }
+
+    [Benchmark(Description = "AiDotNet: 5-op chain[64] compiled plan")]
+    public Tensor<float> AiDotNet_ElementwiseChain_CompiledPlan()
+    {
+        return _compiledChainPlan!.Execute();
+    }
+
+    [Benchmark(Description = "PyTorch: 5-op chain[64] (no_grad)")]
+    public TorchTensor PyTorch_ElementwiseChain()
+    {
+        using var _ = torch.no_grad();
+        var r = _torchSmallA + _torchSmallB;
+        r = r * _torchSmallA;
+        r = torch.nn.functional.relu(r);
+        r = r - _torchSmallB;
+        return torch.nn.functional.relu(r);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Compiled Training Plan: compile-once forward+backward replay
+    // This is the revolutionary part — replaces tape entirely
+    // ═══════════════════════════════════════════════════════════════════
+
+    private Engines.Compilation.CompiledTrainingPlan<float>? _compiledTrainPlan;
+
+    [IterationSetup(Target = nameof(AiDotNet_MLP_CompiledTrainStep))]
+    public void SetupTrainPlan()
+    {
+        if (_compiledTrainPlan is not null) return;
+        // Compile once: record the forward graph, auto-generate backward
+        using var scope = Engines.Compilation.GraphMode.Enable();
+        var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
+        var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
+        var output = _engine.TensorMatMul(h2, _aiW3);
+        _compiledTrainPlan = scope.CompileTraining(new[] { _aiW1, _aiW2, _aiW3 });
+    }
+
+    [Benchmark(Description = "AiDotNet: MLP[32x128->64->32->10] compiled train step (fwd+bwd)")]
+    public Tensor<float> AiDotNet_MLP_CompiledTrainStep()
+    {
+        return _compiledTrainPlan!.Step();
     }
 }
 #endif

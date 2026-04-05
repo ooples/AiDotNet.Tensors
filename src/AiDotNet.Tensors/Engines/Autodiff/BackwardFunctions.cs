@@ -1,4 +1,5 @@
-﻿using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -362,44 +363,30 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Try transposed BLAS GEMM to avoid materializing transpose (60%+ faster)
-        // dA = dC @ B^T  →  GEMM(NoTrans, Trans, dC, B)
-        // dB = A^T @ dC  →  GEMM(Trans, NoTrans, A, dC)
+        // BLAS fast path: compute transposed GEMMs into fresh buffers, then accumulate.
+        // Allocates two float[] arrays but avoids materializing full transpose tensors.
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2 && BlasProvider.IsAvailable)
         {
-            int m0 = gradOutput.Shape[0]; // rows of dC
-            int n0 = inputs[1].Shape[0];  // cols of B^T = rows of B
-            int k0 = gradOutput.Shape[1]; // cols of dC = cols of B
-
-            int m1 = inputs[0].Shape[1];  // cols of A^T = rows of A (becomes cols)
-            int n1 = gradOutput.Shape[1]; // cols of dC
-            int k1 = inputs[0].Shape[0];  // rows of A^T = rows of A
-
-            var gradAData = new float[m0 * n0];
-            var gradBData = new float[m1 * n1];
-
-            // Wait, the dimensions need to be exact. Let me use the proper BLAS convention.
-            // dA = dC @ B^T: dC is [m0, k0], B is [n0, k0] (B^T is [k0, n0])
-            //   → GEMM(NoTrans, Trans): C[m0,n0] = dC[m0,k0] * B^T[k0,n0]
-            //   m=m0, n=n0, k=k0, A=dC, B=B, transB=true
-            // But for row-major: lda=k0, ldb=k0 (B's actual stride), ldc=n0
-
-            // dB = A^T @ dC: A is [k1, m1] (A^T is [m1, k1]), dC is [k1, n1]
-            //   → GEMM(Trans, NoTrans): C[m1,n1] = A^T[m1,k1] * dC[k1,n1]
-            //   m=m1, n=n1, k=k1, A=A, transA=true, B=dC
-            // For row-major: lda=m1 (A's col count), ldb=n1, ldc=n1
-
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
             var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
 
             if (dCArr is not null && aArr is not null && bArr is not null)
             {
-                bool usedA = BlasProvider.TryGemmEx(m0, n0, k0, dCArr, 0, k0, false, bArr, 0, k0, true, gradAData, 0, n0);
-                bool usedB = BlasProvider.TryGemmEx(inputs[0]._shape[1], gradOutput._shape[1], inputs[0]._shape[0],
-                    aArr, 0, inputs[0]._shape[1], true, dCArr, 0, gradOutput._shape[1], false, gradBData, 0, gradOutput._shape[1]);
+                int M = gradOutput._shape[0], K = gradOutput._shape[1];
+                int N_a = inputs[1]._shape[0]; // rows of B = cols of grad_A
+                int N_b = gradOutput._shape[1]; // cols of grad_B
 
-                if (usedA && usedB)
+                // Allocate fresh buffers for both GEMMs. Only accumulate after BOTH
+                // succeed to avoid partial accumulation if the second GEMM fails.
+                var gradAData = new float[M * N_a];
+                var gradBData = new float[inputs[0]._shape[1] * N_b];
+
+                bool okA = BlasProvider.TryGemmEx(M, N_a, K, dCArr, 0, K, false, bArr, 0, K, true, gradAData, 0, N_a);
+                bool okB = BlasProvider.TryGemmEx(inputs[0]._shape[1], N_b, inputs[0]._shape[0],
+                    aArr, 0, inputs[0]._shape[1], true, dCArr, 0, N_b, false, gradBData, 0, N_b);
+
+                if (okA && okB)
                 {
                     var gradA = new Tensor<T>((T[])(object)gradAData, inputs[0]._shape);
                     var gradB = new Tensor<T>((T[])(object)gradBData, inputs[1]._shape);
@@ -407,10 +394,13 @@ internal static class BackwardFunctions<T>
                     DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
                     return;
                 }
+                // Either GEMM refused — fall through to generic path
+                goto fallback;
             }
         }
 
         // Fallback: materialize transposes (works for all types and ranks)
+        fallback:
         var bT = engine.TensorTranspose(inputs[1]);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
@@ -1895,22 +1885,124 @@ internal static class BackwardFunctions<T>
     /// inputs[1] = weight matrix (B)
     /// inputs[2] = bias vector
     /// </remarks>
-    internal static void FusedMatMulAddReLUBackward(
+    internal static unsafe void FusedMatMulAddReLUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Step 1: Apply ReLU mask — gradient is zero where pre-activation was <= 0
         var preActivation = (Tensor<T>)savedState[0];
-        var maskedGrad = engine.ReluBackward(gradOutput, preActivation);
 
-        // Step 2: MatMul backward with the already-masked gradient
+        // Fused BLAS path: ReLU mask + transposed GEMM in minimal allocations
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
+            && BlasProvider.IsAvailable && gradOutput.IsContiguous && preActivation.IsContiguous)
+        {
+            int M = inputs[0]._shape[0]; // batch
+            int K = inputs[0]._shape[1]; // in_features
+            int N = inputs[1]._shape[1]; // out_features
+
+            var gArr = (float[])(object)gradOutput.GetDataArray();
+            var paArr = (float[])(object)preActivation.GetDataArray();
+            var inArr = (float[])(object)inputs[0].GetDataArray();
+            var wArr = (float[])(object)inputs[1].GetDataArray();
+
+            // Step 1: Fused ReLU mask — apply mask in-place on a copy of gradOutput
+            // This avoids allocating a separate masked gradient tensor
+            var maskedArr = new float[M * N];
+            fixed (float* pG = gArr, pPA = paArr, pM = maskedArr)
+            {
+                SimdKernels.ReluBackwardUnsafe(pG, pPA, pM, M * N);
+            }
+
+            // Step 2: gradInput = maskedGrad @ W^T  (transposed BLAS, no transpose allocation)
+            var gradInputArr = new float[M * K];
+            BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+            var gradInput = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
+
+            // Step 3: gradWeight = input^T @ maskedGrad  (transposed BLAS, no transpose allocation)
+            var gradWeightArr = new float[K * N];
+            BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
+            var gradWeight = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
+
+            // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass
+            var biasArr = new float[N];
+            fixed (float* pM = maskedArr, pB = biasArr)
+            {
+                for (int row = 0; row < M; row++)
+                {
+                    float* rowPtr = pM + row * N;
+                    for (int j = 0; j < N; j++)
+                        pB[j] += rowPtr[j];
+                }
+            }
+            var gradBias = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
+
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+            return;
+        }
+
+        // Fallback: separate ops (non-float or non-2D)
+        var maskedGrad = engine.ReluBackward(gradOutput, preActivation);
         var bT = engine.TensorTranspose(inputs[1]);
         var gradA = engine.TensorMatMul(maskedGrad, bT);
-
         var aT = engine.TensorTranspose(inputs[0]);
         var gradB = engine.TensorMatMul(aT, maskedGrad);
+        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
+        var gradBiasFallback = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
-        // Step 3: Bias gradient = sum of maskedGrad along batch dimension (axis 0)
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBiasFallback, engine);
+    }
+
+    /// <summary>
+    /// Shared fused backward: activation_backward → transposed BLAS GEMM for both gradients → bias sum.
+    /// Eliminates transpose allocations by using BLAS transA/transB flags directly.
+    /// </summary>
+    private static unsafe void FusedLinearActivationBackwardCore(
+        float[] maskedArr, int M, int K, int N,
+        Tensor<T>[] inputs, Dictionary<Tensor<T>, Tensor<T>> grads, IEngine engine)
+    {
+        var inArr = (float[])(object)inputs[0].GetDataArray();
+        var wArr = (float[])(object)inputs[1].GetDataArray();
+
+        // gradInput = maskedGrad @ W^T — transposed BLAS, zero transpose allocation
+        var gradInputArr = new float[M * K];
+        BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+        var gradInput = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
+
+        // gradWeight = input^T @ maskedGrad — transposed BLAS, zero transpose allocation
+        var gradWeightArr = new float[K * N];
+        BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
+        var gradWeight = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
+
+        // gradBias = sum(maskedGrad, axis=0) — single pass, no engine call
+        var biasArr = new float[N];
+        fixed (float* pM = maskedArr, pB = biasArr)
+        {
+            for (int row = 0; row < M; row++)
+            {
+                float* rowPtr = pM + row * N;
+                for (int j = 0; j < N; j++)
+                    pB[j] += rowPtr[j];
+            }
+        }
+        var gradBias = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
+
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+    }
+
+    /// <summary>Fallback fused backward using engine calls (non-float or non-2D).</summary>
+    private static void FusedLinearActivationBackwardFallback(
+        Tensor<T> maskedGrad, Tensor<T>[] inputs,
+        Dictionary<Tensor<T>, Tensor<T>> grads, IEngine engine)
+    {
+        var bT = engine.TensorTranspose(inputs[1]);
+        var gradA = engine.TensorMatMul(maskedGrad, bT);
+        var aT = engine.TensorTranspose(inputs[0]);
+        var gradB = engine.TensorMatMul(aT, maskedGrad);
         var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
         var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
 
@@ -1919,101 +2011,70 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
     }
 
-    /// <summary>
-    /// Fused backward for MatMul + Bias Add + Sigmoid.
-    /// </summary>
     internal static void FusedMatMulAddSigmoidBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Sigmoid backward: grad * sigmoid(x) * (1 - sigmoid(x)) = grad * output * (1 - output)
         var maskedGrad = engine.SigmoidBackward(gradOutput, output);
-
-        var bT = engine.TensorTranspose(inputs[1]);
-        var gradA = engine.TensorMatMul(maskedGrad, bT);
-
-        var aT = engine.TensorTranspose(inputs[0]);
-        var gradB = engine.TensorMatMul(aT, maskedGrad);
-
-        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
-        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && BlasProvider.IsAvailable)
+        {
+            FusedLinearActivationBackwardCore(
+                (float[])(object)maskedGrad.GetDataArray(),
+                inputs[0]._shape[0], inputs[0]._shape[1], inputs[1]._shape[1],
+                inputs, grads, engine);
+            return;
+        }
+        FusedLinearActivationBackwardFallback(maskedGrad, inputs, grads, engine);
     }
 
-    /// <summary>
-    /// Fused backward for MatMul + Bias Add + Tanh.
-    /// </summary>
     internal static void FusedMatMulAddTanhBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Tanh backward: grad * (1 - tanh(x)^2) = grad * (1 - output^2)
         var maskedGrad = engine.TanhBackward(gradOutput, output);
-
-        var bT = engine.TensorTranspose(inputs[1]);
-        var gradA = engine.TensorMatMul(maskedGrad, bT);
-
-        var aT = engine.TensorTranspose(inputs[0]);
-        var gradB = engine.TensorMatMul(aT, maskedGrad);
-
-        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
-        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && BlasProvider.IsAvailable)
+        {
+            FusedLinearActivationBackwardCore(
+                (float[])(object)maskedGrad.GetDataArray(),
+                inputs[0]._shape[0], inputs[0]._shape[1], inputs[1]._shape[1],
+                inputs, grads, engine);
+            return;
+        }
+        FusedLinearActivationBackwardFallback(maskedGrad, inputs, grads, engine);
     }
 
-    /// <summary>
-    /// Fused backward for MatMul + Bias Add + GELU.
-    /// </summary>
     internal static void FusedMatMulAddGELUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
-
-        var bT = engine.TensorTranspose(inputs[1]);
-        var gradA = engine.TensorMatMul(maskedGrad, bT);
-
-        var aT = engine.TensorTranspose(inputs[0]);
-        var gradB = engine.TensorMatMul(aT, maskedGrad);
-
-        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
-        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && BlasProvider.IsAvailable)
+        {
+            FusedLinearActivationBackwardCore(
+                (float[])(object)maskedGrad.GetDataArray(),
+                inputs[0]._shape[0], inputs[0]._shape[1], inputs[1]._shape[1],
+                inputs, grads, engine);
+            return;
+        }
+        FusedLinearActivationBackwardFallback(maskedGrad, inputs, grads, engine);
     }
 
-    /// <summary>
-    /// Fused backward for MatMul + Bias Add + Swish/SiLU.
-    /// </summary>
     internal static void FusedMatMulAddSwishBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var preActivation = (Tensor<T>)savedState[0];
-        // Use engine's SwishBackward which computes grad * (sig(x) + x*sig(x)*(1-sig(x))) efficiently
         var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
-
-        var bT = engine.TensorTranspose(inputs[1]);
-        var gradA = engine.TensorMatMul(maskedGrad, bT);
-
-        var aT = engine.TensorTranspose(inputs[0]);
-        var gradB = engine.TensorMatMul(aT, maskedGrad);
-
-        var reduceAxes = Enumerable.Range(0, maskedGrad.Shape.Length - 1).ToArray();
-        var gradBias = engine.ReduceSum(maskedGrad, reduceAxes, keepDims: false);
-
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && BlasProvider.IsAvailable)
+        {
+            FusedLinearActivationBackwardCore(
+                (float[])(object)maskedGrad.GetDataArray(),
+                inputs[0]._shape[0], inputs[0]._shape[1], inputs[1]._shape[1],
+                inputs, grads, engine);
+            return;
+        }
+        FusedLinearActivationBackwardFallback(maskedGrad, inputs, grads, engine);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -3126,46 +3187,98 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Apply activation derivative to gradOutput before linear backward.
-        // savedState[0] = FusedActivationType, output = post-activation values
+        // savedState[0] = FusedActivationType.
+        // We need the pre-activation (linear output) for correct GELU/Swish derivatives.
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];
-            gradOutput = ApplyActivationDerivative(gradOutput, output, activation, engine);
+            // Re-compute pre-activation: linear = input @ weights + bias
+            var preActivation = engine.TensorMatMul(inputs[0], inputs[1]);
+            if (inputs.Length > 2)
+                preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
+            gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine);
         }
 
         FusedLinearBackwardCore(gradOutput, inputs, output, savedState, engine, grads);
     }
 
     private static Tensor<T> ApplyActivationDerivative(
-        Tensor<T> gradOutput, Tensor<T> output, FusedActivationType activation, IEngine engine)
+        Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, IEngine engine)
     {
         if (activation == FusedActivationType.None) return gradOutput;
 
         // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
         // This is OCP-compliant: new activations register themselves, no switch needed here
         if (engine is CpuEngine cpuEngine)
-            return cpuEngine.ApplyFusedActivationBackward(gradOutput, output, activation);
+            return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation);
 
         // Fallback for non-CPU engines
         return gradOutput;
     }
 
-    private static void FusedLinearBackwardCore(
+    private static unsafe void FusedLinearBackwardCore(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // FusedLinear = input @ weight + bias
-        // dL/dinput = gradOutput @ weight^T
+        // Fused BLAS path: transposed GEMM + inline bias sum — no transpose allocation
+        if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2
+            && BlasProvider.IsAvailable && gradOutput.IsContiguous)
+        {
+            int M = inputs[0]._shape[0]; // batch
+            int K = inputs[0]._shape[1]; // in_features
+            int N = inputs[1]._shape[1]; // out_features
+
+            var gArr = (float[])(object)gradOutput.GetDataArray();
+            var inArr = (float[])(object)inputs[0].GetDataArray();
+            var wArr = (float[])(object)inputs[1].GetDataArray();
+
+            // Compute both GEMMs into fresh buffers before accumulating either,
+            // so a failure in the second doesn't leave partial accumulation.
+            var gradInputArr = new float[M * K];
+            var gradWeightArr = new float[K * N];
+
+            // dL/dinput = gradOutput @ weight^T
+            bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+            // dL/dweight = input^T @ gradOutput
+            bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
+
+            if (!okInput || !okWeight)
+                goto fusedFallback; // BLAS refused — use engine fallback for all
+
+            var inputGrad = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+            var weightGrad = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
+
+            // dL/dbias = sum(gradOutput, axis=0) — inline loop, no engine call
+            if (inputs.Length > 2)
+            {
+                var biasArr = new float[N];
+                fixed (float* pG = gArr, pB = biasArr)
+                {
+                    for (int row = 0; row < M; row++)
+                    {
+                        float* rowPtr = pG + row * N;
+                        for (int j = 0; j < N; j++)
+                            pB[j] += rowPtr[j];
+                    }
+                }
+                var biasGrad = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
+            }
+            return;
+        }
+
+        // Fallback: engine calls (non-float or non-2D, or BLAS refused)
+        fusedFallback:
         var weightT = engine.TensorTranspose(inputs[1]);
-        var inputGrad = engine.TensorMatMul(gradOutput, weightT);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+        var inputGradFb = engine.TensorMatMul(gradOutput, weightT);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFb, engine);
 
-        // dL/dweight = input^T @ gradOutput
         var inputT = engine.TensorTranspose(inputs[0]);
-        var weightGrad = engine.TensorMatMul(inputT, gradOutput);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
+        var weightGradFb = engine.TensorMatMul(inputT, gradOutput);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFb, engine);
 
-        // dL/dbias = sum(gradOutput, axis=0)
         if (inputs.Length > 2)
         {
             var biasGrad = engine.ReduceSum(gradOutput, new[] { 0 }, keepDims: false);

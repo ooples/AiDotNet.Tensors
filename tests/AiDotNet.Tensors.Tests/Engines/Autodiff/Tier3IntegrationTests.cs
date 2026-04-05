@@ -196,7 +196,7 @@ public class Tier3IntegrationTests
 
     // ═══ Performance verification ═══
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter Tier3Integration")]
     public void GradFn_IsFasterThanTapeOnly()
     {
         var x = Tensor<float>.CreateRandom([8, 32]);

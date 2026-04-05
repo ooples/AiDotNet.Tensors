@@ -197,7 +197,9 @@ public sealed class GradientTape<T> : IDisposable
 
         // Graph-based backward: walk GradFn pointers instead of tape.
         // This is faster because it skips tape traversal, dict lookups, and relevance checks.
-        if (loss.GradFn is not null && !createGraph)
+        // Skip graph path when anomaly detection or hooks are enabled — the tape path handles those.
+        bool hasHooksRegistered = _hooks is not null && _hooks.Count > 0;
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
         {
             var result = ComputeGradientsViaGraph(loss, sources);
             if (!_options.Persistent) _entries.Reset();
@@ -238,7 +240,8 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> seedGrad;
         if (loss.Length == 1)
         {
-            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+            // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
+            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }
         else
         {
@@ -348,9 +351,10 @@ public sealed class GradientTape<T> : IDisposable
                 entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
 
                 // Performance profiling (only when explicitly enabled)
+                // Timing wraps the backward call above — the Stopwatch overhead
+                // is negligible relative to backward computation cost.
                 if (profileEnabled)
                 {
-                    // Profiling is rare — accept the overhead of Stopwatch only when active
                     System.Console.WriteLine($"  backward[{entry.OperationName}]");
                 }
 

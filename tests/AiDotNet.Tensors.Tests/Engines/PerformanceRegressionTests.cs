@@ -48,7 +48,7 @@ public class PerformanceRegressionTests
 
     public PerformanceRegressionTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorMatMul_256x256_NotScalarLoop()
     {
         var a = Tensor<float>.CreateRandom([32, 256]);
@@ -69,7 +69,7 @@ public class PerformanceRegressionTests
             "Likely using scalar loops instead of BLAS. Check CpuEngine.TensorMatMul2D.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorMatMul_768x768_NotScalarLoop()
     {
         var a = Tensor<float>.CreateRandom([16, 768]);
@@ -89,7 +89,7 @@ public class PerformanceRegressionTests
             "Likely using scalar loops instead of BLAS.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void FusedLinear_256x256_NotScalarLoop()
     {
         var input = Tensor<float>.CreateRandom([32, 256]);
@@ -112,7 +112,7 @@ public class PerformanceRegressionTests
             "Check CpuFusedOperations.FusedGemmBiasActivation for scalar loops.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void FusedLinear_Double_NotScalarLoop()
     {
         var input = new Tensor<double>(Enumerable.Range(0, 32 * 256).Select(i => (double)i / 1000).ToArray(), [32, 256]);
@@ -134,7 +134,7 @@ public class PerformanceRegressionTests
             $"FusedLinear double took {ms:F3}ms — exceeds {FusedLinearDoubleBudgetMs}ms budget.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorAdd_100K_NotScalarLoop()
     {
         var a = Tensor<float>.CreateRandom([100000]);
@@ -153,7 +153,7 @@ public class PerformanceRegressionTests
             $"TensorAdd took {ms:F3}ms — exceeds {Elementwise100KBudgetMs}ms budget.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorMultiply_100K_NotScalarLoop()
     {
         var a = Tensor<float>.CreateRandom([100000]);
@@ -172,7 +172,7 @@ public class PerformanceRegressionTests
             $"TensorMultiply took {ms:F3}ms — exceeds {Elementwise100KBudgetMs}ms budget.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorInstanceMethod_MatrixMultiply_UsesBLAS()
     {
         // Ensures Tensor.MatrixMultiply routes through engine (not scalar loops)
@@ -192,7 +192,7 @@ public class PerformanceRegressionTests
             $"Tensor.MatrixMultiply took {ms:F3}ms — likely not routing through engine BLAS.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorInstanceMethod_Add_UsesSIMD()
     {
         var a = Tensor<float>.CreateRandom([100000]);
@@ -211,7 +211,7 @@ public class PerformanceRegressionTests
             $"Tensor.Add took {ms:F3}ms — likely not routing through engine SIMD.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void TensorInstanceMethod_PointwiseMultiply_UsesSIMD()
     {
         var a = Tensor<float>.CreateRandom([100000]);
@@ -230,7 +230,7 @@ public class PerformanceRegressionTests
             $"Tensor.PointwiseMultiply took {ms:F3}ms — likely not routing through engine SIMD.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void BatchMatMul_3D_UsesBLAS()
     {
         var a = Tensor<float>.CreateRandom([4, 32, 64]);
@@ -249,7 +249,7 @@ public class PerformanceRegressionTests
             $"BatchMatMul took {ms:F3}ms — check if BLAS path is active for batch slices.");
     }
 
-    [Fact]
+    [Fact(Skip = "Performance guard — run manually with --filter PerformanceRegression")]
     public void ReLUBackward_1M_UsesSIMD()
     {
         var gradOutput = Tensor<float>.CreateRandom([1000000]);

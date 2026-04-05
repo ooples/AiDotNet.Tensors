@@ -231,6 +231,13 @@ class Program
             return;
         }
 
+        // Run autograd + compiled plan vs PyTorch comparison
+        if (args[0] == "--vs-autograd")
+        {
+            BenchmarkRunner.Run<AutogradComparisonBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
@@ -313,6 +320,7 @@ class Program
         Console.WriteLine();
         Console.WriteLine("Competitive Benchmarks vs Other Libraries:");
         Console.WriteLine("  --vs-torchsharp-gpu : AiDotNet GPU vs TorchSharp CUDA");
+        Console.WriteLine("  --vs-autograd       : AiDotNet autograd + compiled plan vs PyTorch");
         Console.WriteLine("  --vs-torchsharp-cpu : AiDotNet CPU vs TorchSharp CPU");
         Console.WriteLine("  --vs-tensorflow-gpu : AiDotNet GPU vs TensorFlow.NET GPU");
         Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");
