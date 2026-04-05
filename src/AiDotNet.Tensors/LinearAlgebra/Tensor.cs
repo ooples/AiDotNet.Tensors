@@ -1,3 +1,5 @@
+﻿using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
@@ -818,19 +820,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseSubtract(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
-
-        // SIMD fast path: both operands contiguous
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        // View-safe path: materialize both operands first
-        return Contiguous().ElementwiseSubtract(other.Contiguous());
+        return AiDotNetEngine.Current.TensorSubtract(this, other);
     }
 
     /// <summary>
@@ -1242,18 +1232,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Subtract(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for subtraction.");
-
-        // View-safe: use AsSpan() which handles offset, or materialize non-contiguous views
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        return Contiguous().Subtract(other.Contiguous());
+        return AiDotNetEngine.Current.TensorSubtract(this, other);
     }
 
     /// <summary>
@@ -1773,17 +1752,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> PointwiseMultiply(Tensor<T> other)
     {
+        // Route through engine for SIMD performance + gradient tape recording
+        return AiDotNetEngine.Current.TensorMultiply(this, other);
+    }
+
+    // Legacy broadcast path kept for engine's internal use
+    private Tensor<T> PointwiseMultiplyLegacy(Tensor<T> other)
+    {
         if (ShapeEquals(this._shape, other._shape))
         {
-            // SIMD fast path: both contiguous
             if (IsContiguous && other.IsContiguous)
             {
                 var result = TensorAllocator.Rent<T>(this._shape);
                 _numOps.Multiply(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
                 return result;
             }
-            // View-safe: materialize first
-            return Contiguous().PointwiseMultiply(other.Contiguous());
+            return Contiguous().PointwiseMultiplyLegacy(other.Contiguous());
         }
         else
         {
@@ -1870,27 +1854,26 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MatrixMultiply(Tensor<T> other)
     {
-        if (this.Rank < 2 || other.Rank < 2)
-        {
-            throw new ArgumentException("MatMul requires tensors with at least 2 dimensions.");
-        }
+        // Route through engine for BLAS performance + gradient tape recording.
+        // Engine.TensorMatMul handles all rank combinations and records on tape.
+        return AiDotNetEngine.Current.TensorMatMul(this, other);
+    }
 
-        // Get matrix dimensions (last 2 dims)
-        int M = this._shape[^2];
+    /// <summary>
+    /// Legacy batched matrix multiply — kept as internal fallback.
+    /// </summary>
+    private Tensor<T> MatrixMultiplyInternal(Tensor<T> other)
+    {
+        if (this.Rank < 2 || other.Rank < 2)
+            throw new ArgumentException("MatMul requires tensors with at least 2 dimensions.");
+
         int K1 = this._shape[^1];
         int K2 = other._shape[^2];
-        int N = other._shape[^1];
-
         if (K1 != K2)
-        {
             throw new ArgumentException($"Incompatible matrix dimensions for multiplication: {K1} vs {K2}.");
-        }
 
-        // Handle simple 2D case
         if (this.Rank == 2 && other.Rank == 2)
-        {
             return this.Multiply(other);
-        }
 
         // Handle batched matrix multiplication
         return BatchedMatrixMultiply(other);
@@ -2618,12 +2601,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseMultiply(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same dimensions for element-wise multiplication.");
-
-        // Use the Vector's ElementwiseMultiply method to perform the operation
-        var resultData = _data.ElementwiseMultiply(other._data);
-        return new Tensor<T>(_shape, resultData);
+        return AiDotNetEngine.Current.TensorMultiply(this, other);
     }
 
     /// <summary>
@@ -2982,17 +2960,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for addition.");
-
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Add(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        return Contiguous().Add(other.Contiguous());
+        return AiDotNetEngine.Current.TensorAdd(this, other);
     }
 
     /// <summary>
@@ -3034,6 +3002,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
+        // Route through engine for tape recording when called directly (not from engine)
         // Check if shapes are already identical - use fast path
         if (ShapeEquals(_shape, other._shape))
         {
