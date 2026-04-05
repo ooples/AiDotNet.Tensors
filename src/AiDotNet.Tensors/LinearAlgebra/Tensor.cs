@@ -1,3 +1,4 @@
+﻿using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
@@ -28,6 +29,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// lazily allocated and reused across training steps to avoid per-step allocation.
     /// </summary>
     internal Tensor<T>? Grad;
+
+    /// <summary>
+    /// Computation graph node — stores the backward function and input references.
+    /// Set by DifferentiableOps.Record* when a tape is active. Backward traversal
+    /// walks GradFn pointers for O(1) gradient lookup (PyTorch architecture).
+    /// Null for leaf tensors (inputs, constants) or when no tape is active.
+    /// </summary>
+    internal Engines.Autodiff.GradNode<T>? GradFn;
 
     /// <summary>
     /// If this tensor was created from a pooled array, holds a reference to it for return.
@@ -818,19 +827,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseSubtract(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for elementwise subtraction.");
-
-        // SIMD fast path: both operands contiguous
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        // View-safe path: materialize both operands first
-        return Contiguous().ElementwiseSubtract(other.Contiguous());
+        return AiDotNetEngine.Current.TensorSubtract(this, other);
     }
 
     /// <summary>
@@ -1242,18 +1239,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Subtract(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for subtraction.");
-
-        // View-safe: use AsSpan() which handles offset, or materialize non-contiguous views
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Subtract(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        return Contiguous().Subtract(other.Contiguous());
+        return AiDotNetEngine.Current.TensorSubtract(this, other);
     }
 
     /// <summary>
@@ -1492,7 +1478,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(T scalar)
     {
-        return new Tensor<T>(_shape, _data.Multiply(scalar));
+        return AiDotNetEngine.Current.TensorMultiplyScalar(this, scalar);
     }
 
     /// <summary>
@@ -1532,9 +1518,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Divide(T scalar)
     {
-        var result = TensorAllocator.Rent<T>(_shape);
-        _numOps.DivideScalar(_data.AsSpan(), scalar, result._data.AsWritableSpan());
-        return result;
+        return AiDotNetEngine.Current.TensorDivideScalar(this, scalar);
     }
 
     /// <summary>
@@ -1773,17 +1757,22 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> PointwiseMultiply(Tensor<T> other)
     {
+        // Route through engine for SIMD performance + gradient tape recording
+        return AiDotNetEngine.Current.TensorMultiply(this, other);
+    }
+
+    // Legacy broadcast path kept for engine's internal use
+    private Tensor<T> PointwiseMultiplyLegacy(Tensor<T> other)
+    {
         if (ShapeEquals(this._shape, other._shape))
         {
-            // SIMD fast path: both contiguous
             if (IsContiguous && other.IsContiguous)
             {
                 var result = TensorAllocator.Rent<T>(this._shape);
                 _numOps.Multiply(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
                 return result;
             }
-            // View-safe: materialize first
-            return Contiguous().PointwiseMultiply(other.Contiguous());
+            return Contiguous().PointwiseMultiplyLegacy(other.Contiguous());
         }
         else
         {
@@ -1870,27 +1859,26 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MatrixMultiply(Tensor<T> other)
     {
-        if (this.Rank < 2 || other.Rank < 2)
-        {
-            throw new ArgumentException("MatMul requires tensors with at least 2 dimensions.");
-        }
+        // Route through engine for BLAS performance + gradient tape recording.
+        // Engine.TensorMatMul handles all rank combinations and records on tape.
+        return AiDotNetEngine.Current.TensorMatMul(this, other);
+    }
 
-        // Get matrix dimensions (last 2 dims)
-        int M = this._shape[^2];
+    /// <summary>
+    /// Legacy batched matrix multiply — kept as internal fallback.
+    /// </summary>
+    private Tensor<T> MatrixMultiplyInternal(Tensor<T> other)
+    {
+        if (this.Rank < 2 || other.Rank < 2)
+            throw new ArgumentException("MatMul requires tensors with at least 2 dimensions.");
+
         int K1 = this._shape[^1];
         int K2 = other._shape[^2];
-        int N = other._shape[^1];
-
         if (K1 != K2)
-        {
             throw new ArgumentException($"Incompatible matrix dimensions for multiplication: {K1} vs {K2}.");
-        }
 
-        // Handle simple 2D case
         if (this.Rank == 2 && other.Rank == 2)
-        {
             return this.Multiply(other);
-        }
 
         // Handle batched matrix multiplication
         return BatchedMatrixMultiply(other);
@@ -2618,12 +2606,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> ElementwiseMultiply(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same dimensions for element-wise multiplication.");
-
-        // Use the Vector's ElementwiseMultiply method to perform the operation
-        var resultData = _data.ElementwiseMultiply(other._data);
-        return new Tensor<T>(_shape, resultData);
+        return AiDotNetEngine.Current.TensorMultiply(this, other);
     }
 
     /// <summary>
@@ -2982,17 +2965,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Tensor<T> other)
     {
-        if (!ShapeEquals(_shape, other._shape))
-            throw new ArgumentException("Tensors must have the same shape for addition.");
-
-        if (IsContiguous && other.IsContiguous)
-        {
-            var result = TensorAllocator.Rent<T>(_shape);
-            _numOps.Add(AsSpan(), other.AsSpan(), result._data.AsWritableSpan());
-            return result;
-        }
-
-        return Contiguous().Add(other.Contiguous());
+        return AiDotNetEngine.Current.TensorAdd(this, other);
     }
 
     /// <summary>
@@ -3034,6 +3007,7 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastAdd(Tensor<T> other)
     {
+        // Route through engine for tape recording when called directly (not from engine)
         // Check if shapes are already identical - use fast path
         if (ShapeEquals(_shape, other._shape))
         {
@@ -3363,226 +3337,11 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(Tensor<T> other)
     {
-        // Support 2D matrix multiplication and 3D batch matrix multiplication
-        if (_shape.Length == 2 && other._shape.Length == 2)
-        {
-            // Standard 2D matrix multiplication
-            if (Shape[1] != other._shape[0])
-            {
-                throw new ArgumentException("The number of columns in the first tensor must equal the number of rows in the second tensor.");
-            }
-
-            int resultRows = Shape[0];
-            int resultCols = other._shape[1];
-            int commonDim = Shape[1];
-
-            var result = new Tensor<T>(new[] { resultRows, resultCols });
-
-            for (int i = 0; i < resultRows; i++)
-            {
-                for (int j = 0; j < resultCols; j++)
-                {
-                    T sum = _numOps.Zero;
-                    for (int k = 0; k < commonDim; k++)
-                    {
-                        sum = _numOps.Add(sum, _numOps.Multiply(this[i, k], other[k, j]));
-                    }
-                    result[i, j] = sum;
-                }
-            }
-
-            return result;
-        }
-        else if (_shape.Length == 3 && other._shape.Length == 3)
-        {
-            // 3D batch matrix multiplication: (batch, m, k) @ (batch, k, n) -> (batch, m, n)
-            if (Shape[0] != other._shape[0])
-            {
-                throw new ArgumentException("Batch dimensions must match for batch matrix multiplication.");
-            }
-
-            if (Shape[2] != other._shape[1])
-            {
-                throw new ArgumentException("The number of columns in the first tensor must equal the number of rows in the second tensor for each batch.");
-            }
-
-            int batchSize = Shape[0];
-            int resultRows = Shape[1];
-            int resultCols = other._shape[2];
-            int commonDim = Shape[2];
-
-            var result = new Tensor<T>(new[] { batchSize, resultRows, resultCols });
-
-            for (int b = 0; b < batchSize; b++)
-            {
-                for (int i = 0; i < resultRows; i++)
-                {
-                    for (int j = 0; j < resultCols; j++)
-                    {
-                        T sum = _numOps.Zero;
-                        for (int k = 0; k < commonDim; k++)
-                        {
-                            sum = _numOps.Add(sum, _numOps.Multiply(this[b, i, k], other[b, k, j]));
-                        }
-                        result[b, i, j] = sum;
-                    }
-                }
-            }
-
-            return result;
-        }
-        else if (_shape.Length == 3 && other._shape.Length == 2)
-        {
-            // 3D @ 2D with broadcasting: (batch, m, k) @ (k, n) -> (batch, m, n)
-            // The 2D matrix is broadcast across the batch dimension
-            if (Shape[2] != other._shape[0])
-            {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: ({Shape[1]}, {Shape[2]}) @ ({other._shape[0]}, {other._shape[1]})");
-            }
-
-            int batchSize = Shape[0];
-            int resultRows = Shape[1];
-            int resultCols = other._shape[1];
-            int commonDim = Shape[2];
-
-            var result = new Tensor<T>(new[] { batchSize, resultRows, resultCols });
-
-            for (int b = 0; b < batchSize; b++)
-            {
-                for (int i = 0; i < resultRows; i++)
-                {
-                    for (int j = 0; j < resultCols; j++)
-                    {
-                        T sum = _numOps.Zero;
-                        for (int k = 0; k < commonDim; k++)
-                        {
-                            sum = _numOps.Add(sum, _numOps.Multiply(this[b, i, k], other[k, j]));
-                        }
-                        result[b, i, j] = sum;
-                    }
-                }
-            }
-
-            return result;
-        }
-        else if (_shape.Length == 4 && other._shape.Length == 4)
-        {
-            // 4D batch-head matrix multiplication for multi-head attention:
-            // (batch, heads, m, k) @ (batch, heads, k, n) -> (batch, heads, m, n)
-            if (Shape[0] != other._shape[0])
-            {
-                throw new ArgumentException($"Batch dimensions must match: {Shape[0]} vs {other._shape[0]}");
-            }
-
-            if (Shape[1] != other._shape[1])
-            {
-                throw new ArgumentException($"Head dimensions must match: {Shape[1]} vs {other._shape[1]}");
-            }
-
-            if (Shape[3] != other._shape[2])
-            {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dims {Shape[3]} vs {other._shape[2]}");
-            }
-
-            int batchSize = Shape[0];
-            int numHeads = Shape[1];
-            int resultRows = Shape[2];
-            int resultCols = other._shape[3];
-            int commonDim = Shape[3];
-
-            var result = new Tensor<T>(new[] { batchSize, numHeads, resultRows, resultCols });
-
-            for (int b = 0; b < batchSize; b++)
-            {
-                for (int h = 0; h < numHeads; h++)
-                {
-                    for (int i = 0; i < resultRows; i++)
-                    {
-                        for (int j = 0; j < resultCols; j++)
-                        {
-                            T sum = _numOps.Zero;
-                            for (int k = 0; k < commonDim; k++)
-                            {
-                                sum = _numOps.Add(sum, _numOps.Multiply(this[b, h, i, k], other[b, h, k, j]));
-                            }
-                            result[b, h, i, j] = sum;
-                        }
-                    }
-                }
-            }
-
-            return result;
-        }
-        else if (_shape.Length == 4 && other._shape.Length == 2)
-        {
-            // 4D @ 2D with broadcasting: (batch, heads, m, k) @ (k, n) -> (batch, heads, m, n)
-            // The 2D matrix is broadcast across batch and head dimensions
-            if (Shape[3] != other._shape[0])
-            {
-                throw new ArgumentException($"Matrix dimensions don't match for multiplication: inner dim {Shape[3]} vs {other._shape[0]}");
-            }
-
-            int batchSize = Shape[0];
-            int numHeads = Shape[1];
-            int resultRows = Shape[2];
-            int resultCols = other._shape[1];
-            int commonDim = Shape[3];
-
-            var result = new Tensor<T>(new[] { batchSize, numHeads, resultRows, resultCols });
-
-            for (int b = 0; b < batchSize; b++)
-            {
-                for (int h = 0; h < numHeads; h++)
-                {
-                    for (int i = 0; i < resultRows; i++)
-                    {
-                        for (int j = 0; j < resultCols; j++)
-                        {
-                            T sum = _numOps.Zero;
-                            for (int k = 0; k < commonDim; k++)
-                            {
-                                sum = _numOps.Add(sum, _numOps.Multiply(this[b, h, i, k], other[k, j]));
-                            }
-                            result[b, h, i, j] = sum;
-                        }
-                    }
-                }
-            }
-
-            return result;
-        }
-        else
-        {
-            throw new NotSupportedException($"Multiplication is not supported for tensors with shapes {string.Join("x", Shape)} and {string.Join("x", other._shape)}. Supported: 2D×2D, 3D×3D, 3D×2D, 4D×4D, 4D×2D.");
-        }
+        // Route through engine for BLAS performance + gradient tape recording
+        return AiDotNetEngine.Current.TensorMatMul(this, other);
     }
 
-    /// <summary>
-    /// Transposes the tensor.
-    /// </summary>
-    /// <returns>A new tensor that is the transpose of this tensor.</returns>
-    /// <remarks>
-    /// <para><b>For Beginners:</b> Transposing a tensor means swapping its dimensions.
-    ///
-    /// For different tensor ranks:
-    /// - 1D tensors: Returns a copy (transpose has no effect on vectors)
-    /// - 2D tensors: Swaps rows and columns (standard matrix transpose)
-    /// - N-D tensors: Reverses all dimensions (e.g., shape [2,3,4] becomes [4,3,2])
-    ///
-    /// For example, if you have a 2x3 matrix:
-    /// ```
-    /// A = [[1, 2, 3],
-    ///      [4, 5, 6]]
-    /// ```
-    /// 
-    /// Then A.Transpose() would result in a 3x2 matrix:
-    /// ```
-    /// [[1, 4],
-    ///  [2, 5],
-    ///  [3, 6]]
-    /// ```
-    /// </para>
-    /// </remarks>
+
     public virtual Tensor<T> Transpose()
     {
         ThrowIfSparse();
@@ -3901,6 +3660,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> SumOverAxis(int axis)
     {
+        // Route through engine for SIMD + tape recording
+        return AiDotNetEngine.Current.ReduceSum(this, new[] { axis }, keepDims: false);
+    }
+
+    /// <summary>Legacy SumOverAxis implementation for internal use.</summary>
+    internal Tensor<T> SumOverAxisDirect(int axis)
+    {
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
 
@@ -3966,6 +3732,13 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>The resulting tensor has one fewer dimension than the original tensor.</para>
     /// </remarks>
     public Tensor<T> MeanOverAxis(int axis)
+    {
+        // Route through engine for SIMD + tape recording
+        return AiDotNetEngine.Current.ReduceMean(this, new[] { axis }, keepDims: false);
+    }
+
+    /// <summary>Legacy MeanOverAxis for internal use.</summary>
+    internal Tensor<T> MeanOverAxisDirect(int axis)
     {
         ThrowIfSparse();
         if (axis < 0 || axis >= Rank)

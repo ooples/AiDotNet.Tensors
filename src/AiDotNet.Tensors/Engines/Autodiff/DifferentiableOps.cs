@@ -16,6 +16,18 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 internal static class DifferentiableOps
 {
+    // Indexed gradient array: set by ComputeGradients before backward walk,
+    // read by AccumulateGrad for O(1) access instead of dictionary hash lookup.
+    // ThreadStatic because backward is single-threaded per tape.
+    [ThreadStatic]
+    internal static object?[]? _indexedGrads;
+
+    /// <summary>Sets the indexed gradient array for the current backward pass.</summary>
+    internal static void SetIndexedGrads(object?[] grads) => _indexedGrads = grads;
+
+    /// <summary>Clears the indexed gradient array after backward completes.</summary>
+    internal static void ClearIndexedGrads() => _indexedGrads = null;
+
     /// <summary>
     /// Returns true if a gradient tape is active and not suppressed.
     /// Use this to guard savedState allocation: only create new object[]
@@ -71,6 +83,15 @@ internal static class DifferentiableOps
             slot.InputCount = 0xFF;
             slot.Input0 = inputs[0];
         }
+
+        // Set GradFn for graph-based backward
+        output.GradFn = inputs.Length switch
+        {
+            1 => new GradNode<T>(backward, output, inputs[0], savedState: savedState),
+            2 => new GradNode<T>(backward, output, inputs[0], inputs[1], savedState: savedState, inputCount: 2),
+            3 => new GradNode<T>(backward, output, inputs[0], inputs[1], inputs[2], savedState: savedState, inputCount: 3),
+            _ => new GradNode<T>(backward, output, inputs[0], inputsOverflow: inputs, inputCount: 0xFF, savedState: savedState)
+        };
     }
 
     /// <summary>
@@ -96,6 +117,9 @@ internal static class DifferentiableOps
         slot.Input0 = input;
         slot.InputCount = 1;
         slot.Version0 = input.Version;
+
+        // Set GradFn on output for O(1) graph-based backward traversal
+        output.GradFn = new GradNode<T>(backward, output, input, savedState: savedState);
     }
 
     /// <summary>
@@ -124,6 +148,8 @@ internal static class DifferentiableOps
         slot.InputCount = 2;
         slot.Version0 = a.Version;
         slot.Version1 = b.Version;
+
+        output.GradFn = new GradNode<T>(backward, output, a, b, savedState: savedState, inputCount: 2);
     }
 
     /// <summary>
@@ -141,17 +167,35 @@ internal static class DifferentiableOps
         Tensor<T> grad,
         IEngine engine)
     {
-        if (grads.TryGetValue(tensor, out var existing))
+        // Fast path: use indexed array when grad indices are assigned (avoids hash lookup)
+        int idx = tensor._gradIndex;
+        if (idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length)
         {
-            engine.TensorAddInPlace(existing, grad);
+            var existing = (Tensor<T>?)_indexedGrads[idx];
+            if (existing != null)
+            {
+                engine.TensorAddInPlace(existing, grad);
+                tensor.Grad = existing;
+            }
+            else
+            {
+                _indexedGrads[idx] = grad;
+                tensor.Grad = grad;
+            }
+            grads[tensor] = tensor.Grad!;
+            return;
+        }
+
+        // Fallback: dictionary path (for ops outside tape or during non-indexed backward)
+        if (grads.TryGetValue(tensor, out var existingDict))
+        {
+            engine.TensorAddInPlace(existingDict, grad);
+            tensor.Grad = existingDict;
         }
         else
         {
             grads[tensor] = grad;
+            tensor.Grad = grad;
         }
-
-        // Also write into tensor.Grad for zero-alloc access in training loops.
-        // On first backward this lazily allocates; subsequent steps reuse the same buffer.
-        tensor.Grad = grads[tensor];
     }
 }

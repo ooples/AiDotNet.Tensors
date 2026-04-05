@@ -59,6 +59,13 @@ public abstract class TensorBase<T> : IDisposable
     internal TensorDevice _device = TensorDevice.CPU;
 
     /// <summary>
+    /// Index into the flat gradient array during backward pass. Assigned by the tape
+    /// during recording, used by ComputeGradients for O(1) gradient lookup instead of
+    /// O(1)-amortized dictionary hash. -1 means not assigned.
+    /// </summary>
+    internal int _gradIndex = -1;
+
+    /// <summary>
     /// Optional GPU buffer reference for GPU-resident tensors.
     /// When non-null, this tensor's authoritative data is on the GPU — the CPU-side
     /// _data array may be empty/stale until explicitly synchronized.

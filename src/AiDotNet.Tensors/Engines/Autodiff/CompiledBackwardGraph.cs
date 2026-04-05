@@ -1,4 +1,4 @@
-using AiDotNet.Tensors.Helpers;
+﻿using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -87,25 +87,73 @@ public sealed class CompiledBackwardGraph<T>
     public Dictionary<Tensor<T>, Tensor<T>> Execute()
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var grads = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-        var onesData = new T[_loss.Length];
-        for (int j = 0; j < onesData.Length; j++)
-            onesData[j] = numOps.One;
-        grads[_loss] = new Tensor<T>(onesData, _loss.Shape.ToArray());
-
-        // Execute only reachable entries (dead node elimination applied)
+        // Assign grad indices for O(1) lookup (same as GradientTape.ComputeGradients)
+        int gradIndexCount = 0;
         foreach (int i in _reachableEntryIndices)
         {
-            ref var entry = ref _entries[i];
+            ref var e = ref _entries[i];
+            if (e.Output._gradIndex < 0) e.Output._gradIndex = gradIndexCount++;
+            if (e.Input0 != null && e.Input0._gradIndex < 0) e.Input0._gradIndex = gradIndexCount++;
+            if (e.InputCount >= 2 && e.Input1 != null && e.Input1._gradIndex < 0) e.Input1._gradIndex = gradIndexCount++;
+            if (e.InputCount >= 3 && e.Input2 != null && e.Input2._gradIndex < 0) e.Input2._gradIndex = gradIndexCount++;
+            if (e.InputsOverflow != null)
+                foreach (var inp in e.InputsOverflow)
+                    if (inp._gradIndex < 0) inp._gradIndex = gradIndexCount++;
+        }
 
-            if (!grads.TryGetValue(entry.Output, out var gradOutput))
-                continue;
+        var indexedGrads = new object?[gradIndexCount];
+        DifferentiableOps.SetIndexedGrads(indexedGrads);
 
-            entry.ValidateInputVersions(); // same mutation safety check as uncompiled path
-            var inputsArray = entry.GetInputsArray();
-            entry.Backward(gradOutput, inputsArray, entry.Output,
-                entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+        var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+            Math.Min(gradIndexCount + 1, 1024),
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+        // Seed gradient
+        Tensor<T> seedGrad;
+        if (_loss.Length == 1)
+        {
+            seedGrad = new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+        }
+        else
+        {
+            var onesData = new T[_loss.Length];
+            var one = numOps.One;
+            for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
+            seedGrad = new Tensor<T>(onesData, _loss._shape);
+        }
+        grads[_loss] = seedGrad;
+        if (_loss._gradIndex >= 0) indexedGrads[_loss._gradIndex] = seedGrad;
+
+        try
+        {
+            // Execute only reachable entries (dead node elimination applied)
+            foreach (int i in _reachableEntryIndices)
+            {
+                ref var entry = ref _entries[i];
+
+                if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                    continue;
+
+                entry.ValidateInputVersions();
+                var inputsArray = entry.GetInputsArray();
+                entry.Backward(gradOutput, inputsArray, entry.Output,
+                    entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+            }
+        }
+        finally
+        {
+            DifferentiableOps.ClearIndexedGrads();
+            foreach (int i in _reachableEntryIndices)
+            {
+                ref var e = ref _entries[i];
+                e.Output._gradIndex = -1;
+                if (e.Input0 != null) e.Input0._gradIndex = -1;
+                if (e.InputCount >= 2 && e.Input1 != null) e.Input1._gradIndex = -1;
+                if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
+                if (e.InputsOverflow != null)
+                    foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+            }
         }
 
         if (_sources is not null)

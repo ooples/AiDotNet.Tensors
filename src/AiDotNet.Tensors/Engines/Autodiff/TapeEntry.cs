@@ -39,7 +39,13 @@ public delegate void BackwardFunction<T>(
 /// </remarks>
 public struct TapeEntry<T>
 {
-    // ── Inline input slots (zero-alloc for 1-3 inputs) ──────────────────
+    // ═══ HOT FIELDS (accessed every backward step — keep together for L1 cache) ═══
+
+    /// <summary>The output tensor produced by this operation.</summary>
+    public Tensor<T> Output;
+
+    /// <summary>The backward function delegate.</summary>
+    public BackwardFunction<T> Backward;
 
     /// <summary>First input tensor (always present).</summary>
     public Tensor<T> Input0;
@@ -53,19 +59,13 @@ public struct TapeEntry<T>
     /// <summary>Number of inputs: 1, 2, 3, or 0xFF if using <see cref="InputsOverflow"/>.</summary>
     public byte InputCount;
 
-    /// <summary>
-    /// Overflow array for ops with 4+ inputs (e.g., TensorAddMany, Concat, Stack).
-    /// Null for 1-3 input ops. When set, <see cref="InputCount"/> is 0xFF.
-    /// The caller passes the array — DifferentiableOps does not allocate it.
-    /// </summary>
-    public Tensor<T>[]? InputsOverflow;
+    // ═══ COLD FIELDS (accessed rarely — validation, profiling, overflow) ═══
 
-    /// <summary>
-    /// Version counters for overflow inputs. Snapshotted at recording time.
-    /// </summary>
-    public int[]? InputVersionsOverflow;
+    /// <summary>Optional extra state saved during the forward pass (e.g., dropout mask, max indices).</summary>
+    public object[]? SavedState;
 
-    // ── Inline version counters (zero-alloc) ────────────────────────────
+    /// <summary>Name of the operation (for debugging and profiling).</summary>
+    public string OperationName;
 
     /// <summary>Version counter of Input0 at recording time.</summary>
     public int Version0;
@@ -76,19 +76,15 @@ public struct TapeEntry<T>
     /// <summary>Version counter of Input2 at recording time.</summary>
     public int Version2;
 
-    // ── Core fields ─────────────────────────────────────────────────────
+    /// <summary>
+    /// Overflow array for ops with 4+ inputs (e.g., TensorAddMany, Concat, Stack).
+    /// </summary>
+    public Tensor<T>[]? InputsOverflow;
 
-    /// <summary>Name of the operation (for debugging and profiling).</summary>
-    public string OperationName;
-
-    /// <summary>The output tensor produced by this operation.</summary>
-    public Tensor<T> Output;
-
-    /// <summary>The backward function that computes input gradients given the output gradient.</summary>
-    public BackwardFunction<T> Backward;
-
-    /// <summary>Optional extra state saved during the forward pass (e.g., dropout mask, max indices).</summary>
-    public object[]? SavedState;
+    /// <summary>
+    /// Version counters for overflow inputs. Snapshotted at recording time.
+    /// </summary>
+    public int[]? InputVersionsOverflow;
 
     // ── Backward-path helpers (array construction is deferred) ──────────
 
