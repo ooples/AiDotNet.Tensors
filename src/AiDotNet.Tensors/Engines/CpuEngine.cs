@@ -19304,25 +19304,40 @@ public class CpuEngine : ITensorLevelEngine
                 var wArr = (float[])(object)weights.GetDataArray();
                 var outArr = (float[])(object)result.GetDataArray();
 
-                // Tier 1: Direct native BLAS — zero overhead (pinned pointers, no validation)
-                if (BlasProvider.HasNativeSgemm)
+                bool blasDone = false;
+#if NET5_0_OR_GREATER
+                // Tier 0: Raw function pointer — zero overhead calli (no delegate, no P/Invoke)
+                if (BlasProvider.HasRawSgemm)
                 {
                     unsafe
                     {
                         fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
                     }
+                    blasDone = true;
                 }
-                // Tier 2: MKL verified — call Blas.gemm directly with zero-offset spans
-                else if (BlasProvider.IsMklVerified)
+#endif
+                if (!blasDone)
                 {
-                    BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
-                }
-                // Tier 3: Any BLAS with validation
-                else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                {
-                    // Tier 4: SIMD tiled GEMM fallback
-                    Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                    // Tier 1: Native delegate dispatch
+                    if (BlasProvider.HasNativeSgemm)
+                    {
+                        unsafe
+                        {
+                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                        }
+                    }
+                    // Tier 2: MKL verified
+                    else if (BlasProvider.IsMklVerified)
+                    {
+                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    }
+                    // Tier 3: Any BLAS with validation
+                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                    {
+                        Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                    }
                 }
 
                 // Fused bias + activation in one pass
@@ -19343,19 +19358,33 @@ public class CpuEngine : ITensorLevelEngine
                 var wArr = (double[])(object)weights.GetDataArray();
                 var outArr = (double[])(object)result.GetDataArray();
 
-                if (BlasProvider.HasNativeDgemm)
+                bool dBlasDone = false;
+#if NET5_0_OR_GREATER
+                if (BlasProvider.HasRawDgemm)
+                {
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                    dBlasDone = true;
+                }
+#endif
+                if (!dBlasDone && BlasProvider.HasNativeDgemm)
                 {
                     unsafe
                     {
                         fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
                             BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
                     }
+                    dBlasDone = true;
                 }
-                else if (BlasProvider.IsMklVerified)
+                if (!dBlasDone && BlasProvider.IsMklVerified)
                 {
                     BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
+                    dBlasDone = true;
                 }
-                else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
                     CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
                         bias != null ? (double[])(object)bias.GetDataArray() : null,

@@ -22,6 +22,12 @@ internal static class BlasProvider
     private static IntPtr _libraryHandle;
     private static CblasSgemm? _sgemm;
     private static CblasDgemm? _dgemm;
+#if NET5_0_OR_GREATER
+    // Raw function pointers for zero-overhead native BLAS calls.
+    // These bypass delegate dispatch entirely — JIT emits a direct calli instruction.
+    private static IntPtr _sgemmPtr;
+    private static IntPtr _dgemmPtr;
+#endif
     private static BlasSetNumThreads? _setNumThreads;
     private static MklSetDynamic? _setDynamic;
     private static int? ThreadCountOverride = ReadEnvInt("AIDOTNET_BLAS_THREADS");
@@ -175,6 +181,37 @@ internal static class BlasProvider
     /// </summary>
     internal static bool HasNativeSgemm => _available && !_useMklNet && _sgemm != null;
     internal static bool HasNativeDgemm => _available && !_useMklNet && _dgemm != null;
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Returns true if raw function pointers are available for zero-overhead calli dispatch.
+    /// This is the absolute fastest path — no delegate, no P/Invoke, just a direct native call.
+    /// </summary>
+    internal static bool HasRawSgemm => _sgemmPtr != IntPtr.Zero;
+    internal static bool HasRawDgemm => _dgemmPtr != IntPtr.Zero;
+
+    /// <summary>
+    /// Zero-overhead SGEMM via raw function pointer. The JIT emits a direct calli instruction
+    /// to the native cblas_sgemm — no delegate allocation, no P/Invoke transition, no GC interaction.
+    /// Caller must pin all arrays before calling.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void SgemmRaw(int m, int n, int k, float* a, int lda, float* b, int ldb, float* c, int ldc)
+    {
+        ((delegate* unmanaged[Cdecl]<int, int, int, int, int, int, float, float*, int, float*, int, float, float*, int, void>)_sgemmPtr)(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+    }
+
+    /// <summary>
+    /// Zero-overhead DGEMM via raw function pointer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void DgemmRaw(int m, int n, int k, double* a, int lda, double* b, int ldb, double* c, int ldc)
+    {
+        ((delegate* unmanaged[Cdecl]<int, int, int, int, int, int, double, double*, int, double*, int, double, double*, int, void>)_dgemmPtr)(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, a, lda, b, ldb, 0.0, c, ldc);
+    }
+#endif
 
     /// <summary>
     /// Returns true if MKL.NET is available for direct span calls.
@@ -761,6 +798,14 @@ internal static class BlasProvider
     {
         _sgemm = TryLoadSymbol<CblasSgemm>("cblas_sgemm");
         _dgemm = TryLoadSymbol<CblasDgemm>("cblas_dgemm");
+#if NET5_0_OR_GREATER
+        // Also cache raw function pointers for zero-overhead calli dispatch
+        if (_libraryHandle != IntPtr.Zero)
+        {
+            TryGetNativeExport(_libraryHandle, "cblas_sgemm", out _sgemmPtr);
+            TryGetNativeExport(_libraryHandle, "cblas_dgemm", out _dgemmPtr);
+        }
+#endif
         Trace($"[BLAS] cblas_sgemm loaded: {_sgemm != null}");
         Trace($"[BLAS] cblas_dgemm loaded: {_dgemm != null}");
         TryLoadThreadControls();
