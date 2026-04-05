@@ -1894,6 +1894,20 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (newShape == null) throw new ArgumentNullException(nameof(newShape));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor;
+                var capturedShape = newShape;
+                var origShape = tensor.Shape.ToArray();
+                return scope.RecordUnary(LazyNodeType.Reshape, "Reshape", tensor, newShape,
+                    (eng, output) => { captured.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ReshapeBackward, new object[] { origShape });
+            }
+        }
+
         var originalShape = tensor.Shape.ToArray();
         var result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
