@@ -28,6 +28,11 @@ internal sealed class CompiledTrainingPlan<T>
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
 
+    // Cached raw arrays for zero-overhead Step() — avoid AsSpan()/GetDataArray() per call
+    private T[][]? _cachedGradArrays;
+    private T[]? _cachedLossGradSeedArray;
+    private T[]? _cachedLossGradDestArray;
+
     private CompiledTrainingPlan(
         Action<IEngine>[] forwardActions,
         Action<IEngine>[] backwardActions,
@@ -57,19 +62,34 @@ internal sealed class CompiledTrainingPlan<T>
     {
         var engine = _engine;
 
-        // Forward: straight-line delegate calls
+        // Forward: straight-line delegate calls (specialized: direct BLAS, no engine dispatch)
         var fwd = _forwardActions;
         for (int i = 0; i < fwd.Length; i++)
             fwd[i](engine);
 
-        // Zero all gradient buffers
-        for (int i = 0; i < _preAllocatedGrads.Length; i++)
-            _preAllocatedGrads[i].AsWritableSpan().Clear();
+        // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
+        var gradArrays = _cachedGradArrays;
+        if (gradArrays == null)
+        {
+            gradArrays = new T[_preAllocatedGrads.Length][];
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                gradArrays[i] = _preAllocatedGrads[i].GetDataArray();
+            _cachedGradArrays = gradArrays;
+            _cachedLossGradSeedArray = _lossGradSeed.GetDataArray();
+            _cachedLossGradDestArray = _preAllocatedGrads[_preAllocatedGrads.Length - 1].GetDataArray();
+        }
 
-        // Re-seed loss gradient
-        _lossGradSeed.AsSpan().CopyTo(_preAllocatedGrads[_preAllocatedGrads.Length - 1].AsWritableSpan());
+        // Zero all gradient buffers — direct Array.Clear on exact tensor length
+        for (int i = 0; i < gradArrays.Length; i++)
+            Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
 
-        // Backward: specialized delegates that write directly into pre-allocated buffers
+        // Re-seed loss gradient — direct Array.Copy
+        var seedArr = _cachedLossGradSeedArray;
+        var destArr = _cachedLossGradDestArray;
+        if (seedArr != null && destArr != null)
+            Array.Copy(seedArr, destArr, seedArr.Length);
+
+        // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         var bwd = _backwardActions;
         for (int i = 0; i < bwd.Length; i++)
             bwd[i](engine);
@@ -244,7 +264,7 @@ internal sealed class CompiledTrainingPlan<T>
                 cA ??= (float[])(object)inputA.GetDataArray();
                 cB ??= (float[])(object)inputB.GetDataArray();
                 cOut ??= (float[])(object)output.GetDataArray();
-                Array.Clear(cOut, 0, M * N);
+                // No Array.Clear needed — BLAS GEMM with beta=0 overwrites completely
                 BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
             };
         }
