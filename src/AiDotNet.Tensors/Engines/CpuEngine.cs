@@ -2395,7 +2395,8 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, a._shape,
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, broadcastShape,
                     (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastAddBackward);
             }
@@ -7417,6 +7418,21 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Eagerly computes the output shape of a matmul without executing it.</summary>
+    private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
+    {
+        int maxRank = Math.Max(shape1.Length, shape2.Length);
+        var result = new int[maxRank];
+        for (int i = 0; i < maxRank; i++)
+        {
+            int dim1 = i < shape1.Length ? shape1[shape1.Length - 1 - i] : 1;
+            int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
+            if (dim1 != dim2 && dim1 != 1 && dim2 != 1)
+                throw new ArgumentException($"Shapes are not broadcast-compatible at dimension {maxRank - 1 - i}: {dim1} vs {dim2}");
+            result[maxRank - 1 - i] = Math.Max(dim1, dim2);
+        }
+        return result;
+    }
+
     private static int[] ComputeMatMulOutputShape(int[] aShape, int[] bShape)
     {
         int aRank = aShape.Length;
@@ -20070,13 +20086,13 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> activationOutput, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
     {
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
-        // Each activation handler knows how to compute its own backward.
+        // Each activation handler knows how to compute its own backward from pre-activation input.
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return gradOutput; // None
-        return handler.ApplyBackward(this, gradOutput, activationOutput);
+        return handler.ApplyBackward(this, gradOutput, preActivation);
     }
 
     /// <summary>

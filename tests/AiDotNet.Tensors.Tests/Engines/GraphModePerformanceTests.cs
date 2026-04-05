@@ -35,6 +35,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
 
         [Fact]
+        [Trait("Category", "Performance")]
         public void CompiledPlanReplay_ZeroAllocation()
         {
             var engine = new CpuEngine();
@@ -76,6 +77,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// This is the benchmark that matters — shows the overhead eliminated by compilation.
         /// </summary>
         [Fact]
+        [Trait("Category", "Performance")]
         public void HeadToHead_2LayerMLP_EagerVsCompiled()
         {
             var engine = new CpuEngine();
@@ -137,6 +139,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// Full training step with gradient computation.
         /// </summary>
         [Fact]
+        [Trait("Category", "Performance")]
         public void HeadToHead_TrainingStep_EagerVsCompiled()
         {
             var engine = new CpuEngine();
@@ -200,7 +203,7 @@ namespace AiDotNet.Tensors.Tests.Engines
             _output.WriteLine("=== Training Step ({0}x{1} -> {2}) ===", batch, inF, outF);
             _output.WriteLine("  Eager (fwd+bwd+tape):      {0:F4}ms per step", eagerMs);
             _output.WriteLine("  Compiled (fwd only, plan): {0:F4}ms per step", compiledFwdMs);
-            _output.WriteLine("  Forward speedup:           {0:F2}x (compiled fwd vs eager full step overhead)", eagerMs / compiledFwdMs);
+            _output.WriteLine("  NOTE: Not an apples-to-apples comparison — eager includes backward+tape, compiled is forward-only");
             _output.WriteLine("");
         }
 
@@ -209,6 +212,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// This is where per-op overhead matters most.
         /// </summary>
         [Fact]
+        [Trait("Category", "Performance")]
         public void HeadToHead_ElementwiseChain_EagerVsCompiled()
         {
             var engine = new CpuEngine();

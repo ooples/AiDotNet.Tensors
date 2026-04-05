@@ -78,7 +78,8 @@ public sealed class NativeInferencePool : IDisposable
         int key = -floatCount;
         if (!_nativeBuffers.TryGetValue(key, out var ptr))
         {
-            int byteCount = floatCount * sizeof(float);
+            // Use long multiplication to avoid int overflow for large buffers
+            long byteCount = (long)floatCount * sizeof(float);
             ptr = (IntPtr)NativeMemory.AlignedAlloc((nuint)byteCount, 64);
             _nativeBuffers[key] = ptr;
         }
@@ -94,7 +95,8 @@ public sealed class NativeInferencePool : IDisposable
         int key = doubleCount;
         if (!_nativeBuffers.TryGetValue(key, out var ptr))
         {
-            int byteCount = doubleCount * sizeof(double);
+            // Use long multiplication to avoid int overflow for large buffers
+            long byteCount = (long)doubleCount * sizeof(double);
             ptr = (IntPtr)NativeMemory.AlignedAlloc((nuint)byteCount, 64);
             _nativeBuffers[key] = ptr;
         }

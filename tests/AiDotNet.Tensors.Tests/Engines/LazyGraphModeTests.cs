@@ -8,8 +8,10 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines
 {
     /// <summary>
-    /// Integration tests proving lazy graph mode produces bitwise-identical results to eager execution.
-    /// Each test computes the same operation eagerly and lazily, then asserts element-wise equality.
+    /// Integration tests proving lazy graph mode produces numerically equivalent results to eager execution
+    /// within floating-point tolerance. Fusion may change accumulation order, so exact bitwise equality
+    /// is not guaranteed. Each test computes the same operation eagerly and lazily, then asserts
+    /// element-wise equality within <see cref="Tolerance"/>.
     /// </summary>
     public class LazyGraphModeTests
     {
@@ -371,7 +373,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
 
         [Fact]
-        public void AutoMaterialize_OnDataAccess()
+        public void AutoMaterialize_OnScopeDispose()
         {
             var engine = new CpuEngine();
             var a = MakeRandom(new[] { 16, 16 }, seed: 28);
@@ -379,9 +381,7 @@ namespace AiDotNet.Tensors.Tests.Engines
 
             var eagerResult = engine.TensorAdd(a, b);
 
-            // Record lazy op, then access data without explicit Realize
-            // The scope auto-realizes on Dispose via using, but we verify
-            // the data is correct after that auto-realization path
+            // Record lazy op — scope Dispose auto-realizes the graph
             Tensor<float> lazyResult;
             using (var scope = GraphMode.Enable())
             {
@@ -392,7 +392,7 @@ namespace AiDotNet.Tensors.Tests.Engines
             // Data should be available after auto-realize on Dispose
             var span = lazyResult.AsSpan();
             Assert.Equal(eagerResult.AsSpan().Length, span.Length);
-            AssertTensorsEqual(eagerResult, lazyResult, "AutoMaterialize");
+            AssertTensorsEqual(eagerResult, lazyResult, "AutoMaterialize_OnScopeDispose");
         }
 
         [Fact]
@@ -437,15 +437,21 @@ namespace AiDotNet.Tensors.Tests.Engines
             var eagerResult = engine.ReLU(biased);
 
             // Lazy: should fuse into FusedLinearReLU via CpuFusionPass
-            Tensor<float> lazyResult;
+            // Use compiled plan to verify fusion reduced the step count
+            CompiledInferencePlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
                 var lazyMm = engine.TensorMatMul(input, weights);
                 var lazyBiased = engine.TensorBroadcastAdd(lazyMm, bias1D);
-                lazyResult = engine.ReLU(lazyBiased);
-                scope.Realize();
+                engine.ReLU(lazyBiased);
+
+                // Compile to check fusion: 3 ops should fuse into 1 FusedLinearReLU
+                plan = scope.CompileInference<float>();
+                Assert.True(plan.StepCount < 3,
+                    $"Expected fusion to reduce 3 ops, but compiled plan has {plan.StepCount} steps");
             }
 
+            var lazyResult = plan.Execute();
             AssertTensorsEqual(eagerResult, lazyResult, "FusionPass_MatMulBiasReLU");
         }
 

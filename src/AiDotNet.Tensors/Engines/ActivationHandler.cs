@@ -26,10 +26,12 @@ internal abstract class ActivationHandler
     }
 
     /// <summary>
-    /// Computes the backward pass: gradOutput * activation'(activationOutput).
-    /// activationOutput is the post-activation tensor from the forward pass.
+    /// Computes the backward pass: gradOutput * activation'(input).
+    /// <paramref name="input"/> is the pre-activation tensor (before activation was applied).
+    /// Activations that only need post-activation (Sigmoid, Tanh) can compute it
+    /// from the pre-activation input, or override to accept it via other means.
     /// </summary>
-    public abstract Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput);
+    public abstract Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input);
 }
 
 /// <summary>
@@ -118,50 +120,62 @@ internal sealed class ReLUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.ReLU(input);
     public override void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input) => engine.ReLUInPlace(input);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.ReluBackward(gradOutput, activationOutput);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => engine.ReluBackward(gradOutput, input);
 }
 
 internal sealed class GELUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.GELU(input);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.GeluBackward(gradOutput, activationOutput);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => engine.GeluBackward(gradOutput, input);
 }
 
 internal sealed class SigmoidActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Sigmoid(input);
     public override void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input) => engine.SigmoidInPlace(input);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.SigmoidBackward(gradOutput, activationOutput);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+    {
+        // SigmoidBackward expects post-activation output: grad * s * (1 - s)
+        var sigmoidOutput = engine.Sigmoid(input);
+        return engine.SigmoidBackward(gradOutput, sigmoidOutput);
+    }
 }
 
 internal sealed class TanhActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Tanh(input);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.TanhBackward(gradOutput, activationOutput);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+    {
+        // TanhBackward expects post-activation output: grad * (1 - tanh^2)
+        var tanhOutput = engine.Tanh(input);
+        return engine.TanhBackward(gradOutput, tanhOutput);
+    }
 }
 
 internal sealed class LeakyReLUActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input)
         => engine.LeakyReLU(input, Helpers.MathHelper.GetNumericOperations<T>().FromDouble(0.01));
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.LeakyReluBackward(gradOutput, activationOutput, 0.01);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => engine.LeakyReluBackward(gradOutput, input, 0.01);
 }
 
 internal sealed class SwishActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Swish(input);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.SwishBackward(gradOutput, activationOutput);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+        => engine.SwishBackward(gradOutput, input);
 }
 
 internal sealed class SoftmaxActivationHandler : ActivationHandler
 {
     public override Tensor<T> Apply<T>(CpuEngine engine, Tensor<T> input) => engine.Softmax(input, -1);
-    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> activationOutput)
-        => engine.SoftmaxBackward(gradOutput, activationOutput, -1);
+    public override Tensor<T> ApplyBackward<T>(CpuEngine engine, Tensor<T> gradOutput, Tensor<T> input)
+    {
+        // SoftmaxBackward expects post-activation output
+        var softmaxOutput = engine.Softmax(input, -1);
+        return engine.SoftmaxBackward(gradOutput, softmaxOutput, -1);
+    }
 }

@@ -98,7 +98,14 @@ internal sealed class LazyNode<T> : ILazyNode
         Input0 = inputs[0];
         Input1 = inputs.Length > 1 ? inputs[1] : null;
         Input2 = inputs.Length > 2 ? inputs[2] : null;
-        InputsOverflow = inputs.Length > 3 ? inputs : null;
+        // Store only the overflow elements (index 3+) to avoid duplicating Input0/1/2
+        // in RealizeInputs() and GetInputNodes().
+        if (inputs.Length > 3)
+        {
+            var overflow = new Tensor<T>[inputs.Length - 3];
+            Array.Copy(inputs, 3, overflow, 0, overflow.Length);
+            InputsOverflow = overflow;
+        }
         InputCount = (byte)(inputs.Length > 3 ? 0xFF : inputs.Length);
         Output = output;
         OutputShape = output._shape;
@@ -119,11 +126,20 @@ internal sealed class LazyNode<T> : ILazyNode
         // an infinite recursion: AsWritableSpan → auto-materialize → Realize → Execute → AsWritableSpan.
         IsRealized = true;
 
-        // Ensure inputs are realized first
-        RealizeInputs(engine);
+        try
+        {
+            // Ensure inputs are realized first
+            RealizeInputs(engine);
 
-        // Execute the operation
-        Execute(engine, Output);
+            // Execute the operation
+            Execute(engine, Output);
+        }
+        catch
+        {
+            // Roll back so a retry or diagnostic access doesn't see stale/uninitialized data.
+            IsRealized = false;
+            throw;
+        }
     }
 
     private void RealizeInputs(IEngine engine)
@@ -158,7 +174,16 @@ internal sealed class LazyNode<T> : ILazyNode
     /// <summary>Get input tensors as array for backward compatibility.</summary>
     public Tensor<T>[] GetInputsArray()
     {
-        if (InputsOverflow != null) return InputsOverflow;
+        if (InputsOverflow != null)
+        {
+            // Reconstruct full array from inline slots + overflow
+            var all = new Tensor<T>[3 + InputsOverflow.Length];
+            all[0] = Input0;
+            all[1] = Input1 ?? Input0;
+            all[2] = Input2 ?? Input0;
+            Array.Copy(InputsOverflow, 0, all, 3, InputsOverflow.Length);
+            return all;
+        }
         return InputCount switch
         {
             1 => new[] { Input0 },

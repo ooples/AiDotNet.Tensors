@@ -364,8 +364,9 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Zero-alloc path: if grads already has pre-allocated buffers (compiled training plan),
-        // write BLAS results directly into them via TryGemmEx with beta=1 (accumulate).
-        // This eliminates ALL intermediate tensor allocations in the backward.
+        // write BLAS results directly into them via TryGemmEx (beta=0, overwrite).
+        // For single-consumer tensors this is safe since grads are pre-zeroed.
+        // For multi-consumer tensors, the caller (CompiledTrainingPlan) handles accumulation.
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2 && BlasProvider.IsAvailable)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
@@ -3211,25 +3212,30 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Apply activation derivative to gradOutput before linear backward.
-        // savedState[0] = FusedActivationType, output = post-activation values
+        // savedState[0] = FusedActivationType.
+        // We need the pre-activation (linear output) for correct GELU/Swish derivatives.
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];
-            gradOutput = ApplyActivationDerivative(gradOutput, output, activation, engine);
+            // Re-compute pre-activation: linear = input @ weights + bias
+            var preActivation = engine.TensorMatMul(inputs[0], inputs[1]);
+            if (inputs.Length > 2)
+                preActivation = engine.TensorBroadcastAdd(preActivation, inputs[2]);
+            gradOutput = ApplyActivationDerivative(gradOutput, preActivation, activation, engine);
         }
 
         FusedLinearBackwardCore(gradOutput, inputs, output, savedState, engine, grads);
     }
 
     private static Tensor<T> ApplyActivationDerivative(
-        Tensor<T> gradOutput, Tensor<T> output, FusedActivationType activation, IEngine engine)
+        Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, IEngine engine)
     {
         if (activation == FusedActivationType.None) return gradOutput;
 
         // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
         // This is OCP-compliant: new activations register themselves, no switch needed here
         if (engine is CpuEngine cpuEngine)
-            return cpuEngine.ApplyFusedActivationBackward(gradOutput, output, activation);
+            return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation);
 
         // Fallback for non-CPU engines
         return gradOutput;
