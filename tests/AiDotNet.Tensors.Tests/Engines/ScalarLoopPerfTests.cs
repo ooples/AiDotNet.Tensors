@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
@@ -19,7 +19,7 @@ public class ScalarLoopPerfTests
 
     public ScalarLoopPerfTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [Fact(Skip = "Benchmark - run manually")]
     public void Benchmark_FusedLinear_Float_256x256()
     {
         var input = Tensor<float>.CreateRandom([32, 256]);
@@ -54,7 +54,7 @@ public class ScalarLoopPerfTests
         }
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - run manually")]
     public void Benchmark_FusedLinear_Double_256x256()
     {
         var input = new Tensor<double>(Enumerable.Range(0, 32 * 256).Select(i => (double)i / 1000).ToArray(), [32, 256]);
@@ -73,7 +73,7 @@ public class ScalarLoopPerfTests
         _output.WriteLine($"FusedLinear double 32x256 @ 256x256 + ReLU: {ms:F3}ms");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - run manually")]
     public void Benchmark_FusedLinear_Float_768x768()
     {
         var input = Tensor<float>.CreateRandom([16, 768]);
@@ -104,7 +104,7 @@ public class ScalarLoopPerfTests
         }
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - run manually")]
     public void Benchmark_TensorMatMul_VsFusedLinear_Float()
     {
         // Compare: TensorMatMul (uses BLAS) vs FusedLinear (scalar loops)
@@ -137,7 +137,7 @@ public class ScalarLoopPerfTests
         _output.WriteLine($"Ratio: FusedLinear is {fusedMs / matmulMs:F1}x slower");
     }
 
-    [Fact]
+    [Fact(Skip = "Benchmark - run manually")]
     public void Profile_FusedLinear_Breakdown()
     {
         int M = 32, K = 256, N = 256;

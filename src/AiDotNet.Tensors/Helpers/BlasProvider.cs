@@ -129,8 +129,8 @@ internal static class BlasProvider
 
     internal static bool TryGemm(int m, int n, int k, float[] a, int aOffset, int lda, float[] b, int bOffset, int ldb, float[] c, int cOffset, int ldc)
     {
-        // Hot path: after MKL is verified, skip all validation and init checks
-        if (_mklVerified)
+        // Hot path: after MKL is verified AND still enabled, skip all checks
+        if (_mklVerified && _useMklNet)
         {
             MklNetSgemmCore(m, n, k, a, aOffset, lda, b, bOffset, ldb, c, cOffset, ldc);
             return true;
@@ -572,8 +572,8 @@ internal static class BlasProvider
     /// </summary>
     internal static bool TryGemm(int m, int n, int k, double[] a, int aOffset, int lda, double[] b, int bOffset, int ldb, double[] c, int cOffset, int ldc)
     {
-        // Hot path: skip all checks after MKL verified
-        if (_mklVerified)
+        // Hot path: skip all checks after MKL verified AND still enabled
+        if (_mklVerified && _useMklNet)
         {
             Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k,
                 1.0, a.AsSpan(aOffset), lda, b.AsSpan(bOffset), ldb, 0.0, c.AsSpan(cOffset), ldc);

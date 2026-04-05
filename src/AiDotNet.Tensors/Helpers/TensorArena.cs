@@ -227,5 +227,12 @@ public sealed class TensorArena : IDisposable
 
         _pool.Clear();
         _cursor.Clear();
+
+        // Clear tensor ring pools
+        if (_tensorRing != null)
+        {
+            Array.Clear(_tensorRing, 0, _tensorRingCount);
+            _tensorRingCount = 0;
+        }
     }
 }

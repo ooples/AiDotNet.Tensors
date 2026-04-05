@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -7421,7 +7421,6 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var gradInput = new T[batch * inChannels * height * width];
-        Array.Clear(gradInput, 0, gradInput.Length);
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
 
@@ -7501,7 +7500,6 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
-        Array.Clear(gradKernel, 0, gradKernel.Length);
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
 
@@ -12058,8 +12056,6 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[features];
         var gradBetaData = new T[features];
         var gradInputData = new T[batch * features];
-        Array.Clear(gradGammaData, 0, gradGammaData.Length);
-        Array.Clear(gradBetaData, 0, gradBetaData.Length);
 
         // Compute gradGamma and gradBeta
         for (int f = 0; f < features; f++)
@@ -12198,7 +12194,6 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
         var gradInputData = new T[input.Length];
-        Array.Clear(gradInputData, 0, gradInputData.Length);
 
         // Compute gradGamma and gradBeta per channel (generic fallback)
         Parallel.For(0, channels, c =>
@@ -12407,8 +12402,7 @@ public class CpuEngine : ITensorLevelEngine
         var gradGammaData = new T[featureSize];
         var gradBetaData = new T[featureSize];
         var gradInputData = new T[batchSize * featureSize];
-        // CLR zeros new T[] already; Array.Clear handles value types efficiently
-        // (no scalar numOps.Zero loop needed)
+        // CLR zeros new T[] already — no explicit clearing needed
 
         // Compute gradGamma and gradBeta
         for (int b = 0; b < batchSize; b++)
