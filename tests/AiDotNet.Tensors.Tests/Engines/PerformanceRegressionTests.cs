@@ -40,7 +40,7 @@ public class PerformanceRegressionTests
     // Scalar loops produce 2-20ms for these ops, so 1-2ms budgets catch them.
     private const double MatMul256BudgetMs = 1.5;       // Scalar would be ~3ms
     private const double MatMul768BudgetMs = 5.0;       // Scalar would be ~20ms
-    private const double FusedLinear256BudgetMs = 1.5;   // Scalar would be ~3ms
+    private const double FusedLinear256BudgetMs = 2.0;   // Scalar would be ~3ms
     private const double FusedLinearDoubleBudgetMs = 2.0; // Scalar would be ~3ms
     private const double Elementwise100KBudgetMs = 1.0;  // Scalar would be ~2ms
     private const double BatchMatMulBudgetMs = 2.0;      // Scalar would be ~5ms

@@ -2090,7 +2090,8 @@ public class CpuEngine : ITensorLevelEngine
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
 
-        var result = TensorAllocator.Rent<T>(a._shape);
+        // RentUninitialized: kernel writes every element, no need to zero
+        var result = TensorAllocator.RentUninitialized<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
