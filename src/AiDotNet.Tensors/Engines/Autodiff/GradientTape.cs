@@ -195,6 +195,15 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
 
+        // Graph-based backward: walk GradFn pointers instead of tape.
+        // This is faster because it skips tape traversal, dict lookups, and relevance checks.
+        if (loss.GradFn is not null && !createGraph)
+        {
+            var result = ComputeGradientsViaGraph(loss, sources);
+            if (!_options.Persistent) _entries.Reset();
+            return result;
+        }
+
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -428,6 +437,94 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         return grads;
+    }
+
+    /// <summary>
+    /// Graph-based backward: walks GradFn pointers on tensors instead of the tape.
+    /// Eliminates tape traversal, dictionary lookups, and relevance checks.
+    /// </summary>
+    private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsViaGraph(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources)
+    {
+        var engine = _engine;
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var grads = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+        // Seed
+        Tensor<T> seedGrad;
+        if (loss.Length == 1)
+            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+        else
+        {
+            var onesData = new T[loss.Length];
+            var one = numOps.One;
+            for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
+            seedGrad = new Tensor<T>(onesData, loss._shape);
+        }
+        grads[loss] = seedGrad;
+
+        // Topological sort via DFS from loss.GradFn
+        var visited = new HashSet<GradNode<T>>();
+        var topoOrder = new List<GradNode<T>>();
+        TopologicalSort(loss.GradFn!, visited, topoOrder);
+
+        // Suspend recording during backward
+        var savedCurrent = _current;
+        SetCurrentTape(null);
+
+        try
+        {
+            // Walk in reverse topological order (loss first, then dependencies)
+            for (int i = topoOrder.Count - 1; i >= 0; i--)
+            {
+                var node = topoOrder[i];
+                if (!grads.TryGetValue(node.Output, out var gradOutput))
+                    continue;
+
+                var inputsArray = node.GetInputsArray();
+                node.Backward(gradOutput, inputsArray, node.Output,
+                    node.SavedState ?? Array.Empty<object>(), engine, grads);
+            }
+        }
+        finally
+        {
+            SetCurrentTape(savedCurrent);
+            // Clear GradFn to release graph memory
+            foreach (var node in topoOrder)
+            {
+                node.Output.GradFn = null;
+                foreach (var inp in node.GetInputsArray())
+                    inp.GradFn = null;
+            }
+        }
+
+        if (sources is not null)
+        {
+            var filtered = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+            foreach (var source in sources)
+                if (grads.TryGetValue(source, out var grad))
+                    filtered[source] = grad;
+            return filtered;
+        }
+
+        return grads;
+    }
+
+    private static void TopologicalSort(GradNode<T> node, HashSet<GradNode<T>> visited, List<GradNode<T>> result)
+    {
+        if (!visited.Add(node)) return;
+
+        // Visit children first (inputs)
+        if (node.Input0?.GradFn is not null) TopologicalSort(node.Input0.GradFn, visited, result);
+        if (node.Input1?.GradFn is not null) TopologicalSort(node.Input1.GradFn, visited, result);
+        if (node.Input2?.GradFn is not null) TopologicalSort(node.Input2.GradFn, visited, result);
+        if (node.InputsOverflow is not null)
+            foreach (var inp in node.InputsOverflow)
+                if (inp.GradFn is not null) TopologicalSort(inp.GradFn, visited, result);
+
+        // Add after children (reverse post-order)
+        result.Add(node);
     }
 
     /// <summary>

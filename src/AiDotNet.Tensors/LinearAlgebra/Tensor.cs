@@ -31,6 +31,14 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal Tensor<T>? Grad;
 
     /// <summary>
+    /// Computation graph node — stores the backward function and input references.
+    /// Set by DifferentiableOps.Record* when a tape is active. Backward traversal
+    /// walks GradFn pointers for O(1) gradient lookup (PyTorch architecture).
+    /// Null for leaf tensors (inputs, constants) or when no tape is active.
+    /// </summary>
+    internal Engines.Autodiff.GradNode<T>? GradFn;
+
+    /// <summary>
     /// If this tensor was created from a pooled array, holds a reference to it for return.
     /// Null for non-pooled tensors.
     /// </summary>

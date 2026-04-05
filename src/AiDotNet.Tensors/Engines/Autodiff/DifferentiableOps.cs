@@ -83,6 +83,15 @@ internal static class DifferentiableOps
             slot.InputCount = 0xFF;
             slot.Input0 = inputs[0];
         }
+
+        // Set GradFn for graph-based backward
+        output.GradFn = inputs.Length switch
+        {
+            1 => new GradNode<T>(backward, output, inputs[0], savedState: savedState),
+            2 => new GradNode<T>(backward, output, inputs[0], inputs[1], savedState: savedState, inputCount: 2),
+            3 => new GradNode<T>(backward, output, inputs[0], inputs[1], inputs[2], savedState: savedState, inputCount: 3),
+            _ => new GradNode<T>(backward, output, inputs[0], inputsOverflow: inputs, inputCount: 0xFF, savedState: savedState)
+        };
     }
 
     /// <summary>
@@ -108,6 +117,9 @@ internal static class DifferentiableOps
         slot.Input0 = input;
         slot.InputCount = 1;
         slot.Version0 = input.Version;
+
+        // Set GradFn on output for O(1) graph-based backward traversal
+        output.GradFn = new GradNode<T>(backward, output, input, savedState: savedState);
     }
 
     /// <summary>
@@ -136,6 +148,8 @@ internal static class DifferentiableOps
         slot.InputCount = 2;
         slot.Version0 = a.Version;
         slot.Version1 = b.Version;
+
+        output.GradFn = new GradNode<T>(backward, output, a, b, savedState: savedState, inputCount: 2);
     }
 
     /// <summary>
