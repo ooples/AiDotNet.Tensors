@@ -144,14 +144,12 @@ internal static class DifferentiableOps
         if (grads.TryGetValue(tensor, out var existing))
         {
             engine.TensorAddInPlace(existing, grad);
+            tensor.Grad = existing; // Already accumulated in-place
         }
         else
         {
             grads[tensor] = grad;
+            tensor.Grad = grad;
         }
-
-        // Also write into tensor.Grad for zero-alloc access in training loops.
-        // On first backward this lazily allocates; subsequent steps reuse the same buffer.
-        tensor.Grad = grads[tensor];
     }
 }

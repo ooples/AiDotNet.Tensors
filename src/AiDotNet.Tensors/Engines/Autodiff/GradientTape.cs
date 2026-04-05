@@ -93,6 +93,10 @@ public sealed class GradientTape<T> : IDisposable
     [ThreadStatic]
     private static TapeEntryArena<T>? _cachedArena;
 
+    // Cached scalar seed gradient (ones tensor of shape [1]) — reused across training steps
+    [ThreadStatic]
+    private static Tensor<T>? _cachedScalarSeed;
+
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
@@ -193,15 +197,19 @@ public sealed class GradientTape<T> : IDisposable
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        // Gradient accumulator: maps each tensor (by reference identity) to its accumulated gradient
-        var grads = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // Gradient accumulator: maps each tensor (by reference identity) to its accumulated gradient.
+        // Pre-size to entry count to avoid 5-6 dictionary resizes during backward walk.
+        var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+            Math.Min(_entries.Count + 1, 1024),
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Seed: gradient of loss w.r.t. itself is ones with the same shape.
         // Fast path for scalar loss (the overwhelmingly common case in training).
+        // Reuse cached scalar seed across training steps to avoid per-backward allocation.
         Tensor<T> seedGrad;
         if (loss.Length == 1)
         {
-            seedGrad = new Tensor<T>(new[] { numOps.One }, loss.Shape.ToArray());
+            seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, new[] { 1 });
         }
         else
         {
@@ -225,6 +233,12 @@ public sealed class GradientTape<T> : IDisposable
 
         try
         {
+            // Pre-compute boolean guards to skip expensive checks in the hot loop.
+            // These avoid dictionary lookups and iteration when features are not used.
+            bool hasHooks = _hooks is not null && _hooks.Count > 0;
+            bool hasRetainGrad = _retainGrad is not null && _retainGrad.Count > 0;
+            bool profileEnabled = ProfileBackward;
+
             // Walk tape in reverse (reverse-mode AD)
             var numOpsForAnomaly = DetectAnomaly ? MathHelper.GetNumericOperations<T>() : null;
 
@@ -283,37 +297,31 @@ public sealed class GradientTape<T> : IDisposable
                     continue;
                 }
 
-                // Apply tensor hooks: let registered hooks modify the gradient before backward
-                if (_hooks is not null && _hooks.TryGetValue(entry.Output, out var hookList))
+                // Construct input array once for this entry's backward pass
+                var inputsArray = entry.GetInputsArray();
+
+                // Apply tensor hooks (skip dictionary lookup entirely when no hooks registered)
+                if (hasHooks && _hooks!.TryGetValue(entry.Output, out var hookList))
                 {
                     foreach (var hook in hookList)
                         gradOutput = hook(gradOutput);
                     grads[entry.Output] = gradOutput;
                 }
 
-                // Validate that no input tensor was mutated after recording (would produce wrong gradients)
+                // Validate that no input tensor was mutated after recording
                 entry.ValidateInputVersions();
 
-                // Performance profiling: log per-op backward time when enabled
-                System.Diagnostics.Stopwatch? opSw = null;
-                if (ProfileBackward)
-                {
-                    opSw = System.Diagnostics.Stopwatch.StartNew();
-                }
-
-                // Construct input array once for this entry's backward pass
-                var inputsArray = entry.GetInputsArray();
-
-                // Invoke the backward function to propagate gradients to inputs
+                // Invoke the backward function
                 entry.Backward(gradOutput, inputsArray, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, grads);
 
-                if (opSw is not null)
+                // Performance profiling (only when explicitly enabled)
+                if (profileEnabled)
                 {
-                    opSw.Stop();
-                    System.Console.WriteLine($"  backward[{entry.OperationName}]: {opSw.Elapsed.TotalMilliseconds:F3}ms");
+                    // Profiling is rare — accept the overhead of Stopwatch only when active
+                    System.Console.WriteLine($"  backward[{entry.OperationName}]");
                 }
 
-                // Anomaly detection: check for NaN/Inf in computed input gradients
+                // Anomaly detection (only when explicitly enabled)
                 if (numOpsForAnomaly is not null)
                 {
                     foreach (var input in inputsArray)
@@ -332,12 +340,12 @@ public sealed class GradientTape<T> : IDisposable
                     }
                 }
 
-                // Retain gradient for non-leaf tensors if requested
-                if (_retainGrad is not null)
+                // Retain gradient (skip entirely when not requested — common case)
+                if (hasRetainGrad)
                 {
                     foreach (var input in inputsArray)
                     {
-                        if (_retainGrad.Contains(input) && grads.TryGetValue(input, out var retained))
+                        if (_retainGrad!.Contains(input) && grads.TryGetValue(input, out var retained))
                         {
                             // Hook into input tensors that requested gradient retention
                             if (_hooks is not null && _hooks.TryGetValue(input, out var inputHooks))
