@@ -19304,7 +19304,7 @@ public class CpuEngine : ITensorLevelEngine
                 var wArr = (float[])(object)weights.GetDataArray();
                 var outArr = (float[])(object)result.GetDataArray();
 
-                // Fastest path: direct BLAS with fixed pointers (skip TryGemm overhead)
+                // Tier 1: Direct native BLAS — zero overhead (pinned pointers, no validation)
                 if (BlasProvider.HasNativeSgemm)
                 {
                     unsafe
@@ -19313,10 +19313,10 @@ public class CpuEngine : ITensorLevelEngine
                             BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
                     }
                 }
-                // MKL.NET or other managed BLAS path
+                // Tier 2: Any BLAS (MKL.NET or native with validation)
                 else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
-                    // All BLAS unavailable: SIMD tiled fallback
+                    // Tier 3: SIMD tiled GEMM fallback
                     Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
                 }
 

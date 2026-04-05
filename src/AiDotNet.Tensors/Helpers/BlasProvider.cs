@@ -164,10 +164,33 @@ internal static class BlasProvider
 
     /// <summary>
     /// Returns true if native BLAS (not MKL.NET) is available for direct pointer calls.
-    /// MKL.NET uses managed arrays internally so it can't take raw pointers.
     /// </summary>
     internal static bool HasNativeSgemm => _available && !_useMklNet && _sgemm != null;
     internal static bool HasNativeDgemm => _available && !_useMklNet && _dgemm != null;
+
+    /// <summary>
+    /// Returns true if MKL.NET is available for direct span calls.
+    /// </summary>
+    internal static bool HasMklNet => _available && _useMklNet;
+
+    /// <summary>
+    /// Direct MKL.NET SGEMM with zero-offset spans. Skips TryGemm overhead (validation,
+    /// init check, try/catch, AsSpan offset). Caller must ensure arrays are correctly sized.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void MklSgemmDirect(int m, int n, int k, float[] a, int lda, float[] b, int ldb, float[] c, int ldc)
+    {
+        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k, 1.0f, a.AsSpan(), lda, b.AsSpan(), ldb, 0.0f, c.AsSpan(), ldc);
+    }
+
+    /// <summary>
+    /// Direct MKL.NET DGEMM with zero-offset spans.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void MklDgemmDirect(int m, int n, int k, double[] a, int lda, double[] b, int ldb, double[] c, int ldc)
+    {
+        Blas.gemm(Layout.RowMajor, Trans.No, Trans.No, m, n, k, 1.0, a.AsSpan(), lda, b.AsSpan(), ldb, 0.0, c.AsSpan(), ldc);
+    }
 
     /// <summary>
     /// Raw SGEMM call with pre-pinned pointers. Skips ALL validation, initialization checks,
