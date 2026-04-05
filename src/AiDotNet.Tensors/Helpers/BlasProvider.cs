@@ -163,6 +163,34 @@ internal static class BlasProvider
     }
 
     /// <summary>
+    /// Returns true if native BLAS (not MKL.NET) is available for direct pointer calls.
+    /// MKL.NET uses managed arrays internally so it can't take raw pointers.
+    /// </summary>
+    internal static bool HasNativeSgemm => _available && !_useMklNet && _sgemm != null;
+    internal static bool HasNativeDgemm => _available && !_useMklNet && _dgemm != null;
+
+    /// <summary>
+    /// Raw SGEMM call with pre-pinned pointers. Skips ALL validation, initialization checks,
+    /// and GC pinning. Caller must ensure pointers are valid and arrays are pinned.
+    /// Only available when HasNativeSgemm is true (native BLAS, not MKL.NET).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void SgemmDirect(int m, int n, int k, float* a, int lda, float* b, int ldb, float* c, int ldc)
+    {
+        _sgemm!(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a, lda, b, ldb, 0.0f, c, ldc);
+    }
+
+    /// <summary>
+    /// Raw DGEMM call with pre-pinned pointers.
+    /// Only available when HasNativeDgemm is true.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void DgemmDirect(int m, int n, int k, double* a, int lda, double* b, int ldb, double* c, int ldc)
+    {
+        _dgemm!(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, a, lda, b, ldb, 0.0, c, ldc);
+    }
+
+    /// <summary>
     /// GEMM with configurable beta: C = A*B + beta*C. When beta=1 and C is pre-filled with bias,
     /// this fuses bias addition into the GEMM — saving a full O(MN) memory pass.
     /// </summary>

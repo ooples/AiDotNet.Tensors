@@ -19296,19 +19296,29 @@ public class CpuEngine : ITensorLevelEngine
             if (weights._shape[0] != K)
                 throw new ArgumentException($"Weight matrix shape mismatch: expected [{K}, N], got [{weights._shape[0]}, {weights._shape[1]}]");
 
-            // Ultra-fast path for float: arena-pooled tensor + inline BLAS, zero-alloc after warmup
+            // Ultra-fast path for float: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(float))
             {
-                // Use input._shape-style cached array when possible to avoid int[] alloc
-                var outShape = new[] { M, N };
-                var result = TensorAllocator.RentUninitialized<T>(outShape);
+                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
                 var inArr = (float[])(object)input.GetDataArray();
                 var wArr = (float[])(object)weights.GetDataArray();
                 var outArr = (float[])(object)result.GetDataArray();
 
-                // Inline BLAS — no CpuFusedOperations dispatch
-                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                // Fastest path: direct BLAS with fixed pointers (skip TryGemm overhead)
+                if (BlasProvider.HasNativeSgemm)
+                {
+                    unsafe
+                    {
+                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                }
+                // MKL.NET or other managed BLAS path
+                else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
+                    // All BLAS unavailable: SIMD tiled fallback
                     Simd.SimdGemm.Sgemm(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, K, N);
+                }
 
                 // Fused bias + activation in one pass
                 if (bias != null || activation != FusedActivationType.None)
@@ -19320,17 +19330,24 @@ public class CpuEngine : ITensorLevelEngine
                 return result;
             }
 
-            // Ultra-fast path for double: same pattern
+            // Ultra-fast path for double: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(double))
             {
-                var result = TensorAllocator.RentUninitialized<T>([M, N]);
+                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
                 var inArr = (double[])(object)input.GetDataArray();
                 var wArr = (double[])(object)weights.GetDataArray();
                 var outArr = (double[])(object)result.GetDataArray();
 
-                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                if (BlasProvider.HasNativeDgemm)
                 {
-                    // No SimdGemm.Dgemm — scalar fallback
+                    unsafe
+                    {
+                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
+                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
+                    }
+                }
+                else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                {
                     CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
                         bias != null ? (double[])(object)bias.GetDataArray() : null,
                         outArr, M, N, K, activation);
