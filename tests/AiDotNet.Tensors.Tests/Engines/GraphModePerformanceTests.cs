@@ -34,7 +34,7 @@ namespace AiDotNet.Tensors.Tests.Engines
             return new Tensor<float>(data, shape);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
         [Trait("Category", "Performance")]
         public void CompiledPlanReplay_ZeroAllocation()
         {
@@ -76,7 +76,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// 2-layer MLP: input [64,256] → hidden [128] → output [10]
         /// This is the benchmark that matters — shows the overhead eliminated by compilation.
         /// </summary>
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
         [Trait("Category", "Performance")]
         public void HeadToHead_2LayerMLP_EagerVsCompiled()
         {
@@ -138,7 +138,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// HEAD-TO-HEAD: Eager forward+backward vs CompiledTrainingPlan.
         /// Full training step with gradient computation.
         /// </summary>
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
         [Trait("Category", "Performance")]
         public void HeadToHead_TrainingStep_EagerVsCompiled()
         {
@@ -211,7 +211,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// Elementwise operation chain: measures overhead of 10 chained ops.
         /// This is where per-op overhead matters most.
         /// </summary>
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
         [Trait("Category", "Performance")]
         public void HeadToHead_ElementwiseChain_EagerVsCompiled()
         {

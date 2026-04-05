@@ -659,9 +659,9 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
-        // Auto-materialize lazy tensors on data access
+        // Auto-materialize lazy tensors on data access using the recording-time engine
         if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+            node.Realize(node.RecordingEngine);
 
         ThrowIfSparse();
         if (Length == 0) return ReadOnlySpan<T>.Empty;
@@ -678,9 +678,9 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal Span<T> AsWritableSpan()
     {
-        // Auto-materialize lazy tensors on data access
+        // Auto-materialize lazy tensors on data access using the recording-time engine
         if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+            node.Realize(node.RecordingEngine);
 
         if (Length == 0) return Span<T>.Empty;
         if (!IsContiguous)
@@ -696,9 +696,9 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
-        // Auto-materialize lazy tensors on data access
+        // Auto-materialize lazy tensors on data access using the recording-time engine
         if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+            node.Realize(node.RecordingEngine);
 
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
             return ToArray();

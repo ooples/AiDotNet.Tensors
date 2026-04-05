@@ -74,6 +74,7 @@ public sealed class NativeInferencePool : IDisposable
     /// </summary>
     public unsafe float* GetActivationBuffer(int floatCount)
     {
+        if (floatCount <= 0) throw new ArgumentOutOfRangeException(nameof(floatCount), "Element count must be positive.");
         // Use negative key space for float to avoid collision with double buffers
         int key = -floatCount;
         if (!_nativeBuffers.TryGetValue(key, out var ptr))
@@ -91,6 +92,7 @@ public sealed class NativeInferencePool : IDisposable
     /// </summary>
     public unsafe double* GetActivationBufferDouble(int doubleCount)
     {
+        if (doubleCount <= 0) throw new ArgumentOutOfRangeException(nameof(doubleCount), "Element count must be positive.");
         // Use positive key space for double (element count, not byte count)
         int key = doubleCount;
         if (!_nativeBuffers.TryGetValue(key, out var ptr))

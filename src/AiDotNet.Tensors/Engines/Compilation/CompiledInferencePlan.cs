@@ -69,6 +69,13 @@ internal sealed class CompiledInferencePlan<T>
             }
         }
 
+        // Clear LazySource on all compiled output buffers so later data access
+        // (AsSpan/GetDataArray) doesn't re-trigger auto-materialization.
+        foreach (var node in optimized)
+        {
+            node.ClearOutputLazySource();
+        }
+
         var finalOutput = steps.Count > 0 ? steps[steps.Count - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
         return new CompiledInferencePlan<T>(steps.ToArray(), finalOutput, engine);
     }

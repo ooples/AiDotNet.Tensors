@@ -363,10 +363,8 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Zero-alloc path: if grads already has pre-allocated buffers (compiled training plan),
-        // write BLAS results directly into them via TryGemmEx (beta=0, overwrite).
-        // For single-consumer tensors this is safe since grads are pre-zeroed.
-        // For multi-consumer tensors, the caller (CompiledTrainingPlan) handles accumulation.
+        // BLAS fast path: compute transposed GEMMs into fresh buffers, then accumulate.
+        // Allocates two float[] arrays but avoids materializing full transpose tensors.
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && inputs[1].Rank == 2 && BlasProvider.IsAvailable)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
@@ -379,36 +377,25 @@ internal static class BackwardFunctions<T>
                 int N_a = inputs[1]._shape[0]; // rows of B = cols of grad_A
                 int N_b = gradOutput._shape[1]; // cols of grad_B
 
-                // Always allocate fresh buffers and use AccumulateGrad to handle
-                // multi-consumer accumulation correctly. TryGemmEx uses beta=0 (overwrite),
-                // so writing into an existing grad buffer would clobber prior contributions.
+                // Allocate fresh buffers for both GEMMs. Only accumulate after BOTH
+                // succeed to avoid partial accumulation if the second GEMM fails.
+                var gradAData = new float[M * N_a];
+                var gradBData = new float[inputs[0]._shape[1] * N_b];
+
+                bool okA = BlasProvider.TryGemmEx(M, N_a, K, dCArr, 0, K, false, bArr, 0, K, true, gradAData, 0, N_a);
+                bool okB = BlasProvider.TryGemmEx(inputs[0]._shape[1], N_b, inputs[0]._shape[0],
+                    aArr, 0, inputs[0]._shape[1], true, dCArr, 0, N_b, false, gradBData, 0, N_b);
+
+                if (okA && okB)
                 {
-                    var gradAData = new float[M * N_a];
-                    if (BlasProvider.TryGemmEx(M, N_a, K, dCArr, 0, K, false, bArr, 0, K, true, gradAData, 0, N_a))
-                    {
-                        var gradA = new Tensor<T>((T[])(object)gradAData, inputs[0]._shape);
-                        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-                    }
-                    else
-                    {
-                        // BLAS refused — fall through to generic path below
-                        goto fallback;
-                    }
+                    var gradA = new Tensor<T>((T[])(object)gradAData, inputs[0]._shape);
+                    var gradB = new Tensor<T>((T[])(object)gradBData, inputs[1]._shape);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+                    return;
                 }
-                {
-                    var gradBData = new float[inputs[0]._shape[1] * N_b];
-                    if (BlasProvider.TryGemmEx(inputs[0]._shape[1], N_b, inputs[0]._shape[0],
-                        aArr, 0, inputs[0]._shape[1], true, dCArr, 0, N_b, false, gradBData, 0, N_b))
-                    {
-                        var gradB = new Tensor<T>((T[])(object)gradBData, inputs[1]._shape);
-                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
-                    }
-                    else
-                    {
-                        goto fallback;
-                    }
-                }
-                return;
+                // Either GEMM refused — fall through to generic path
+                goto fallback;
             }
         }
 
@@ -3245,17 +3232,21 @@ internal static class BackwardFunctions<T>
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
-            // dL/dinput = gradOutput @ weight^T — transposed BLAS, no Transpose() call
+            // Compute both GEMMs into fresh buffers before accumulating either,
+            // so a failure in the second doesn't leave partial accumulation.
             var gradInputArr = new float[M * K];
-            if (!BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K))
-                goto fusedFallback; // BLAS refused — use engine fallback
+            var gradWeightArr = new float[K * N];
+
+            // dL/dinput = gradOutput @ weight^T
+            bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+            // dL/dweight = input^T @ gradOutput
+            bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
+
+            if (!okInput || !okWeight)
+                goto fusedFallback; // BLAS refused — use engine fallback for all
+
             var inputGrad = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
-
-            // dL/dweight = input^T @ gradOutput — transposed BLAS, no Transpose() call
-            var gradWeightArr = new float[K * N];
-            if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N))
-                goto fusedFallback;
             var weightGrad = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
 

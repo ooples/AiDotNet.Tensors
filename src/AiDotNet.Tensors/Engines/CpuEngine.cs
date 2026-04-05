@@ -7371,8 +7371,15 @@ public class CpuEngine : ITensorLevelEngine
         if (b.Rank < 2) throw new ArgumentException($"TensorMatMul requires tensors of rank >= 2. Got rank {b.Rank} for second tensor.");
 
         // Lazy graph mode: record and return placeholder
+        // Validate rank combos eagerly (same rules as the eager path below)
         if (GraphMode.IsActive)
         {
+            bool supported = (a.Rank == 2 && b.Rank == 2)
+                          || (b.Rank == 2)
+                          || (a.Rank == b.Rank);
+            if (!supported)
+                throw new ArgumentException($"Unsupported TensorMatMul combination: ranks {a.Rank} and {b.Rank}. Supported: 2Dx2D, NDx2D, NDxND (same rank).");
+
             var outShape = ComputeMatMulOutputShape(a._shape, b._shape);
             var scope = GraphMode.Current;
             if (scope != null)
@@ -7457,6 +7464,8 @@ public class CpuEngine : ITensorLevelEngine
             int bIdx = bBatchRank - 1 - i;
             int aDim = aIdx >= 0 ? aShape[aIdx] : 1;
             int bDim = bIdx >= 0 ? bShape[bIdx] : 1;
+            if (aDim != bDim && aDim != 1 && bDim != 1)
+                throw new ArgumentException($"MatMul batch dimensions are not broadcast-compatible at position {outBatchRank - 1 - i}: {aDim} vs {bDim}");
             outShape[outBatchRank - 1 - i] = Math.Max(aDim, bDim);
         }
         outShape[outShape.Length - 2] = aShape[aRank - 2];

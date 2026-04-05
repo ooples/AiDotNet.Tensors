@@ -217,10 +217,14 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
                 BackwardFunctions<T>.FusedLinearWithActivationBackward,
                 savedState);
 
-            // Redirect intermediate outputs' LazySource to the fused node so that
-            // user-held references to removed intermediates can still auto-materialize.
-            matmul.Output.LazySource = fusedNode;
-            add.Output.LazySource = fusedNode;
+            // Clear LazySource on removed intermediates. The fused node only writes
+            // into finalOutput — intermediate buffers are never populated, so leaving
+            // a LazySource would auto-materialize into a buffer the fused node doesn't
+            // write to, returning uninitialized data. Clearing is safer: accessing an
+            // intermediate will return its (uninitialized) buffer rather than silently
+            // running the wrong realization.
+            matmul.Output.LazySource = null;
+            add.Output.LazySource = null;
 
             return fusedNode;
         }

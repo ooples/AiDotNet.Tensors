@@ -474,12 +474,8 @@ public static class CpuFusedOperations
     #region Activation Functions
 
     /// <summary>
-    /// Applies the specified activation function to a single value.
-    /// Inline for performance in fused operations.
-    /// </summary>
-    /// <summary>
-    /// OCP-compliant activation dispatch table. Register new activations here.
-    /// Resolved once before loop, then called per-element with zero lookup overhead.
+    /// OCP-compliant activation dispatch table for pointwise float activations.
+    /// Resolve once before a loop, then call the returned delegate per element with zero lookup overhead.
     /// </summary>
     private static readonly Dictionary<FusedActivationType, Func<float, float>> _floatActivations = new()
     {
