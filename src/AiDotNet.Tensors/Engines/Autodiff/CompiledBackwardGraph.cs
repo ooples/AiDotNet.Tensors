@@ -83,9 +83,20 @@ public sealed class CompiledBackwardGraph<T>
     /// <summary>
     /// Executes the compiled backward graph. Faster than uncompiled because
     /// dead entries are skipped and the traversal order is pre-computed.
+    /// When TensorCodec algebraic optimization is enabled and beneficial,
+    /// delegates to OptimizedBackwardPlan for CSE + transposed BLAS.
     /// </summary>
     public Dictionary<Tensor<T>, Tensor<T>> Execute()
     {
+        // Phase C: try optimized backward with CSE + algebraic simplification
+        if (Optimization.TensorCodecOptions.Current.EnableAlgebraicBackward)
+        {
+            var optimized = OptimizedBackwardPlan<T>.TryCreate(
+                _entries, _reachableEntryIndices, _loss, _sources, _engine);
+            if (optimized != null)
+                return optimized.Execute();
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Assign grad indices for O(1) lookup (same as GradientTape.ComputeGradients)
