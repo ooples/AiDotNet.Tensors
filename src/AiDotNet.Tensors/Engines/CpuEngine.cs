@@ -2614,6 +2614,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (destination.Length < input.Length)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
 
         int length = input.Length;
         if (typeof(T) == typeof(float))
@@ -7439,19 +7441,26 @@ public class CpuEngine : ITensorLevelEngine
         int bRank = bShape.Length;
         if (aRank == 2 && bRank == 2)
             return new[] { aShape[0], bShape[1] };
-        if (bRank == 2)
+
+        // General case: broadcast batch dims (all except last 2), matmul last two dims
+        int maxRank = Math.Max(aRank, bRank);
+        // For 2D inputs treat them as having no batch dims
+        int aBatchRank = aRank - 2;
+        int bBatchRank = bRank - 2;
+        int outBatchRank = Math.Max(maxRank - 2, 0);
+
+        var outShape = new int[maxRank < 2 ? 2 : maxRank];
+        // Broadcast batch dimensions from right to left
+        for (int i = 0; i < outBatchRank; i++)
         {
-            // ND x 2D: batch dims from a, last dim from b
-            var shape = new int[aRank];
-            Array.Copy(aShape, shape, aRank - 1);
-            shape[aRank - 1] = bShape[1];
-            return shape;
+            int aIdx = aBatchRank - 1 - i;
+            int bIdx = bBatchRank - 1 - i;
+            int aDim = aIdx >= 0 ? aShape[aIdx] : 1;
+            int bDim = bIdx >= 0 ? bShape[bIdx] : 1;
+            outShape[outBatchRank - 1 - i] = Math.Max(aDim, bDim);
         }
-        // ND x ND: same batch dims, matmul last two
-        var outShape = new int[aRank];
-        Array.Copy(aShape, outShape, aRank - 2);
-        outShape[aRank - 2] = aShape[aRank - 2];
-        outShape[aRank - 1] = bShape[bRank - 1];
+        outShape[outShape.Length - 2] = aShape[aRank - 2];
+        outShape[outShape.Length - 1] = bShape[bRank - 1];
         return outShape;
     }
 
@@ -20088,10 +20097,13 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
     {
+        // None is an explicit pass-through — no derivative to apply
+        if (activation == FusedActivationType.None) return gradOutput;
+
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
-        // Each activation handler knows how to compute its own backward from pre-activation input.
+        // ActivationRegistry.Get throws for unknown types, preventing silent identity pass-through.
         var handler = ActivationRegistry.Get(activation);
-        if (handler is null) return gradOutput; // None
+        if (handler is null) return gradOutput;
         return handler.ApplyBackward(this, gradOutput, preActivation);
     }
 

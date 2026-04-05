@@ -490,7 +490,8 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, MathF.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0f ? x : 0.01f * x },
         { FusedActivationType.Swish, x => x / (1f + MathF.Exp(-x)) },
-        { FusedActivationType.Softmax, x => x },
+        // Softmax is NOT pointwise (depends on entire row) — must not appear here.
+        // Fused paths that include Softmax should apply it separately after the GEMM loop.
     };
 
     /// <summary>Gets the float activation function delegate for use in tight loops.
@@ -644,7 +645,7 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, Math.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0.0 ? x : 0.01 * x },
         { FusedActivationType.Swish, x => x / (1.0 + Math.Exp(-x)) },
-        { FusedActivationType.Softmax, x => x },
+        // Softmax is NOT pointwise — must not appear here.
     };
 
     /// <summary>Gets the double activation function delegate for use in tight loops.

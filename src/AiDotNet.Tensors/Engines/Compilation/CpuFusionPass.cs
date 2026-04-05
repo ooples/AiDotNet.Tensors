@@ -193,13 +193,6 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             if (bias._shape[0] != matmulOutputCols)
                 return null;
 
-            // Redirect intermediate outputs' LazySource to the fused node so that
-            // auto-materialize through user-held references still works. Setting to
-            // null would leave those tensors with uninitialized data if accessed.
-            // The fused node writes only into finalOutput, so intermediate tensors
-            // will show the fused output shape if accessed (acceptable trade-off
-            // since they are implementation-internal).
-
             var nodeType = ActivationRegistry.GetFusedLinearNodeType(activation);
 
             var capturedInput = input;
@@ -211,7 +204,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
                 ? new object[] { activation }
                 : null;
 
-            return new LazyNode<T>(
+            var fusedNode = new LazyNode<T>(
                 nodeType,
                 "FusedLinear",
                 new[] { capturedInput, capturedWeights, capturedBias },
@@ -223,6 +216,13 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
                 },
                 BackwardFunctions<T>.FusedLinearWithActivationBackward,
                 savedState);
+
+            // Redirect intermediate outputs' LazySource to the fused node so that
+            // user-held references to removed intermediates can still auto-materialize.
+            matmul.Output.LazySource = fusedNode;
+            add.Output.LazySource = fusedNode;
+
+            return fusedNode;
         }
     }
 }
