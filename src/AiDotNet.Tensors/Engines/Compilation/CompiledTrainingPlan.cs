@@ -28,6 +28,9 @@ internal sealed class CompiledTrainingPlan<T>
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
 
+    // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
+    private readonly int[]? _genericGradIndices;
+
     // Cached raw arrays for zero-overhead Step() — avoid AsSpan()/GetDataArray() per call
     private T[][]? _cachedGradArrays;
     private T[]? _cachedLossGradSeedArray;
@@ -41,7 +44,8 @@ internal sealed class CompiledTrainingPlan<T>
         Tensor<T>[] parameters,
         Tensor<T>[] preAllocatedGrads,
         Tensor<T>[] gradients,
-        Tensor<T> lossGradSeed)
+        Tensor<T> lossGradSeed,
+        int[]? genericGradIndices = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -51,6 +55,7 @@ internal sealed class CompiledTrainingPlan<T>
         _preAllocatedGrads = preAllocatedGrads;
         _gradients = gradients;
         _lossGradSeed = lossGradSeed;
+        _genericGradIndices = genericGradIndices;
     }
 
     internal Tensor<T>[] Gradients => _gradients;
@@ -79,9 +84,23 @@ internal sealed class CompiledTrainingPlan<T>
             _cachedLossGradDestArray = _preAllocatedGrads[_preAllocatedGrads.Length - 1].GetDataArray();
         }
 
-        // Zero all gradient buffers — direct Array.Clear on exact tensor length
-        for (int i = 0; i < gradArrays.Length; i++)
-            Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+        // Only zero gradient buffers used by generic (accumulating) backward delegates.
+        // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
+        // At large sizes, this saves significant time by skipping unnecessary clears.
+        if (_genericGradIndices != null)
+        {
+            for (int i = 0; i < _genericGradIndices.Length; i++)
+            {
+                int idx = _genericGradIndices[i];
+                Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+            }
+        }
+        else
+        {
+            // First call: clear everything (safe fallback)
+            for (int i = 0; i < gradArrays.Length; i++)
+                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+        }
 
         // Re-seed loss gradient — direct Array.Copy
         var seedArr = _cachedLossGradSeedArray;
@@ -184,6 +203,7 @@ internal sealed class CompiledTrainingPlan<T>
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
+        int genericBackwardCount = 0;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
@@ -195,6 +215,7 @@ internal sealed class CompiledTrainingPlan<T>
                 backwardActions.Add(action);
             else
             {
+                genericBackwardCount++;
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -226,6 +247,9 @@ internal sealed class CompiledTrainingPlan<T>
                 gradients[i] = gradMap[parameters[i]];
         }
 
+        // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
+        int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
+
         return new CompiledTrainingPlan<T>(
             forwardActions,
             backwardActions.ToArray(),
@@ -234,7 +258,8 @@ internal sealed class CompiledTrainingPlan<T>
             parameters,
             allGrads.ToArray(),
             gradients,
-            lossGradSeed);
+            lossGradSeed,
+            genericGradIndices);
     }
 
     /// <summary>
