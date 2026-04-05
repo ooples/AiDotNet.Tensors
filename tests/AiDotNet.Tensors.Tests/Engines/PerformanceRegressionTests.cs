@@ -131,7 +131,7 @@ public class PerformanceRegressionTests
 
         _output.WriteLine($"FusedLinear double 32x256 + ReLU: {ms:F3}ms (budget: {FusedLinearDoubleBudgetMs}ms)");
         Assert.True(ms < FusedLinearDoubleBudgetMs,
-            $"FusedLinear double took {ms:F3}ms — exceeds {FusedLinear256BudgetMs}ms budget.");
+            $"FusedLinear double took {ms:F3}ms — exceeds {FusedLinearDoubleBudgetMs}ms budget.");
     }
 
     [Fact]

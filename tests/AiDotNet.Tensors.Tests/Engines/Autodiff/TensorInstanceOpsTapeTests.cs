@@ -78,7 +78,8 @@ public class TensorInstanceOpsTapeTests
 
         Assert.True(tape.EntryCount > 0, "Add should record on tape");
         var grads = tape.ComputeGradients(loss, sources: new[] { a, b });
-        Assert.True(grads.ContainsKey(a));
+        Assert.True(grads.ContainsKey(a), "Add should have gradient for a");
+        Assert.True(grads.ContainsKey(b), "Add should have gradient for b");
     }
 
     [Fact]
