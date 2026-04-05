@@ -2886,13 +2886,28 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Divide into pre-allocated destination. Zero allocation.</summary>
-    public void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
+    public unsafe void TensorDivideInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+
+        int length = a.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var aMem = AsFloatMemory(a.Data);
+            var bMem = AsFloatMemory(b.Data);
+            var rMem = AsFloatMemory(destination.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
+            Simd.SimdKernels.VectorDivideUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+        }
     }
 
     /// <summary>Exp into pre-allocated destination. Zero allocation.</summary>

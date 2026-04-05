@@ -390,8 +390,8 @@ internal sealed class CompiledTrainingPlan<T>
 
         // TensorTranspose: don't specialize (no Into variant, allocate+copy is slower)
 
-        // TensorDivide: don't specialize — the engine's allocating path with JIT/SIMD is faster
-        // than our Into variant for division (SIMD divide is inherently expensive)
+        // TensorDivide: no Into specialization (Pin overhead in Into variants
+        // exceeds the allocation savings — eager path uses fixed+GetDataArray which is faster)
 
         // BatchMatMul/BroadcastAdd: don't specialize (allocate+copy is slower than eager)
         // These need proper Into variants to be worth specializing
