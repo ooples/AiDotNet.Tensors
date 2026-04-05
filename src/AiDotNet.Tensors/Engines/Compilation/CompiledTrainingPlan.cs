@@ -142,14 +142,23 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Build forward actions: fused actions first, then remaining unfused steps
+        // Build forward actions with specialized direct-BLAS where possible
         var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
         for (int i = 0; i < forwardSteps.Count; i++)
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
-            var output = step.OutputBuffer;
-            var exec = step.Execute;
-            allForwardActions.Add(eng => exec(eng, output));
+            var specialized = BuildSpecializedForward(step);
+            if (specialized != null)
+            {
+                allForwardActions.Add(specialized);
+            }
+            else
+            {
+                var output = step.OutputBuffer;
+                var exec = step.Execute;
+                allForwardActions.Add(eng => exec(eng, output));
+            }
         }
         var forwardActions = allForwardActions.ToArray();
 
@@ -209,6 +218,57 @@ internal sealed class CompiledTrainingPlan<T>
     }
 
     /// <summary>
+    /// Generates a specialized forward delegate that bypasses engine dispatch overhead.
+    /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
+    /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
+    /// </summary>
+    private static unsafe Action<IEngine>? BuildSpecializedForward(CompiledStep<T> step)
+    {
+        if (typeof(T) != typeof(float)) return null;
+
+        // MatMul forward: direct BLAS into output buffer
+        if (step.OpName == "TensorMatMul" && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && BlasProvider.IsAvailable)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+
+            // Cache arrays on first call
+            float[]? cA = null, cB = null, cOut = null;
+
+            return eng =>
+            {
+                cA ??= (float[])(object)inputA.GetDataArray();
+                cB ??= (float[])(object)inputB.GetDataArray();
+                cOut ??= (float[])(object)output.GetDataArray();
+                Array.Clear(cOut, 0, M * N);
+                BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
+            };
+        }
+
+        // ReLU forward: direct SIMD into output buffer
+        if (step.OpName == "ReLU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            return eng =>
+            {
+                var iMem = ((Tensor<float>)(object)input).Data;
+                var oMem = ((Tensor<float>)(object)output).Data;
+                using var pinI = iMem.Pin();
+                using var pinO = oMem.Pin();
+                SimdKernels.ReLUUnsafe((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
+            };
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Generates a specialized backward delegate that writes directly into pre-allocated
     /// gradient buffers using transposed BLAS GEMM and SIMD kernels. No intermediate allocations.
     /// </summary>
@@ -240,18 +300,21 @@ internal sealed class CompiledTrainingPlan<T>
             bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
+            // Cache array references on first call to avoid GetDataArray() overhead per step
+            float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
+
             return eng =>
             {
-                var dCArr = (float[])(object)gradOut.GetDataArray();
-                var aArr = (float[])(object)inputA.GetDataArray();
-                var bArr = (float[])(object)inputB.GetDataArray();
-                var destA = (float[])(object)gradA.GetDataArray();
-                var destB = (float[])(object)gradB.GetDataArray();
+                cachedDC ??= (float[])(object)gradOut.GetDataArray();
+                cachedA ??= (float[])(object)inputA.GetDataArray();
+                cachedB ??= (float[])(object)inputB.GetDataArray();
+                cachedDestA ??= (float[])(object)gradA.GetDataArray();
+                cachedDestB ??= (float[])(object)gradB.GetDataArray();
 
                 // dA = dC @ B^T — direct BLAS into pre-allocated buffer
-                BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, N, true, destA, 0, K);
+                BlasProvider.TryGemmEx(M, K, N, cachedDC, 0, N, false, cachedB, 0, N, true, cachedDestA, 0, K);
                 // dB = A^T @ dC — direct BLAS into pre-allocated buffer
-                BlasProvider.TryGemmEx(K, N, M, aArr, 0, K, true, dCArr, 0, N, false, destB, 0, N);
+                BlasProvider.TryGemmEx(K, N, M, cachedA, 0, K, true, cachedDC, 0, N, false, cachedDestB, 0, N);
 
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
