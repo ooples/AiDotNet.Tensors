@@ -19282,22 +19282,29 @@ public class CpuEngine : ITensorLevelEngine
         // backward can trace the dependency chain from loss -> output -> parameters.
         // The BLAS fast path below bypasses the tape (operates on raw arrays), so we
         // must use the recorded path during training.
-        if (Autodiff.GradientTape<T>.Current is not null)
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
             var result = TensorMatMul(input, weights);
             if (bias != null)
                 result = TensorBroadcastAdd(result, bias);
             // Apply activation through recorded ops (each records its own backward)
-            result = activation switch
+            if (activation != FusedActivationType.None)
             {
-                FusedActivationType.ReLU => ReLU(result),
-                FusedActivationType.Sigmoid => Sigmoid(result),
-                FusedActivationType.Tanh => Tanh(result),
-                FusedActivationType.GELU => GELU(result),
-                FusedActivationType.Swish => Swish(result),
-                FusedActivationType.LeakyReLU => LeakyReLU(result, MathHelper.GetNumericOperations<T>().FromDouble(0.01)),
-                _ => result
-            };
+                var numOps = MathHelper.GetNumericOperations<T>();
+                result = activation switch
+                {
+                    FusedActivationType.ReLU => ReLU(result),
+                    FusedActivationType.Sigmoid => Sigmoid(result),
+                    FusedActivationType.Tanh => Tanh(result),
+                    FusedActivationType.GELU => GELU(result),
+                    FusedActivationType.Swish => Swish(result),
+                    FusedActivationType.LeakyReLU => LeakyReLU(result, numOps.FromDouble(0.01)),
+                    FusedActivationType.ELU => ELU(result),
+                    FusedActivationType.Softmax => Softmax(result),
+                    _ => throw new ArgumentOutOfRangeException(nameof(activation), activation,
+                        $"Unsupported activation type {activation} in tape-recorded FusedLinear path")
+                };
+            }
             return result;
         }
 

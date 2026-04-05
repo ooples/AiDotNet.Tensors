@@ -25,6 +25,7 @@ public class FusedLinearTapeTests
     [InlineData(FusedActivationType.Tanh)]
     [InlineData(FusedActivationType.GELU)]
     [InlineData(FusedActivationType.Swish)]
+    [InlineData(FusedActivationType.LeakyReLU)]
     public void FusedLinear_Float_AllActivations_ProducesGradients(FusedActivationType activation)
     {
         var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, [2, 2]);
@@ -127,14 +128,14 @@ public class FusedLinearTapeTests
         Assert.Equal(8, result._shape[1]);
 
         // Verify output is reasonable (not all zeros, no NaN)
-        bool allZero = true;
+        bool anyNonZero = false;
         for (int i = 0; i < result.Length; i++)
         {
             float v = result.GetFlat(i);
             Assert.False(float.IsNaN(v), "Output should not contain NaN");
-            if (v != 0f) allZero = false;
+            if (v != 0f) anyNonZero = true;
         }
-        // With random inputs and ReLU, some should be non-zero
+        Assert.True(anyNonZero, "Output should have non-zero values with random inputs");
     }
 
     [Fact]
@@ -160,7 +161,6 @@ public class FusedLinearTapeTests
 
         // Apply SGD update: param -= lr * grad
         float lr = 0.01f;
-        var numOps = MathHelper.GetNumericOperations<float>();
         var wGrad = grads[weights];
         var bGrad = grads[bias];
 
