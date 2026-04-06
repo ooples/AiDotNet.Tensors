@@ -7728,37 +7728,21 @@ public class CpuEngine : ITensorLevelEngine
                 int cols0 = tensor._shape[1];
                 var captured = tensor;
                 return scope.RecordUnary(LazyNodeType.Transpose, "TensorTranspose", tensor, new[] { cols0, rows0 },
-                    (eng, output) => { var eager = eng.TensorTranspose(captured); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // TensorTranspose returns a view — need to materialize contiguous data into the output buffer
+                        var transposed = eng.TensorTranspose(captured);
+                        var data = transposed.ToArray();
+                        data.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
                     BackwardFunctions<T>.TransposeBackward);
             }
         }
 
-        int rows = tensor._shape[0];
-        int cols = tensor._shape[1];
-        var result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
-
-        var srcData = tensor.GetFlattenedData();
-        var dstData = result.GetDataArray();
-
-        // Cache-blocked transpose for better locality
-        const int Block = 32;
-        for (int ii = 0; ii < rows; ii += Block)
-        {
-            int iEnd = Math.Min(ii + Block, rows);
-            for (int jj = 0; jj < cols; jj += Block)
-            {
-                int jEnd = Math.Min(jj + Block, cols);
-                for (int i = ii; i < iEnd; i++)
-                {
-                    int srcRow = i * cols;
-                    for (int j = jj; j < jEnd; j++)
-                    {
-                        dstData[j * rows + i] = srcData[srcRow + j];
-                    }
-                }
-            }
-        }
-
+        // Return a contiguous transposed copy for API compatibility.
+        // The lazy graph path uses a more efficient execute delegate.
+        var view = tensor.Transpose();
+        var result = view.Contiguous();
         DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         return result;
     }
