@@ -319,11 +319,11 @@ public class TensorCodecVsPyTorchBenchmarks
     // 5. BATCH NORMALIZATION: Critical for training
     // ═══════════════════════════════════════════════════════════════════
 
-    [Benchmark(Description = "AiDotNet: BatchNorm[32x64x8x8]")]
-    public Tensor<float> AiDotNet_BatchNorm()
-    {
-        return _engine.BatchNorm(_bn_input, _bn_gamma, _bn_beta, 1e-5, out _, out _);
-    }
+    [Benchmark(Description = "AiDotNet Eager: BatchNorm[32x64x8x8]")]
+    public Tensor<float> AiDotNet_BatchNorm() => _engine.BatchNorm(_bn_input, _bn_gamma, _bn_beta, 1e-5, out _, out _);
+
+    [Benchmark(Description = "AiDotNet Compiled: BatchNorm[32x64x8x8]")]
+    public Tensor<float> AiDotNet_BatchNorm_Compiled() => _batchnormPlan is not null ? _batchnormPlan.Execute() : _engine.BatchNorm(_bn_input, _bn_gamma, _bn_beta, 1e-5, out _, out _);
 
     [Benchmark(Description = "PyTorch: BatchNorm[32x64x8x8]")]
     public TorchTensor PyTorch_BatchNorm()
@@ -339,11 +339,11 @@ public class TensorCodecVsPyTorchBenchmarks
     // 6. LAYER NORMALIZATION: Transformer building block
     // ═══════════════════════════════════════════════════════════════════
 
-    [Benchmark(Description = "AiDotNet: LayerNorm[32x128]")]
-    public Tensor<float> AiDotNet_LayerNorm()
-    {
-        return _engine.LayerNorm(_ln_input, _ln_gamma, _ln_beta, 1e-5, out _, out _);
-    }
+    [Benchmark(Description = "AiDotNet Eager: LayerNorm[32x128]")]
+    public Tensor<float> AiDotNet_LayerNorm() => _engine.LayerNorm(_ln_input, _ln_gamma, _ln_beta, 1e-5, out _, out _);
+
+    [Benchmark(Description = "AiDotNet Compiled: LayerNorm[32x128]")]
+    public Tensor<float> AiDotNet_LayerNorm_Compiled() => _layernormPlan is not null ? _layernormPlan.Execute() : _engine.LayerNorm(_ln_input, _ln_gamma, _ln_beta, 1e-5, out _, out _);
 
     [Benchmark(Description = "PyTorch: LayerNorm[32x128]")]
     public TorchTensor PyTorch_LayerNorm()
@@ -373,7 +373,7 @@ public class TensorCodecVsPyTorchBenchmarks
         for (int i = 0; i < _fusedW2.Length; i++) _fusedW2[i] = (float)(rng.NextDouble() * 2 - 1);
     }
 
-    [Benchmark(Description = "AiDotNet: FusedTwoLayerGemm[32x128→64→10] (Phase B)")]
+    [Benchmark(Description = "AiDotNet Eager: FusedTwoLayerGemm[32x128→64→10] (Phase B)")]
     public void AiDotNet_FusedTwoLayerGemm()
     {
         FusedMultiLayerGemm.FusedGemmActivationGemm(
@@ -429,14 +429,14 @@ public class TensorCodecVsPyTorchBenchmarks
             _spectralWorkspace = new float[m * _spectralFactors.Value.Rank];
     }
 
-    [Benchmark(Description = "AiDotNet: SpectralMatMul[32x64,64x64] rank-16 (Phase A)")]
+    [Benchmark(Description = "AiDotNet Eager: SpectralMatMul[32x64,64x64] rank-16 (Phase A)")]
     public void AiDotNet_SpectralMatMul()
     {
         if (_spectralFactors.HasValue)
             SvdDecomposition.SpectralMatMul(_spectralX!, 32, 64, _spectralFactors.Value, _spectralOut!, _spectralWorkspace);
     }
 
-    [Benchmark(Description = "AiDotNet: DirectMatMul[32x64,64x64] (baseline)")]
+    [Benchmark(Description = "AiDotNet Eager: DirectMatMul[32x64,64x64] (baseline)")]
     public void AiDotNet_DirectMatMul()
     {
         Array.Clear(_spectralOut!, 0, _spectralOut!.Length);
@@ -457,7 +457,7 @@ public class TensorCodecVsPyTorchBenchmarks
     private TorchTensor _t_op_large = null!;
     private TorchTensor _t_op_2d = null!;
 
-    // Compiled plans for gap ops
+    // Compiled plans for ALL individual ops
     private CompiledInferencePlan<float>? _addPlan;
     private CompiledInferencePlan<float>? _geluPlan;
     private CompiledInferencePlan<float>? _transposePlan;
@@ -465,6 +465,19 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _sigmoidPlan;
     private CompiledInferencePlan<float>? _softmaxPlan;
     private CompiledInferencePlan<float>? _matmulPlan;
+    private CompiledInferencePlan<float>? _multiplyPlan;
+    private CompiledInferencePlan<float>? _subtractPlan;
+    private CompiledInferencePlan<float>? _reluPlan;
+    private CompiledInferencePlan<float>? _tanhPlan;
+    private CompiledInferencePlan<float>? _leakyReluPlan;
+    private CompiledInferencePlan<float>? _swishPlan;
+    private CompiledInferencePlan<float>? _mishPlan;
+    private CompiledInferencePlan<float>? _expPlan;
+    private CompiledInferencePlan<float>? _logPlan;
+    private CompiledInferencePlan<float>? _conv2dPlan;
+    private CompiledInferencePlan<float>? _maxpoolPlan;
+    private CompiledInferencePlan<float>? _batchnormPlan;
+    private CompiledInferencePlan<float>? _layernormPlan;
 
     private void SetupOps()
     {
@@ -488,6 +501,19 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.Sigmoid(_op_a); _sigmoidPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.Softmax(_op_2d, -1); _softmaxPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorMatMul(_op_2d, _op_2d); _matmulPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMultiply(_op_a, _op_b); _multiplyPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSubtract(_op_a, _op_b); _subtractPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReLU(_op_a); _reluPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Tanh(_op_a); _tanhPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.LeakyReLU(_op_a, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().FromDouble(0.01)); _leakyReluPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Swish(_op_a); _swishPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Mish(_op_a); _mishPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorExp(_op_a); _expPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorLog(_op_a); _logPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Conv2D(_conv_input, _conv_kernel, stride: 1, padding: 1); _conv2dPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.MaxPool2D(_bn_input, poolSize: 2, stride: 2); _maxpoolPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.BatchNorm(_bn_input, _bn_gamma, _bn_beta, 1e-5, out _, out _); _batchnormPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.LayerNorm(_ln_input, _ln_gamma, _ln_beta, 1e-5, out _, out _); _layernormPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -503,8 +529,11 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_Add_100K() => _t_op_a + _t_op_b;
 
     // --- Multiply ---
-    [Benchmark(Description = "AiDotNet: Multiply[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Multiply[100K]")]
     public Tensor<float> AiDotNet_Multiply_100K() => _engine.TensorMultiply(_op_a, _op_b);
+
+    [Benchmark(Description = "AiDotNet Compiled: Multiply[100K]")]
+    public Tensor<float> AiDotNet_Multiply_100K_Compiled() => _multiplyPlan is not null ? _multiplyPlan.Execute() : _engine.TensorMultiply(_op_a, _op_b);
 
     [Benchmark(Description = "PyTorch: Multiply[100K]")]
     public TorchTensor PyTorch_Multiply_100K() => _t_op_a * _t_op_b;
@@ -520,15 +549,21 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_GELU_100K() => torch.nn.functional.gelu(_t_op_a);
 
     // --- Swish/SiLU ---
-    [Benchmark(Description = "AiDotNet: Swish[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Swish[100K]")]
     public Tensor<float> AiDotNet_Swish_100K() => _engine.Swish(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Swish[100K]")]
+    public Tensor<float> AiDotNet_Swish_100K_Compiled() => _swishPlan is not null ? _swishPlan.Execute() : _engine.Swish(_op_a);
 
     [Benchmark(Description = "PyTorch: SiLU[100K]")]
     public TorchTensor PyTorch_Swish_100K() => torch.nn.functional.silu(_t_op_a);
 
     // --- Mish ---
-    [Benchmark(Description = "AiDotNet: Mish[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Mish[100K]")]
     public Tensor<float> AiDotNet_Mish_100K() => _engine.Mish(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Mish[100K]")]
+    public Tensor<float> AiDotNet_Mish_100K_Compiled() => _mishPlan is not null ? _mishPlan.Execute() : _engine.Mish(_op_a);
 
     [Benchmark(Description = "PyTorch: Mish[100K]")]
     public TorchTensor PyTorch_Mish_100K() => torch.nn.functional.mish(_t_op_a);
@@ -564,7 +599,7 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_ReduceSum() => _t_op_large.sum();
 
     // --- Conv2D ---
-    [Benchmark(Description = "AiDotNet: Conv2D[4x3x32x32, 16x3x3x3]")]
+    [Benchmark(Description = "AiDotNet Eager: Conv2D[4x3x32x32, 16x3x3x3]")]
     public Tensor<float> AiDotNet_Conv2D_3x3()
         => _engine.Conv2D(_conv_input, _conv_kernel, stride: 1, padding: 1);
 
@@ -576,8 +611,11 @@ public class TensorCodecVsPyTorchBenchmarks
     }
 
     // --- MaxPool2D ---
-    [Benchmark(Description = "AiDotNet: MaxPool2D[32x64x8x8, pool=2]")]
+    [Benchmark(Description = "AiDotNet Eager: MaxPool2D[32x64x8x8, pool=2]")]
     public Tensor<float> AiDotNet_MaxPool2D() => _engine.MaxPool2D(_bn_input, poolSize: 2, stride: 2);
+
+    [Benchmark(Description = "AiDotNet Compiled: MaxPool2D[32x64x8x8, pool=2]")]
+    public Tensor<float> AiDotNet_MaxPool2D_Compiled() => _maxpoolPlan is not null ? _maxpoolPlan.Execute() : _engine.MaxPool2D(_bn_input, poolSize: 2, stride: 2);
 
     [Benchmark(Description = "PyTorch: MaxPool2D[32x64x8x8, pool=2]")]
     public TorchTensor PyTorch_MaxPool2D()
@@ -600,14 +638,17 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_Sigmoid_100K() => torch.sigmoid(_t_op_a);
 
     // --- Tanh ---
-    [Benchmark(Description = "AiDotNet: Tanh[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Tanh[100K]")]
     public Tensor<float> AiDotNet_Tanh_100K() => _engine.Tanh(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Tanh[100K]")]
+    public Tensor<float> AiDotNet_Tanh_100K_Compiled() => _tanhPlan is not null ? _tanhPlan.Execute() : _engine.Tanh(_op_a);
 
     [Benchmark(Description = "PyTorch: Tanh[100K]")]
     public TorchTensor PyTorch_Tanh_100K() => torch.tanh(_t_op_a);
 
     // --- LeakyReLU ---
-    [Benchmark(Description = "AiDotNet: LeakyReLU[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: LeakyReLU[100K]")]
     public Tensor<float> AiDotNet_LeakyReLU_100K()
     {
         return _engine.LeakyReLU(_op_a, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().FromDouble(0.01));
@@ -617,22 +658,31 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_LeakyReLU_100K() => torch.nn.functional.leaky_relu(_t_op_a, 0.01);
 
     // --- ReLU ---
-    [Benchmark(Description = "AiDotNet: ReLU[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: ReLU[100K]")]
     public Tensor<float> AiDotNet_ReLU_100K() => _engine.ReLU(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: ReLU[100K]")]
+    public Tensor<float> AiDotNet_ReLU_100K_Compiled() => _reluPlan is not null ? _reluPlan.Execute() : _engine.ReLU(_op_a);
 
     [Benchmark(Description = "PyTorch: ReLU[100K]")]
     public TorchTensor PyTorch_ReLU_100K() => torch.nn.functional.relu(_t_op_a);
 
     // --- Exp ---
-    [Benchmark(Description = "AiDotNet: Exp[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Exp[100K]")]
     public Tensor<float> AiDotNet_Exp_100K() => _engine.TensorExp(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Exp[100K]")]
+    public Tensor<float> AiDotNet_Exp_100K_Compiled() => _expPlan is not null ? _expPlan.Execute() : _engine.TensorExp(_op_a);
 
     [Benchmark(Description = "PyTorch: Exp[100K]")]
     public TorchTensor PyTorch_Exp_100K() => torch.exp(_t_op_a);
 
     // --- Log ---
-    [Benchmark(Description = "AiDotNet: Log[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Log[100K]")]
     public Tensor<float> AiDotNet_Log_100K() => _engine.TensorLog(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Log[100K]")]
+    public Tensor<float> AiDotNet_Log_100K_Compiled() => _logPlan is not null ? _logPlan.Execute() : _engine.TensorLog(_op_a);
 
     [Benchmark(Description = "PyTorch: Log[100K]")]
     public TorchTensor PyTorch_Log_100K() => torch.log(_t_op_a);
@@ -648,8 +698,11 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_MatMul_256() => torch.matmul(_t_op_2d, _t_op_2d);
 
     // --- Subtract ---
-    [Benchmark(Description = "AiDotNet: Subtract[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Subtract[100K]")]
     public Tensor<float> AiDotNet_Sub_100K() => _engine.TensorSubtract(_op_a, _op_b);
+
+    [Benchmark(Description = "AiDotNet Compiled: Subtract[100K]")]
+    public Tensor<float> AiDotNet_Sub_100K_Compiled() => _subtractPlan is not null ? _subtractPlan.Execute() : _engine.TensorSubtract(_op_a, _op_b);
 
     [Benchmark(Description = "PyTorch: Subtract[100K]")]
     public TorchTensor PyTorch_Sub_100K() => _t_op_a - _t_op_b;
