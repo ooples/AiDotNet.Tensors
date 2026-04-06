@@ -327,10 +327,14 @@ internal sealed class CompiledTrainingPlan<T>
             {
                 cIn ??= (float[])(object)input.GetDataArray();
                 cOut ??= (float[])(object)output.GetDataArray();
-                float sum = 0;
-                int len = input.Length;
-                for (int j = 0; j < len; j++) sum += cIn[j];
-                cOut[0] = sum;
+                // Use SIMD parallel sum for large arrays instead of scalar loop
+                unsafe
+                {
+                    fixed (float* p = cIn)
+                    {
+                        cOut[0] = SimdKernels.SumUnsafe(p, input.Length);
+                    }
+                }
             };
         }
 
@@ -441,6 +445,36 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
+
+        // Transpose forward: cache-blocked copy into pre-allocated buffer
+        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1
+            && step.Inputs[0].Rank == 2 && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0];
+            var o = step.OutputBuffer;
+            int rows = inp._shape[0], cols = inp._shape[1];
+            float[]? cIn = null, cOut = null;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                const int Block = 32;
+                for (int ii = 0; ii < rows; ii += Block)
+                {
+                    int iEnd = Math.Min(ii + Block, rows);
+                    for (int jj = 0; jj < cols; jj += Block)
+                    {
+                        int jEnd = Math.Min(jj + Block, cols);
+                        for (int i = ii; i < iEnd; i++)
+                        {
+                            int srcRow = i * cols;
+                            for (int j = jj; j < jEnd; j++)
+                                cOut[j * rows + i] = cIn[srcRow + j];
+                        }
+                    }
+                }
+            };
+        }
 
         return null;
     }
