@@ -3001,7 +3001,7 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
-    /// <summary>Exp into pre-allocated destination. Uses VML/SVML when available.</summary>
+    /// <summary>Exp into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
     public unsafe void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -3012,14 +3012,14 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.ExpUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    /// <summary>Log into pre-allocated destination. Uses VML/SVML when available.</summary>
+    /// <summary>Log into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
     public unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -3030,7 +3030,7 @@ public class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            Simd.SimdKernels.LogUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
