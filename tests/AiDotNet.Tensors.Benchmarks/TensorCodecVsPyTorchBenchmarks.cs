@@ -481,7 +481,7 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _absPlan;
     private CompiledInferencePlan<float>? _powPlan;
     private CompiledInferencePlan<float>? _logSoftmaxPlan;
-    private CompiledInferencePlan<float>? _meanPlan;
+    private CompiledInferencePlan<float>? _groupnormPlan;
 
     private void SetupOps()
     {
@@ -521,7 +521,7 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.TensorAbs(_op_a); _absPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorPower(_op_a, 2.0f); _powPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorLogSoftmax(_op_2d, -1); _logSoftmaxPlan = s.CompileInference<float>(); }
-            using (var s = GraphMode.Enable()) { _engine.ReduceSum(_op_large, null); _meanPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.GroupNorm(_bn_input, 8, _bn_gamma, _bn_beta, 1e-5, out _, out _); _groupnormPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -828,6 +828,9 @@ public class TensorCodecVsPyTorchBenchmarks
     {
         return _engine.GroupNorm(_bn_input, 8, _bn_gamma, _bn_beta, 1e-5, out _, out _);
     }
+
+    [Benchmark(Description = "AiDotNet Compiled: GroupNorm[32x64x8x8]")]
+    public Tensor<float> AiDotNet_GroupNorm_Compiled() => _groupnormPlan is not null ? _groupnormPlan.Execute() : _engine.GroupNorm(_bn_input, 8, _bn_gamma, _bn_beta, 1e-5, out _, out _);
 
     [Benchmark(Description = "PyTorch: GroupNorm[32x64x8x8]")]
     public TorchTensor PyTorch_GroupNorm()

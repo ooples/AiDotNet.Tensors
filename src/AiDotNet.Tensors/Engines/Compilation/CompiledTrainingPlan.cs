@@ -525,6 +525,38 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
         }
 
+        // LogSoftmax forward: direct into output buffer using LogSoftmaxFloatFastPtr
+        if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            int axis = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToInt32(step.SavedState[0]) : -1;
+            return eng =>
+            {
+                // Use engine's LogSoftmax which has the fast float path, copy result
+                if (eng is CpuEngine cpu)
+                {
+                    var r = cpu.TensorLogSoftmax(inp, axis);
+                    r.AsSpan().CopyTo(o.AsWritableSpan());
+                }
+            };
+        }
+
+        // Mean forward: direct sum + divide into scalar output
+        if (step.OpName == "Mean" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                T sum = eng.TensorSum(inp);
+                if (typeof(T) == typeof(float))
+                {
+                    float fSum = Unsafe.As<T, float>(ref sum);
+                    float mean = fSum / inp.Length;
+                    o.GetDataArray()[0] = Unsafe.As<float, T>(ref mean);
+                }
+            };
+        }
+
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
         // Transpose forward: zero-copy strided view (same as PyTorch .t())
