@@ -12448,6 +12448,30 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+
+        // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
+                // Execute eagerly to fill out params
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
+                GraphMode.SetCurrent(savedScope);
+                // Record in graph so compiled plan captures the dependency
+                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
+                    new[] { input, gamma, beta }, eagerResult._shape,
+                    (eng, output) => { var r = eng.BatchNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+                // Copy eager data into lazy output
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -13163,6 +13187,25 @@ public class CpuEngine : ITensorLevelEngine
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
+                    new[] { input, gamma, beta }, eagerResult._shape,
+                    (eng, output) => { var r = eng.LayerNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
 
@@ -13343,6 +13386,26 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; var cb = beta; int cn = numGroups; double ce = epsilon;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = GroupNorm(ci, cn, cg, cb, ce, out mean, out variance);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "GroupNorm",
+                    new[] { input, gamma, beta }, eagerResult._shape,
+                    (eng, output) => { var r = eng.GroupNorm(ci, cn, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.GroupNormBackward, new object[] { mean, variance, numGroups, epsilon });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
         if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
 
@@ -13583,6 +13646,25 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; double ce = epsilon;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = RMSNorm(ci, cg, ce, out rms);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, eagerResult._shape,
+                    (eng, output) => { var r = eng.RMSNorm(ci, cg, ce, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -15245,6 +15327,24 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cs = source; var ci = indices; int cd = dim; int? co = outputSize;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = ScatterMean(cs, ci, out counts, cd, co);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "ScatterMean", source, eagerResult._shape,
+                    (eng, output) => { var r = eng.ScatterMean(cs, ci, out _, cd, co); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -18887,6 +18987,32 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (numSplits <= 0) throw new ArgumentException("Number of splits must be positive", nameof(numSplits));
+
+        // GraphMode: execute eagerly and record each split result individually
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; int cn = numSplits; int ca = axis;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResults = TensorSplit(ct, cn, ca);
+                GraphMode.SetCurrent(savedScope);
+                // Record each split as a separate lazy node
+                var lazyResults = new Tensor<T>[eagerResults.Length];
+                for (int s = 0; s < eagerResults.Length; s++)
+                {
+                    int splitIdx = s;
+                    var eager = eagerResults[s];
+                    lazyResults[s] = scope.RecordUnary(LazyNodeType.Custom, "TensorSplit", tensor, eager._shape,
+                        (eng, output) => { var r = eng.TensorSplit(ct, cn, ca)[splitIdx]; r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                        BackwardFunctions<T>.SplitBackward, new object[] { numSplits, axis, s });
+                    eager.AsSpan().CopyTo(lazyResults[s].AsWritableSpan());
+                }
+                return lazyResults;
+            }
+        }
 
         // Normalize axis
         if (axis < 0) axis = tensor._shape.Length + axis;
@@ -22799,6 +22925,25 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = InstanceNorm(ci, cg, cb, ce, out mean, out variance);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "InstanceNorm",
+                    new[] { input, gamma, beta }, eagerResult._shape,
+                    (eng, output) => { var r = eng.InstanceNorm(ci, cg, cb, ce, out _, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -22961,6 +23106,24 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; double cdr = dropoutRate; bool ct = training;
+                var savedScope = GraphMode.Current;
+                GraphMode.SetCurrent(null);
+                var eagerResult = Dropout(ci, cdr, ct, out mask);
+                GraphMode.SetCurrent(savedScope);
+                var lazyResult = scope.RecordUnary(LazyNodeType.Custom, "Dropout", input, eagerResult._shape,
+                    (eng, output) => { var r = eng.Dropout(ci, cdr, ct, out _); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
+                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                return lazyResult;
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var maskData = new T[input.Length];
@@ -23014,6 +23177,20 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = indices; var ct = embeddingTable;
+                int embDim = embeddingTable._shape[^1];
+                var outShape = new[] { indices.Length, embDim };
+                return scope.RecordUnary(LazyNodeType.Custom, "Embedding", embeddingTable, outShape,
+                    (eng, output) => { var r = eng.Embedding(ci, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.EmbeddingBackward, new object[] { indices });
+            }
+        }
+
         int vocabSize = embeddingTable._shape[0];
         int embeddingDim = embeddingTable._shape[^1];
         int numIndices = indices.Length;
@@ -24871,6 +25048,17 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (predicted == null) throw new ArgumentNullException(nameof(predicted));
         if (target == null) throw new ArgumentNullException(nameof(target));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cp = predicted; var ct = target;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorIoULoss", predicted, target, new[] { predicted._shape[0] },
+                    (eng, output) => { var r = eng.TensorIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
         if (target.Shape.Length != 2 || target.Shape[1] != 4)
@@ -24926,6 +25114,17 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (predicted == null) throw new ArgumentNullException(nameof(predicted));
         if (target == null) throw new ArgumentNullException(nameof(target));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cp = predicted; var ct = target;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorGIoULoss", predicted, target, new[] { predicted._shape[0] },
+                    (eng, output) => { var r = eng.TensorGIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
         if (target.Shape.Length != 2 || target.Shape[1] != 4)
@@ -24985,6 +25184,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (predicted == null) throw new ArgumentNullException(nameof(predicted));
         if (target == null) throw new ArgumentNullException(nameof(target));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cp = predicted; var ct = target;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorDIoULoss", predicted, target, new[] { predicted._shape[0] },
+                    (eng, output) => { var r = eng.TensorDIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
+
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
         if (target.Shape.Length != 2 || target.Shape[1] != 4)
@@ -25051,6 +25262,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (predicted == null) throw new ArgumentNullException(nameof(predicted));
         if (target == null) throw new ArgumentNullException(nameof(target));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cp = predicted; var ct = target;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorCIoULoss", predicted, target, new[] { predicted._shape[0] },
+                    (eng, output) => { var r = eng.TensorCIoULoss(cp, ct); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
+
         if (predicted.Shape.Length != 2 || predicted.Shape[1] != 4)
             throw new ArgumentException("Predicted must be [N, 4] in (x1, y1, x2, y2) format.", nameof(predicted));
         if (target.Shape.Length != 2 || target.Shape[1] != 4)
