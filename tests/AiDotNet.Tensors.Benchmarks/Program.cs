@@ -8,7 +8,8 @@ class Program
 {
     // TensorFlow.Binding NuGet is not built in Release mode, so we must disable the validator
     private static readonly IConfig BenchConfig = DefaultConfig.Instance
-        .WithOptions(ConfigOptions.DisableOptimizationsValidator);
+        .WithOptions(ConfigOptions.DisableOptimizationsValidator)
+        .WithBuildTimeout(TimeSpan.FromMinutes(5));
 
     static void Main(string[] args)
     {
