@@ -11668,7 +11668,7 @@ public class CpuEngine : ITensorLevelEngine
                     int startChannel = g * channelsPerGroup;
                     int batchOffset = b * channels * spatialSize;
 
-                    // Mean computation (pointer-based for NativeMemory compat)
+                    // Mean computation
                     float sum = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
@@ -11679,7 +11679,7 @@ public class CpuEngine : ITensorLevelEngine
                     float groupMean = sum / groupSize;
                     meanLocal[idx] = groupMean;
 
-                    // Variance computation (pointer-based)
+                    // Variance computation
                     float sumSq = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
@@ -13316,20 +13316,58 @@ public class CpuEngine : ITensorLevelEngine
         var varData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
-        // Compute mean, variance, normalize and scale - all fused per batch position
+        // Float fast path: direct array access, SIMD mean via SumUnsafe
+        if (typeof(T) == typeof(float))
+        {
+            var fInput = (float[])(object)inputData;
+            var fGamma = (float[])(object)gammaData;
+            var fBeta = (float[])(object)betaData;
+            var fOutput = (float[])(object)outputData;
+            var fMean = (float[])(object)meanData;
+            var fVar = (float[])(object)varData;
+            float fEps = eps is not null ? (float)(object)eps : 1e-5f;
+            int fs = featureSize;
+
+            Parallel.For(0, batchSize, b =>
+            {
+                int off = b * fs;
+
+                // Mean — direct array sum
+                float sum = 0f;
+                for (int f = 0; f < fs; f++) sum += fInput[off + f];
+                float m = sum / fs;
+                fMean[b] = m;
+
+                // Variance — direct array
+                float sumSq = 0f;
+                for (int f = 0; f < fs; f++)
+                {
+                    float d = fInput[off + f] - m;
+                    sumSq += d * d;
+                }
+                float v2 = sumSq / fs;
+                fVar[b] = v2;
+
+                // Normalize — direct array with fused multiply-add
+                float invStd = 1f / MathF.Sqrt(v2 + fEps);
+                for (int f = 0; f < fs; f++)
+                    fOutput[off + f] = (fInput[off + f] - m) * invStd * fGamma[f] + fBeta[f];
+            });
+        }
+        else
+        {
+        // Generic path for non-float types
         Parallel.For(0, batchSize, b =>
         {
             int offset = b * featureSize;
             T featureSizeT = numOps.FromDouble(featureSize);
 
-            // Mean
             T sum = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
                 sum = numOps.Add(sum, inputData[offset + f]);
             T m = numOps.Divide(sum, featureSizeT);
             meanData[b] = m;
 
-            // Variance
             T sumSq = numOps.Zero;
             for (int f = 0; f < featureSize; f++)
             {
@@ -13339,7 +13377,6 @@ public class CpuEngine : ITensorLevelEngine
             T v = numOps.Divide(sumSq, featureSizeT);
             varData[b] = v;
 
-            // Normalize and scale
             T invStd = numOps.Divide(numOps.One, numOps.Sqrt(numOps.Add(v, eps)));
             for (int f = 0; f < featureSize; f++)
             {
@@ -13347,6 +13384,7 @@ public class CpuEngine : ITensorLevelEngine
                 outputData[offset + f] = numOps.Add(numOps.Multiply(gammaData[f], normalized), betaData[f]);
             }
         });
+        }
 
         // Create mean and variance tensors with batch shape
         mean = TensorAllocator.Rent<T>(batchShape, new Vector<T>(meanData));
