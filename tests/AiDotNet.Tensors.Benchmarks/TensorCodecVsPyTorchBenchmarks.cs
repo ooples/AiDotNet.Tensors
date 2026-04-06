@@ -583,5 +583,67 @@ public class TensorCodecVsPyTorchBenchmarks
         using var _ = torch.no_grad();
         return torch.nn.functional.max_pool2d(_t_bn_input, 2, 2);
     }
+    // ═══════════════════════════════════════════════════════════════════
+    // 10. EXPANDED OPERATIONS: Close remaining gaps + more coverage
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Sigmoid ---
+    [Benchmark(Description = "AiDotNet: Sigmoid[100K]")]
+    public Tensor<float> AiDotNet_Sigmoid_100K() => _engine.Sigmoid(_op_a);
+
+    [Benchmark(Description = "PyTorch: Sigmoid[100K]")]
+    public TorchTensor PyTorch_Sigmoid_100K() => torch.sigmoid(_t_op_a);
+
+    // --- Tanh ---
+    [Benchmark(Description = "AiDotNet: Tanh[100K]")]
+    public Tensor<float> AiDotNet_Tanh_100K() => _engine.Tanh(_op_a);
+
+    [Benchmark(Description = "PyTorch: Tanh[100K]")]
+    public TorchTensor PyTorch_Tanh_100K() => torch.tanh(_t_op_a);
+
+    // --- LeakyReLU ---
+    [Benchmark(Description = "AiDotNet: LeakyReLU[100K]")]
+    public Tensor<float> AiDotNet_LeakyReLU_100K()
+    {
+        return _engine.LeakyReLU(_op_a, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().FromDouble(0.01));
+    }
+
+    [Benchmark(Description = "PyTorch: LeakyReLU[100K]")]
+    public TorchTensor PyTorch_LeakyReLU_100K() => torch.nn.functional.leaky_relu(_t_op_a, 0.01);
+
+    // --- ReLU ---
+    [Benchmark(Description = "AiDotNet: ReLU[100K]")]
+    public Tensor<float> AiDotNet_ReLU_100K() => _engine.ReLU(_op_a);
+
+    [Benchmark(Description = "PyTorch: ReLU[100K]")]
+    public TorchTensor PyTorch_ReLU_100K() => torch.nn.functional.relu(_t_op_a);
+
+    // --- Exp ---
+    [Benchmark(Description = "AiDotNet: Exp[100K]")]
+    public Tensor<float> AiDotNet_Exp_100K() => _engine.TensorExp(_op_a);
+
+    [Benchmark(Description = "PyTorch: Exp[100K]")]
+    public TorchTensor PyTorch_Exp_100K() => torch.exp(_t_op_a);
+
+    // --- Log ---
+    [Benchmark(Description = "AiDotNet: Log[100K]")]
+    public Tensor<float> AiDotNet_Log_100K() => _engine.TensorLog(_op_a);
+
+    [Benchmark(Description = "PyTorch: Log[100K]")]
+    public TorchTensor PyTorch_Log_100K() => torch.log(_t_op_a);
+
+    // --- MatMul ---
+    [Benchmark(Description = "AiDotNet: MatMul[256x256]")]
+    public Tensor<float> AiDotNet_MatMul_256() => _engine.TensorMatMul(_op_2d, _op_2d);
+
+    [Benchmark(Description = "PyTorch: MatMul[256x256]")]
+    public TorchTensor PyTorch_MatMul_256() => torch.matmul(_t_op_2d, _t_op_2d);
+
+    // --- Subtract ---
+    [Benchmark(Description = "AiDotNet: Subtract[100K]")]
+    public Tensor<float> AiDotNet_Sub_100K() => _engine.TensorSubtract(_op_a, _op_b);
+
+    [Benchmark(Description = "PyTorch: Subtract[100K]")]
+    public TorchTensor PyTorch_Sub_100K() => _t_op_a - _t_op_b;
 }
 #endif
