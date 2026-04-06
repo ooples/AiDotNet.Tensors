@@ -450,25 +450,25 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); };
         }
 
-        // Log forward: allocate+copy (no Into variant yet)
+        // Log forward: direct VML/SIMD via CpuEngine.TensorLogInto
         if (step.OpName == "TensorLog" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Exp forward: allocate+copy (no Into variant yet)
+        // Exp forward: direct VML/SIMD via CpuEngine.TensorExpInto
         if (step.OpName == "TensorExp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Mish forward: allocate+copy (no Into variant yet)
+        // Mish forward: direct SIMD MishUnsafe via CpuEngine.MishInto
         if (step.OpName == "Mish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+            return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // BatchNorm forward: bypass the GraphMode hook's double execution

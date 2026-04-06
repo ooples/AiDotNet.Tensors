@@ -2631,10 +2631,25 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void SwishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            // Fused sigmoid*x in two SIMD passes using unsafe pointers (no ArrayPool)
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            float* pSrc = (float*)pinSrc.Pointer;
+            float* pDst = (float*)pinDst.Pointer;
+            // Sigmoid into destination
+            Simd.SimdKernels.SigmoidUnsafe(pSrc, pDst, input.Length);
+            // Multiply: dst = src * dst (fused swish = x * sigmoid(x))
+            Simd.SimdKernels.VectorMultiplyUnsafe(pSrc, pDst, pDst, input.Length);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
         numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
@@ -2713,10 +2728,19 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public void MishInto<T>(Tensor<T> destination, Tensor<T> input)
+    public unsafe void MishInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.MishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
     }
@@ -2977,20 +3001,38 @@ public class CpuEngine : ITensorLevelEngine
         }
     }
 
-    /// <summary>Exp into pre-allocated destination. Zero allocation.</summary>
-    public void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
+    /// <summary>Exp into pre-allocated destination. Uses VML/SVML when available.</summary>
+    public unsafe void TensorExpInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.ExpUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    /// <summary>Log into pre-allocated destination. Zero allocation.</summary>
-    public void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
+    /// <summary>Log into pre-allocated destination. Uses VML/SVML when available.</summary>
+    public unsafe void TensorLogInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            Simd.SimdKernels.LogUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Log(input.AsSpan(), destination.AsWritableSpan());
     }
