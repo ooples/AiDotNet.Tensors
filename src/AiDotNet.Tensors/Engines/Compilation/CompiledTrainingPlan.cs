@@ -323,39 +323,13 @@ internal sealed class CompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             float[]? cOut = null;
 
-            // Cache the input array pointer for zero-overhead replay
-            float[]? cIn = null;
             return eng =>
             {
-                cIn ??= (float[])(object)input.GetDataArray();
                 cOut ??= (float[])(object)output.GetDataArray();
-                // Direct SIMD sum — bypass engine dispatch overhead
-                unsafe
-                {
-                    fixed (float* p = cIn)
-                    {
-                        int len = input.Length;
-                        // Parallel chunking for large arrays (same strategy as TensorSum)
-                        if (len >= 200_000)
-                        {
-                            int numChunks = Math.Max(2, len / 50_000);
-                            int chunkSize = ((len + numChunks - 1) / numChunks + 31) & ~31;
-                            float total = 0;
-                            for (int c = 0; c < numChunks; c++)
-                            {
-                                int start = c * chunkSize;
-                                int count = Math.Min(chunkSize, len - start);
-                                if (count > 0)
-                                    total += SimdKernels.SumUnsafe(p + start, count);
-                            }
-                            cOut[0] = total;
-                        }
-                        else
-                        {
-                            cOut[0] = SimdKernels.SumUnsafe(p, len);
-                        }
-                    }
-                }
+                // Use engine TensorSum which has multi-threaded LightweightParallel
+                T sum = eng.TensorSum(input);
+                if (typeof(T) == typeof(float))
+                    cOut[0] = Unsafe.As<T, float>(ref sum);
             };
         }
 
@@ -471,23 +445,9 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // BatchNorm forward: bypass the GraphMode hook's double execution
-        if (step.OpName == "BatchNorm" && step.Inputs.Length >= 3)
-        {
-            var inp = step.Inputs[0]; var gamma = step.Inputs[1]; var beta = step.Inputs[2];
-            var o = step.OutputBuffer;
-            double eps = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToDouble(step.SavedState[^1]) : 1e-5;
-            return eng => { var r = eng.BatchNorm(inp, gamma, beta, eps, out _, out _); r.AsSpan().CopyTo(o.AsWritableSpan()); };
-        }
-
-        // LayerNorm forward: bypass the GraphMode hook's double execution
-        if (step.OpName == "LayerNorm" && step.Inputs.Length >= 3)
-        {
-            var inp = step.Inputs[0]; var gamma = step.Inputs[1]; var beta = step.Inputs[2];
-            var o = step.OutputBuffer;
-            double eps = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToDouble(step.SavedState[^1]) : 1e-5;
-            return eng => { var r = eng.LayerNorm(inp, gamma, beta, eps, out _, out _); r.AsSpan().CopyTo(o.AsWritableSpan()); };
-        }
+        // BatchNorm/LayerNorm: don't specialize — the generic execute delegate
+        // (from the lazy node) already handles these correctly. Specializing adds
+        // an extra allocate+copy on top of what the generic path already does.
 
         // TensorDivide: no Into specialization (Pin overhead in Into variants
         // exceeds the allocation savings — eager path uses fixed+GetDataArray which is faster)

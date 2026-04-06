@@ -224,6 +224,10 @@ internal static class VmlProvider
 #if NET5_0_OR_GREATER
         try
         {
+            // Force MKL.NET to load its native library first — this ensures
+            // the mkl_rt DLL is in the process and available for symbol lookup.
+            try { _ = typeof(MKLNET.Blas).Assembly; } catch { /* MKL.NET not available */ }
+
             // Try to load MKL runtime library from multiple candidate names
             var candidates = new[]
             {
