@@ -324,9 +324,8 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // VML SVML path: exp(-x) then SIMD reciprocal — ~3x faster than polynomial
-            if (VmlProvider.TrySigmoid(input, output, length))
-                return;
+            // Note: VML TrySigmoid (negate+exp+reciprocal) is SLOWER than polynomial
+            // FastSigmoid256 for float due to the 3-pass overhead. Keep polynomial path.
 
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
