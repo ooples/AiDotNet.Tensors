@@ -132,6 +132,7 @@ public class TensorCodecVsPyTorchBenchmarks
 
         // Pre-compile plans — each in try/catch so one failure doesn't block all
         try { SetupSmallMlpPlan(); } catch { /* plan will be null, benchmark skipped */ }
+        try { SetupSmallMlpCodecPlan(); } catch { }
         try { SetupMediumMlpPlan(); } catch { }
         try { SetupCnnPlan(); } catch { }
         try { SetupMlpMsePlan(); } catch { }
@@ -165,8 +166,31 @@ public class TensorCodecVsPyTorchBenchmarks
         _smallMlpTrainPlan = scope.CompileTraining(new[] { _w128x64, _w64x32, _w32x10 });
     }
 
+    private CompiledTrainingPlan<float>? _smallMlpCodecPlan;
+
+    private void SetupSmallMlpCodecPlan()
+    {
+        // Enable TensorCodec optimizations (Phase B: dataflow fusion, Phase C: algebraic backward)
+        var codecOpts = new TensorCodecOptions
+        {
+            EnableDataflowFusion = true,
+            EnableAlgebraicBackward = true,
+            EnableSpectralDecomposition = false // training uses exact weights
+        };
+        TensorCodecOptions.SetCurrent(codecOpts);
+        using var scope = GraphMode.Enable();
+        var h1 = _engine.FusedLinear(_input32x128, _w128x64, _b64, FusedActivationType.ReLU);
+        var h2 = _engine.FusedLinear(h1, _w64x32, _b32, FusedActivationType.ReLU);
+        _engine.FusedLinear(h2, _w32x10, _b10, FusedActivationType.None);
+        _smallMlpCodecPlan = scope.CompileTraining(new[] { _w128x64, _w64x32, _w32x10 });
+        TensorCodecOptions.SetCurrent(null);
+    }
+
     [Benchmark(Description = "AiDotNet Compiled: MLP[32x128→64→32→10] train step")]
     public Tensor<float> AiDotNet_SmallMLP_CompiledTrain() => _smallMlpTrainPlan!.Step();
+
+    [Benchmark(Description = "AiDotNet TensorCodec: MLP[32x128→64→32→10] train step")]
+    public Tensor<float> AiDotNet_SmallMLP_CodecTrain() => _smallMlpCodecPlan!.Step();
 
     [Benchmark(Description = "AiDotNet Eager: MLP[32x128→64→32→10] train step")]
     public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_SmallMLP_EagerTrain()
