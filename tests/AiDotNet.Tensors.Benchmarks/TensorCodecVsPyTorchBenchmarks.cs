@@ -835,5 +835,75 @@ public class TensorCodecVsPyTorchBenchmarks
         using var _ = torch.no_grad();
         return torch.nn.functional.group_norm(_t_bn_input, 8, _t_bn_gamma, _t_bn_beta);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 12. MORE OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Clamp ---
+    [Benchmark(Description = "AiDotNet Eager: Clamp[100K]")]
+    public Tensor<float> AiDotNet_Clamp_100K() => _engine.TensorClamp(_op_a, -0.5f, 0.5f);
+
+    [Benchmark(Description = "PyTorch: Clamp[100K]")]
+    public TorchTensor PyTorch_Clamp_100K() => torch.clamp(_t_op_a, -0.5, 0.5);
+
+    // --- Sin ---
+    [Benchmark(Description = "AiDotNet Eager: Sin[100K]")]
+    public Tensor<float> AiDotNet_Sin_100K() => _engine.TensorSin(_op_a);
+
+    [Benchmark(Description = "PyTorch: Sin[100K]")]
+    public TorchTensor PyTorch_Sin_100K() => torch.sin(_t_op_a);
+
+    // --- Cos ---
+    [Benchmark(Description = "AiDotNet Eager: Cos[100K]")]
+    public Tensor<float> AiDotNet_Cos_100K() => _engine.TensorCos(_op_a);
+
+    [Benchmark(Description = "PyTorch: Cos[100K]")]
+    public TorchTensor PyTorch_Cos_100K() => torch.cos(_t_op_a);
+
+    // --- BroadcastAdd (bias pattern) ---
+    private Tensor<float> _ba_input = null!, _ba_bias = null!;
+    private TorchTensor _t_ba_input = null!, _t_ba_bias = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_BroadcastAdd))]
+    public void SetupBroadcastAdd()
+    {
+        if (_ba_input != null) return;
+        _ba_input = Tensor<float>.CreateRandom([32, 256]);
+        _ba_bias = Tensor<float>.CreateRandom([256]);
+        _t_ba_input = torch.randn([32, 256]);
+        _t_ba_bias = torch.randn([256]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: BroadcastAdd[32x256]+[256]")]
+    public Tensor<float> AiDotNet_BroadcastAdd() => _engine.TensorBroadcastAdd(_ba_input, _ba_bias);
+
+    [Benchmark(Description = "PyTorch: BroadcastAdd[32x256]+[256]")]
+    public TorchTensor PyTorch_BroadcastAdd() => _t_ba_input + _t_ba_bias;
+
+    // --- AvgPool2D ---
+    [Benchmark(Description = "AiDotNet Eager: AvgPool2D[32x64x8x8, pool=2]")]
+    public Tensor<float> AiDotNet_AvgPool2D() => _engine.AvgPool2D(_bn_input, poolSize: 2, stride: 2);
+
+    [Benchmark(Description = "PyTorch: AvgPool2D[32x64x8x8, pool=2]")]
+    public TorchTensor PyTorch_AvgPool2D()
+    {
+        using var _ = torch.no_grad();
+        return torch.nn.functional.avg_pool2d(_t_bn_input, 2, 2);
+    }
+
+    // --- Concat ---
+    [Benchmark(Description = "AiDotNet Eager: Concat[2x100K]")]
+    public Tensor<float> AiDotNet_Concat_100K() => _engine.TensorConcatenate(new[] { _op_a, _op_b }, axis: 0);
+
+    [Benchmark(Description = "PyTorch: Concat[2x100K]")]
+    public TorchTensor PyTorch_Concat_100K() => torch.cat(new[] { _t_op_a, _t_op_b }, dim: 0);
+
+    // --- Sum along axis ---
+    [Benchmark(Description = "AiDotNet Eager: SumAxis[256x256, axis=1]")]
+    public Tensor<float> AiDotNet_SumAxis() => _engine.ReduceSum(_op_2d, new[] { 1 });
+
+    [Benchmark(Description = "PyTorch: SumAxis[256x256, axis=1]")]
+    public TorchTensor PyTorch_SumAxis() => _t_op_2d.sum(dim: 1);
 }
 #endif
