@@ -393,8 +393,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // GELU forward: direct SIMD with pre-allocated tanh buffer (avoids ArrayPool per call)
-        if (step.OpName == "GELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
-            && typeof(T) == typeof(float))
+        if (step.OpName == "GELU" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             // Pre-allocate the tanh buffer once at compile time instead of renting per call

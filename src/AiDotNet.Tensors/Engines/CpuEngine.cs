@@ -11668,18 +11668,18 @@ public class CpuEngine : ITensorLevelEngine
                     int startChannel = g * channelsPerGroup;
                     int batchOffset = b * channels * spatialSize;
 
-                    // Mean computation
+                    // Mean computation — use SIMD SumUnsafe per channel
                     float sum = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                            sum += inputData[chanOff + s];
+                        sum += SimdKernels.SumUnsafe(inputData + chanOff, spatialSize);
                     }
                     float groupMean = sum / groupSize;
                     meanLocal[idx] = groupMean;
 
-                    // Variance computation
+                    // Fused variance + normalize in single pass per channel
+                    // First compute variance
                     float sumSq = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
@@ -11693,18 +11693,17 @@ public class CpuEngine : ITensorLevelEngine
                     float groupVar = sumSq / groupSize;
                     varLocal[idx] = groupVar;
 
-                    // Normalize and apply scale/shift
+                    // Normalize and apply scale/shift — fused per channel
                     float invStd = 1f / MathF.Sqrt(groupVar + eps);
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int channel = startChannel + c;
                         int chanOff = batchOffset + channel * spatialSize;
-                        float g_val = gammaData[channel];
-                        float b_val = betaData[channel];
+                        float scale = gammaData[channel] * invStd;
+                        float bias = betaData[channel] - groupMean * scale;
+                        // Fused: output = input * scale + bias (single pass, JIT auto-vectorizes)
                         for (int s = 0; s < spatialSize; s++)
-                        {
-                            outputData[chanOff + s] = (inputData[chanOff + s] - groupMean) * invStd * g_val + b_val;
-                        }
+                            outputData[chanOff + s] = inputData[chanOff + s] * scale + bias;
                     }
                 }
             });

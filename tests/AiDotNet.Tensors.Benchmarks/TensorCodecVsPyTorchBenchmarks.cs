@@ -905,5 +905,51 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: SumAxis[256x256, axis=1]")]
     public TorchTensor PyTorch_SumAxis() => _t_op_2d.sum(dim: 1);
+
+    // --- ELU ---
+    [Benchmark(Description = "AiDotNet Eager: ELU[100K]")]
+    public Tensor<float> AiDotNet_ELU_100K() => _engine.ELU(_op_a, 1.0);
+
+    [Benchmark(Description = "PyTorch: ELU[100K]")]
+    public TorchTensor PyTorch_ELU_100K() => torch.nn.functional.elu(_t_op_a, 1.0);
+
+    // --- Softplus ---
+    [Benchmark(Description = "AiDotNet Eager: Softplus[100K]")]
+    public Tensor<float> AiDotNet_Softplus_100K() => _engine.Softplus(_op_a);
+
+    [Benchmark(Description = "PyTorch: Softplus[100K]")]
+    public TorchTensor PyTorch_Softplus_100K() => torch.nn.functional.softplus(_t_op_a);
+
+    // --- HardSwish ---
+    [Benchmark(Description = "AiDotNet Eager: HardSwish[100K]")]
+    public Tensor<float> AiDotNet_HardSwish_100K() => _engine.HardSwish(_op_a);
+
+    [Benchmark(Description = "PyTorch: HardSwish[100K]")]
+    public TorchTensor PyTorch_HardSwish_100K() => torch.nn.functional.hardswish(_t_op_a);
+
+    // --- BroadcastMultiply (scaling pattern) ---
+    [Benchmark(Description = "AiDotNet Eager: BroadcastMul[32x256]*[256]")]
+    public Tensor<float> AiDotNet_BroadcastMul() => _engine.TensorBroadcastMultiply(_ba_input, _ba_bias);
+
+    [Benchmark(Description = "PyTorch: BroadcastMul[32x256]*[256]")]
+    public TorchTensor PyTorch_BroadcastMul() => _t_ba_input * _t_ba_bias;
+
+    // --- Reshape (should be ~zero cost) ---
+    [Benchmark(Description = "AiDotNet Eager: Reshape[256x256→65536]")]
+    public Tensor<float> AiDotNet_Reshape() => _engine.Reshape(_op_2d, new[] { 65536 });
+
+    [Benchmark(Description = "PyTorch: Reshape[256x256→65536]")]
+    public TorchTensor PyTorch_Reshape() => _t_op_2d.reshape(65536);
+
+    // --- ReduceMax ---
+    [Benchmark(Description = "AiDotNet Eager: ReduceMax[100K]")]
+    public Tensor<float> AiDotNet_ReduceMax_100K() => _engine.ReduceMax(_op_a, new[] { 0 }, keepDims: false, out _);
+
+    [Benchmark(Description = "PyTorch: ReduceMax[100K]")]
+    public TorchTensor PyTorch_ReduceMax_100K()
+    {
+        var (values, _) = torch.max(_t_op_a, dim: 0);
+        return values;
+    }
 }
 #endif
