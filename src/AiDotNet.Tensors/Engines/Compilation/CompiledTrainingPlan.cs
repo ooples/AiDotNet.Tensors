@@ -392,12 +392,10 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.SigmoidInto(o, inp);
         }
 
-        // GELU forward: direct SIMD with pre-allocated tanh buffer (avoids ArrayPool per call)
+        // GELU forward: direct SIMD via GELUUnsafe — single fused pass, no intermediate buffer
         if (step.OpName == "GELU" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            // Pre-allocate the tanh buffer once at compile time instead of renting per call
-            var tanhBuf = new float[inp.Length];
             return eng =>
             {
                 unsafe
@@ -406,70 +404,13 @@ internal sealed class CompiledTrainingPlan<T>
                     var dstMem = ((Tensor<float>)(object)o).Data;
                     using var pinSrc = srcMem.Pin();
                     using var pinDst = dstMem.Pin();
-                    float* pSrc = (float*)pinSrc.Pointer;
-                    float* pDst = (float*)pinDst.Pointer;
-                    int length = inp.Length;
-
-                    // Compute tanh arguments: sqrt(2/pi) * (x + 0.044715 * x^3)
-                    fixed (float* tanhArgs = tanhBuf)
-                    {
-#if NET5_0_OR_GREATER
-                        if (System.Runtime.Intrinsics.X86.Avx.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
-                        {
-                            var vSqrt2OverPi = System.Runtime.Intrinsics.Vector256.Create(0.7978845608028654f);
-                            var vCoeff = System.Runtime.Intrinsics.Vector256.Create(0.044715f);
-                            var vHalf = System.Runtime.Intrinsics.Vector256.Create(0.5f);
-                            var vOne = System.Runtime.Intrinsics.Vector256.Create(1.0f);
-                            var vTwo = System.Runtime.Intrinsics.Vector256.Create(2.0f);
-
-                            int simdLen = length & ~7;
-                            // Compute tanh args
-                            for (int j = 0; j < simdLen; j += 8)
-                            {
-                                var x = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pSrc + j);
-                                var x3 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Multiply(x, x), x);
-                                var inner = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(vCoeff, x3, x);
-                                System.Runtime.Intrinsics.X86.Avx.Store(tanhArgs + j, System.Runtime.Intrinsics.X86.Avx.Multiply(vSqrt2OverPi, inner));
-                            }
-                            for (int j = simdLen; j < length; j++)
-                            {
-                                float x = pSrc[j];
-                                tanhArgs[j] = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-                            }
-
-                            // Try VML tanh
-                            if (!VmlProvider.TryTanh(tanhArgs, tanhArgs, length))
-                            {
-                                // Polynomial fallback via SimdKernels.TanhUnsafe
-                                SimdKernels.TanhUnsafe(tanhArgs, tanhArgs, length);
-                            }
-
-                            // GELU = 0.5 * x * (1 + tanh)
-                            for (int j = 0; j < simdLen; j += 8)
-                            {
-                                var x = System.Runtime.Intrinsics.X86.Avx.LoadVector256(pSrc + j);
-                                var t = System.Runtime.Intrinsics.X86.Avx.LoadVector256(tanhArgs + j);
-                                System.Runtime.Intrinsics.X86.Avx.Store(pDst + j, System.Runtime.Intrinsics.X86.Avx.Multiply(vHalf, System.Runtime.Intrinsics.X86.Avx.Multiply(x, System.Runtime.Intrinsics.X86.Avx.Add(vOne, t))));
-                            }
-                            for (int j = simdLen; j < length; j++)
-                                pDst[j] = 0.5f * pSrc[j] * (1f + tanhArgs[j]);
-                            return;
-                        }
-#endif
-                        // Scalar fallback
-                        for (int j = 0; j < length; j++)
-                        {
-                            float x = pSrc[j];
-                            float x3 = x * x * x;
-                            float inner = 0.7978845608028654f * (x + 0.044715f * x3);
-                            pDst[j] = 0.5f * x * (1f + MathF.Tanh(inner));
-                        }
-                    }
+                    // Single-pass fused GELU — no intermediate buffer, no ArrayPool
+                    SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, inp.Length);
                 }
             };
         }
         // GELU non-float fallback
-        if (step.OpName == "GELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpName == "GELU" && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => eng.GELUInto(o, inp);

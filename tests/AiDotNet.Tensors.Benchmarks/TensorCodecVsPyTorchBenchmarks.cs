@@ -951,5 +951,58 @@ public class TensorCodecVsPyTorchBenchmarks
         var (values, _) = torch.max(_t_op_a, dim: 0);
         return values;
     }
+
+    // --- Floor ---
+    [Benchmark(Description = "AiDotNet Eager: Floor[100K]")]
+    public Tensor<float> AiDotNet_Floor_100K() => _engine.TensorFloor(_op_a);
+
+    [Benchmark(Description = "PyTorch: Floor[100K]")]
+    public TorchTensor PyTorch_Floor_100K() => torch.floor(_t_op_a);
+
+    // --- Ceiling ---
+    [Benchmark(Description = "AiDotNet Eager: Ceiling[100K]")]
+    public Tensor<float> AiDotNet_Ceiling_100K() => _engine.TensorCeiling(_op_a);
+
+    [Benchmark(Description = "PyTorch: Ceiling[100K]")]
+    public TorchTensor PyTorch_Ceiling_100K() => torch.ceil(_t_op_a);
+
+    // --- Sign ---
+    [Benchmark(Description = "AiDotNet Eager: Sign[100K]")]
+    public Tensor<float> AiDotNet_Sign_100K() => _engine.TensorSign(_op_a);
+
+    [Benchmark(Description = "PyTorch: Sign[100K]")]
+    public TorchTensor PyTorch_Sign_100K() => torch.sign(_t_op_a);
+
+    // --- Reciprocal ---
+    [Benchmark(Description = "AiDotNet Eager: Reciprocal[100K]")]
+    public Tensor<float> AiDotNet_Reciprocal_100K() => _engine.TensorReciprocal(_op_a);
+
+    [Benchmark(Description = "PyTorch: Reciprocal[100K]")]
+    public TorchTensor PyTorch_Reciprocal_100K() => torch.reciprocal(_t_op_a);
+
+    // --- BroadcastSubtract ---
+    [Benchmark(Description = "AiDotNet Eager: BroadcastSub[32x256]-[256]")]
+    public Tensor<float> AiDotNet_BroadcastSub() => _engine.TensorBroadcastSubtract(_ba_input, _ba_bias);
+
+    [Benchmark(Description = "PyTorch: BroadcastSub[32x256]-[256]")]
+    public TorchTensor PyTorch_BroadcastSub() => _t_ba_input - _t_ba_bias;
+
+    // --- Larger MatMul 512x512 ---
+    private Tensor<float> _mat512 = null!;
+    private TorchTensor _t_mat512 = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_MatMul_512))]
+    public void SetupMat512()
+    {
+        if (_mat512 != null) return;
+        _mat512 = Tensor<float>.CreateRandom([512, 512]);
+        _t_mat512 = torch.randn([512, 512]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: MatMul[512x512]")]
+    public Tensor<float> AiDotNet_MatMul_512() => _engine.TensorMatMul(_mat512, _mat512);
+
+    [Benchmark(Description = "PyTorch: MatMul[512x512]")]
+    public TorchTensor PyTorch_MatMul_512() => torch.matmul(_t_mat512, _t_mat512);
 }
 #endif

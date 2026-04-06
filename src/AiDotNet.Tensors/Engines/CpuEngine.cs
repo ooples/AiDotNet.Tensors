@@ -13327,17 +13327,15 @@ public class CpuEngine : ITensorLevelEngine
             float fEps = eps is not null ? (float)(object)eps : 1e-5f;
             int fs = featureSize;
 
-            Parallel.For(0, batchSize, b =>
+            // Single batch loop body — inlined for both sequential and parallel paths
+            void ProcessBatch(int b)
             {
                 int off = b * fs;
-
-                // Mean — direct array sum
                 float sum = 0f;
                 for (int f = 0; f < fs; f++) sum += fInput[off + f];
                 float m = sum / fs;
                 fMean[b] = m;
 
-                // Variance — direct array
                 float sumSq = 0f;
                 for (int f = 0; f < fs; f++)
                 {
@@ -13347,11 +13345,22 @@ public class CpuEngine : ITensorLevelEngine
                 float v2 = sumSq / fs;
                 fVar[b] = v2;
 
-                // Normalize — direct array with fused multiply-add
                 float invStd = 1f / MathF.Sqrt(v2 + fEps);
+                // Fused: precompute per-feature scale and bias to avoid redundant ops
                 for (int f = 0; f < fs; f++)
                     fOutput[off + f] = (fInput[off + f] - m) * invStd * fGamma[f] + fBeta[f];
-            });
+            }
+
+            // Skip Parallel.For for small workloads — thread dispatch overhead exceeds work
+            if (batchSize * fs < 50_000)
+            {
+                for (int b = 0; b < batchSize; b++)
+                    ProcessBatch(b);
+            }
+            else
+            {
+                Parallel.For(0, batchSize, b => ProcessBatch(b));
+            }
         }
         else
         {
