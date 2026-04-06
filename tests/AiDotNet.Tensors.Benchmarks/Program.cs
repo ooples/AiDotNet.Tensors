@@ -238,6 +238,13 @@ class Program
             return;
         }
 
+        // Run TensorCodec comprehensive vs PyTorch benchmarks
+        if (args[0] == "--vs-tensorcodec")
+        {
+            BenchmarkRunner.Run<TensorCodecVsPyTorchBenchmarks>(BenchConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
@@ -321,6 +328,7 @@ class Program
         Console.WriteLine("Competitive Benchmarks vs Other Libraries:");
         Console.WriteLine("  --vs-torchsharp-gpu : AiDotNet GPU vs TorchSharp CUDA");
         Console.WriteLine("  --vs-autograd       : AiDotNet autograd + compiled plan vs PyTorch");
+        Console.WriteLine("  --vs-tensorcodec    : TensorCodec comprehensive vs PyTorch (17 op pairs)");
         Console.WriteLine("  --vs-torchsharp-cpu : AiDotNet CPU vs TorchSharp CPU");
         Console.WriteLine("  --vs-tensorflow-gpu : AiDotNet GPU vs TensorFlow.NET GPU");
         Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");

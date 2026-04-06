@@ -165,6 +165,17 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Compiled: MLP[32x128→64→32→10] train step")]
     public Tensor<float> AiDotNet_SmallMLP_CompiledTrain() => _smallMlpTrainPlan!.Step();
 
+    [Benchmark(Description = "AiDotNet Eager: MLP[32x128→64→32→10] train step")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_SmallMLP_EagerTrain()
+    {
+        using var tape = new GradientTape<float>();
+        var h1 = _engine.FusedLinear(_input32x128, _w128x64, _b64, FusedActivationType.ReLU);
+        var h2 = _engine.FusedLinear(h1, _w64x32, _b32, FusedActivationType.ReLU);
+        var output = _engine.FusedLinear(h2, _w32x10, _b10, FusedActivationType.None);
+        var loss = _engine.ReduceSum(output, null);
+        return tape.ComputeGradients(loss, new[] { _w128x64, _w64x32, _w32x10 });
+    }
+
     [Benchmark(Description = "PyTorch: MLP[32x128→64→32→10] train step")]
     public (TorchTensor, TorchTensor, TorchTensor) PyTorch_SmallMLP_Train()
     {
@@ -194,6 +205,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Compiled: MLP+MSE[32x128→64→32] train step")]
     public Tensor<float> AiDotNet_MLP_MSE_CompiledTrain() => _mlpMseTrainPlan!.Step();
 
+    [Benchmark(Description = "AiDotNet Eager: MLP+MSE[32x128→64→32] train step")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_MLP_MSE_EagerTrain()
+    {
+        using var tape = new GradientTape<float>();
+        var h1 = _engine.FusedLinear(_input32x128, _w128x64, _b64, FusedActivationType.ReLU);
+        var output = _engine.FusedLinear(h1, _w64x32, _b32, FusedActivationType.None);
+        var diff = _engine.TensorSubtract(output, _target64x32);
+        var sq = _engine.TensorMultiply(diff, diff);
+        var loss = _engine.ReduceSum(sq, null);
+        return tape.ComputeGradients(loss, new[] { _w128x64, _w64x32 });
+    }
+
     [Benchmark(Description = "PyTorch: MLP+MSE[32x128→64→32] train step")]
     public (TorchTensor, TorchTensor) PyTorch_MLP_MSE_Train()
     {
@@ -219,6 +242,16 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "AiDotNet Compiled: MLP[64x256→128→32] train step")]
     public Tensor<float> AiDotNet_MediumMLP_CompiledTrain() => _mediumMlpTrainPlan!.Step();
+
+    [Benchmark(Description = "AiDotNet Eager: MLP[64x256→128→32] train step")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_MediumMLP_EagerTrain()
+    {
+        using var tape = new GradientTape<float>();
+        var h = _engine.FusedLinear(_input64x256, _w256x128, _b128, FusedActivationType.ReLU);
+        var output = _engine.FusedLinear(h, _w128x32, _b32, FusedActivationType.None);
+        var loss = _engine.ReduceSum(output, null);
+        return tape.ComputeGradients(loss, new[] { _w256x128, _w128x32 });
+    }
 
     [Benchmark(Description = "PyTorch: MLP[64x256→128→32] train step")]
     public (TorchTensor, TorchTensor) PyTorch_MediumMLP_Train()
