@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -94,7 +95,34 @@ internal sealed class CompiledInferencePlan<T>
             }
         }
 
+        // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
+        var optimizedSteps = RunCpuOptimizationPasses(specializedSteps, engine);
+
         var finalOutput = steps.Count > 0 ? steps[steps.Count - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(specializedSteps, finalOutput, engine);
+        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine);
+    }
+
+    /// <summary>
+    /// Runs CPU-level optimization passes on the compiled steps.
+    /// Currently: spectral decomposition (Phase A) and dataflow fusion (Phase B).
+    /// Each pass is independently toggleable via TensorCodecOptions.
+    /// </summary>
+    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine)
+    {
+        ICpuOptimizationPass[] passes =
+        {
+            new SpectralDecompositionPass(),
+            new DataflowFusionPass(),
+        };
+
+        var current = steps;
+        foreach (var pass in passes)
+        {
+            if (!pass.IsEnabled) continue;
+            var optimized = pass.TryOptimize(current, engine);
+            if (optimized != null)
+                current = optimized;
+        }
+        return current;
     }
 }
