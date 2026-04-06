@@ -16672,6 +16672,18 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = grid;
+                var outShape = new[] { input._shape[0], grid._shape[1], grid._shape[2], input._shape[3] };
+                return scope.RecordBinary(LazyNodeType.Custom, "GridSample", input, grid, outShape,
+                    (eng, output) => { var r = eng.GridSample(ci, cg); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
+
         if (input._shape.Length != 4)
             throw new ArgumentException("GridSample expects input shape [batch, height, width, channels]");
         if (grid._shape.Length != 4 || grid._shape[3] != 2)
@@ -16748,6 +16760,23 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> Unfold<T>(Tensor<T> input, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var ck = kernelSize; var cs = stride; var cp = padding;
+                int lkH = kernelSize[0], lkW = kernelSize[1];
+                int lsH = stride[0], lsW = stride[1];
+                int lpH = padding[0], lpW = padding[1];
+                int oH = (input._shape[2] + 2 * lpH - lkH) / lsH + 1;
+                int oW = (input._shape[3] + 2 * lpW - lkW) / lsW + 1;
+                var outShape = new[] { input._shape[0], input._shape[1] * lkH * lkW, oH * oW };
+                return scope.RecordUnary(LazyNodeType.Custom, "Unfold", input, outShape,
+                    (eng, output) => { var r = eng.Unfold(ci, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
         if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
@@ -16823,6 +16852,21 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> Fold<T>(Tensor<T> input, int[] outputSize, int[] kernelSize, int[] stride, int[] padding)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var co = outputSize; var ck = kernelSize; var cs = stride; var cp = padding;
+                int lBatch = input._shape[0];
+                int lkH = kernelSize[0], lkW = kernelSize[1];
+                int lCh = input._shape[1] / (lkH * lkW);
+                var outShape = new[] { lBatch, lCh, outputSize[0], outputSize[1] };
+                return scope.RecordUnary(LazyNodeType.Custom, "Fold", input, outShape,
+                    (eng, output) => { var r = eng.Fold(ci, co, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (outputSize == null || outputSize.Length < 2) throw new ArgumentException("outputSize must have at least 2 elements.", nameof(outputSize));
         if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
@@ -17788,6 +17832,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var cc = condition; var cx = x; var cy = y;
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorWhere",
+                    new[] { condition, x, y }, x._shape,
+                    (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (y == null) throw new ArgumentNullException(nameof(y));
         if (!y.IsContiguous) y = y.Contiguous();
         if (!x.IsContiguous) x = x.Contiguous();
@@ -19734,6 +19790,18 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ct = tensor; var cm = mask; var cv = value;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorMaskedFill", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
+            }
+        }
         if (mask == null) throw new ArgumentNullException(nameof(mask));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -23480,6 +23548,17 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon = 1e-5)
     {
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorLayerNorm",
+                    new[] { input, gamma, beta }, input._shape,
+                    (eng, output) => { var r = eng.TensorLayerNorm(ci, cg, cb, ce); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         if (!input.IsContiguous) input = input.Contiguous();
         return LayerNorm(input, gamma, beta, epsilon, out _, out _);
     }
@@ -23489,6 +23568,20 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ci = input; var ca = axes; bool ck = keepDims;
+                // Compute output shape for reduction
+                var lazyVar = ReduceVariance(input, axes, keepDims);
+                var outShape = lazyVar._shape;
+                return scope.RecordUnary(LazyNodeType.Custom, "ReduceStd", input, outShape,
+                    (eng, output) => { var r = eng.ReduceStd(ci, ca, ck); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
         // ReduceVariance is already stride-aware — no Contiguous() needed here
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -23534,6 +23627,18 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var ca = a; var cb = b; var csA = scaleA; var csB = scaleB;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorAddScaled", a, b, a._shape,
+                    (eng, output) => { var r = eng.TensorAddScaled(ca, cb, csA, csB); r.AsSpan().CopyTo(output.AsWritableSpan()); });
+            }
+        }
+
         if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
