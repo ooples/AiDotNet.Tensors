@@ -478,6 +478,10 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _maxpoolPlan;
     private CompiledInferencePlan<float>? _batchnormPlan;
     private CompiledInferencePlan<float>? _layernormPlan;
+    private CompiledInferencePlan<float>? _absPlan;
+    private CompiledInferencePlan<float>? _powPlan;
+    private CompiledInferencePlan<float>? _logSoftmaxPlan;
+    private CompiledInferencePlan<float>? _meanPlan;
 
     private void SetupOps()
     {
@@ -514,6 +518,10 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.MaxPool2D(_bn_input, poolSize: 2, stride: 2); _maxpoolPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.BatchNorm(_bn_input, _bn_gamma, _bn_beta, 1e-5, out _, out _); _batchnormPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.LayerNorm(_ln_input, _ln_gamma, _ln_beta, 1e-5, out _, out _); _layernormPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorAbs(_op_a); _absPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorPower(_op_a, 2.0f); _powPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorLogSoftmax(_op_2d, -1); _logSoftmaxPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceSum(_op_large, null); _meanPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -728,6 +736,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Abs[100K]")]
     public Tensor<float> AiDotNet_Abs_100K() => _engine.TensorAbs(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Abs[100K]")]
+    public Tensor<float> AiDotNet_Abs_100K_Compiled() => _absPlan is not null ? _absPlan.Execute() : _engine.TensorAbs(_op_a);
+
     [Benchmark(Description = "PyTorch: Abs[100K]")]
     public TorchTensor PyTorch_Abs_100K() => torch.abs(_t_op_a);
 
@@ -741,6 +752,9 @@ public class TensorCodecVsPyTorchBenchmarks
     // --- LogSoftmax ---
     [Benchmark(Description = "AiDotNet Eager: LogSoftmax[256x256]")]
     public Tensor<float> AiDotNet_LogSoftmax() => _engine.TensorLogSoftmax(_op_2d, -1);
+
+    [Benchmark(Description = "AiDotNet Compiled: LogSoftmax[256x256]")]
+    public Tensor<float> AiDotNet_LogSoftmax_Compiled() => _logSoftmaxPlan is not null ? _logSoftmaxPlan.Execute() : _engine.TensorLogSoftmax(_op_2d, -1);
 
     [Benchmark(Description = "PyTorch: LogSoftmax[256x256]")]
     public TorchTensor PyTorch_LogSoftmax() => torch.nn.functional.log_softmax(_t_op_2d, dim: -1);
@@ -801,6 +815,9 @@ public class TensorCodecVsPyTorchBenchmarks
     // --- Pow ---
     [Benchmark(Description = "AiDotNet Eager: Pow[100K]")]
     public Tensor<float> AiDotNet_Pow_100K() => _engine.TensorPower(_op_a, 2.0f);
+
+    [Benchmark(Description = "AiDotNet Compiled: Pow[100K]")]
+    public Tensor<float> AiDotNet_Pow_100K_Compiled() => _powPlan is not null ? _powPlan.Execute() : _engine.TensorPower(_op_a, 2.0f);
 
     [Benchmark(Description = "PyTorch: Pow[100K]")]
     public TorchTensor PyTorch_Pow_100K() => torch.pow(_t_op_a, 2.0);

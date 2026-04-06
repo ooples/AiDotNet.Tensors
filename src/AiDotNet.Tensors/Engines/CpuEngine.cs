@@ -4177,13 +4177,45 @@ public class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
+    public virtual unsafe Tensor<T> TensorPower<T>(Tensor<T> tensor, T exponent)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                var captured = tensor; var capturedExp = exponent;
+                return scope.RecordUnary(LazyNodeType.Custom, "TensorPower", tensor, tensor._shape,
+                    (eng, output) => { var r = eng.TensorPower(captured, capturedExp); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.PowerBackward, exponent is not null ? new object[] { exponent } : Array.Empty<object>());
+            }
+        }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+
+        // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x)
+        if (typeof(T) == typeof(float))
+        {
+            float fExp = exponent is not null ? (float)(object)exponent : 0f;
+            if (fExp == 2.0f)
+            {
+                // x^2 = x * x — use SIMD multiply
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+                if (exponent is not null)
+                    DifferentiableOps.RecordUnary("TensorPower", result, tensor, BackwardFunctions<T>.PowerBackward, new object[] { exponent });
+                return result;
+            }
+        }
+
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
