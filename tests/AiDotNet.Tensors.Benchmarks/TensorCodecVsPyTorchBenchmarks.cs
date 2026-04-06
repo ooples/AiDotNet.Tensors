@@ -712,5 +712,111 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: Subtract[100K]")]
     public TorchTensor PyTorch_Sub_100K() => _t_op_a - _t_op_b;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 11. EXPANDED OPERATIONS: More coverage
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Divide ---
+    [Benchmark(Description = "AiDotNet Eager: Divide[100K]")]
+    public Tensor<float> AiDotNet_Divide_100K() => _engine.TensorDivide(_op_a, _op_b);
+
+    [Benchmark(Description = "PyTorch: Divide[100K]")]
+    public TorchTensor PyTorch_Divide_100K() => _t_op_a / _t_op_b;
+
+    // --- Abs ---
+    [Benchmark(Description = "AiDotNet Eager: Abs[100K]")]
+    public Tensor<float> AiDotNet_Abs_100K() => _engine.TensorAbs(_op_a);
+
+    [Benchmark(Description = "PyTorch: Abs[100K]")]
+    public TorchTensor PyTorch_Abs_100K() => torch.abs(_t_op_a);
+
+    // --- Sqrt ---
+    [Benchmark(Description = "AiDotNet Eager: Sqrt[100K]")]
+    public Tensor<float> AiDotNet_Sqrt_100K() => _engine.TensorSqrt(_op_a);
+
+    [Benchmark(Description = "PyTorch: Sqrt[100K]")]
+    public TorchTensor PyTorch_Sqrt_100K() => torch.sqrt(_t_op_a);
+
+    // --- LogSoftmax ---
+    [Benchmark(Description = "AiDotNet Eager: LogSoftmax[256x256]")]
+    public Tensor<float> AiDotNet_LogSoftmax() => _engine.TensorLogSoftmax(_op_2d, -1);
+
+    [Benchmark(Description = "PyTorch: LogSoftmax[256x256]")]
+    public TorchTensor PyTorch_LogSoftmax() => torch.nn.functional.log_softmax(_t_op_2d, dim: -1);
+
+    // --- Mean reduction ---
+    [Benchmark(Description = "AiDotNet Eager: Mean[1M]")]
+    public Tensor<float> AiDotNet_Mean_1M()
+    {
+        var mean = _engine.TensorMean(_op_large);
+        return new Tensor<float>(new[] { mean }, new[] { 1 });
+    }
+
+    [Benchmark(Description = "PyTorch: Mean[1M]")]
+    public TorchTensor PyTorch_Mean_1M() => _t_op_large.mean();
+
+    // --- Max reduction ---
+    [Benchmark(Description = "AiDotNet Eager: Max[100K]")]
+    public Tensor<float> AiDotNet_Max_100K() => _engine.TensorMax(_op_a, _op_b);
+
+    [Benchmark(Description = "PyTorch: Max[100K]")]
+    public TorchTensor PyTorch_Max_100K() => torch.max(_t_op_a, _t_op_b);
+
+    // --- Attention Q@K^T pattern ---
+    private Tensor<float> _attn_q = null!, _attn_k = null!;
+    private TorchTensor _t_attn_q = null!, _t_attn_k = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_AttentionQKT))]
+    public void SetupAttn()
+    {
+        if (_attn_q != null) return;
+        _attn_q = Tensor<float>.CreateRandom([8, 64, 32]); // [batch, seq, head_dim]
+        _attn_k = Tensor<float>.CreateRandom([8, 64, 32]);
+        _t_attn_q = torch.randn([8, 64, 32]);
+        _t_attn_k = torch.randn([8, 64, 32]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: Attention Q@K^T [8x64x32]")]
+    public Tensor<float> AiDotNet_AttentionQKT()
+    {
+        var kT = _engine.TensorTranspose(_attn_k);
+        return _engine.BatchMatMul(_attn_q, kT);
+    }
+
+    [Benchmark(Description = "PyTorch: Attention Q@K^T [8x64x32]")]
+    public TorchTensor PyTorch_AttentionQKT()
+    {
+        using var _ = torch.no_grad();
+        return torch.matmul(_t_attn_q, _t_attn_k.transpose(-2, -1));
+    }
+
+    // --- Negate ---
+    [Benchmark(Description = "AiDotNet Eager: Negate[100K]")]
+    public Tensor<float> AiDotNet_Negate_100K() => _engine.TensorNegate(_op_a);
+
+    [Benchmark(Description = "PyTorch: Negate[100K]")]
+    public TorchTensor PyTorch_Negate_100K() => -_t_op_a;
+
+    // --- Pow ---
+    [Benchmark(Description = "AiDotNet Eager: Pow[100K]")]
+    public Tensor<float> AiDotNet_Pow_100K() => _engine.TensorPower(_op_a, 2.0f);
+
+    [Benchmark(Description = "PyTorch: Pow[100K]")]
+    public TorchTensor PyTorch_Pow_100K() => torch.pow(_t_op_a, 2.0);
+
+    // --- GroupNorm ---
+    [Benchmark(Description = "AiDotNet Eager: GroupNorm[32x64x8x8]")]
+    public Tensor<float> AiDotNet_GroupNorm()
+    {
+        return _engine.GroupNorm(_bn_input, 8, _bn_gamma, _bn_beta, 1e-5, out _, out _);
+    }
+
+    [Benchmark(Description = "PyTorch: GroupNorm[32x64x8x8]")]
+    public TorchTensor PyTorch_GroupNorm()
+    {
+        using var _ = torch.no_grad();
+        return torch.nn.functional.group_norm(_t_bn_input, 8, _t_bn_gamma, _t_bn_beta);
+    }
 }
 #endif
