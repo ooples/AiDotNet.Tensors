@@ -462,6 +462,9 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _geluPlan;
     private CompiledInferencePlan<float>? _transposePlan;
     private CompiledInferencePlan<float>? _reduceSumPlan;
+    private CompiledInferencePlan<float>? _sigmoidPlan;
+    private CompiledInferencePlan<float>? _softmaxPlan;
+    private CompiledInferencePlan<float>? _matmulPlan;
 
     private void SetupOps()
     {
@@ -482,6 +485,9 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.GELU(_op_a); _geluPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorTranspose(_op_2d); _transposePlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.ReduceSum(_op_large, null); _reduceSumPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Sigmoid(_op_a); _sigmoidPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Softmax(_op_2d, -1); _softmaxPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMatMul(_op_2d, _op_2d); _matmulPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -528,18 +534,14 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_Mish_100K() => torch.nn.functional.mish(_t_op_a);
 
     // --- Softmax ---
-    [Benchmark(Description = "AiDotNet: Softmax[32x1024]")]
-    public Tensor<float> AiDotNet_Softmax_1K()
-    {
-        var input = _op_2d; // reuse 256x256 ≈ 65K
-        return _engine.Softmax(input, -1);
-    }
+    [Benchmark(Description = "AiDotNet Eager: Softmax[256x256]")]
+    public Tensor<float> AiDotNet_Softmax() => _engine.Softmax(_op_2d, -1);
 
-    [Benchmark(Description = "PyTorch: Softmax[32x1024]")]
-    public TorchTensor PyTorch_Softmax_1K()
-    {
-        return torch.nn.functional.softmax(_t_op_2d, dim: -1);
-    }
+    [Benchmark(Description = "AiDotNet Compiled: Softmax[256x256]")]
+    public Tensor<float> AiDotNet_Softmax_Compiled() => _softmaxPlan is not null ? _softmaxPlan.Execute() : _engine.Softmax(_op_2d, -1);
+
+    [Benchmark(Description = "PyTorch: Softmax[256x256]")]
+    public TorchTensor PyTorch_Softmax() => torch.nn.functional.softmax(_t_op_2d, dim: -1);
 
     // --- Transpose ---
     [Benchmark(Description = "AiDotNet Eager: Transpose[256x256]")]
@@ -588,8 +590,11 @@ public class TensorCodecVsPyTorchBenchmarks
     // ═══════════════════════════════════════════════════════════════════
 
     // --- Sigmoid ---
-    [Benchmark(Description = "AiDotNet: Sigmoid[100K]")]
+    [Benchmark(Description = "AiDotNet Eager: Sigmoid[100K]")]
     public Tensor<float> AiDotNet_Sigmoid_100K() => _engine.Sigmoid(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Sigmoid[100K]")]
+    public Tensor<float> AiDotNet_Sigmoid_100K_Compiled() => _sigmoidPlan is not null ? _sigmoidPlan.Execute() : _engine.Sigmoid(_op_a);
 
     [Benchmark(Description = "PyTorch: Sigmoid[100K]")]
     public TorchTensor PyTorch_Sigmoid_100K() => torch.sigmoid(_t_op_a);
@@ -633,8 +638,11 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_Log_100K() => torch.log(_t_op_a);
 
     // --- MatMul ---
-    [Benchmark(Description = "AiDotNet: MatMul[256x256]")]
+    [Benchmark(Description = "AiDotNet Eager: MatMul[256x256]")]
     public Tensor<float> AiDotNet_MatMul_256() => _engine.TensorMatMul(_op_2d, _op_2d);
+
+    [Benchmark(Description = "AiDotNet Compiled: MatMul[256x256]")]
+    public Tensor<float> AiDotNet_MatMul_256_Compiled() => _matmulPlan is not null ? _matmulPlan.Execute() : _engine.TensorMatMul(_op_2d, _op_2d);
 
     [Benchmark(Description = "PyTorch: MatMul[256x256]")]
     public TorchTensor PyTorch_MatMul_256() => torch.matmul(_t_op_2d, _t_op_2d);

@@ -321,20 +321,15 @@ internal sealed class CompiledTrainingPlan<T>
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            float[]? cOut = null;
 
             return eng =>
             {
-                cIn ??= (float[])(object)input.GetDataArray();
                 cOut ??= (float[])(object)output.GetDataArray();
-                // Use SIMD parallel sum for large arrays instead of scalar loop
-                unsafe
-                {
-                    fixed (float* p = cIn)
-                    {
-                        cOut[0] = SimdKernels.SumUnsafe(p, input.Length);
-                    }
-                }
+                // Use engine's TensorSum which has parallel chunking for large arrays
+                T sum = eng.TensorSum(input);
+                if (typeof(T) == typeof(float))
+                    cOut[0] = Unsafe.As<T, float>(ref sum);
             };
         }
 
@@ -388,6 +383,13 @@ internal sealed class CompiledTrainingPlan<T>
             {
                 MathHelper.GetNumericOperations<T>().Negate(inp.AsSpan(), o.AsWritableSpan());
             };
+        }
+
+        // Sigmoid forward: direct SIMD into pre-allocated buffer
+        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.SigmoidInto(o, inp);
         }
 
         // GELU forward: direct SIMD
