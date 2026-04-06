@@ -543,14 +543,15 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Log forward: direct VML/SIMD via CpuEngine.TensorLogInto
-        if (step.OpName == "TensorLog" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpName == "TensorLog" && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Exp forward: direct VML/SIMD via CpuEngine.TensorExpInto
-        if (step.OpName == "TensorExp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        // Exp forward: direct VML/SIMD via CpuEngine.TensorExpInto
+        if (step.OpName == "TensorExp" && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
