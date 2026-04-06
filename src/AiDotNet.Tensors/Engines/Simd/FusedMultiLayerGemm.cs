@@ -1,8 +1,6 @@
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Helpers;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
@@ -71,14 +69,13 @@ internal static class FusedMultiLayerGemm
         // Allocate inter-layer tile buffer [Mr, H] — stays in L1
         var tile = ArrayPool<float>.Shared.Rent(Mr * h);
 
-        // Pack W2 once (it's reused for every row-strip)
+        // Defer W2 packing until we know BLAS isn't available (avoids wasted work)
         int nrBlocks = (n + Nr - 1) / Nr;
-        var packedW2 = ArrayPool<float>.Shared.Rent(h * ((nrBlocks * Nr) + Nr));
+        float[] packedW2 = Array.Empty<float>();
+        bool w2Packed = false;
 
         try
         {
-            PackBRowMajor(w2, packedW2, h, n);
-
             // Process Mr rows at a time
             for (int ic = 0; ic < m; ic += Mr)
             {
@@ -106,13 +103,23 @@ internal static class FusedMultiLayerGemm
                 // Step 3: Compute GEMM2: output[ic:ic+mr, :] += tile[mr, H] @ W2[H, N]
                 // Use BLAS with beta=0 (output was pre-cleared) for the strip
                 if (!BlasProvider.TryGemm(mr, n, h, tile, 0, h, w2, 0, n, output, ic * n, n))
+                {
+                    // Pack W2 on first BLAS miss (deferred to avoid wasted work when BLAS is available)
+                    if (!w2Packed)
+                    {
+                        packedW2 = ArrayPool<float>.Shared.Rent(h * ((nrBlocks * Nr) + Nr));
+                        PackBRowMajor(w2, packedW2, h, n);
+                        w2Packed = true;
+                    }
                     ComputeGemm2FromTile(tile, packedW2, output, ic, mr, h, n);
+                }
             }
         }
         finally
         {
             ArrayPool<float>.Shared.Return(tile);
-            ArrayPool<float>.Shared.Return(packedW2);
+            if (w2Packed)
+                ArrayPool<float>.Shared.Return(packedW2);
         }
     }
 

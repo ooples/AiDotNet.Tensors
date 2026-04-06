@@ -25,7 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             return sw.Elapsed.TotalMilliseconds / iters;
         }
 
-        [Theory]
+        [Theory(Skip = "Performance benchmark — run manually")]
         [InlineData(8, 64, 32, 10, 500)]     // Tiny
         [InlineData(32, 128, 64, 10, 500)]    // Small (main benchmark)
         [InlineData(64, 256, 128, 32, 200)]   // Medium
@@ -87,7 +87,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 m, k, h, n, eagerMs, compiledMs, speedupVsEager, phaseBMs, phaseBVsEager);
         }
 
-        [Theory]
+        [Theory(Skip = "Performance benchmark — run manually")]
         [InlineData(100000, 500)]    // 100K elements
         [InlineData(1000000, 200)]   // 1M elements
         public void ElementwiseOps_CompiledVsEager(int size, int iters)
@@ -313,7 +313,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Theory]
+        [Theory(Skip = "Performance benchmark — run manually")]
         [InlineData("ReLU")]
         [InlineData("Tanh")]
         [InlineData("GELU")]
@@ -366,7 +366,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Theory]
+        [Theory(Skip = "Performance benchmark — run manually")]
         [InlineData(32, 512, 256, 128, 64, 10, 100)]    // Wide MLP
         [InlineData(128, 256, 128, 64, 32, 10, 100)]     // Large batch
         [InlineData(32, 1024, 512, 256, 128, 10, 50)]    // Very deep/wide

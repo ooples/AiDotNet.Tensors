@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;

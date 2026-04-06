@@ -129,7 +129,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra
             Assert.True(maxDiff < 1e-2, "SpectralMatMul too inaccurate: " + maxDiff);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void SpectralMatMul_Performance_VsDirect()
         {
             int m = 128, n = 64, trueRank = 16;
@@ -224,6 +224,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra
             // Full rank matrix: rank won't be reducible by 2x
             // Decompose returns null when rank >= minDim/2
             _output.WriteLine("Full rank matrix: factors is {0}", factors == null ? "null (correct)" : "not null (rank=" + factors.Value.Rank + ")");
+            Assert.Null(factors);
         }
     }
 }

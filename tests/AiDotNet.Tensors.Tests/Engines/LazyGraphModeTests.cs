@@ -8,8 +8,10 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines
 {
     /// <summary>
-    /// Integration tests proving lazy graph mode produces bitwise-identical results to eager execution.
-    /// Each test computes the same operation eagerly and lazily, then asserts element-wise equality.
+    /// Integration tests proving lazy graph mode produces numerically equivalent results to eager execution
+    /// within floating-point tolerance. Fusion may change accumulation order, so exact bitwise equality
+    /// is not guaranteed. Each test computes the same operation eagerly and lazily, then asserts
+    /// element-wise equality within <see cref="Tolerance"/>.
     /// </summary>
     public class LazyGraphModeTests
     {

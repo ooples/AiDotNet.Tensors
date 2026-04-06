@@ -79,7 +79,10 @@ internal static class FusedMultiLayerBackward
 
         // Step 3: grad_h = gradOutput @ W2^T  [M,N] @ [N,H] = [M,H]
         // Uses TryGemmEx(transB=true) — no transpose allocation
-        var grad_h = workspace ?? new float[m * h];
+        int requiredSize = m * h;
+        var grad_h = workspace != null && workspace.Length >= requiredSize
+            ? workspace
+            : new float[requiredSize];
         if (!BlasProvider.TryGemmEx(m, h, n,
                 gradOutput, 0, n, false,
                 w2, 0, n, true,

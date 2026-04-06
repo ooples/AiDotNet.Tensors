@@ -149,7 +149,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             Assert.True(maxW2Diff < 1e-3, "gradW2 diverged: " + maxW2Diff);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void FusedForward_Performance_VsUnfused()
         {
             int m = 32, k = 128, h = 64, n = 10;

@@ -223,13 +223,18 @@ internal static class SvdDecomposition
     internal static void SpectralMatMul(
         float[] x, int xRows, int xCols,
         SpectralFactors factors,
-        float[] output)
+        float[] output,
+        float[]? workspace = null)
     {
         int r = factors.Rank;
         int n = factors.OriginalN;
 
-        // Step 1: temp = x[xRows, xCols] @ leftFactor[xCols, r] → [xRows, r]
-        var temp = new float[xRows * r];
+        // Reuse caller-provided workspace to avoid per-call allocation on hot paths.
+        // Caller can pre-allocate: workspace = new float[xRows * factors.Rank]
+        var temp = workspace != null && workspace.Length >= xRows * r
+            ? workspace
+            : new float[xRows * r];
+        Array.Clear(temp, 0, xRows * r);
         if (!BlasProvider.TryGemm(xRows, r, xCols, x, 0, xCols, factors.LeftFactor, 0, r, temp, 0, r))
         {
             SimdGemm.Sgemm(x.AsSpan(0, xRows * xCols), factors.LeftFactor.AsSpan(0, xCols * r),

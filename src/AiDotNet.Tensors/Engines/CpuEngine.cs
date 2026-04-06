@@ -2409,7 +2409,8 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var capturedA = a;
                 var capturedB = b;
-                return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, a._shape,
+                var broadcastShape = ComputeBroadcastShape(a._shape, b._shape);
+                return scope.RecordBinary(LazyNodeType.BroadcastAdd, "TensorBroadcastAdd", a, b, broadcastShape,
                     (eng, output) => { var eager = eng.TensorBroadcastAdd(capturedA, capturedB); eager.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.BroadcastAddBackward);
             }
@@ -2650,8 +2651,12 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe void GELUInto<T>(Tensor<T> destination, Tensor<T> input)
     {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (destination.Length < input.Length)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
             var srcMem = AsFloatMemory(input.Data);
@@ -2680,6 +2685,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (destination.Length < input.Length)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
 
         int length = input.Length;
         if (typeof(T) == typeof(float))
@@ -2725,8 +2732,12 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public void LeakyReLUInto<T>(Tensor<T> destination, Tensor<T> input, T alpha)
     {
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (input == null) throw new ArgumentNullException(nameof(input));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (destination.Length < input.Length)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
             var srcMem = AsFloatMemory(input.Data);
@@ -7809,6 +7820,21 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorMatMul", result, a, b, BackwardFunctions<T>.MatMulBackward);
+        return result;
+    }
+
+    private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
+    {
+        int maxRank = Math.Max(shape1.Length, shape2.Length);
+        var result = new int[maxRank];
+        for (int i = 0; i < maxRank; i++)
+        {
+            int dim1 = i < shape1.Length ? shape1[shape1.Length - 1 - i] : 1;
+            int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
+            if (dim1 != dim2 && dim1 != 1 && dim2 != 1)
+                throw new ArgumentException($"Shapes are not broadcast-compatible at dimension {maxRank - 1 - i}: {dim1} vs {dim2}");
+            result[maxRank - 1 - i] = Math.Max(dim1, dim2);
+        }
         return result;
     }
 
@@ -20953,13 +20979,16 @@ public class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Computes the backward pass for the specified activation function.
     /// </summary>
-    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> activationOutput, FusedActivationType activation)
+    internal Tensor<T> ApplyFusedActivationBackward<T>(Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation)
     {
+        // None is an explicit pass-through — no derivative to apply
+        if (activation == FusedActivationType.None) return gradOutput;
+
         // OCP-compliant: dispatch through ActivationRegistry, no switch statement.
-        // Each activation handler knows how to compute its own backward.
+        // ActivationRegistry.Get throws for unknown types, preventing silent identity pass-through.
         var handler = ActivationRegistry.Get(activation);
-        if (handler is null) return gradOutput; // None
-        return handler.ApplyBackward(this, gradOutput, activationOutput);
+        if (handler is null) return gradOutput;
+        return handler.ApplyBackward(this, gradOutput, preActivation);
     }
 
     /// <summary>
