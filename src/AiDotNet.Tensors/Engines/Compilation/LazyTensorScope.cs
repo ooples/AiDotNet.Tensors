@@ -138,6 +138,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledInferencePlan<T> CompileInference<T>()
     {
+        MarkCompiled();
         return CompiledInferencePlan<T>.Compile(this, _engine);
     }
 
@@ -147,7 +148,17 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
+        MarkCompiled();
         return CompiledTrainingPlan<T>.Compile(this, _engine, parameters);
+    }
+
+    /// <summary>
+    /// Marks this scope as compiled so Dispose() won't auto-realize the graph.
+    /// Called by CompileInference/CompileTraining which handle the graph themselves.
+    /// </summary>
+    internal void MarkCompiled()
+    {
+        _realized = true;
     }
 
     public void Dispose()
@@ -155,11 +166,16 @@ internal sealed class LazyTensorScope : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        // Auto-realize on dispose if not yet done (safety net)
-        if (!_realized)
-            Realize();
-
-        // Restore parent scope
-        GraphMode.SetCurrent(_parent);
+        try
+        {
+            // Auto-realize on dispose if not yet done (safety net)
+            if (!_realized)
+                Realize();
+        }
+        finally
+        {
+            // Always restore parent scope, even if Realize() throws
+            GraphMode.SetCurrent(_parent);
+        }
     }
 }

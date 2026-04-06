@@ -150,6 +150,9 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
+        // Hoist the delegate lookup outside the hot loop to avoid per-element dictionary access
+        Func<float, float>? activationFn = hasActivation ? GetFloatActivation(activation) : null;
+
         for (int i = 0; i < M; i++)
         {
             int rowOffset = i * N;
@@ -157,7 +160,7 @@ public static class CpuFusedOperations
             {
                 float val = output[rowOffset + j];
                 if (hasBias) val += bias![j];
-                if (hasActivation) val = ApplyActivation(val, activation);
+                if (activationFn != null) val = activationFn(val);
                 output[rowOffset + j] = val;
             }
         }
@@ -251,11 +254,13 @@ public static class CpuFusedOperations
         float invStd = 1f / MathF.Sqrt(variance + epsilon);
 
         // Pass 2: Normalize, scale, shift, and apply activation (fused)
+        // Hoist delegate lookup outside the loop
+        var activationFn = activation != FusedActivationType.None ? GetFloatActivation(activation) : null;
         for (int i = 0; i < featureSize; i++)
         {
             float normalized = (input[offset + i] - mean) * invStd;
             float scaled = normalized * gamma[i] + beta[i];
-            output[offset + i] = ApplyActivation(scaled, activation);
+            output[offset + i] = activationFn != null ? activationFn(scaled) : scaled;
         }
     }
 
@@ -469,12 +474,8 @@ public static class CpuFusedOperations
     #region Activation Functions
 
     /// <summary>
-    /// Applies the specified activation function to a single value.
-    /// Inline for performance in fused operations.
-    /// </summary>
-    /// <summary>
-    /// OCP-compliant activation dispatch table. Register new activations here.
-    /// Resolved once before loop, then called per-element with zero lookup overhead.
+    /// OCP-compliant activation dispatch table for pointwise float activations.
+    /// Resolve once before a loop, then call the returned delegate per element with zero lookup overhead.
     /// </summary>
     private static readonly Dictionary<FusedActivationType, Func<float, float>> _floatActivations = new()
     {
@@ -485,15 +486,17 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, MathF.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0f ? x : 0.01f * x },
         { FusedActivationType.Swish, x => x / (1f + MathF.Exp(-x)) },
-        { FusedActivationType.Softmax, x => x },
+        // Softmax is NOT pointwise (depends on entire row) — must not appear here.
+        // Fused paths that include Softmax should apply it separately after the GEMM loop.
     };
 
-    /// <summary>Gets the float activation function delegate for use in tight loops.</summary>
+    /// <summary>Gets the float activation function delegate for use in tight loops.
+    /// Resolve once outside the loop, then call the returned delegate per element.</summary>
     internal static Func<float, float> GetFloatActivation(FusedActivationType activation)
     {
         if (_floatActivations.TryGetValue(activation, out var fn))
             return fn;
-        return x => x;
+        throw new ArgumentException($"No float activation registered for type: {activation}");
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -552,18 +555,20 @@ public static class CpuFusedOperations
 
         // BLAS unavailable: parallel scalar fallback
         bool hasBias = bias != null;
+        // Hoist delegate lookup outside the loop
+        Func<double, double>? activationFn = activation != FusedActivationType.None ? GetDoubleActivation(activation) : null;
         int totalElements = M * N;
         if (totalElements >= PARALLEL_THRESHOLD && M > 1)
         {
             Parallel.For(0, M, i =>
             {
-                ComputeGemmRowFusedDouble(A, B, bias, output, i, M, N, K, hasBias, activation);
+                ComputeGemmRowFusedDouble(A, B, bias, output, i, M, N, K, hasBias, activationFn);
             });
         }
         else
         {
             for (int i = 0; i < M; i++)
-                ComputeGemmRowFusedDouble(A, B, bias, output, i, M, N, K, hasBias, activation);
+                ComputeGemmRowFusedDouble(A, B, bias, output, i, M, N, K, hasBias, activationFn);
         }
     }
 
@@ -577,6 +582,9 @@ public static class CpuFusedOperations
         bool hasActivation = activation != FusedActivationType.None;
         if (!hasBias && !hasActivation) return;
 
+        // Hoist the delegate lookup outside the hot loop
+        Func<double, double>? activationFn = hasActivation ? GetDoubleActivation(activation) : null;
+
         for (int i = 0; i < M; i++)
         {
             int rowOffset = i * N;
@@ -584,7 +592,7 @@ public static class CpuFusedOperations
             {
                 double val = output[rowOffset + j];
                 if (hasBias) val += bias![j];
-                if (hasActivation) val = ApplyActivationDouble(val, activation);
+                if (activationFn != null) val = activationFn(val);
                 output[rowOffset + j] = val;
             }
         }
@@ -599,7 +607,7 @@ public static class CpuFusedOperations
         int row,
         int M, int N, int K,
         bool hasBias,
-        FusedActivationType activation)
+        Func<double, double>? activationFn)
     {
         int aRowOffset = row * K;
         int outRowOffset = row * N;
@@ -619,7 +627,7 @@ public static class CpuFusedOperations
             if (hasBias && bias != null)
                 sum += bias[j];
 
-            output[outRowOffset + j] = ApplyActivationDouble(sum, activation);
+            output[outRowOffset + j] = activationFn != null ? activationFn(sum) : sum;
         }
     }
 
@@ -633,15 +641,16 @@ public static class CpuFusedOperations
         { FusedActivationType.Tanh, Math.Tanh },
         { FusedActivationType.LeakyReLU, x => x > 0.0 ? x : 0.01 * x },
         { FusedActivationType.Swish, x => x / (1.0 + Math.Exp(-x)) },
-        { FusedActivationType.Softmax, x => x },
+        // Softmax is NOT pointwise — must not appear here.
     };
 
-    /// <summary>Gets the double activation function delegate for use in tight loops.</summary>
+    /// <summary>Gets the double activation function delegate for use in tight loops.
+    /// Resolve once outside the loop, then call the returned delegate per element.</summary>
     internal static Func<double, double> GetDoubleActivation(FusedActivationType activation)
     {
         if (_doubleActivations.TryGetValue(activation, out var fn))
             return fn;
-        return x => x;
+        throw new ArgumentException($"No double activation registered for type: {activation}");
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

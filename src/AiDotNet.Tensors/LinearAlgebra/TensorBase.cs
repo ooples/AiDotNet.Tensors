@@ -583,6 +583,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual T[] ToArray()
     {
+        EnsureMaterialized();
         ThrowIfSparse();
         if (Length == 0) return Array.Empty<T>();
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
@@ -606,6 +607,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public virtual void CopyFromArray(T[] source)
     {
+        EnsureMaterialized();
         ThrowIfSparse();
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (source.Length != Length)
@@ -632,6 +634,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public T GetFlat(int flatIndex)
     {
+        EnsureMaterialized();
         ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
@@ -645,6 +648,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     public void SetFlat(int flatIndex, T value)
     {
+        EnsureMaterialized();
         ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
             throw new ArgumentOutOfRangeException(nameof(flatIndex), "Flat index is out of range.");
@@ -655,13 +659,22 @@ public abstract class TensorBase<T> : IDisposable
     }
 
     /// <summary>
+    /// Ensures lazy tensor data has been materialized before access.
+    /// Centralizes the auto-materialization guard so all data access paths use it.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void EnsureMaterialized()
+    {
+        if (LazySource is ILazyNode node && !node.IsRealized)
+            node.Realize(node.RecordingEngine);
+    }
+
+    /// <summary>
     /// Gets a read-only span over the tensor data. Throws for non-contiguous views.
     /// </summary>
     public ReadOnlySpan<T> AsSpan()
     {
-        // Auto-materialize lazy tensors on data access
-        if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+        EnsureMaterialized();
 
         ThrowIfSparse();
         if (Length == 0) return ReadOnlySpan<T>.Empty;
@@ -678,9 +691,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal Span<T> AsWritableSpan()
     {
-        // Auto-materialize lazy tensors on data access
-        if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+        EnsureMaterialized();
 
         if (Length == 0) return Span<T>.Empty;
         if (!IsContiguous)
@@ -696,9 +707,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal T[] GetDataArray()
     {
-        // Auto-materialize lazy tensors on data access
-        if (LazySource is ILazyNode node && !node.IsRealized)
-            node.Realize(AiDotNetEngine.Current);
+        EnsureMaterialized();
 
         if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
             return ToArray();
@@ -965,6 +974,7 @@ public abstract class TensorBase<T> : IDisposable
     /// </summary>
     internal bool TryGetContiguousSpan(out ReadOnlySpan<T> span)
     {
+        EnsureMaterialized();
         if (!IsContiguous)
         {
             span = default;

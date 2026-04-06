@@ -22,6 +22,10 @@ internal interface ILazyNode
     /// <summary>Number of downstream nodes that depend on this node's output.</summary>
     int ConsumerCount { get; set; }
 
+    /// <summary>The engine that was active when this node was recorded.</summary>
+    IEngine RecordingEngine { get; }
+
+
     /// <summary>Execute this node, materializing its output tensor's data.</summary>
     void Realize(IEngine engine);
 
