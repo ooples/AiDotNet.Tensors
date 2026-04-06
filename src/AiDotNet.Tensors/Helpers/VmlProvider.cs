@@ -29,6 +29,8 @@ internal static class VmlProvider
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsExp;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsLn;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSqrt;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsAbs;
 
     // Double VML — mode-specific (vmd* takes mode as 4th arg).
     // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
@@ -136,6 +138,72 @@ internal static class VmlProvider
 #endif
     }
 
+    /// <summary>
+    /// Computes element-wise sigmoid(x) = 1/(1+exp(-x)) using VML exp + SIMD.
+    /// VML accelerates the exp(-x) part, SIMD does the reciprocal.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TrySigmoid(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsExp == null) return false;
+
+        // Step 1: output[i] = -input[i]
+        for (int i = 0; i < length; i++) output[i] = -input[i];
+        // Step 2: output[i] = exp(-input[i]) via VML SVML
+        _vsExp(length, output, output);
+        // Step 3: output[i] = 1 / (1 + exp(-input[i])) via SIMD
+        if (System.Runtime.Intrinsics.X86.Avx.IsSupported)
+        {
+            var vOne = System.Runtime.Intrinsics.Vector256.Create(1.0f);
+            int simdLen = length & ~7;
+            for (int i = 0; i < simdLen; i += 8)
+            {
+                var e = System.Runtime.Intrinsics.X86.Avx.LoadVector256(output + i);
+                var denom = System.Runtime.Intrinsics.X86.Avx.Add(vOne, e);
+                System.Runtime.Intrinsics.X86.Avx.Store(output + i,
+                    System.Runtime.Intrinsics.X86.Avx.Divide(vOne, denom));
+            }
+            for (int i = simdLen; i < length; i++)
+                output[i] = 1.0f / (1.0f + output[i]);
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+                output[i] = 1.0f / (1.0f + output[i]);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>Computes element-wise sqrt(x) using MKL VML.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TrySqrt(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsSqrt == null) return false;
+        _vsSqrt(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>Computes element-wise abs(x) using MKL VML.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TryAbs(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsAbs == null) return false;
+        _vsAbs(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
 
     private static bool EnsureInitialized()
@@ -208,6 +276,10 @@ internal static class VmlProvider
                 TryGetExport(handle, "vsLn", "MKL_vsLn", "VSLN");
             _vsTanh = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsTanh", "MKL_vsTanh", "VSTANH");
+            _vsSqrt = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsSqrt", "MKL_vsSqrt", "VSSQRT");
+            _vsAbs = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsAbs", "MKL_vsAbs", "VSABS");
 
             // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
             // This avoids the VML_HA regression that vd* functions hit when

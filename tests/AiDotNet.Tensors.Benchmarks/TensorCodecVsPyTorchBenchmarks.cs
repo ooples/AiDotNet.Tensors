@@ -603,6 +603,9 @@ public class TensorCodecVsPyTorchBenchmarks
     public Tensor<float> AiDotNet_Conv2D_3x3()
         => _engine.Conv2D(_conv_input, _conv_kernel, stride: 1, padding: 1);
 
+    [Benchmark(Description = "AiDotNet Compiled: Conv2D[4x3x32x32, 16x3x3x3]")]
+    public Tensor<float> AiDotNet_Conv2D_3x3_Compiled() => _conv2dPlan is not null ? _conv2dPlan.Execute() : _engine.Conv2D(_conv_input, _conv_kernel, stride: 1, padding: 1);
+
     [Benchmark(Description = "PyTorch: Conv2D[4x3x32x32, 16x3x3x3]")]
     public TorchTensor PyTorch_Conv2D_3x3()
     {
@@ -653,6 +656,9 @@ public class TensorCodecVsPyTorchBenchmarks
     {
         return _engine.LeakyReLU(_op_a, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().FromDouble(0.01));
     }
+
+    [Benchmark(Description = "AiDotNet Compiled: LeakyReLU[100K]")]
+    public Tensor<float> AiDotNet_LeakyReLU_100K_Compiled() => _leakyReluPlan is not null ? _leakyReluPlan.Execute() : _engine.LeakyReLU(_op_a, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().FromDouble(0.01));
 
     [Benchmark(Description = "PyTorch: LeakyReLU[100K]")]
     public TorchTensor PyTorch_LeakyReLU_100K() => torch.nn.functional.leaky_relu(_t_op_a, 0.01);

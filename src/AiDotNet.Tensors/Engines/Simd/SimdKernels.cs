@@ -324,6 +324,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
+            // VML SVML path: exp(-x) then SIMD reciprocal — ~3x faster than polynomial
+            if (VmlProvider.TrySigmoid(input, output, length))
+                return;
+
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
                 // 4x unrolled FastSigmoid256: consistent approximation across all SIMD paths
