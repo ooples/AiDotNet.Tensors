@@ -658,7 +658,6 @@ namespace AiDotNet.Tensors.Engines.Simd
             // This is ~3x faster than our polynomial FastSigmoid256 approximation.
             if (Avx.IsSupported && Fma.IsSupported && length >= 8)
             {
-                // Use rented buffer (stackalloc is unsafe for large arrays like 100K+)
                 var tanhArgsBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
                 try
                 {
