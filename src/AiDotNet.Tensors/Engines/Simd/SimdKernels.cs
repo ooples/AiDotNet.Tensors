@@ -655,42 +655,50 @@ namespace AiDotNet.Tensors.Engines.Simd
             // This is ~3x faster than our polynomial FastSigmoid256 approximation.
             if (Avx.IsSupported && Fma.IsSupported && length >= 8)
             {
-                // Step 1: Compute tanh arguments: tanh_arg[j] = sqrt(2/pi) * (x + 0.044715 * x^3)
-                var tanhArgs = stackalloc float[length];
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                var vCoeff = Vector256.Create(0.044715f);
-
-                int simdLen = length & ~7;
-                for (int j = 0; j < simdLen; j += 8)
+                // Use rented buffer (stackalloc is unsafe for large arrays like 100K+)
+                var tanhArgsBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
+                try
                 {
-                    var x = Avx.LoadVector256(input + j);
-                    var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
-                    var inner = Fma.MultiplyAdd(vCoeff, x3, x);
-                    Avx.Store(tanhArgs + j, Avx.Multiply(vSqrt2OverPi, inner));
-                }
-                for (int j = simdLen; j < length; j++)
-                {
-                    float x = input[j];
-                    tanhArgs[j] = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-                }
-
-                // Step 2: VML tanh (SVML vectorized) — the fast path
-                if (VmlProvider.TryTanh(tanhArgs, tanhArgs, length))
-                {
-                    // Step 3: GELU = 0.5 * x * (1 + tanh_result) — SIMD
-                    var vHalf = Vector256.Create(0.5f);
-                    var vOne = Vector256.Create(1.0f);
-                    for (int j = 0; j < simdLen; j += 8)
+                    fixed (float* tanhArgs = tanhArgsBuf)
                     {
-                        var x = Avx.LoadVector256(input + j);
-                        var t = Avx.LoadVector256(tanhArgs + j);
-                        Avx.Store(output + j, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, t))));
-                    }
-                    for (int j = simdLen; j < length; j++)
-                        output[j] = 0.5f * input[j] * (1f + tanhArgs[j]);
-                    return;
-                }
+                        var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                        var vCoeff = Vector256.Create(0.044715f);
 
+                        int simdLen = length & ~7;
+                        for (int j = 0; j < simdLen; j += 8)
+                        {
+                            var x = Avx.LoadVector256(input + j);
+                            var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
+                            var inner = Fma.MultiplyAdd(vCoeff, x3, x);
+                            Avx.Store(tanhArgs + j, Avx.Multiply(vSqrt2OverPi, inner));
+                        }
+                        for (int j = simdLen; j < length; j++)
+                        {
+                            float x = input[j];
+                            tanhArgs[j] = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+                        }
+
+                        // Step 2: VML tanh (SVML vectorized) — the fast path
+                        if (VmlProvider.TryTanh(tanhArgs, tanhArgs, length))
+                        {
+                            var vHalf = Vector256.Create(0.5f);
+                            var vOne = Vector256.Create(1.0f);
+                            for (int j = 0; j < simdLen; j += 8)
+                            {
+                                var x = Avx.LoadVector256(input + j);
+                                var t = Avx.LoadVector256(tanhArgs + j);
+                                Avx.Store(output + j, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, t))));
+                            }
+                            for (int j = simdLen; j < length; j++)
+                                output[j] = 0.5f * input[j] * (1f + tanhArgs[j]);
+                            return;
+                        }
+                    }
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(tanhArgsBuf);
+                }
                 // VML not available — fall through to polynomial path
             }
 
