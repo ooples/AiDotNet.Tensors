@@ -1869,5 +1869,62 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: Exp[1M]")]
     public TorchTensor PyTorch_Exp_1M() => torch.exp(_t_op_large);
+    // ═══════════════════════════════════════════════════════════════════
+    // 23. TOPK + NORMS + ADDITIONAL
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- TopK ---
+    [Benchmark(Description = "AiDotNet Eager: TopK[256x256, k=10]")]
+    public Tensor<float> AiDotNet_TopK()
+    {
+        var (values, _) = _engine.TopK(_op_2d, 10, axis: -1, largest: true);
+        return values;
+    }
+
+    [Benchmark(Description = "PyTorch: TopK[256x256, k=10]")]
+    public TorchTensor PyTorch_TopK()
+    {
+        var (values, _) = torch.topk(_t_op_2d, 10, dim: -1, largest: true);
+        return values;
+    }
+
+    // --- Mish 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Mish[1M]")]
+    public Tensor<float> AiDotNet_Mish_1M() => _engine.Mish(_op_large);
+
+    [Benchmark(Description = "PyTorch: Mish[1M]")]
+    public TorchTensor PyTorch_Mish_1M() => torch.nn.functional.mish(_t_op_large);
+
+    // --- Swish 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Swish[1M]")]
+    public Tensor<float> AiDotNet_Swish_1M() => _engine.Swish(_op_large);
+
+    [Benchmark(Description = "PyTorch: Swish[1M]")]
+    public TorchTensor PyTorch_Swish_1M() => torch.nn.functional.silu(_t_op_large);
+
+    // --- Softmax 1M ---
+    private Tensor<float> _op_large_2d = null!;
+    private TorchTensor _t_op_large_2d = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_Softmax_1M))]
+    public void SetupSoftmax1M()
+    {
+        if (_op_large_2d != null) return;
+        _op_large_2d = Tensor<float>.CreateRandom([1000, 1000]);
+        _t_op_large_2d = torch.randn([1000, 1000]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: Softmax[1000x1000]")]
+    public Tensor<float> AiDotNet_Softmax_1M() => _engine.Softmax(_op_large_2d, -1);
+
+    [Benchmark(Description = "PyTorch: Softmax[1000x1000]")]
+    public TorchTensor PyTorch_Softmax_1M() => torch.nn.functional.softmax(_t_op_large_2d, dim: -1);
+
+    // --- Log 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Log[1M]")]
+    public Tensor<float> AiDotNet_Log_1M() => _engine.TensorLog(_op_large);
+
+    [Benchmark(Description = "PyTorch: Log[1M]")]
+    public TorchTensor PyTorch_Log_1M() => torch.log(_t_op_large);
 }
 #endif
