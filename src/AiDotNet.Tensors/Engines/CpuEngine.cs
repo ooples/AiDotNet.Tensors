@@ -24439,6 +24439,24 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Float fast path: fused diff^2 sum in a single pass, no intermediate allocations
+        if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (float[])(object)predictions.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            float sumSq = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                float d = pArr[i] - tArr[i];
+                sumSq += d * d;
+            }
+            float fMean = sumSq / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
+            DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
+            return scalarResult;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
         using (new NoGradScope<T>())
