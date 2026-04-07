@@ -1061,17 +1061,16 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // VML erf path: exact GELU = 0.5 * x * (1 + erf(x / sqrt(2)))
-            // vsErf is SVML-optimized and ~5x faster than our polynomial tanh approximation
-            if (Avx.IsSupported && length >= 8)
+            // VML paths: only attempt if VML is actually initialized (avoid wasted ArrayPool rent)
+            if (Avx.IsSupported && length >= 8 && VmlProvider.IsInitialized)
             {
+                // Try VML erf path first: exact GELU = 0.5 * x * (1 + erf(x / sqrt(2)))
                 var erfBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
                 try
                 {
                     fixed (float* erf = erfBuf)
                     {
-                        // Compute x / sqrt(2) into erf buffer
-                        var vInvSqrt2 = Vector256.Create(0.70710678118654752f); // 1/sqrt(2)
+                        var vInvSqrt2 = Vector256.Create(0.70710678118654752f);
                         int simdLen = length & ~7;
                         for (int j = 0; j < simdLen; j += 8)
                             Avx.Store(erf + j, Avx.Multiply(Avx.LoadVector256(input + j), vInvSqrt2));
@@ -1092,6 +1091,38 @@ namespace AiDotNet.Tensors.Engines.Simd
                                 output[j] = 0.5f * input[j] * (1f + erf[j]);
                             return;
                         }
+
+                        // erf failed — try tanh path using same buffer
+                        if (Fma.IsSupported)
+                        {
+                            var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                            var vCoeff = Vector256.Create(0.044715f);
+                            for (int j = 0; j < simdLen; j += 8)
+                            {
+                                var x = Avx.LoadVector256(input + j);
+                                var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
+                                Avx.Store(erf + j, Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, x3, x)));
+                            }
+                            for (int j = simdLen; j < length; j++)
+                            {
+                                float x = input[j];
+                                erf[j] = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+                            }
+                            if (VmlProvider.TryTanh(erf, erf, length))
+                            {
+                                var vHalf = Vector256.Create(0.5f);
+                                var vOne = Vector256.Create(1.0f);
+                                for (int j = 0; j < simdLen; j += 8)
+                                {
+                                    var x = Avx.LoadVector256(input + j);
+                                    var t = Avx.LoadVector256(erf + j);
+                                    Avx.Store(output + j, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, t))));
+                                }
+                                for (int j = simdLen; j < length; j++)
+                                    output[j] = 0.5f * input[j] * (1f + erf[j]);
+                                return;
+                            }
+                        }
                     }
                 }
                 finally
@@ -1100,56 +1131,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
             }
 
-            // VML tanh path: approximate GELU via tanh (SVML microcode)
-            if (Avx.IsSupported && Fma.IsSupported && length >= 8)
-            {
-                var tanhArgsBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
-                try
-                {
-                    fixed (float* tanhArgs = tanhArgsBuf)
-                    {
-                        var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
-                        var vCoeff = Vector256.Create(0.044715f);
-
-                        int simdLen = length & ~7;
-                        for (int j = 0; j < simdLen; j += 8)
-                        {
-                            var x = Avx.LoadVector256(input + j);
-                            var x3 = Avx.Multiply(Avx.Multiply(x, x), x);
-                            var inner = Fma.MultiplyAdd(vCoeff, x3, x);
-                            Avx.Store(tanhArgs + j, Avx.Multiply(vSqrt2OverPi, inner));
-                        }
-                        for (int j = simdLen; j < length; j++)
-                        {
-                            float x = input[j];
-                            tanhArgs[j] = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-                        }
-
-                        // Step 2: VML tanh (SVML vectorized) — the fast path
-                        if (VmlProvider.TryTanh(tanhArgs, tanhArgs, length))
-                        {
-                            var vHalf = Vector256.Create(0.5f);
-                            var vOne = Vector256.Create(1.0f);
-                            for (int j = 0; j < simdLen; j += 8)
-                            {
-                                var x = Avx.LoadVector256(input + j);
-                                var t = Avx.LoadVector256(tanhArgs + j);
-                                Avx.Store(output + j, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, t))));
-                            }
-                            for (int j = simdLen; j < length; j++)
-                                output[j] = 0.5f * input[j] * (1f + tanhArgs[j]);
-                            return;
-                        }
-                    }
-                }
-                finally
-                {
-                    System.Buffers.ArrayPool<float>.Shared.Return(tanhArgsBuf);
-                }
-                // VML not available — fall through to polynomial path
-            }
-
-            // Polynomial fallback: FastSigmoid256-based tanh approximation
+            // Polynomial fallback (no VML): fully fused single-pass, no buffer needed
             if (Avx.IsSupported && Fma.IsSupported && length >= 32)
             {
                 var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);

@@ -59,8 +59,8 @@ internal static class AutoTensorCache
         if (!Enabled || tensor == null || !tensor.IsContiguous)
             return;
 
-        // Don't cache very large tensors (>16MB) — they'd hold too much memory
-        if (tensor.Length > 4_000_000)
+        // Don't cache very large tensors (>64MB) — they'd hold too much memory
+        if (tensor.Length > 16_000_000)
             return;
 
         var pools = _pools ??= new ConcurrentDictionary<long, ConcurrentQueue<object>>();

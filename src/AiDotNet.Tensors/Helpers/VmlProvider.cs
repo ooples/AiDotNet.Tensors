@@ -245,6 +245,9 @@ internal static class VmlProvider
 #endif
     }
 
+    /// <summary>Whether VML has been initialized and is available (avoids triggering lazy init).</summary>
+    internal static bool IsInitialized => _initialized && _available;
+
     // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
 
     private static bool EnsureInitialized()

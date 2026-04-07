@@ -1494,19 +1494,22 @@ public class TensorCodecVsPyTorchBenchmarks
     // ═══════════════════════════════════════════════════════════════════
 
     // --- Squeeze ---
-    [Benchmark(Description = "AiDotNet Eager: Squeeze[1x256x256]")]
-    public Tensor<float> AiDotNet_Squeeze()
+    private Tensor<float> _squeeze_input = null!;
+    private TorchTensor _t_squeeze_input = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_Squeeze))]
+    public void SetupSqueeze()
     {
-        var input = Tensor<float>.CreateRandom([1, 256, 256]);
-        return _engine.TensorSqueeze(input, 0);
+        if (_squeeze_input != null) return;
+        _squeeze_input = Tensor<float>.CreateRandom([1, 256, 256]);
+        _t_squeeze_input = torch.randn([1, 256, 256]);
     }
 
+    [Benchmark(Description = "AiDotNet Eager: Squeeze[1x256x256]")]
+    public Tensor<float> AiDotNet_Squeeze() => _engine.TensorSqueeze(_squeeze_input, 0);
+
     [Benchmark(Description = "PyTorch: Squeeze[1x256x256]")]
-    public TorchTensor PyTorch_Squeeze()
-    {
-        var input = torch.randn([1, 256, 256]);
-        return input.squeeze(0);
-    }
+    public TorchTensor PyTorch_Squeeze() => _t_squeeze_input.squeeze(0);
 
     // --- Stack ---
     [Benchmark(Description = "AiDotNet Eager: Stack[4x100K]")]
