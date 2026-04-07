@@ -19198,9 +19198,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Fast path for axis=0 contiguous 1D tensors: direct Array.Copy
+        // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         Tensor<T> result;
-        if (axis == 0 && tensors[0].Rank == 1 && tensors.All(t => t.IsContiguous))
+        if (axis == 0 && tensors.All(t => t.IsContiguous))
         {
             int totalLen = tensors.Sum(t => t.Length);
             var data = new T[totalLen];
@@ -19211,7 +19211,12 @@ public class CpuEngine : ITensorLevelEngine
                 Array.Copy(src, 0, data, offset, t.Length);
                 offset += t.Length;
             }
-            result = TensorAllocator.Rent<T>(new[] { totalLen }, new Vector<T>(data));
+            // Compute output shape: same as first tensor except axis 0 grows
+            var outShape = (int[])tensors[0]._shape.Clone();
+            int totalAxis0 = 0;
+            foreach (var t in tensors) totalAxis0 += t._shape[0];
+            outShape[0] = totalAxis0;
+            result = TensorAllocator.Rent<T>(outShape, new Vector<T>(data));
         }
         else
         {
