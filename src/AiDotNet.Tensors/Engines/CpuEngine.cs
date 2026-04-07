@@ -20369,14 +20369,27 @@ public class CpuEngine : ITensorLevelEngine
         for (int i = axis; i < firstShape.Length; i++) newShape[i + 1] = firstShape[i];
 
         var result = AutoTensorCache.RentOrAllocate<T>(newShape);
-
         var resultData = result.GetDataArray();
 
-        // Copy each tensor
+        // Fast path: axis=0 with contiguous tensors — just Array.Copy sequentially
+        if (axis == 0 && tensors.All(t => t.IsContiguous))
+        {
+            int elementsPerTensor = tensors[0].Length;
+            for (int t = 0; t < numTensors; t++)
+            {
+                var srcArr = tensors[t].GetDataArray();
+                Array.Copy(srcArr, 0, resultData, t * elementsPerTensor, elementsPerTensor);
+            }
+            DifferentiableOps.RecordIfActive("TensorStack", result, (Tensor<T>[])tensors.Clone(),
+                BackwardFunctions<T>.StackBackward, savedState: new object[] { axis });
+            return result;
+        }
+
+        // General path: copy each tensor with index mapping
         Parallel.For(0, numTensors, t =>
         {
             var tensor = tensors[t];
-            var tensorData = tensor.GetFlattenedData();
+            var tensorData = tensor.IsContiguous ? tensor.GetDataArray() : tensor.GetFlattenedData();
             int sliceSize = 1;
             for (int i = axis + 1; i < newShape.Length; i++) sliceSize *= newShape[i];
 
