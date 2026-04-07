@@ -1331,5 +1331,99 @@ public class TensorCodecVsPyTorchBenchmarks
         if (_t_loss_pred is null) SetupLoss();
         return torch.nn.functional.cross_entropy(_t_loss_pred, _t_loss_target.to(torch.int64).argmax(dim: 1));
     }
+    // ═══════════════════════════════════════════════════════════════════
+    // 15. HYPERBOLIC + EXTENDED OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Sinh ---
+    [Benchmark(Description = "AiDotNet Eager: Sinh[100K]")]
+    public Tensor<float> AiDotNet_Sinh_100K() => _engine.TensorSinh(_op_a);
+
+    [Benchmark(Description = "PyTorch: Sinh[100K]")]
+    public TorchTensor PyTorch_Sinh_100K() => torch.sinh(_t_op_a);
+
+    // --- Cosh ---
+    [Benchmark(Description = "AiDotNet Eager: Cosh[100K]")]
+    public Tensor<float> AiDotNet_Cosh_100K() => _engine.TensorCosh(_op_a);
+
+    [Benchmark(Description = "PyTorch: Cosh[100K]")]
+    public TorchTensor PyTorch_Cosh_100K() => torch.cosh(_t_op_a);
+
+    // --- ReLU6 ---
+    [Benchmark(Description = "AiDotNet Eager: ReLU6[100K]")]
+    public Tensor<float> AiDotNet_ReLU6_100K() => _engine.TensorReLU6(_op_a);
+
+    [Benchmark(Description = "PyTorch: ReLU6[100K]")]
+    public TorchTensor PyTorch_ReLU6_100K() => torch.nn.functional.relu6(_t_op_a);
+
+    // --- Tanh backward (derivative) ---
+    [Benchmark(Description = "AiDotNet Eager: TanhBackward[100K]")]
+    public Tensor<float> AiDotNet_TanhBackward_100K()
+    {
+        var grad = Tensor<float>.CreateOnes([100000]);
+        var tanhOut = _engine.Tanh(_op_a);
+        return _engine.TanhBackward(grad, tanhOut);
+    }
+
+    [Benchmark(Description = "PyTorch: TanhBackward[100K]")]
+    public TorchTensor PyTorch_TanhBackward_100K()
+    {
+        var tanhOut = torch.tanh(_t_op_a);
+        return 1.0 - tanhOut * tanhOut;
+    }
+
+    // --- InstanceNorm ---
+    private Tensor<float> _in_input = null!;
+    private Tensor<float> _in_gamma = null!, _in_beta = null!;
+    private TorchTensor _t_in_input = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_InstanceNorm))]
+    public void SetupInstanceNorm()
+    {
+        if (_in_input != null) return;
+        _in_input = Tensor<float>.CreateRandom([8, 32, 16, 16]); // [N, C, H, W]
+        _in_gamma = Tensor<float>.CreateRandom([32]);
+        _in_beta = Tensor<float>.CreateRandom([32]);
+        _t_in_input = torch.randn([8, 32, 16, 16]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: InstanceNorm[8x32x16x16]")]
+    public Tensor<float> AiDotNet_InstanceNorm()
+    {
+        return _engine.InstanceNorm(_in_input, _in_gamma, _in_beta, 1e-5, out _, out _);
+    }
+
+    [Benchmark(Description = "PyTorch: InstanceNorm[8x32x16x16]")]
+    public TorchTensor PyTorch_InstanceNorm()
+    {
+        using var _ = torch.no_grad();
+        return torch.nn.functional.instance_norm(_t_in_input);
+    }
+
+    // --- RMSNorm ---
+    private Tensor<float> _rms_input = null!, _rms_gamma = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_RMSNorm))]
+    public void SetupRMSNorm()
+    {
+        if (_rms_input != null) return;
+        _rms_input = Tensor<float>.CreateRandom([32, 128]);
+        _rms_gamma = Tensor<float>.CreateRandom([128]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: RMSNorm[32x128]")]
+    public Tensor<float> AiDotNet_RMSNorm()
+    {
+        return _engine.RMSNorm(_rms_input, _rms_gamma, 1e-5, out _);
+    }
+
+    // --- TanhBackward on large ---
+    [Benchmark(Description = "AiDotNet Eager: SigmoidBackward[100K]")]
+    public Tensor<float> AiDotNet_SigmoidBackward_100K()
+    {
+        var grad = Tensor<float>.CreateOnes([100000]);
+        var sigOut = _engine.Sigmoid(_op_a);
+        return _engine.SigmoidBackward(grad, sigOut);
+    }
 }
 #endif
