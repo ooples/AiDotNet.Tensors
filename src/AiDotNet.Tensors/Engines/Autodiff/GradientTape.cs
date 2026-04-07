@@ -116,6 +116,7 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         SetCurrentTape(this);
+        System.Threading.Interlocked.Increment(ref DifferentiableOps._anyTapeActive);
     }
 
     /// <summary>
@@ -643,6 +644,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         SetCurrentTape(_parent);
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
