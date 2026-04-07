@@ -12024,7 +12024,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Auto-tracer: check if a compiled plan exists for this op pattern
-        { var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Softmax", input._shape);
+        { var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Softmax", input._shape, paramHash: axis);
           if (autoCompiled is not null) return autoCompiled.Execute(); }
 
         // Compute outer and inner sizes
@@ -12044,7 +12044,7 @@ public class CpuEngine : ITensorLevelEngine
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
             DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax)); }
+            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
             return result;
         }
 
@@ -12084,7 +12084,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("Softmax", result2, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-        { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax)); }
+        { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax), paramHash: ax); }
         return result2;
     }
 

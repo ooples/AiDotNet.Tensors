@@ -34,10 +34,15 @@ internal static class AutoTracer
     /// Called by CpuEngine before each operation. Returns a compiled plan
     /// if one exists for the current operation sequence.
     /// </summary>
-    internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape)
+    /// <param name="opName">Operation name (e.g., "TensorAdd", "ReLU")</param>
+    /// <param name="outputShape">Expected output shape for hash matching.</param>
+    /// <param name="paramHash">Extra hash for op-specific parameters (axis, alpha, min/max)
+    /// that affect the result. Two calls with the same opName+shape but different paramHash
+    /// are treated as different operations — prevents silent wrong-result bugs.</param>
+    internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
         if (!Enabled || GraphMode.IsActive) return null;
-        return State.TryGetPlan<T>(opName, outputShape);
+        return State.TryGetPlan<T>(opName, outputShape, paramHash);
     }
 
     /// <summary>
@@ -48,10 +53,11 @@ internal static class AutoTracer
     /// <param name="result">The eagerly computed result tensor</param>
     /// <param name="replayDelegate">A delegate that can re-execute this op inside GraphMode.
     /// Signature: (engine) => engine.OpName(inputs...) — captures the input tensors.</param>
-    internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate)
+    /// <param name="paramHash">Extra hash for op-specific parameters (must match TryGetCompiledPlan).</param>
+    internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate, long paramHash = 0)
     {
         if (!Enabled || GraphMode.IsActive) return;
-        State.RecordOp(opName, result._shape, replayDelegate);
+        State.RecordOp(opName, result._shape, replayDelegate, paramHash);
     }
 }
 
@@ -63,12 +69,14 @@ internal sealed class TracedOp
     internal readonly string OpName;
     internal readonly int[] OutputShape;
     internal readonly object ReplayDelegate; // Func<IEngine, Tensor<T>> — type-erased
+    internal readonly long ParamHash;
 
-    internal TracedOp(string opName, int[] outputShape, object replayDelegate)
+    internal TracedOp(string opName, int[] outputShape, object replayDelegate, long paramHash = 0)
     {
         OpName = opName;
         OutputShape = outputShape;
         ReplayDelegate = replayDelegate;
+        ParamHash = paramHash;
     }
 }
 
@@ -86,9 +94,9 @@ internal sealed class AutoTracerState
     private const int CompileThreshold = 2;
     private const int MaxSequenceLength = 128;
 
-    internal CompiledInferencePlan<T>? TryGetPlan<T>(string opName, int[] outputShape)
+    internal CompiledInferencePlan<T>? TryGetPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
-        long hash = ComputeLookupHash(opName, outputShape);
+        long hash = ComputeLookupHash(opName, outputShape, paramHash);
         if (_compiledPlans.TryGetValue(hash, out var plan))
         {
             // Reset sequence since we're using the compiled plan
@@ -98,7 +106,7 @@ internal sealed class AutoTracerState
         return null;
     }
 
-    internal void RecordOp<T>(string opName, int[] outputShape, Func<IEngine, Tensor<T>> replayDelegate)
+    internal void RecordOp<T>(string opName, int[] outputShape, Func<IEngine, Tensor<T>> replayDelegate, long paramHash = 0)
     {
         if (_currentSequence.Count >= MaxSequenceLength)
         {
@@ -107,7 +115,7 @@ internal sealed class AutoTracerState
             return;
         }
 
-        _currentSequence.Add(new TracedOp(opName, (int[])outputShape.Clone(), replayDelegate));
+        _currentSequence.Add(new TracedOp(opName, (int[])outputShape.Clone(), replayDelegate, paramHash));
 
         long hash = ComputeCurrentHash();
         if (hash == _lastPatternHash && _lastPatternHash != 0)
@@ -162,7 +170,7 @@ internal sealed class AutoTracerState
         }
     }
 
-    private long ComputeLookupHash(string nextOp, int[] shape)
+    private long ComputeLookupHash(string nextOp, int[] shape, long paramHash = 0)
     {
         long hash = ComputeCurrentHash();
         hash ^= nextOp.GetHashCode();
@@ -170,6 +178,13 @@ internal sealed class AutoTracerState
         for (int i = 0; i < shape.Length; i++)
         {
             hash ^= shape[i];
+            hash *= unchecked((long)0x100000001b3L);
+        }
+        // Include parameter hash so ops with different params (axis, alpha, etc.)
+        // are treated as distinct operations — prevents silent wrong-result bugs
+        if (paramHash != 0)
+        {
+            hash ^= paramHash;
             hash *= unchecked((long)0x100000001b3L);
         }
         return hash;
@@ -185,6 +200,11 @@ internal sealed class AutoTracerState
             foreach (int dim in op.OutputShape)
             {
                 hash ^= dim;
+                hash *= unchecked((long)0x100000001b3L);
+            }
+            if (op.ParamHash != 0)
+            {
+                hash ^= op.ParamHash;
                 hash *= unchecked((long)0x100000001b3L);
             }
         }
