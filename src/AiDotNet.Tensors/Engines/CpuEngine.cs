@@ -4314,13 +4314,22 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
-        for (int i = 0; i < src.Length; i++)
-            dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
-        // Round uses straight-through estimator (same as PyTorch) for gradient
+        if (typeof(T) == typeof(float))
+        {
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < fSrc.Length; i++)
+                fDst[i] = MathF.Round(fSrc[i]);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+                dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
+        }
         DifferentiableOps.RecordUnary("Round", result, tensor,
             BackwardFunctions<T>.StraightThroughBackward);
         return result;
@@ -4751,15 +4760,22 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
 
-        for (int i = 0; i < srcA.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            var aVal = srcA[i];
-            var bVal = srcB[i];
-            dest[i] = numOps.LessThan(aVal, bVal) ? aVal : bVal;
+            var fA = (float[])(object)a.GetDataArray();
+            var fB = (float[])(object)b.GetDataArray();
+            var fD = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < fA.Length; i++)
+                fD[i] = MathF.Min(fA[i], fB[i]);
+        }
+        else
+        {
+            var srcA = a.AsSpan();
+            var srcB = b.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < srcA.Length; i++)
+                dest[i] = numOps.LessThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
 
         DifferentiableOps.RecordBinary("TensorMin", result, a, b, BackwardFunctions<T>.MinBackward);
