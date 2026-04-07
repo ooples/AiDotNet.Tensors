@@ -18764,7 +18764,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // Normalize axis
@@ -18778,22 +18778,50 @@ public class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
-        var tensorData = tensor.GetFlattenedData();
+        // Float fast path for 1D (common case)
+        if (typeof(T) == typeof(float) && tensor.Rank == 1)
+        {
+            var src = (float[])(object)tensor.GetDataArray();
+            var dst = (float[])(object)result.GetDataArray();
+            float cum = 0f;
+            for (int i = 0; i < src.Length; i++)
+            {
+                cum += src[i];
+                dst[i] = cum;
+            }
+            DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            return result;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
 
-        Parallel.For(0, outerSize * innerSize, flatIdx =>
+        int totalWork = outerSize * innerSize;
+        if (totalWork > 1)
         {
-            int outer = flatIdx / innerSize;
-            int inner = flatIdx % innerSize;
-
+            Parallel.For(0, totalWork, flatIdx =>
+            {
+                int outer = flatIdx / innerSize;
+                int inner = flatIdx % innerSize;
+                T cumSum = numOps.Zero;
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int srcIdx = (outer * axisSize + a) * innerSize + inner;
+                    cumSum = numOps.Add(cumSum, tensorData[srcIdx]);
+                    resultData[srcIdx] = cumSum;
+                }
+            });
+        }
+        else
+        {
             T cumSum = numOps.Zero;
             for (int a = 0; a < axisSize; a++)
             {
-                int srcIdx = (outer * axisSize + a) * innerSize + inner;
-                cumSum = numOps.Add(cumSum, tensorData[srcIdx]);
-                resultData[srcIdx] = cumSum;
+                cumSum = numOps.Add(cumSum, tensorData[a]);
+                resultData[a] = cumSum;
             }
-        });
+        }
 
         DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
         return result;
