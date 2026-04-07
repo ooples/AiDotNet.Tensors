@@ -23680,38 +23680,68 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var inputData = input.GetFlattenedData();
-        var maskData = new T[input.Length];
-        var resultData = new T[input.Length];
+        if (!input.IsContiguous) input = input.Contiguous();
+        var dropResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        mask = AutoTensorCache.RentOrAllocate<T>(input._shape);
 
         if (!training || dropoutRate <= 0)
         {
-            Array.Copy(inputData, resultData, input.Length);
-            for (int i = 0; i < maskData.Length; i++)
-                maskData[i] = numOps.One;
+            input.AsSpan().CopyTo(dropResult.AsWritableSpan());
+            if (typeof(T) == typeof(float))
+            {
+                var mArr = (float[])(object)mask.GetDataArray();
+                for (int i = 0; i < mArr.Length; i++) mArr[i] = 1.0f;
+            }
+            else
+            {
+                var numOps = MathHelper.GetNumericOperations<T>();
+                var mSpan = mask.AsWritableSpan();
+                for (int i = 0; i < mSpan.Length; i++) mSpan[i] = numOps.One;
+            }
         }
-        else
+        else if (typeof(T) == typeof(float))
         {
             var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
-            double scale = 1.0 / (1.0 - dropoutRate);
+            float fScale = (float)(1.0 / (1.0 - dropoutRate));
+            var inArr = (float[])(object)input.GetDataArray();
+            var outArr = (float[])(object)dropResult.GetDataArray();
+            var mArr = (float[])(object)mask.GetDataArray();
             for (int i = 0; i < input.Length; i++)
             {
                 if (rand.NextDouble() >= dropoutRate)
                 {
-                    maskData[i] = numOps.FromDouble(scale);
-                    resultData[i] = numOps.FromDouble(numOps.ToDouble(inputData[i]) * scale);
+                    mArr[i] = fScale;
+                    outArr[i] = inArr[i] * fScale;
                 }
                 else
                 {
-                    maskData[i] = numOps.Zero;
-                    resultData[i] = numOps.Zero;
+                    mArr[i] = 0f;
+                    outArr[i] = 0f;
                 }
             }
         }
-
-        mask = TensorAllocator.Rent<T>(input._shape, new Vector<T>(maskData));
-        var dropResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
+            double scale = 1.0 / (1.0 - dropoutRate);
+            var inSpan = input.AsSpan();
+            var outSpan = dropResult.AsWritableSpan();
+            var mSpan = mask.AsWritableSpan();
+            for (int i = 0; i < input.Length; i++)
+            {
+                if (rand.NextDouble() >= dropoutRate)
+                {
+                    mSpan[i] = numOps.FromDouble(scale);
+                    outSpan[i] = numOps.FromDouble(numOps.ToDouble(inSpan[i]) * scale);
+                }
+                else
+                {
+                    mSpan[i] = numOps.Zero;
+                    outSpan[i] = numOps.Zero;
+                }
+            }
+        }
         DifferentiableOps.RecordUnary("Dropout", dropResult, input, BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
         return dropResult;
     }
