@@ -590,6 +590,38 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Pointer-based Negate — zero bounds-checking.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void NegateUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var zero = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Subtract(zero, Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.Subtract(zero, Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.Subtract(zero, Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.Subtract(zero, Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.Subtract(zero, Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = -input[i];
+        }
+
+        /// <summary>
         /// SIMD Clamp: min(max(x, lo), hi) using AVX.Max/Min.
         /// </summary>
         [MethodImpl(HotInline)]

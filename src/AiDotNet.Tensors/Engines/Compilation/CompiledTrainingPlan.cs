@@ -473,18 +473,15 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.SoftmaxInto(o, inp, axis);
         }
 
-        // TensorNegate forward: pinned SIMD negate
+        // TensorNegate forward: pinned SIMD NegateUnsafe
         if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inArr = (float[])(object)inp.GetDataArray();
-            var outArr = (float[])(object)o.GetDataArray();
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
-            return eng =>
-            {
-                for (int i = 0; i < len; i++) outArr[i] = -inArr[i];
-            };
+            return eng => { unsafe { SimdKernels.NegateUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
         // TensorNegate non-float fallback
         if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
