@@ -3866,6 +3866,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorDivide", a._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
@@ -3922,6 +3925,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorDivide", result, a, b, BackwardFunctions<T>.DivideBackward);
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorDivide", result, eng => eng.TensorDivide(ca, cb)); }
         return result;
     }
 
@@ -4116,6 +4120,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorLog", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4138,6 +4145,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorLog", result, tensor, BackwardFunctions<T>.LogBackward);
+        { var c = tensor; AutoTracer.RecordOp("TensorLog", result, eng => eng.TensorLog(c)); }
         return result;
     }
 
@@ -4293,6 +4301,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorNegate", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4300,6 +4311,7 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         DifferentiableOps.RecordUnary("TensorNegate", result, tensor, BackwardFunctions<T>.NegateBackward);
+        { var c = tensor; AutoTracer.RecordOp("TensorNegate", result, eng => eng.TensorNegate(c)); }
         return result;
     }
 
@@ -7446,6 +7458,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var autoCompiledMish = AutoTracer.TryGetCompiledPlan<T>("Mish", tensor._shape);
+        if (autoCompiledMish is not null) return autoCompiledMish.Execute();
+
         if (!tensor.IsContiguous)
         {
             if (tensor.Length <= 4096)
@@ -7459,6 +7474,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T sp = ops.Log(ops.Add(ops.One, ops.Exp(v))); T e2sp = ops.Exp(ops.Multiply(ops.FromDouble(2.0), sp)); T th = ops.Divide(ops.Subtract(e2sp, ops.One), ops.Add(e2sp, ops.One)); dstArr[i] = ops.Multiply(v, th); }
                 DifferentiableOps.RecordUnary("Mish", resultS, tensor, BackwardFunctions<T>.MishBackward);
+                { var c = tensor; AutoTracer.RecordOp("Mish", resultS, eng => eng.Mish(c)); }
                 return resultS;
             }
             return Mish(tensor.Contiguous());
@@ -7483,6 +7499,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("Mish", result, tensor, BackwardFunctions<T>.MishBackward);
+        { var c = tensor; AutoTracer.RecordOp("Mish", result, eng => eng.Mish(c)); }
         return result;
     }
 
@@ -7503,6 +7520,9 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        var autoCompiledSwish = AutoTracer.TryGetCompiledPlan<T>("Swish", tensor._shape);
+        if (autoCompiledSwish is not null) return autoCompiledSwish.Execute();
+
         if (!tensor.IsContiguous)
         {
             if (tensor.Length <= 4096)
@@ -7513,6 +7533,7 @@ public class CpuEngine : ITensorLevelEngine
                 var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
                 for (int i = 0; i < tensor.Length; i++) { T v = src[idx[i]]; T negV = ops2.Negate(v); T sig = ops2.Divide(ops2.One, ops2.Add(ops2.One, ops2.Exp(negV))); dst[i] = ops2.Multiply(v, sig); }
                 DifferentiableOps.RecordUnary("Swish", r, tensor, BackwardFunctions<T>.SwishBackward);
+                { var c = tensor; AutoTracer.RecordOp("Swish", r, eng => eng.Swish(c)); }
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -7542,6 +7563,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("Swish", result, tensor, BackwardFunctions<T>.SwishBackward);
+        { var c = tensor; AutoTracer.RecordOp("Swish", result, eng => eng.Swish(c)); }
         return result;
     }
 
