@@ -33,6 +33,7 @@ internal static class VmlProvider
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsAbs;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSin;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsCos;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsErf;
 
     // Double VML — mode-specific (vmd* takes mode as 4th arg).
     // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
@@ -232,6 +233,18 @@ internal static class VmlProvider
 #endif
     }
 
+    /// <summary>Vectorized error function (SVML). Used for exact GELU computation.</summary>
+    public static unsafe bool TryErf(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsErf == null) return false;
+        _vsErf(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
 
     private static bool EnsureInitialized()
@@ -316,6 +329,8 @@ internal static class VmlProvider
                 TryGetExport(handle, "vsSin", "MKL_vsSin", "VSSIN");
             _vsCos = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsCos", "MKL_vsCos", "VSCOS");
+            _vsErf = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsErf", "MKL_vsErf", "VSERF");
 
             // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
             // This avoids the VML_HA regression that vd* functions hit when

@@ -971,8 +971,46 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // VML SVML path: compute tanh_arg in SIMD, then use VML tanh (SVML microcode)
-            // This is ~3x faster than our polynomial FastSigmoid256 approximation.
+            // VML erf path: exact GELU = 0.5 * x * (1 + erf(x / sqrt(2)))
+            // vsErf is SVML-optimized and ~5x faster than our polynomial tanh approximation
+            if (Avx.IsSupported && length >= 8)
+            {
+                var erfBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
+                try
+                {
+                    fixed (float* erf = erfBuf)
+                    {
+                        // Compute x / sqrt(2) into erf buffer
+                        var vInvSqrt2 = Vector256.Create(0.70710678118654752f); // 1/sqrt(2)
+                        int simdLen = length & ~7;
+                        for (int j = 0; j < simdLen; j += 8)
+                            Avx.Store(erf + j, Avx.Multiply(Avx.LoadVector256(input + j), vInvSqrt2));
+                        for (int j = simdLen; j < length; j++)
+                            erf[j] = input[j] * 0.70710678118654752f;
+
+                        if (VmlProvider.TryErf(erf, erf, length))
+                        {
+                            var vHalf = Vector256.Create(0.5f);
+                            var vOne = Vector256.Create(1.0f);
+                            for (int j = 0; j < simdLen; j += 8)
+                            {
+                                var x = Avx.LoadVector256(input + j);
+                                var e = Avx.LoadVector256(erf + j);
+                                Avx.Store(output + j, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, e))));
+                            }
+                            for (int j = simdLen; j < length; j++)
+                                output[j] = 0.5f * input[j] * (1f + erf[j]);
+                            return;
+                        }
+                    }
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(erfBuf);
+                }
+            }
+
+            // VML tanh path: approximate GELU via tanh (SVML microcode)
             if (Avx.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var tanhArgsBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
