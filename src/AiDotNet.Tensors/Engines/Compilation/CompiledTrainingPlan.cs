@@ -704,6 +704,104 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
+        // Sign forward: direct float computation
+        if (step.OpName == "Sign" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Sign(cIn[i]);
+            };
+        }
+
+        // Reciprocal forward: direct float computation
+        if (step.OpName == "Reciprocal" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = 1f / cIn[i];
+            };
+        }
+
+        // Floor forward: direct float computation
+        if (step.OpName == "Floor" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Floor(cIn[i]);
+            };
+        }
+
+        // Ceiling forward: direct float computation
+        if (step.OpName == "Ceiling" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Ceiling(cIn[i]);
+            };
+        }
+
+        // Round forward: direct float computation
+        if (step.OpName == "Round" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Round(cIn[i]);
+            };
+        }
+
+        // Clamp forward: direct float computation
+        if (step.OpName == "Clamp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float fMin = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[0]) : float.MinValue;
+            float fMax = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[1]) : float.MaxValue;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Min(MathF.Max(cIn[i], fMin), fMax);
+            };
+        }
+
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
         // Transpose forward: zero-copy strided view (same as PyTorch .t())
