@@ -3236,6 +3236,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorSubtract", a._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
@@ -3296,6 +3300,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorSubtract", result, a, b, BackwardFunctions<T>.SubtractBackward);
+
+        // Auto-tracer: record this op for future compilation
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorSubtract", result, eng => eng.TensorSubtract(ca, cb)); }
+
         return result;
     }
 
@@ -3326,6 +3334,10 @@ public class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.MultiplyBackward);
             }
         }
+
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorMultiply", a._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
 
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
@@ -3386,6 +3398,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorMultiply", result, a, b, BackwardFunctions<T>.MultiplyBackward);
+
+        // Auto-tracer: record this op for future compilation
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMultiply", result, eng => eng.TensorMultiply(ca, cb)); }
+
         return result;
     }
 
@@ -4142,6 +4158,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorExp", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
@@ -4164,6 +4184,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorExp", result, tensor, BackwardFunctions<T>.ExpBackward);
+
+        // Auto-tracer: record this op for future compilation
+        { var c = tensor; AutoTracer.RecordOp("TensorExp", result, eng => eng.TensorExp(c)); }
+
         return result;
     }
 
@@ -6608,6 +6632,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Tanh", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -6622,6 +6650,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T e2v = ops.Exp(ops.Multiply(ops.FromDouble(2.0), v)); dstArr[i] = ops.Divide(ops.Subtract(e2v, ops.One), ops.Add(e2v, ops.One)); }
                 DifferentiableOps.RecordUnary("Tanh", resultS, tensor, BackwardFunctions<T>.TanhBackward);
+                { var c = tensor; AutoTracer.RecordOp("Tanh", resultS, eng => eng.Tanh(c)); }
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -6646,6 +6675,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("Tanh", result, tensor, BackwardFunctions<T>.TanhBackward);
+        { var c = tensor; AutoTracer.RecordOp("Tanh", result, eng => eng.Tanh(c)); }
         return result;
     }
 
@@ -6667,6 +6697,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Sigmoid", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -6681,6 +6715,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T negV = ops.Negate(v); dstArr[i] = ops.Divide(ops.One, ops.Add(ops.One, ops.Exp(negV))); }
                 DifferentiableOps.RecordUnary("Sigmoid", resultS, tensor, BackwardFunctions<T>.SigmoidBackward);
+                { var c = tensor; AutoTracer.RecordOp("Sigmoid", resultS, eng => eng.Sigmoid(c)); }
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -6743,6 +6778,7 @@ public class CpuEngine : ITensorLevelEngine
                     }
                 }
                 DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
+                { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
                 return result;
             }
 
@@ -6768,6 +6804,7 @@ public class CpuEngine : ITensorLevelEngine
                 SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
+            { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
         }
 
@@ -6806,6 +6843,7 @@ public class CpuEngine : ITensorLevelEngine
                 SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
             }
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
+            { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
         }
 
@@ -6814,6 +6852,7 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
 
         DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
+        { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
         return result;
     }
 
@@ -7008,6 +7047,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("ReLU", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -7022,6 +7065,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; dstArr[i] = ops.GreaterThan(v, ops.Zero) ? v : ops.Zero; }
                 DifferentiableOps.RecordUnary("ReLU", resultS, tensor, BackwardFunctions<T>.ReLUBackward);
+                { var c = tensor; AutoTracer.RecordOp("ReLU", resultS, eng => eng.ReLU(c)); }
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -7075,6 +7119,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("ReLU", result, tensor, BackwardFunctions<T>.ReLUBackward);
+        { var c = tensor; AutoTracer.RecordOp("ReLU", result, eng => eng.ReLU(c)); }
         return result;
     }
 
@@ -7260,6 +7305,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("GELU", tensor._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         // Stride-aware: strided scalar loop for small views, Contiguous()+SIMD for large
         if (!tensor.IsContiguous)
         {
@@ -7274,6 +7323,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor.Length; i++)
                     { T v = srcRaw[idxBuf[i]]; T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v))))); T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z)); T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One)); T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0)); dstArr[i] = ops.Multiply(v, cdf); }
                 DifferentiableOps.RecordUnary("GELU", resultS, tensor, BackwardFunctions<T>.GELUBackward);
+                { var c = tensor; AutoTracer.RecordOp("GELU", resultS, eng => eng.GELU(c)); }
                 return resultS;
             }
             tensor = tensor.Contiguous();
@@ -7298,6 +7348,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("GELU", result, tensor, BackwardFunctions<T>.GELUBackward);
+        { var c = tensor; AutoTracer.RecordOp("GELU", result, eng => eng.GELU(c)); }
         return result;
     }
 
@@ -8144,6 +8195,11 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        { var matMulOutShape = ComputeMatMulOutputShape(a._shape, b._shape);
+          var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorMatMul", matMulOutShape);
+          if (autoCompiled is not null) return autoCompiled.Execute(); }
+
         // Materialize non-contiguous views so downstream paths can use .Data safely.
         // BatchMatMul already does this for rank >= 3; TensorMatMul2D did not.
         if (!a.IsContiguous) a = a.Contiguous();
@@ -8175,6 +8231,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorMatMul", result, a, b, BackwardFunctions<T>.MatMulBackward);
+
+        // Auto-tracer: record this op for future compilation
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorMatMul", result, eng => eng.TensorMatMul(ca, cb)); }
+
         return result;
     }
 
@@ -11864,6 +11924,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        { var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Softmax", input._shape);
+          if (autoCompiled is not null) return autoCompiled.Execute(); }
+
         // Compute outer and inner sizes
         int outerSize = 1, axisSize = input._shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
@@ -11881,6 +11945,7 @@ public class CpuEngine : ITensorLevelEngine
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
             DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax)); }
             return result;
         }
 
@@ -11920,6 +11985,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("Softmax", result2, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+        { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax)); }
         return result2;
     }
 
