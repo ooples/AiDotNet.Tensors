@@ -15987,6 +15987,24 @@ public class CpuEngine : ITensorLevelEngine
         }
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
+
+        // Fast path: 1D full reduction
+        if (input.Rank == 1 && axes.Length == 1 && (axes[0] == 0 || axes[0] == -1))
+        {
+            if (typeof(T) == typeof(float) && input.IsContiguous)
+            {
+                var fData = (float[])(object)input.GetDataArray();
+                float maxVal = float.MinValue;
+                int maxIdx = 0;
+                for (int i = 0; i < fData.Length; i++)
+                    if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
+                maxIndices = new[] { maxIdx };
+                float fMax = maxVal;
+                return TensorAllocator.Rent<T>(keepDims ? new[] { 1 } : new[] { 1 },
+                    new Vector<T>(new[] { Unsafe.As<float, T>(ref fMax) }));
+            }
+        }
+
         var inputData = input.GetFlattenedData();
 
         // Validate and normalize axes
@@ -22461,11 +22479,12 @@ public class CpuEngine : ITensorLevelEngine
 
         if (data is float[] dF && result is float[] rF)
         {
-            Parallel.For(0, length, i =>
+            // Sequential loop — Parallel.For per-element has catastrophic overhead
+            for (int i = 0; i < length; i++)
             {
                 float x = dF[i];
                 rF[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
-            });
+            }
         }
         else
         {
