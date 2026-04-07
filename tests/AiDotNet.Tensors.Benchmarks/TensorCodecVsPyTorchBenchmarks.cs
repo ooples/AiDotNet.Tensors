@@ -1393,20 +1393,23 @@ public class TensorCodecVsPyTorchBenchmarks
     public TorchTensor PyTorch_ReLU6_100K() => torch.nn.functional.relu6(_t_op_a);
 
     // --- Tanh backward (derivative) ---
-    [Benchmark(Description = "AiDotNet Eager: TanhBackward[100K]")]
-    public Tensor<float> AiDotNet_TanhBackward_100K()
+    private Tensor<float> _tanh_grad = null!, _tanh_out = null!;
+    private TorchTensor _t_tanh_out = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_TanhBackward_100K))]
+    public void SetupTanhBackward()
     {
-        var grad = Tensor<float>.CreateOnes([100000]);
-        var tanhOut = _engine.Tanh(_op_a);
-        return _engine.TanhBackward(grad, tanhOut);
+        if (_tanh_grad != null) return;
+        _tanh_grad = Tensor<float>.CreateOnes([100000]);
+        _tanh_out = _engine.Tanh(_op_a);
+        _t_tanh_out = torch.tanh(_t_op_a);
     }
 
+    [Benchmark(Description = "AiDotNet Eager: TanhBackward[100K]")]
+    public Tensor<float> AiDotNet_TanhBackward_100K() => _engine.TanhBackward(_tanh_grad, _tanh_out);
+
     [Benchmark(Description = "PyTorch: TanhBackward[100K]")]
-    public TorchTensor PyTorch_TanhBackward_100K()
-    {
-        var tanhOut = torch.tanh(_t_op_a);
-        return 1.0 - tanhOut * tanhOut;
-    }
+    public TorchTensor PyTorch_TanhBackward_100K() => 1.0 - _t_tanh_out * _t_tanh_out;
 
     // --- InstanceNorm ---
     private Tensor<float> _in_input = null!;
@@ -1453,14 +1456,19 @@ public class TensorCodecVsPyTorchBenchmarks
         return _engine.RMSNorm(_rms_input, _rms_gamma, 1e-5, out _);
     }
 
-    // --- TanhBackward on large ---
-    [Benchmark(Description = "AiDotNet Eager: SigmoidBackward[100K]")]
-    public Tensor<float> AiDotNet_SigmoidBackward_100K()
+    // --- SigmoidBackward ---
+    private Tensor<float> _sig_grad = null!, _sig_out = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_SigmoidBackward_100K))]
+    public void SetupSigmoidBackward()
     {
-        var grad = Tensor<float>.CreateOnes([100000]);
-        var sigOut = _engine.Sigmoid(_op_a);
-        return _engine.SigmoidBackward(grad, sigOut);
+        if (_sig_grad != null) return;
+        _sig_grad = Tensor<float>.CreateOnes([100000]);
+        _sig_out = _engine.Sigmoid(_op_a);
     }
+
+    [Benchmark(Description = "AiDotNet Eager: SigmoidBackward[100K]")]
+    public Tensor<float> AiDotNet_SigmoidBackward_100K() => _engine.SigmoidBackward(_sig_grad, _sig_out);
     // ═══════════════════════════════════════════════════════════════════
     // 16. CONV + POOLING VARIANTS
     // ═══════════════════════════════════════════════════════════════════
