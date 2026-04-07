@@ -365,4 +365,147 @@ public class AutoTracerTests
     }
 
     #endregion
+
+    #region Softmax axis paramHash correctness
+
+    [Fact]
+    public void Softmax_DifferentAxes_ProduceCorrectResults()
+    {
+        // Regression test: without paramHash, Softmax(x, axis=0) would compile
+        // a plan that gets reused for axis=1, producing wrong results.
+        var a = Rand(new[] { 5, 10 }, 70);
+
+        // Run axis=1 several times (may compile a plan)
+        var axis1Results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++)
+            axis1Results[i] = E.Softmax(a, axis: 1);
+
+        // Now run axis=0 — must NOT reuse axis=1 plan
+        var axis0Result = E.Softmax(a, axis: 0);
+
+        // axis=1: each row sums to 1 (10 elements per row, 5 rows)
+        var d1 = axis1Results[0].GetDataArray();
+        for (int row = 0; row < 5; row++)
+        {
+            float sum = 0;
+            for (int col = 0; col < 10; col++) sum += d1[row * 10 + col];
+            Assert.True(Math.Abs(sum - 1.0f) < 1e-3f, $"axis=1 row {row} sum={sum}");
+        }
+
+        // axis=0: each column sums to 1 (5 elements per column, 10 columns)
+        var d0 = axis0Result.GetDataArray();
+        for (int col = 0; col < 10; col++)
+        {
+            float sum = 0;
+            for (int row = 0; row < 5; row++) sum += d0[row * 10 + col];
+            Assert.True(Math.Abs(sum - 1.0f) < 1e-3f, $"axis=0 col {col} sum={sum}");
+        }
+    }
+
+    #endregion
+
+    #region Thread safety
+
+    [Fact]
+    public void ThreadSafety_IndependentPerThread()
+    {
+        // Each thread should have independent AutoTracer state
+        var exceptions = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+        var threads = new Thread[4];
+
+        for (int t = 0; t < threads.Length; t++)
+        {
+            int threadSeed = t * 100;
+            threads[t] = new Thread(() =>
+            {
+                try
+                {
+                    var engine = new CpuEngine();
+                    var a = Rand(new[] { 500 }, threadSeed);
+                    var b = Rand(new[] { 500 }, threadSeed + 1);
+
+                    var results = new Tensor<float>[5];
+                    for (int i = 0; i < 5; i++)
+                        results[i] = engine.TensorAdd(a, b);
+
+                    // All results must match
+                    var expected = results[0].GetDataArray();
+                    for (int i = 1; i < 5; i++)
+                    {
+                        var actual = results[i].GetDataArray();
+                        for (int j = 0; j < expected.Length; j++)
+                            if (Math.Abs(expected[j] - actual[j]) > 1e-4f)
+                                throw new Exception($"Thread {threadSeed}: mismatch at [{j}]");
+                    }
+                }
+                catch (Exception ex) { exceptions.Add(ex); }
+            });
+        }
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) t.Join();
+
+        Assert.Empty(exceptions);
+    }
+
+    #endregion
+
+    #region Newly wired ops correctness
+
+    [Fact]
+    public void TensorSqrt_EagerMatchesRepeated()
+    {
+        var a = RandPositive(new[] { 1000 }, 80);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorSqrt(a);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"Sqrt iter {i}");
+    }
+
+    [Fact]
+    public void TensorAbs_EagerMatchesRepeated()
+    {
+        var a = Rand(new[] { 1000 }, 81);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorAbs(a);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"Abs iter {i}");
+    }
+
+    [Fact]
+    public void Sin_EagerMatchesRepeated()
+    {
+        var a = Rand(new[] { 1000 }, 82);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorSin(a);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"Sin iter {i}");
+    }
+
+    [Fact]
+    public void TensorBroadcastAdd_EagerMatchesRepeated()
+    {
+        var a = Rand(new[] { 10, 100 }, 83);
+        var b = Rand(new[] { 1, 100 }, 84);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorBroadcastAdd(a, b);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"BroadcastAdd iter {i}");
+    }
+
+    [Fact]
+    public void Floor_EagerMatchesRepeated()
+    {
+        var a = Rand(new[] { 1000 }, 85);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorFloor(a);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"Floor iter {i}");
+    }
+
+    [Fact]
+    public void TensorTranspose_EagerMatchesRepeated()
+    {
+        var a = Rand(new[] { 32, 64 }, 86);
+        var results = new Tensor<float>[5];
+        for (int i = 0; i < 5; i++) results[i] = E.TensorTranspose(a);
+        for (int i = 1; i < 5; i++) AssertClose(results[0], results[i], msg: $"Transpose iter {i}");
+    }
+
+    #endregion
 }
