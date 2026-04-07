@@ -5258,10 +5258,11 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
 
-        if (typeof(T) == typeof(float) && tensor.GetFlattenedData() is float[] arr)
+        if (typeof(T) == typeof(float) && tensor.IsContiguous)
         {
+            var fArr = (float[])(object)tensor.GetDataArray();
             int length = tensor.Length;
-            fixed (float* ptr = arr)
+            fixed (float* ptr = fArr)
             {
                 float result = ParallelReduceFloat(ptr, length, float.NegativeInfinity,
                     SimdKernels.MaxUnsafe, Math.Max);
@@ -5280,10 +5281,11 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute min of empty tensor.", nameof(tensor));
 
-        if (typeof(T) == typeof(float) && tensor.GetFlattenedData() is float[] arr)
+        if (typeof(T) == typeof(float))
         {
+            var fArr = (float[])(object)tensor.GetDataArray();
             int length = tensor.Length;
-            fixed (float* ptr = arr)
+            fixed (float* ptr = fArr)
             {
                 float result = ParallelReduceFloat(ptr, length, float.PositiveInfinity,
                     SimdKernels.MinUnsafe, Math.Min);
