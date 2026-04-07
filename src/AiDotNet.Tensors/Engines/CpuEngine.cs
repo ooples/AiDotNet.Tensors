@@ -5119,7 +5119,17 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute mean of empty tensor.", nameof(tensor));
 
-        // Route through TensorSum which has the parallel fast path
+        // Float fast path: direct Pin + SumUnsafe (avoids TensorSum's GCHandle overhead)
+        if (typeof(T) == typeof(float) && tensor.IsContiguous)
+        {
+            var mem = AsFloatMemory(tensor.Data);
+            using var pin = mem.Pin();
+            float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, tensor.Length);
+            float result = fSum / tensor.Length;
+            return Unsafe.As<float, T>(ref result);
+        }
+
+        // Generic path
         T sum = TensorSum(tensor);
         if (typeof(T) == typeof(float))
         {

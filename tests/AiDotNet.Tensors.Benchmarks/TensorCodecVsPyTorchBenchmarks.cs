@@ -774,11 +774,10 @@ public class TensorCodecVsPyTorchBenchmarks
 
     // --- Mean reduction ---
     [Benchmark(Description = "AiDotNet Eager: Mean[1M]")]
-    public Tensor<float> AiDotNet_Mean_1M()
-    {
-        var mean = _engine.TensorMean(_op_large);
-        return new Tensor<float>(new[] { mean }, new[] { 1 });
-    }
+    public float AiDotNet_Mean_1M() => _engine.TensorMean(_op_large);
+
+    [Benchmark(Description = "AiDotNet Eager: ReduceMean[1M]")]
+    public Tensor<float> AiDotNet_ReduceMean_1M() => _engine.ReduceMean(_op_large, null);
 
     [Benchmark(Description = "PyTorch: Mean[1M]")]
     public TorchTensor PyTorch_Mean_1M() => _t_op_large.mean();
@@ -1032,5 +1031,65 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: MatMul[512x512]")]
     public TorchTensor PyTorch_MatMul_512() => torch.matmul(_t_mat512, _t_mat512);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 13. ADDITIONAL OPERATIONS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Flatten (should be near zero-cost) ---
+    [Benchmark(Description = "AiDotNet Eager: Flatten[256x256]")]
+    public Tensor<float> AiDotNet_Flatten() => _engine.Flatten(_op_2d, 0);
+
+    [Benchmark(Description = "PyTorch: Flatten[256x256]")]
+    public TorchTensor PyTorch_Flatten() => _t_op_2d.flatten();
+
+    // --- BatchMatMul ---
+    [Benchmark(Description = "AiDotNet Eager: BatchMatMul[8x64x32]")]
+    public Tensor<float> AiDotNet_BatchMatMul()
+    {
+        if (_attn_q == null) { SetupAttn(); }
+        return _engine.BatchMatMul(_attn_q, _attn_k);
+    }
+
+    [Benchmark(Description = "PyTorch: BatchMatMul[8x64x32]")]
+    public TorchTensor PyTorch_BatchMatMul()
+    {
+        if (_t_attn_q == null) { SetupAttn(); }
+        return torch.matmul(_t_attn_q, _t_attn_k);
+    }
+
+    // --- MSELoss ---
+    private Tensor<float> _loss_pred = null!, _loss_target = null!;
+    private TorchTensor _t_loss_pred = null!, _t_loss_target = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_MSELoss))]
+    public void SetupLoss()
+    {
+        if (_loss_pred != null) return;
+        _loss_pred = Tensor<float>.CreateRandom([32, 10]);
+        _loss_target = Tensor<float>.CreateRandom([32, 10]);
+        _t_loss_pred = torch.randn([32, 10]);
+        _t_loss_target = torch.randn([32, 10]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: MSELoss[32x10]")]
+    public Tensor<float> AiDotNet_MSELoss() => _engine.TensorMSELoss(_loss_pred, _loss_target);
+
+    [Benchmark(Description = "PyTorch: MSELoss[32x10]")]
+    public TorchTensor PyTorch_MSELoss() => torch.nn.functional.mse_loss(_t_loss_pred, _t_loss_target);
+
+    // --- ReduceVariance ---
+    [Benchmark(Description = "AiDotNet Eager: Variance[256x256, axis=1]")]
+    public Tensor<float> AiDotNet_Variance() => _engine.ReduceVariance(_op_2d, new[] { 1 }, keepDims: false);
+
+    [Benchmark(Description = "PyTorch: Variance[256x256, axis=1]")]
+    public TorchTensor PyTorch_Variance() => _t_op_2d.var(dim: 1);
+
+    // --- Where (conditional select) ---
+    [Benchmark(Description = "AiDotNet Eager: Where[100K]")]
+    public Tensor<float> AiDotNet_Where_100K() => _engine.TensorMax(_op_a, _op_b);
+
+    [Benchmark(Description = "PyTorch: Where[100K]")]
+    public TorchTensor PyTorch_Where_100K() => torch.maximum(_t_op_a, _t_op_b);
 }
 #endif
