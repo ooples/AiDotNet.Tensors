@@ -475,11 +475,9 @@ internal sealed class CompiledTrainingPlan<T>
                 ? act : FusedActivationType.None;
             int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
 
-            // Pin once at compile time
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)input).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var wH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)weights).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            // Pre-fetch arrays at compile time — bypass EnsureMaterialized at replay
+            var inArr = (float[])(object)input.GetDataArray();
+            var wArr = (float[])(object)weights.GetDataArray();
             var bArr = (float[])(object)bias.GetDataArray();
             var oArr = (float[])(object)o.GetDataArray();
 
@@ -487,9 +485,7 @@ internal sealed class CompiledTrainingPlan<T>
             {
                 // Direct BLAS into output + fused bias + activation
                 CpuFusedOperations.FusedGemmBiasActivation(
-                    (float[])(object)input.GetDataArray(),
-                    (float[])(object)weights.GetDataArray(),
-                    bArr, oArr, M, N, K, activation);
+                    inArr, wArr, bArr, oArr, M, N, K, activation);
             };
         }
 
