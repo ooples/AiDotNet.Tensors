@@ -279,23 +279,29 @@ internal sealed class CompiledTrainingPlan<T>
         // MatMul forward: direct BLAS into output buffer
         if (step.OpName == "TensorMatMul" && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
-            && BlasProvider.IsAvailable)
+            && typeof(T) == typeof(float))
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
             var output = step.OutputBuffer;
             int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
 
-            // Cache arrays on first call
-            float[]? cA = null, cB = null, cOut = null;
+            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
+            var cA = (float[])(object)inputA.GetDataArray();
+            var cB = (float[])(object)inputB.GetDataArray();
+            var cOut = (float[])(object)output.GetDataArray();
 
+            if (BlasProvider.IsAvailable)
+            {
+                return eng =>
+                {
+                    BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
+                };
+            }
+            // Fallback: use SimdGemm SIMD BLIS-style tiled GEMM
             return eng =>
             {
-                cA ??= (float[])(object)inputA.GetDataArray();
-                cB ??= (float[])(object)inputB.GetDataArray();
-                cOut ??= (float[])(object)output.GetDataArray();
-                // No Array.Clear needed — BLAS GEMM with beta=0 overwrites completely
-                BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
+                SimdGemm.Sgemm(cA, cB, cOut, M, K, N);
             };
         }
 
@@ -689,23 +695,37 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
         }
 
-        // LogSoftmax forward: pinned direct path — no allocation on replay
-        if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        // LogSoftmax forward: compute in-place into pre-allocated output
+        if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             int axis = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToInt32(step.SavedState[0]) : -1;
-            // Pin arrays once at compile time
-            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outHandle = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            // Pre-fetch arrays at compile time
+            var inArr = (float[])(object)inp.GetDataArray();
+            var outArr = (float[])(object)o.GetDataArray();
+            int rows = inp._shape[0], cols = inp._shape[1];
+            // Inline LogSoftmax: for each row, compute max, subtract, exp, sum, log, subtract
             return eng =>
             {
-                // Call engine's LogSoftmax but copy into pre-pinned output
-                if (eng is CpuEngine cpu)
+                for (int r = 0; r < rows; r++)
                 {
-                    var r = cpu.TensorLogSoftmax(inp, axis);
-                    r.AsSpan().CopyTo(o.AsWritableSpan());
+                    int off = r * cols;
+                    // Find max for numerical stability
+                    float maxVal = float.NegativeInfinity;
+                    for (int c = 0; c < cols; c++)
+                        if (inArr[off + c] > maxVal) maxVal = inArr[off + c];
+                    // Compute log(sum(exp(x - max))) + (x - max)
+                    float sumExp = 0f;
+                    for (int c = 0; c < cols; c++)
+                    {
+                        float shifted = inArr[off + c] - maxVal;
+                        sumExp += MathF.Exp(shifted);
+                        outArr[off + c] = shifted;
+                    }
+                    float logSumExp = MathF.Log(sumExp);
+                    for (int c = 0; c < cols; c++)
+                        outArr[off + c] -= logSumExp;
                 }
             };
         }
