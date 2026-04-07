@@ -21221,10 +21221,14 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < length; i++)
-                fDst[i] = MathF.Cosh(fSrc[i]);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.CoshUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+            }
         }
         else
         {
@@ -21260,10 +21264,14 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < length; i++)
-                fDst[i] = MathF.Sinh(fSrc[i]);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SinhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
+            }
         }
         else
         {

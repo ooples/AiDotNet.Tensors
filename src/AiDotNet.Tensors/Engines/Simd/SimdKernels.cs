@@ -622,6 +622,58 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD Cosh: (exp(x) + exp(-x)) / 2 using FastExp256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void CoshUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                var half = Vector256.Create(0.5f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var expX = FastExp256(x);
+                    var expNegX = FastExp256(Avx.Subtract(zero, x));
+                    Avx.Store(output + i, Avx.Multiply(half, Avx.Add(expX, expNegX)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Cosh(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Sinh: (exp(x) - exp(-x)) / 2 using FastExp256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void SinhUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                var half = Vector256.Create(0.5f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var expX = FastExp256(x);
+                    var expNegX = FastExp256(Avx.Subtract(zero, x));
+                    Avx.Store(output + i, Avx.Multiply(half, Avx.Subtract(expX, expNegX)));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Sinh(input[i]);
+        }
+
+        /// <summary>
         /// SIMD Clamp: min(max(x, lo), hi) using AVX.Max/Min.
         /// </summary>
         [MethodImpl(HotInline)]
