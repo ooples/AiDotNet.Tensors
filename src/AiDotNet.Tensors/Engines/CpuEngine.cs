@@ -2444,6 +2444,28 @@ public class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
+        // Fast path for [N,M] - [M] or [N,M] - [1,M] bias subtract pattern
+        if (typeof(T) == typeof(float) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        {
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+                var af = (float[])(object)a.GetDataArray();
+                var bf = (float[])(object)b.GetDataArray();
+                var rf = (float[])(object)res.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rf[off + c] = af[off + c] - bf[c];
+                }
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, a, b, BackwardFunctions<T>.BroadcastSubtractBackward);
+                return res;
+            }
+        }
+
         var result = a.BroadcastSubtract(b);
         DifferentiableOps.RecordBinary("TensorBroadcastSubtract", result, a, b, BackwardFunctions<T>.BroadcastSubtractBackward);
         return result;
@@ -2497,6 +2519,28 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
+
+        // Fast path for [N,M] * [M] or [N,M] * [1,M] scaling pattern
+        if (typeof(T) == typeof(float) && a.Rank == 2 && (b.Rank == 1 || (b.Rank == 2 && b._shape[0] == 1)))
+        {
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
+                var af = (float[])(object)a.GetDataArray();
+                var bf = (float[])(object)b.GetDataArray();
+                var rf = (float[])(object)res.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        rf[off + c] = af[off + c] * bf[c];
+                }
+                DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);
+                return res;
+            }
+        }
 
         var result = a.BroadcastMultiply(b);
         DifferentiableOps.RecordBinary("TensorBroadcastMultiply", result, a, b, BackwardFunctions<T>.BroadcastMultiplyBackward);

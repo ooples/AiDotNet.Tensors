@@ -2824,9 +2824,9 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             bool isBiasAdd = cols == otherCols && (other.Rank == 1 || other._shape[0] == 1);
             if (isBiasAdd && IsContiguous && other.IsContiguous)
             {
-                var biasResult = new Tensor<T>(new T[Length], (int[])_shape.Clone());
-                var aData = GetFlattenedData();
-                var bData = other.GetFlattenedData();
+                var biasResult = Helpers.AutoTensorCache.RentOrAllocate<T>(_shape);
+                var aData = GetDataArray();
+                var bData = other.GetDataArray();
                 var rData = biasResult.GetDataArray();
                 // Specialize for float to avoid interface dispatch in tight loop
                 if (typeof(T) == typeof(float))
@@ -2836,18 +2836,18 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     var rf = (float[])(object)rData;
                     for (int r = 0; r < rows; r++)
                     {
-                        int offset = r * cols;
+                        int off = r * cols;
                         for (int c = 0; c < cols; c++)
-                            rf[offset + c] = af[offset + c] + bf[c];
+                            rf[off + c] = af[off + c] + bf[c];
                     }
                 }
                 else
                 {
                     for (int r = 0; r < rows; r++)
                     {
-                        int offset = r * cols;
+                        int off = r * cols;
                         for (int c = 0; c < cols; c++)
-                            rData[offset + c] = _numOps.Add(aData[offset + c], bData[c]);
+                            rData[off + c] = _numOps.Add(aData[off + c], bData[c]);
                     }
                 }
                 return biasResult;
