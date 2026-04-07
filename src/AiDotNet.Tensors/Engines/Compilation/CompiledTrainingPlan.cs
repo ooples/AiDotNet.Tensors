@@ -316,17 +316,27 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReduceSum forward: direct sum, skip engine dispatch
-        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
-            && step.OutputBuffer.Length == 1)
+        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1 && step.OutputBuffer.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
             float[]? cOut = null;
 
+            if (typeof(T) == typeof(float) && input.IsContiguous)
+            {
+                // Pinned path: GCHandle once at compile time, SumUnsafe per replay
+                var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                    ((Tensor<float>)(object)input).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+                int len = input.Length;
+                return eng =>
+                {
+                    cOut ??= (float[])(object)output.GetDataArray();
+                    unsafe { cOut[0] = SimdKernels.SumUnsafe((float*)inH.AddrOfPinnedObject(), len); }
+                };
+            }
             return eng =>
             {
                 cOut ??= (float[])(object)output.GetDataArray();
-                // Use engine TensorSum which has multi-threaded LightweightParallel
                 T sum = eng.TensorSum(input);
                 if (typeof(T) == typeof(float))
                     cOut[0] = Unsafe.As<T, float>(ref sum);
