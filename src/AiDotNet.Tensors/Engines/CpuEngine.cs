@@ -2154,6 +2154,10 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Auto-tracer: check if a compiled plan exists for this op pattern
+        var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("TensorAdd", a._shape);
+        if (autoCompiled is not null) return autoCompiled.Execute();
+
         // RentUninitialized: kernel writes every element, no need to zero
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
@@ -2255,6 +2259,10 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
+
+        // Auto-tracer: record this op for future compilation
+        { var ca = a; var cb = b; AutoTracer.RecordOp("TensorAdd", result, eng => eng.TensorAdd(ca, cb)); }
+
         return result;
     }
 

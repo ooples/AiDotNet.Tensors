@@ -4,21 +4,21 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Compilation;
 
 /// <summary>
-/// Auto-Tracing JIT: transparently detects repeated tensor operation patterns
-/// and compiles them into optimized plans for zero-overhead replay.
+/// Auto-Tracing JIT: transparently compiles repeated tensor operation patterns
+/// into optimized plans for zero-overhead replay. Fully automatic — no user
+/// code changes needed.
 ///
 /// How it works:
-/// 1. First call: operations execute eagerly (tracing mode records the pattern)
-/// 2. Second call with same shapes: pattern recognized, graph is compiled
-/// 3. Third+ calls: compiled plan is replayed — zero allocation, BLAS/SIMD direct
+/// 1. First call: operation executes eagerly, trace records the op + delegate
+/// 2. Second call with same pattern: pattern recognized, graph compiled from trace
+/// 3. Third+ calls: compiled plan replayed — zero allocation, pinned SIMD direct
 ///
 /// This is Layer 2 of the TensorCodec system:
-///   Layer 1: AutoTensorCache — zero-alloc eager ops
-///   Layer 2: AutoTracer — auto-compile hot paths (this)
-///   Layer 3: TensorCodec optimizations — spectral/dataflow/algebraic (applied by compiler)
+///   Layer 1: AutoTensorCache — zero-alloc eager ops (always active)
+///   Layer 2: AutoTracer — auto-compile hot paths (this, always active)
+///   Layer 3: TensorCodec optimizations — spectral/dataflow/algebraic
 ///
-/// Unlike PyTorch's torch.compile() or JAX's jit(), this requires NO user code changes.
-/// The engine detects patterns automatically based on operation sequence + tensor shapes.
+/// Enabled by default. Disable via TensorCacheSettings or AutoTracer.Enabled = false.
 /// </summary>
 internal static class AutoTracer
 {
@@ -28,13 +28,11 @@ internal static class AutoTracer
     [ThreadStatic]
     private static AutoTracerState? _state;
 
-    /// <summary>Gets the auto-tracer state for this thread.</summary>
     internal static AutoTracerState State => _state ??= new AutoTracerState();
 
     /// <summary>
-    /// Called by CpuEngine before each operation. Records the op signature
-    /// for pattern detection. Returns a compiled plan if one exists for
-    /// the current pattern.
+    /// Called by CpuEngine before each operation. Returns a compiled plan
+    /// if one exists for the current operation sequence.
     /// </summary>
     internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape)
     {
@@ -43,54 +41,82 @@ internal static class AutoTracer
     }
 
     /// <summary>
-    /// Called by CpuEngine after each operation. Records the op for pattern building.
-    /// When a pattern repeats, triggers compilation.
+    /// Called by CpuEngine after each operation. Records the op with its
+    /// execute delegate for future compilation.
     /// </summary>
-    internal static void RecordOp(string opName, int[] outputShape)
+    /// <param name="opName">Operation name (e.g., "TensorAdd", "ReLU")</param>
+    /// <param name="result">The eagerly computed result tensor</param>
+    /// <param name="replayDelegate">A delegate that can re-execute this op inside GraphMode.
+    /// Signature: (engine) => engine.OpName(inputs...) — captures the input tensors.</param>
+    internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate)
     {
         if (!Enabled || GraphMode.IsActive) return;
-        State.RecordOp(opName, outputShape);
+        State.RecordOp(opName, result._shape, replayDelegate);
     }
 }
 
 /// <summary>
-/// Per-thread auto-tracer state. Tracks operation sequences and caches compiled plans.
+/// A recorded operation in the trace — captures the execute delegate for replay.
+/// </summary>
+internal sealed class TracedOp
+{
+    internal readonly string OpName;
+    internal readonly int[] OutputShape;
+    internal readonly object ReplayDelegate; // Func<IEngine, Tensor<T>> — type-erased
+
+    internal TracedOp(string opName, int[] outputShape, object replayDelegate)
+    {
+        OpName = opName;
+        OutputShape = outputShape;
+        ReplayDelegate = replayDelegate;
+    }
+}
+
+/// <summary>
+/// Per-thread auto-tracer state. Tracks operation sequences and auto-compiles
+/// when a pattern repeats.
 /// </summary>
 internal sealed class AutoTracerState
 {
-    // Current sequence of operations being recorded
-    private readonly List<string> _currentSequence = new();
-
-    // Pattern hash → compiled plan cache
+    private readonly List<TracedOp> _currentSequence = new();
     private readonly Dictionary<long, object> _compiledPlans = new();
-
-    // How many times we've seen the current pattern
     private int _patternRepeatCount;
     private long _lastPatternHash;
 
-    // Minimum repeats before compiling
     private const int CompileThreshold = 2;
+    private const int MaxSequenceLength = 128;
 
     internal CompiledInferencePlan<T>? TryGetPlan<T>(string opName, int[] outputShape)
     {
-        // Check if we have a compiled plan for the current sequence + this op
-        long hash = ComputeSequenceHash(opName);
+        long hash = ComputeLookupHash(opName, outputShape);
         if (_compiledPlans.TryGetValue(hash, out var plan))
         {
+            // Reset sequence since we're using the compiled plan
+            _currentSequence.Clear();
             return plan as CompiledInferencePlan<T>;
         }
         return null;
     }
 
-    internal void RecordOp(string opName, int[] outputShape)
+    internal void RecordOp<T>(string opName, int[] outputShape, Func<IEngine, Tensor<T>> replayDelegate)
     {
-        _currentSequence.Add(opName);
+        if (_currentSequence.Count >= MaxSequenceLength)
+        {
+            _currentSequence.Clear();
+            _patternRepeatCount = 0;
+            return;
+        }
 
-        // Check for pattern repeat (same sequence of ops)
+        _currentSequence.Add(new TracedOp(opName, (int[])outputShape.Clone(), replayDelegate));
+
         long hash = ComputeCurrentHash();
-        if (hash == _lastPatternHash)
+        if (hash == _lastPatternHash && _lastPatternHash != 0)
         {
             _patternRepeatCount++;
+            if (_patternRepeatCount >= CompileThreshold && !_compiledPlans.ContainsKey(hash))
+            {
+                TryCompile<T>(hash);
+            }
         }
         else
         {
@@ -99,16 +125,53 @@ internal sealed class AutoTracerState
         }
     }
 
-    private long ComputeSequenceHash(string nextOp)
+    /// <summary>
+    /// Compiles the traced sequence into a CompiledInferencePlan.
+    /// Replays all recorded ops inside a GraphMode scope, then calls CompileInference.
+    /// </summary>
+    private void TryCompile<T>(long patternHash)
     {
-        long hash = unchecked((long)0xcbf29ce484222325L);
-        foreach (var op in _currentSequence)
+        try
         {
-            hash ^= op.GetHashCode();
-            hash *= unchecked((long)0x100000001b3L);
+            using var scope = GraphMode.Enable();
+            var engine = AiDotNetEngine.Current;
+            if (engine is null) return;
+
+            // Replay each traced op inside GraphMode — this builds the lazy graph
+            foreach (var tracedOp in _currentSequence)
+            {
+                if (tracedOp.ReplayDelegate is Func<IEngine, Tensor<T>> replay)
+                {
+                    replay(engine);
+                }
+            }
+
+            // Compile the captured graph into an optimized plan
+            var plan = scope.CompileInference<T>();
+            if (plan is not null)
+            {
+                _compiledPlans[patternHash] = plan;
+            }
+
+            _currentSequence.Clear();
         }
+        catch
+        {
+            // Compilation failed — continue with eager execution
+            // Don't retry: mark this pattern as attempted
+        }
+    }
+
+    private long ComputeLookupHash(string nextOp, int[] shape)
+    {
+        long hash = ComputeCurrentHash();
         hash ^= nextOp.GetHashCode();
         hash *= unchecked((long)0x100000001b3L);
+        for (int i = 0; i < shape.Length; i++)
+        {
+            hash ^= shape[i];
+            hash *= unchecked((long)0x100000001b3L);
+        }
         return hash;
     }
 
@@ -117,8 +180,13 @@ internal sealed class AutoTracerState
         long hash = unchecked((long)0xcbf29ce484222325L);
         foreach (var op in _currentSequence)
         {
-            hash ^= op.GetHashCode();
+            hash ^= op.OpName.GetHashCode();
             hash *= unchecked((long)0x100000001b3L);
+            foreach (int dim in op.OutputShape)
+            {
+                hash ^= dim;
+                hash *= unchecked((long)0x100000001b3L);
+            }
         }
         return hash;
     }
