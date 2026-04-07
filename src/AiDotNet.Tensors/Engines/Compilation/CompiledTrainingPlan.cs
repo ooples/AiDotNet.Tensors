@@ -614,14 +614,14 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
-        if (step.OpName == "TensorSin" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpName == "Sin" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
-        if (step.OpName == "TensorCos" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpName == "Cos" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
