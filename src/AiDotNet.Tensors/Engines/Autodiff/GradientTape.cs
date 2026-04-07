@@ -207,6 +207,16 @@ public sealed class GradientTape<T> : IDisposable
             return result;
         }
 
+        // Auto-training compiler: reuse compiled backward graph if pattern matches
+        if (_options.Persistent && !createGraph)
+        {
+            var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
+            if (compiledBwd is not null)
+            {
+                return compiledBwd.Execute();
+            }
+        }
+
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
