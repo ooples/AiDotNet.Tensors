@@ -949,6 +949,24 @@ internal sealed class CompiledTrainingPlan<T>
             }
         }
 
+        // MSELoss forward: fused single-pass diff^2 sum
+        if (step.OpName == "MSELoss" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var pred = step.Inputs[0]; var target = step.Inputs[1]; var o = step.OutputBuffer;
+            var pArr = (float[])(object)pred.GetDataArray();
+            var tArr = (float[])(object)target.GetDataArray();
+            var oArr = (float[])(object)o.GetDataArray();
+            int len = pred.Length;
+            return eng =>
+            {
+                float sumSq = 0f;
+                for (int i = 0; i < len; i++) { float d = pArr[i] - tArr[i]; sumSq += d * d; }
+                oArr[0] = sumSq / len;
+            };
+        }
+
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
         // Transpose forward: zero-copy strided view (same as PyTorch .t())
