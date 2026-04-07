@@ -19369,8 +19369,14 @@ public class CpuEngine : ITensorLevelEngine
         Tensor<T> result;
         if (axis == 0 && tensors.All(t => t.IsContiguous))
         {
-            int totalLen = tensors.Sum(t => t.Length);
-            var data = new T[totalLen];
+            // Compute output shape first
+            var outShape = (int[])tensors[0]._shape.Clone();
+            int totalAxis0 = 0;
+            foreach (var t in tensors) totalAxis0 += t._shape[0];
+            outShape[0] = totalAxis0;
+
+            result = AutoTensorCache.RentOrAllocate<T>(outShape);
+            var data = result.GetDataArray();
             int offset = 0;
             foreach (var t in tensors)
             {
@@ -19378,12 +19384,6 @@ public class CpuEngine : ITensorLevelEngine
                 Array.Copy(src, 0, data, offset, t.Length);
                 offset += t.Length;
             }
-            // Compute output shape: same as first tensor except axis 0 grows
-            var outShape = (int[])tensors[0]._shape.Clone();
-            int totalAxis0 = 0;
-            foreach (var t in tensors) totalAxis0 += t._shape[0];
-            outShape[0] = totalAxis0;
-            result = TensorAllocator.Rent<T>(outShape, new Vector<T>(data));
         }
         else
         {
