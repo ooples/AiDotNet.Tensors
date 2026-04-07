@@ -392,20 +392,23 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.SigmoidInto(o, inp);
         }
 
-        // GELU forward: direct SIMD via GELUUnsafe — single fused pass, no intermediate buffer
+        // GELU forward: pinned SIMD — cache GCHandles at compile time for zero-overhead replay
         if (step.OpName == "GELU" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            // Pin arrays once at compile time — GCHandles survive across replays
+            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
             return eng =>
             {
                 unsafe
                 {
-                    var srcMem = ((Tensor<float>)(object)inp).Data;
-                    var dstMem = ((Tensor<float>)(object)o).Data;
-                    using var pinSrc = srcMem.Pin();
-                    using var pinDst = dstMem.Pin();
-                    // Single-pass fused GELU — no intermediate buffer, no ArrayPool
-                    SimdKernels.GELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, inp.Length);
+                    float* pIn = (float*)inHandle.AddrOfPinnedObject();
+                    float* pOut = (float*)outHandle.AddrOfPinnedObject();
+                    SimdKernels.GELUUnsafe(pIn, pOut, len);
                 }
             };
         }
@@ -525,14 +528,19 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
         }
 
-        // LogSoftmax forward: direct into output buffer using LogSoftmaxFloatFastPtr
+        // LogSoftmax forward: pinned direct path — no allocation on replay
         if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             int axis = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToInt32(step.SavedState[0]) : -1;
+            // Pin arrays once at compile time
+            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             return eng =>
             {
-                // Use engine's LogSoftmax which has the fast float path, copy result
+                // Call engine's LogSoftmax but copy into pre-pinned output
                 if (eng is CpuEngine cpu)
                 {
                     var r = cpu.TensorLogSoftmax(inp, axis);
@@ -541,18 +549,21 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Mean forward: direct sum + divide into scalar output
+        // Mean forward: pinned SumUnsafe + divide, zero allocation
         if (step.OpName == "Mean" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            float[]? cOut = null;
+            int len = inp.Length;
             return eng =>
             {
-                T sum = eng.TensorSum(inp);
-                if (typeof(T) == typeof(float))
+                cOut ??= (float[])(object)o.GetDataArray();
+                unsafe
                 {
-                    float fSum = Unsafe.As<T, float>(ref sum);
-                    float mean = fSum / inp.Length;
-                    o.GetDataArray()[0] = Unsafe.As<float, T>(ref mean);
+                    float* pIn = (float*)inHandle.AddrOfPinnedObject();
+                    cOut[0] = SimdKernels.SumUnsafe(pIn, len) / len;
                 }
             };
         }
