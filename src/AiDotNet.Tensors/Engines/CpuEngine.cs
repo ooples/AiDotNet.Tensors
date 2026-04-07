@@ -19424,11 +19424,53 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Compute squared values
+        // Float fast path for 2D L2 norm along axis: fused sum(x²) + sqrt per row/col
+        if (typeof(T) == typeof(float) && tensor.Rank == 2 && tensor.IsContiguous)
+        {
+            int normAxis = axis < 0 ? tensor.Rank + axis : axis;
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var fSrc = (float[])(object)tensor.GetDataArray();
+
+            if (normAxis == 1)
+            {
+                // Norm along cols → output [rows] or [rows,1]
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var fDst = (float[])(object)normResult.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    float sumSq = 0f;
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        sumSq += fSrc[off + c] * fSrc[off + c];
+                    fDst[r] = MathF.Sqrt(sumSq);
+                }
+                DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                return normResult;
+            }
+            else if (normAxis == 0)
+            {
+                // Norm along rows → output [cols] or [1,cols]
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var fDst = (float[])(object)normResult.GetDataArray();
+                Array.Clear(fDst, 0, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    for (int c = 0; c < cols; c++)
+                        fDst[c] += fSrc[off + c] * fSrc[off + c];
+                }
+                for (int c = 0; c < cols; c++)
+                    fDst[c] = MathF.Sqrt(fDst[c]);
+                DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                return normResult;
+            }
+        }
+
+        // Generic fallback: 3-op chain
         var squared = TensorMultiply(tensor, tensor);
-        // Sum along axis
         var sumSquared = ReduceSum(squared, new[] { axis }, keepDims: keepDims);
-        // Square root
         return TensorSqrt(sumSquared);
     }
 

@@ -529,6 +529,10 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _tanh1MPlan;
     private CompiledInferencePlan<float>? _exp1MPlan;
     private CompiledInferencePlan<float>? _sqrt1MPlan;
+    private CompiledInferencePlan<float>? _swish1MPlan;
+    private CompiledInferencePlan<float>? _mish1MPlan;
+    private CompiledInferencePlan<float>? _gelu1MPlan;
+    private CompiledInferencePlan<float>? _log1MPlan;
 
     private void SetupOps()
     {
@@ -654,6 +658,10 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.Tanh(_op_large); _tanh1MPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorExp(_op_large); _exp1MPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorSqrt(_op_large); _sqrt1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Swish(_op_large); _swish1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Mish(_op_large); _mish1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.GELU(_op_large); _gelu1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorLog(_op_large); _log1MPlan = s.CompileInference<float>(); }
         }
         catch { }
     }
@@ -1899,6 +1907,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: GELU[1M]")]
     public Tensor<float> AiDotNet_GELU_1M() => _engine.GELU(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: GELU[1M]")]
+    public Tensor<float> AiDotNet_GELU_1M_Compiled() => _gelu1MPlan is not null ? _gelu1MPlan.Execute() : _engine.GELU(_op_large);
+
     [Benchmark(Description = "PyTorch: GELU[1M]")]
     public TorchTensor PyTorch_GELU_1M() => torch.nn.functional.gelu(_t_op_large);
 
@@ -1944,12 +1955,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Mish[1M]")]
     public Tensor<float> AiDotNet_Mish_1M() => _engine.Mish(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Mish[1M]")]
+    public Tensor<float> AiDotNet_Mish_1M_Compiled() => _mish1MPlan is not null ? _mish1MPlan.Execute() : _engine.Mish(_op_large);
+
     [Benchmark(Description = "PyTorch: Mish[1M]")]
     public TorchTensor PyTorch_Mish_1M() => torch.nn.functional.mish(_t_op_large);
 
     // --- Swish 1M ---
     [Benchmark(Description = "AiDotNet Eager: Swish[1M]")]
     public Tensor<float> AiDotNet_Swish_1M() => _engine.Swish(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Swish[1M]")]
+    public Tensor<float> AiDotNet_Swish_1M_Compiled() => _swish1MPlan is not null ? _swish1MPlan.Execute() : _engine.Swish(_op_large);
 
     [Benchmark(Description = "PyTorch: Swish[1M]")]
     public TorchTensor PyTorch_Swish_1M() => torch.nn.functional.silu(_t_op_large);
@@ -1975,6 +1992,9 @@ public class TensorCodecVsPyTorchBenchmarks
     // --- Log 1M ---
     [Benchmark(Description = "AiDotNet Eager: Log[1M]")]
     public Tensor<float> AiDotNet_Log_1M() => _engine.TensorLog(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Log[1M]")]
+    public Tensor<float> AiDotNet_Log_1M_Compiled() => _log1MPlan is not null ? _log1MPlan.Execute() : _engine.TensorLog(_op_large);
 
     [Benchmark(Description = "PyTorch: Log[1M]")]
     public TorchTensor PyTorch_Log_1M() => torch.log(_t_op_large);
