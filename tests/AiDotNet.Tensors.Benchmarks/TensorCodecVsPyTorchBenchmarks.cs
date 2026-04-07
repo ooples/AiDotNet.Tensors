@@ -482,6 +482,11 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _powPlan;
     private CompiledInferencePlan<float>? _logSoftmaxPlan;
     private CompiledInferencePlan<float>? _groupnormPlan;
+    private CompiledInferencePlan<float>? _dividePlan;
+    private CompiledInferencePlan<float>? _negatePlan;
+    private CompiledInferencePlan<float>? _eluPlan;
+    private CompiledInferencePlan<float>? _sinPlan;
+    private CompiledInferencePlan<float>? _cosPlan;
 
     private void SetupOps()
     {
@@ -522,6 +527,11 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.TensorPower(_op_a, 2.0f); _powPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorLogSoftmax(_op_2d, -1); _logSoftmaxPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.GroupNorm(_bn_input, 8, _bn_gamma, _bn_beta, 1e-5, out _, out _); _groupnormPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorDivide(_op_a, _op_b); _dividePlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorNegate(_op_a); _negatePlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ELU(_op_a, 1.0); _eluPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSin(_op_a); _sinPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorCos(_op_a); _cosPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -729,6 +739,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Divide[100K]")]
     public Tensor<float> AiDotNet_Divide_100K() => _engine.TensorDivide(_op_a, _op_b);
 
+    [Benchmark(Description = "AiDotNet Compiled: Divide[100K]")]
+    public Tensor<float> AiDotNet_Divide_100K_Compiled() => _dividePlan is not null ? _dividePlan.Execute() : _engine.TensorDivide(_op_a, _op_b);
+
     [Benchmark(Description = "PyTorch: Divide[100K]")]
     public TorchTensor PyTorch_Divide_100K() => _t_op_a / _t_op_b;
 
@@ -809,6 +822,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Negate[100K]")]
     public Tensor<float> AiDotNet_Negate_100K() => _engine.TensorNegate(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Negate[100K]")]
+    public Tensor<float> AiDotNet_Negate_100K_Compiled() => _negatePlan is not null ? _negatePlan.Execute() : _engine.TensorNegate(_op_a);
+
     [Benchmark(Description = "PyTorch: Negate[100K]")]
     public TorchTensor PyTorch_Negate_100K() => -_t_op_a;
 
@@ -854,12 +870,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Sin[100K]")]
     public Tensor<float> AiDotNet_Sin_100K() => _engine.TensorSin(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Sin[100K]")]
+    public Tensor<float> AiDotNet_Sin_100K_Compiled() => _sinPlan is not null ? _sinPlan.Execute() : _engine.TensorSin(_op_a);
+
     [Benchmark(Description = "PyTorch: Sin[100K]")]
     public TorchTensor PyTorch_Sin_100K() => torch.sin(_t_op_a);
 
     // --- Cos ---
     [Benchmark(Description = "AiDotNet Eager: Cos[100K]")]
     public Tensor<float> AiDotNet_Cos_100K() => _engine.TensorCos(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Cos[100K]")]
+    public Tensor<float> AiDotNet_Cos_100K_Compiled() => _cosPlan is not null ? _cosPlan.Execute() : _engine.TensorCos(_op_a);
 
     [Benchmark(Description = "PyTorch: Cos[100K]")]
     public TorchTensor PyTorch_Cos_100K() => torch.cos(_t_op_a);
@@ -912,6 +934,9 @@ public class TensorCodecVsPyTorchBenchmarks
     // --- ELU ---
     [Benchmark(Description = "AiDotNet Eager: ELU[100K]")]
     public Tensor<float> AiDotNet_ELU_100K() => _engine.ELU(_op_a, 1.0);
+
+    [Benchmark(Description = "AiDotNet Compiled: ELU[100K]")]
+    public Tensor<float> AiDotNet_ELU_100K_Compiled() => _eluPlan is not null ? _eluPlan.Execute() : _engine.ELU(_op_a, 1.0);
 
     [Benchmark(Description = "PyTorch: ELU[100K]")]
     public TorchTensor PyTorch_ELU_100K() => torch.nn.functional.elu(_t_op_a, 1.0);
