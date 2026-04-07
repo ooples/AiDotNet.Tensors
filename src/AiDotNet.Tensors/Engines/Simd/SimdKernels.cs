@@ -1113,8 +1113,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // VML paths: only attempt if VML is actually initialized (avoid wasted ArrayPool rent)
-            if (Avx.IsSupported && length >= 8 && VmlProvider.IsInitialized)
+            // VML paths: only attempt for large arrays where erf precision matters and
+            // ArrayPool rent cost is amortized. For small/medium arrays (< 500K), the
+            // polynomial SIMD path below is faster (no buffer allocation, no VML dispatch).
+            if (Avx.IsSupported && length >= 500_000 && VmlProvider.IsInitialized)
             {
                 // Try VML erf path first: exact GELU = 0.5 * x * (1 + erf(x / sqrt(2)))
                 var erfBuf = System.Buffers.ArrayPool<float>.Shared.Rent(length);
@@ -1355,6 +1357,59 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
                 sum += data[i];
+            }
+            return sum;
+        }
+
+        /// <summary>
+        /// Computes sum of (data[i] - mean)^2 using AVX SIMD.
+        /// Used for variance computation in GroupNorm/LayerNorm.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe float SumSquaredDiffUnsafe(float* data, float mean, int length)
+        {
+            int i = 0;
+            float sum = 0f;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vMean = Vector256.Create(mean);
+                var vsum0 = Vector256<float>.Zero;
+                var vsum1 = Vector256<float>.Zero;
+                var vsum2 = Vector256<float>.Zero;
+                var vsum3 = Vector256<float>.Zero;
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var d0 = Avx.Subtract(Avx.LoadVector256(data + i), vMean);
+                    var d1 = Avx.Subtract(Avx.LoadVector256(data + i + 8), vMean);
+                    var d2 = Avx.Subtract(Avx.LoadVector256(data + i + 16), vMean);
+                    var d3 = Avx.Subtract(Avx.LoadVector256(data + i + 24), vMean);
+                    vsum0 = Avx.Add(vsum0, Avx.Multiply(d0, d0));
+                    vsum1 = Avx.Add(vsum1, Avx.Multiply(d1, d1));
+                    vsum2 = Avx.Add(vsum2, Avx.Multiply(d2, d2));
+                    vsum3 = Avx.Add(vsum3, Avx.Multiply(d3, d3));
+                }
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                sum += HorizontalSum(vsum0);
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vMean = Vector256.Create(mean);
+                var vsum = Vector256<float>.Zero;
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                {
+                    var d = Avx.Subtract(Avx.LoadVector256(data + i), vMean);
+                    vsum = Avx.Add(vsum, Avx.Multiply(d, d));
+                }
+                sum += HorizontalSum(vsum);
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float diff = data[i] - mean;
+                sum += diff * diff;
             }
             return sum;
         }

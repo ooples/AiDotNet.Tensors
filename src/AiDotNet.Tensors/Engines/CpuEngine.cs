@@ -5450,32 +5450,66 @@ public class CpuEngine : ITensorLevelEngine
         fixed (float* pIn = inArr)
         fixed (float* pOut = outArr)
         {
-            for (int idx = 0; idx < bc; idx++)
+            IntPtr ipIn = (IntPtr)pIn;
+            IntPtr ipOut = (IntPtr)pOut;
+            int hw = h * w;
+            int ohow = oH * oW;
+
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
             {
-                float* inBase = pIn + idx * h * w;
-                float* outBase = pOut + idx * oH * oW;
-
-                for (int oh = 0; oh < oH; oh++)
+                Parallel.For(0, bc, idx =>
                 {
-                    int ihStart = oh * st;
-                    float* r0 = inBase + ihStart * w;
-                    float* r1 = r0 + w;
-                    float* r2 = r1 + w;
-                    float* dst = outBase + oh * oW;
-
-                    for (int ow = 0; ow < oW; ow++)
+                    float* inBase = (float*)ipIn + idx * hw;
+                    float* outBase = (float*)ipOut + idx * ohow;
+                    for (int oh = 0; oh < oH; oh++)
                     {
-                        int iw = ow * st;
-                        float m = r0[iw];
-                        float v = r0[iw + 1]; if (v > m) m = v;
-                        v = r0[iw + 2]; if (v > m) m = v;
-                        v = r1[iw]; if (v > m) m = v;
-                        v = r1[iw + 1]; if (v > m) m = v;
-                        v = r1[iw + 2]; if (v > m) m = v;
-                        v = r2[iw]; if (v > m) m = v;
-                        v = r2[iw + 1]; if (v > m) m = v;
-                        v = r2[iw + 2]; if (v > m) m = v;
-                        dst[ow] = m;
+                        float* r0 = inBase + oh * st * w;
+                        float* r1 = r0 + w;
+                        float* r2 = r1 + w;
+                        float* dst = outBase + oh * oW;
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            int iw = ow * st;
+                            float m = r0[iw];
+                            float v = r0[iw + 1]; if (v > m) m = v;
+                            v = r0[iw + 2]; if (v > m) m = v;
+                            v = r1[iw]; if (v > m) m = v;
+                            v = r1[iw + 1]; if (v > m) m = v;
+                            v = r1[iw + 2]; if (v > m) m = v;
+                            v = r2[iw]; if (v > m) m = v;
+                            v = r2[iw + 1]; if (v > m) m = v;
+                            v = r2[iw + 2]; if (v > m) m = v;
+                            dst[ow] = m;
+                        }
+                    }
+                });
+            }
+            else
+            {
+                for (int idx = 0; idx < bc; idx++)
+                {
+                    float* inBase = pIn + idx * hw;
+                    float* outBase = pOut + idx * ohow;
+                    for (int oh = 0; oh < oH; oh++)
+                    {
+                        float* r0 = inBase + oh * st * w;
+                        float* r1 = r0 + w;
+                        float* r2 = r1 + w;
+                        float* dst = outBase + oh * oW;
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            int iw = ow * st;
+                            float m = r0[iw];
+                            float v = r0[iw + 1]; if (v > m) m = v;
+                            v = r0[iw + 2]; if (v > m) m = v;
+                            v = r1[iw]; if (v > m) m = v;
+                            v = r1[iw + 1]; if (v > m) m = v;
+                            v = r1[iw + 2]; if (v > m) m = v;
+                            v = r2[iw]; if (v > m) m = v;
+                            v = r2[iw + 1]; if (v > m) m = v;
+                            v = r2[iw + 2]; if (v > m) m = v;
+                            dst[ow] = m;
+                        }
                     }
                 }
             }
@@ -5487,26 +5521,54 @@ public class CpuEngine : ITensorLevelEngine
         fixed (float* pIn = inArr)
         fixed (float* pOut = outArr)
         {
-            for (int idx = 0; idx < bc; idx++)
+            IntPtr ipIn = (IntPtr)pIn;
+            IntPtr ipOut = (IntPtr)pOut;
+            int hw = h * w;
+            int ohow = oH * oW;
+
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
             {
-                float* inBase = pIn + idx * h * w;
-                float* outBase = pOut + idx * oH * oW;
-
-                for (int oh = 0; oh < oH; oh++)
+                Parallel.For(0, bc, idx =>
                 {
-                    int ihStart = oh * st;
-                    float* r0 = inBase + ihStart * w;
-                    float* r1 = r0 + w;
-                    float* dst = outBase + oh * oW;
-
-                    for (int ow = 0; ow < oW; ow++)
+                    float* inBase = (float*)ipIn + idx * hw;
+                    float* outBase = (float*)ipOut + idx * ohow;
+                    for (int oh = 0; oh < oH; oh++)
                     {
-                        int iw = ow * st;
-                        float m = r0[iw];
-                        float v = r0[iw + 1]; if (v > m) m = v;
-                        v = r1[iw]; if (v > m) m = v;
-                        v = r1[iw + 1]; if (v > m) m = v;
-                        dst[ow] = m;
+                        float* r0 = inBase + oh * st * w;
+                        float* r1 = r0 + w;
+                        float* dst = outBase + oh * oW;
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            int iw = ow * st;
+                            float m = r0[iw];
+                            float v = r0[iw + 1]; if (v > m) m = v;
+                            v = r1[iw]; if (v > m) m = v;
+                            v = r1[iw + 1]; if (v > m) m = v;
+                            dst[ow] = m;
+                        }
+                    }
+                });
+            }
+            else
+            {
+                for (int idx = 0; idx < bc; idx++)
+                {
+                    float* inBase = pIn + idx * hw;
+                    float* outBase = pOut + idx * ohow;
+                    for (int oh = 0; oh < oH; oh++)
+                    {
+                        float* r0 = inBase + oh * st * w;
+                        float* r1 = r0 + w;
+                        float* dst = outBase + oh * oW;
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            int iw = ow * st;
+                            float m = r0[iw];
+                            float v = r0[iw + 1]; if (v > m) m = v;
+                            v = r1[iw]; if (v > m) m = v;
+                            v = r1[iw + 1]; if (v > m) m = v;
+                            dst[ow] = m;
+                        }
                     }
                 }
             }
@@ -5588,11 +5650,13 @@ public class CpuEngine : ITensorLevelEngine
         fixed (float* pIn = inArr)
         fixed (float* pOut = outArr)
         {
-            for (int idx = 0; idx < bc; idx++)
-            {
-                float* inBase = pIn + idx * h * w;
-                float* outBase = pOut + idx * oH * oW;
+            IntPtr ipIn = (IntPtr)pIn;
+            IntPtr ipOut = (IntPtr)pOut;
+            int hw = h * w;
+            int ohow = oH * oW;
 
+            void ProcessChannel(float* inBase, float* outBase)
+            {
                 for (int oh = 0; oh < oH; oh++)
                 {
                     float* dst = outBase + oh * oW;
@@ -5618,6 +5682,19 @@ public class CpuEngine : ITensorLevelEngine
                         dst[ow] = maxVal;
                     }
                 }
+            }
+
+            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism)
+            {
+                Parallel.For(0, bc, idx =>
+                {
+                    ProcessChannel((float*)ipIn + idx * hw, (float*)ipOut + idx * ohow);
+                });
+            }
+            else
+            {
+                for (int idx = 0; idx < bc; idx++)
+                    ProcessChannel(pIn + idx * hw, pOut + idx * ohow);
             }
         }
     }
@@ -12041,17 +12118,12 @@ public class CpuEngine : ITensorLevelEngine
                     float groupMean = sum / groupSize;
                     meanLocal[idx] = groupMean;
 
-                    // Fused variance + normalize in single pass per channel
-                    // First compute variance
+                    // Fused variance computation per channel — SIMD accelerated
                     float sumSq = 0f;
                     for (int c = 0; c < channelsPerGroup; c++)
                     {
                         int chanOff = batchOffset + (startChannel + c) * spatialSize;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            float diff = inputData[chanOff + s] - groupMean;
-                            sumSq += diff * diff;
-                        }
+                        sumSq += SimdKernels.SumSquaredDiffUnsafe(inputData + chanOff, groupMean, spatialSize);
                     }
                     float groupVar = sumSq / groupSize;
                     varLocal[idx] = groupVar;
