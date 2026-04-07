@@ -4645,15 +4645,22 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
 
-        for (int i = 0; i < srcA.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            var aVal = srcA[i];
-            var bVal = srcB[i];
-            dest[i] = numOps.GreaterThan(aVal, bVal) ? aVal : bVal;
+            var fA = (float[])(object)a.GetDataArray();
+            var fB = (float[])(object)b.GetDataArray();
+            var fD = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < fA.Length; i++)
+                fD[i] = MathF.Max(fA[i], fB[i]);
+        }
+        else
+        {
+            var srcA = a.AsSpan();
+            var srcB = b.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < srcA.Length; i++)
+                dest[i] = numOps.GreaterThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
 
         DifferentiableOps.RecordBinary("TensorMax", result, a, b, BackwardFunctions<T>.MaxBackward);
@@ -19119,7 +19126,25 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = Tensor<T>.Concatenate(tensors, axis);
+        // Fast path for axis=0 contiguous 1D tensors: direct Array.Copy
+        Tensor<T> result;
+        if (axis == 0 && tensors[0].Rank == 1 && tensors.All(t => t.IsContiguous))
+        {
+            int totalLen = tensors.Sum(t => t.Length);
+            var data = new T[totalLen];
+            int offset = 0;
+            foreach (var t in tensors)
+            {
+                var src = t.GetDataArray();
+                Array.Copy(src, 0, data, offset, t.Length);
+                offset += t.Length;
+            }
+            result = TensorAllocator.Rent<T>(new[] { totalLen }, new Vector<T>(data));
+        }
+        else
+        {
+            result = Tensor<T>.Concatenate(tensors, axis);
+        }
         DifferentiableOps.RecordIfActive("Concatenate", result, (Tensor<T>[])tensors.Clone(),
             BackwardFunctions<T>.ConcatenateBackward,
             savedState: new object[] { axis });
