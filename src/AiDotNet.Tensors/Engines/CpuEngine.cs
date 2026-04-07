@@ -16369,12 +16369,34 @@ public class CpuEngine : ITensorLevelEngine
                 savedState: new object[] { new[] { axis } });
             return earlyResult;
         }
+        // Fast path: reduce all axes (axes == null) — just sum/count
+        if ((axes == null || axes.Length == 0) && input.IsContiguous)
+        {
+            if (typeof(T) == typeof(float))
+            {
+                unsafe
+                {
+                    var mem = AsFloatMemory(input.Data);
+                    using var pin = mem.Pin();
+                    float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
+                    float fMean = fSum / input.Length;
+                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                    ((float[])(object)scalarResult.GetDataArray())[0] = fMean;
+                    DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
+                        BackwardFunctions<T>.ReduceMeanBackward,
+                        savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
+                    return scalarResult;
+                }
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputShape = input._shape;
         var inputData = input.GetFlattenedData();
 
-        // Validate and normalize axes
-        var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
+        // Validate and normalize axes (handle null = reduce all)
+        var effectiveAxes = axes ?? Enumerable.Range(0, inputShape.Length).ToArray();
+        var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, inputShape.Length);
 
         var outputShapeList = new List<int>();
         for (int i = 0; i < inputShape.Length; i++)
