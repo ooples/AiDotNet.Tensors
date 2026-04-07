@@ -24716,14 +24716,13 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            const float alpha = 1.6732632423543772f;
-            const float scale = 1.0507009873554805f;
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fSrc.Length; i++)
+            unsafe
             {
-                float x = fSrc[i];
-                fDst[i] = x > 0 ? scale * x : scale * alpha * (MathF.Exp(x) - 1f);
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
         }
         else
@@ -24731,11 +24730,13 @@ public class CpuEngine : ITensorLevelEngine
             var numOps = MathHelper.GetNumericOperations<T>();
             const double alpha = 1.6732632423543772;
             const double scale = 1.0507009873554805;
+            var srcSpan = tensor.AsSpan();
+            var dstSpan = result.AsWritableSpan();
             for (int i = 0; i < tensor.Length; i++)
             {
-                double x = numOps.ToDouble(tensor[i]);
+                double x = numOps.ToDouble(srcSpan[i]);
                 double val = x > 0 ? scale * x : scale * alpha * (Math.Exp(x) - 1);
-                result[i] = numOps.FromDouble(val);
+                dstSpan[i] = numOps.FromDouble(val);
             }
         }
         DifferentiableOps.RecordUnary("SELU", result, tensor, BackwardFunctions<T>.SELUBackward);

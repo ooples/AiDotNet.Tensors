@@ -370,7 +370,22 @@ internal sealed class CompiledTrainingPlan<T>
         // Sigmoid: don't specialize forward — the eager allocating path is faster
         // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
 
-        // Tanh forward: direct SIMD
+        // Tanh forward: pinned SIMD TanhUnsafe — bypass EnsureMaterialized overhead
+        if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.TanhUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Tanh non-float fallback
         if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -395,7 +410,22 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Sigmoid forward: direct SIMD into pre-allocated buffer
+        // Sigmoid forward: pinned SigmoidUnsafe — bypass EnsureMaterialized
+        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.SigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Sigmoid non-float fallback
         if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -508,7 +538,28 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.LeakyReLUInto(o, inp, alpha);
         }
 
-        // Swish forward: direct fused sigmoid*x into output buffer
+        // Swish forward: pinned SigmoidUnsafe + VectorMultiplyUnsafe — bypass EnsureMaterialized
+        if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    SimdKernels.SigmoidUnsafe(pIn, pOut, len);
+                    SimdKernels.VectorMultiplyUnsafe(pIn, pOut, pOut, len);
+                }
+            };
+        }
+        // Swish non-float fallback
         if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -523,22 +574,66 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Log forward: direct VML/SIMD via CpuEngine.TensorLogInto
+        // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
+        if (step.OpName == "TensorLog" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.LogUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Log non-float fallback
         if (step.OpName == "TensorLog" && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Exp forward: direct VML/SIMD via CpuEngine.TensorExpInto
-        // Exp forward: direct VML/SIMD via CpuEngine.TensorExpInto
+        // Exp forward: pinned ExpUnsafe — bypass EnsureMaterialized
+        if (step.OpName == "TensorExp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ExpUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Exp non-float fallback
         if (step.OpName == "TensorExp" && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Mish forward: direct SIMD MishUnsafe via CpuEngine.MishInto
+        // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
+        if (step.OpName == "Mish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.MishUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Mish non-float fallback
         if (step.OpName == "Mish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -674,24 +769,19 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // SELU forward: direct float computation
+        // SELU forward: pinned SELUUnsafe SIMD
         if (step.OpName == "SELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                const float alpha = 1.6732632423543772f;
-                const float scale = 1.0507009873554805f;
-                for (int i = 0; i < len; i++)
-                {
-                    float x = cIn[i];
-                    cOut[i] = x > 0 ? scale * x : scale * alpha * (MathF.Exp(x) - 1f);
-                }
+                unsafe { SimdKernels.SELUUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 

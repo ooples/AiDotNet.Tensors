@@ -656,6 +656,41 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD SELU: scale * (x > 0 ? x : alpha * (exp(x) - 1)) using AVX + FastExp256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void SELUUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                var one = Vector256.Create(1.0f);
+                var alpha = Vector256.Create(1.6732632423543772f);
+                var scale = Vector256.Create(1.0507009873554805f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var expX = FastExp256(x);
+                    var negPart = Avx.Multiply(alpha, Avx.Subtract(expX, one));
+                    var mask = Avx.Compare(x, zero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var result = Avx.Multiply(scale, Avx.BlendVariable(negPart, x, mask));
+                    Avx.Store(output + i, result);
+                }
+            }
+#endif
+            const float alphaS = 1.6732632423543772f;
+            const float scaleS = 1.0507009873554805f;
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                output[i] = x > 0 ? scaleS * x : scaleS * alphaS * (MathF.Exp(x) - 1f);
+            }
+        }
+
+        /// <summary>
         /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
