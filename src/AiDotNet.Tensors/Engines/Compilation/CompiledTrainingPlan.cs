@@ -370,7 +370,7 @@ internal sealed class CompiledTrainingPlan<T>
         // Sigmoid: don't specialize forward — the eager allocating path is faster
         // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
 
-        // Tanh forward: pinned SIMD TanhUnsafe — bypass EnsureMaterialized overhead
+        // Tanh forward: VML → SIMD fallback, pinned GCHandle
         if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -382,7 +382,14 @@ internal sealed class CompiledTrainingPlan<T>
             int len = inp.Length;
             return eng =>
             {
-                unsafe { SimdKernels.TanhUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    // Try MKL VML vsTanh first (SVML, ~3x faster than polynomial)
+                    if (!Helpers.VmlProvider.TryTanh(pIn, pOut, len))
+                        SimdKernels.TanhUnsafe(pIn, pOut, len);
+                }
             };
         }
         // Tanh non-float fallback
@@ -596,7 +603,7 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Exp forward: pinned ExpUnsafe — bypass EnsureMaterialized
+        // Exp forward: VML → SIMD fallback, pinned GCHandle
         if (step.OpName == "TensorExp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -608,7 +615,13 @@ internal sealed class CompiledTrainingPlan<T>
             int len = inp.Length;
             return eng =>
             {
-                unsafe { SimdKernels.ExpUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    if (!Helpers.VmlProvider.TryExp(pIn, pOut, len))
+                        SimdKernels.ExpUnsafe(pIn, pOut, len);
+                }
             };
         }
         // Exp non-float fallback
