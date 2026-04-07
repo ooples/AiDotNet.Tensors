@@ -549,8 +549,23 @@ internal sealed class CompiledTrainingPlan<T>
         // (from the lazy node) already handles these correctly. Specializing adds
         // an extra allocate+copy on top of what the generic path already does.
 
-        // TensorDivide: no Into specialization (Pin overhead in Into variants
-        // exceeds the allocation savings — eager path uses fixed+GetDataArray which is faster)
+        // TensorDivide forward: direct cached array division
+        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            float[]? cA = null, cB = null, cOut = null;
+            int len = a.Length;
+            return eng =>
+            {
+                cA ??= (float[])(object)a.GetDataArray();
+                cB ??= (float[])(object)b.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = cA[i] / cB[i];
+            };
+        }
 
         // Conv2D forward: use Conv2DInto to write directly into output
         if (step.OpName == "Conv2D" && step.Inputs.Length == 2)
@@ -781,6 +796,24 @@ internal sealed class CompiledTrainingPlan<T>
                 cOut ??= (float[])(object)o.GetDataArray();
                 for (int i = 0; i < len; i++)
                     cOut[i] = MathF.Round(cIn[i]);
+            };
+        }
+
+        // TensorMax forward: direct float max
+        if (step.OpName == "TensorMax" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            float[]? cA = null, cB = null, cOut = null;
+            int len = a.Length;
+            return eng =>
+            {
+                cA ??= (float[])(object)a.GetDataArray();
+                cB ??= (float[])(object)b.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Max(cA[i], cB[i]);
             };
         }
 
