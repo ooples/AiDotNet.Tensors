@@ -635,6 +635,15 @@ public sealed class GradientTape<T> : IDisposable
                     param[i] = numOps.Subtract(param[i], numOps.Multiply(learningRate, grad[i]));
             }
         }
+
+        // Auto-training compiler: record step pattern for future compilation
+        Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count);
+
+        // If pattern repeats, compile backward graph for next time
+        if (_options.Persistent)
+        {
+            Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, parameters);
+        }
     }
 
     /// <summary>
