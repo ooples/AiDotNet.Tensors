@@ -4258,16 +4258,25 @@ public class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
-
-        for (int i = 0; i < src.Length; i++)
-            dest[i] = numOps.Floor(src[i]);
+        if (typeof(T) == typeof(float))
+        {
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < fSrc.Length; i++)
+                fDst[i] = MathF.Floor(fSrc[i]);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+                dest[i] = numOps.Floor(src[i]);
+        }
 
         DifferentiableOps.RecordUnary("Floor", result, tensor,
-            BackwardFunctions<T>.SignBackward); // zero gradient: floor is piecewise constant
+            BackwardFunctions<T>.SignBackward);
         return result;
     }
 
@@ -4279,14 +4288,23 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
-
-        for (int i = 0; i < src.Length; i++)
-            dest[i] = numOps.Ceiling(src[i]);
+        if (typeof(T) == typeof(float))
+        {
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < fSrc.Length; i++)
+                fDst[i] = MathF.Ceiling(fSrc[i]);
+        }
+        else
+        {
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+                dest[i] = numOps.Ceiling(src[i]);
+        }
 
         DifferentiableOps.RecordUnary("Ceiling", result, tensor,
-            BackwardFunctions<T>.SignBackward); // zero gradient: ceil is piecewise constant
+            BackwardFunctions<T>.SignBackward);
         return result;
     }
 
@@ -4747,15 +4765,27 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
 
-        for (int i = 0; i < src.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            var val = src[i];
-            if (numOps.LessThan(val, min)) val = min;
-            else if (numOps.GreaterThan(val, max)) val = max;
-            dest[i] = val;
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            float fMin = min is not null ? (float)(object)min : float.MinValue;
+            float fMax = max is not null ? (float)(object)max : float.MaxValue;
+            for (int i = 0; i < fSrc.Length; i++)
+                fDst[i] = MathF.Min(MathF.Max(fSrc[i], fMin), fMax);
+        }
+        else
+        {
+            var src = tensor.AsSpan();
+            var dest = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+            {
+                var val = src[i];
+                if (numOps.LessThan(val, min)) val = min;
+                else if (numOps.GreaterThan(val, max)) val = max;
+                dest[i] = val;
+            }
         }
 
         DifferentiableOps.RecordUnary("Clamp", result, tensor,
@@ -22450,12 +22480,13 @@ public class CpuEngine : ITensorLevelEngine
 
         if (data is float[] dF && result is float[] rF)
         {
-            Parallel.For(0, length, i =>
+            // Direct sequential loop — Parallel.For per-element has catastrophic overhead
+            for (int i = 0; i < length; i++)
             {
                 float x = dF[i];
                 float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
                 rF[i] = x * clip / 6f;
-            });
+            }
         }
         else
         {
@@ -24472,11 +24503,22 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        for (int i = 0; i < tensor.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            result[i] = numOps.Divide(numOps.One, tensor[i]);
+            var src = (float[])(object)tensor.GetDataArray();
+            var dst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = 1f / src[i];
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = numOps.Divide(numOps.One, src[i]);
         }
         DifferentiableOps.RecordUnary("Reciprocal", result, tensor, BackwardFunctions<T>.ReciprocalBackward);
         return result;
@@ -24497,12 +24539,22 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        for (int i = 0; i < tensor.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            double x = numOps.ToDouble(tensor[i]);
-            result[i] = numOps.FromDouble(Math.Sign(x));
+            var src = (float[])(object)tensor.GetDataArray();
+            var dst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = MathF.Sign(src[i]); // scalar but fast — no virtual dispatch
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var src = tensor.AsSpan();
+            var dst = result.AsWritableSpan();
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
         }
         DifferentiableOps.RecordUnary("Sign", result, tensor, BackwardFunctions<T>.SignBackward);
         return result;
