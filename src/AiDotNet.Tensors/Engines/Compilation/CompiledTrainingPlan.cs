@@ -642,43 +642,35 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Softplus forward: direct float computation
+        // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
         if (step.OpName == "Softplus" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                {
-                    float x = cIn[i];
-                    cOut[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
-                }
+                unsafe { SimdKernels.SoftplusUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 
-        // HardSwish forward: direct float computation
+        // HardSwish forward: SIMD HardSwishUnsafe with pinned arrays
         if (step.OpName == "HardSwish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                const float inv6 = 1f / 6f;
-                for (int i = 0; i < len; i++)
-                {
-                    float x = cIn[i];
-                    float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
-                    cOut[i] = x * clip * inv6;
-                }
+                unsafe { SimdKernels.HardSwishUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 
@@ -719,19 +711,19 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Sign forward: direct float computation
+        // Sign forward: SIMD SignUnsafe with pinned arrays
         if (step.OpName == "Sign" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Sign(cIn[i]);
+                unsafe { SimdKernels.SignUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 

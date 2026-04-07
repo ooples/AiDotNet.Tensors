@@ -22794,15 +22794,13 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcArr = input.GetDataArray() as float[];
-            var dstArr = softplusResult.GetDataArray() as float[];
-            if (srcArr is not null && dstArr is not null)
+            unsafe
             {
-                for (int i = 0; i < length; i++)
-                {
-                    float x = srcArr[i];
-                    dstArr[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
-                }
+                var srcMem = AsFloatMemory(input.Data);
+                var dstMem = AsFloatMemory(softplusResult.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SoftplusUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
         }
         else
@@ -22843,17 +22841,13 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcArr = input.GetDataArray() as float[];
-            var dstArr = hardSwishResult.GetDataArray() as float[];
-            if (srcArr is not null && dstArr is not null)
+            unsafe
             {
-                const float inv6 = 1f / 6f;
-                for (int i = 0; i < length; i++)
-                {
-                    float x = srcArr[i];
-                    float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
-                    dstArr[i] = x * clip * inv6;
-                }
+                var srcMem = AsFloatMemory(input.Data);
+                var dstMem = AsFloatMemory(hardSwishResult.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.HardSwishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
             }
         }
         else
@@ -24977,10 +24971,14 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var src = (float[])(object)tensor.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < src.Length; i++)
-                dst[i] = MathF.Sign(src[i]); // scalar but fast — no virtual dispatch
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SignUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
         }
         else
         {

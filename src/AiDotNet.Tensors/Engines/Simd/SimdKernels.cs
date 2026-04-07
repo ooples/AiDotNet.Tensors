@@ -560,6 +560,102 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD Sign: returns -1, 0, or 1 per element using AVX compare+blend.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void SignUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                var pos1 = Vector256.Create(1.0f);
+                var neg1 = Vector256.Create(-1.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var v = Avx.LoadVector256(input + i);
+                    // sign = (v > 0) ? 1 : ((v < 0) ? -1 : 0)
+                    var gtZero = Avx.Compare(v, zero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var ltZero = Avx.Compare(v, zero, FloatComparisonMode.OrderedLessThanSignaling);
+                    var result = Avx.BlendVariable(zero, pos1, gtZero);
+                    result = Avx.BlendVariable(result, neg1, ltZero);
+                    Avx.Store(output + i, result);
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Sign(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Softplus: log(1 + exp(x)) with numerical stability (x > 20 → x).
+        /// Uses FastExp256 SIMD polynomial for the exp part.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void SoftplusUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var threshold = Vector256.Create(20.0f);
+                var one = Vector256.Create(1.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    // exp(x) via fast polynomial
+                    var expX = FastExp256(x);
+                    // log(1 + exp(x)) — use FastLog256 for consistency
+                    var logTerm = FastLog256(Avx.Add(one, expX));
+                    // For x > 20, softplus ≈ x (numerical stability)
+                    var mask = Avx.Compare(x, threshold, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var result = Avx.BlendVariable(logTerm, x, mask);
+                    Avx.Store(output + i, result);
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                output[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+            }
+        }
+
+        /// <summary>
+        /// SIMD HardSwish: x * clamp(x+3, 0, 6) / 6 using AVX min/max/mul.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void HardSwishUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var three = Vector256.Create(3.0f);
+                var zero = Vector256<float>.Zero;
+                var six = Vector256.Create(6.0f);
+                var inv6 = Vector256.Create(1.0f / 6.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var clip = Avx.Min(Avx.Max(Avx.Add(x, three), zero), six);
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, clip), inv6));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
+                output[i] = x * clip * (1f / 6f);
+            }
+        }
+
+        /// <summary>
         /// Pointer-based Tanh — 2*sigmoid(2x)-1 with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
