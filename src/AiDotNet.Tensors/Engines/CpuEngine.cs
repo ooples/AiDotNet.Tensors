@@ -3826,6 +3826,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMultiplyScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -3855,6 +3857,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (scalar is not null)
             DifferentiableOps.RecordUnary("TensorMultiplyScalar", result, tensor, BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
+        AutoTracer.RecordOp("TensorMultiplyScalar", result, eng => result);
         return result;
     }
 
@@ -4847,6 +4850,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPow", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -4872,6 +4877,7 @@ public class CpuEngine : ITensorLevelEngine
 
         object boxedExponent = exponent is not null ? (object)exponent : throw new InvalidOperationException("Exponent cannot be null");
         DifferentiableOps.RecordUnary("TensorPow", result, tensor, BackwardFunctions<T>.TensorPowBackward, new object[] { boxedExponent });
+        AutoTracer.RecordOp("TensorPow", result, eng => result);
         return result;
     }
 
@@ -4958,6 +4964,8 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMin", a._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -4996,6 +5004,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("TensorMin", result, a, b, BackwardFunctions<T>.MinBackward);
+        AutoTracer.RecordOp("TensorMin", result, eng => result);
         return result;
     }
 
@@ -5025,6 +5034,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Clamp", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -5073,6 +5084,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("Clamp", result, tensor,
             BackwardFunctions<T>.ClampBackward,
             savedState: new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
+        AutoTracer.RecordOp("Clamp", result, eng => result);
         return result;
     }
 
@@ -6141,6 +6153,8 @@ public class CpuEngine : ITensorLevelEngine
 
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Conv2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -6170,6 +6184,7 @@ public class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -6186,6 +6201,7 @@ public class CpuEngine : ITensorLevelEngine
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
+            AutoTracer.RecordOp("Conv2D", result, eng => result);
             return result;
         }
 
@@ -6198,6 +6214,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, input, kernel,
             BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
+        AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
     }
 
@@ -7618,7 +7635,7 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> ELU<T>(Tensor<T> tensor, double alpha = 1.0)
     {
         if (GraphMode.IsActive)
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("ELU", tensor._shape); if (ac is not null) return ac.Execute(); }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ELU", tensor._shape, paramHash: alpha.GetHashCode()); if (ac is not null) return ac.Execute(); }
 
         {
             var scope = GraphMode.Current;
@@ -7647,7 +7664,7 @@ public class CpuEngine : ITensorLevelEngine
                     dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alphaT, ops2.Subtract(ops2.Exp(v), ops2.One));
                 }
                 DifferentiableOps.RecordUnary("ELU", r, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
-                { var c = tensor; AutoTracer.RecordOp("ELU", r, eng => eng.ELU(c)); }
+                { var c = tensor; double al = alpha; AutoTracer.RecordOp("ELU", r, eng => eng.ELU(c, al), paramHash: al.GetHashCode()); }
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -7675,7 +7692,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("ELU", result, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
-        { var c = tensor; AutoTracer.RecordOp("ELU", result, eng => eng.ELU(c)); }
+        { var c = tensor; double al = alpha; AutoTracer.RecordOp("ELU", result, eng => eng.ELU(c, al), paramHash: al.GetHashCode()); }
         return result;
     }
 
@@ -7701,8 +7718,6 @@ public class CpuEngine : ITensorLevelEngine
     public virtual unsafe Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         if (GraphMode.IsActive)
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("LeakyReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
-
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -7714,6 +7729,8 @@ public class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.LeakyReLUBackward, new object[] { MathHelper.GetNumericOperations<T>().ToDouble(alpha) });
             }
         }
+
+        { long ph = alpha is null ? 0L : alpha.GetHashCode(); var ac = AutoTracer.TryGetCompiledPlan<T>("LeakyReLU", tensor._shape, paramHash: ph); if (ac is not null) return ac.Execute(); }
 
         if (!tensor.IsContiguous)
         {
@@ -7729,7 +7746,7 @@ public class CpuEngine : ITensorLevelEngine
                     dst[i] = ops2.GreaterThan(v, ops2.Zero) ? v : ops2.Multiply(alpha, v);
                 }
                 DifferentiableOps.RecordUnary("LeakyReLU", r, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { MathHelper.GetNumericOperations<T>().ToDouble(alpha) });
-                { var c = tensor; AutoTracer.RecordOp("LeakyReLU", r, eng => eng.LeakyReLU(c, alpha)); }
+                { var c = tensor; var a = alpha; AutoTracer.RecordOp("LeakyReLU", r, eng => eng.LeakyReLU(c, a), paramHash: a is null ? 0L : a.GetHashCode()); }
                 return r;
             }
             tensor = tensor.Contiguous();
@@ -7779,7 +7796,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("LeakyReLU", result, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { negSlope });
-        { var c = tensor; var a = alpha; AutoTracer.RecordOp("LeakyReLU", result, eng => eng.LeakyReLU(c, a)); }
+        { var c = tensor; var a = alpha; AutoTracer.RecordOp("LeakyReLU", result, eng => eng.LeakyReLU(c, a), paramHash: a is null ? 0L : a.GetHashCode()); }
         return result;
     }
 
@@ -8733,6 +8750,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, BackwardFunctions<T>.Conv2DBackward,
             new object[] { stride, padding, dilation });
+        AutoTracer.RecordOp("Conv2D", result, eng => result);
         return result;
     }
 
@@ -11451,6 +11469,8 @@ public class CpuEngine : ITensorLevelEngine
         if (scaleD <= 0 || scaleH <= 0 || scaleW <= 0) throw new ArgumentException("Scale factors must be positive.");
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Upsample3D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -11504,6 +11524,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var up3dResult = TensorAllocator.Rent<T>([batch, channels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("Upsample3D", up3dResult, input, BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
+        AutoTracer.RecordOp("Upsample3D", up3dResult, eng => up3dResult);
         return up3dResult;
     }
 
@@ -18986,6 +19007,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorCumSum", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -19024,6 +19047,7 @@ public class CpuEngine : ITensorLevelEngine
                 dst[i] = cum;
             }
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            AutoTracer.RecordOp("TensorCumSum", result, eng => result);
             return result;
         }
 
@@ -19058,6 +19082,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorCumSum", result, tensor, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+        AutoTracer.RecordOp("TensorCumSum", result, eng => result);
         return result;
     }
 
@@ -19411,6 +19436,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorAddScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -19429,6 +19456,7 @@ public class CpuEngine : ITensorLevelEngine
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorAddScalar", result, tensor, BackwardFunctions<T>.AddScalarBackward);
+        AutoTracer.RecordOp("TensorAddScalar", result, eng => result);
         return result;
     }
 
@@ -19438,6 +19466,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSubtractScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -19456,6 +19486,7 @@ public class CpuEngine : ITensorLevelEngine
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorSubtractScalar", result, tensor, BackwardFunctions<T>.SubtractScalarBackward);
+        AutoTracer.RecordOp("TensorSubtractScalar", result, eng => result);
         return result;
     }
 
@@ -19465,6 +19496,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorDivideScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -19484,6 +19517,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (scalar is not null)
             DifferentiableOps.RecordUnary("TensorDivideScalar", result, tensor, BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar });
+        AutoTracer.RecordOp("TensorDivideScalar", result, eng => result);
         return result;
     }
 
@@ -19673,6 +19707,7 @@ public class CpuEngine : ITensorLevelEngine
                     fDst[r] = MathF.Sqrt(sumSq);
                 }
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
                 return normResult;
             }
             else if (normAxis == 0)
@@ -19691,6 +19726,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int c = 0; c < cols; c++)
                     fDst[c] = MathF.Sqrt(fDst[c]);
                 DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { normAxis });
+                AutoTracer.RecordOp("Norm", normResult, eng => normResult);
                 return normResult;
             }
         }
@@ -20325,6 +20361,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid axis {axis} for tensor with {rank} dimensions");
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("LogSoftmax", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -20355,6 +20393,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
                 BackwardFunctions<T>.LogSoftmaxBackward);
+            AutoTracer.RecordOp("LogSoftmax", result, eng => result);
             return result;
         }
 
@@ -20399,6 +20438,7 @@ public class CpuEngine : ITensorLevelEngine
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
             BackwardFunctions<T>.LogSoftmaxBackward);
+        AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => logSoftmaxResult);
         return logSoftmaxResult;
     }
 
@@ -24392,6 +24432,8 @@ public class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("AdaptiveAvgPool2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24450,6 +24492,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, input,
             BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
             savedState: new object[] { outputHeight, outputWidth });
+        AutoTracer.RecordOp("AdaptiveAvgPool2D", result, eng => result);
         return result;
     }
 
@@ -24693,6 +24736,8 @@ public class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
 
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorAddScaled", a._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24726,6 +24771,7 @@ public class CpuEngine : ITensorLevelEngine
         object boxedScaleA = scaleA is not null ? (object)scaleA : throw new InvalidOperationException("scaleA cannot be null");
         object boxedScaleB = scaleB is not null ? (object)scaleB : throw new InvalidOperationException("scaleB cannot be null");
         DifferentiableOps.RecordBinary("TensorAddScaled", result, a, b, BackwardFunctions<T>.AddScaledBackward, new object[] { boxedScaleA, boxedScaleB });
+        AutoTracer.RecordOp("TensorAddScaled", result, eng => result);
         return result;
     }
 
@@ -24799,6 +24845,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("MSELoss", predictions._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24826,6 +24874,7 @@ public class CpuEngine : ITensorLevelEngine
             float fMean = sumSq / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("MSELoss", scalarResult, predictions, targets, BackwardFunctions<T>.MSELossBackward);
+            AutoTracer.RecordOp("MSELoss", scalarResult, eng => scalarResult);
             return scalarResult;
         }
 
@@ -24840,6 +24889,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("MSELoss", result, predictions, targets, BackwardFunctions<T>.MSELossBackward);
+        AutoTracer.RecordOp("MSELoss", result, eng => result);
         return result;
     }
 
@@ -24847,6 +24897,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("L1Loss", predictions._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24871,6 +24923,7 @@ public class CpuEngine : ITensorLevelEngine
             float fMean = sumAbs / len;
             var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
             DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
+            AutoTracer.RecordOp("L1Loss", scalarResult, eng => scalarResult);
             return scalarResult;
         }
 
@@ -24885,6 +24938,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("L1Loss", result, predictions, targets, BackwardFunctions<T>.L1LossBackward);
+        AutoTracer.RecordOp("L1Loss", result, eng => result);
         return result;
     }
 
@@ -24892,6 +24946,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("HuberLoss", predictions._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24920,6 +24976,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("HuberLoss", result, predictions, targets,
             BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+        AutoTracer.RecordOp("HuberLoss", result, eng => result);
         return result;
     }
 
@@ -24927,6 +24984,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("BCEWithLogitsLoss", logits._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24953,6 +25012,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("BCEWithLogitsLoss", result, logits, targets,
             BackwardFunctions<T>.BCEWithLogitsLossBackward);
+        AutoTracer.RecordOp("BCEWithLogitsLoss", result, eng => result);
         return result;
     }
 
@@ -24960,6 +25020,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("CrossEntropyLoss", logits._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -24993,6 +25055,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("CrossEntropyLoss", result, logits, targets,
             BackwardFunctions<T>.CrossEntropyLossBackward);
+        AutoTracer.RecordOp("CrossEntropyLoss", result, eng => result);
         return result;
     }
 
@@ -25000,6 +25063,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("NLLLoss", logProbs._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25029,6 +25094,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("NLLLoss", result, logProbs, targets,
             BackwardFunctions<T>.NLLLossBackward);
+        AutoTracer.RecordOp("NLLLoss", result, eng => result);
         return result;
     }
 
@@ -25036,6 +25102,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorKLDivLoss<T>(Tensor<T> input, Tensor<T> target)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("KLDivLoss", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25063,6 +25131,7 @@ public class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("KLDivLoss", result, input, target,
             BackwardFunctions<T>.KLDivLossBackward);
+        AutoTracer.RecordOp("KLDivLoss", result, eng => result);
         return result;
     }
 
@@ -25188,6 +25257,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorReLU6<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReLU6", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25221,6 +25292,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
         DifferentiableOps.RecordUnary("ReLU6", result, tensor, BackwardFunctions<T>.ReLU6Backward);
+        AutoTracer.RecordOp("ReLU6", result, eng => result);
         return result;
     }
 
@@ -25228,6 +25300,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorPReLU<T>(Tensor<T> tensor, Tensor<T> alpha)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("PReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25285,6 +25359,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("PReLU", result, tensor, alpha,
             BackwardFunctions<T>.PReLUBackward,
             savedState: new object[] { channels, spatialSize });
+        AutoTracer.RecordOp("PReLU", result, eng => result);
         return result;
     }
 
@@ -25292,6 +25367,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorRReLU<T>(Tensor<T> tensor, double lower = 1.0/8, double upper = 1.0/3, bool training = true)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("RReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25317,6 +25394,7 @@ public class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(x >= 0 ? x : a * x);
         }
         DifferentiableOps.RecordUnary("RReLU", result, tensor, BackwardFunctions<T>.RReLUBackward, savedState: new object[] { noise });
+        AutoTracer.RecordOp("RReLU", result, eng => result);
         return result;
     }
 
@@ -25324,6 +25402,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Threshold", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25346,6 +25426,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         DifferentiableOps.RecordUnary("Threshold", result, tensor, BackwardFunctions<T>.ThresholdBackward,
             savedState: new object[] { numOps.ToDouble(threshold) });
+        AutoTracer.RecordOp("Threshold", result, eng => result);
         return result;
     }
 
@@ -25562,6 +25643,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorUpsampleBilinear<T>(Tensor<T> input, int[] outputSize)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("UpsampleBilinear", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25604,6 +25687,7 @@ public class CpuEngine : ITensorLevelEngine
                     }
         DifferentiableOps.RecordUnary("UpsampleBilinear", result, input, BackwardFunctions<T>.UpsampleBilinearBackward,
             savedState: new object[] { new[] { h, w } });
+        AutoTracer.RecordOp("UpsampleBilinear", result, eng => result);
         return result;
     }
 
@@ -25615,6 +25699,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorAvgPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("AvgPool1D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25648,6 +25734,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
         DifferentiableOps.RecordUnary("AvgPool1D", result, input, BackwardFunctions<T>.AvgPool1DBackward,
             savedState: new object[] { kernelSize, stride });
+        AutoTracer.RecordOp("AvgPool1D", result, eng => result);
         return result;
     }
 
@@ -25655,6 +25742,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorMaxPool1D<T>(Tensor<T> input, int kernelSize, int stride)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("MaxPool1D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25696,6 +25785,7 @@ public class CpuEngine : ITensorLevelEngine
                 }
         DifferentiableOps.RecordUnary("MaxPool1D", result, input, BackwardFunctions<T>.MaxPool1DBackward,
             savedState: new object[] { indices, kernelSize, stride });
+        AutoTracer.RecordOp("MaxPool1D", result, eng => result);
         return result;
     }
 
@@ -25707,6 +25797,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorMeanDiff<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Mean", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25723,6 +25815,7 @@ public class CpuEngine : ITensorLevelEngine
         T mean = numOps.Divide(sum, numOps.FromDouble(tensor.Length));
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordUnary("Mean", result, tensor, BackwardFunctions<T>.MeanBackward);
+        AutoTracer.RecordOp("Mean", result, eng => result);
         return result;
     }
 
@@ -25741,6 +25834,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorVar<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Var", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25765,6 +25860,7 @@ public class CpuEngine : ITensorLevelEngine
         variance /= tensor.Length;
         var result = new Tensor<T>(new[] { numOps.FromDouble(variance) }, [1]);
         DifferentiableOps.RecordUnary("Var", result, tensor, BackwardFunctions<T>.VarBackward);
+        AutoTracer.RecordOp("Var", result, eng => result);
         return result;
     }
 
@@ -25772,6 +25868,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorStd<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Std", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25796,6 +25894,7 @@ public class CpuEngine : ITensorLevelEngine
         variance /= tensor.Length;
         var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(variance)) }, [1]);
         DifferentiableOps.RecordUnary("Std", result, tensor, BackwardFunctions<T>.StdBackward);
+        AutoTracer.RecordOp("Std", result, eng => result);
         return result;
     }
 
@@ -25813,6 +25912,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorLogSumExp<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("LogSumExp", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25834,6 +25935,7 @@ public class CpuEngine : ITensorLevelEngine
         double lse = maxVal + Math.Log(sumExp);
         var result = new Tensor<T>(new[] { numOps.FromDouble(lse) }, [1]);
         DifferentiableOps.RecordUnary("LogSumExp", result, tensor, BackwardFunctions<T>.LogSumExpBackward);
+        AutoTracer.RecordOp("LogSumExp", result, eng => result);
         return result;
     }
 
@@ -25841,6 +25943,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorNorm<T>(Tensor<T> tensor)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Norm", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25861,6 +25965,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         var result = new Tensor<T>(new[] { numOps.FromDouble(Math.Sqrt(sumSq)) }, [1]);
         DifferentiableOps.RecordUnary("Norm", result, tensor, BackwardFunctions<T>.NormBackward);
+        AutoTracer.RecordOp("Norm", result, eng => result);
         return result;
     }
 
@@ -25868,6 +25973,8 @@ public class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
     {
         if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("AdaptiveMaxPool2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         {
             var scope = GraphMode.Current;
             if (scope != null)
@@ -25912,6 +26019,7 @@ public class CpuEngine : ITensorLevelEngine
                     }
         DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,
             BackwardFunctions<T>.AdaptiveMaxPool2DBackward, savedState: new object[] { argmax });
+        AutoTracer.RecordOp("AdaptiveMaxPool2D", result, eng => result);
         return result;
     }
 

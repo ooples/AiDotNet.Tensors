@@ -88,11 +88,19 @@ internal sealed class AutoTracerState
 {
     private readonly List<TracedOp> _currentSequence = new();
     private readonly Dictionary<long, object> _compiledPlans = new();
+    private readonly LinkedList<long> _evictionOrder = new();
     private int _patternRepeatCount;
     private long _lastPatternHash;
 
     private const int CompileThreshold = 2;
     private const int MaxSequenceLength = 128;
+
+    /// <summary>
+    /// Maximum number of compiled plans cached per thread.
+    /// When exceeded, the oldest plan is evicted (LRU).
+    /// Prevents unbounded memory growth in long-running processes.
+    /// </summary>
+    private const int MaxCompiledPlans = 64;
 
     internal CompiledInferencePlan<T>? TryGetPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
@@ -158,7 +166,16 @@ internal sealed class AutoTracerState
             var plan = scope.CompileInference<T>();
             if (plan is not null)
             {
+                // Evict oldest plan if at capacity (LRU eviction)
+                while (_compiledPlans.Count >= MaxCompiledPlans && _evictionOrder.Count > 0)
+                {
+                    long oldest = _evictionOrder.First!.Value;
+                    _evictionOrder.RemoveFirst();
+                    _compiledPlans.Remove(oldest);
+                }
+
                 _compiledPlans[patternHash] = plan;
+                _evictionOrder.AddLast(patternHash);
             }
 
             _currentSequence.Clear();
