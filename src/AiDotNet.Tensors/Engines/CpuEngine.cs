@@ -1999,7 +1999,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[rank - 1] = n;
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         // Handle 2D case (no batch dimensions)
         if (rank == 2)
@@ -2155,7 +2155,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // RentUninitialized: kernel writes every element, no need to zero
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: if either operand is non-contiguous, use strided iteration (zero-copy)
@@ -3079,7 +3079,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Chain pairwise additions using span-based numOps: result = t0 + t1 + t2 + ...
         // First: result = tensors[0] + tensors[1]
-        var result = TensorAllocator.RentUninitialized<T>(referenceShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
         numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
 
         // Accumulate remaining tensors into result
@@ -3120,7 +3120,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -3211,7 +3211,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -3656,7 +3656,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
-        var result = TensorAllocator.RentUninitialized<T>(referenceShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
         numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
 
         for (int t = 2; t < tensors.Length; t++)
@@ -3687,7 +3687,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         if (tensor.IsContiguous)
         {
@@ -3734,7 +3734,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         int length = a.Length;
 
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
@@ -3802,7 +3802,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3826,7 +3826,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3844,7 +3844,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3868,7 +3868,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3893,7 +3893,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3911,7 +3911,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3935,7 +3935,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
         var srcB = b.AsSpan();
         var dest = result.AsWritableSpan();
@@ -3953,7 +3953,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -3986,7 +3986,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -4028,7 +4028,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -4070,7 +4070,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -4112,7 +4112,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -4156,7 +4156,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
 
         DifferentiableOps.RecordUnary("TensorNegate", result, tensor, BackwardFunctions<T>.NegateBackward);
@@ -4171,7 +4171,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Copy data to a new tensor with no tape connection.
         // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         tensor.AsSpan().CopyTo(result.AsWritableSpan());
         return result;
     }
@@ -4196,7 +4196,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // Fast SIMD path for common integer exponents (x^2 = x*x, x^3 = x*x*x)
         if (typeof(T) == typeof(float))
@@ -4238,7 +4238,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensors must have the same shape for element-wise power.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(bases._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(bases._shape);
         var srcB = bases.AsSpan();
         var srcE = exponents.AsSpan();
         var dest = result.AsWritableSpan();
@@ -4258,7 +4258,7 @@ public class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var fSrc = (float[])(object)tensor.GetDataArray();
@@ -4287,7 +4287,7 @@ public class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Ceiling", tensor, tensor._shape, (eng, o) => { var r = eng.TensorCeiling(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var fSrc = (float[])(object)tensor.GetDataArray();
@@ -4314,7 +4314,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var fSrc = (float[])(object)tensor.GetDataArray();
@@ -4343,7 +4343,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -4373,7 +4373,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             unsafe
@@ -4420,7 +4420,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             unsafe
@@ -4543,7 +4543,7 @@ public class CpuEngine : ITensorLevelEngine
         int numPositions = positions._shape[0];
 
         // Initialize gradient grid with zeros
-        var gradGrid = TensorAllocator.RentUninitialized<T>(grid._shape);
+        var gradGrid = AutoTensorCache.RentOrAllocate<T>(grid._shape);
 
         // Use thread-local gradients to avoid contention, then combine
         int numThreads = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -4654,7 +4654,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -4691,7 +4691,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -4721,7 +4721,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -4759,7 +4759,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -4789,7 +4789,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var src = tensor.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -4825,7 +4825,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -4993,7 +4993,7 @@ public class CpuEngine : ITensorLevelEngine
                 if (d == axis) { if (keepDims) outShape.Add(1); }
                 else outShape.Add(tensor._shape[d]);
             }
-            var result = TensorAllocator.RentUninitialized<T>(outShape.ToArray());
+            var result = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
             var rArr = result.GetDataArray();
             var srcArr = tensor._storage.GetDataArray();
 
@@ -5028,7 +5028,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var shape = new int[tensor.Rank];
                 for (int i = 0; i < tensor.Rank; i++) shape[i] = 1;
-                fullResult = TensorAllocator.RentUninitialized<T>(shape);
+                fullResult = AutoTensorCache.RentOrAllocate<T>(shape);
                 fullResult.GetDataArray()[0] = sum;
             }
             else
@@ -5054,7 +5054,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 // Sum along rows → output [1, cols] or [cols]
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
-                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (float[])(object)fastResult.GetDataArray();
                 Array.Clear(rArr, 0, cols);
                 for (int r = 0; r < rows; r++)
@@ -5071,7 +5071,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 // Sum along cols → output [rows, 1] or [rows]
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
-                var fastResult = TensorAllocator.RentUninitialized<T>(outShape);
+                var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (float[])(object)fastResult.GetDataArray();
                 for (int r = 0; r < rows; r++)
                 {
@@ -5101,7 +5101,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result2 = TensorAllocator.RentUninitialized<T>(outputShape.ToArray());
+        var result2 = AutoTensorCache.RentOrAllocate<T>(outputShape.ToArray());
 
         // Use tensor's built-in Sum which is already optimized
         var summed = tensor.Sum(normalizedAxes);
@@ -5503,7 +5503,7 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         // When tape is active, use WithIndices variant so backward can access max indices
         var tape = GradientTape<T>.Current;
@@ -5630,7 +5630,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var outputShape = new[] { batch, channels, outputHeight, outputWidth };
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         // Float fast path: direct array access, no virtual dispatch
         if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
@@ -6468,7 +6468,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops = MathHelper.GetNumericOperations<T>();
-                var resultS = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
                 var dstArr = resultS.GetDataArray();
                 var idxBuf = new int[tensor.Length];
@@ -6481,7 +6481,7 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -6527,7 +6527,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops = MathHelper.GetNumericOperations<T>();
-                var resultS = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
                 var dstArr = resultS.GetDataArray();
                 var idxBuf = new int[tensor.Length];
@@ -6540,7 +6540,7 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         // Fast path for float tensors: bypass generic dispatch + Span bounds-checking
@@ -6868,7 +6868,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops = MathHelper.GetNumericOperations<T>();
-                var resultS = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
                 var dstArr = resultS.GetDataArray();
                 var idxBuf = new int[tensor.Length];
@@ -6882,7 +6882,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // RentUninitialized — ReLU writes every element, no need to zero
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
 
         if (typeof(T) == typeof(float))
@@ -7120,7 +7120,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops = MathHelper.GetNumericOperations<T>();
-                var resultS = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
                 var dstArr = resultS.GetDataArray();
                 var idxBuf = new int[tensor.Length];
@@ -7133,7 +7133,7 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -7177,7 +7177,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops = MathHelper.GetNumericOperations<T>();
-                var resultS = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
                 var dstArr = resultS.GetDataArray();
                 var idxBuf = new int[tensor.Length];
@@ -7190,7 +7190,7 @@ public class CpuEngine : ITensorLevelEngine
             return Mish(tensor.Contiguous());
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -7234,7 +7234,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops2 = MathHelper.GetNumericOperations<T>();
-                var r = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var r = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
                 var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
                 for (int i = 0; i < tensor.Length; i++) { T v = src[idx[i]]; T negV = ops2.Negate(v); T sig = ops2.Divide(ops2.One, ops2.Add(ops2.One, ops2.Exp(negV))); dst[i] = ops2.Multiply(v, sig); }
@@ -7245,7 +7245,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
 
@@ -7273,7 +7273,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops2 = MathHelper.GetNumericOperations<T>();
-                var r = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var r = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
                 var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
                 T alphaT = ops2.FromDouble(alpha);
@@ -7291,7 +7291,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
 
@@ -7320,7 +7320,7 @@ public class CpuEngine : ITensorLevelEngine
             if (tensor.Length <= 4096)
             {
                 var ops2 = MathHelper.GetNumericOperations<T>();
-                var r = TensorAllocator.RentUninitialized<T>(tensor._shape);
+                var r = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var src = tensor._storage.GetDataArray(); var dst = r.GetDataArray();
                 var idx = new int[tensor.Length]; tensor.FillStorageIndices(idx);
                 for (int i = 0; i < tensor.Length; i++)
@@ -7336,7 +7336,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var negSlope = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
 
         if (typeof(T) == typeof(float))
@@ -8037,7 +8037,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Matrix dimensions incompatible: [{m},{n}] x [{b._shape[0]},{p}]");
 
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
-        var result = TensorAllocator.RentUninitialized<T>(new[] { m, p });
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
 
         // Try BLAS-accelerated path for float/double tensors
         if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
@@ -8103,7 +8103,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[aRank - 2] = m;
         outputShape[aRank - 1] = p;
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeResult = m * p;
@@ -8180,7 +8180,7 @@ public class CpuEngine : ITensorLevelEngine
         outputShape[rank - 2] = m;
         outputShape[rank - 1] = p;
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         int matrixSizeA = m * n;
         int matrixSizeB = n * p;
@@ -8571,7 +8571,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
-        var result = TensorAllocator.RentUninitialized<T>(inputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
 
@@ -8681,7 +8681,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
-        var result = TensorAllocator.RentUninitialized<T>(inputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
         T poolArea = numOps.FromDouble(poolH * poolW);
@@ -9409,7 +9409,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradInput = TensorAllocator.RentUninitialized<T>(inputShape);
+        var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var kernelData = kernel.GetDataArray();
@@ -9576,7 +9576,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradKernel = TensorAllocator.RentUninitialized<T>(kernelShape);
+        var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
         var gradKernelData = gradKernel.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -9697,7 +9697,7 @@ public class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
         int numKernelPositions = kernelHeight * kernelWidth;
 
-        var gradOffset = TensorAllocator.RentUninitialized<T>(offset._shape);
+        var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
         var gradOffsetData = gradOffset.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -10106,7 +10106,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
         if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: inputShape has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
 
-        var gradInput = TensorAllocator.RentUninitialized<T>(inputShape);
+        var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
@@ -10180,7 +10180,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[1]},{gradOutput._shape[2]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
         if (gradOutput._shape[3] != channels) throw new ArgumentException($"Channel mismatch: input has {channels}, gradOutput has {gradOutput._shape[3]}.", nameof(gradOutput));
 
-        var gradGrid = TensorAllocator.RentUninitialized<T>(grid._shape);
+        var gradGrid = AutoTensorCache.RentOrAllocate<T>(grid._shape);
         var gradGridData = gradGrid.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetDataArray();
@@ -11677,7 +11677,7 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
-            var result = TensorAllocator.RentUninitialized<T>(input._shape);
+            var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
             using var pinIn = input.Data.Pin();
             using var pinOut = result.Data.Pin();
             unsafe
@@ -11691,7 +11691,7 @@ public class CpuEngine : ITensorLevelEngine
         // Generic scalar fallback for non-float types or non-last-axis
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
-        var result2 = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result2 = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var outputDataGeneric = result2.GetDataArray();
 
         Parallel.For(0, outerSize * innerSize, idx =>
@@ -13640,7 +13640,7 @@ public class CpuEngine : ITensorLevelEngine
         // Fast float path: Pin() for NativeMemory compatibility
         if (typeof(T) == typeof(float))
         {
-            var result = TensorAllocator.RentUninitialized<T>(input._shape);
+            var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
             // Pin all memory to get float* pointers (works with both managed and NativeMemory)
             using var pinIn = input.Data.Pin();
             using var pinOut = result.Data.Pin();
@@ -13674,7 +13674,7 @@ public class CpuEngine : ITensorLevelEngine
         // Allocate output via TensorAllocator to benefit from pooling.
         // Write directly into the tensor's backing array — avoid the Rent().GetDataArray()
         // round-trip which can return an oversized pooled array.
-        var output = TensorAllocator.RentUninitialized<T>(input._shape);
+        var output = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var outputData = output.GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
@@ -16026,7 +16026,7 @@ public class CpuEngine : ITensorLevelEngine
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
-            var result = TensorAllocator.RentUninitialized<T>(outShape.ToArray());
+            var result = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
             var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
             maxIndices = new int[outerSize * innerSize];
             for (int o = 0; o < outerSize; o++)
@@ -16185,7 +16185,7 @@ public class CpuEngine : ITensorLevelEngine
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
-            var earlyResult = TensorAllocator.RentUninitialized<T>(outShape.ToArray());
+            var earlyResult = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
             var rArr = earlyResult.GetDataArray(); var srcArr = input._storage.GetDataArray();
             T divisor = ops.FromDouble(axisSize);
             for (int o = 0; o < outerSize; o++)
@@ -16350,7 +16350,7 @@ public class CpuEngine : ITensorLevelEngine
             var (outerSize, axisSize, innerSize) = input.GetReductionDims(axis);
             var outShape = new List<int>();
             for (int d = 0; d < input.Rank; d++) { if (d == axis) { if (keepDims) outShape.Add(1); } else outShape.Add(input._shape[d]); }
-            var result = TensorAllocator.RentUninitialized<T>(outShape.ToArray());
+            var result = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
             var rArr = result.GetDataArray(); var srcArr = input._storage.GetDataArray();
             T divisor = ops.FromDouble(axisSize);
             for (int o = 0; o < outerSize; o++)
@@ -17315,7 +17315,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Real and imaginary parts must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var output = TensorAllocator.RentUninitialized<T>(real._shape);
+        var output = AutoTensorCache.RentOrAllocate<T>(real._shape);
         for (int idx = 0; idx < real.Length; idx++)
         {
             var r = real[idx];
@@ -17334,7 +17334,7 @@ public class CpuEngine : ITensorLevelEngine
         if (numOps.Equals(total, numOps.Zero))
             return (real.Clone(), imag.Clone());
         var denom = numOps.Sqrt(total);
-        var denomTensor = TensorAllocator.RentUninitialized<T>(magSq._shape);
+        var denomTensor = AutoTensorCache.RentOrAllocate<T>(magSq._shape);
         denomTensor.Fill(denom);
         var realNorm = TensorDivide(real, denomTensor);
         var imagNorm = TensorDivide(imag, denomTensor);
@@ -17856,9 +17856,9 @@ public class CpuEngine : ITensorLevelEngine
         if (output._shape[0] != batchSize || output._shape[1] != numCenters)
             throw new ArgumentException($"output shape [{output._shape[0]}, {output._shape[1]}] must be [{batchSize}, {numCenters}]", nameof(output));
 
-        var gradInput = TensorAllocator.RentUninitialized<T>(input._shape);
-        var gradCenters = TensorAllocator.RentUninitialized<T>(centers._shape);
-        var gradEpsilons = TensorAllocator.RentUninitialized<T>(epsilons._shape);
+        var gradInput = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        var gradCenters = AutoTensorCache.RentOrAllocate<T>(centers._shape);
+        var gradEpsilons = AutoTensorCache.RentOrAllocate<T>(epsilons._shape);
 
         var inputData = input.GetFlattenedData();
         var centersData = centers.GetFlattenedData();
@@ -17937,7 +17937,7 @@ public class CpuEngine : ITensorLevelEngine
         Array.Copy(tensor._shape, outputShape, tensor._shape.Length);
         outputShape[axis] *= repeats;
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         // Calculate strides for the tensor
         int outerSize = 1;
@@ -18006,7 +18006,7 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = tensor._shape[i] * multiples[i];
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         int totalElements = result._shape.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
@@ -18074,7 +18074,7 @@ public class CpuEngine : ITensorLevelEngine
                 throw new ArgumentOutOfRangeException(nameof(length), $"Slice length {length[i]} starting at {start[i]} exceeds axis {i} size {tensor._shape[i]}");
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(length);
+        var result = AutoTensorCache.RentOrAllocate<T>(length);
         int totalElements = length.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
@@ -18121,7 +18121,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         // Create a copy of destination to avoid modifying the original
-        var result = TensorAllocator.RentUninitialized<T>(destination._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(destination._shape);
         var destData = destination.GetDataArray();
         var resultData = result.GetDataArray();
         Array.Copy(destData, resultData, destData.Length);
@@ -18177,7 +18177,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("All tensors must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(condition._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(condition._shape);
         var condSpan = condition.AsSpan();
         var xSpan = x.AsSpan();
         var ySpan = y.AsSpan();
@@ -18409,7 +18409,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(destination._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(destination._shape);
         TensorCopy(destination, result);
 
         // Simple 1D scatter-add for now (most common use case: embeddings)
@@ -18513,7 +18513,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // Normalize axis
         if (axis < 0) axis = tensor._shape.Length + axis;
@@ -18617,7 +18617,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = RandomHelper.ThreadSafeRandom;
-        var result = TensorAllocator.RentUninitialized<T>(shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         var resultData = result.GetDataArray();
@@ -18652,7 +18652,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = TensorAllocator.RentUninitialized<T>(shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double minD = numOps.ToDouble(min);
@@ -18705,7 +18705,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.ThreadSafeRandom;
-        var result = TensorAllocator.RentUninitialized<T>(shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(shape);
         int totalElements = shape.Aggregate(1, (a, b) => a * b);
 
         double dropoutRateD = numOps.ToDouble(dropoutRate);
@@ -18757,7 +18757,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
         numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
@@ -18815,7 +18815,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Tensor must be 2D");
 
         int n = Math.Min(tensor._shape[0], tensor._shape[1]);
-        var result = TensorAllocator.RentUninitialized<T>([n]);
+        var result = AutoTensorCache.RentOrAllocate<T>([n]);
 
         for (int i = 0; i < n; i++)
         {
@@ -18873,7 +18873,7 @@ public class CpuEngine : ITensorLevelEngine
             {
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];
-                var result = TensorAllocator.RentUninitialized<T>([batch]);
+                var result = AutoTensorCache.RentOrAllocate<T>([batch]);
                 Parallel.For(0, batch, b =>
                 {
                     T sum = numOps.Zero;
@@ -18910,7 +18910,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
@@ -18937,7 +18937,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
@@ -18964,7 +18964,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
@@ -18980,7 +18980,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!tanhOutput.IsContiguous) tanhOutput = tanhOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tanhOutput._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tanhOutput._shape);
 
         // d/dx tanh(x) = 1 - tanh(x)^2: compute y*y then subtract from 1
         // Use span-based: result = 1 - y*y
@@ -19000,8 +19000,8 @@ public class CpuEngine : ITensorLevelEngine
         if (!sigmoidOutput.IsContiguous) sigmoidOutput = sigmoidOutput.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(sigmoidOutput._shape);
-        var temp = TensorAllocator.RentUninitialized<T>(sigmoidOutput._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(sigmoidOutput._shape);
+        var temp = AutoTensorCache.RentOrAllocate<T>(sigmoidOutput._shape);
 
         // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
         var y = sigmoidOutput.AsSpan();
@@ -19020,7 +19020,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         int totalElements = input.Length;
 
         // ReLU derivative: 1 if x > 0, else 0
@@ -19069,14 +19069,14 @@ public class CpuEngine : ITensorLevelEngine
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
 
         // Compute scale factor: ||v||^2 / (1 + ||v||^2)
-        var one = TensorAllocator.RentUninitialized<T>(normSquared._shape);
+        var one = AutoTensorCache.RentOrAllocate<T>(normSquared._shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(normSquared, denom);
 
         // Compute ||v||
         var norm = TensorSqrt(normSquared);
-        var epsilon = TensorAllocator.RentUninitialized<T>(norm._shape);
+        var epsilon = AutoTensorCache.RentOrAllocate<T>(norm._shape);
         epsilon.Fill(numOps.FromDouble(1e-8));
         norm = TensorAdd(norm, epsilon);
 
@@ -19103,7 +19103,7 @@ public class CpuEngine : ITensorLevelEngine
         // For now, approximate with element-wise gradient scaling
         var squared = TensorMultiply(input, input);
         var normSquared = ReduceSum(squared, new[] { axis }, keepDims: true);
-        var one = TensorAllocator.RentUninitialized<T>(normSquared._shape);
+        var one = AutoTensorCache.RentOrAllocate<T>(normSquared._shape);
         one.Fill(numOps.One);
         var denom = TensorAdd(one, normSquared);
         var scale = TensorDivide(one, denom);
@@ -19154,7 +19154,7 @@ public class CpuEngine : ITensorLevelEngine
         var norm = TensorNorm(tensor, axis, keepDims: true);
 
         // Add epsilon for numerical stability
-        var epsArray = TensorAllocator.RentUninitialized<T>(norm._shape);
+        var epsArray = AutoTensorCache.RentOrAllocate<T>(norm._shape);
         epsArray.Fill(epsilon);
         norm = TensorAdd(norm, epsArray);
 
@@ -19415,7 +19415,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!targets.IsContiguous) targets = targets.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(predictions._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -19457,7 +19457,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!targets.IsContiguous) targets = targets.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(predictions._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
         var predSpan = predictions.AsSpan();
         var targetSpan = targets.AsSpan();
         var dest = result.AsWritableSpan();
@@ -19596,7 +19596,7 @@ public class CpuEngine : ITensorLevelEngine
         if (count < 2) throw new ArgumentException("Count must be at least 2.", nameof(count));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>([count]);
+        var result = AutoTensorCache.RentOrAllocate<T>([count]);
 
         T range = numOps.Subtract(end, start);
         T divisor = numOps.FromDouble(count - 1);
@@ -19784,7 +19784,7 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility
-            var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+            var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
             using var pinIn = tensor.Data.Pin();
             using var pinOut = result.Data.Pin();
             unsafe
@@ -20076,7 +20076,7 @@ public class CpuEngine : ITensorLevelEngine
         newShape[axis] = numTensors;
         for (int i = axis; i < firstShape.Length; i++) newShape[i + 1] = firstShape[i];
 
-        var result = TensorAllocator.RentUninitialized<T>(newShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(newShape);
 
         var resultData = result.GetDataArray();
 
@@ -20135,7 +20135,7 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
 
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         try
         {
             var src = tensor.GetFlattenedData();
@@ -20216,7 +20216,7 @@ public class CpuEngine : ITensorLevelEngine
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
 
-        var result = TensorAllocator.RentUninitialized<T>(x._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
         var condData = condition.GetFlattenedData();
         var xData = x.GetFlattenedData();
         var yData = y.GetFlattenedData();
@@ -20242,7 +20242,7 @@ public class CpuEngine : ITensorLevelEngine
         if (x.Length != y.Length || x.Length != condition.Length)
             throw new ArgumentException("All tensors must have the same length.");
 
-        var result = TensorAllocator.RentUninitialized<T>(x._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
         var condData = condition.GetFlattenedData();
         var xData = x.GetFlattenedData();
         var yData = y.GetFlattenedData();
@@ -20649,7 +20649,7 @@ public class CpuEngine : ITensorLevelEngine
         var outputShape = (int[])input._shape.Clone();
         outputShape[axis] = k;
 
-        var values = TensorAllocator.RentUninitialized<T>(outputShape);
+        var values = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var indices = new Tensor<int>(outputShape);
         var inputData = input.GetDataArray();
         var valuesData = values.GetDataArray();
@@ -20778,7 +20778,7 @@ public class CpuEngine : ITensorLevelEngine
             outputShape[i] = i == axis ? indices.Length : input._shape[i];
         }
 
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var indicesData = indices.GetFlattenedData();
         var resultData = result.GetDataArray();
@@ -20816,7 +20816,7 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
         // Create a copy of input
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
         Array.Copy(inputData, resultData, input.Length);
@@ -20861,7 +20861,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Create a copy of input
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
         Array.Copy(inputData, resultData, input.Length);
@@ -20911,7 +20911,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var srcData = tensor.GetFlattenedData();
         var dstData = result.GetDataArray();
 
@@ -20942,7 +20942,7 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var srcData = tensor.GetFlattenedData();
         var dstData = result.GetDataArray();
 
@@ -21062,7 +21062,7 @@ public class CpuEngine : ITensorLevelEngine
             // Ultra-fast path for float: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(float))
             {
-                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
+                var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                 var inArr = (float[])(object)input.GetDataArray();
                 var wArr = (float[])(object)weights.GetDataArray();
                 var outArr = (float[])(object)result.GetDataArray();
@@ -21137,7 +21137,7 @@ public class CpuEngine : ITensorLevelEngine
             // Ultra-fast path for double: zero-alloc arena + direct BLAS pointers
             if (typeof(T) == typeof(double))
             {
-                var result = TensorAllocator.RentUninitialized<T>(new[] { M, N });
+                var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                 var inArr = (double[])(object)input.GetDataArray();
                 var wArr = (double[])(object)weights.GetDataArray();
                 var outArr = (double[])(object)result.GetDataArray();
@@ -21225,7 +21225,7 @@ public class CpuEngine : ITensorLevelEngine
         {
             int batchSize = gradActivation._shape[0];
             int outputSize = gradActivation._shape[1];
-            var biasGrad = TensorAllocator.RentUninitialized<T>([outputSize]);
+            var biasGrad = AutoTensorCache.RentOrAllocate<T>([outputSize]);
 
             for (int j = 0; j < outputSize; j++)
             {
@@ -21432,7 +21432,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> SwishDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -21453,7 +21453,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> LeakyReLUDerivative<T>(Tensor<T> input, T alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -21469,7 +21469,7 @@ public class CpuEngine : ITensorLevelEngine
     private Tensor<T> GELUDerivative<T>(Tensor<T> input)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(input._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var src = input.AsSpan();
         var dest = result.AsWritableSpan();
 
@@ -21546,7 +21546,7 @@ public class CpuEngine : ITensorLevelEngine
         // Compute shape for output (last dim becomes 2 * numFreqs for interleaved complex)
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
 
@@ -21598,7 +21598,7 @@ public class CpuEngine : ITensorLevelEngine
         // Output shape
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
 
@@ -21658,8 +21658,8 @@ public class CpuEngine : ITensorLevelEngine
         int n = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.RentUninitialized<T>(inputReal._shape);
-        var outImag = TensorAllocator.RentUninitialized<T>(inputImag._shape);
+        var outReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
+        var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
         var outRealData = outReal.GetDataArray();
@@ -21706,8 +21706,8 @@ public class CpuEngine : ITensorLevelEngine
         int n = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.RentUninitialized<T>(inputReal._shape);
-        var outImag = TensorAllocator.RentUninitialized<T>(inputImag._shape);
+        var outReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
+        var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
         var outRealData = outReal.GetDataArray();
@@ -21759,8 +21759,8 @@ public class CpuEngine : ITensorLevelEngine
         int width = inputReal._shape[^1];
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.RentUninitialized<T>(inputReal._shape);
-        var outImag = TensorAllocator.RentUninitialized<T>(inputImag._shape);
+        var outReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
+        var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var tempRealData = tempReal.GetDataArray();
         var tempImagData = tempImag.GetDataArray();
         var outRealData = outReal.GetDataArray();
@@ -21811,12 +21811,12 @@ public class CpuEngine : ITensorLevelEngine
         int height = inputReal._shape[^2];
         int width = inputReal._shape[^1];
 
-        var tempReal = TensorAllocator.RentUninitialized<T>(inputReal._shape);
-        var tempImag = TensorAllocator.RentUninitialized<T>(inputImag._shape);
+        var tempReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
+        var tempImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
 
         // Create local variables to use in lambda (out params can't be captured)
-        var outReal = TensorAllocator.RentUninitialized<T>(inputReal._shape);
-        var outImag = TensorAllocator.RentUninitialized<T>(inputImag._shape);
+        var outReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
+        var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
         var tempRealData = tempReal.GetDataArray();
@@ -21904,7 +21904,7 @@ public class CpuEngine : ITensorLevelEngine
             int padAmount = nFft / 2;
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
-            paddedInput = TensorAllocator.RentUninitialized<T>(paddedShape);
+            paddedInput = AutoTensorCache.RentOrAllocate<T>(paddedShape);
             var inputData = input.GetDataArray();
             var paddedData = paddedInput.GetDataArray();
 
@@ -21946,8 +21946,8 @@ public class CpuEngine : ITensorLevelEngine
         newShape[^1] = numFrames;
 
         // Create local variables to use in lambda (out params can't be captured)
-        var magOut = TensorAllocator.RentUninitialized<T>(newShape);
-        var phOut = TensorAllocator.RentUninitialized<T>(newShape);
+        var magOut = AutoTensorCache.RentOrAllocate<T>(newShape);
+        var phOut = AutoTensorCache.RentOrAllocate<T>(newShape);
         var paddedInputData = paddedInput.GetDataArray();
         var windowData = window.GetDataArray();
         var magOutData = magOut.GetDataArray();
@@ -22017,8 +22017,8 @@ public class CpuEngine : ITensorLevelEngine
         // Output shape
         var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
         outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
-        var result = TensorAllocator.RentUninitialized<T>(outputShape);
-        var windowSum = TensorAllocator.RentUninitialized<T>(outputShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
+        var windowSum = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var magData = magnitude.GetDataArray();
         var phaseData = phase.GetDataArray();
         var windowData = window.GetDataArray();
@@ -22124,7 +22124,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var melShape = magnitude.Shape.ToArray();
         melShape[^2] = nMels;
-        var melSpec = TensorAllocator.RentUninitialized<T>(melShape);
+        var melSpec = AutoTensorCache.RentOrAllocate<T>(melShape);
         var melFilterData = melFilterbank.GetDataArray();
         var powerSpecData = powerSpec.GetDataArray();
         var melSpecData = melSpec.GetDataArray();
@@ -22188,7 +22188,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // Initialize with random phase
         var random = RandomHelper.ThreadSafeRandom;
-        var phase = TensorAllocator.RentUninitialized<T>(magnitude._shape);
+        var phase = AutoTensorCache.RentOrAllocate<T>(magnitude._shape);
         var phaseData = phase.GetDataArray();
         for (int i = 0; i < phase.Length; i++)
         {
@@ -22308,7 +22308,7 @@ public class CpuEngine : ITensorLevelEngine
         if (length <= 0) throw new ArgumentException("Length must be positive", nameof(length));
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var window = TensorAllocator.RentUninitialized<T>([length]);
+        var window = AutoTensorCache.RentOrAllocate<T>([length]);
 
         switch (windowType.ToLowerInvariant())
         {
@@ -22620,7 +22620,7 @@ public class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && gradOutput.UniformFillValue.HasValue)
         {
             float scale = (float)gradOutput.UniformFillValue.Value;
-            var resultTensor = TensorAllocator.RentUninitialized<T>(input._shape);
+            var resultTensor = AutoTensorCache.RentOrAllocate<T>(input._shape);
             var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor.GetDataArray();
             fixed (float* pI = iArr, pR = rArr)
@@ -22631,7 +22631,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
 
         // Allocating path: new output buffer
-        var resultTensor2 = TensorAllocator.RentUninitialized<T>(input._shape);
+        var resultTensor2 = AutoTensorCache.RentOrAllocate<T>(input._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -22697,7 +22697,7 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var resultTensor = AutoTensorCache.RentOrAllocate<T>(gradOutput._shape);
             var gArr = (double[])(object)gradOutput.GetFlattenedData();
             var oArr = (double[])(object)output.GetDataArray();
             var rArr = (double[])(object)resultTensor.GetDataArray();
@@ -22783,7 +22783,7 @@ public class CpuEngine : ITensorLevelEngine
         // Double SIMD path
         if (typeof(T) == typeof(double))
         {
-            var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+            var resultTensor = AutoTensorCache.RentOrAllocate<T>(gradOutput._shape);
             var gArr = (double[])(object)gradOutput.GetFlattenedData();
             var oArr = (double[])(object)output.GetDataArray();
             var rArr = (double[])(object)resultTensor.GetDataArray();
@@ -22857,7 +22857,7 @@ public class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         int length = gradOutput.Length;
 
-        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput._shape);
+        var resultTensor = AutoTensorCache.RentOrAllocate<T>(gradOutput._shape);
 
         if (typeof(T) == typeof(float))
         {
@@ -23652,7 +23652,7 @@ public class CpuEngine : ITensorLevelEngine
 
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
-        var diff = TensorAllocator.RentUninitialized<T>(predictions._shape);
+        var diff = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpan());
         T sumSq = numOps.Dot(diff.AsSpan(), diff.AsSpan());
 
@@ -23667,7 +23667,7 @@ public class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // grad = 2 * (pred - target) / N
-        var result = TensorAllocator.RentUninitialized<T>(predictions._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
         numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpan());
         T scale = numOps.FromDouble(2.0 / predictions.Length);
         numOps.MultiplyScalar(result.AsSpan(), scale, result.AsWritableSpan());
@@ -24066,7 +24066,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(a._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var aData = a.GetFlattenedData();
         var bData = b.GetFlattenedData();
         var rData = result.GetDataArray();
@@ -24423,7 +24423,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             const float alpha = 1.6732632423543772f;
@@ -24468,7 +24468,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var fSrc = (float[])(object)tensor.GetDataArray();
@@ -24505,7 +24505,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
         {
             double x = numOps.ToDouble(tensor[i]);
@@ -24537,7 +24537,7 @@ public class CpuEngine : ITensorLevelEngine
         // Compute channel-aware alpha indexing for NCHW tensors
         int channels = alpha.Length;
         int spatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
         {
             double x = numOps.ToDouble(tensor[i]);
@@ -24569,7 +24569,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var noise = new Tensor<T>(tensor._shape);
         var rng = new Random();
         for (int i = 0; i < tensor.Length; i++)
@@ -24602,7 +24602,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         for (int i = 0; i < tensor.Length; i++)
         {
             result[i] = numOps.GreaterThan(tensor[i], threshold) ? tensor[i] : value;
@@ -24628,7 +24628,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var src = (float[])(object)tensor.GetDataArray();
@@ -24664,7 +24664,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
             var src = (float[])(object)tensor.GetDataArray();
