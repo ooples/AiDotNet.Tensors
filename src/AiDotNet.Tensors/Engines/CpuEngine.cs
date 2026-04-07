@@ -23747,12 +23747,21 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (!embeddingTable.IsContiguous) embeddingTable = embeddingTable.Contiguous();
+        if (!indices.IsContiguous) indices = indices.Contiguous();
         int vocabSize = embeddingTable._shape[0];
         int embeddingDim = embeddingTable._shape[^1];
         int numIndices = indices.Length;
-        var tableData = embeddingTable.GetFlattenedData();
-        var indicesData = indices.GetFlattenedData();
-        var resultData = new T[numIndices * embeddingDim];
+
+        var outputShape = new int[indices._shape.Length + 1];
+        for (int i = 0; i < indices._shape.Length; i++)
+            outputShape[i] = indices._shape[i];
+        outputShape[^1] = embeddingDim;
+
+        var embResult = AutoTensorCache.RentOrAllocate<T>(outputShape);
+        var tableData = embeddingTable.GetDataArray();
+        var indicesData = indices.GetDataArray();
+        var resultData = embResult.GetDataArray();
 
         for (int i = 0; i < numIndices; i++)
         {
@@ -23763,19 +23772,8 @@ public class CpuEngine : ITensorLevelEngine
                     nameof(indices),
                     $"Embedding index {idx} at position {i} is out of bounds. Valid range: [0, {vocabSize - 1}].");
             }
-
-            int srcOffset = idx * embeddingDim;
-            int dstOffset = i * embeddingDim;
-            for (int j = 0; j < embeddingDim; j++)
-                resultData[dstOffset + j] = tableData[srcOffset + j];
+            Array.Copy(tableData, idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
         }
-
-        var outputShape = new int[indices._shape.Length + 1];
-        for (int i = 0; i < indices._shape.Length; i++)
-            outputShape[i] = indices._shape[i];
-        outputShape[^1] = embeddingDim;
-
-        var embResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(resultData));
         DifferentiableOps.RecordUnary("Embedding", embResult, embeddingTable, BackwardFunctions<T>.EmbeddingBackward,
             new object[] { indices, vocabSize, embeddingDim });
         return embResult;
