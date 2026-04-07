@@ -28,6 +28,9 @@ internal sealed class CompiledStep<T>
     /// <summary>Operation name for diagnostics.</summary>
     internal readonly string OpName;
 
+    /// <summary>Type-safe operation type for compiled plan dispatch (avoids string comparisons).</summary>
+    internal readonly OpType OpType;
+
     internal CompiledStep(
         string opName,
         Action<IEngine, Tensor<T>> execute,
@@ -37,6 +40,7 @@ internal sealed class CompiledStep<T>
         object[]? savedState = null)
     {
         OpName = opName;
+        OpType = OpTypeParser.Parse(opName);
         Execute = execute;
         OutputBuffer = outputBuffer;
         Inputs = inputs;

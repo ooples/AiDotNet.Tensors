@@ -277,7 +277,7 @@ internal sealed class CompiledTrainingPlan<T>
         if (typeof(T) != typeof(float)) return null;
 
         // MatMul forward: direct BLAS into output buffer
-        if (step.OpName == "TensorMatMul" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
             && typeof(T) == typeof(float))
         {
@@ -306,7 +306,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReLU forward: direct SIMD into output buffer
-        if (step.OpName == "ReLU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -322,7 +322,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReduceSum forward: direct sum, skip engine dispatch
-        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1 && step.OutputBuffer.Length == 1)
+        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1 && step.OutputBuffer.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -377,7 +377,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // TensorAdd forward: pinned SIMD VectorAddUnsafe
-        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -388,7 +388,7 @@ internal sealed class CompiledTrainingPlan<T>
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorAddUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
-        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
@@ -396,7 +396,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // TensorSubtract forward: pinned SIMD VectorSubtractUnsafe
-        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -407,7 +407,7 @@ internal sealed class CompiledTrainingPlan<T>
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorSubtractUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
-        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
@@ -415,7 +415,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // TensorMultiply forward: pinned SIMD VectorMultiplyUnsafe
-        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -426,7 +426,7 @@ internal sealed class CompiledTrainingPlan<T>
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorMultiplyUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
-        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
@@ -437,7 +437,7 @@ internal sealed class CompiledTrainingPlan<T>
         // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
 
         // Tanh forward: VML → SIMD fallback, pinned GCHandle
-        if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -459,14 +459,14 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Tanh non-float fallback
-        if (step.OpName == "Tanh" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => eng.TanhInto(o, inp);
         }
 
         // Softmax forward: use SoftmaxInto
-        if (step.OpName == "Softmax" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Softmax && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             int axis = step.SavedState != null && step.SavedState.Length > 0 ? (int)step.SavedState[0] : -1;
@@ -474,7 +474,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // TensorNegate forward: pinned SIMD NegateUnsafe
-        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -484,7 +484,7 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { unsafe { SimdKernels.NegateUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
         // TensorNegate non-float fallback
-        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng =>
@@ -494,7 +494,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Sigmoid forward: pinned SigmoidUnsafe — bypass EnsureMaterialized
-        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -509,14 +509,14 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Sigmoid non-float fallback
-        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => eng.SigmoidInto(o, inp);
         }
 
         // GELU forward: pinned SIMD — cache GCHandles at compile time for zero-overhead replay
-        if (step.OpName == "GELU" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             // Pin arrays once at compile time — GCHandles survive across replays
@@ -536,7 +536,7 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // FusedLinear forward: direct BLAS + bias + activation into output buffer
-        if (step.OpName == "FusedLinear" && step.Inputs.Length == 3 && typeof(T) == typeof(float)
+        if (step.OpType == OpType.FusedLinear && step.Inputs.Length == 3 && typeof(T) == typeof(float)
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
         {
             var input = step.Inputs[0]; var weights = step.Inputs[1]; var bias = step.Inputs[2];
@@ -560,14 +560,14 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // GELU non-float fallback
-        if (step.OpName == "GELU" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => eng.GELUInto(o, inp);
         }
 
         // Abs forward: direct SIMD AbsUnsafe
-        if (step.OpName == "TensorAbs" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.TensorAbs && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -585,7 +585,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Pow forward: SIMD x*x for exponent=2
-        if (step.OpName == "TensorPower" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.TensorPower && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -608,7 +608,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // LeakyReLU forward: direct SIMD
-        if (step.OpName == "LeakyReLU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.LeakyReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var alpha = step.SavedState != null && step.SavedState.Length > 0
@@ -618,7 +618,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Swish forward: pinned SigmoidUnsafe + VectorMultiplyUnsafe — bypass EnsureMaterialized
-        if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -639,14 +639,14 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Swish non-float fallback
-        if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // ELU forward: pinned SIMD ELUUnsafe
-        if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -662,7 +662,7 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // ELU non-float fallback
-        if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
@@ -670,7 +670,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
-        if (step.OpName == "TensorLog" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -685,14 +685,14 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Log non-float fallback
-        if (step.OpName == "TensorLog" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Exp forward: VML → SIMD fallback, pinned GCHandle
-        if (step.OpName == "TensorExp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -713,14 +713,14 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Exp non-float fallback
-        if (step.OpName == "TensorExp" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
-        if (step.OpName == "Mish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -735,7 +735,7 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
         // Mish non-float fallback
-        if (step.OpName == "Mish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
@@ -746,7 +746,7 @@ internal sealed class CompiledTrainingPlan<T>
         // an extra allocate+copy on top of what the generic path already does.
 
         // TensorDivide forward: pinned SIMD VectorDivideUnsafe
-        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -762,7 +762,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Conv2D forward: use Conv2DInto to write directly into output
-        if (step.OpName == "Conv2D" && step.Inputs.Length == 2)
+        if (step.OpType == OpType.Conv2D && step.Inputs.Length == 2)
         {
             var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
             var savedState = step.SavedState;
@@ -776,7 +776,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // LogSoftmax forward: pinned SIMD with VML exp for inner loop
-        if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float)
+        if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
             && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -817,7 +817,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Mean forward: pinned SumUnsafe + divide, zero allocation
-        if (step.OpName == "Mean" && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
@@ -836,28 +836,28 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Sqrt forward: direct SIMD SqrtUnsafe into output buffer
-        if (step.OpName == "TensorSqrt" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
-        if (step.OpName == "Sin" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
-        if (step.OpName == "Cos" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
-        if (step.OpName == "Softplus" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Softplus && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -873,7 +873,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // HardSwish forward: SIMD HardSwishUnsafe with pinned arrays
-        if (step.OpName == "HardSwish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.HardSwish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -889,7 +889,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // SELU forward: pinned SELUUnsafe SIMD
-        if (step.OpName == "SELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.SELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -905,7 +905,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // HardSigmoid forward: pinned SIMD HardSigmoidUnsafe
-        if (step.OpName == "HardSigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.HardSigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -921,7 +921,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Sign forward: SIMD SignUnsafe with pinned arrays
-        if (step.OpName == "Sign" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Sign && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -937,7 +937,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Reciprocal forward: pinned SIMD
-        if (step.OpName == "Reciprocal" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Reciprocal && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -948,7 +948,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Floor forward: pinned SIMD
-        if (step.OpName == "Floor" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Floor && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -959,7 +959,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Ceiling forward: pinned SIMD
-        if (step.OpName == "Ceiling" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Ceiling && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -970,7 +970,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Round forward: pinned SIMD (AVX RoundToNearestInteger)
-        if (step.OpName == "Round" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Round && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -981,7 +981,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // TensorMax forward: pinned SIMD VectorMaxUnsafe
-        if (step.OpName == "TensorMax" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMax && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -1000,7 +1000,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Clamp forward: pinned SIMD ClampUnsafe
-        if (step.OpName == "Clamp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+        if (step.OpType == OpType.Clamp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -1018,7 +1018,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // BroadcastAdd/Sub/Mul forward: direct array loop for [N,M] op [M] pattern
-        if ((step.OpName == "TensorBroadcastAdd" || step.OpName == "TensorBroadcastSubtract" || step.OpName == "TensorBroadcastMultiply")
+        if ((step.OpType == OpType.TensorBroadcastAdd || step.OpType == OpType.TensorBroadcastSubtract || step.OpType == OpType.TensorBroadcastMultiply)
             && step.Inputs.Length == 2 && typeof(T) == typeof(float)
             && step.Inputs[0].Rank == 2 && (step.Inputs[1].Rank == 1 || (step.Inputs[1].Rank == 2 && step.Inputs[1]._shape[0] == 1)))
         {
@@ -1030,9 +1030,9 @@ internal sealed class CompiledTrainingPlan<T>
                 var aArr = (float[])(object)a.GetDataArray();
                 var bArr = (float[])(object)b.GetDataArray();
                 var oArr = (float[])(object)o.GetDataArray();
-                if (step.OpName == "TensorBroadcastAdd")
+                if (step.OpType == OpType.TensorBroadcastAdd)
                     return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
-                else if (step.OpName == "TensorBroadcastSubtract")
+                else if (step.OpType == OpType.TensorBroadcastSubtract)
                     return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] - bArr[c]; } };
                 else
                     return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] * bArr[c]; } };
@@ -1040,7 +1040,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // MSELoss forward: fused single-pass diff^2 sum
-        if (step.OpName == "MSELoss" && step.Inputs.Length == 2
+        if (step.OpType == OpType.MSELoss && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -1062,7 +1062,7 @@ internal sealed class CompiledTrainingPlan<T>
         // Transpose forward: zero-copy strided view (same as PyTorch .t())
         // Replace the output buffer with a strided view of the input at compile time.
         // The execute delegate is a no-op — data is accessed through stride permutation.
-        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1
+        if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1
             && step.Inputs[0].Rank == 2)
         {
             var inp = step.Inputs[0];
@@ -1094,7 +1094,7 @@ internal sealed class CompiledTrainingPlan<T>
         if (typeof(T) != typeof(float)) return null;
 
         // MatMul backward: dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc
-        if (step.OpName == "TensorMatMul" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
             && BlasProvider.IsAvailable)
         {
@@ -1135,7 +1135,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReLU backward: mask = input > 0, grad = gradOut * mask — SIMD, zero alloc
-        if (step.OpName == "ReLU" && step.Inputs.Length == 1
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
             && step.Inputs[0].IsContiguous)
         {
             var input = step.Inputs[0];
@@ -1162,7 +1162,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Add backward: gradA += gradOut, gradB += gradOut — just copy, zero alloc
-        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2)
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2)
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
@@ -1186,7 +1186,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Subtract backward: gradA += gradOut, gradB -= gradOut
-        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2)
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2)
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
@@ -1209,7 +1209,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Multiply backward: gradA = gradOut * B, gradB = gradOut * A — SIMD, zero alloc
-        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var inputA = step.Inputs[0];
@@ -1233,7 +1233,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReduceSum backward: broadcast scalar gradient to all elements
-        if (step.OpName == "ReduceSum" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1254,7 +1254,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Sigmoid backward: grad * sigmoid(out) * (1 - sigmoid(out))
-        if (step.OpName == "Sigmoid" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1270,7 +1270,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Tanh backward: grad * (1 - tanh(out)^2)
-        if (step.OpName == "Tanh" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1286,7 +1286,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Negate backward: grad = -gradOut
-        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1301,7 +1301,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Transpose backward: grad = transpose(gradOut)
-        if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1317,7 +1317,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Divide backward: gradA = gradOut / B, gradB = -gradOut * A / (B * B)
-        if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var inputA = step.Inputs[0];
@@ -1342,7 +1342,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Softmax backward
-        if (step.OpName == "Softmax" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.Softmax && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -1359,7 +1359,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // GELU backward
-        if (step.OpName == "GELU" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0]; var output = step.OutputBuffer;
             if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
@@ -1373,7 +1373,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // LeakyReLU backward
-        if (step.OpName == "LeakyReLU" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.LeakyReLU && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0]; var output = step.OutputBuffer;
             if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
@@ -1388,7 +1388,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // Swish backward
-        if (step.OpName == "Swish" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0]; var output = step.OutputBuffer;
             if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
@@ -1402,7 +1402,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ELU backward
-        if (step.OpName == "ELU" && step.Inputs.Length == 1)
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1)
         {
             var input = step.Inputs[0]; var output = step.OutputBuffer;
             if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;

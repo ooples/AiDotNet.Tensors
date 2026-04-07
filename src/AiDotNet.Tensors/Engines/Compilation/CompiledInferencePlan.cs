@@ -77,7 +77,7 @@ internal sealed class CompiledInferencePlan<T>
             var step = steps[i];
 
             // Zero-copy transpose: replace output buffer with strided view, no-op execute
-            if (step.OpName == "TensorTranspose" && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
+            if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
             {
                 var view = step.Inputs[0].Transpose();
                 specializedSteps[i] = new CompiledStep<T>(
