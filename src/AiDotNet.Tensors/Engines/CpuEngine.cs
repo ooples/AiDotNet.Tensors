@@ -7448,17 +7448,13 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            float alphaF = (float)alpha;
-            var srcArr = tensor.GetDataArray() as float[];
-            var dstArr = result.GetDataArray() as float[];
-            if (srcArr is not null && dstArr is not null)
+            unsafe
             {
-                int length = tensor.Length;
-                for (int i = 0; i < length; i++)
-                {
-                    float x = srcArr[i];
-                    dstArr[i] = x >= 0f ? x : alphaF * (MathF.Exp(x) - 1f);
-                }
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
             }
         }
         else
@@ -7471,25 +7467,18 @@ public class CpuEngine : ITensorLevelEngine
         return result;
     }
 
-    /// <summary>ELU into pre-allocated destination. Zero allocation for compiled plans.</summary>
-    public void ELUInto<T>(Tensor<T> destination, Tensor<T> input, double alpha = 1.0)
+    /// <summary>ELU into pre-allocated destination. Uses AVX SIMD for float.</summary>
+    public unsafe void ELUInto<T>(Tensor<T> destination, Tensor<T> input, double alpha = 1.0)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            float alphaF = (float)alpha;
-            var srcArr = input.GetDataArray() as float[];
-            var dstArr = destination.GetDataArray() as float[];
-            if (srcArr is not null && dstArr is not null)
-            {
-                int length = input.Length;
-                for (int i = 0; i < length; i++)
-                {
-                    float x = srcArr[i];
-                    dstArr[i] = x >= 0f ? x : alphaF * (MathF.Exp(x) - 1f);
-                }
-            }
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -24783,10 +24772,14 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fSrc.Length; i++)
-                fDst[i] = MathF.Max(0f, MathF.Min(1f, fSrc[i] / 6f + 0.5f));
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.HardSigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
             DifferentiableOps.RecordUnary("HardSigmoid", result, tensor, BackwardFunctions<T>.HardSigmoidBackward);
             return result;
         }

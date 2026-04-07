@@ -746,6 +746,64 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD HardSigmoid: clamp(x/6 + 0.5, 0, 1) using AVX.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void HardSigmoidUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var inv6 = Vector256.Create(1.0f / 6.0f);
+                var half = Vector256.Create(0.5f);
+                var zero = Vector256<float>.Zero;
+                var one = Vector256.Create(1.0f);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var v = Avx.Add(Avx.Multiply(x, inv6), half);
+                    Avx.Store(output + i, Avx.Min(Avx.Max(v, zero), one));
+                }
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Max(0f, MathF.Min(1f, input[i] / 6f + 0.5f));
+        }
+
+        /// <summary>
+        /// SIMD ELU: x > 0 ? x : alpha * (exp(x) - 1) using AVX + FastExp256.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void ELUUnsafe(float* input, float* output, int length, float alpha = 1.0f)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var zero = Vector256<float>.Zero;
+                var one = Vector256.Create(1.0f);
+                var vAlpha = Vector256.Create(alpha);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    var expX = FastExp256(x);
+                    var negPart = Avx.Multiply(vAlpha, Avx.Subtract(expX, one));
+                    var mask = Avx.Compare(x, zero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    Avx.Store(output + i, Avx.BlendVariable(negPart, x, mask));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                output[i] = x >= 0f ? x : alpha * (MathF.Exp(x) - 1f);
+            }
+        }
+
+        /// <summary>
         /// SIMD Sign: returns -1, 0, or 1 per element using AVX compare+blend.
         /// </summary>
         [MethodImpl(HotInline)]

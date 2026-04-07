@@ -602,7 +602,23 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // ELU forward: direct ELUInto for zero allocation
+        // ELU forward: pinned SIMD ELUUnsafe
+        if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float alphaF = step.SavedState != null && step.SavedState.Length > 0 ? (float)(double)step.SavedState[0] : 1.0f;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ELUUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len, alphaF); }
+            };
+        }
+        // ELU non-float fallback
         if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -841,19 +857,19 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // HardSigmoid forward: direct float computation
+        // HardSigmoid forward: pinned SIMD HardSigmoidUnsafe
         if (step.OpName == "HardSigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Max(0f, MathF.Min(1f, cIn[i] / 6f + 0.5f));
+                unsafe { SimdKernels.HardSigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
 
