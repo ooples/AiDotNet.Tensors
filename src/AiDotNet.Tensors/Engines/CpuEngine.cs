@@ -16370,6 +16370,48 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null)
             throw new ArgumentNullException(nameof(input));
 
+        // Float fast path for 2D single-axis variance
+        if (typeof(T) == typeof(float) && input.IsContiguous && axes.Length == 1 && input.Rank == 2)
+        {
+            int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
+            var fData = (float[])(object)input.GetDataArray();
+            int rows = input._shape[0], cols = input._shape[1];
+
+            if (axis == 1) // variance along columns (per-row)
+            {
+                var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var fOut = (float[])(object)result.GetDataArray();
+                for (int r = 0; r < rows; r++)
+                {
+                    int off = r * cols;
+                    float rowSum = 0f;
+                    for (int c = 0; c < cols; c++) rowSum += fData[off + c];
+                    float rowMean = rowSum / cols;
+                    float varSum = 0f;
+                    for (int c = 0; c < cols; c++) { float d = fData[off + c] - rowMean; varSum += d * d; }
+                    fOut[r] = varSum / cols;
+                }
+                return result;
+            }
+            else if (axis == 0) // variance along rows (per-column)
+            {
+                var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
+                var result = AutoTensorCache.RentOrAllocate<T>(outShape);
+                var fOut = (float[])(object)result.GetDataArray();
+                // First compute means
+                var means = new float[cols];
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) means[c] += fData[r * cols + c];
+                for (int c = 0; c < cols; c++) means[c] /= rows;
+                // Then compute variance
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++) { float d = fData[r * cols + c] - means[c]; fOut[c] += d * d; }
+                for (int c = 0; c < cols; c++) fOut[c] /= rows;
+                return result;
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var inputShape = input._shape;
