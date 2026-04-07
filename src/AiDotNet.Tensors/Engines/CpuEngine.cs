@@ -4369,10 +4369,14 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fSrc.Length; i++)
-                fDst[i] = MathF.Floor(fSrc[i]);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.FloorUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
         }
         else
         {
@@ -4394,17 +4398,21 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Ceiling", tensor, tensor._shape, (eng, o) => { var r = eng.TensorCeiling(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fSrc.Length; i++)
-                fDst[i] = MathF.Ceiling(fSrc[i]);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.CeilingUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
         }
         else
         {
+            var numOps = MathHelper.GetNumericOperations<T>();
             var src = tensor.AsSpan();
             var dest = result.AsWritableSpan();
             for (int i = 0; i < src.Length; i++)
@@ -4425,10 +4433,14 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fSrc.Length; i++)
-                fDst[i] = MathF.Round(fSrc[i]);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.RoundUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
         }
         else
         {
@@ -4942,12 +4954,16 @@ public class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
             float fMin = min is not null ? (float)(object)min : float.MinValue;
             float fMax = max is not null ? (float)(object)max : float.MaxValue;
-            for (int i = 0; i < fSrc.Length; i++)
-                fDst[i] = MathF.Min(MathF.Max(fSrc[i], fMin), fMax);
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.ClampUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, fMin, fMax);
+            }
         }
         else
         {
@@ -24941,10 +24957,14 @@ public class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            var src = (float[])(object)tensor.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < src.Length; i++)
-                dst[i] = 1f / src[i];
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.ReciprocalUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
+            }
         }
         else
         {

@@ -590,6 +590,162 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// SIMD Clamp: min(max(x, lo), hi) using AVX.Max/Min.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void ClampUnsafe(float* input, float* output, int length, float lo, float hi)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var vLo = Vector256.Create(lo);
+                var vHi = Vector256.Create(hi);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vLo), vHi));
+                    Avx.Store(output + i + 8, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), vLo), vHi));
+                    Avx.Store(output + i + 16, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 16), vLo), vHi));
+                    Avx.Store(output + i + 24, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 24), vLo), vHi));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var vLo = Vector256.Create(lo);
+                var vHi = Vector256.Create(hi);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vLo), vHi));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Min(MathF.Max(input[i], lo), hi);
+        }
+
+        /// <summary>
+        /// SIMD Round using AVX RoundToNearestInteger.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void RoundUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.RoundToNearestInteger(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Round(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Floor using AVX Floor.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void FloorUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.Floor(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.Floor(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.Floor(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.Floor(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Floor(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Ceiling using AVX Ceiling.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void CeilingUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.Ceiling(Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.Ceiling(Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.Ceiling(Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.Ceiling(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = MathF.Ceiling(input[i]);
+        }
+
+        /// <summary>
+        /// SIMD Reciprocal: 1/x using AVX Reciprocal (fast approximate + Newton refinement).
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void ReciprocalUnsafe(float* input, float* output, int length)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 32)
+            {
+                var one = Vector256.Create(1.0f);
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    Avx.Store(output + i, Avx.Divide(one, Avx.LoadVector256(input + i)));
+                    Avx.Store(output + i + 8, Avx.Divide(one, Avx.LoadVector256(input + i + 8)));
+                    Avx.Store(output + i + 16, Avx.Divide(one, Avx.LoadVector256(input + i + 16)));
+                    Avx.Store(output + i + 24, Avx.Divide(one, Avx.LoadVector256(input + i + 24)));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
+            {
+                var one = Vector256.Create(1.0f);
+                int simdLength = i + ((length - i) & ~7);
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Avx.Divide(one, Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = 1.0f / input[i];
+        }
+
+        /// <summary>
         /// SIMD Sign: returns -1, 0, or 1 per element using AVX compare+blend.
         /// </summary>
         [MethodImpl(HotInline)]

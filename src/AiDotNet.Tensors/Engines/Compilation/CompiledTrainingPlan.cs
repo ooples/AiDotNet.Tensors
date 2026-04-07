@@ -830,68 +830,48 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Reciprocal forward: direct float computation
+        // Reciprocal forward: pinned SIMD
         if (step.OpName == "Reciprocal" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
-            return eng =>
-            {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = 1f / cIn[i];
-            };
+            return eng => { unsafe { SimdKernels.ReciprocalUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
 
-        // Floor forward: direct float computation
+        // Floor forward: pinned SIMD
         if (step.OpName == "Floor" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
-            return eng =>
-            {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Floor(cIn[i]);
-            };
+            return eng => { unsafe { SimdKernels.FloorUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
 
-        // Ceiling forward: direct float computation
+        // Ceiling forward: pinned SIMD
         if (step.OpName == "Ceiling" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
-            return eng =>
-            {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Ceiling(cIn[i]);
-            };
+            return eng => { unsafe { SimdKernels.CeilingUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
 
-        // Round forward: direct float computation
+        // Round forward: pinned SIMD (AVX RoundToNearestInteger)
         if (step.OpName == "Round" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
-            return eng =>
-            {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Round(cIn[i]);
-            };
+            return eng => { unsafe { SimdKernels.RoundUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
 
         // TensorMax forward: pinned SIMD VectorMaxUnsafe
@@ -913,21 +893,21 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Clamp forward: direct float computation
+        // Clamp forward: pinned SIMD ClampUnsafe
         if (step.OpName == "Clamp" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             float fMin = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[0]) : float.MinValue;
             float fMax = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[1]) : float.MaxValue;
-            float[]? cIn = null, cOut = null;
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = inp.Length;
             return eng =>
             {
-                cIn ??= (float[])(object)inp.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = MathF.Min(MathF.Max(cIn[i], fMin), fMax);
+                unsafe { SimdKernels.ClampUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len, fMin, fMax); }
             };
         }
 
