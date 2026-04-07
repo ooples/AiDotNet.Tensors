@@ -1926,5 +1926,92 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: Log[1M]")]
     public TorchTensor PyTorch_Log_1M() => torch.log(_t_op_large);
+    // ═══════════════════════════════════════════════════════════════════
+    // 24. GATHER/SCATTER + NORM + CLIP
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Gather ---
+    private Tensor<float> _gather_src = null!;
+    private Tensor<int> _gather_idx = null!;
+    private TorchTensor _t_gather_src = null!, _t_gather_idx = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_Gather))]
+    public void SetupGather()
+    {
+        if (_gather_src != null) return;
+        _gather_src = Tensor<float>.CreateRandom([64, 128]);
+        var idxArr = new int[64 * 32];
+        var rng = new Random(42);
+        for (int i = 0; i < idxArr.Length; i++) idxArr[i] = rng.Next(128);
+        _gather_idx = new Tensor<int>(idxArr, [64, 32]);
+        _t_gather_src = torch.randn([64, 128]);
+        _t_gather_idx = torch.tensor(idxArr.Select(x => (long)x).ToArray(), [64, 32]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: Gather[64x128, idx=64x32]")]
+    public Tensor<float> AiDotNet_Gather()
+    {
+        return _engine.Gather(_gather_src, _gather_idx, 1);
+    }
+
+    [Benchmark(Description = "PyTorch: Gather[64x128, idx=64x32]")]
+    public TorchTensor PyTorch_Gather()
+    {
+        return _t_gather_src.gather(1, _t_gather_idx);
+    }
+
+    // --- TensorNorm (L2 norm along axis) ---
+    [Benchmark(Description = "AiDotNet Eager: L2Norm[256x256, axis=1]")]
+    public Tensor<float> AiDotNet_L2Norm()
+    {
+        return _engine.TensorNorm(_op_2d, 1);
+    }
+
+    [Benchmark(Description = "PyTorch: L2Norm[256x256, axis=1]")]
+    public TorchTensor PyTorch_L2Norm()
+    {
+        return _t_op_2d.norm(dim: 1);
+    }
+
+    // --- Clip (same as Clamp but different API) ---
+    [Benchmark(Description = "AiDotNet Eager: Clip[100K, -1..1]")]
+    public Tensor<float> AiDotNet_Clip()
+    {
+        return _engine.TensorClip(_op_a, -1.0f, 1.0f);
+    }
+
+    [Benchmark(Description = "PyTorch: Clip[100K, -1..1]")]
+    public TorchTensor PyTorch_Clip()
+    {
+        return torch.clip(_t_op_a, -1.0, 1.0);
+    }
+
+    // --- Subtract 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Subtract[1M]")]
+    public Tensor<float> AiDotNet_Subtract_1M() => _engine.TensorSubtract(_op_large, _op_large);
+
+    [Benchmark(Description = "PyTorch: Subtract[1M]")]
+    public TorchTensor PyTorch_Subtract_1M() => _t_op_large - _t_op_large;
+
+    // --- Negate 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Negate[1M]")]
+    public Tensor<float> AiDotNet_Negate_1M() => _engine.TensorNegate(_op_large);
+
+    [Benchmark(Description = "PyTorch: Negate[1M]")]
+    public TorchTensor PyTorch_Negate_1M() => -_t_op_large;
+
+    // --- Abs 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Abs[1M]")]
+    public Tensor<float> AiDotNet_Abs_1M() => _engine.TensorAbs(_op_large);
+
+    [Benchmark(Description = "PyTorch: Abs[1M]")]
+    public TorchTensor PyTorch_Abs_1M() => torch.abs(_t_op_large);
+
+    // --- Sqrt 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Sqrt[1M]")]
+    public Tensor<float> AiDotNet_Sqrt_1M() => _engine.TensorSqrt(_op_large);
+
+    [Benchmark(Description = "PyTorch: Sqrt[1M]")]
+    public TorchTensor PyTorch_Sqrt_1M() => torch.sqrt(_t_op_large);
 }
 #endif
