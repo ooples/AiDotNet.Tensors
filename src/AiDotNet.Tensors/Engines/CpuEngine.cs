@@ -4798,19 +4798,24 @@ public class CpuEngine : ITensorLevelEngine
         if (!ShapesMatch(a._shape, b._shape))
             throw new ArgumentException($"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
 
         if (typeof(T) == typeof(float))
         {
-            var fA = (float[])(object)a.GetDataArray();
-            var fB = (float[])(object)b.GetDataArray();
-            var fD = (float[])(object)result.GetDataArray();
-            for (int i = 0; i < fA.Length; i++)
-                fD[i] = MathF.Max(fA[i], fB[i]);
+            unsafe
+            {
+                var srcMemA = AsFloatMemory(a.Data);
+                var srcMemB = AsFloatMemory(b.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinA = srcMemA.Pin();
+                using var pinB = srcMemB.Pin();
+                using var pinD = dstMem.Pin();
+                SimdKernels.VectorMaxUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinD.Pointer, a.Length);
+            }
         }
         else
         {
+            var numOps = MathHelper.GetNumericOperations<T>();
             var srcA = a.AsSpan();
             var srcB = b.AsSpan();
             var dest = result.AsWritableSpan();
