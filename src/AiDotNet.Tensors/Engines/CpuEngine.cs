@@ -25180,7 +25180,7 @@ public class CpuEngine : ITensorLevelEngine
             int dim = rank - 1 - i;
             newShape[dim] += padding[2 * i] + padding[2 * i + 1];
         }
-        var result = new Tensor<T>(newShape);
+        var result = AutoTensorCache.RentOrAllocate<T>(newShape);
         result.Fill(value);
         // Copy original data
         CopyTensorRegion(tensor, result, padding, rank);
