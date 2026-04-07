@@ -5747,7 +5747,9 @@ public class CpuEngine : ITensorLevelEngine
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
             int ps = poolSize, st = stride, pd = padding;
 
-            Parallel.For(0, bc, idx =>
+            // Use sequential loop when work per task is too small (spatial < 1024)
+            // Parallel.For overhead (thread dispatch) exceeds computation for tiny spatial
+            Action<int> poolKernel = idx =>
             {
                 int inputBase = idx * h * w;
                 int outputBase = idx * oH * oW;
@@ -5779,7 +5781,12 @@ public class CpuEngine : ITensorLevelEngine
                         outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
                     }
                 }
-            });
+            };
+
+            if (h * w >= 1024)
+                Parallel.For(0, bc, poolKernel);
+            else
+                for (int idx = 0; idx < bc; idx++) poolKernel(idx);
             DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
                 new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             return result;
