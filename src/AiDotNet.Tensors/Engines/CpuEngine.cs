@@ -24932,17 +24932,45 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        // Compute channel-aware alpha indexing for NCHW tensors
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        if (!alpha.IsContiguous) alpha = alpha.Contiguous();
         int channels = alpha.Length;
         int spatialSize = tensor.Rank >= 4 ? tensor._shape[^2] * tensor._shape[^1] : 1;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        for (int i = 0; i < tensor.Length; i++)
+
+        if (typeof(T) == typeof(float))
         {
-            double x = numOps.ToDouble(tensor[i]);
-            int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
-            double a = numOps.ToDouble(alpha[channelIdx]);
-            result[i] = numOps.FromDouble(x >= 0 ? x : a * x);
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fAlpha = (float[])(object)alpha.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            if (channels == tensor.Length)
+            {
+                // Element-wise alpha (1D case)
+                for (int i = 0; i < fSrc.Length; i++)
+                    fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[i] * fSrc[i];
+            }
+            else
+            {
+                for (int i = 0; i < fSrc.Length; i++)
+                {
+                    int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
+                    fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[channelIdx] * fSrc[i];
+                }
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = tensor.AsSpan();
+            var alphaSpan = alpha.AsSpan();
+            var dstSpan = result.AsWritableSpan();
+            for (int i = 0; i < tensor.Length; i++)
+            {
+                double x = numOps.ToDouble(srcSpan[i]);
+                int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
+                double a = numOps.ToDouble(alphaSpan[channelIdx]);
+                dstSpan[i] = numOps.FromDouble(x >= 0 ? x : a * x);
+            }
         }
         DifferentiableOps.RecordBinary("PReLU", result, tensor, alpha,
             BackwardFunctions<T>.PReLUBackward,
