@@ -18259,33 +18259,40 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        int totalElements = result._shape.Aggregate(1, (a, b) => a * b);
-        var tensorData = tensor.GetFlattenedData();
+        var tensorData = tensor.GetDataArray();
         var resultData = result.GetDataArray();
+        int srcLen = tensor.Length;
 
-        // For each output element, find the corresponding input element
-        Parallel.For(0, totalElements, flatIdx =>
+        // Fast path: only tiling along axis 0 (other axes multiply=1)
+        bool onlyAxis0 = true;
+        for (int i = 1; i < multiples.Length; i++)
+            if (multiples[i] != 1) { onlyAxis0 = false; break; }
+
+        if (onlyAxis0)
         {
-            // Convert flat index to multi-dimensional indices
-            var outputIndices = new int[outputShape.Length];
-            int remaining = flatIdx;
-            for (int d = outputShape.Length - 1; d >= 0; d--)
+            // Just copy the source data `multiples[0]` times
+            for (int m = 0; m < multiples[0]; m++)
+                Array.Copy(tensorData, 0, resultData, m * srcLen, srcLen);
+        }
+        else
+        {
+            // General tiling via per-element index mapping
+            int totalElements = result.Length;
+            Parallel.For(0, totalElements, flatIdx =>
             {
-                outputIndices[d] = remaining % outputShape[d];
-                remaining /= outputShape[d];
-            }
-
-            // Map to input indices (modulo original size)
-            int inputFlat = 0;
-            int stride = 1;
-            for (int d = tensor._shape.Length - 1; d >= 0; d--)
-            {
-                inputFlat += (outputIndices[d] % tensor._shape[d]) * stride;
-                stride *= tensor._shape[d];
-            }
-
-            resultData[flatIdx] = tensorData[inputFlat];
-        });
+                int remaining = flatIdx;
+                int inputFlat = 0;
+                int inStride = 1;
+                for (int d = outputShape.Length - 1; d >= 0; d--)
+                {
+                    int outIdx = remaining % outputShape[d];
+                    remaining /= outputShape[d];
+                    inputFlat += (outIdx % tensor._shape[d]) * inStride;
+                    inStride *= tensor._shape[d];
+                }
+                resultData[flatIdx] = tensorData[inputFlat];
+            });
+        }
 
         DifferentiableOps.RecordUnary("Tile", result, tensor,
             BackwardFunctions<T>.TileBackward);
