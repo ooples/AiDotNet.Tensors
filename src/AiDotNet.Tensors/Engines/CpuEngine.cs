@@ -24591,10 +24591,16 @@ public class CpuEngine : ITensorLevelEngine
         T totalLoss = numOps.Zero;
         bool sparse = targets.Rank == 1;
 
+        // Hoist data arrays outside loop — GetFlattenedData() copies the entire array
+        if (!logits.IsContiguous) logits = logits.Contiguous();
+        if (!targets.IsContiguous) targets = targets.Contiguous();
+        var logitData = logits.GetDataArray();
+        var targetData = targets.GetDataArray();
+
         for (int b = 0; b < batchSize; b++)
         {
             totalLoss = numOps.Add(totalLoss,
-                numOps.FromDouble(ComputeCrossEntropyBatch(numOps, logits.GetFlattenedData(), targets.GetFlattenedData(), b, numClasses, sparse)));
+                numOps.FromDouble(ComputeCrossEntropyBatch(numOps, logitData, targetData, b, numClasses, sparse)));
         }
         T mean = numOps.Divide(totalLoss, numOps.FromDouble(batchSize));
         var result = new Tensor<T>(new[] { mean }, [1]);
