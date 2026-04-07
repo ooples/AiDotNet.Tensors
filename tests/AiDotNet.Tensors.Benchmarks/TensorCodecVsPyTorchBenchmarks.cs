@@ -487,6 +487,36 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _eluPlan;
     private CompiledInferencePlan<float>? _sinPlan;
     private CompiledInferencePlan<float>? _cosPlan;
+    private CompiledInferencePlan<float>? _sqrtPlan;
+    private CompiledInferencePlan<float>? _clampPlan;
+    private CompiledInferencePlan<float>? _floorPlan;
+    private CompiledInferencePlan<float>? _ceilingPlan;
+    private CompiledInferencePlan<float>? _signPlan;
+    private CompiledInferencePlan<float>? _reciprocalPlan;
+    private CompiledInferencePlan<float>? _meanPlan;
+    private CompiledInferencePlan<float>? _variancePlan;
+    private CompiledInferencePlan<float>? _maxPlan;
+    private CompiledInferencePlan<float>? _softplusPlan;
+    private CompiledInferencePlan<float>? _hardSwishPlan;
+    private CompiledInferencePlan<float>? _hardSigmoidPlan;
+    private CompiledInferencePlan<float>? _seluPlan;
+    private CompiledInferencePlan<float>? _roundPlan;
+    private CompiledInferencePlan<float>? _concatPlan;
+    private CompiledInferencePlan<float>? _sumAxisPlan;
+    private CompiledInferencePlan<float>? _broadcastAddPlan;
+    private CompiledInferencePlan<float>? _broadcastSubPlan;
+    private CompiledInferencePlan<float>? _broadcastMulPlan;
+    private CompiledInferencePlan<float>? _avgPool2dPlan;
+    private CompiledInferencePlan<float>? _reshapePlan;
+    private CompiledInferencePlan<float>? _flattenPlan;
+    private CompiledInferencePlan<float>? _reduceMaxPlan;
+    private CompiledInferencePlan<float>? _matmul512Plan;
+    private CompiledInferencePlan<float>? _batchMatMulPlan;
+    private CompiledInferencePlan<float>? _mseLossPlan;
+    private CompiledInferencePlan<float>? _crossEntropyPlan;
+    private CompiledInferencePlan<float>? _wherePlan;
+    private CompiledInferencePlan<float>? _reduceMeanPlan;
+    private CompiledInferencePlan<float>? _attentionPlan;
 
     private void SetupOps()
     {
@@ -532,6 +562,70 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { _engine.ELU(_op_a, 1.0); _eluPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorSin(_op_a); _sinPlan = s.CompileInference<float>(); }
             using (var s = GraphMode.Enable()) { _engine.TensorCos(_op_a); _cosPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSqrt(_op_a); _sqrtPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorClamp(_op_a, -0.5f, 0.5f); _clampPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorFloor(_op_a); _floorPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorCeiling(_op_a); _ceilingPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSign(_op_a); _signPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorReciprocal(_op_a); _reciprocalPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceMean(_op_large, null, false); _meanPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceVariance(_op_2d, new[] { 1 }, keepDims: false); _variancePlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMax(_op_a, _op_b); _maxPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Softplus(_op_a); _softplusPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.HardSwish(_op_a); _hardSwishPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorHardSigmoid(_op_a); _hardSigmoidPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSELU(_op_a); _seluPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorRound(_op_a); _roundPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorConcatenate(new[] { _op_a, _op_b }, axis: 0); _concatPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceSum(_op_2d, new[] { 1 }); _sumAxisPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.AvgPool2D(_bn_input, poolSize: 2, stride: 2); _avgPool2dPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Reshape(_op_2d, new[] { 65536 }); _reshapePlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Reshape(_op_2d, new[] { 65536 }); _flattenPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceMax(_op_a, new[] { 0 }, keepDims: false, out _); _reduceMaxPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMax(_op_a, _op_b); _wherePlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReduceMean(_op_large, null, false); _reduceMeanPlan = s.CompileInference<float>(); }
+        }
+        catch { /* plans may fail, benchmarks will show NA */ }
+
+        // Compile plans for ops that use special tensors (broadcast, matmul512, loss, attention)
+        try
+        {
+            // Initialize special tensors if needed
+            if (_ba_input is null)
+            {
+                _ba_input = Tensor<float>.CreateRandom([32, 256]);
+                _ba_bias = Tensor<float>.CreateRandom([256]);
+                _t_ba_input = torch.randn([32, 256]);
+                _t_ba_bias = torch.randn([256]);
+            }
+            if (_mat512 is null)
+            {
+                _mat512 = Tensor<float>.CreateRandom([512, 512]);
+                _t_mat512 = torch.randn([512, 512]);
+            }
+            if (_loss_pred is null)
+            {
+                _loss_pred = Tensor<float>.CreateRandom([32, 10]);
+                _loss_target = Tensor<float>.CreateRandom([32, 10]);
+                _t_loss_pred = torch.randn([32, 10]);
+                _t_loss_target = torch.randn([32, 10]);
+            }
+            if (_attn_q is null)
+            {
+                _attn_q = Tensor<float>.CreateRandom([8, 64, 32]);
+                _attn_k = Tensor<float>.CreateRandom([8, 64, 32]);
+                _t_attn_q = torch.randn([8, 64, 32]);
+                _t_attn_k = torch.randn([8, 64, 32]);
+            }
+
+            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastAdd(_ba_input, _ba_bias); _broadcastAddPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastSubtract(_ba_input, _ba_bias); _broadcastSubPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorBroadcastMultiply(_ba_input, _ba_bias); _broadcastMulPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMatMul(_mat512, _mat512); _matmul512Plan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMSELoss(_loss_pred, _loss_target); _mseLossPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorCrossEntropyLoss(_loss_pred, _loss_target); _crossEntropyPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.BatchMatMul(_attn_q, _attn_k); _batchMatMulPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { var kT = _engine.TensorTranspose(_attn_k); _engine.BatchMatMul(_attn_q, kT); _attentionPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
     }
@@ -759,6 +853,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Sqrt[100K]")]
     public Tensor<float> AiDotNet_Sqrt_100K() => _engine.TensorSqrt(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Sqrt[100K]")]
+    public Tensor<float> AiDotNet_Sqrt_100K_Compiled() => _sqrtPlan is not null ? _sqrtPlan.Execute() : _engine.TensorSqrt(_op_a);
+
     [Benchmark(Description = "PyTorch: Sqrt[100K]")]
     public TorchTensor PyTorch_Sqrt_100K() => torch.sqrt(_t_op_a);
 
@@ -776,8 +873,14 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Mean[1M]")]
     public float AiDotNet_Mean_1M() => _engine.TensorMean(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Mean[1M]")]
+    public Tensor<float> AiDotNet_Mean_1M_Compiled() => _meanPlan is not null ? _meanPlan.Execute() : _engine.ReduceMean(_op_large, null, false);
+
     [Benchmark(Description = "AiDotNet Eager: ReduceMean[1M]")]
     public Tensor<float> AiDotNet_ReduceMean_1M() => _engine.ReduceMean(_op_large, null, false);
+
+    [Benchmark(Description = "AiDotNet Compiled: ReduceMean[1M]")]
+    public Tensor<float> AiDotNet_ReduceMean_1M_Compiled() => _reduceMeanPlan is not null ? _reduceMeanPlan.Execute() : _engine.ReduceMean(_op_large, null, false);
 
     [Benchmark(Description = "PyTorch: Mean[1M]")]
     public TorchTensor PyTorch_Mean_1M() => _t_op_large.mean();
@@ -785,6 +888,9 @@ public class TensorCodecVsPyTorchBenchmarks
     // --- Max reduction ---
     [Benchmark(Description = "AiDotNet Eager: Max[100K]")]
     public Tensor<float> AiDotNet_Max_100K() => _engine.TensorMax(_op_a, _op_b);
+
+    [Benchmark(Description = "AiDotNet Compiled: Max[100K]")]
+    public Tensor<float> AiDotNet_Max_100K_Compiled() => _maxPlan is not null ? _maxPlan.Execute() : _engine.TensorMax(_op_a, _op_b);
 
     [Benchmark(Description = "PyTorch: Max[100K]")]
     public TorchTensor PyTorch_Max_100K() => torch.max(_t_op_a, _t_op_b);
@@ -808,6 +914,13 @@ public class TensorCodecVsPyTorchBenchmarks
     {
         var kT = _engine.TensorTranspose(_attn_k);
         return _engine.BatchMatMul(_attn_q, kT);
+    }
+
+    [Benchmark(Description = "AiDotNet Compiled: Attention Q@K^T [8x64x32]")]
+    public Tensor<float> AiDotNet_AttentionQKT_Compiled()
+    {
+        if (_attn_q is null) { SetupAttn(); }
+        return _attentionPlan is not null ? _attentionPlan.Execute() : AiDotNet_AttentionQKT();
     }
 
     [Benchmark(Description = "PyTorch: Attention Q@K^T [8x64x32]")]
@@ -862,6 +975,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Clamp[100K]")]
     public Tensor<float> AiDotNet_Clamp_100K() => _engine.TensorClamp(_op_a, -0.5f, 0.5f);
 
+    [Benchmark(Description = "AiDotNet Compiled: Clamp[100K]")]
+    public Tensor<float> AiDotNet_Clamp_100K_Compiled() => _clampPlan is not null ? _clampPlan.Execute() : _engine.TensorClamp(_op_a, -0.5f, 0.5f);
+
     [Benchmark(Description = "PyTorch: Clamp[100K]")]
     public TorchTensor PyTorch_Clamp_100K() => torch.clamp(_t_op_a, -0.5, 0.5);
 
@@ -902,12 +1018,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: BroadcastAdd[32x256]+[256]")]
     public Tensor<float> AiDotNet_BroadcastAdd() => _engine.TensorBroadcastAdd(_ba_input, _ba_bias);
 
+    [Benchmark(Description = "AiDotNet Compiled: BroadcastAdd[32x256]+[256]")]
+    public Tensor<float> AiDotNet_BroadcastAdd_Compiled() => _broadcastAddPlan is not null ? _broadcastAddPlan.Execute() : _engine.TensorBroadcastAdd(_ba_input, _ba_bias);
+
     [Benchmark(Description = "PyTorch: BroadcastAdd[32x256]+[256]")]
     public TorchTensor PyTorch_BroadcastAdd() => _t_ba_input + _t_ba_bias;
 
     // --- AvgPool2D ---
     [Benchmark(Description = "AiDotNet Eager: AvgPool2D[32x64x8x8, pool=2]")]
     public Tensor<float> AiDotNet_AvgPool2D() => _engine.AvgPool2D(_bn_input, poolSize: 2, stride: 2);
+
+    [Benchmark(Description = "AiDotNet Compiled: AvgPool2D[32x64x8x8, pool=2]")]
+    public Tensor<float> AiDotNet_AvgPool2D_Compiled() => _avgPool2dPlan is not null ? _avgPool2dPlan.Execute() : _engine.AvgPool2D(_bn_input, poolSize: 2, stride: 2);
 
     [Benchmark(Description = "PyTorch: AvgPool2D[32x64x8x8, pool=2]")]
     public TorchTensor PyTorch_AvgPool2D()
@@ -920,12 +1042,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Concat[2x100K]")]
     public Tensor<float> AiDotNet_Concat_100K() => _engine.TensorConcatenate(new[] { _op_a, _op_b }, axis: 0);
 
+    [Benchmark(Description = "AiDotNet Compiled: Concat[2x100K]")]
+    public Tensor<float> AiDotNet_Concat_100K_Compiled() => _concatPlan is not null ? _concatPlan.Execute() : _engine.TensorConcatenate(new[] { _op_a, _op_b }, axis: 0);
+
     [Benchmark(Description = "PyTorch: Concat[2x100K]")]
     public TorchTensor PyTorch_Concat_100K() => torch.cat(new[] { _t_op_a, _t_op_b }, dim: 0);
 
     // --- Sum along axis ---
     [Benchmark(Description = "AiDotNet Eager: SumAxis[256x256, axis=1]")]
     public Tensor<float> AiDotNet_SumAxis() => _engine.ReduceSum(_op_2d, new[] { 1 });
+
+    [Benchmark(Description = "AiDotNet Compiled: SumAxis[256x256, axis=1]")]
+    public Tensor<float> AiDotNet_SumAxis_Compiled() => _sumAxisPlan is not null ? _sumAxisPlan.Execute() : _engine.ReduceSum(_op_2d, new[] { 1 });
 
     [Benchmark(Description = "PyTorch: SumAxis[256x256, axis=1]")]
     public TorchTensor PyTorch_SumAxis() => _t_op_2d.sum(dim: 1);
@@ -944,12 +1072,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Softplus[100K]")]
     public Tensor<float> AiDotNet_Softplus_100K() => _engine.Softplus(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Softplus[100K]")]
+    public Tensor<float> AiDotNet_Softplus_100K_Compiled() => _softplusPlan is not null ? _softplusPlan.Execute() : _engine.Softplus(_op_a);
+
     [Benchmark(Description = "PyTorch: Softplus[100K]")]
     public TorchTensor PyTorch_Softplus_100K() => torch.nn.functional.softplus(_t_op_a);
 
     // --- HardSwish ---
     [Benchmark(Description = "AiDotNet Eager: HardSwish[100K]")]
     public Tensor<float> AiDotNet_HardSwish_100K() => _engine.HardSwish(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: HardSwish[100K]")]
+    public Tensor<float> AiDotNet_HardSwish_100K_Compiled() => _hardSwishPlan is not null ? _hardSwishPlan.Execute() : _engine.HardSwish(_op_a);
 
     [Benchmark(Description = "PyTorch: HardSwish[100K]")]
     public TorchTensor PyTorch_HardSwish_100K() => torch.nn.functional.hardswish(_t_op_a);
@@ -958,6 +1092,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: BroadcastMul[32x256]*[256]")]
     public Tensor<float> AiDotNet_BroadcastMul() => _engine.TensorBroadcastMultiply(_ba_input, _ba_bias);
 
+    [Benchmark(Description = "AiDotNet Compiled: BroadcastMul[32x256]*[256]")]
+    public Tensor<float> AiDotNet_BroadcastMul_Compiled() => _broadcastMulPlan is not null ? _broadcastMulPlan.Execute() : _engine.TensorBroadcastMultiply(_ba_input, _ba_bias);
+
     [Benchmark(Description = "PyTorch: BroadcastMul[32x256]*[256]")]
     public TorchTensor PyTorch_BroadcastMul() => _t_ba_input * _t_ba_bias;
 
@@ -965,12 +1102,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Reshape[256x256→65536]")]
     public Tensor<float> AiDotNet_Reshape() => _engine.Reshape(_op_2d, new[] { 65536 });
 
+    [Benchmark(Description = "AiDotNet Compiled: Reshape[256x256→65536]")]
+    public Tensor<float> AiDotNet_Reshape_Compiled() => _reshapePlan is not null ? _reshapePlan.Execute() : _engine.Reshape(_op_2d, new[] { 65536 });
+
     [Benchmark(Description = "PyTorch: Reshape[256x256→65536]")]
     public TorchTensor PyTorch_Reshape() => _t_op_2d.reshape(65536);
 
     // --- ReduceMax ---
     [Benchmark(Description = "AiDotNet Eager: ReduceMax[100K]")]
     public Tensor<float> AiDotNet_ReduceMax_100K() => _engine.ReduceMax(_op_a, new[] { 0 }, keepDims: false, out _);
+
+    [Benchmark(Description = "AiDotNet Compiled: ReduceMax[100K]")]
+    public Tensor<float> AiDotNet_ReduceMax_100K_Compiled() => _reduceMaxPlan is not null ? _reduceMaxPlan.Execute() : _engine.ReduceMax(_op_a, new[] { 0 }, keepDims: false, out _);
 
     [Benchmark(Description = "PyTorch: ReduceMax[100K]")]
     public TorchTensor PyTorch_ReduceMax_100K()
@@ -983,12 +1126,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Floor[100K]")]
     public Tensor<float> AiDotNet_Floor_100K() => _engine.TensorFloor(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Floor[100K]")]
+    public Tensor<float> AiDotNet_Floor_100K_Compiled() => _floorPlan is not null ? _floorPlan.Execute() : _engine.TensorFloor(_op_a);
+
     [Benchmark(Description = "PyTorch: Floor[100K]")]
     public TorchTensor PyTorch_Floor_100K() => torch.floor(_t_op_a);
 
     // --- Ceiling ---
     [Benchmark(Description = "AiDotNet Eager: Ceiling[100K]")]
     public Tensor<float> AiDotNet_Ceiling_100K() => _engine.TensorCeiling(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Ceiling[100K]")]
+    public Tensor<float> AiDotNet_Ceiling_100K_Compiled() => _ceilingPlan is not null ? _ceilingPlan.Execute() : _engine.TensorCeiling(_op_a);
 
     [Benchmark(Description = "PyTorch: Ceiling[100K]")]
     public TorchTensor PyTorch_Ceiling_100K() => torch.ceil(_t_op_a);
@@ -997,6 +1146,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Sign[100K]")]
     public Tensor<float> AiDotNet_Sign_100K() => _engine.TensorSign(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Sign[100K]")]
+    public Tensor<float> AiDotNet_Sign_100K_Compiled() => _signPlan is not null ? _signPlan.Execute() : _engine.TensorSign(_op_a);
+
     [Benchmark(Description = "PyTorch: Sign[100K]")]
     public TorchTensor PyTorch_Sign_100K() => torch.sign(_t_op_a);
 
@@ -1004,12 +1156,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Reciprocal[100K]")]
     public Tensor<float> AiDotNet_Reciprocal_100K() => _engine.TensorReciprocal(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: Reciprocal[100K]")]
+    public Tensor<float> AiDotNet_Reciprocal_100K_Compiled() => _reciprocalPlan is not null ? _reciprocalPlan.Execute() : _engine.TensorReciprocal(_op_a);
+
     [Benchmark(Description = "PyTorch: Reciprocal[100K]")]
     public TorchTensor PyTorch_Reciprocal_100K() => torch.reciprocal(_t_op_a);
 
     // --- BroadcastSubtract ---
     [Benchmark(Description = "AiDotNet Eager: BroadcastSub[32x256]-[256]")]
     public Tensor<float> AiDotNet_BroadcastSub() => _engine.TensorBroadcastSubtract(_ba_input, _ba_bias);
+
+    [Benchmark(Description = "AiDotNet Compiled: BroadcastSub[32x256]-[256]")]
+    public Tensor<float> AiDotNet_BroadcastSub_Compiled() => _broadcastSubPlan is not null ? _broadcastSubPlan.Execute() : _engine.TensorBroadcastSubtract(_ba_input, _ba_bias);
 
     [Benchmark(Description = "PyTorch: BroadcastSub[32x256]-[256]")]
     public TorchTensor PyTorch_BroadcastSub() => _t_ba_input - _t_ba_bias;
@@ -1029,6 +1187,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: MatMul[512x512]")]
     public Tensor<float> AiDotNet_MatMul_512() => _engine.TensorMatMul(_mat512, _mat512);
 
+    [Benchmark(Description = "AiDotNet Compiled: MatMul[512x512]")]
+    public Tensor<float> AiDotNet_MatMul_512_Compiled() => _matmul512Plan is not null ? _matmul512Plan.Execute() : _engine.TensorMatMul(_mat512, _mat512);
+
     [Benchmark(Description = "PyTorch: MatMul[512x512]")]
     public TorchTensor PyTorch_MatMul_512() => torch.matmul(_t_mat512, _t_mat512);
 
@@ -1040,6 +1201,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Flatten[256x256]")]
     public Tensor<float> AiDotNet_Flatten() => _engine.Reshape(_op_2d, new[] { 65536 });
 
+    [Benchmark(Description = "AiDotNet Compiled: Flatten[256x256]")]
+    public Tensor<float> AiDotNet_Flatten_Compiled() => _flattenPlan is not null ? _flattenPlan.Execute() : _engine.Reshape(_op_2d, new[] { 65536 });
+
     [Benchmark(Description = "PyTorch: Flatten[256x256]")]
     public TorchTensor PyTorch_Flatten() => _t_op_2d.flatten();
 
@@ -1049,6 +1213,13 @@ public class TensorCodecVsPyTorchBenchmarks
     {
         if (_attn_q is null) { SetupAttn(); }
         return _engine.BatchMatMul(_attn_q, _attn_k);
+    }
+
+    [Benchmark(Description = "AiDotNet Compiled: BatchMatMul[8x64x32]")]
+    public Tensor<float> AiDotNet_BatchMatMul_Compiled()
+    {
+        if (_attn_q is null) { SetupAttn(); }
+        return _batchMatMulPlan is not null ? _batchMatMulPlan.Execute() : _engine.BatchMatMul(_attn_q, _attn_k);
     }
 
     [Benchmark(Description = "PyTorch: BatchMatMul[8x64x32]")]
@@ -1075,6 +1246,13 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: MSELoss[32x10]")]
     public Tensor<float> AiDotNet_MSELoss() => _engine.TensorMSELoss(_loss_pred, _loss_target);
 
+    [Benchmark(Description = "AiDotNet Compiled: MSELoss[32x10]")]
+    public Tensor<float> AiDotNet_MSELoss_Compiled()
+    {
+        if (_loss_pred is null) SetupLoss();
+        return _mseLossPlan is not null ? _mseLossPlan.Execute() : _engine.TensorMSELoss(_loss_pred, _loss_target);
+    }
+
     [Benchmark(Description = "PyTorch: MSELoss[32x10]")]
     public TorchTensor PyTorch_MSELoss() => torch.nn.functional.mse_loss(_t_loss_pred, _t_loss_target);
 
@@ -1082,12 +1260,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Variance[256x256, axis=1]")]
     public Tensor<float> AiDotNet_Variance() => _engine.ReduceVariance(_op_2d, new[] { 1 }, keepDims: false);
 
+    [Benchmark(Description = "AiDotNet Compiled: Variance[256x256, axis=1]")]
+    public Tensor<float> AiDotNet_Variance_Compiled() => _variancePlan is not null ? _variancePlan.Execute() : _engine.ReduceVariance(_op_2d, new[] { 1 }, keepDims: false);
+
     [Benchmark(Description = "PyTorch: Variance[256x256, axis=1]")]
     public TorchTensor PyTorch_Variance() => _t_op_2d.var(dim: 1);
 
     // --- Where (conditional select) ---
     [Benchmark(Description = "AiDotNet Eager: Where[100K]")]
     public Tensor<float> AiDotNet_Where_100K() => _engine.TensorMax(_op_a, _op_b);
+
+    [Benchmark(Description = "AiDotNet Compiled: Where[100K]")]
+    public Tensor<float> AiDotNet_Where_100K_Compiled() => _wherePlan is not null ? _wherePlan.Execute() : _engine.TensorMax(_op_a, _op_b);
 
     [Benchmark(Description = "PyTorch: Where[100K]")]
     public TorchTensor PyTorch_Where_100K() => torch.maximum(_t_op_a, _t_op_b);
@@ -1100,6 +1284,9 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: SELU[100K]")]
     public Tensor<float> AiDotNet_SELU_100K() => _engine.TensorSELU(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: SELU[100K]")]
+    public Tensor<float> AiDotNet_SELU_100K_Compiled() => _seluPlan is not null ? _seluPlan.Execute() : _engine.TensorSELU(_op_a);
+
     [Benchmark(Description = "PyTorch: SELU[100K]")]
     public TorchTensor PyTorch_SELU_100K() => torch.nn.functional.selu(_t_op_a);
 
@@ -1107,12 +1294,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: HardSigmoid[100K]")]
     public Tensor<float> AiDotNet_HardSigmoid_100K() => _engine.TensorHardSigmoid(_op_a);
 
+    [Benchmark(Description = "AiDotNet Compiled: HardSigmoid[100K]")]
+    public Tensor<float> AiDotNet_HardSigmoid_100K_Compiled() => _hardSigmoidPlan is not null ? _hardSigmoidPlan.Execute() : _engine.TensorHardSigmoid(_op_a);
+
     [Benchmark(Description = "PyTorch: HardSigmoid[100K]")]
     public TorchTensor PyTorch_HardSigmoid_100K() => torch.nn.functional.hardsigmoid(_t_op_a);
 
     // --- Round ---
     [Benchmark(Description = "AiDotNet Eager: Round[100K]")]
     public Tensor<float> AiDotNet_Round_100K() => _engine.TensorRound(_op_a);
+
+    [Benchmark(Description = "AiDotNet Compiled: Round[100K]")]
+    public Tensor<float> AiDotNet_Round_100K_Compiled() => _roundPlan is not null ? _roundPlan.Execute() : _engine.TensorRound(_op_a);
 
     [Benchmark(Description = "PyTorch: Round[100K]")]
     public TorchTensor PyTorch_Round_100K() => torch.round(_t_op_a);
@@ -1123,6 +1316,13 @@ public class TensorCodecVsPyTorchBenchmarks
     {
         if (_loss_pred is null) SetupLoss();
         return _engine.TensorCrossEntropyLoss(_loss_pred, _loss_target);
+    }
+
+    [Benchmark(Description = "AiDotNet Compiled: CrossEntropyLoss[32x10]")]
+    public Tensor<float> AiDotNet_CrossEntropy_Compiled()
+    {
+        if (_loss_pred is null) SetupLoss();
+        return _crossEntropyPlan is not null ? _crossEntropyPlan.Execute() : _engine.TensorCrossEntropyLoss(_loss_pred, _loss_target);
     }
 
     [Benchmark(Description = "PyTorch: CrossEntropyLoss[32x10]")]
