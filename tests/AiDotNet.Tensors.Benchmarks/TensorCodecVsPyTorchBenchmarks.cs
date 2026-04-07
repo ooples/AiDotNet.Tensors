@@ -1834,19 +1834,22 @@ public class TensorCodecVsPyTorchBenchmarks
     }
 
     // --- OneHot ---
-    [Benchmark(Description = "AiDotNet Eager: OneHot[1000, depth=100]")]
-    public Tensor<float> AiDotNet_OneHot()
+    private Tensor<int> _onehot_indices = null!;
+    private TorchTensor _t_onehot_indices = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_OneHot))]
+    public void SetupOneHot()
     {
-        var indices = new Tensor<int>(Enumerable.Range(0, 1000).Select(i => i % 100).ToArray(), [1000]);
-        return _engine.TensorOneHot<float>(indices, 100);
+        if (_onehot_indices != null) return;
+        _onehot_indices = new Tensor<int>(Enumerable.Range(0, 1000).Select(i => i % 100).ToArray(), [1000]);
+        _t_onehot_indices = torch.arange(1000, dtype: torch.int64) % 100;
     }
 
+    [Benchmark(Description = "AiDotNet Eager: OneHot[1000, depth=100]")]
+    public Tensor<float> AiDotNet_OneHot() => _engine.TensorOneHot<float>(_onehot_indices, 100);
+
     [Benchmark(Description = "PyTorch: OneHot[1000, depth=100]")]
-    public TorchTensor PyTorch_OneHot()
-    {
-        var indices = torch.arange(1000, dtype: torch.int64) % 100;
-        return torch.nn.functional.one_hot(indices, 100).to(torch.float32);
-    }
+    public TorchTensor PyTorch_OneHot() => torch.nn.functional.one_hot(_t_onehot_indices, 100).to(torch.float32);
 
     // ═══════════════════════════════════════════════════════════════════
     // 22. ELEMENT-WISE LARGER SIZES
