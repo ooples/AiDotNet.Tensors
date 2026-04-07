@@ -518,6 +518,18 @@ public class TensorCodecVsPyTorchBenchmarks
     private CompiledInferencePlan<float>? _reduceMeanPlan;
     private CompiledInferencePlan<float>? _attentionPlan;
 
+    // 1M-scale compiled plans
+    private CompiledInferencePlan<float>? _add1MPlan;
+    private CompiledInferencePlan<float>? _sub1MPlan;
+    private CompiledInferencePlan<float>? _mul1MPlan;
+    private CompiledInferencePlan<float>? _neg1MPlan;
+    private CompiledInferencePlan<float>? _abs1MPlan;
+    private CompiledInferencePlan<float>? _relu1MPlan;
+    private CompiledInferencePlan<float>? _sigmoid1MPlan;
+    private CompiledInferencePlan<float>? _tanh1MPlan;
+    private CompiledInferencePlan<float>? _exp1MPlan;
+    private CompiledInferencePlan<float>? _sqrt1MPlan;
+
     private void SetupOps()
     {
         if (_op_a != null) return;
@@ -628,6 +640,22 @@ public class TensorCodecVsPyTorchBenchmarks
             using (var s = GraphMode.Enable()) { var kT = _engine.TensorTranspose(_attn_k); _engine.BatchMatMul(_attn_q, kT); _attentionPlan = s.CompileInference<float>(); }
         }
         catch { /* plans may fail, benchmarks will show NA */ }
+
+        // Compile 1M-scale plans
+        try
+        {
+            using (var s = GraphMode.Enable()) { _engine.TensorAdd(_op_large, _op_large); _add1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSubtract(_op_large, _op_large); _sub1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorMultiply(_op_large, _op_large); _mul1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorNegate(_op_large); _neg1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorAbs(_op_large); _abs1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.ReLU(_op_large); _relu1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Sigmoid(_op_large); _sigmoid1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.Tanh(_op_large); _tanh1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorExp(_op_large); _exp1MPlan = s.CompileInference<float>(); }
+            using (var s = GraphMode.Enable()) { _engine.TensorSqrt(_op_large); _sqrt1MPlan = s.CompileInference<float>(); }
+        }
+        catch { }
     }
 
     // --- Add ---
@@ -1828,12 +1856,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Add[1M]")]
     public Tensor<float> AiDotNet_Add_1M() => _engine.TensorAdd(_op_large, _op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Add[1M]")]
+    public Tensor<float> AiDotNet_Add_1M_Compiled() => _add1MPlan is not null ? _add1MPlan.Execute() : _engine.TensorAdd(_op_large, _op_large);
+
     [Benchmark(Description = "PyTorch: Add[1M]")]
     public TorchTensor PyTorch_Add_1M() => _t_op_large + _t_op_large;
 
     // --- Multiply 1M ---
     [Benchmark(Description = "AiDotNet Eager: Multiply[1M]")]
     public Tensor<float> AiDotNet_Multiply_1M() => _engine.TensorMultiply(_op_large, _op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Multiply[1M]")]
+    public Tensor<float> AiDotNet_Multiply_1M_Compiled() => _mul1MPlan is not null ? _mul1MPlan.Execute() : _engine.TensorMultiply(_op_large, _op_large);
 
     [Benchmark(Description = "PyTorch: Multiply[1M]")]
     public TorchTensor PyTorch_Multiply_1M() => _t_op_large * _t_op_large;
@@ -1842,12 +1876,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: ReLU[1M]")]
     public Tensor<float> AiDotNet_ReLU_1M() => _engine.ReLU(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: ReLU[1M]")]
+    public Tensor<float> AiDotNet_ReLU_1M_Compiled() => _relu1MPlan is not null ? _relu1MPlan.Execute() : _engine.ReLU(_op_large);
+
     [Benchmark(Description = "PyTorch: ReLU[1M]")]
     public TorchTensor PyTorch_ReLU_1M() => torch.nn.functional.relu(_t_op_large);
 
     // --- Sigmoid 1M ---
     [Benchmark(Description = "AiDotNet Eager: Sigmoid[1M]")]
     public Tensor<float> AiDotNet_Sigmoid_1M() => _engine.Sigmoid(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Sigmoid[1M]")]
+    public Tensor<float> AiDotNet_Sigmoid_1M_Compiled() => _sigmoid1MPlan is not null ? _sigmoid1MPlan.Execute() : _engine.Sigmoid(_op_large);
 
     [Benchmark(Description = "PyTorch: Sigmoid[1M]")]
     public TorchTensor PyTorch_Sigmoid_1M() => torch.sigmoid(_t_op_large);
@@ -1863,12 +1903,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Tanh[1M]")]
     public Tensor<float> AiDotNet_Tanh_1M() => _engine.Tanh(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Tanh[1M]")]
+    public Tensor<float> AiDotNet_Tanh_1M_Compiled() => _tanh1MPlan is not null ? _tanh1MPlan.Execute() : _engine.Tanh(_op_large);
+
     [Benchmark(Description = "PyTorch: Tanh[1M]")]
     public TorchTensor PyTorch_Tanh_1M() => torch.tanh(_t_op_large);
 
     // --- Exp 1M ---
     [Benchmark(Description = "AiDotNet Eager: Exp[1M]")]
     public Tensor<float> AiDotNet_Exp_1M() => _engine.TensorExp(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Exp[1M]")]
+    public Tensor<float> AiDotNet_Exp_1M_Compiled() => _exp1MPlan is not null ? _exp1MPlan.Execute() : _engine.TensorExp(_op_large);
 
     [Benchmark(Description = "PyTorch: Exp[1M]")]
     public TorchTensor PyTorch_Exp_1M() => torch.exp(_t_op_large);
@@ -1993,12 +2039,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Subtract[1M]")]
     public Tensor<float> AiDotNet_Subtract_1M() => _engine.TensorSubtract(_op_large, _op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Subtract[1M]")]
+    public Tensor<float> AiDotNet_Subtract_1M_Compiled() => _sub1MPlan is not null ? _sub1MPlan.Execute() : _engine.TensorSubtract(_op_large, _op_large);
+
     [Benchmark(Description = "PyTorch: Subtract[1M]")]
     public TorchTensor PyTorch_Subtract_1M() => _t_op_large - _t_op_large;
 
     // --- Negate 1M ---
     [Benchmark(Description = "AiDotNet Eager: Negate[1M]")]
     public Tensor<float> AiDotNet_Negate_1M() => _engine.TensorNegate(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Negate[1M]")]
+    public Tensor<float> AiDotNet_Negate_1M_Compiled() => _neg1MPlan is not null ? _neg1MPlan.Execute() : _engine.TensorNegate(_op_large);
 
     [Benchmark(Description = "PyTorch: Negate[1M]")]
     public TorchTensor PyTorch_Negate_1M() => -_t_op_large;
@@ -2007,12 +2059,18 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: Abs[1M]")]
     public Tensor<float> AiDotNet_Abs_1M() => _engine.TensorAbs(_op_large);
 
+    [Benchmark(Description = "AiDotNet Compiled: Abs[1M]")]
+    public Tensor<float> AiDotNet_Abs_1M_Compiled() => _abs1MPlan is not null ? _abs1MPlan.Execute() : _engine.TensorAbs(_op_large);
+
     [Benchmark(Description = "PyTorch: Abs[1M]")]
     public TorchTensor PyTorch_Abs_1M() => torch.abs(_t_op_large);
 
     // --- Sqrt 1M ---
     [Benchmark(Description = "AiDotNet Eager: Sqrt[1M]")]
     public Tensor<float> AiDotNet_Sqrt_1M() => _engine.TensorSqrt(_op_large);
+
+    [Benchmark(Description = "AiDotNet Compiled: Sqrt[1M]")]
+    public Tensor<float> AiDotNet_Sqrt_1M_Compiled() => _sqrt1MPlan is not null ? _sqrt1MPlan.Execute() : _engine.TensorSqrt(_op_large);
 
     [Benchmark(Description = "PyTorch: Sqrt[1M]")]
     public TorchTensor PyTorch_Sqrt_1M() => torch.sqrt(_t_op_large);
