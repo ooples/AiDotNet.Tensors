@@ -1091,5 +1091,45 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: Where[100K]")]
     public TorchTensor PyTorch_Where_100K() => torch.maximum(_t_op_a, _t_op_b);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 14. MORE ACTIVATIONS + LOSS FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- SELU ---
+    [Benchmark(Description = "AiDotNet Eager: SELU[100K]")]
+    public Tensor<float> AiDotNet_SELU_100K() => _engine.TensorSELU(_op_a);
+
+    [Benchmark(Description = "PyTorch: SELU[100K]")]
+    public TorchTensor PyTorch_SELU_100K() => torch.nn.functional.selu(_t_op_a);
+
+    // --- HardSigmoid ---
+    [Benchmark(Description = "AiDotNet Eager: HardSigmoid[100K]")]
+    public Tensor<float> AiDotNet_HardSigmoid_100K() => _engine.TensorHardSigmoid(_op_a);
+
+    [Benchmark(Description = "PyTorch: HardSigmoid[100K]")]
+    public TorchTensor PyTorch_HardSigmoid_100K() => torch.nn.functional.hardsigmoid(_t_op_a);
+
+    // --- Round ---
+    [Benchmark(Description = "AiDotNet Eager: Round[100K]")]
+    public Tensor<float> AiDotNet_Round_100K() => _engine.TensorRound(_op_a);
+
+    [Benchmark(Description = "PyTorch: Round[100K]")]
+    public TorchTensor PyTorch_Round_100K() => torch.round(_t_op_a);
+
+    // --- CrossEntropyLoss ---
+    [Benchmark(Description = "AiDotNet Eager: CrossEntropyLoss[32x10]")]
+    public Tensor<float> AiDotNet_CrossEntropy()
+    {
+        if (_loss_pred is null) SetupLoss();
+        return _engine.TensorCrossEntropyLoss(_loss_pred, _loss_target);
+    }
+
+    [Benchmark(Description = "PyTorch: CrossEntropyLoss[32x10]")]
+    public TorchTensor PyTorch_CrossEntropy()
+    {
+        if (_t_loss_pred is null) SetupLoss();
+        return torch.nn.functional.cross_entropy(_t_loss_pred, _t_loss_target.to(torch.int64).argmax(dim: 1));
+    }
 }
 #endif

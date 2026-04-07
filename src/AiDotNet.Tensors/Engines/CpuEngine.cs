@@ -22892,7 +22892,7 @@ public class CpuEngine : ITensorLevelEngine
         if (gradData is float[] gF && inputData is float[] iF && result is float[] rF)
         {
             float slopeF = (float)negativeSlope;
-            Parallel.For(0, length, i => { rF[i] = iF[i] > 0f ? gF[i] : gF[i] * slopeF; });
+            for (int i = 0; i < length; i++) rF[i] = iF[i] > 0f ? gF[i] : gF[i] * slopeF;
         }
         else
         {
