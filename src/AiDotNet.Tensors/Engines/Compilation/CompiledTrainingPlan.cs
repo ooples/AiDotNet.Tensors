@@ -508,19 +508,19 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.LeakyReLUInto(o, inp, alpha);
         }
 
-        // Swish forward
+        // Swish forward: direct fused sigmoid*x into output buffer
         if (step.OpName == "Swish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+            return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // ELU forward
+        // ELU forward: direct ELUInto for zero allocation
         if (step.OpName == "ELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
-            return eng => { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); };
+            return eng => { if (eng is CpuEngine cpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Log forward: direct VML/SIMD via CpuEngine.TensorLogInto
@@ -603,6 +603,104 @@ internal sealed class CompiledTrainingPlan<T>
                     float* pIn = (float*)inHandle.AddrOfPinnedObject();
                     cOut[0] = SimdKernels.SumUnsafe(pIn, len) / len;
                 }
+            };
+        }
+
+        // Sqrt forward: direct SIMD SqrtUnsafe into output buffer
+        if (step.OpName == "TensorSqrt" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
+        if (step.OpName == "TensorSin" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
+        if (step.OpName == "TensorCos" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Softplus forward: direct float computation
+        if (step.OpName == "Softplus" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                {
+                    float x = cIn[i];
+                    cOut[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+                }
+            };
+        }
+
+        // HardSwish forward: direct float computation
+        if (step.OpName == "HardSwish" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                const float inv6 = 1f / 6f;
+                for (int i = 0; i < len; i++)
+                {
+                    float x = cIn[i];
+                    float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
+                    cOut[i] = x * clip * inv6;
+                }
+            };
+        }
+
+        // SELU forward: direct float computation
+        if (step.OpName == "SELU" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                const float alpha = 1.6732632423543772f;
+                const float scale = 1.0507009873554805f;
+                for (int i = 0; i < len; i++)
+                {
+                    float x = cIn[i];
+                    cOut[i] = x > 0 ? scale * x : scale * alpha * (MathF.Exp(x) - 1f);
+                }
+            };
+        }
+
+        // HardSigmoid forward: direct float computation
+        if (step.OpName == "HardSigmoid" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float[]? cIn = null, cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cIn ??= (float[])(object)inp.GetDataArray();
+                cOut ??= (float[])(object)o.GetDataArray();
+                for (int i = 0; i < len; i++)
+                    cOut[i] = MathF.Max(0f, MathF.Min(1f, cIn[i] / 6f + 0.5f));
             };
         }
 

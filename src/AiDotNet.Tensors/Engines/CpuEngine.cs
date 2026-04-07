@@ -3037,22 +3037,86 @@ public class CpuEngine : ITensorLevelEngine
         numOps.Log(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    /// <summary>Sqrt into pre-allocated destination. Zero allocation.</summary>
-    public void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
+    /// <summary>Sqrt into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
+    public unsafe void TensorSqrtInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.SqrtUnsafe);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
     }
 
-    /// <summary>Abs into pre-allocated destination. Zero allocation.</summary>
-    public void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
+    /// <summary>Abs into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
+    public unsafe void TensorAbsInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Sin into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
+    public unsafe void TensorSinInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
+            {
+                var fSrc = (float[])(object)input.GetDataArray();
+                var fDst = (float[])(object)destination.GetDataArray();
+                for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+            }
+            return;
+        }
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Sin(input.AsSpan(), destination.AsWritableSpan());
+    }
+
+    /// <summary>Cos into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
+    public unsafe void TensorCosInto<T>(Tensor<T> destination, Tensor<T> input)
+    {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(input.Data);
+            var dstMem = AsFloatMemory(destination.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
+            {
+                var fSrc = (float[])(object)input.GetDataArray();
+                var fDst = (float[])(object)destination.GetDataArray();
+                for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+            }
+            return;
+        }
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.Cos(input.AsSpan(), destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -7244,10 +7308,28 @@ public class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
-        numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            var srcMem = AsFloatMemory(tensor.Data);
+            var dstMem = AsFloatMemory(result.Data);
+            using var pinSrc = srcMem.Pin();
+            using var pinDst = dstMem.Pin();
+            unsafe
+            {
+                float* pSrc = (float*)pinSrc.Pointer;
+                float* pDst = (float*)pinDst.Pointer;
+                // Fused swish: sigmoid(x) * x in two SIMD passes
+                SimdKernels.SigmoidUnsafe(pSrc, pDst, tensor.Length);
+                SimdKernels.VectorMultiplyUnsafe(pSrc, pDst, pDst, tensor.Length);
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
+        }
 
         DifferentiableOps.RecordUnary("Swish", result, tensor, BackwardFunctions<T>.SwishBackward);
         return result;
@@ -7290,13 +7372,56 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null)
             throw new ArgumentNullException(nameof(tensor));
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
-        numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            float alphaF = (float)alpha;
+            var srcArr = tensor.GetDataArray() as float[];
+            var dstArr = result.GetDataArray() as float[];
+            if (srcArr is not null && dstArr is not null)
+            {
+                int length = tensor.Length;
+                for (int i = 0; i < length; i++)
+                {
+                    float x = srcArr[i];
+                    dstArr[i] = x >= 0f ? x : alphaF * (MathF.Exp(x) - 1f);
+                }
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
+        }
 
         DifferentiableOps.RecordUnary("ELU", result, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
         return result;
+    }
+
+    /// <summary>ELU into pre-allocated destination. Zero allocation for compiled plans.</summary>
+    public void ELUInto<T>(Tensor<T> destination, Tensor<T> input, double alpha = 1.0)
+    {
+        if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (typeof(T) == typeof(float))
+        {
+            float alphaF = (float)alpha;
+            var srcArr = input.GetDataArray() as float[];
+            var dstArr = destination.GetDataArray() as float[];
+            if (srcArr is not null && dstArr is not null)
+            {
+                int length = input.Length;
+                for (int i = 0; i < length; i++)
+                {
+                    float x = srcArr[i];
+                    dstArr[i] = x >= 0f ? x : alphaF * (MathF.Exp(x) - 1f);
+                }
+            }
+            return;
+        }
+        var numOps = MathHelper.GetNumericOperations<T>();
+        numOps.ELU(input.AsSpan(), numOps.FromDouble(alpha), destination.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -22573,30 +22698,35 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var data = input.GetFlattenedData();
-        var result = new T[data.Length];
-        int length = data.Length;
+        if (!input.IsContiguous) input = input.Contiguous();
+        var softplusResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        int length = input.Length;
 
-        if (data is float[] dF && result is float[] rF)
+        if (typeof(T) == typeof(float))
         {
-            // Sequential loop — Parallel.For per-element has catastrophic overhead
-            for (int i = 0; i < length; i++)
+            var srcArr = input.GetDataArray() as float[];
+            var dstArr = softplusResult.GetDataArray() as float[];
+            if (srcArr is not null && dstArr is not null)
             {
-                float x = dF[i];
-                rF[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+                for (int i = 0; i < length; i++)
+                {
+                    float x = srcArr[i];
+                    dstArr[i] = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
+                }
             }
         }
         else
         {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = input.AsSpan();
+            var dstSpan = softplusResult.AsWritableSpan();
             for (int i = 0; i < length; i++)
             {
-                double x = numOps.ToDouble(data[i]);
-                result[i] = numOps.FromDouble(x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x)));
+                double x = numOps.ToDouble(srcSpan[i]);
+                dstSpan[i] = numOps.FromDouble(x > 20.0 ? x : Math.Log(1.0 + Math.Exp(x)));
             }
         }
 
-        var softplusResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
         DifferentiableOps.RecordUnary("Softplus", softplusResult, input,
             BackwardFunctions<T>.SoftplusBackward);
         return softplusResult;
@@ -22618,32 +22748,37 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!input.IsContiguous) input = input.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var data = input.GetFlattenedData();
-        var result = new T[data.Length];
-        int length = data.Length;
+        var hardSwishResult = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        int length = input.Length;
 
-        if (data is float[] dF && result is float[] rF)
+        if (typeof(T) == typeof(float))
         {
-            // Direct sequential loop — Parallel.For per-element has catastrophic overhead
-            for (int i = 0; i < length; i++)
+            var srcArr = input.GetDataArray() as float[];
+            var dstArr = hardSwishResult.GetDataArray() as float[];
+            if (srcArr is not null && dstArr is not null)
             {
-                float x = dF[i];
-                float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
-                rF[i] = x * clip / 6f;
+                const float inv6 = 1f / 6f;
+                for (int i = 0; i < length; i++)
+                {
+                    float x = srcArr[i];
+                    float clip = MathF.Min(MathF.Max(x + 3f, 0f), 6f);
+                    dstArr[i] = x * clip * inv6;
+                }
             }
         }
         else
         {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = input.AsSpan();
+            var dstSpan = hardSwishResult.AsWritableSpan();
             for (int i = 0; i < length; i++)
             {
-                double x = numOps.ToDouble(data[i]);
+                double x = numOps.ToDouble(srcSpan[i]);
                 double clip = Math.Min(Math.Max(x + 3.0, 0.0), 6.0);
-                result[i] = numOps.FromDouble(x * clip / 6.0);
+                dstSpan[i] = numOps.FromDouble(x * clip / 6.0);
             }
         }
 
-        var hardSwishResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(result));
         DifferentiableOps.RecordUnary("HardSwish", hardSwishResult, input,
             BackwardFunctions<T>.HardSwishBackward);
         return hardSwishResult;
