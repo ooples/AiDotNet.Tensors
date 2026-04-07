@@ -25230,9 +25230,34 @@ public class CpuEngine : ITensorLevelEngine
             newShape[dim] += padding[2 * i] + padding[2 * i + 1];
         }
         var result = AutoTensorCache.RentOrAllocate<T>(newShape);
-        result.Fill(value);
-        // Copy original data
-        CopyTensorRegion(tensor, result, padding, rank);
+
+        // Float fast path for 2D constant pad: single pass with Array.Copy per row
+        if (typeof(T) == typeof(float) && rank == 2 && padding.Length >= 4 && tensor.IsContiguous)
+        {
+            float fVal = value is not null ? (float)(object)value : 0f;
+            var srcArr = (float[])(object)tensor.GetDataArray();
+            var dstArr = (float[])(object)result.GetDataArray();
+            int srcRows = tensor._shape[0], srcCols = tensor._shape[1];
+            int padLeft = padding[0], padRight = padding[1];
+            int padTop = padding[2], padBottom = padding[3];
+            int dstCols = newShape[1];
+
+            // Fill entire output with pad value
+            if (fVal == 0f)
+                Array.Clear(dstArr, 0, dstArr.Length);
+            else
+                for (int i = 0; i < dstArr.Length; i++) dstArr[i] = fVal;
+
+            // Copy source rows into padded positions
+            for (int r = 0; r < srcRows; r++)
+                Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
+        }
+        else
+        {
+            result.Fill(value);
+            // Copy original data
+            CopyTensorRegion(tensor, result, padding, rank);
+        }
         DifferentiableOps.RecordUnary("ConstantPad", result, tensor, BackwardFunctions<T>.ConstantPadBackward,
             savedState: new object[] { padding });
         return result;
