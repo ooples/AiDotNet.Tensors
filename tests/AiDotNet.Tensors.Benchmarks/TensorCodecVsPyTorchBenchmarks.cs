@@ -1699,5 +1699,175 @@ public class TensorCodecVsPyTorchBenchmarks
 
     [Benchmark(Description = "PyTorch: Sum[1M]")]
     public TorchTensor PyTorch_Sum_1M() => _t_op_large.sum();
+    // ═══════════════════════════════════════════════════════════════════
+    // 21. ATTENTION + ADVANCED OPS
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- ScaledDotProductAttention ---
+    private Tensor<float> _sdpa_q = null!, _sdpa_k = null!, _sdpa_v = null!;
+    private TorchTensor _t_sdpa_q = null!, _t_sdpa_k = null!, _t_sdpa_v = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_SDPA))]
+    public void SetupSDPA()
+    {
+        if (_sdpa_q != null) return;
+        _sdpa_q = Tensor<float>.CreateRandom([4, 8, 32, 64]); // [batch, heads, seq, head_dim]
+        _sdpa_k = Tensor<float>.CreateRandom([4, 8, 32, 64]);
+        _sdpa_v = Tensor<float>.CreateRandom([4, 8, 32, 64]);
+        _t_sdpa_q = torch.randn([4, 8, 32, 64]);
+        _t_sdpa_k = torch.randn([4, 8, 32, 64]);
+        _t_sdpa_v = torch.randn([4, 8, 32, 64]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: SDPA[4x8x32x64]")]
+    public Tensor<float> AiDotNet_SDPA()
+    {
+        return _engine.ScaledDotProductAttention(_sdpa_q, _sdpa_k, _sdpa_v, null, null, out _);
+    }
+
+    [Benchmark(Description = "PyTorch: SDPA[4x8x32x64]")]
+    public TorchTensor PyTorch_SDPA()
+    {
+        using var _ = torch.no_grad();
+        // Manual SDPA: Q@K^T / sqrt(d) -> softmax -> @V
+        var scores = torch.matmul(_t_sdpa_q, _t_sdpa_k.transpose(-2, -1)) / MathF.Sqrt(64f);
+        var attn = torch.nn.functional.softmax(scores, dim: -1);
+        return torch.matmul(attn, _t_sdpa_v);
+    }
+
+    // --- Conv3D ---
+    private Tensor<float> _conv3d_input = null!, _conv3d_kernel = null!;
+    private TorchTensor _t_conv3d_input = null!, _t_conv3d_kernel = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_Conv3D))]
+    public void SetupConv3D()
+    {
+        if (_conv3d_input != null) return;
+        _conv3d_input = Tensor<float>.CreateRandom([2, 3, 8, 8, 8]); // [batch, ch, D, H, W]
+        _conv3d_kernel = Tensor<float>.CreateRandom([8, 3, 3, 3, 3]); // [out_ch, in_ch, kD, kH, kW]
+        _t_conv3d_input = torch.randn([2, 3, 8, 8, 8]);
+        _t_conv3d_kernel = torch.randn([8, 3, 3, 3, 3]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: Conv3D[2x3x8x8x8, k=3]")]
+    public Tensor<float> AiDotNet_Conv3D()
+    {
+        return _engine.Conv3D(_conv3d_input, _conv3d_kernel, stride: 1, padding: 1);
+    }
+
+    [Benchmark(Description = "PyTorch: Conv3D[2x3x8x8x8, k=3]")]
+    public TorchTensor PyTorch_Conv3D()
+    {
+        using var _ = torch.no_grad();
+        return torch.nn.functional.conv3d(_t_conv3d_input, _t_conv3d_kernel, padding: new long[] { 1, 1, 1 });
+    }
+
+    // --- ConvTranspose2D ---
+    private Tensor<float> _ct2d_input = null!, _ct2d_kernel = null!;
+    private TorchTensor _t_ct2d_input = null!, _t_ct2d_kernel = null!;
+
+    [IterationSetup(Target = nameof(AiDotNet_ConvTranspose2D))]
+    public void SetupConvTranspose2D()
+    {
+        if (_ct2d_input != null) return;
+        _ct2d_input = Tensor<float>.CreateRandom([4, 16, 8, 8]); // [batch, ch, H, W]
+        _ct2d_kernel = Tensor<float>.CreateRandom([16, 8, 3, 3]); // [in_ch, out_ch, kH, kW]
+        _t_ct2d_input = torch.randn([4, 16, 8, 8]);
+        _t_ct2d_kernel = torch.randn([16, 8, 3, 3]);
+    }
+
+    [Benchmark(Description = "AiDotNet Eager: ConvTranspose2D[4x16x8x8]")]
+    public Tensor<float> AiDotNet_ConvTranspose2D()
+    {
+        return _engine.ConvTranspose2D(_ct2d_input, _ct2d_kernel, new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 });
+    }
+
+    [Benchmark(Description = "PyTorch: ConvTranspose2D[4x16x8x8]")]
+    public TorchTensor PyTorch_ConvTranspose2D()
+    {
+        using var _ = torch.no_grad();
+        return torch.nn.functional.conv_transpose2d(_t_ct2d_input, _t_ct2d_kernel, strides: new long[] { 2, 2 }, padding: new long[] { 1, 1 });
+    }
+
+    // --- Einsum: batch matmul via subscript notation ---
+    [Benchmark(Description = "AiDotNet Eager: Einsum 'ij,jk->ik' [256x256]")]
+    public Tensor<float> AiDotNet_Einsum()
+    {
+        return _engine.TensorEinsum("ij,jk->ik", _op_2d, _op_2d);
+    }
+
+    [Benchmark(Description = "PyTorch: Einsum 'ij,jk->ik' [256x256]")]
+    public TorchTensor PyTorch_Einsum()
+    {
+        return torch.einsum("ij,jk->ik", _t_op_2d, _t_op_2d);
+    }
+
+    // --- OneHot ---
+    [Benchmark(Description = "AiDotNet Eager: OneHot[1000, depth=100]")]
+    public Tensor<float> AiDotNet_OneHot()
+    {
+        var indices = new Tensor<int>(Enumerable.Range(0, 1000).Select(i => i % 100).ToArray(), [1000]);
+        return _engine.TensorOneHot<float>(indices, 100);
+    }
+
+    [Benchmark(Description = "PyTorch: OneHot[1000, depth=100]")]
+    public TorchTensor PyTorch_OneHot()
+    {
+        var indices = torch.arange(1000, dtype: torch.int64) % 100;
+        return torch.nn.functional.one_hot(indices, 100).to(torch.float32);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 22. ELEMENT-WISE LARGER SIZES
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- Add 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Add[1M]")]
+    public Tensor<float> AiDotNet_Add_1M() => _engine.TensorAdd(_op_large, _op_large);
+
+    [Benchmark(Description = "PyTorch: Add[1M]")]
+    public TorchTensor PyTorch_Add_1M() => _t_op_large + _t_op_large;
+
+    // --- Multiply 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Multiply[1M]")]
+    public Tensor<float> AiDotNet_Multiply_1M() => _engine.TensorMultiply(_op_large, _op_large);
+
+    [Benchmark(Description = "PyTorch: Multiply[1M]")]
+    public TorchTensor PyTorch_Multiply_1M() => _t_op_large * _t_op_large;
+
+    // --- ReLU 1M ---
+    [Benchmark(Description = "AiDotNet Eager: ReLU[1M]")]
+    public Tensor<float> AiDotNet_ReLU_1M() => _engine.ReLU(_op_large);
+
+    [Benchmark(Description = "PyTorch: ReLU[1M]")]
+    public TorchTensor PyTorch_ReLU_1M() => torch.nn.functional.relu(_t_op_large);
+
+    // --- Sigmoid 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Sigmoid[1M]")]
+    public Tensor<float> AiDotNet_Sigmoid_1M() => _engine.Sigmoid(_op_large);
+
+    [Benchmark(Description = "PyTorch: Sigmoid[1M]")]
+    public TorchTensor PyTorch_Sigmoid_1M() => torch.sigmoid(_t_op_large);
+
+    // --- GELU 1M ---
+    [Benchmark(Description = "AiDotNet Eager: GELU[1M]")]
+    public Tensor<float> AiDotNet_GELU_1M() => _engine.GELU(_op_large);
+
+    [Benchmark(Description = "PyTorch: GELU[1M]")]
+    public TorchTensor PyTorch_GELU_1M() => torch.nn.functional.gelu(_t_op_large);
+
+    // --- Tanh 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Tanh[1M]")]
+    public Tensor<float> AiDotNet_Tanh_1M() => _engine.Tanh(_op_large);
+
+    [Benchmark(Description = "PyTorch: Tanh[1M]")]
+    public TorchTensor PyTorch_Tanh_1M() => torch.tanh(_t_op_large);
+
+    // --- Exp 1M ---
+    [Benchmark(Description = "AiDotNet Eager: Exp[1M]")]
+    public Tensor<float> AiDotNet_Exp_1M() => _engine.TensorExp(_op_large);
+
+    [Benchmark(Description = "PyTorch: Exp[1M]")]
+    public TorchTensor PyTorch_Exp_1M() => torch.exp(_t_op_large);
 }
 #endif
