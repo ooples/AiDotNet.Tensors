@@ -775,37 +775,43 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
         }
 
-        // LogSoftmax forward: compute in-place into pre-allocated output
+        // LogSoftmax forward: pinned SIMD with VML exp for inner loop
         if (step.OpName == "LogSoftmax" && step.Inputs.Length == 1 && typeof(T) == typeof(float)
             && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            int axis = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToInt32(step.SavedState[0]) : -1;
-            // Pre-fetch arrays at compile time
-            var inArr = (float[])(object)inp.GetDataArray();
-            var outArr = (float[])(object)o.GetDataArray();
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int rows = inp._shape[0], cols = inp._shape[1];
-            // Inline LogSoftmax: for each row, compute max, subtract, exp, sum, log, subtract
             return eng =>
             {
-                for (int r = 0; r < rows; r++)
+                unsafe
                 {
-                    int off = r * cols;
-                    // Find max for numerical stability
-                    float maxVal = float.NegativeInfinity;
-                    for (int c = 0; c < cols; c++)
-                        if (inArr[off + c] > maxVal) maxVal = inArr[off + c];
-                    // Compute log(sum(exp(x - max))) + (x - max)
-                    float sumExp = 0f;
-                    for (int c = 0; c < cols; c++)
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    for (int r = 0; r < rows; r++)
                     {
-                        float shifted = inArr[off + c] - maxVal;
-                        sumExp += MathF.Exp(shifted);
-                        outArr[off + c] = shifted;
+                        float* rowIn = pIn + r * cols;
+                        float* rowOut = pOut + r * cols;
+                        // Find max
+                        float maxVal = rowIn[0];
+                        for (int c = 1; c < cols; c++)
+                            if (rowIn[c] > maxVal) maxVal = rowIn[c];
+                        // Compute shifted values into output, then exp in-place
+                        for (int c = 0; c < cols; c++)
+                            rowOut[c] = rowIn[c] - maxVal;
+                        // Vectorized exp: try VML first, then SIMD fallback
+                        if (!Helpers.VmlProvider.TryExp(rowOut, rowOut, cols))
+                            SimdKernels.ExpUnsafe(rowOut, rowOut, cols);
+                        // Sum + log
+                        float sumExp = SimdKernels.SumUnsafe(rowOut, cols);
+                        float logSumExp = MathF.Log(sumExp);
+                        // Final: log_softmax = shifted - log(sumExp)
+                        for (int c = 0; c < cols; c++)
+                            rowOut[c] = (rowIn[c] - maxVal) - logSumExp;
                     }
-                    float logSumExp = MathF.Log(sumExp);
-                    for (int c = 0; c < cols; c++)
-                        outArr[off + c] -= logSumExp;
                 }
             };
         }
