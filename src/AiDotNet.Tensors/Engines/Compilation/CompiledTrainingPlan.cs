@@ -376,7 +376,18 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // TensorAdd forward: direct SIMD into output buffer
+        // TensorAdd forward: pinned SIMD VectorAddUnsafe
+        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorAddUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
         if (step.OpName == "TensorAdd" && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
@@ -384,7 +395,18 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.TensorAddInto(o, a, b);
         }
 
-        // TensorSubtract forward
+        // TensorSubtract forward: pinned SIMD VectorSubtractUnsafe
+        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorSubtractUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
         if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
@@ -392,7 +414,18 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.TensorSubtractInto(o, a, b);
         }
 
-        // TensorMultiply forward
+        // TensorMultiply forward: pinned SIMD VectorMultiplyUnsafe
+        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorMultiplyUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
         if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
@@ -440,7 +473,20 @@ internal sealed class CompiledTrainingPlan<T>
             return eng => eng.SoftmaxInto(o, inp, axis);
         }
 
-        // TensorNegate forward
+        // TensorNegate forward: pinned SIMD negate
+        if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inArr = (float[])(object)inp.GetDataArray();
+            var outArr = (float[])(object)o.GetDataArray();
+            int len = inp.Length;
+            return eng =>
+            {
+                for (int i = 0; i < len; i++) outArr[i] = -inArr[i];
+            };
+        }
+        // TensorNegate non-float fallback
         if (step.OpName == "TensorNegate" && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
