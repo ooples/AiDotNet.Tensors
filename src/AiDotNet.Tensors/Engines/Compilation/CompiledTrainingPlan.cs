@@ -927,6 +927,28 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
+        // BroadcastAdd/Sub/Mul forward: direct array loop for [N,M] op [M] pattern
+        if ((step.OpName == "TensorBroadcastAdd" || step.OpName == "TensorBroadcastSubtract" || step.OpName == "TensorBroadcastMultiply")
+            && step.Inputs.Length == 2 && typeof(T) == typeof(float)
+            && step.Inputs[0].Rank == 2 && (step.Inputs[1].Rank == 1 || (step.Inputs[1].Rank == 2 && step.Inputs[1]._shape[0] == 1)))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var aArr = (float[])(object)a.GetDataArray();
+                var bArr = (float[])(object)b.GetDataArray();
+                var oArr = (float[])(object)o.GetDataArray();
+                if (step.OpName == "TensorBroadcastAdd")
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
+                else if (step.OpName == "TensorBroadcastSubtract")
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] - bArr[c]; } };
+                else
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] * bArr[c]; } };
+            }
+        }
+
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
         // Transpose forward: zero-copy strided view (same as PyTorch .t())
