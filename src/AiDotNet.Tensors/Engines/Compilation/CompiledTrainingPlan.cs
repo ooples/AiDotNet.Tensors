@@ -330,10 +330,37 @@ internal sealed class CompiledTrainingPlan<T>
 
             if (typeof(T) == typeof(float) && input.IsContiguous)
             {
-                // Pinned path: GCHandle once at compile time, SumUnsafe per replay
+                // Pinned path: GCHandle once at compile time
                 var inH = System.Runtime.InteropServices.GCHandle.Alloc(
                     ((Tensor<float>)(object)input).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
                 int len = input.Length;
+
+                // For large arrays, use parallel chunked reduction (matches TensorSum)
+                if (len >= 200_000)
+                {
+                    int numChunks = Math.Max(2, len / 50_000);
+                    int chunkSize = ((len + numChunks - 1) / numChunks + 31) & ~31;
+                    var partials = new float[numChunks];
+                    return eng =>
+                    {
+                        cOut ??= (float[])(object)output.GetDataArray();
+                        unsafe
+                        {
+                            float* p = (float*)inH.AddrOfPinnedObject();
+                            Parallel.For(0, numChunks, chunk =>
+                            {
+                                int start = chunk * chunkSize;
+                                int count = Math.Min(chunkSize, len - start);
+                                if (count > 0) partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
+                                else partials[chunk] = 0f;
+                            });
+                            float total = 0f;
+                            for (int c = 0; c < numChunks; c++) total += partials[c];
+                            cOut[0] = total;
+                        }
+                    };
+                }
+
                 return eng =>
                 {
                     cOut ??= (float[])(object)output.GetDataArray();
