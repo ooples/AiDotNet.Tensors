@@ -31,6 +31,8 @@ internal static class VmlProvider
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsTanh;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSqrt;
     private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsAbs;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsSin;
+    private static unsafe delegate* unmanaged[Cdecl]<int, float*, float*, void> _vsCos;
 
     // Double VML — mode-specific (vmd* takes mode as 4th arg).
     // Using VML_EP=0x1 per-call avoids the VML_HA regression that vd* functions hit
@@ -204,6 +206,32 @@ internal static class VmlProvider
 #endif
     }
 
+    /// <summary>Computes element-wise sin(x) using MKL VML SVML.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TrySin(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsSin == null) return false;
+        _vsSin(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>Computes element-wise cos(x) using MKL VML SVML.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe bool TryCos(float* input, float* output, int length)
+    {
+#if NET5_0_OR_GREATER
+        if (!EnsureInitialized() || _vsCos == null) return false;
+        _vsCos(length, input, output);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // EnforceVmlLaMode removed — using vmd* (mode-per-call) instead of vd* + vmlSetMode
 
     private static bool EnsureInitialized()
@@ -284,6 +312,10 @@ internal static class VmlProvider
                 TryGetExport(handle, "vsSqrt", "MKL_vsSqrt", "VSSQRT");
             _vsAbs = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
                 TryGetExport(handle, "vsAbs", "MKL_vsAbs", "VSABS");
+            _vsSin = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsSin", "MKL_vsSin", "VSSIN");
+            _vsCos = (delegate* unmanaged[Cdecl]<int, float*, float*, void>)
+                TryGetExport(handle, "vsCos", "MKL_vsCos", "VSCOS");
 
             // Double VML — mode-specific per-call (vmd* takes mode as 4th arg).
             // This avoids the VML_HA regression that vd* functions hit when

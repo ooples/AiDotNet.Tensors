@@ -4364,9 +4364,28 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
+                {
+                    var fSrc = (float[])(object)tensor.GetDataArray();
+                    var fDst = (float[])(object)result.GetDataArray();
+                    for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+                }
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
+        }
 
         DifferentiableOps.RecordUnary("Sin", result, tensor,
             BackwardFunctions<T>.SinBackward);
@@ -4392,9 +4411,28 @@ public class CpuEngine : ITensorLevelEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = TensorAllocator.RentUninitialized<T>(tensor._shape);
-        numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
+        if (typeof(T) == typeof(float))
+        {
+            unsafe
+            {
+                var srcMem = AsFloatMemory(tensor.Data);
+                var dstMem = AsFloatMemory(result.Data);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
+                {
+                    var fSrc = (float[])(object)tensor.GetDataArray();
+                    var fDst = (float[])(object)result.GetDataArray();
+                    for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+                }
+            }
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
+        }
 
         DifferentiableOps.RecordUnary("Cos", result, tensor,
             BackwardFunctions<T>.CosBackward);

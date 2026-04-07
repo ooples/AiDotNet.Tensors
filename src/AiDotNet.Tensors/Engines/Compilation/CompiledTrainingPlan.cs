@@ -412,6 +412,34 @@ internal sealed class CompiledTrainingPlan<T>
                 }
             };
         }
+        // FusedLinear forward: direct BLAS + bias + activation into output buffer
+        if (step.OpName == "FusedLinear" && step.Inputs.Length == 3 && typeof(T) == typeof(float)
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
+        {
+            var input = step.Inputs[0]; var weights = step.Inputs[1]; var bias = step.Inputs[2];
+            var o = step.OutputBuffer;
+            var activation = step.SavedState != null && step.SavedState.Length > 0 && step.SavedState[0] is FusedActivationType act
+                ? act : FusedActivationType.None;
+            int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
+
+            // Pin once at compile time
+            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)input).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var wH = System.Runtime.InteropServices.GCHandle.Alloc(
+                ((Tensor<float>)(object)weights).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var bArr = (float[])(object)bias.GetDataArray();
+            var oArr = (float[])(object)o.GetDataArray();
+
+            return eng =>
+            {
+                // Direct BLAS into output + fused bias + activation
+                CpuFusedOperations.FusedGemmBiasActivation(
+                    (float[])(object)input.GetDataArray(),
+                    (float[])(object)weights.GetDataArray(),
+                    bArr, oArr, M, N, K, activation);
+            };
+        }
+
         // GELU non-float fallback
         if (step.OpName == "GELU" && step.Inputs.Length == 1)
         {

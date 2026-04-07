@@ -777,7 +777,7 @@ public class TensorCodecVsPyTorchBenchmarks
     public float AiDotNet_Mean_1M() => _engine.TensorMean(_op_large);
 
     [Benchmark(Description = "AiDotNet Eager: ReduceMean[1M]")]
-    public Tensor<float> AiDotNet_ReduceMean_1M() => _engine.ReduceMean(_op_large, null);
+    public Tensor<float> AiDotNet_ReduceMean_1M() => _engine.ReduceMean(_op_large, null, false);
 
     [Benchmark(Description = "PyTorch: Mean[1M]")]
     public TorchTensor PyTorch_Mean_1M() => _t_op_large.mean();
@@ -1038,7 +1038,7 @@ public class TensorCodecVsPyTorchBenchmarks
 
     // --- Flatten (should be near zero-cost) ---
     [Benchmark(Description = "AiDotNet Eager: Flatten[256x256]")]
-    public Tensor<float> AiDotNet_Flatten() => _engine.Flatten(_op_2d, 0);
+    public Tensor<float> AiDotNet_Flatten() => _engine.Reshape(_op_2d, new[] { 65536 });
 
     [Benchmark(Description = "PyTorch: Flatten[256x256]")]
     public TorchTensor PyTorch_Flatten() => _t_op_2d.flatten();
@@ -1047,14 +1047,14 @@ public class TensorCodecVsPyTorchBenchmarks
     [Benchmark(Description = "AiDotNet Eager: BatchMatMul[8x64x32]")]
     public Tensor<float> AiDotNet_BatchMatMul()
     {
-        if (_attn_q == null) { SetupAttn(); }
+        if (_attn_q is null) { SetupAttn(); }
         return _engine.BatchMatMul(_attn_q, _attn_k);
     }
 
     [Benchmark(Description = "PyTorch: BatchMatMul[8x64x32]")]
     public TorchTensor PyTorch_BatchMatMul()
     {
-        if (_t_attn_q == null) { SetupAttn(); }
+        if (_t_attn_q is null) { SetupAttn(); }
         return torch.matmul(_t_attn_q, _t_attn_k);
     }
 
