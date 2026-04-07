@@ -24493,6 +24493,21 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Float fast path: fused single-pass sum(|p - t|) / n
+        if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
+        {
+            var pArr = (float[])(object)predictions.GetDataArray();
+            var tArr = (float[])(object)targets.GetDataArray();
+            int len = predictions.Length;
+            float sumAbs = 0f;
+            for (int i = 0; i < len; i++)
+                sumAbs += MathF.Abs(pArr[i] - tArr[i]);
+            float fMean = sumAbs / len;
+            var scalarResult = new Tensor<T>(new[] { Unsafe.As<float, T>(ref fMean) }, [1]);
+            DifferentiableOps.RecordBinary("L1Loss", scalarResult, predictions, targets, BackwardFunctions<T>.L1LossBackward);
+            return scalarResult;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T mean;
         using (new NoGradScope<T>())
