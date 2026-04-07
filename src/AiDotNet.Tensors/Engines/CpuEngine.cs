@@ -21126,15 +21126,24 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var srcData = tensor.GetFlattenedData();
-        var dstData = result.GetDataArray();
-
         int length = tensor.Length;
-        for (int i = 0; i < length; i++)
+
+        if (typeof(T) == typeof(float))
         {
-            dstData[i] = numOps.FromDouble(Math.Cosh(numOps.ToDouble(srcData[i])));
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                fDst[i] = MathF.Cosh(fSrc[i]);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = tensor.AsSpan();
+            var dstSpan = result.AsWritableSpan();
+            for (int i = 0; i < length; i++)
+                dstSpan[i] = numOps.FromDouble(Math.Cosh(numOps.ToDouble(srcSpan[i])));
         }
 
         DifferentiableOps.RecordUnary("TensorCosh", result, tensor, BackwardFunctions<T>.CoshBackward);
@@ -21157,15 +21166,23 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var srcData = tensor.GetFlattenedData();
-        var dstData = result.GetDataArray();
-
         int length = tensor.Length;
-        for (int i = 0; i < length; i++)
+
+        if (typeof(T) == typeof(float))
         {
-            dstData[i] = numOps.FromDouble(Math.Sinh(numOps.ToDouble(srcData[i])));
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                fDst[i] = MathF.Sinh(fSrc[i]);
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = tensor.AsSpan();
+            var dstSpan = result.AsWritableSpan();
+            for (int i = 0; i < length; i++)
+                dstSpan[i] = numOps.FromDouble(Math.Sinh(numOps.ToDouble(srcSpan[i])));
         }
 
         DifferentiableOps.RecordUnary("TensorSinh", result, tensor, BackwardFunctions<T>.SinhBackward);
@@ -24730,12 +24747,26 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        for (int i = 0; i < tensor.Length; i++)
+        int length = tensor.Length;
+        if (typeof(T) == typeof(float))
         {
-            double x = numOps.ToDouble(tensor[i]);
-            result[i] = numOps.FromDouble(Math.Max(0, Math.Min(6, x)));
+            var fSrc = (float[])(object)tensor.GetDataArray();
+            var fDst = (float[])(object)result.GetDataArray();
+            for (int i = 0; i < length; i++)
+                fDst[i] = MathF.Max(0f, MathF.Min(6f, fSrc[i]));
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            var srcSpan = tensor.AsSpan();
+            var dstSpan = result.AsWritableSpan();
+            for (int i = 0; i < length; i++)
+            {
+                double x = numOps.ToDouble(srcSpan[i]);
+                dstSpan[i] = numOps.FromDouble(Math.Max(0, Math.Min(6, x)));
+            }
         }
         DifferentiableOps.RecordUnary("ReLU6", result, tensor, BackwardFunctions<T>.ReLU6Backward);
         return result;
