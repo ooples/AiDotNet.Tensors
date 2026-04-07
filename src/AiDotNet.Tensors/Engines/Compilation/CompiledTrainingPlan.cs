@@ -748,21 +748,19 @@ internal sealed class CompiledTrainingPlan<T>
         // (from the lazy node) already handles these correctly. Specializing adds
         // an extra allocate+copy on top of what the generic path already does.
 
-        // TensorDivide forward: direct cached array division
+        // TensorDivide forward: pinned SIMD VectorDivideUnsafe
         if (step.OpName == "TensorDivide" && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            float[]? cA = null, cB = null, cOut = null;
+            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
             int len = a.Length;
             return eng =>
             {
-                cA ??= (float[])(object)a.GetDataArray();
-                cB ??= (float[])(object)b.GetDataArray();
-                cOut ??= (float[])(object)o.GetDataArray();
-                for (int i = 0; i < len; i++)
-                    cOut[i] = cA[i] / cB[i];
+                unsafe { SimdKernels.VectorDivideUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); }
             };
         }
 
