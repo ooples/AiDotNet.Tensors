@@ -229,29 +229,41 @@ internal static class AutoTensorCache
             // But the simplest reliable approach is environment-based heuristics
             if (System.Runtime.Intrinsics.X86.X86Base.IsSupported)
             {
-                // Use CPUID leaf 4 for deterministic cache parameters
-                // This is complex — use heuristics based on processor count instead
-                int cores = Environment.ProcessorCount;
+                // ProcessorCount includes hyperthreads — estimate physical cores
+                int logicalCores = Environment.ProcessorCount;
+                int physicalCores = Math.Max(1, logicalCores / 2); // SMT/HT gives 2x
 
-                // Modern AMD Ryzen: L1=32KB, L2=512KB, L3=32MB (for 16-core)
-                // Modern Intel: L1=48KB, L2=1.25MB, L3=30MB (for 24-core)
-                // Scale L3 estimate by core count
-                if (cores >= 32)
+                // Scale L3 by physical cores (each core contributes ~2MB L3 slice)
+                // AMD Zen 2/3: ~4MB L3 per core (CCX-based, 16MB per 4-core CCX)
+                // AMD Zen 4: ~4MB L3 per core (32MB per CCD)
+                // Intel 12th+: ~1.5-2.5MB L3 per core
+                long l3Estimate = physicalCores * 4L * 1024 * 1024; // ~4MB per physical core
+                l3Estimate = Math.Min(l3Estimate, 128L * 1024 * 1024); // Cap at 128MB
+
+                // L1/L2 per core:
+                // AMD Zen 2/3: L1=32KB, L2=512KB
+                // AMD Zen 4: L1=32KB, L2=1MB
+                // Intel 12th+: L1=48KB, L2=1.25MB
+                // Intel 13th+: L1=48KB, L2=2MB (P-cores)
+                // Default to AMD Zen 2/3 (most common for compute workloads)
+                int l1 = 32 * 1024;   // 32KB — safe conservative default
+                int l2 = 512 * 1024;  // 512KB — AMD Zen 2/3 default
+
+                // Detect if Intel (has wider L2)
+                // Simple heuristic: check if SSE4.2 + no FMA3 fallback needed
+                // This isn't reliable, so just use physical cores as proxy:
+                // High core count (24+) = likely server/Intel with bigger L2
+                if (physicalCores >= 24)
                 {
-                    return (48 * 1024, 1024 * 1024, 64L * 1024 * 1024);
+                    l1 = 48 * 1024;    // Intel P-core style
+                    l2 = 2048 * 1024;  // Intel 13th gen+ P-core L2
                 }
-                else if (cores >= 16)
+                else if (physicalCores >= 12)
                 {
-                    return (32 * 1024, 512 * 1024, 32L * 1024 * 1024);
+                    l2 = 1024 * 1024;  // Could be AMD Zen 4 or Intel 12th
                 }
-                else if (cores >= 8)
-                {
-                    return (32 * 1024, 512 * 1024, 16L * 1024 * 1024);
-                }
-                else
-                {
-                    return (32 * 1024, 256 * 1024, 8L * 1024 * 1024);
-                }
+
+                return (l1, l2, l3Estimate);
             }
 #endif
 #if NET5_0_OR_GREATER

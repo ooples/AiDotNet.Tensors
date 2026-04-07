@@ -73,6 +73,49 @@ public static class TensorCacheSettings
     /// Gets whether tensor caching is currently enabled.
     /// </summary>
     public static bool IsEnabled => AutoTensorCache.Enabled;
+
+    /// <summary>Gets detected L1 data cache size per core in bytes.</summary>
+    public static int DetectedL1CacheBytes => AutoTensorCache.L1CacheBytes;
+
+    /// <summary>Gets detected L2 cache size per core in bytes.</summary>
+    public static int DetectedL2CacheBytes => AutoTensorCache.L2CacheBytes;
+
+    /// <summary>Gets detected L3 shared cache size in bytes.</summary>
+    public static long DetectedL3CacheBytes => AutoTensorCache.L3CacheBytes;
+
+    /// <summary>Gets detected L4/HBM cache size in bytes (0 if not present).</summary>
+    public static long DetectedL4CacheBytes => AutoTensorCache.L4CacheBytes;
+
+    /// <summary>Gets detected total available RAM in bytes.</summary>
+    public static long DetectedRamBytes => AutoTensorCache.AvailableRamBytes;
+
+    /// <summary>Gets max cacheable elements for the current policy.</summary>
+    public static long MaxCacheableElements => AutoTensorCache.MaxElementsPerTensor;
+
+    /// <summary>
+    /// Gets the number of cached copies kept per shape for a given tensor size.
+    /// Smaller tensors (fitting in L2) get more copies than larger ones.
+    /// </summary>
+    public static int GetCopiesPerShape(long tensorElements) => AutoTensorCache.GetMaxPerShape(tensorElements);
+
+    /// <summary>
+    /// Prints a diagnostic summary of detected hardware and cache settings to Console.
+    /// </summary>
+    public static string GetDiagnostics()
+    {
+        return $"""
+            Tensor Cache Diagnostics:
+              L1 Cache: {DetectedL1CacheBytes / 1024}KB per core
+              L2 Cache: {DetectedL2CacheBytes / 1024}KB per core
+              L3 Cache: {DetectedL3CacheBytes / 1024 / 1024}MB shared
+              L4/HBM:   {(DetectedL4CacheBytes > 0 ? $"{DetectedL4CacheBytes / 1024 / 1024}MB" : "not detected")}
+              RAM:      {DetectedRamBytes / 1024 / 1024 / 1024}GB
+              Policy:   {(AutoTensorCache.Policy)}
+              Max elem: {MaxCacheableElements:N0}
+              100K copies: {GetCopiesPerShape(100_000)} (L2 tier)
+              1M copies:   {GetCopiesPerShape(1_000_000)} (L3 tier)
+            """;
+    }
 }
 
 /// <summary>
