@@ -110,6 +110,8 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         var capturedOutput = matmul2.OutputBuffer;
         int cm = m, ck = k, ch = h, cn = n;
         var capturedActivationFn = activationFn;
+        // Pre-allocate activated buffer once at compile time (not per-replay)
+        var capturedActivated = new float[m * h];
 
         fused = new CompiledStep<T>(
             "FusedTwoLayer",
@@ -119,7 +121,7 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
                 var w1Arr = (float[])(object)capturedW1.GetDataArray();
                 var w2Arr = (float[])(object)capturedW2.GetDataArray();
                 var outArr = (float[])(object)output.GetDataArray();
-                var activated = new float[cm * ch];
+                var activated = capturedActivated;
                 FusedMultiLayerGemm.FusedGemmActivationGemm(
                     inArr, w1Arr, w2Arr, outArr, activated, cm, ck, ch, cn, capturedActivationFn);
             },

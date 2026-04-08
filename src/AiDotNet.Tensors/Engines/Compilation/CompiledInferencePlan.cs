@@ -113,7 +113,13 @@ internal sealed class CompiledInferencePlan<T>
         // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
         var optimizedSteps = RunCpuOptimizationPasses(specializedSteps, engine);
 
-        var finalOutput = steps.Count > 0 ? steps[steps.Count - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
+        // Clear LazySource on all compiled output tensors to prevent auto-materialization
+        // from re-triggering lazy graph execution after compilation
+        foreach (var step in optimizedSteps)
+            step.OutputBuffer.LazySource = null;
+
+        // Use the last optimized step's output (may differ from original after fusion/spectral passes)
+        var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
         return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine);
     }
 

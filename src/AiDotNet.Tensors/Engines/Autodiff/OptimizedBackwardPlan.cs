@@ -22,7 +22,6 @@ internal sealed class OptimizedBackwardPlan<T>
     private readonly Tensor<T> _loss;
     private readonly Tensor<T>[]? _sources;
     private readonly IEngine _engine;
-    private readonly BackwardAnalysis _analysis;
 
     internal OptimizedBackwardPlan(
         TapeEntryArena<T> entries,
@@ -37,7 +36,7 @@ internal sealed class OptimizedBackwardPlan<T>
         _loss = loss;
         _sources = sources;
         _engine = engine;
-        _analysis = analysis;
+        _ = analysis; // Retained for future backward optimization passes
     }
 
     /// <summary>

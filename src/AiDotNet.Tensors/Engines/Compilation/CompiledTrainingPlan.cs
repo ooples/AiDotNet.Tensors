@@ -1052,24 +1052,9 @@ internal sealed class CompiledTrainingPlan<T>
 
         // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
 
-        // Transpose forward: zero-copy strided view (same as PyTorch .t())
-        // Replace the output buffer with a strided view of the input at compile time.
-        // The execute delegate is a no-op — data is accessed through stride permutation.
-        if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1
-            && step.Inputs[0].Rank == 2)
-        {
-            var inp = step.Inputs[0];
-            // Create the strided view once at compile time and replace the step's output
-            var view = inp.Transpose();
-            // Mutate the step's output buffer reference to point to the view
-            // This way, downstream steps that read from this output get the view directly
-            var viewRef = view;
-            return eng =>
-            {
-                // No-op: the output IS the strided view of the input.
-                // Data access goes through stride permutation — zero copy.
-            };
-        }
+        // Transpose: fall through to generic path.
+        // Zero-copy transpose requires replacing OutputBuffer references in downstream steps,
+        // which is not yet supported by the compiled step infrastructure.
 
         return null;
     }

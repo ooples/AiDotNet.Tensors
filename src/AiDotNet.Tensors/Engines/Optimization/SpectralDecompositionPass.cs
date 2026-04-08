@@ -69,7 +69,6 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         var input = step.Inputs[0];
         var capturedInput = input;
         var capturedFactors = factors.Value;
-        int xCols = input._shape.Length >= 2 ? input._shape[^1] : input._shape[0];
 
         // Pre-allocate workspace for spectral matmul (avoids per-call allocation)
         int xRows = input._shape.Length >= 2 ? input._shape[0] : 1;
