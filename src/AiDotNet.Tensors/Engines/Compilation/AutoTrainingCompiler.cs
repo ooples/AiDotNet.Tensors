@@ -67,10 +67,12 @@ internal static class AutoTrainingCompiler
             return null;
         }
 
-        // Enable replay mode: suppress tape recording on subsequent forward passes
-        // since we'll use the compiled backward graph instead
-        ReplayMode = true;
-        return State.TryGetCompiledBackward<T>();
+        var compiled = State.TryGetCompiledBackward<T>();
+        // Only enable replay mode if we actually got a compiled backward graph.
+        // If TryGetCompiledBackward returns null (type mismatch, etc.), recording
+        // must continue so the tape-based backward path can function.
+        ReplayMode = compiled is not null;
+        return compiled;
     }
 
     /// <summary>

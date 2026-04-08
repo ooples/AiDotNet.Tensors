@@ -64,11 +64,12 @@ internal static class DifferentiableOps
         object[]? savedState = null)
     {
         if (_anyTapeActive == 0) return;
-        // Replay mode: compiled backward graph replaces tape — skip recording (~200ns saved per op)
-        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
+        // Replay mode: compiled backward graph replaces tape — skip recording (~200ns saved per op).
+        // Checked AFTER tape null check so only persistent tapes that triggered compilation are affected.
+        if (tape.Options.Persistent && Compilation.AutoTrainingCompiler.ReplayMode) return;
 
         ref var slot = ref tape.RecordSlot();
         slot.OperationName = opName;
@@ -123,9 +124,9 @@ internal static class DifferentiableOps
     {
         // Fast path: skip ThreadStatic read entirely when no tape exists globally
         if (_anyTapeActive == 0) return;
-        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        if (tape.Options.Persistent && Compilation.AutoTrainingCompiler.ReplayMode) return;
 
         ref var slot = ref tape.RecordSlot();
         slot.OperationName = opName;
@@ -154,9 +155,9 @@ internal static class DifferentiableOps
         object[]? savedState = null)
     {
         if (_anyTapeActive == 0) return;
-        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        if (tape.Options.Persistent && Compilation.AutoTrainingCompiler.ReplayMode) return;
 
         ref var slot = ref tape.RecordSlot();
         slot.OperationName = opName;

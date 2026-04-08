@@ -674,6 +674,8 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        // Clear replay mode so the next tape on this thread records normally
+        Compilation.AutoTrainingCompiler.ReplayMode = false;
         System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         SetCurrentTape(_parent);
         // Return arena to thread-local cache for reuse by next GradientTape

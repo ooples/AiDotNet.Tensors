@@ -1,6 +1,7 @@
 #if NET8_0_OR_GREATER
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
@@ -99,6 +100,8 @@ public class AutogradComparisonBenchmarks
         _torchB1?.Dispose(); _torchB2?.Dispose(); _torchB3?.Dispose();
         _torchSmallA?.Dispose(); _torchSmallB?.Dispose();
         _torchMlpModule?.Dispose();
+        _persistentTapeAutoCompiled?.Dispose();
+        _persistentTapeEager?.Dispose();
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -245,38 +248,62 @@ public class AutogradComparisonBenchmarks
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // 5. AUTO-COMPILED PERSISTENT TAPE: transparent zero-overhead
-    // Uses persistent GradientTape that auto-compiles after 2 warmup steps.
-    // After warmup, tape recording is suppressed and backward is compiled.
-    // This is the key benchmark proving zero-overhead autograd.
+    // 5. AiDotNet INTERNAL: Auto-compilation speedup measurement
+    // Compares AiDotNet eager vs AiDotNet auto-compiled to measure the
+    // compilation benefit. NOT compared against TorchSharp — that would
+    // be compiled vs eager (unfair). The fair cross-library comparison
+    // is sections 1-4 above (both eager).
     // ═══════════════════════════════════════════════════════════════════
 
-    private GradientTape<float>? _persistentTape;
+    private GradientTape<float>? _persistentTapeAutoCompiled;
+    private GradientTape<float>? _persistentTapeEager;
 
     [IterationSetup(Target = nameof(AiDotNet_AutoCompiled_MLP_NoBias_TrainStep))]
-    public void SetupPersistentTape()
+    public void SetupAutoCompiledTape()
     {
         // Create persistent tape and run 3 warmup steps to trigger auto-compilation
-        _persistentTape?.Dispose();
-        _persistentTape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+        _persistentTapeAutoCompiled?.Dispose();
+        _persistentTapeAutoCompiled = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
         for (int warmup = 0; warmup < 3; warmup++)
         {
             var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
             var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
             var output = _engine.TensorMatMul(h2, _aiW3);
             var loss = _engine.ReduceSum(output, null);
-            _persistentTape.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+            _persistentTapeAutoCompiled.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
         }
     }
 
-    [Benchmark(Description = "AiDotNet AutoCompiled: MLP-NoBias[32x128->64->32->10] train")]
+    [Benchmark(Description = "AiDotNet AutoCompiled: MLP-NoBias train (vs AiDotNet Eager above)")]
     public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_AutoCompiled_MLP_NoBias_TrainStep()
     {
         var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
         var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
         var output = _engine.TensorMatMul(h2, _aiW3);
         var loss = _engine.ReduceSum(output, null);
-        return _persistentTape!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+        return _persistentTapeAutoCompiled!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+    }
+
+    [IterationSetup(Target = nameof(AiDotNet_PersistentEager_MLP_NoBias_TrainStep))]
+    public void SetupPersistentEagerTape()
+    {
+        // Same persistent tape setup, but disable auto-compilation to isolate eager performance
+        _persistentTapeEager?.Dispose();
+        AutoTrainingCompiler.Enabled = false;
+        AutoTrainingCompiler.ReplayMode = false;
+        _persistentTapeEager = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+    }
+
+    [Benchmark(Description = "AiDotNet Persistent Eager: MLP-NoBias train (baseline for auto-compile)")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_PersistentEager_MLP_NoBias_TrainStep()
+    {
+        var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
+        var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
+        var output = _engine.TensorMatMul(h2, _aiW3);
+        var loss = _engine.ReduceSum(output, null);
+        var result = _persistentTapeEager!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+        AutoTrainingCompiler.Enabled = true; // restore for other benchmarks
+        return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════
