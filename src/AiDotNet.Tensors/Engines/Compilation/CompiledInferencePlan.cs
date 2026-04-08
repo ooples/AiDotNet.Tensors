@@ -79,6 +79,7 @@ internal sealed class CompiledInferencePlan<T>
             // Zero-copy transpose: replace output buffer with strided view, no-op execute
             if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
             {
+                var originalOutput = step.OutputBuffer;
                 var view = step.Inputs[0].Transpose();
                 specializedSteps[i] = new CompiledStep<T>(
                     step.OpName,
@@ -87,6 +88,33 @@ internal sealed class CompiledInferencePlan<T>
                     step.Inputs,
                     step.BackwardFn,
                     step.SavedState);
+
+                // Rewrite downstream steps: replace any input reference to the original
+                // OutputBuffer with the new view so they read from the strided view
+                for (int j = i + 1; j < steps.Count; j++)
+                {
+                    var downstream = steps[j];
+                    bool rewritten = false;
+                    var newInputs = new Tensor<T>[downstream.Inputs.Length];
+                    for (int k = 0; k < downstream.Inputs.Length; k++)
+                    {
+                        if (ReferenceEquals(downstream.Inputs[k], originalOutput))
+                        {
+                            newInputs[k] = view;
+                            rewritten = true;
+                        }
+                        else
+                        {
+                            newInputs[k] = downstream.Inputs[k];
+                        }
+                    }
+                    if (rewritten)
+                    {
+                        steps[j] = new CompiledStep<T>(
+                            downstream.OpName, downstream.Execute, downstream.OutputBuffer,
+                            newInputs, downstream.BackwardFn, downstream.SavedState);
+                    }
+                }
                 continue;
             }
 

@@ -101,8 +101,25 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         if (!TensorCodecOptimizer.CanFuseDataflow(h))
             return false;
 
-        // Get activation function delegate (activationType already validated above)
-        var activationFn = CpuFusedOperations.GetFloatActivation(activationType);
+        // Get activation function delegate, with parameter capture for parameterized activations
+        Func<float, float> activationFn;
+        if (activationType == FusedActivationType.LeakyReLU && activation.SavedState is { Length: > 0 })
+        {
+            // Extract alpha from savedState (LeakyReLU stores alpha as first element)
+            float alpha = activation.SavedState[0] is float f ? f
+                : activation.SavedState[0] is double d ? (float)d : 0.01f;
+            activationFn = x => x >= 0 ? x : alpha * x;
+        }
+        else if (activationType == FusedActivationType.ELU && activation.SavedState is { Length: > 0 })
+        {
+            float alpha = activation.SavedState[0] is float f ? f
+                : activation.SavedState[0] is double d ? (float)d : 1.0f;
+            activationFn = x => x >= 0 ? x : alpha * (MathF.Exp(x) - 1f);
+        }
+        else
+        {
+            activationFn = CpuFusedOperations.GetFloatActivation(activationType);
+        }
 
         var capturedInput = input;
         var capturedW1 = w1;

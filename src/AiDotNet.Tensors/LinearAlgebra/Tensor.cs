@@ -2822,7 +2822,8 @@ public class Tensor<T> : TensorBase<T>, IEnumerable<T>
             int cols = _shape[1];
             int otherCols = other.Rank == 2 ? other._shape[1] : other._shape[0];
             bool isBiasAdd = cols == otherCols && (other.Rank == 1 || other._shape[0] == 1);
-            if (isBiasAdd && IsContiguous && other.IsContiguous)
+            if (isBiasAdd && IsContiguous && other.IsContiguous
+                && _storageOffset == 0 && other._storageOffset == 0)
             {
                 var biasResult = Helpers.AutoTensorCache.RentOrAllocate<T>(_shape);
                 var aData = GetDataArray();
