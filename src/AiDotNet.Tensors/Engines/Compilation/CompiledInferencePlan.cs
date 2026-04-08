@@ -111,25 +111,49 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var step = steps[i];
 
-            // Transpose optimization: execute a contiguous copy into the output buffer
-            // instead of the full engine dispatch. The output remains contiguous (safe for
-            // downstream GetDataArray() fast paths), unlike a strided view which would break
-            // array-based specializations that assume dense row-major storage.
+            // Transpose optimization: use fast Data.Span path when input is contiguous
+            // with zero offset, fall back to eng.TensorTranspose for views/slices
             if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
             {
-                var capturedStep = step;
+                var capturedInput = step.Inputs[0];
                 var capturedOutput = step.OutputBuffer;
-                specializedSteps[i] = new CompiledStep<T>(
-                    step.OpName,
-                    (eng, o) =>
-                    {
-                        var transposed = eng.TensorTranspose(capturedStep.Inputs[0]);
-                        transposed.AsSpan().CopyTo(capturedOutput.Data.Span);
-                    },
-                    step.OutputBuffer,
-                    step.Inputs,
-                    step.BackwardFn,
-                    step.SavedState);
+                bool canUseFastPath = capturedInput.IsContiguous && capturedInput._storageOffset == 0;
+
+                if (canUseFastPath)
+                {
+                    // Fast path: direct data access (zero-offset contiguous tensor)
+                    int rows = capturedInput._shape[0];
+                    int cols = capturedInput._shape[1];
+                    specializedSteps[i] = new CompiledStep<T>(
+                        step.OpName,
+                        (eng, o) =>
+                        {
+                            var src = capturedInput.GetDataArray();
+                            var dst = capturedOutput.GetDataArray();
+                            for (int r = 0; r < rows; r++)
+                                for (int c = 0; c < cols; c++)
+                                    dst[c * rows + r] = src[r * cols + c];
+                        },
+                        step.OutputBuffer,
+                        step.Inputs,
+                        step.BackwardFn,
+                        step.SavedState);
+                }
+                else
+                {
+                    // Safe path: use engine transpose for views/slices with offset
+                    specializedSteps[i] = new CompiledStep<T>(
+                        step.OpName,
+                        (eng, o) =>
+                        {
+                            var transposed = eng.TensorTranspose(capturedInput);
+                            transposed.AsSpan().CopyTo(capturedOutput.AsWritableSpan());
+                        },
+                        step.OutputBuffer,
+                        step.Inputs,
+                        step.BackwardFn,
+                        step.SavedState);
+                }
                 continue;
             }
 

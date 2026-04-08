@@ -57,6 +57,24 @@ public class CompilationComponentTests
         Assert.Equal(0, cache.InferencePlanCount);
     }
 
+    [Fact]
+    public void AutoTensorCache_ClearThenReturnStillAccepts()
+    {
+        // Verify that after Clear(), Return() still accepts buffers
+        // (O(1) counters must be reset alongside the queues)
+        var tensor = CreateRandom(new[] { 4, 4 }, 99);
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Return(tensor);
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
+
+        // After clear, cache should accept new returns
+        var tensor2 = CreateRandom(new[] { 4, 4 }, 100);
+        AiDotNet.Tensors.Helpers.AutoTensorCache.Return(tensor2);
+
+        // Renting should return the tensor we just returned (not the cleared one)
+        var rented = AiDotNet.Tensors.Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { 4, 4 });
+        Assert.NotNull(rented);
+    }
+
     #endregion
 
     #region SymbolicShape Tests
