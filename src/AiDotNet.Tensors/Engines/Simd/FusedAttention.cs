@@ -27,6 +27,11 @@ internal static class FusedAttention
     private const int DefaultBr = 32;  // Query tile — tuned for L1
     private const int DefaultBc = 32;  // Key tile — tuned for L1
 
+    // Thread-local work buffers to avoid per-call allocation in compiled plans
+    [ThreadStatic] private static float[]? _tlRowMax;
+    [ThreadStatic] private static float[]? _tlRowSum;
+    [ThreadStatic] private static float[]? _tlScores;
+
     /// <summary>
     /// Flash Attention forward: O = softmax(Q @ K^T / sqrt(d)) @ V
     /// </summary>
@@ -39,9 +44,13 @@ internal static class FusedAttention
         int br = Math.Min(DefaultBr, seqQ);
         int bc = Math.Min(DefaultBc, seqK);
 
-        var rowMax = new float[br];
-        var rowSum = new float[br];
-        var localScores = new float[br * bc];
+        // Reuse thread-local work buffers to avoid per-call allocation
+        var rowMax = _tlRowMax;
+        if (rowMax is null || rowMax.Length < br) _tlRowMax = rowMax = new float[br];
+        var rowSum = _tlRowSum;
+        if (rowSum is null || rowSum.Length < br) _tlRowSum = rowSum = new float[br];
+        var localScores = _tlScores;
+        if (localScores is null || localScores.Length < br * bc) _tlScores = localScores = new float[br * bc];
 
         Array.Clear(output, 0, seqQ * headDim);
 

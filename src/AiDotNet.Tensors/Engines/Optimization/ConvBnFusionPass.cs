@@ -189,8 +189,12 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                         capturedPaddings[0], capturedPaddings[1],
                         capturedDilations[0], capturedDilations[1], capturedActivation);
                 else
+                {
                     result = eng.Conv2D(capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings, capturedDilations);
+                    // Add the fused BN bias (Conv2D alone doesn't include bias)
+                    result = eng.TensorBroadcastAdd(result, capturedFusedBias);
+                }
 
                 result.AsSpan().CopyTo(output.AsWritableSpan());
             },

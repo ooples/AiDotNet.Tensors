@@ -45,11 +45,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     /// <summary>
     /// Executes the compiled plan. Runs each step's delegate in order.
-    /// All buffers are pre-allocated — zero allocation during execution.
+    /// All buffers are pre-allocated - zero allocation during execution.
+    /// Throws ObjectDisposedException if the plan has been disposed.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Execute()
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
         var steps = _steps;
         var engine = _engine;
         for (int i = 0; i < steps.Length; i++)

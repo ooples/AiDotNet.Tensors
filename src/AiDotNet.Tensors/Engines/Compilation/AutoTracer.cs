@@ -190,6 +190,9 @@ internal sealed class AutoTracerState
                 {
                     long oldest = _evictionOrder.First!.Value;
                     _evictionOrder.RemoveFirst();
+                    // Dispose evicted plan if it implements IDisposable (GCHandle cleanup)
+                    if (_compiledPlans.TryGetValue(oldest, out var evicted) && evicted is IDisposable disposable)
+                        disposable.Dispose();
                     _compiledPlans.Remove(oldest);
                 }
 
