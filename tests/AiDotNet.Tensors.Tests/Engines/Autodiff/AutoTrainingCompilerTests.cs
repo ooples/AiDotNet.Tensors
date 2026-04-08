@@ -20,14 +20,14 @@ public class AutoTrainingCompilerTests : IDisposable
     // Always restore global state after each test to prevent cross-test contamination
     public AutoTrainingCompilerTests()
     {
+        AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
-        AutoTrainingCompiler.ReplayMode = false;
     }
 
     public void Dispose()
     {
+        AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
-        AutoTrainingCompiler.ReplayMode = false;
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -133,10 +133,12 @@ public class AutoTrainingCompilerTests : IDisposable
     }
 
     [Fact]
-    public void PersistentTape_DifferentLossTensors_SameOps_DoesNotActivateReplayMode()
+    public void PersistentTape_DifferentLossTensors_SameOps_ActivatesReplayMode()
     {
-        // Two steps with the same tape ops but DIFFERENT loss tensor instances
-        // should produce different hashes and NOT trigger compilation.
+        // Two steps with the same op pattern but different loss tensor instances
+        // SHOULD trigger compilation — loss tensors are always recreated each forward
+        // pass, so identity-based matching would prevent compilation in all real training.
+        // The pattern hash (op names + shapes) identifies the computation structure.
         var input = new Tensor<float>(new float[] { 1f, 0f, 0f, 1f }, new[] { 2, 2 });
         var weight = new Tensor<float>(new float[] { 2f, 0f, 0f, 2f }, new[] { 2, 2 });
 
@@ -158,9 +160,9 @@ public class AutoTrainingCompilerTests : IDisposable
             tape.ComputeGradients(loss2, new[] { weight });
         }
 
-        // Different loss identities → hash mismatch → no compilation → ReplayMode must be false
-        Assert.False(AutoTrainingCompiler.ReplayMode,
-            "ReplayMode must stay false when loss tensor identity changes between steps");
+        // Same op pattern → compilation triggers → ReplayMode active
+        Assert.True(AutoTrainingCompiler.ReplayMode,
+            "ReplayMode should activate when op pattern matches, even with new loss tensor instances");
     }
 
     [Fact]

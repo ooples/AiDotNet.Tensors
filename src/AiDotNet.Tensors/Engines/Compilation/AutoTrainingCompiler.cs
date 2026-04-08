@@ -20,6 +20,13 @@ internal static class AutoTrainingCompiler
 {
     internal static bool Enabled { get; set; } = true;
 
+    /// <summary>Resets all thread-static state. Used by tests to ensure isolation.</summary>
+    internal static void ResetState()
+    {
+        _state = null;
+        ReplayMode = false;
+    }
+
     /// <summary>
     /// When true, DifferentiableOps.RecordIfActive skips tape recording entirely.
     /// Set after auto-compilation succeeds — the compiled backward graph replaces
@@ -41,12 +48,10 @@ internal static class AutoTrainingCompiler
     internal static void RecordStep<T>(TapeEntryArena<T> entries, int entryCount, Tensor<T>? loss = null)
     {
         if (!Enabled) return;
+        // Pattern hash is based on op sequence + shapes only — NOT loss tensor identity.
+        // Loss tensors are recreated each forward pass (different object each step),
+        // so including identity would prevent pattern detection across steps.
         long hash = ComputePatternHash(entries, entryCount);
-        if (loss is not null)
-        {
-            hash ^= System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(loss);
-            hash *= unchecked((long)0x100000001b3L);
-        }
         State.RecordStepHash(hash);
     }
 
@@ -115,13 +120,14 @@ internal static class AutoTrainingCompiler
     }
 
     /// <summary>
-    /// Incorporates loss tensor and source tensor identities into the pattern hash
-    /// so that different tapes/losses/sources don't collide.
+    /// Incorporates source tensor identities into the pattern hash so that different
+    /// parameter sets don't reuse the wrong backward plan.
+    /// Note: loss tensor identity is NOT included because loss tensors are recreated
+    /// each forward pass. The op structure (captured in tape entries hash) already
+    /// identifies the computation pattern including the loss function type.
     /// </summary>
     private static long IncludeTargetIdentity<T>(long hash, Tensor<T> loss, Tensor<T>[]? sources)
     {
-        hash ^= RuntimeHelpers.GetHashCode(loss);
-        hash *= unchecked((long)0x100000001b3L);
         if (sources is not null)
         {
             foreach (var src in sources)
@@ -167,7 +173,8 @@ internal static class AutoTrainingCompiler
 /// </summary>
 internal sealed class AutoTrainingState
 {
-    private long _lastStepHash;
+    private long _lastStepHash;    // Pattern hash (ops + shapes only) for repeat detection
+    private long _compiledHash;    // Full hash (pattern + sources) for compiled backward lookup
     private int _repeatCount;
     private object? _compiledBackward; // CompiledBackwardGraph<T> — type-erased
     private bool _compiledStored;
@@ -178,8 +185,10 @@ internal sealed class AutoTrainingState
 
     internal bool HasCompiledPlan => _compiledStored;
     internal bool ShouldCompile => _repeatCount >= CompileThreshold && !_compiledStored && !_compilationFailed;
-    internal bool MatchesCompiledHash(long hash) => _compiledStored && hash == _lastStepHash;
+    internal bool MatchesCompiledHash(long hash) => _compiledStored && hash == _compiledHash;
     internal void MarkCompilationFailed() => _compilationFailed = true;
+    internal int RepeatCount => _repeatCount;
+    internal bool CompilationFailed => _compilationFailed;
 
     internal void RecordStepHash(long hash)
     {
@@ -187,13 +196,17 @@ internal sealed class AutoTrainingState
         {
             _repeatCount++;
         }
-        else
+        else if (!_compiledStored || hash != _lastStepHash)
         {
+            // New pattern — reset state. But don't drop compiled state if
+            // the pattern hash matches (only the full hash differs due to sources).
             _lastStepHash = hash;
             _repeatCount = 1;
-            _compiledStored = false;
-            _compilationFailed = false;
-            _compiledBackward = null;
+            if (!_compiledStored)
+            {
+                _compilationFailed = false;
+                _compiledBackward = null;
+            }
         }
     }
 
@@ -207,7 +220,7 @@ internal sealed class AutoTrainingState
     {
         _compiledBackward = compiled;
         _compiledStored = true;
-        _lastStepHash = hash;
+        _compiledHash = hash; // Store full hash (pattern + sources) for lookup matching
     }
 
     internal CompiledBackwardGraph<T>? TryGetCompiledBackward<T>()

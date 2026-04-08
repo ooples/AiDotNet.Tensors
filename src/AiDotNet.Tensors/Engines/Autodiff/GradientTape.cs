@@ -200,33 +200,43 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         }
 
-        // Graph-based backward: walk GradFn pointers instead of tape.
-        // This is faster because it skips tape traversal, dict lookups, and relevance checks.
-        // Skip graph path when anomaly detection or hooks are enabled — the tape path handles those.
+        // Auto-training compiler: highest priority — use compiled backward if available.
+        // Must be checked BEFORE the graph path because DifferentiableOps always records
+        // (GradFn is always set), so the graph path would always win otherwise.
         bool hasHooksRegistered = _hooks is not null && _hooks.Count > 0;
-        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
-        {
-            var result = ComputeGradientsViaGraph(loss, sources);
-
-            // Record step pattern for auto-compilation (same as tape-based path below)
-            if (_options.Persistent)
-            {
-                Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
-                Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
-            }
-
-            if (!_options.Persistent) _entries.Reset();
-            return result;
-        }
-
-        // Auto-training compiler: reuse compiled backward graph if pattern matches
         if (_options.Persistent && !createGraph)
         {
             var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
             if (compiledBwd is not null)
             {
-                return compiledBwd.Execute();
+                return compiledBwd.Execute(loss);
             }
+        }
+
+        // Graph-based backward: walk GradFn pointers instead of tape.
+        // This is faster because it skips tape traversal, dict lookups, and relevance checks.
+        // Skip graph path when anomaly detection or hooks are enabled — the tape path handles those.
+        if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
+        {
+            // Record step pattern BEFORE backward — backward ops get recorded on the tape
+            // (since DifferentiableOps always records), which would make the hash nondeterministic.
+            // The pattern hash should only reflect the forward pass ops.
+            int forwardEntryCount = _entries.Count;
+            if (_options.Persistent)
+            {
+                Compilation.AutoTrainingCompiler.RecordStep(_entries, forwardEntryCount, loss);
+            }
+
+            var result = ComputeGradientsViaGraph(loss, sources);
+
+            // Try to compile AFTER backward (needs tape entries for CompileBackward)
+            if (_options.Persistent)
+            {
+                Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
+            }
+
+            if (!_options.Persistent) _entries.Reset();
+            return result;
         }
 
         var engine = _engine;

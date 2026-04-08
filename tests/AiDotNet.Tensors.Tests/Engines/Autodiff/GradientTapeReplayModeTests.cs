@@ -21,14 +21,14 @@ public class GradientTapeReplayModeTests : IDisposable
 
     public GradientTapeReplayModeTests()
     {
+        AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
-        AutoTrainingCompiler.ReplayMode = false;
     }
 
     public void Dispose()
     {
+        AutoTrainingCompiler.ResetState();
         AutoTrainingCompiler.Enabled = true;
-        AutoTrainingCompiler.ReplayMode = false;
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -236,5 +236,74 @@ public class GradientTapeReplayModeTests : IDisposable
         Assert.True(AutoTrainingCompiler.ReplayMode == compiledBefore,
             $"Inner tape dispose must not change outer tape's ReplayMode " +
             $"(was {compiledBefore}, now {AutoTrainingCompiler.ReplayMode})");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // createGraph compatibility: forward ops must still record GradFn
+    // even after auto-compilation has triggered
+    // ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CreateGraph_WorksAfterAutoCompilation()
+    {
+        // After auto-compilation triggers, forward ops must still record to tape
+        // and set GradFn on outputs. Without this, createGraph:true would fail
+        // because the tape would be empty and GradFn would be null.
+        var x = new Tensor<float>(new float[] { 2f, 3f }, new[] { 2 });
+        var w = new Tensor<float>(new float[] { 1f, 1f }, new[] { 2 });
+
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+        // Warm up: 3 identical steps to trigger auto-compilation
+        for (int i = 0; i < 3; i++)
+        {
+            tape.Reset();
+            var y = _engine.TensorMultiply(x, w);
+            var loss = _engine.ReduceSum(y, null);
+            tape.ComputeGradients(loss, new[] { w });
+        }
+
+        // Now do a forward pass and use createGraph:true
+        tape.Reset();
+        var y2 = _engine.TensorMultiply(x, w);
+        var loss2 = _engine.ReduceSum(y2, null);
+
+        // This must NOT throw — the tape must have recorded ops and set GradFn
+        // even though auto-compilation may be active
+        var grads = tape.ComputeGradients(loss2, new[] { w }, createGraph: true);
+
+        Assert.NotNull(grads);
+        Assert.True(grads.Count > 0, "createGraph:true should produce gradients even after auto-compilation");
+    }
+
+    [Fact]
+    public void ForwardPass_RecordsTapeEntries_EvenAfterCompilation()
+    {
+        // Verifies that DifferentiableOps.RecordIfActive always records (no replay mode skip).
+        // This is the safety guarantee that makes createGraph:true possible.
+        var a = new Tensor<float>(new float[] { 1f, 2f, 3f }, new[] { 3 });
+        var b = new Tensor<float>(new float[] { 4f, 5f, 6f }, new[] { 3 });
+
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+
+        // Warm up to trigger compilation
+        for (int i = 0; i < 3; i++)
+        {
+            tape.Reset();
+            var r = _engine.TensorAdd(a, b);
+            var l = _engine.ReduceSum(r, null);
+            tape.ComputeGradients(l, new[] { a });
+        }
+
+        // After compilation, verify tape still records on next forward pass
+        tape.Reset();
+        var result = _engine.TensorAdd(a, b);
+        var loss = _engine.ReduceSum(result, null);
+
+        // Tape should have entries from the forward pass
+        Assert.True(tape.EntryCount > 0,
+            "Tape must record forward ops even after auto-compilation (needed for createGraph support)");
+
+        tape.ComputeGradients(loss, new[] { a });
     }
 }
