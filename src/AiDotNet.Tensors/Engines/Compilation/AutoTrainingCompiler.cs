@@ -37,10 +37,16 @@ internal static class AutoTrainingCompiler
     /// Called by GradientTape.GradientAndUpdate after backward pass completes.
     /// Records the training step pattern for future compilation.
     /// </summary>
-    internal static void RecordStep<T>(TapeEntryArena<T> entries, int entryCount)
+    internal static void RecordStep<T>(TapeEntryArena<T> entries, int entryCount, Tensor<T>? loss = null)
     {
         if (!Enabled) return;
-        State.RecordStepHash(ComputePatternHash(entries, entryCount));
+        long hash = ComputePatternHash(entries, entryCount);
+        if (loss is not null)
+        {
+            hash ^= System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(loss);
+            hash *= unchecked((long)0x100000001b3L);
+        }
+        State.RecordStepHash(hash);
     }
 
     /// <summary>
@@ -58,8 +64,12 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
-        // Validate current tape pattern matches the compiled plan's pattern
+        // Validate current tape pattern AND loss identity match the compiled plan.
+        // Including loss identity prevents returning a backward graph compiled for
+        // a different loss tensor when ReplayMode suppressed recording.
         long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
+        currentHash ^= System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(loss);
+        currentHash *= unchecked((long)0x100000001b3L);
         if (!State.MatchesCompiledHash(currentHash))
         {
             // Pattern changed — disable replay mode so recording resumes

@@ -50,6 +50,12 @@ public class AutogradComparisonBenchmarks
     private TorchTensor _torchSmallA = null!;
     private TorchTensor _torchSmallB = null!;
 
+    // Pre-transposed weight views for fair TorchSharp linear benchmarks
+    // (avoids per-iteration .t() overhead that AiDotNet doesn't incur)
+    private TorchTensor _torchW1T = null!;
+    private TorchTensor _torchW2T = null!;
+    private TorchTensor _torchW3T = null!;
+
     // TorchSharp nn.Sequential module (highest-level API available)
     private TorchSharp.Modules.Sequential _torchMlpModule = null!;
 
@@ -82,6 +88,11 @@ public class AutogradComparisonBenchmarks
         _torchSmallA = torch.randn([64], requires_grad: true);
         _torchSmallB = torch.randn([64], requires_grad: true);
 
+        // Pre-transpose weights for functional.linear benchmarks (avoids per-iteration .t())
+        _torchW1T = _torchW1.t();
+        _torchW2T = _torchW2.t();
+        _torchW3T = _torchW3.t();
+
         // TorchSharp nn.Sequential — the highest-level API available in TorchSharp.
         // This uses nn.Linear (matmul + bias) internally, matching AiDotNet FusedLinear.
         _torchMlpModule = torch.nn.Sequential(
@@ -99,6 +110,7 @@ public class AutogradComparisonBenchmarks
         _torchW1?.Dispose(); _torchW2?.Dispose(); _torchW3?.Dispose();
         _torchB1?.Dispose(); _torchB2?.Dispose(); _torchB3?.Dispose();
         _torchSmallA?.Dispose(); _torchSmallB?.Dispose();
+        _torchW1T?.Dispose(); _torchW2T?.Dispose(); _torchW3T?.Dispose();
         _torchMlpModule?.Dispose();
         _persistentTapeAutoCompiled?.Dispose();
         _persistentTapeEager?.Dispose();
@@ -205,10 +217,10 @@ public class AutogradComparisonBenchmarks
         _torchW1.grad?.zero_(); _torchW2.grad?.zero_(); _torchW3.grad?.zero_();
         _torchB1.grad?.zero_(); _torchB2.grad?.zero_(); _torchB3.grad?.zero_();
         // functional.linear = matmul + bias, matching AiDotNet FusedLinear
-        // Note: functional.linear expects weight as [out, in], so we transpose
-        var h1 = torch.nn.functional.relu(torch.nn.functional.linear(_torchInput, _torchW1.t(), _torchB1));
-        var h2 = torch.nn.functional.relu(torch.nn.functional.linear(h1, _torchW2.t(), _torchB2));
-        var output = torch.nn.functional.linear(h2, _torchW3.t(), _torchB3);
+        // Using pre-transposed views cached in Setup to avoid per-iteration .t() overhead
+        var h1 = torch.nn.functional.relu(torch.nn.functional.linear(_torchInput, _torchW1T, _torchB1));
+        var h2 = torch.nn.functional.relu(torch.nn.functional.linear(h1, _torchW2T, _torchB2));
+        var output = torch.nn.functional.linear(h2, _torchW3T, _torchB3);
         var loss = output.sum();
         loss.backward();
         return (_torchW1.grad!, _torchW2.grad!, _torchW3.grad!);
@@ -301,9 +313,15 @@ public class AutogradComparisonBenchmarks
         var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
         var output = _engine.TensorMatMul(h2, _aiW3);
         var loss = _engine.ReduceSum(output, null);
-        var result = _persistentTapeEager!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
-        AutoTrainingCompiler.Enabled = true; // restore for other benchmarks
-        return result;
+        return _persistentTapeEager!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+    }
+
+    [IterationCleanup(Target = nameof(AiDotNet_PersistentEager_MLP_NoBias_TrainStep))]
+    public void CleanupPersistentEagerTape()
+    {
+        // Restore global compiler state in cleanup to prevent leaking across benchmarks
+        AutoTrainingCompiler.Enabled = true;
+        AutoTrainingCompiler.ReplayMode = false;
     }
 
     // ═══════════════════════════════════════════════════════════════════

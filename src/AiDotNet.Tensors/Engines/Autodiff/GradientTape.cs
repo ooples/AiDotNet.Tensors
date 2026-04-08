@@ -440,6 +440,13 @@ public sealed class GradientTape<T> : IDisposable
                 }
             }
 
+            // Auto-training compiler: record step pattern for both filtered and unfiltered paths
+            if (_options.Persistent)
+            {
+                Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
+                Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
+            }
+
             if (!_options.Persistent)
             {
                 _entries.Reset();
@@ -448,12 +455,10 @@ public sealed class GradientTape<T> : IDisposable
             return filtered;
         }
 
-        // Auto-training compiler: record step pattern and try to compile for next call.
-        // This makes ComputeGradients auto-compile just like GradientAndUpdate does,
-        // so users get zero-overhead autograd regardless of which API they use.
+        // Auto-training compiler for unfiltered path (no sources specified)
         if (_options.Persistent)
         {
-            Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count);
+            Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
             Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
         }
 
@@ -658,7 +663,7 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         // Auto-training compiler: record step pattern for future compilation
-        Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count);
+        Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
 
         // If pattern repeats, compile backward graph for next time
         if (_options.Persistent)
