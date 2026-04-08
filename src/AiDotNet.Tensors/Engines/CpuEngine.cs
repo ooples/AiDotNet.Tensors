@@ -26223,12 +26223,13 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearReLU, "FusedLinearReLU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearReLU(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddReLUBackward); } }
+
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
         var result = ReLU(biased);
 
-        // Replace the 3 separate tape entries with a single fused entry
         RemoveLastNTapeEntries<T>(3);
         DifferentiableOps.RecordIfActive("FusedLinearReLU", result,
             new[] { input, weight, bias },
@@ -26240,6 +26241,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearSigmoid, "FusedLinearSigmoid", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSigmoid(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddSigmoidBackward); } }
+
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
         var result = TensorSigmoid(biased);
@@ -26254,6 +26257,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearTanh", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearTanh(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddTanhBackward); } }
+
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
         var result = Tanh(biased);
@@ -26268,6 +26273,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearGELU, "FusedLinearGELU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearGELU(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddGELUBackward); } }
+
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
@@ -26284,6 +26291,8 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearSwish", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSwish(ci, cw, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FusedMatMulAddSwishBackward); } }
+
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
         var preActivation = biased;
