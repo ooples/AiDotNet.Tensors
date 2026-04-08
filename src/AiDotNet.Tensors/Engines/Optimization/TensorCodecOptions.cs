@@ -44,4 +44,7 @@ public sealed class TensorCodecOptions
     /// <summary>Maximum hidden dimension for dataflow fusion L1 residency.
     /// H * Mr * sizeof(float) must fit in L1 cache (32KB).</summary>
     public int DataflowFusionMaxHidden { get; set; } = 512;
+
+    /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
+    public bool EnableMixedPrecision { get; set; }
 }
