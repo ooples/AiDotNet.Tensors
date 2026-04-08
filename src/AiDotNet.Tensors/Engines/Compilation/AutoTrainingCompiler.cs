@@ -76,7 +76,8 @@ internal static class AutoTrainingCompiler
         }
         catch
         {
-            // Compilation failed — continue with eager backward
+            // Compilation failed — mark as attempted to prevent infinite retry
+            State.MarkCompilationFailed();
         }
     }
 
@@ -118,9 +119,12 @@ internal sealed class AutoTrainingState
 
     private const int CompileThreshold = 2;
 
+    private bool _compilationFailed;
+
     internal bool HasCompiledPlan => _compiledStored;
-    internal bool ShouldCompile => _repeatCount >= CompileThreshold && !_compiledStored;
+    internal bool ShouldCompile => _repeatCount >= CompileThreshold && !_compiledStored && !_compilationFailed;
     internal bool MatchesCompiledHash(long hash) => _compiledStored && hash == _lastStepHash;
+    internal void MarkCompilationFailed() => _compilationFailed = true;
 
     internal void RecordStepHash(long hash)
     {
@@ -133,6 +137,7 @@ internal sealed class AutoTrainingState
             _lastStepHash = hash;
             _repeatCount = 1;
             _compiledStored = false;
+            _compilationFailed = false;
             _compiledBackward = null;
         }
     }

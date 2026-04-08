@@ -643,16 +643,24 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
             }
 #endif
+            // Scalar tail (already correct via MathF.Cosh)
             for (; i < length; i++)
                 output[i] = MathF.Cosh(input[i]);
 
-            // FastExp256 saturates at ~88.7, producing finite values instead of infinity.
-            // Correct any elements where |input| > 88 using scalar MathF.Cosh.
-            for (int j = 0; j < length; j++)
+            // FastExp256 saturates at ~88.7 — correct only SIMD-processed elements with extreme values.
+            // Scalar tail above already used MathF.Cosh, so only fix [0..simdEnd).
+            int simdEnd = i; // i is now past the SIMD range
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported)
             {
-                if (input[j] > 88f || input[j] < -88f)
-                    output[j] = MathF.Cosh(input[j]);
+                simdEnd = length & ~7; // same simdLength as the SIMD loop above
+                for (int j = 0; j < simdEnd; j++)
+                {
+                    if (input[j] > 88f || input[j] < -88f)
+                        output[j] = MathF.Cosh(input[j]);
+                }
             }
+#endif
         }
 
         /// <summary>
@@ -680,12 +688,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
                 output[i] = MathF.Sinh(input[i]);
 
-            // FastExp256 saturates at ~88.7 — correct extreme values with scalar fallback
-            for (int j = 0; j < length; j++)
+#if NET5_0_OR_GREATER
+            // FastExp256 saturates at ~88.7 — correct only SIMD-processed extreme values
+            if (Avx.IsSupported)
             {
-                if (input[j] > 88f || input[j] < -88f)
-                    output[j] = MathF.Sinh(input[j]);
+                int simdEnd = length & ~7;
+                for (int j = 0; j < simdEnd; j++)
+                {
+                    if (input[j] > 88f || input[j] < -88f)
+                        output[j] = MathF.Sinh(input[j]);
+                }
             }
+#endif
         }
 
         /// <summary>
