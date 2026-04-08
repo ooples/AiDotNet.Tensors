@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
@@ -93,13 +94,55 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
 
         consumed = softmaxIdx + 2 - index;
 
-        // For now, create a fused step that executes the ops sequentially
-        // but in a single compiled step (reduces dispatch overhead).
-        // True Flash Attention tiling is future work.
+        // Extract Q, K, V tensors and dimensions for Flash Attention
+        // QK step: Q @ K^T, so Q = qk.Inputs[0], K^T's source = qk.Inputs[1]
+        // attnV step: attn_weights @ V, so V = attnV.Inputs[1]
+        if (typeof(T) != typeof(float)) return false;
+
+        var queryTensor = qk.Inputs[0];
+        var keyTensor = qk.Inputs[1]; // This is K (or K^T depending on how the graph was built)
+        var valueTensor = attnV.Inputs[1];
+        var finalOutput = attnV.OutputBuffer;
+
+        // Determine if this is batched (4D: [batch*heads, seqQ, headDim]) or 2D
+        bool isBatched = queryTensor.Rank >= 3;
+
+        if (queryTensor.Rank == 2 && keyTensor.Rank == 2 && valueTensor.Rank == 2)
+        {
+            // 2D attention: [seqQ, headDim] @ [seqK, headDim]^T
+            int seqQ = queryTensor._shape[0];
+            int headDim = queryTensor._shape[1];
+            int seqK = keyTensor._shape[0];
+            float scale = 1f / MathF.Sqrt(headDim);
+
+            var capturedQ = queryTensor;
+            var capturedK = keyTensor;
+            var capturedV = valueTensor;
+
+            fused = new CompiledStep<T>(
+                "FlashAttention",
+                (eng, output) =>
+                {
+                    var qArr = (float[])(object)capturedQ.GetDataArray();
+                    var kArr = (float[])(object)capturedK.GetDataArray();
+                    var vArr = (float[])(object)capturedV.GetDataArray();
+                    var oArr = (float[])(object)output.GetDataArray();
+
+                    FusedAttention.FlashAttentionForward(
+                        qArr, kArr, vArr, oArr,
+                        seqQ, seqK, headDim, scale);
+                },
+                finalOutput,
+                new[] { queryTensor, keyTensor, valueTensor },
+                null, // Flash Attention backward is a separate kernel (not yet implemented)
+                null);
+
+            return true;
+        }
+
+        // For higher-rank tensors, fall back to dispatch fusion (sequential execution)
         var capturedSteps = new CompiledStep<T>[consumed];
         Array.Copy(steps, index, capturedSteps, 0, consumed);
-        var finalOutput = attnV.OutputBuffer;
-        var firstInputs = qk.Inputs;
 
         fused = new CompiledStep<T>(
             "FusedAttention",
@@ -109,8 +152,8 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
                     step.Execute(eng, step.OutputBuffer);
             },
             finalOutput,
-            firstInputs,
-            null, // Backward for fused attention needs custom implementation
+            qk.Inputs,
+            null,
             null);
 
         return true;

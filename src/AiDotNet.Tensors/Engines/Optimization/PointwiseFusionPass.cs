@@ -1,5 +1,6 @@
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -79,8 +80,38 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
         var lastOutput = steps[end].OutputBuffer;
         string fusedName = "Fused_" + string.Join("_", chainOps);
 
-        // Build a fused delegate that applies all ops in sequence
-        // Each op is applied element-wise in a single pass
+        // Try true single-pass fusion via FusedPointwise delegate composition
+        if (typeof(T) == typeof(float) && firstInput.IsContiguous)
+        {
+            var fusedDelegate = Simd.FusedPointwise.BuildFusedDelegate(chainOps.ToArray());
+            if (fusedDelegate is not null)
+            {
+                var capturedInput = firstInput;
+                var capturedFused = fusedDelegate;
+
+                return new CompiledStep<T>(
+                    fusedName,
+                    (eng, output) =>
+                    {
+                        var iMem = ((Tensor<float>)(object)capturedInput).Data;
+                        var oMem = ((Tensor<float>)(object)output).Data;
+                        using var pinI = iMem.Pin();
+                        using var pinO = oMem.Pin();
+                        unsafe
+                        {
+                            Simd.FusedPointwise.ApplyFused(
+                                (float*)pinI.Pointer, (float*)pinO.Pointer,
+                                capturedInput.Length, capturedFused);
+                        }
+                    },
+                    lastOutput,
+                    new[] { firstInput },
+                    null, // Backward incompatible with fused inputs — inference-only
+                    steps[end].SavedState);
+            }
+        }
+
+        // Fallback: dispatch fusion (sequential execution, fewer dispatch steps)
         var capturedSteps = new CompiledStep<T>[end - start + 1];
         Array.Copy(steps, start, capturedSteps, 0, capturedSteps.Length);
 
@@ -88,17 +119,12 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
             fusedName,
             (eng, output) =>
             {
-                // Execute the chain sequentially: each step uses its pre-allocated
-                // output buffer, eliminating intermediate tensor allocation.
-                // This is a scheduling optimization (fewer steps to dispatch),
-                // not a single-pass kernel — true element-wise fusion would require
-                // code generation (future work).
                 foreach (var step in capturedSteps)
                     step.Execute(eng, step.OutputBuffer);
             },
             lastOutput,
             new[] { firstInput },
-            null, // BackwardFn from last step is incompatible with fused inputs — inference-only
+            null,
             steps[end].SavedState);
     }
 
