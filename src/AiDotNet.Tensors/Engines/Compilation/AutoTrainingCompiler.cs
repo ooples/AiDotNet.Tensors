@@ -94,8 +94,9 @@ internal static class AutoTrainingCompiler
         for (int i = 0; i < entryCount; i++)
         {
             ref var entry = ref entries[i];
-            hash ^= entry.OperationName.GetHashCode();
-            hash *= unchecked((long)0x100000001b3L);
+            // Use FNV-1a over the operation name bytes for a deterministic hash
+            // (string.GetHashCode() is randomized per process in .NET Core)
+            hash = StableStringHash(entry.OperationName, hash);
             if (entry.Output is not null)
             {
                 foreach (int dim in entry.Output._shape)
@@ -104,6 +105,21 @@ internal static class AutoTrainingCompiler
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }
+        }
+        return hash;
+    }
+
+    /// <summary>
+    /// Deterministic FNV-1a hash over string characters (not affected by
+    /// .NET's per-process hash randomization).
+    /// </summary>
+    private static long StableStringHash(string s, long seed)
+    {
+        long hash = seed;
+        for (int i = 0; i < s.Length; i++)
+        {
+            hash ^= s[i];
+            hash *= unchecked((long)0x100000001b3L);
         }
         return hash;
     }

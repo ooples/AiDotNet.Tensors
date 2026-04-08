@@ -110,6 +110,14 @@ internal sealed class AutoTracerState
         long hash = ComputeLookupHash(opName, outputShape, paramHash, typeof(T).GetHashCode());
         if (_compiledPlans.TryGetValue(hash, out var plan))
         {
+            // FailedCompilationSentinel means this pattern was tried and failed —
+            // return null without retrying (prevents infinite compilation attempts)
+            if (ReferenceEquals(plan, FailedCompilationSentinel))
+            {
+                _currentSequence.Clear();
+                return null;
+            }
+
             // Reset sequence since we're using the compiled plan
             _currentSequence.Clear();
 

@@ -35,6 +35,10 @@ internal static class AutoTensorCache
     [ThreadStatic]
     private static ConcurrentDictionary<long, ConcurrentQueue<object>>? _pools;
 
+    // Approximate pool size counters — avoids O(n) ConcurrentQueue.Count
+    [ThreadStatic]
+    private static ConcurrentDictionary<long, int>? _poolCounters;
+
     // Track all thread-local pools so Clear() can flush all threads, not just the caller's
     private static readonly List<WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>> _allPools = new();
 
@@ -174,6 +178,10 @@ internal static class AutoTensorCache
             var tensor = (Tensor<T>)obj;
             if (ShapesMatch(tensor._shape, shape))
             {
+                // Decrement approximate pool counter
+                var counterKey = key + 0x7f7f7f7f7f7f7f7fL;
+                _poolCounters?.AddOrUpdate(counterKey, 0, (_, c) => Math.Max(0, c - 1));
+
                 // Clear mutable state from previous use to prevent stale metadata
                 tensor.Grad = null;
                 tensor.LazySource = null;
@@ -210,8 +218,21 @@ internal static class AutoTensorCache
         var pool = pools.GetOrAdd(key, _ => new ConcurrentQueue<object>());
 
         int maxCopies = GetMaxPerShape(elements);
-        if (pool.Count < maxCopies)
-            pool.Enqueue(tensor);
+        if (maxCopies <= 0) return;
+        // Track approximate pool size with Interlocked counter to avoid
+        // O(n) ConcurrentQueue.Count. The counter is approximate under
+        // contention but bounded — worst case is one extra buffer.
+        var counterKey = key + 0x7f7f7f7f7f7f7f7fL; // offset to avoid collision with pool key
+        var counters = _poolCounters;
+        if (counters == null)
+        {
+            counters = new ConcurrentDictionary<long, int>();
+            _poolCounters = counters;
+        }
+        int current = counters.GetOrAdd(counterKey, 0);
+        if (current >= maxCopies) return;
+        pool.Enqueue(tensor);
+        counters.AddOrUpdate(counterKey, 1, (_, c) => c + 1);
     }
 
     /// <summary>Clears all cached tensors across all threads, releasing memory immediately.</summary>
