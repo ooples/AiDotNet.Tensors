@@ -132,7 +132,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Sigmoid: Eager {0:F4}ms", eagerSigMs);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void AllActivations_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -170,7 +170,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void AllBinaryOps_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -207,7 +207,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void MatMul_VaryingSizes_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -245,7 +245,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             }
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void CNN_Conv2D_ReLU_Pool_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -278,7 +278,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("  Compiled: {0:F4}ms ({1:F2}x)", compiledMs, eagerMs / compiledMs);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void TransformerBlock_MatMul_Softmax_MatMul_CompiledVsEager()
         {
             var engine = new CpuEngine();
@@ -409,7 +409,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 eagerMs, compiledMs, eagerMs / compiledMs);
         }
 
-        [Fact]
+        [Fact(Skip = "Performance benchmark — run manually")]
         public void RealisticTraining_MLP_MSELoss_CompiledVsEager()
         {
             var engine = new CpuEngine();
