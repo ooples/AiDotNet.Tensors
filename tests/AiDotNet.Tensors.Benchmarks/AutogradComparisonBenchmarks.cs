@@ -245,8 +245,43 @@ public class AutogradComparisonBenchmarks
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // 5. COMPILED PLANS: AiDotNet-only (no TorchSharp equivalent)
-    // Shows speedup from graph compilation over AiDotNet eager.
+    // 5. AUTO-COMPILED PERSISTENT TAPE: transparent zero-overhead
+    // Uses persistent GradientTape that auto-compiles after 2 warmup steps.
+    // After warmup, tape recording is suppressed and backward is compiled.
+    // This is the key benchmark proving zero-overhead autograd.
+    // ═══════════════════════════════════════════════════════════════════
+
+    private GradientTape<float>? _persistentTape;
+
+    [IterationSetup(Target = nameof(AiDotNet_AutoCompiled_MLP_NoBias_TrainStep))]
+    public void SetupPersistentTape()
+    {
+        // Create persistent tape and run 3 warmup steps to trigger auto-compilation
+        _persistentTape?.Dispose();
+        _persistentTape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+        for (int warmup = 0; warmup < 3; warmup++)
+        {
+            var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
+            var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
+            var output = _engine.TensorMatMul(h2, _aiW3);
+            var loss = _engine.ReduceSum(output, null);
+            _persistentTape.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+        }
+    }
+
+    [Benchmark(Description = "AiDotNet AutoCompiled: MLP-NoBias[32x128->64->32->10] train")]
+    public Dictionary<Tensor<float>, Tensor<float>> AiDotNet_AutoCompiled_MLP_NoBias_TrainStep()
+    {
+        var h1 = _engine.ReLU(_engine.TensorMatMul(_aiInput, _aiW1));
+        var h2 = _engine.ReLU(_engine.TensorMatMul(h1, _aiW2));
+        var output = _engine.TensorMatMul(h2, _aiW3);
+        var loss = _engine.ReduceSum(output, null);
+        return _persistentTape!.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 6. COMPILED PLANS: AiDotNet-only (no TorchSharp equivalent)
+    // Shows speedup from explicit graph compilation over AiDotNet eager.
     // NOT compared against TorchSharp — that would be unfair.
     // ═══════════════════════════════════════════════════════════════════
 
