@@ -19,6 +19,15 @@ internal static class AutoTrainingCompiler
 {
     internal static bool Enabled { get; set; } = true;
 
+    /// <summary>
+    /// When true, DifferentiableOps.RecordIfActive skips tape recording entirely.
+    /// Set after auto-compilation succeeds — the compiled backward graph replaces
+    /// the tape, so recording new entries would be wasted work (~200ns per op saved).
+    /// Cleared when the forward pattern changes (new model, different input shape).
+    /// </summary>
+    [ThreadStatic]
+    internal static bool ReplayMode;
+
     [ThreadStatic]
     private static AutoTrainingState? _state;
 
@@ -51,8 +60,16 @@ internal static class AutoTrainingCompiler
 
         // Validate current tape pattern matches the compiled plan's pattern
         long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
-        if (!State.MatchesCompiledHash(currentHash)) return null;
+        if (!State.MatchesCompiledHash(currentHash))
+        {
+            // Pattern changed — disable replay mode so recording resumes
+            ReplayMode = false;
+            return null;
+        }
 
+        // Enable replay mode: suppress tape recording on subsequent forward passes
+        // since we'll use the compiled backward graph instead
+        ReplayMode = true;
         return State.TryGetCompiledBackward<T>();
     }
 
@@ -73,6 +90,7 @@ internal static class AutoTrainingCompiler
         {
             var compiled = tape.CompileBackward(loss, sources);
             State.StoreCompiledBackward(compiled);
+            ReplayMode = true; // Enable replay mode now that backward is compiled
         }
         catch
         {

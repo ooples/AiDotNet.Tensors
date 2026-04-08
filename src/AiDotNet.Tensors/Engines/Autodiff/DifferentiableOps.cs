@@ -64,6 +64,8 @@ internal static class DifferentiableOps
         object[]? savedState = null)
     {
         if (_anyTapeActive == 0) return;
+        // Replay mode: compiled backward graph replaces tape — skip recording (~200ns saved per op)
+        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
@@ -121,6 +123,7 @@ internal static class DifferentiableOps
     {
         // Fast path: skip ThreadStatic read entirely when no tape exists globally
         if (_anyTapeActive == 0) return;
+        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
 
@@ -151,6 +154,7 @@ internal static class DifferentiableOps
         object[]? savedState = null)
     {
         if (_anyTapeActive == 0) return;
+        if (Compilation.AutoTrainingCompiler.ReplayMode) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
 

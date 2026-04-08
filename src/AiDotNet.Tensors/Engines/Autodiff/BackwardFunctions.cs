@@ -377,10 +377,14 @@ internal static class BackwardFunctions<T>
                 int N_a = inputs[1]._shape[0]; // rows of B = cols of grad_A
                 int N_b = gradOutput._shape[1]; // cols of grad_B
 
-                // Allocate fresh buffers for both GEMMs. Only accumulate after BOTH
-                // succeed to avoid partial accumulation if the second GEMM fails.
-                var gradAData = new float[M * N_a];
-                var gradBData = new float[inputs[0]._shape[1] * N_b];
+                // Pool gradient buffers via AutoTensorCache — zero allocation on steps 2+.
+                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                var gradAData = (float[])(object)gradATensor.GetDataArray();
+                var gradBData = (float[])(object)gradBTensor.GetDataArray();
+                // Clear — reused buffers may contain stale data from previous backward
+                Array.Clear(gradAData, 0, M * N_a);
+                Array.Clear(gradBData, 0, inputs[0]._shape[1] * N_b);
 
                 bool okA = BlasProvider.TryGemmEx(M, N_a, K, dCArr, 0, K, false, bArr, 0, K, true, gradAData, 0, N_a);
                 bool okB = BlasProvider.TryGemmEx(inputs[0]._shape[1], N_b, inputs[0]._shape[0],
@@ -388,10 +392,8 @@ internal static class BackwardFunctions<T>
 
                 if (okA && okB)
                 {
-                    var gradA = new Tensor<T>((T[])(object)gradAData, inputs[0]._shape);
-                    var gradB = new Tensor<T>((T[])(object)gradBData, inputs[1]._shape);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradA, engine);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
                     return;
                 }
                 // Either GEMM refused — fall through to generic path
