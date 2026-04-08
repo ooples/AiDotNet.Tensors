@@ -38,7 +38,7 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
             if (consumed.Contains(i))
                 continue;
 
-            if (steps[i].OpName == "TensorMatMul" && steps[i].Inputs.Length == 2
+            if (steps[i].OpType == OpType.TensorMatMul && steps[i].Inputs.Length == 2
                 && steps[i].Inputs[0].Rank == 2 && steps[i].Inputs[1].Rank == 2)
             {
                 int k = steps[i].Inputs[0]._shape[1];
@@ -51,7 +51,7 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                 for (int j = i + 1; j < steps.Length; j++)
                 {
                     if (consumed.Contains(j)) continue;
-                    if (steps[j].OpName != "TensorMatMul" || steps[j].Inputs.Length != 2) continue;
+                    if (steps[j].OpType != OpType.TensorMatMul || steps[j].Inputs.Length != 2) continue;
                     if (steps[j].Inputs[0].Rank != 2 || steps[j].Inputs[1].Rank != 2) continue;
 
                     int jk = steps[j].Inputs[0]._shape[1];

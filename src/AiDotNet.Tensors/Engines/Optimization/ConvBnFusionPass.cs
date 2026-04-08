@@ -61,9 +61,9 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
         var bn = steps[index + 1];
 
         // Verify: Conv2D followed by BatchNorm
-        if (conv.OpName is not ("Conv2D" or "DepthwiseConv2D"))
+        if (conv.OpType is not (OpType.Conv2D or OpType.DepthwiseConv2D))
             return false;
-        if (bn.OpName is not ("BatchNorm" or "InstanceNorm"))
+        if (bn.OpType is not (OpType.BatchNorm or OpType.InstanceNorm))
             return false;
         if (conv.Inputs.Length < 2 || bn.Inputs.Length < 5)
             return false;
@@ -168,13 +168,22 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
         var capturedStrides = strides;
         var capturedPaddings = paddings;
         var capturedDilations = dilations;
+        bool isDepthwise = conv.OpType == OpType.DepthwiseConv2D;
 
         fused = new CompiledStep<T>(
-            "FusedConvBnReLU",
+            isDepthwise ? "FusedDepthwiseConvBn" : "FusedConvBnReLU",
             (eng, output) =>
             {
                 Tensor<T> result;
-                if (capturedActivation != FusedActivationType.None)
+                if (isDepthwise)
+                {
+                    // DepthwiseConv2D with fused BN weights (no FusedConv2D for depthwise)
+                    result = eng.DepthwiseConv2D(capturedInput, capturedFusedWeights,
+                        capturedStrides, capturedPaddings);
+                    // Add fused bias manually
+                    result = eng.TensorBroadcastAdd(result, capturedFusedBias);
+                }
+                else if (capturedActivation != FusedActivationType.None)
                     result = eng.FusedConv2D(capturedInput, capturedFusedWeights, capturedFusedBias,
                         capturedStrides[0], capturedStrides[1],
                         capturedPaddings[0], capturedPaddings[1],

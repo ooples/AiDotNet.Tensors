@@ -22,6 +22,10 @@ public sealed class ProfilingCompiler<T>
     /// </summary>
     public void ProfileInference(ICompiledPlan<T> plan, int warmupSteps = 10, int measureSteps = 50)
     {
+        if (plan is null) throw new ArgumentNullException(nameof(plan));
+        if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
+        if (measureSteps <= 0) throw new ArgumentOutOfRangeException(nameof(measureSteps));
+
         // Warmup
         for (int i = 0; i < warmupSteps; i++)
             plan.Execute();
@@ -43,6 +47,10 @@ public sealed class ProfilingCompiler<T>
     /// </summary>
     public void ProfileTraining(ICompiledTrainingPlan<T> plan, int warmupSteps = 5, int measureSteps = 20)
     {
+        if (plan is null) throw new ArgumentNullException(nameof(plan));
+        if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
+        if (measureSteps <= 0) throw new ArgumentOutOfRangeException(nameof(measureSteps));
+
         // Warmup
         for (int i = 0; i < warmupSteps; i++)
             plan.Step();

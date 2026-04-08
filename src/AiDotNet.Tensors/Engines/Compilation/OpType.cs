@@ -64,12 +64,30 @@ internal enum OpType : byte
 
     // Convolution
     Conv2D,
+    DepthwiseConv2D,
+    ConvTranspose2D,
+
+    // Normalization
+    BatchNorm,
+    LayerNorm,
+    GroupNorm,
+    InstanceNorm,
+
+    // Pooling
+    MaxPool2D,
+    AvgPool2D,
+
+    // Attention
+    ScaledDotProductAttention,
+    BatchMatMul,
 
     // Fused
     FusedLinear,
 
     // Loss
     MSELoss,
+    CrossEntropyLoss,
+    BinaryCrossEntropy,
 }
 
 internal static class OpTypeParser
@@ -121,8 +139,20 @@ internal static class OpTypeParser
         "TensorMatMul" => OpType.TensorMatMul,
         "TensorTranspose" => OpType.TensorTranspose,
         "Conv2D" => OpType.Conv2D,
+        "DepthwiseConv2D" => OpType.DepthwiseConv2D,
+        "ConvTranspose2D" => OpType.ConvTranspose2D,
+        "BatchNorm" => OpType.BatchNorm,
+        "LayerNorm" => OpType.LayerNorm,
+        "GroupNorm" => OpType.GroupNorm,
+        "InstanceNorm" => OpType.InstanceNorm,
+        "MaxPool2D" or "MaxPool2DWithIndices" => OpType.MaxPool2D,
+        "AvgPool2D" => OpType.AvgPool2D,
+        "ScaledDotProductAttention" or "TensorScaledDotProductAttention" => OpType.ScaledDotProductAttention,
+        "BatchMatMul" or "TensorBatchMatMul" => OpType.BatchMatMul,
         "FusedLinear" => OpType.FusedLinear,
         "MSELoss" => OpType.MSELoss,
+        "TensorCrossEntropyLoss" or "CrossEntropyLoss" => OpType.CrossEntropyLoss,
+        "TensorBinaryCrossEntropy" => OpType.BinaryCrossEntropy,
         _ => OpType.Unknown,
     };
 }

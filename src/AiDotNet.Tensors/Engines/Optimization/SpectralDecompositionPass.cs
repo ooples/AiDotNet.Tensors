@@ -32,7 +32,7 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
 
         for (int i = 0; i < steps.Length; i++)
         {
-            if (steps[i].OpName == "TensorMatMul"
+            if (steps[i].OpType == OpType.TensorMatMul
                 && steps[i].Inputs.Length == 2
                 && steps[i].Inputs[0].Rank == 2
                 && steps[i].Inputs[1].Rank == 2)

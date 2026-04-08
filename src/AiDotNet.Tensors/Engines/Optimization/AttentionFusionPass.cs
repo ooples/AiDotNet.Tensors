@@ -61,14 +61,14 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
 
         // Look for: MatMul -> [Scale] -> Softmax -> MatMul
         var qk = steps[index];
-        if (qk.OpName != "TensorMatMul" && qk.OpName != "BatchMatMul")
+        if (qk.OpType is not (OpType.TensorMatMul or OpType.BatchMatMul))
             return false;
 
         // Find Softmax within next 2 steps (may have Scale in between)
         int softmaxIdx = -1;
         for (int j = index + 1; j <= Math.Min(index + 2, steps.Length - 1); j++)
         {
-            if (steps[j].OpName == "Softmax")
+            if (steps[j].OpType == OpType.Softmax)
             {
                 softmaxIdx = j;
                 break;
@@ -79,7 +79,7 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
         // Find the second MatMul right after Softmax
         if (softmaxIdx + 1 >= steps.Length) return false;
         var attnV = steps[softmaxIdx + 1];
-        if (attnV.OpName != "TensorMatMul" && attnV.OpName != "BatchMatMul")
+        if (attnV.OpType is not (OpType.TensorMatMul or OpType.BatchMatMul))
             return false;
 
         // Verify data dependencies:

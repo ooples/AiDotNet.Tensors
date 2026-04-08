@@ -41,10 +41,12 @@ internal static class ActivationCheckpoint
     /// </summary>
     internal static byte[] CreateReluBitmask(float[] activationData, int length)
     {
-        int byteCount = (length + 7) / 8;
+        if (activationData is null) throw new ArgumentNullException(nameof(activationData));
+        int safeLength = Math.Min(length, activationData.Length);
+        int byteCount = (safeLength + 7) / 8;
         var mask = new byte[byteCount];
 
-        for (int i = 0; i < length; i++)
+        for (int i = 0; i < safeLength; i++)
         {
             if (activationData[i] > 0f)
                 mask[i / 8] |= (byte)(1 << (i % 8));
@@ -60,7 +62,14 @@ internal static class ActivationCheckpoint
     internal static void ApplyReluBackwardFromBitmask(
         float[] gradOutput, byte[] bitmask, float[] gradInput, int length)
     {
-        for (int i = 0; i < length; i++)
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (bitmask is null) throw new ArgumentNullException(nameof(bitmask));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        int safeLength = Math.Min(length, Math.Min(gradOutput.Length, gradInput.Length));
+        int safeBitmaskLen = bitmask.Length * 8;
+        safeLength = Math.Min(safeLength, safeBitmaskLen);
+
+        for (int i = 0; i < safeLength; i++)
         {
             bool active = (bitmask[i / 8] & (1 << (i % 8))) != 0;
             gradInput[i] = active ? gradOutput[i] : 0f;
