@@ -18,7 +18,7 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
 {
     public string Name => "ForwardCSE";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnableForwardCSE;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

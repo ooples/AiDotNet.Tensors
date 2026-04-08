@@ -20,7 +20,7 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
 {
     public string Name => "BlasBatch";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnableBlasBatch;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

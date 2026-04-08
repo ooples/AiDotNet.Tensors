@@ -20,7 +20,7 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
 {
     public string Name => "PointwiseFusion";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnablePointwiseFusion;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

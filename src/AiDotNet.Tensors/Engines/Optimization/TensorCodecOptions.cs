@@ -45,6 +45,24 @@ public sealed class TensorCodecOptions
     /// H * Mr * sizeof(float) must fit in L1 cache (32KB).</summary>
     public int DataflowFusionMaxHidden { get; set; } = 512;
 
+    /// <summary>Phase 4.1: Fold BatchNorm into Conv2D weights at compile time.</summary>
+    public bool EnableConvBnFusion { get; set; } = true;
+
+    /// <summary>Phase 4.2: Fuse attention Q@K^T->Softmax->V patterns.</summary>
+    public bool EnableAttentionFusion { get; set; } = true;
+
+    /// <summary>Phase 4.3: Merge consecutive pointwise ops into fewer dispatch steps.</summary>
+    public bool EnablePointwiseFusion { get; set; } = true;
+
+    /// <summary>Phase 4.5: Precompute static subgraphs at compile time.</summary>
+    public bool EnableConstantFolding { get; set; } = true;
+
+    /// <summary>Phase 6.2: Deduplicate identical computations across layers.</summary>
+    public bool EnableForwardCSE { get; set; } = true;
+
+    /// <summary>Phase 7.1: Group independent MatMuls into batched calls.</summary>
+    public bool EnableBlasBatch { get; set; } = true;
+
     /// <summary>Phase 7.3: Enable mixed precision (fp16 forward, fp32 backward). Opt-in.</summary>
     public bool EnableMixedPrecision { get; set; }
 }

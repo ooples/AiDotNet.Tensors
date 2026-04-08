@@ -19,7 +19,7 @@ internal sealed class ConstantFoldingPass : ICpuOptimizationPass
 {
     public string Name => "ConstantFolding";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnableConstantFolding;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

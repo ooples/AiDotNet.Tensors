@@ -22,7 +22,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
 {
     public string Name => "ConvBnFusion";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnableConvBnFusion;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {

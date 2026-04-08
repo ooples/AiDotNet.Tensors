@@ -22,7 +22,7 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
 {
     public string Name => "AttentionFusion";
 
-    public bool IsEnabled => TensorCodecOptions.Current.EnableCompilation;
+    public bool IsEnabled => TensorCodecOptions.Current.EnableAttentionFusion;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
