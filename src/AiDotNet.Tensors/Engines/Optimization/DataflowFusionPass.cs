@@ -79,6 +79,22 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         if (!ReferenceEquals(activation.OutputBuffer, matmul2.Inputs[0]))
             return false;
 
+        // Guard against fan-out: matmul1 and activation outputs must be single-consumer.
+        // If other steps also read from these buffers, fusing would skip materializing
+        // intermediate results that those consumers need.
+        int matmul1Consumers = 0, activationConsumers = 0;
+        for (int j = 0; j < steps.Length; j++)
+        {
+            if (j == index || j == index + 1 || j == index + 2) continue;
+            foreach (var inp in steps[j].Inputs)
+            {
+                if (ReferenceEquals(inp, matmul1.OutputBuffer)) matmul1Consumers++;
+                if (ReferenceEquals(inp, activation.OutputBuffer)) activationConsumers++;
+            }
+        }
+        if (matmul1Consumers > 0 || activationConsumers > 0)
+            return false;
+
         // Verify activation type is supported by the fused kernel
         var activationType = MapOpNameToActivationType(activation.OpName);
         if (activationType == FusedActivationType.None)
