@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -9,33 +10,45 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// Zero overhead per-operation: no graph traversal, no shape validation, no allocation.
 /// All buffers are pre-allocated at compile time and reused across replays.
 ///
-/// Usage:
-///   var plan = CompiledInferencePlan.Compile(scope);
-///   var output = plan.Execute(engine);  // first call
-///   var output2 = plan.Execute(engine); // replay — same speed, zero alloc
+/// Implements ICompiledPlan for public API access and IDisposable for GCHandle cleanup.
 /// </summary>
-internal sealed class CompiledInferencePlan<T>
+internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 {
     private readonly CompiledStep<T>[] _steps;
     private readonly Tensor<T> _finalOutput;
     private readonly IEngine _engine;
+    private readonly int[] _compiledInputShape;
+    private readonly List<GCHandle> _pinnedHandles = new();
+    private bool _disposed;
 
-    private CompiledInferencePlan(CompiledStep<T>[] steps, Tensor<T> finalOutput, IEngine engine)
+    private CompiledInferencePlan(CompiledStep<T>[] steps, Tensor<T> finalOutput, IEngine engine, int[] inputShape, List<GCHandle>? handles = null)
     {
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
+        _compiledInputShape = inputShape;
+        if (handles is not null)
+            _pinnedHandles.AddRange(handles);
     }
 
     /// <summary>Number of compiled steps.</summary>
-    internal int StepCount => _steps.Length;
+    public int StepCount => _steps.Length;
+
+    /// <summary>Checks whether this plan was compiled for the given input shape.</summary>
+    public bool IsValid(int[] inputShape)
+    {
+        if (inputShape.Length != _compiledInputShape.Length) return false;
+        for (int i = 0; i < inputShape.Length; i++)
+            if (inputShape[i] != _compiledInputShape[i]) return false;
+        return true;
+    }
 
     /// <summary>
     /// Executes the compiled plan. Runs each step's delegate in order.
     /// All buffers are pre-allocated — zero allocation during execution.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal Tensor<T> Execute()
+    public Tensor<T> Execute()
     {
         var steps = _steps;
         var engine = _engine;
@@ -44,6 +57,18 @@ internal sealed class CompiledInferencePlan<T>
             steps[i].Execute(engine, steps[i].OutputBuffer);
         }
         return _finalOutput;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var handle in _pinnedHandles)
+        {
+            if (handle.IsAllocated)
+                handle.Free();
+        }
+        _pinnedHandles.Clear();
     }
 
     /// <summary>
@@ -69,6 +94,14 @@ internal sealed class CompiledInferencePlan<T>
                     typed.SavedState));
             }
         }
+
+        // Track GCHandles for cleanup on Dispose
+        var pinnedHandles = new List<GCHandle>();
+
+        // Determine input shape from the first step's inputs (for IsValid check)
+        var inputShape = steps.Count > 0 && steps[0].Inputs.Length > 0
+            ? (int[])steps[0].Inputs[0]._shape.Clone()
+            : Array.Empty<int>();
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
         var specializedSteps = new CompiledStep<T>[steps.Count];
@@ -118,7 +151,7 @@ internal sealed class CompiledInferencePlan<T>
                 continue;
             }
 
-            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step);
+            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles);
             if (specialized != null)
             {
                 // Wrap the specialized action as a CompiledStep with the optimized execute
@@ -148,7 +181,7 @@ internal sealed class CompiledInferencePlan<T>
 
         // Use the last optimized step's output (may differ from original after fusion/spectral passes)
         var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine);
+        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine, inputShape, pinnedHandles);
     }
 
     /// <summary>

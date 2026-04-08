@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : IDisposable
+internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 {
     private readonly Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
@@ -80,12 +80,12 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
         _pinnedHandles.Clear();
     }
 
-    internal Tensor<T>[] Gradients => _gradients;
-    internal int ForwardStepCount => _forwardActions.Length;
-    internal int BackwardStepCount => _backwardActions.Length;
+    public Tensor<T>[] Gradients => _gradients;
+    public int ForwardStepCount => _forwardActions.Length;
+    public int BackwardStepCount => _backwardActions.Length;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal Tensor<T> Step()
+    public Tensor<T> Step()
     {
         var engine = _engine;
 

@@ -5,19 +5,23 @@ namespace AiDotNet.Tensors.Engines.Optimization;
 /// Controls which radical computation transformations are enabled.
 /// Thread-static ambient context following GradientTape/GraphMode pattern.
 /// </summary>
-internal sealed class TensorCodecOptions
+public sealed class TensorCodecOptions
 {
     [ThreadStatic]
     private static TensorCodecOptions? _current;
 
     /// <summary>Gets the active TensorCodec options for this thread, or the default.</summary>
-    internal static TensorCodecOptions Current => _current ?? Default;
+    public static TensorCodecOptions Current => _current ?? Default;
 
     /// <summary>Default options: dataflow fusion and algebraic backward enabled, spectral opt-in.</summary>
-    internal static readonly TensorCodecOptions Default = new();
+    public static readonly TensorCodecOptions Default = new();
 
-    /// <summary>Sets thread-local options (for testing/benchmarking).</summary>
-    internal static void SetCurrent(TensorCodecOptions? options) => _current = options;
+    /// <summary>Sets thread-local options. Pass null to revert to defaults.</summary>
+    public static void SetCurrent(TensorCodecOptions? options) => _current = options;
+
+    /// <summary>Master switch for auto-compilation. When false, all compilation is disabled
+    /// and execution falls through to the eager path.</summary>
+    public bool EnableCompilation { get; set; } = true;
 
     /// <summary>Phase B: Fuse consecutive linear layers into a single multi-layer kernel
     /// that keeps data in registers/L1 across layer boundaries.</summary>
