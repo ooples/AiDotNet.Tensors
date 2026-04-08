@@ -310,6 +310,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // packedWeights are available for future SIMD tile kernels that consume panel format
         }
 
+        // Phase 4.4: Fused optimizer — append SGD/Adam parameter update directly to backward actions.
+        // This is optional and controlled by the caller via FusedOptimizer.AppendFusedUpdates().
+        // The default compiled plan returns gradients for the caller to update parameters manually.
+        // When a caller (e.g., CompiledTapeTrainingStep) wants fused updates, it calls:
+        //   FusedOptimizer.AppendFusedUpdates(plan.BackwardActions, params, grads, lr)
+        // This avoids hard-coding the learning rate into the compiled plan.
+
         return new CompiledTrainingPlan<T>(
             forwardActions,
             backwardActions.ToArray(),
