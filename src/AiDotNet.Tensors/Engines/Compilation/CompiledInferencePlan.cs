@@ -193,6 +193,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         ICpuOptimizationPass[] passes =
         {
+            new ConstantFoldingPass(),
+            new ConvBnFusionPass(),
+            new PointwiseFusionPass(),
             new SpectralDecompositionPass(),
             new DataflowFusionPass(),
         };
