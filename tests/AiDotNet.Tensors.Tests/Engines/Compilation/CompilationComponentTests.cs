@@ -644,6 +644,139 @@ public class CompilationComponentTests
 
     #endregion
 
+    #region WeightLayoutOptimizer Tests
+
+    [Fact]
+    public void WeightLayoutOptimizer_PackRoundTrip()
+    {
+        // Verify that packing and unpacking preserves all values
+        int rows = 4, cols = 6, panelWidth = 4;
+        var weights = new float[rows * cols];
+        for (int i = 0; i < weights.Length; i++) weights[i] = i + 1;
+
+        var packed = WeightLayoutOptimizer.PackRowMajorToPanelFormat(weights, rows, cols, panelWidth);
+
+        // Verify packed array contains all original values (in a different layout)
+        Assert.True(packed.Length >= rows * cols,
+            $"Packed array should be at least as large as original: {packed.Length} < {rows * cols}");
+
+        // Unpack and verify: for each (r, c), find it in packed format
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                int panel = c / panelWidth;
+                int j = c % panelWidth;
+                int packedIdx = (panel * rows + r) * panelWidth + j;
+                Assert.Equal(weights[r * cols + c], packed[packedIdx]);
+            }
+        }
+    }
+
+    #endregion
+
+    #region CompiledDropout Tests
+
+    [Fact]
+    public void CompiledDropout_MaskCycling()
+    {
+        int length = 16;
+        float rate = 0.5f;
+        int maskCount = 4;
+        var dropout = new CompiledDropout(length, rate, maskCount, seed: 42);
+
+        Assert.Equal(maskCount, dropout.MaskCount);
+
+        // Get masks and verify they cycle
+        var mask1 = dropout.GetNextMask();
+        var mask2 = dropout.GetNextMask();
+        var mask3 = dropout.GetNextMask();
+        var mask4 = dropout.GetNextMask();
+        var mask5 = dropout.GetNextMask(); // Should wrap around
+
+        // mask5 should equal mask1 (cycle of 4)
+        Assert.Equal(mask1.Length, mask5.Length);
+        for (int i = 0; i < mask1.Length; i++)
+            Assert.Equal(mask1[i], mask5[i]);
+    }
+
+    [Fact]
+    public void CompiledDropout_ApplyInPlace_ZerosElements()
+    {
+        int length = 100;
+        float rate = 0.5f;
+        var dropout = new CompiledDropout(length, rate, maskCount: 8, seed: 99);
+
+        var data = new float[length];
+        for (int i = 0; i < length; i++) data[i] = 1f;
+
+        dropout.ApplyInPlace(data, length);
+
+        // Some elements should be zero (dropped), others scaled by 1/(1-rate) = 2
+        int zeros = 0, scaled = 0;
+        for (int i = 0; i < length; i++)
+        {
+            if (data[i] == 0f) zeros++;
+            else if (MathF.Abs(data[i] - 2f) < 1e-5f) scaled++;
+        }
+
+        // With rate=0.5, roughly half should be zero and half scaled
+        Assert.True(zeros > 20 && zeros < 80,
+            $"Expected ~50 zeros, got {zeros}");
+        Assert.True(scaled > 20 && scaled < 80,
+            $"Expected ~50 scaled, got {scaled}");
+        Assert.Equal(length, zeros + scaled);
+    }
+
+    #endregion
+
+    #region BlasBatchPass Tests
+
+    [Fact]
+    public void BlasBatchPass_GroupsIndependentMatMuls()
+    {
+        var pass = new BlasBatchPass();
+        var engine = new CpuEngine();
+
+        // Create 3 independent MatMul steps with same K,N dimensions
+        var a1 = CreateRandom(new[] { 2, 4 }, 10);
+        var b1 = CreateRandom(new[] { 4, 3 }, 11);
+        var o1 = new Tensor<float>(new[] { 2, 3 });
+
+        var a2 = CreateRandom(new[] { 3, 4 }, 12);
+        var b2 = CreateRandom(new[] { 4, 3 }, 13);
+        var o2 = new Tensor<float>(new[] { 3, 3 });
+
+        var a3 = CreateRandom(new[] { 1, 4 }, 14);
+        var b3 = CreateRandom(new[] { 4, 3 }, 15);
+        var o3 = new Tensor<float>(new[] { 1, 3 });
+
+        var steps = new[]
+        {
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a1, b1); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o1, new[] { a1, b1 }, null, null),
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a2, b2); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o2, new[] { a2, b2 }, null, null),
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a3, b3); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o3, new[] { a3, b3 }, null, null),
+        };
+
+        var result = pass.TryOptimize(steps, engine);
+
+        // Should batch the 3 independent matmuls (same K=4, N=3)
+        Assert.NotNull(result);
+        // Batched: 1 BatchedMatMul + 2 BatchedMatMul_Output = 3 steps total
+        // (fewer dispatch steps than 3 separate matmuls)
+        Assert.True(result.Length <= steps.Length,
+            $"Batched should have <= {steps.Length} steps, got {result.Length}");
+        Assert.Contains(result, s => s.OpName == "BatchedMatMul");
+    }
+
+    #endregion
+
     #region Helpers
 
     private static Tensor<float> CreateRandom(int[] shape, int seed)
