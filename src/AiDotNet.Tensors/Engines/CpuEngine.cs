@@ -4684,7 +4684,7 @@ public class CpuEngine : ITensorLevelEngine
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, grid._shape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", grid._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int depth = grid._shape[0];
@@ -12696,7 +12696,7 @@ public class CpuEngine : ITensorLevelEngine
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SoftmaxBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TaylorSoftmax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -12867,7 +12867,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SparsemaxBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Sparsemax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -15942,7 +15942,7 @@ public class CpuEngine : ITensorLevelEngine
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_source = source; var c_indices = indices; var c_dim = dim; var c_outputSize = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterAdd", source, source._shape, (eng, output) => { var r = eng.ScatterAdd(c_source, c_indices, c_dim, c_outputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterAddBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterAdd", source._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -17125,6 +17125,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null)
             throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", input._shape); if (ac is not null) return ac.Execute(); }
 
         if (!input.IsContiguous) input = input.Contiguous();
 
@@ -17476,7 +17477,7 @@ public class CpuEngine : ITensorLevelEngine
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_upscaleFactor = upscaleFactor; return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, input._shape, (eng, output) => { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PixelShuffleBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("PixelShuffle", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
         int channels = shape[1];
@@ -17939,6 +17940,7 @@ public class CpuEngine : ITensorLevelEngine
         if (real == null || imag == null)
             throw new ArgumentNullException("ComplexMagnitudeSquared inputs cannot be null");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ComplexMagnitudeSquared", real._shape); if (ac is not null) return ac.Execute(); }
 
         if (!real._shape.SequenceEqual(imag._shape))
             throw new ArgumentException("Real and imaginary parts must have the same shape");
@@ -17978,7 +17980,7 @@ public class CpuEngine : ITensorLevelEngine
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_top = top; var c_left = left; var c_height = height; var c_width = width; return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, input._shape, (eng, output) => { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CropBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Crop", input._shape); if (ac is not null) return ac.Execute(); }
 
         int batch = shape[0];
         int channels = shape[1];
@@ -18408,7 +18410,7 @@ public class CpuEngine : ITensorLevelEngine
         if (centers == null) throw new ArgumentNullException(nameof(centers));
         if (epsilons == null) throw new ArgumentNullException(nameof(epsilons));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, input._shape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.RBFKernelBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("RBFKernel", input._shape); if (ac is not null) return ac.Execute(); }
 
         if (input.Rank != 2)
             throw new ArgumentException($"input must be 2D [batch, features], got rank {input.Rank}", nameof(input));
@@ -20472,6 +20474,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.BatchMatMulBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBatchMatMul", a._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -21869,7 +21872,7 @@ public class CpuEngine : ITensorLevelEngine
         if (a._shape.Length != 1 || b._shape.Length != 1)
             throw new ArgumentException("Both inputs must be 1D tensors");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, a._shape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorOuter", a._shape); if (ac is not null) return ac.Execute(); }
 
         int n = a._shape[0];
         int m = b._shape[0];
@@ -22445,7 +22448,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, input._shape, (eng, output) => { var r = eng.RFFT(c_input); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[^1]; // Last dimension is the signal length
@@ -22504,6 +22507,7 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         if (!input.IsContiguous) input = input.Contiguous();
 
@@ -26997,7 +27001,7 @@ public class CpuEngine : ITensorLevelEngine
         if (input._shape[1] != weight._shape[1])
             throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, input._shape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MatMulBackward); } }
-
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("OctonionMatMulTensor", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
