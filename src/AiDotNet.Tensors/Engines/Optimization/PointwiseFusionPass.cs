@@ -165,10 +165,18 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
 
     private static bool IsPointwiseUnary(string opName)
     {
-        return opName is "ReLU" or "Sigmoid" or "Tanh" or "GELU" or "Swish" or "Mish"
-            or "Exp" or "Log" or "Abs" or "Sqrt" or "Negate" or "Sign"
-            or "Softplus" or "HardSwish" or "HardSigmoid" or "ELU" or "SELU"
-            or "LeakyReLU" or "Reciprocal" or "Floor" or "Ceiling" or "Round"
-            or "TensorFrac" or "Clamp";
+        // Use OpType enum for reliable matching (handles "Exp" vs "TensorExp" differences)
+        var opType = OpTypeParser.Parse(opName);
+        return IsPointwiseUnaryOpType(opType);
+    }
+
+    private static bool IsPointwiseUnaryOpType(OpType opType)
+    {
+        return opType is OpType.ReLU or OpType.Sigmoid or OpType.Tanh or OpType.GELU
+            or OpType.Swish or OpType.Mish or OpType.TensorExp or OpType.TensorLog
+            or OpType.TensorAbs or OpType.TensorSqrt or OpType.TensorNegate or OpType.Sign
+            or OpType.Softplus or OpType.HardSwish or OpType.HardSigmoid or OpType.ELU
+            or OpType.SELU or OpType.LeakyReLU or OpType.Reciprocal or OpType.Floor
+            or OpType.Ceiling or OpType.Round or OpType.Clamp;
     }
 }
