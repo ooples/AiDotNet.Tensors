@@ -107,7 +107,7 @@ internal sealed class AutoTracerState
 
     internal CompiledInferencePlan<T>? TryGetPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
-        long hash = ComputeLookupHash(opName, outputShape, paramHash);
+        long hash = ComputeLookupHash(opName, outputShape, paramHash, typeof(T).GetHashCode());
         if (_compiledPlans.TryGetValue(hash, out var plan))
         {
             // Reset sequence since we're using the compiled plan
@@ -192,10 +192,11 @@ internal sealed class AutoTracerState
         {
             // Compilation failed — mark pattern as attempted so we don't retry indefinitely.
             _compiledPlans[patternHash] = FailedCompilationSentinel;
+            _evictionOrder.AddLast(patternHash); // Track for eviction so cache doesn't grow unbounded
         }
     }
 
-    private long ComputeLookupHash(string nextOp, int[] shape, long paramHash = 0)
+    private long ComputeLookupHash(string nextOp, int[] shape, long paramHash = 0, int typeHash = 0)
     {
         long hash = ComputeCurrentHash();
         hash ^= nextOp.GetHashCode();
@@ -210,6 +211,12 @@ internal sealed class AutoTracerState
         if (paramHash != 0)
         {
             hash ^= paramHash;
+            hash *= unchecked((long)0x100000001b3L);
+        }
+        // Include element type so plans compiled for float don't match double
+        if (typeHash != 0)
+        {
+            hash ^= typeHash;
             hash *= unchecked((long)0x100000001b3L);
         }
         return hash;

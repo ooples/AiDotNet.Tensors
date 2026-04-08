@@ -127,7 +127,8 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         var capturedOutput = matmul2.OutputBuffer;
         int ck = k, ch = h, cn = n;
         var capturedActivationFn = activationFn;
-        // Pre-allocate activated buffer at compile time; resize if batch changes at replay
+        // Pre-allocate activated buffer; resize if batch changes at replay.
+        // Note: single-threaded per compiled plan (plans are per-thread via AutoTracer)
         var capturedActivated = new float[m * h];
 
         fused = new CompiledStep<T>(

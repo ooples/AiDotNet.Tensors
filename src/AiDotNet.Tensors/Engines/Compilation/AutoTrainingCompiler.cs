@@ -88,6 +88,9 @@ internal static class AutoTrainingCompiler
     private static long ComputePatternHash<T>(TapeEntryArena<T> entries, int entryCount)
     {
         long hash = unchecked((long)0xcbf29ce484222325L);
+        // Include element type so float and double plans don't collide
+        hash ^= typeof(T).GetHashCode();
+        hash *= unchecked((long)0x100000001b3L);
         for (int i = 0; i < entryCount; i++)
         {
             ref var entry = ref entries[i];

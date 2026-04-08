@@ -269,20 +269,16 @@ internal static class FusedMultiLayerGemm
         int m, int k, int h, int n,
         Func<float, float> applyActivation)
     {
-        // GEMM1: hidden = input @ W1
-        var hidden = new float[m * h];
-        SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), hidden.AsSpan(), m, k, h);
+        // GEMM1: hidden = input @ W1 (reuse activated buffer as scratch — same size [m*h])
+        Array.Clear(activated, 0, m * h);
+        SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), activated.AsSpan(0, m * h), m, k, h);
 
-        // Activation + save
+        // Activation in-place on activated buffer
         for (int i = 0; i < m * h; i++)
-        {
-            float val = applyActivation(hidden[i]);
-            hidden[i] = val;
-            activated[i] = val;
-        }
+            activated[i] = applyActivation(activated[i]);
 
-        // GEMM2: output = hidden @ W2 (clear first since SimdGemm accumulates)
+        // GEMM2: output = activated @ W2 (clear first since SimdGemm accumulates)
         Array.Clear(output, 0, m * n);
-        SimdGemm.Sgemm(hidden.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
+        SimdGemm.Sgemm(activated.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
     }
 }

@@ -827,7 +827,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// SIMD Reciprocal: 1/x using AVX Reciprocal (fast approximate + Newton refinement).
+        /// SIMD Reciprocal: 1/x using AVX exact division (Avx.Divide).
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void ReciprocalUnsafe(float* input, float* output, int length)
