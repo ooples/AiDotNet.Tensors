@@ -542,22 +542,24 @@ public class CompilationComponentTests
                 }
             }
         }
-        finally { plan.Dispose(); }
+        finally
+        {
+            // Verify before dispose: compiled plan produces non-null gradients
+            Assert.NotNull(plan.Gradients);
+            Assert.True(plan.Gradients.Length == 2, "Should have 2 gradient tensors (w1, w2)");
+
+            // Verify consistent loss (same value on repeated calls without weight updates)
+            var loss1 = plan.Step().GetFlat(0);
+            var loss2 = plan.Step().GetFlat(0);
+            Assert.True(MathF.Abs(loss1 - loss2) < 1e-4f,
+                $"Compiled plan should produce consistent loss: {loss1:F6} vs {loss2:F6}");
+
+            plan.Dispose();
+        }
 
         // Verify eager training works
         Assert.True(eagerLosses[19] < eagerLosses[0],
             $"Eager loss should decrease: start={eagerLosses[0]:F4}, end={eagerLosses[19]:F4}");
-
-        // Verify compiled plan produces non-null, non-zero gradients
-        Assert.NotNull(plan.Gradients);
-        Assert.True(plan.Gradients.Length == 2, "Should have 2 gradient tensors (w1, w2)");
-
-        // Verify compiled plan produces consistent loss (same value on repeated calls
-        // without weight updates — ensures the plan replays correctly)
-        var loss1 = plan.Step().GetFlat(0);
-        var loss2 = plan.Step().GetFlat(0);
-        Assert.True(MathF.Abs(loss1 - loss2) < 1e-4f,
-            $"Compiled plan should produce consistent loss without weight updates: {loss1:F6} vs {loss2:F6}");
     }
 
     #endregion

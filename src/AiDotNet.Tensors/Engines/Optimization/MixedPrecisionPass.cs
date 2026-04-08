@@ -54,26 +54,38 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
             {
                 // Wrap with precision cast: forward executes in reduced precision
                 // by rounding inputs to Half precision first (simulates fp16 bandwidth)
+                // Pre-allocate Half-rounded shadow buffers for each input at compile time.
+                // The execute delegate copies fp32 inputs → shadow (rounded to Half precision)
+                // → executes the op on the shadow inputs. Original inputs are NOT modified,
+                // preserving backward pass correctness and shared tensor integrity.
                 var capturedStep = steps[i];
+                var shadowInputs = new Tensor<T>[steps[i].Inputs.Length];
+                for (int si = 0; si < shadowInputs.Length; si++)
+                    shadowInputs[si] = Helpers.TensorAllocator.RentUninitialized<T>(steps[i].Inputs[si]._shape);
+                var capturedShadows = shadowInputs;
+
                 result[i] = new CompiledStep<T>(
                     "MP_" + steps[i].OpName,
                     (eng, output) =>
                     {
-                        // Simulate fp16: round inputs to Half precision before computation
-                        foreach (var inp in capturedStep.Inputs)
+                        // Copy inputs to shadow buffers with Half rounding (simulates fp16 bandwidth)
+                        for (int si = 0; si < capturedStep.Inputs.Length; si++)
                         {
-                            if (inp.IsContiguous)
+                            var inp = capturedStep.Inputs[si];
+                            if (inp is Tensor<float> floatInp && capturedShadows[si] is Tensor<float> floatShadow
+                                && floatInp.IsContiguous)
                             {
-                                var span = ((Tensor<float>)(object)inp).Data.Span;
-                                for (int j = 0; j < span.Length; j++)
-                                    span[j] = (float)(Half)span[j]; // fp32 → fp16 → fp32 round-trip
+                                var src = floatInp.Data.Span;
+                                var dst = floatShadow.Data.Span;
+                                for (int j = 0; j < src.Length && j < dst.Length; j++)
+                                    dst[j] = (float)(Half)src[j]; // fp32 → fp16 → fp32 round-trip
                             }
                         }
                         capturedStep.Execute(eng, output);
                     },
                     steps[i].OutputBuffer,
-                    steps[i].Inputs,
-                    steps[i].BackwardFn, // Backward stays in fp32
+                    capturedShadows, // Use shadow inputs for this step
+                    steps[i].BackwardFn, // Backward stays in fp32 on original inputs
                     steps[i].SavedState);
                 anyOptimized = true;
             }
