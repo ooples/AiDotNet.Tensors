@@ -291,17 +291,10 @@ internal sealed class CompiledTrainingPlan<T>
             var cB = (float[])(object)inputB.GetDataArray();
             var cOut = (float[])(object)output.GetDataArray();
 
-            if (BlasProvider.IsAvailable)
-            {
-                return eng =>
-                {
-                    BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
-                };
-            }
-            // Fallback: use SimdGemm SIMD BLIS-style tiled GEMM
             return eng =>
             {
-                SimdGemm.Sgemm(cA, cB, cOut, M, K, N);
+                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                    SimdGemm.Sgemm(cA, cB, cOut, M, K, N);
             };
         }
 
@@ -1110,8 +1103,6 @@ internal sealed class CompiledTrainingPlan<T>
             var gradB = gradMap[inputB];
 
             int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
-            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
-            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
             // Cache array references on first call to avoid GetDataArray() overhead per step
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
@@ -1124,10 +1115,18 @@ internal sealed class CompiledTrainingPlan<T>
                 cachedDestA ??= (float[])(object)gradA.GetDataArray();
                 cachedDestB ??= (float[])(object)gradB.GetDataArray();
 
-                // dA = dC @ B^T — direct BLAS into pre-allocated buffer
-                BlasProvider.TryGemmEx(M, K, N, cachedDC, 0, N, false, cachedB, 0, N, true, cachedDestA, 0, K);
-                // dB = A^T @ dC — direct BLAS into pre-allocated buffer
-                BlasProvider.TryGemmEx(K, N, M, cachedA, 0, K, true, cachedDC, 0, N, false, cachedDestB, 0, N);
+                // dA = dC @ B^T — direct BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, 0, N, false, cachedB, 0, N, true, cachedDestA, 0, K))
+                {
+                    var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
+                    dA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                }
+                // dB = A^T @ dC — direct BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(K, N, M, cachedA, 0, K, true, cachedDC, 0, N, false, cachedDestB, 0, N))
+                {
+                    var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
+                    dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                }
 
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
@@ -1161,7 +1160,8 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Add backward: gradA += gradOut, gradB += gradOut — just copy, zero alloc
+        // Add backward: gradA += gradOut, gradB += gradOut
+        // Use consumerCount to decide: overwrite (fast) for single-consumer, accumulate for multi-consumer
         if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2)
         {
             var inputA = step.Inputs[0];
@@ -1174,12 +1174,21 @@ internal sealed class CompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
             return eng =>
             {
-                // Add backward: both inputs get the output gradient
-                gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
-                gradOut.AsSpan().CopyTo(gradB.AsWritableSpan());
+                if (accumA)
+                    eng.TensorAddInto(gradA, gradA, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
+
+                if (accumB)
+                    eng.TensorAddInto(gradB, gradB, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradB.AsWritableSpan());
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
@@ -1198,17 +1207,31 @@ internal sealed class CompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+            var numOps = MathHelper.GetNumericOperations<T>();
 
             return eng =>
             {
-                gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
-                MathHelper.GetNumericOperations<T>().Negate(gradOut.AsSpan(), gradB.AsWritableSpan());
+                if (accumA)
+                    eng.TensorAddInto(gradA, gradA, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
+
+                if (accumB)
+                {
+                    // gradB -= gradOut (accumulate negative)
+                    eng.TensorSubtractInto(gradB, gradB, gradOut);
+                }
+                else
+                    numOps.Negate(gradOut.AsSpan(), gradB.AsWritableSpan());
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
         }
 
-        // Multiply backward: gradA = gradOut * B, gradB = gradOut * A — SIMD, zero alloc
+        // Multiply backward: gradA = gradOut * B, gradB = gradOut * A
         if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
@@ -1222,11 +1245,29 @@ internal sealed class CompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
             return eng =>
             {
-                eng.TensorMultiplyInto(gradA, gradOut, inputB);
-                eng.TensorMultiplyInto(gradB, gradOut, inputA);
+                if (accumA)
+                {
+                    // gradA += gradOut * inputB
+                    var temp = eng.TensorMultiply(gradOut, inputB);
+                    eng.TensorAddInto(gradA, gradA, temp);
+                }
+                else
+                    eng.TensorMultiplyInto(gradA, gradOut, inputB);
+
+                if (accumB)
+                {
+                    // gradB += gradOut * inputA
+                    var temp = eng.TensorMultiply(gradOut, inputA);
+                    eng.TensorAddInto(gradB, gradB, temp);
+                }
+                else
+                    eng.TensorMultiplyInto(gradB, gradOut, inputA);
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
@@ -1243,7 +1284,6 @@ internal sealed class CompiledTrainingPlan<T>
 
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
-            int length = input.Length;
 
             return eng =>
             {

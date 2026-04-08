@@ -67,8 +67,21 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         if (!IsPointwiseActivation(activation.OpName))
             return false;
 
-        // Verify chaining: matmul1.output → activation.input, activation.output → matmul2.input
+        // Verify correct input counts
         if (matmul1.Inputs.Length != 2 || matmul2.Inputs.Length != 2)
+            return false;
+        if (activation.Inputs.Length < 1)
+            return false;
+
+        // Verify data dependency chain: matmul1.output feeds activation, activation.output feeds matmul2
+        if (!ReferenceEquals(matmul1.OutputBuffer, activation.Inputs[0]))
+            return false;
+        if (!ReferenceEquals(activation.OutputBuffer, matmul2.Inputs[0]))
+            return false;
+
+        // Verify activation type is supported by the fused kernel
+        var activationType = MapOpNameToActivationType(activation.OpName);
+        if (activationType == FusedActivationType.None)
             return false;
 
         // Extract dimensions
@@ -88,9 +101,8 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         if (!TensorCodecOptimizer.CanFuseDataflow(h))
             return false;
 
-        // Get activation function delegate
-        var activationFn = CpuFusedOperations.GetFloatActivation(
-            MapOpNameToActivationType(activation.OpName));
+        // Get activation function delegate (activationType already validated above)
+        var activationFn = CpuFusedOperations.GetFloatActivation(activationType);
 
         var capturedInput = input;
         var capturedW1 = w1;
@@ -121,8 +133,7 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
 
     private static bool IsPointwiseActivation(string opName)
     {
-        return opName is "ReLU" or "GELU" or "Sigmoid" or "Tanh" or "Swish"
-            or "LeakyReLU" or "ELU" or "Mish" or "Softplus" or "HardSwish";
+        return MapOpNameToActivationType(opName) != FusedActivationType.None;
     }
 
     private static FusedActivationType MapOpNameToActivationType(string opName) => opName switch
@@ -133,6 +144,10 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
         "Tanh" => FusedActivationType.Tanh,
         "Swish" => FusedActivationType.Swish,
         "LeakyReLU" => FusedActivationType.LeakyReLU,
+        "ELU" => FusedActivationType.ELU,
+        "Mish" => FusedActivationType.Mish,
+        "Softplus" => FusedActivationType.Softplus,
+        "HardSwish" => FusedActivationType.HardSwish,
         _ => FusedActivationType.None
     };
 }
