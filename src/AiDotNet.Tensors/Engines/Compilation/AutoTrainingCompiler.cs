@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -64,12 +65,11 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
-        // Validate current tape pattern AND loss identity match the compiled plan.
-        // Including loss identity prevents returning a backward graph compiled for
-        // a different loss tensor when ReplayMode suppressed recording.
+        // Validate current tape pattern AND loss/sources identity match the compiled plan.
+        // IncludeTargetIdentity hashes both loss tensor and source tensors so different
+        // loss functions or source sets don't reuse the wrong backward plan.
         long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
-        currentHash ^= System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(loss);
-        currentHash *= unchecked((long)0x100000001b3L);
+        currentHash = IncludeTargetIdentity(currentHash, loss, sources);
         if (!State.MatchesCompiledHash(currentHash))
         {
             // Pattern changed — disable replay mode so recording resumes
@@ -101,7 +101,10 @@ internal static class AutoTrainingCompiler
         try
         {
             var compiled = tape.CompileBackward(loss, sources);
-            State.StoreCompiledBackward(compiled);
+            // Store with target identity so the hash includes loss/sources
+            long hash = ComputePatternHash(tape.Entries, tape.EntryCount);
+            hash = IncludeTargetIdentity(hash, loss, sources);
+            State.StoreCompiledBackwardWithHash(compiled, hash);
             ReplayMode = true; // Enable replay mode now that backward is compiled
         }
         catch
@@ -109,6 +112,25 @@ internal static class AutoTrainingCompiler
             // Compilation failed — mark as attempted to prevent infinite retry
             State.MarkCompilationFailed();
         }
+    }
+
+    /// <summary>
+    /// Incorporates loss tensor and source tensor identities into the pattern hash
+    /// so that different tapes/losses/sources don't collide.
+    /// </summary>
+    private static long IncludeTargetIdentity<T>(long hash, Tensor<T> loss, Tensor<T>[]? sources)
+    {
+        hash ^= RuntimeHelpers.GetHashCode(loss);
+        hash *= unchecked((long)0x100000001b3L);
+        if (sources is not null)
+        {
+            foreach (var src in sources)
+            {
+                hash ^= RuntimeHelpers.GetHashCode(src);
+                hash *= unchecked((long)0x100000001b3L);
+            }
+        }
+        return hash;
     }
 
     /// <summary>
@@ -124,9 +146,8 @@ internal static class AutoTrainingCompiler
         for (int i = 0; i < entryCount; i++)
         {
             ref var entry = ref entries[i];
-            // Use FNV-1a over the operation name bytes for a deterministic hash
-            // (string.GetHashCode() is randomized per process in .NET Core)
-            hash = StableStringHash(entry.OperationName, hash);
+            hash ^= entry.OperationName.GetHashCode();
+            hash *= unchecked((long)0x100000001b3L);
             if (entry.Output is not null)
             {
                 foreach (int dim in entry.Output._shape)
@@ -135,21 +156,6 @@ internal static class AutoTrainingCompiler
                     hash *= unchecked((long)0x100000001b3L);
                 }
             }
-        }
-        return hash;
-    }
-
-    /// <summary>
-    /// Deterministic FNV-1a hash over string characters (not affected by
-    /// .NET's per-process hash randomization).
-    /// </summary>
-    private static long StableStringHash(string s, long seed)
-    {
-        long hash = seed;
-        for (int i = 0; i < s.Length; i++)
-        {
-            hash ^= s[i];
-            hash *= unchecked((long)0x100000001b3L);
         }
         return hash;
     }
@@ -195,6 +201,13 @@ internal sealed class AutoTrainingState
     {
         _compiledBackward = compiled;
         _compiledStored = true;
+    }
+
+    internal void StoreCompiledBackwardWithHash<T>(CompiledBackwardGraph<T> compiled, long hash)
+    {
+        _compiledBackward = compiled;
+        _compiledStored = true;
+        _lastStepHash = hash;
     }
 
     internal CompiledBackwardGraph<T>? TryGetCompiledBackward<T>()

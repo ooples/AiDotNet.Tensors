@@ -446,8 +446,10 @@ namespace AiDotNet.Tensors.Tests.Engines
                 var lazyBiased = engine.TensorBroadcastAdd(lazyMm, bias1D);
                 lazyResult = engine.ReLU(lazyBiased);
 
-                // Verify fusion actually reduced the node count (3 ops → fewer after fusion)
-                Assert.True(scope.NodeCount <= 3, $"Expected fusion to reduce node count, got {scope.NodeCount}");
+                // NodeCount reflects recorded lazy nodes (always 3 here: MatMul, Add, ReLU).
+                // Fusion happens at compile time, not during recording, so NodeCount won't
+                // decrease. Instead, verify the compiled result matches the eager output.
+                Assert.Equal(3, scope.NodeCount);
                 scope.Realize();
             }
 

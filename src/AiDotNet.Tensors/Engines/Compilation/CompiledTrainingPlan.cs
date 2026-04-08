@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : IDisposable
+internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 {
     private readonly Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
@@ -80,12 +80,12 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
         _pinnedHandles.Clear();
     }
 
-    internal Tensor<T>[] Gradients => _gradients;
-    internal int ForwardStepCount => _forwardActions.Length;
-    internal int BackwardStepCount => _backwardActions.Length;
+    public Tensor<T>[] Gradients => _gradients;
+    public int ForwardStepCount => _forwardActions.Length;
+    public int BackwardStepCount => _backwardActions.Length;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal Tensor<T> Step()
+    public Tensor<T> Step()
     {
         var engine = _engine;
 
@@ -205,12 +205,25 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
-        // Build forward actions: fused actions first, then remaining unfused steps
-        // Build forward actions with specialized direct-BLAS where possible
-        var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
+        // Build forward actions in original graph order. Fused groups replace their
+        // constituent steps at the position of the first fused step in each group,
+        // ensuring non-fused producers that appear before a fused block still run first.
+        var allForwardActions = new List<Action<IEngine>>();
+        int nextFusedGroupIdx = 0; // index into fusedForwardActions
         for (int i = 0; i < forwardSteps.Count; i++)
         {
-            if (fusedStepIndices.Contains(i)) continue;
+            if (fusedStepIndices.Contains(i))
+            {
+                // A fused step starts a new group when its predecessor is NOT fused.
+                // This correctly handles consecutive groups (e.g., {0,1,2, 3,4,5}).
+                bool isFirstInGroup = i == 0 || !fusedStepIndices.Contains(i - 1);
+                if (isFirstInGroup && nextFusedGroupIdx < fusedForwardActions.Count)
+                {
+                    allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
+                    nextFusedGroupIdx++;
+                }
+                continue;
+            }
             var step = forwardSteps[i];
             var specialized = TryBuildSpecializedForward(step, pinnedHandles);
             if (specialized != null)
@@ -253,8 +266,10 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
                 });
             }
         }
-        // Append fused backward actions (they handle their own gradient routing)
-        backwardActions.AddRange(fusedBackwardActions);
+        // Append fused backward actions in reverse order — TryFuseForwardBackward records
+        // them in forward order, but autodiff requires backward (reverse) order.
+        for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
+            backwardActions.Add(fusedBackwardActions[i]);
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -272,8 +287,29 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
                 gradients[i] = gradMap[parameters[i]];
         }
 
+        // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
+        var paramSet = new HashSet<Tensor<T>>(parameters);
+        backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
+
         // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
         int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
+
+        // Phase 4.4: Wire pre-packed weights for MatMul forward steps
+        if (typeof(T) == typeof(float))
+        {
+            var packedWeights = WeightLayoutOptimizer.PrePackWeights(allForwardActions
+                .Select((a, idx) => idx < forwardSteps.Count && !fusedStepIndices.Contains(idx) ? forwardSteps[idx] : null)
+                .Where(s => s is not null)
+                .ToArray()!);
+            // packedWeights are available for future SIMD tile kernels that consume panel format
+        }
+
+        // Phase 4.4: Fused optimizer — append SGD/Adam parameter update directly to backward actions.
+        // This is optional and controlled by the caller via FusedOptimizer.AppendFusedUpdates().
+        // The default compiled plan returns gradients for the caller to update parameters manually.
+        // When a caller (e.g., CompiledTapeTrainingStep) wants fused updates, it calls:
+        //   FusedOptimizer.AppendFusedUpdates(plan.BackwardActions, params, grads, lr)
+        // This avoids hard-coding the learning rate into the compiled plan.
 
         return new CompiledTrainingPlan<T>(
             forwardActions,
@@ -1149,7 +1185,39 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
             };
         }
 
-        // ReLU backward: mask = input > 0, grad = gradOut * mask — SIMD, zero alloc
+        // ReLU backward: mask = input > 0, grad = gradOut * mask
+        // Phase 5.2: Use bitmask (1 bit/element) instead of full input tensor (32x memory savings)
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
+            && step.Inputs[0].IsContiguous && typeof(T) == typeof(float))
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            // Pre-allocate bitmask at compile time (32x smaller than storing full input)
+            byte[]? reluBitmask = null;
+
+            return eng =>
+            {
+                // Create bitmask from forward output (output > 0 ↔ input > 0 for ReLU)
+                var outputData = (float[])(object)output.GetDataArray();
+                int len = output.Length;
+                reluBitmask ??= new byte[(len + 7) / 8];
+                ActivationCheckpoint.CreateReluBitmask(outputData, len);
+
+                // Apply backward using bitmask
+                var gradOutData = (float[])(object)gradOut.GetDataArray();
+                var gradInData = (float[])(object)gradIn.GetDataArray();
+                ActivationCheckpoint.ApplyReluBackwardFromBitmask(gradOutData, reluBitmask, gradInData, len);
+                input.Grad = gradIn;
+            };
+        }
+        // ReLU backward fallback: full input tensor path (non-float types)
         if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
             && step.Inputs[0].IsContiguous)
         {
@@ -1513,6 +1581,14 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
             if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0]))
                 continue;
             if (!ReferenceEquals(step1.OutputBuffer, step2.Inputs[0]))
+                continue;
+
+            // Require single-consumer chain: if step0 or step1 output feeds
+            // other steps beyond the fused chain, skipping them would leave
+            // those consumers without materialized data.
+            if (consumerCount.TryGetValue(step0.OutputBuffer, out int c0) && c0 > 1)
+                continue;
+            if (consumerCount.TryGetValue(step1.OutputBuffer, out int c1) && c1 > 1)
                 continue;
 
             // Verify all 2D

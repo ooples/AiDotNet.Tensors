@@ -62,6 +62,28 @@ internal static class SimdGemm
     }
 
     /// <summary>
+    /// Computes C = beta*C + A*B. When beta=0, overwrites C (clears first).
+    /// When beta=1, accumulates into C. Matches BLAS sgemm semantics.
+    /// </summary>
+    [MethodImpl(Hot)]
+    public static void Sgemm(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m, int k, int n,
+        float beta)
+    {
+        if (beta == 0f)
+            c.Clear();
+        else if (beta != 1f)
+        {
+            for (int i = 0; i < c.Length; i++)
+                c[i] *= beta;
+        }
+        SgemmAdd(a, b, c, m, k, n);
+    }
+
+    /// <summary>
     /// Computes C += A * B (accumulates into C without clearing).
     /// </summary>
     [MethodImpl(Hot)]
