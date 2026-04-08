@@ -16,6 +16,18 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 internal static class DifferentiableOps
 {
+    /// <summary>
+    /// Global flag: true when ANY thread has an active gradient tape.
+    /// Checked first in Record methods — when false, the entire method
+    /// is skipped without even reading ThreadStatic (saves ~5ns/op).
+    /// Set by GradientTape constructor/Dispose.
+    /// </summary>
+    internal static volatile int _anyTapeActive;
+
+    /// <summary>Fast check: is any tape active on any thread?</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool AnyTapeActive() => _anyTapeActive != 0;
+
     // Indexed gradient array: set by ComputeGradients before backward walk,
     // read by AccumulateGrad for O(1) access instead of dictionary hash lookup.
     // ThreadStatic because backward is single-threaded per tape.
@@ -51,6 +63,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (_anyTapeActive == 0) return;
         if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
@@ -106,6 +119,8 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        // Fast path: skip ThreadStatic read entirely when no tape exists globally
+        if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
 
@@ -135,6 +150,7 @@ internal static class DifferentiableOps
         BackwardFunction<T> backward,
         object[]? savedState = null)
     {
+        if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
 

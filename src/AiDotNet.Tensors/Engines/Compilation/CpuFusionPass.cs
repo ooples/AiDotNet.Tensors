@@ -193,6 +193,12 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             if (bias._shape[0] != matmulOutputCols)
                 return null;
 
+            // Clear LazySource on intermediate outputs so auto-materialize doesn't
+            // try to realize the now-removed nodes. The fused node will write the
+            // final result into finalOutput.
+            matmul.Output.LazySource = null;
+            add.Output.LazySource = null;
+
             var nodeType = ActivationRegistry.GetFusedLinearNodeType(activation);
 
             var capturedInput = input;
@@ -204,7 +210,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
                 ? new object[] { activation }
                 : null;
 
-            var fusedNode = new LazyNode<T>(
+            return new LazyNode<T>(
                 nodeType,
                 "FusedLinear",
                 new[] { capturedInput, capturedWeights, capturedBias },
@@ -216,17 +222,6 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
                 },
                 BackwardFunctions<T>.FusedLinearWithActivationBackward,
                 savedState);
-
-            // Clear LazySource on removed intermediates. The fused node only writes
-            // into finalOutput — intermediate buffers are never populated, so leaving
-            // a LazySource would auto-materialize into a buffer the fused node doesn't
-            // write to, returning uninitialized data. Clearing is safer: accessing an
-            // intermediate will return its (uninitialized) buffer rather than silently
-            // running the wrong realization.
-            matmul.Output.LazySource = null;
-            add.Output.LazySource = null;
-
-            return fusedNode;
         }
     }
 }

@@ -499,14 +499,6 @@ public static class CpuFusedOperations
         throw new ArgumentException($"No float activation registered for type: {activation}");
     }
 
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static float ApplyActivation(float x, FusedActivationType activation)
-    {
-        // Delegate through the registered table for OCP compliance.
-        // JIT inlines this for the common case since the delegate is a static field.
-        return GetFloatActivation(activation)(x);
-    }
-
     /// <summary>
     /// GELU activation using fast tanh approximation.
     /// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -651,12 +643,6 @@ public static class CpuFusedOperations
         if (_doubleActivations.TryGetValue(activation, out var fn))
             return fn;
         throw new ArgumentException($"No double activation registered for type: {activation}");
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static double ApplyActivationDouble(double x, FusedActivationType activation)
-    {
-        return GetDoubleActivation(activation)(x);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

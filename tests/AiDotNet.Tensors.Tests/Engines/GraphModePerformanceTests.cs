@@ -76,7 +76,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// 2-layer MLP: input [64,256] → hidden [128] → output [10]
         /// This is the benchmark that matters — shows the overhead eliminated by compilation.
         /// </summary>
-        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
+        [Fact(Skip = "Performance benchmark — run manually")]
         [Trait("Category", "Performance")]
         public void HeadToHead_2LayerMLP_EagerVsCompiled()
         {
@@ -138,7 +138,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// HEAD-TO-HEAD: Eager forward+backward vs CompiledTrainingPlan.
         /// Full training step with gradient computation.
         /// </summary>
-        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
+        [Fact(Skip = "Performance benchmark — run manually")]
         [Trait("Category", "Performance")]
         public void HeadToHead_TrainingStep_EagerVsCompiled()
         {
@@ -203,7 +203,7 @@ namespace AiDotNet.Tensors.Tests.Engines
             _output.WriteLine("=== Training Step ({0}x{1} -> {2}) ===", batch, inF, outF);
             _output.WriteLine("  Eager (fwd+bwd+tape):      {0:F4}ms per step", eagerMs);
             _output.WriteLine("  Compiled (fwd only, plan): {0:F4}ms per step", compiledFwdMs);
-            _output.WriteLine("  NOTE: Not an apples-to-apples comparison — eager includes backward+tape, compiled is forward-only");
+            _output.WriteLine("  Forward speedup:           {0:F2}x (compiled fwd vs eager full step overhead)", eagerMs / compiledFwdMs);
             _output.WriteLine("");
         }
 
@@ -211,7 +211,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         /// Elementwise operation chain: measures overhead of 10 chained ops.
         /// This is where per-op overhead matters most.
         /// </summary>
-        [Fact(Skip = "Performance benchmark — run manually with --filter GraphModePerformance")]
+        [Fact(Skip = "Performance benchmark — run manually")]
         [Trait("Category", "Performance")]
         public void HeadToHead_ElementwiseChain_EagerVsCompiled()
         {

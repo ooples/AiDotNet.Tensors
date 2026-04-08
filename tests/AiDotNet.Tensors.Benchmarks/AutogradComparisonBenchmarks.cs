@@ -91,7 +91,7 @@ public class AutogradComparisonBenchmarks
         return grads[_aiSmallA];
     }
 
-    [Benchmark(Description = "PyTorch: Add[64] forward+backward")]
+    [Benchmark(Description = "TorchSharp Eager: Add[64] forward+backward")]
     public TorchTensor PyTorch_Add64_ForwardBackward()
     {
         _torchSmallA.grad?.zero_();
@@ -115,7 +115,7 @@ public class AutogradComparisonBenchmarks
         return grads[_aiW1];
     }
 
-    [Benchmark(Description = "PyTorch: MatMul[32x128,128x64] forward+backward")]
+    [Benchmark(Description = "TorchSharp Eager: MatMul[32x128,128x64] forward+backward")]
     public TorchTensor PyTorch_MatMul_ForwardBackward()
     {
         _torchW1.grad?.zero_();
@@ -151,7 +151,7 @@ public class AutogradComparisonBenchmarks
         return tape.ComputeGradients(loss, new[] { _aiW1, _aiW2, _aiW3 });
     }
 
-    [Benchmark(Description = "PyTorch: MLP[32x128->64->32->10] train step")]
+    [Benchmark(Description = "TorchSharp Eager: MLP[32x128->64->32->10] train step")]
     public (TorchTensor, TorchTensor, TorchTensor) PyTorch_MLP_TrainStep()
     {
         _torchW1.grad?.zero_();
@@ -175,7 +175,7 @@ public class AutogradComparisonBenchmarks
         return _engine.TensorMatMul(_aiInput, _aiW1);
     }
 
-    [Benchmark(Description = "PyTorch: MatMul[32x128,128x64] inference (no_grad)")]
+    [Benchmark(Description = "TorchSharp Eager: MatMul[32x128,128x64] inference (no_grad)")]
     public TorchTensor PyTorch_MatMul_Inference()
     {
         using var _ = torch.no_grad();
@@ -225,7 +225,7 @@ public class AutogradComparisonBenchmarks
         return _compiledChainPlan!.Execute();
     }
 
-    [Benchmark(Description = "PyTorch: 5-op chain[64] (no_grad)")]
+    [Benchmark(Description = "TorchSharp Eager: 5-op chain[64] (no_grad)")]
     public TorchTensor PyTorch_ElementwiseChain()
     {
         using var _ = torch.no_grad();

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -69,14 +70,92 @@ internal sealed class CompiledInferencePlan<T>
             }
         }
 
-        // Clear LazySource on all compiled output buffers so later data access
-        // (AsSpan/GetDataArray) doesn't re-trigger auto-materialization.
-        foreach (var node in optimized)
+        // Build specialized forward actions (same optimization as CompiledTrainingPlan)
+        var specializedSteps = new CompiledStep<T>[steps.Count];
+        for (int i = 0; i < steps.Count; i++)
         {
-            node.ClearOutputLazySource();
+            var step = steps[i];
+
+            // Transpose optimization: write directly into the pre-allocated output buffer
+            // using a tight loop. Avoids both the temporary allocation from TensorTranspose()
+            // and the strided-view approach which breaks array-based fast paths.
+            if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
+            {
+                var capturedInput = step.Inputs[0];
+                var capturedOutput = step.OutputBuffer;
+                int rows = capturedInput._shape[0];
+                int cols = capturedInput._shape[1];
+                specializedSteps[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) =>
+                    {
+                        var src = capturedInput.Data.Span;
+                        var dst = capturedOutput.Data.Span;
+                        for (int r = 0; r < rows; r++)
+                            for (int c = 0; c < cols; c++)
+                                dst[c * rows + r] = src[r * cols + c];
+                    },
+                    step.OutputBuffer,
+                    step.Inputs,
+                    step.BackwardFn,
+                    step.SavedState);
+                continue;
+            }
+
+            var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step);
+            if (specialized != null)
+            {
+                // Wrap the specialized action as a CompiledStep with the optimized execute
+                var output = step.OutputBuffer;
+                var action = specialized;
+                specializedSteps[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) => action(eng),
+                    output,
+                    step.Inputs,
+                    step.BackwardFn,
+                    step.SavedState);
+            }
+            else
+            {
+                specializedSteps[i] = step;
+            }
         }
 
-        var finalOutput = steps.Count > 0 ? steps[steps.Count - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
-        return new CompiledInferencePlan<T>(steps.ToArray(), finalOutput, engine);
+        // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
+        var optimizedSteps = RunCpuOptimizationPasses(specializedSteps, engine);
+
+        // Clear LazySource on all compiled output tensors to prevent auto-materialization
+        // from re-triggering lazy graph execution after compilation
+        foreach (var step in optimizedSteps)
+            step.OutputBuffer.LazySource = null;
+
+        // Use the last optimized step's output (may differ from original after fusion/spectral passes)
+        var finalOutput = optimizedSteps.Length > 0 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer : new Tensor<T>(new int[] { 0 });
+        return new CompiledInferencePlan<T>(optimizedSteps, finalOutput, engine);
+    }
+
+    /// <summary>
+    /// Runs CPU-level optimization passes on the compiled steps.
+    /// Currently: spectral decomposition (Phase A) and dataflow fusion (Phase B).
+    /// Each pass is independently toggleable via TensorCodecOptions.
+    /// </summary>
+    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine)
+    {
+        ICpuOptimizationPass[] passes =
+        {
+            new SpectralDecompositionPass(),
+            new DataflowFusionPass(),
+        };
+
+        var current = steps;
+        foreach (var pass in passes)
+        {
+            if (!pass.IsEnabled) continue;
+            var optimized = pass.TryOptimize(current, engine);
+            if (optimized != null)
+                current = optimized;
+        }
+        return current;
     }
 }

@@ -395,12 +395,10 @@ internal static class BackwardFunctions<T>
                     return;
                 }
                 // Either GEMM refused — fall through to generic path
-                goto fallback;
             }
         }
 
         // Fallback: materialize transposes (works for all types and ranks)
-        fallback:
         var bT = engine.TensorTranspose(inputs[1]);
         var gradAFallback = engine.TensorMatMul(gradOutput, bT);
 
@@ -3187,7 +3185,6 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Apply activation derivative to gradOutput before linear backward.
-        // savedState[0] = FusedActivationType.
         // We need the pre-activation (linear output) for correct GELU/Swish derivatives.
         if (savedState is { Length: >= 1 })
         {
@@ -3237,9 +3234,7 @@ internal static class BackwardFunctions<T>
             var gradInputArr = new float[M * K];
             var gradWeightArr = new float[K * N];
 
-            // dL/dinput = gradOutput @ weight^T
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
-            // dL/dweight = input^T @ gradOutput
             bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
 
             if (!okInput || !okWeight)

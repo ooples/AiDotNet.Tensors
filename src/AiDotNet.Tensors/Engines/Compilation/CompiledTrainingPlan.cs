@@ -1,5 +1,7 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -17,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T>
+internal sealed class CompiledTrainingPlan<T> : IDisposable
 {
     private readonly Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
@@ -27,7 +29,17 @@ internal sealed class CompiledTrainingPlan<T>
     private readonly Tensor<T>[] _gradients;
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
-    private readonly Tensor<T> _lossGrad;
+    private readonly List<GCHandle> _pinnedHandles = new();
+    private bool _disposed;
+
+    // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
+    private readonly int[]? _genericGradIndices;
+
+    // Cached raw arrays for zero-overhead Step() — avoid AsSpan()/GetDataArray() per call
+    private T[][]? _cachedGradArrays;
+    private T[]? _cachedLossGradSeedArray;
+    private T[]? _cachedLossGradDestArray;
+    private readonly Tensor<T>? _lossGradDest; // Pre-allocated gradient buffer for loss output
 
     private CompiledTrainingPlan(
         Action<IEngine>[] forwardActions,
@@ -38,7 +50,9 @@ internal sealed class CompiledTrainingPlan<T>
         Tensor<T>[] preAllocatedGrads,
         Tensor<T>[] gradients,
         Tensor<T> lossGradSeed,
-        Tensor<T> lossGrad)
+        int[]? genericGradIndices = null,
+        Tensor<T>? lossGradDest = null,
+        List<GCHandle>? pinnedHandles = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -48,7 +62,22 @@ internal sealed class CompiledTrainingPlan<T>
         _preAllocatedGrads = preAllocatedGrads;
         _gradients = gradients;
         _lossGradSeed = lossGradSeed;
-        _lossGrad = lossGrad;
+        _genericGradIndices = genericGradIndices;
+        _lossGradDest = lossGradDest;
+        if (pinnedHandles is not null)
+            _pinnedHandles.AddRange(pinnedHandles);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var handle in _pinnedHandles)
+        {
+            if (handle.IsAllocated)
+                handle.Free();
+        }
+        _pinnedHandles.Clear();
     }
 
     internal Tensor<T>[] Gradients => _gradients;
@@ -60,19 +89,48 @@ internal sealed class CompiledTrainingPlan<T>
     {
         var engine = _engine;
 
-        // Forward: straight-line delegate calls
+        // Forward: straight-line delegate calls (specialized: direct BLAS, no engine dispatch)
         var fwd = _forwardActions;
         for (int i = 0; i < fwd.Length; i++)
             fwd[i](engine);
 
-        // Zero all gradient buffers
-        for (int i = 0; i < _preAllocatedGrads.Length; i++)
-            _preAllocatedGrads[i].AsWritableSpan().Clear();
+        // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
+        var gradArrays = _cachedGradArrays;
+        if (gradArrays == null)
+        {
+            gradArrays = new T[_preAllocatedGrads.Length][];
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                gradArrays[i] = _preAllocatedGrads[i].GetDataArray();
+            _cachedGradArrays = gradArrays;
+            _cachedLossGradSeedArray = _lossGradSeed.GetDataArray();
+            _cachedLossGradDestArray = _lossGradDest?.GetDataArray();
+        }
 
-        // Re-seed loss gradient into the loss output's gradient buffer (not positional)
-        _lossGradSeed.AsSpan().CopyTo(_lossGrad.AsWritableSpan());
+        // Only zero gradient buffers used by generic (accumulating) backward delegates.
+        // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
+        // At large sizes, this saves significant time by skipping unnecessary clears.
+        if (_genericGradIndices != null)
+        {
+            for (int i = 0; i < _genericGradIndices.Length; i++)
+            {
+                int idx = _genericGradIndices[i];
+                Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+            }
+        }
+        else
+        {
+            // First call: clear everything (safe fallback)
+            for (int i = 0; i < gradArrays.Length; i++)
+                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+        }
 
-        // Backward: specialized delegates that write directly into pre-allocated buffers
+        // Re-seed loss gradient — direct Array.Copy
+        var seedArr = _cachedLossGradSeedArray;
+        var destArr = _cachedLossGradDestArray;
+        if (seedArr != null && destArr != null)
+            Array.Copy(seedArr, destArr, seedArr.Length);
+
+        // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         var bwd = _backwardActions;
         for (int i = 0; i < bwd.Length; i++)
             bwd[i](engine);
@@ -133,29 +191,56 @@ internal sealed class CompiledTrainingPlan<T>
             allGrads.Add(grad);
         }
 
-        // Build forward actions (capture step + output buffer)
-        var forwardActions = new Action<IEngine>[forwardSteps.Count];
-        for (int i = 0; i < forwardSteps.Count; i++)
+        // Phase B integration: detect MatMul→ReLU→MatMul patterns and replace with fused kernel
+        var fusedForwardActions = new List<Action<IEngine>>();
+        var fusedBackwardActions = new List<Action<IEngine>>();
+        var fusedStepIndices = new HashSet<int>(); // indices consumed by fusion
+
+        if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion)
         {
-            var step = forwardSteps[i];
-            var output = step.OutputBuffer;
-            var exec = step.Execute;
-            forwardActions[i] = eng => exec(eng, output);
+            TryFuseForwardBackward(forwardSteps, gradMap, consumerCount, engine,
+                fusedForwardActions, fusedBackwardActions, fusedStepIndices);
         }
 
-        // Build specialized backward actions
+        // Track GCHandles for cleanup on Dispose
+        var pinnedHandles = new List<GCHandle>();
+
+        // Build forward actions: fused actions first, then remaining unfused steps
+        // Build forward actions with specialized direct-BLAS where possible
+        var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            if (fusedStepIndices.Contains(i)) continue;
+            var step = forwardSteps[i];
+            var specialized = TryBuildSpecializedForward(step, pinnedHandles);
+            if (specialized != null)
+            {
+                allForwardActions.Add(specialized);
+            }
+            else
+            {
+                var output = step.OutputBuffer;
+                var exec = step.Execute;
+                allForwardActions.Add(eng => exec(eng, output));
+            }
+        }
+        var forwardActions = allForwardActions.ToArray();
+
+        // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
+        int genericBackwardCount = 0;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
+            if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine);
+            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
             if (action != null)
                 backwardActions.Add(action);
             else
             {
-                // Fallback: use generic backward function with pre-allocated grad accumulator
+                genericBackwardCount++;
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -168,17 +253,16 @@ internal sealed class CompiledTrainingPlan<T>
                 });
             }
         }
+        // Append fused backward actions (they handle their own gradient routing)
+        backwardActions.AddRange(fusedBackwardActions);
 
-        // Loss gradient seed — use the loss output tensor's gradient buffer explicitly
+        // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
         var lossOutput = forwardSteps.Count > 0
             ? forwardSteps[forwardSteps.Count - 1].OutputBuffer
             : new Tensor<T>(new int[] { 1 });
         var lossGradSeed = TensorAllocator.RentUninitialized<T>(lossOutput._shape);
         lossGradSeed.AsWritableSpan().Fill(numOps.One);
-
-        // Look up the loss output's gradient buffer by tensor identity, not array position
-        var lossGrad = gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : allGrads[allGrads.Count - 1];
 
         // Gradients array for parameters
         var gradients = new Tensor<T>[parameters.Length];
@@ -187,6 +271,9 @@ internal sealed class CompiledTrainingPlan<T>
             if (gradMap.ContainsKey(parameters[i]))
                 gradients[i] = gradMap[parameters[i]];
         }
+
+        // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
+        int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
 
         return new CompiledTrainingPlan<T>(
             forwardActions,
@@ -197,7 +284,809 @@ internal sealed class CompiledTrainingPlan<T>
             allGrads.ToArray(),
             gradients,
             lossGradSeed,
-            lossGrad);
+            genericGradIndices,
+            gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
+            pinnedHandles);
+    }
+
+    /// <summary>
+    /// Generates a specialized forward delegate that bypasses engine dispatch overhead.
+    /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
+    /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
+    /// </summary>
+    /// <summary>Pin an array and track the handle for later cleanup.</summary>
+    private static GCHandle PinAndTrack(object array, List<GCHandle>? tracker)
+    {
+        var handle = GCHandle.Alloc(array, GCHandleType.Pinned);
+        tracker?.Add(handle);
+        return handle;
+    }
+
+    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step, List<GCHandle>? handleTracker = null)
+    {
+        if (typeof(T) != typeof(float)) return null;
+
+        // MatMul forward: direct BLAS into output buffer
+        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
+            && typeof(T) == typeof(float))
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
+
+            // Pre-fetch arrays at compile time (bypasses EnsureMaterialized at replay)
+            var cA = (float[])(object)inputA.GetDataArray();
+            var cB = (float[])(object)inputB.GetDataArray();
+            var cOut = (float[])(object)output.GetDataArray();
+
+            return eng =>
+            {
+                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
+                    SimdGemm.Sgemm(cA, cB, cOut, M, K, N);
+            };
+        }
+
+        // ReLU forward: direct SIMD into output buffer
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            return eng =>
+            {
+                var iMem = ((Tensor<float>)(object)input).Data;
+                var oMem = ((Tensor<float>)(object)output).Data;
+                using var pinI = iMem.Pin();
+                using var pinO = oMem.Pin();
+                SimdKernels.ReLUUnsafe((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
+            };
+        }
+
+        // ReduceSum forward: direct sum, skip engine dispatch
+        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1 && step.OutputBuffer.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            float[]? cOut = null;
+
+            if (typeof(T) == typeof(float) && input.IsContiguous)
+            {
+                // Pinned path: GCHandle once at compile time
+                var inH = PinAndTrack(
+                    ((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+                int len = input.Length;
+
+                // For large arrays, use parallel chunked reduction (matches TensorSum)
+                if (len >= 200_000)
+                {
+                    int numChunks = Math.Max(2, len / 50_000);
+                    int chunkSize = ((len + numChunks - 1) / numChunks + 31) & ~31;
+                    var partials = new float[numChunks];
+                    return eng =>
+                    {
+                        cOut ??= (float[])(object)output.GetDataArray();
+                        unsafe
+                        {
+                            float* p = (float*)inH.AddrOfPinnedObject();
+                            Parallel.For(0, numChunks, chunk =>
+                            {
+                                int start = chunk * chunkSize;
+                                int count = Math.Min(chunkSize, len - start);
+                                if (count > 0) partials[chunk] = SimdKernels.SumUnsafe(p + start, count);
+                                else partials[chunk] = 0f;
+                            });
+                            float total = 0f;
+                            for (int c = 0; c < numChunks; c++) total += partials[c];
+                            cOut[0] = total;
+                        }
+                    };
+                }
+
+                return eng =>
+                {
+                    cOut ??= (float[])(object)output.GetDataArray();
+                    unsafe { cOut[0] = SimdKernels.SumUnsafe((float*)inH.AddrOfPinnedObject(), len); }
+                };
+            }
+            return eng =>
+            {
+                cOut ??= (float[])(object)output.GetDataArray();
+                T sum = eng.TensorSum(input);
+                if (typeof(T) == typeof(float))
+                    cOut[0] = Unsafe.As<T, float>(ref sum);
+            };
+        }
+
+        // TensorAdd forward: pinned SIMD VectorAddUnsafe
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorAddUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorAddInto(o, a, b);
+        }
+
+        // TensorSubtract forward: pinned SIMD VectorSubtractUnsafe
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorSubtractUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorSubtractInto(o, a, b);
+        }
+
+        // TensorMultiply forward: pinned SIMD VectorMultiplyUnsafe
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = a.Length;
+            return eng => { unsafe { SimdKernels.VectorMultiplyUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
+        }
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            return eng => eng.TensorMultiplyInto(o, a, b);
+        }
+
+        // Sigmoid: don't specialize forward — the eager allocating path is faster
+        // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
+
+        // Tanh forward: VML → SIMD fallback, pinned GCHandle
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    // Try MKL VML vsTanh first (SVML, ~3x faster than polynomial)
+                    if (!Helpers.VmlProvider.TryTanh(pIn, pOut, len))
+                        SimdKernels.TanhUnsafe(pIn, pOut, len);
+                }
+            };
+        }
+        // Tanh non-float fallback
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.TanhInto(o, inp);
+        }
+
+        // Softmax forward: use SoftmaxInto
+        if (step.OpType == OpType.Softmax && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            int axis = step.SavedState != null && step.SavedState.Length > 0 ? (int)step.SavedState[0] : -1;
+            return eng => eng.SoftmaxInto(o, inp, axis);
+        }
+
+        // TensorNegate forward: pinned SIMD NegateUnsafe
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng => { unsafe { SimdKernels.NegateUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
+        }
+        // TensorNegate non-float fallback
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                MathHelper.GetNumericOperations<T>().Negate(inp.AsSpan(), o.AsWritableSpan());
+            };
+        }
+
+        // Sigmoid forward: pinned SigmoidUnsafe — bypass EnsureMaterialized
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.SigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Sigmoid non-float fallback
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.SigmoidInto(o, inp);
+        }
+
+        // GELU forward: pinned SIMD — cache GCHandles at compile time for zero-overhead replay
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            // Pin arrays once at compile time — GCHandles survive across replays
+            var inHandle = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outHandle = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inHandle.AddrOfPinnedObject();
+                    float* pOut = (float*)outHandle.AddrOfPinnedObject();
+                    SimdKernels.GELUUnsafe(pIn, pOut, len);
+                }
+            };
+        }
+        // FusedLinear forward: direct BLAS + bias + activation into output buffer
+        if (step.OpType == OpType.FusedLinear && step.Inputs.Length == 3 && typeof(T) == typeof(float)
+            && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
+        {
+            var input = step.Inputs[0]; var weights = step.Inputs[1]; var bias = step.Inputs[2];
+            var o = step.OutputBuffer;
+            var activation = step.SavedState != null && step.SavedState.Length > 0 && step.SavedState[0] is FusedActivationType act
+                ? act : FusedActivationType.None;
+            int M = input._shape[0], K = input._shape[1], N = weights._shape[1];
+
+            // Pre-fetch arrays at compile time — bypass EnsureMaterialized at replay
+            var inArr = (float[])(object)input.GetDataArray();
+            var wArr = (float[])(object)weights.GetDataArray();
+            var bArr = (float[])(object)bias.GetDataArray();
+            var oArr = (float[])(object)o.GetDataArray();
+
+            return eng =>
+            {
+                // Direct BLAS into output + fused bias + activation
+                CpuFusedOperations.FusedGemmBiasActivation(
+                    inArr, wArr, bArr, oArr, M, N, K, activation);
+            };
+        }
+
+        // GELU non-float fallback
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => eng.GELUInto(o, inp);
+        }
+
+        // Abs forward: direct SIMD AbsUnsafe
+        if (step.OpType == OpType.TensorAbs && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng =>
+            {
+                unsafe
+                {
+                    var srcMem = ((Tensor<float>)(object)inp).Data;
+                    var dstMem = ((Tensor<float>)(object)o).Data;
+                    using var pinS = srcMem.Pin();
+                    using var pinD = dstMem.Pin();
+                    SimdKernels.AbsUnsafe((float*)pinS.Pointer, (float*)pinD.Pointer, inp.Length);
+                }
+            };
+        }
+
+        // Pow forward: SIMD x*x for exponent=2
+        if (step.OpType == OpType.TensorPower && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            // Check if exponent is 2 (x^2 = x*x)
+            float exp = step.SavedState != null && step.SavedState.Length > 0 ? Convert.ToSingle(step.SavedState[0]) : 0;
+            if (exp == 2.0f)
+            {
+                return eng =>
+                {
+                    unsafe
+                    {
+                        var srcMem = ((Tensor<float>)(object)inp).Data;
+                        var dstMem = ((Tensor<float>)(object)o).Data;
+                        using var pinS = srcMem.Pin();
+                        using var pinD = dstMem.Pin();
+                        SimdKernels.VectorMultiplyUnsafe((float*)pinS.Pointer, (float*)pinS.Pointer, (float*)pinD.Pointer, inp.Length);
+                    }
+                };
+            }
+        }
+
+        // LeakyReLU forward: direct SIMD
+        if (step.OpType == OpType.LeakyReLU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var alpha = step.SavedState != null && step.SavedState.Length > 0
+                ? MathHelper.GetNumericOperations<T>().FromDouble((double)step.SavedState[0])
+                : MathHelper.GetNumericOperations<T>().FromDouble(0.01);
+            return eng => eng.LeakyReLUInto(o, inp, alpha);
+        }
+
+        // Swish forward: pinned SigmoidUnsafe + VectorMultiplyUnsafe — bypass EnsureMaterialized
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    SimdKernels.SigmoidUnsafe(pIn, pOut, len);
+                    SimdKernels.VectorMultiplyUnsafe(pIn, pOut, pOut, len);
+                }
+            };
+        }
+        // Swish non-float fallback
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // ELU forward: pinned SIMD ELUUnsafe
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float alphaF = step.SavedState != null && step.SavedState.Length > 0 ? (float)(double)step.SavedState[0] : 1.0f;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ELUUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len, alphaF); }
+            };
+        }
+        // ELU non-float fallback
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
+            return eng => { if (eng is CpuEngine cpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
+        if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.LogUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Log non-float fallback
+        if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Exp forward: VML → SIMD fallback, pinned GCHandle
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    if (!Helpers.VmlProvider.TryExp(pIn, pOut, len))
+                        SimdKernels.ExpUnsafe(pIn, pOut, len);
+                }
+            };
+        }
+        // Exp non-float fallback
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
+        if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.MishUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+        // Mish non-float fallback
+        if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // BatchNorm/LayerNorm: don't specialize — the generic execute delegate
+        // (from the lazy node) already handles these correctly. Specializing adds
+        // an extra allocate+copy on top of what the generic path already does.
+
+        // TensorDivide forward: pinned SIMD VectorDivideUnsafe
+        if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = a.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.VectorDivideUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // Conv2D forward: use Conv2DInto to write directly into output
+        if (step.OpType == OpType.Conv2D && step.Inputs.Length == 2)
+        {
+            var inp = step.Inputs[0]; var kernel = step.Inputs[1]; var o = step.OutputBuffer;
+            var savedState = step.SavedState;
+            if (savedState != null && savedState.Length == 3
+                && savedState[0] is int[] stride && savedState[1] is int[] padding && savedState[2] is int[] dilation)
+            {
+                int s = stride[0], p = padding[0], d = dilation[0];
+                return eng => eng.Conv2DInto(o, inp, kernel, s, p, d);
+            }
+            return eng => eng.Conv2DInto(o, inp, kernel, 1, 0, 1);
+        }
+
+        // LogSoftmax forward: pinned SIMD with VML exp for inner loop
+        if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int rows = inp._shape[0], cols = inp._shape[1];
+            return eng =>
+            {
+                unsafe
+                {
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    for (int r = 0; r < rows; r++)
+                    {
+                        float* rowIn = pIn + r * cols;
+                        float* rowOut = pOut + r * cols;
+                        // Find max
+                        float maxVal = rowIn[0];
+                        for (int c = 1; c < cols; c++)
+                            if (rowIn[c] > maxVal) maxVal = rowIn[c];
+                        // Compute shifted values into output, then exp in-place
+                        for (int c = 0; c < cols; c++)
+                            rowOut[c] = rowIn[c] - maxVal;
+                        // Vectorized exp: try VML first, then SIMD fallback
+                        if (!Helpers.VmlProvider.TryExp(rowOut, rowOut, cols))
+                            SimdKernels.ExpUnsafe(rowOut, rowOut, cols);
+                        // Sum + log
+                        float sumExp = SimdKernels.SumUnsafe(rowOut, cols);
+                        float logSumExp = MathF.Log(sumExp);
+                        // Final: log_softmax = shifted - log(sumExp)
+                        for (int c = 0; c < cols; c++)
+                            rowOut[c] = (rowIn[c] - maxVal) - logSumExp;
+                    }
+                }
+            };
+        }
+
+        // Mean forward: pinned SumUnsafe + divide, zero allocation
+        if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inHandle = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            float[]? cOut = null;
+            int len = inp.Length;
+            return eng =>
+            {
+                cOut ??= (float[])(object)o.GetDataArray();
+                unsafe
+                {
+                    float* pIn = (float*)inHandle.AddrOfPinnedObject();
+                    cOut[0] = SimdKernels.SumUnsafe(pIn, len) / len;
+                }
+            };
+        }
+
+        // Sqrt forward: direct SIMD SqrtUnsafe into output buffer
+        if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
+        if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
+        if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+        }
+
+        // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
+        if (step.OpType == OpType.Softplus && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.SoftplusUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // HardSwish forward: SIMD HardSwishUnsafe with pinned arrays
+        if (step.OpType == OpType.HardSwish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.HardSwishUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // SELU forward: pinned SELUUnsafe SIMD
+        if (step.OpType == OpType.SELU && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.SELUUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // HardSigmoid forward: pinned SIMD HardSigmoidUnsafe
+        if (step.OpType == OpType.HardSigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.HardSigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // Sign forward: SIMD SignUnsafe with pinned arrays
+        if (step.OpType == OpType.Sign && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.SignUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // Reciprocal forward: pinned SIMD
+        if (step.OpType == OpType.Reciprocal && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng => { unsafe { SimdKernels.ReciprocalUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
+        }
+
+        // Floor forward: pinned SIMD
+        if (step.OpType == OpType.Floor && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng => { unsafe { SimdKernels.FloorUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
+        }
+
+        // Ceiling forward: pinned SIMD
+        if (step.OpType == OpType.Ceiling && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng => { unsafe { SimdKernels.CeilingUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
+        }
+
+        // Round forward: pinned SIMD (AVX RoundToNearestInteger)
+        if (step.OpType == OpType.Round && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng => { unsafe { SimdKernels.RoundUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
+        }
+
+        // TensorMax forward: pinned SIMD VectorMaxUnsafe
+        if (step.OpType == OpType.TensorMax && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            var aH = PinAndTrack(
+                ((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(
+                ((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = a.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.VectorMaxUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); }
+            };
+        }
+
+        // Clamp forward: pinned SIMD ClampUnsafe
+        if (step.OpType == OpType.Clamp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            float fMin = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[0]) : float.MinValue;
+            float fMax = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[1]) : float.MaxValue;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ClampUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len, fMin, fMax); }
+            };
+        }
+
+        // BroadcastAdd/Sub/Mul forward: direct array loop for [N,M] op [M] pattern
+        if ((step.OpType == OpType.TensorBroadcastAdd || step.OpType == OpType.TensorBroadcastSubtract || step.OpType == OpType.TensorBroadcastMultiply)
+            && step.Inputs.Length == 2 && typeof(T) == typeof(float)
+            && step.Inputs[0].Rank == 2 && (step.Inputs[1].Rank == 1 || (step.Inputs[1].Rank == 2 && step.Inputs[1]._shape[0] == 1)))
+        {
+            var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
+            int rows = a._shape[0], cols = a._shape[1];
+            int bCols = b.Rank == 1 ? b._shape[0] : b._shape[1];
+            if (cols == bCols)
+            {
+                var aArr = (float[])(object)a.GetDataArray();
+                var bArr = (float[])(object)b.GetDataArray();
+                var oArr = (float[])(object)o.GetDataArray();
+                if (step.OpType == OpType.TensorBroadcastAdd)
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] + bArr[c]; } };
+                else if (step.OpType == OpType.TensorBroadcastSubtract)
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] - bArr[c]; } };
+                else
+                    return eng => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) oArr[off + c] = aArr[off + c] * bArr[c]; } };
+            }
+        }
+
+        // MSELoss forward: fused single-pass diff^2 sum
+        if (step.OpType == OpType.MSELoss && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var pred = step.Inputs[0]; var target = step.Inputs[1]; var o = step.OutputBuffer;
+            var pArr = (float[])(object)pred.GetDataArray();
+            var tArr = (float[])(object)target.GetDataArray();
+            var oArr = (float[])(object)o.GetDataArray();
+            int len = pred.Length;
+            return eng =>
+            {
+                float sumSq = 0f;
+                for (int i = 0; i < len; i++) { float d = pArr[i] - tArr[i]; sumSq += d * d; }
+                oArr[0] = sumSq / len;
+            };
+        }
+
+        // MaxPool2D: don't specialize (no Into variant, allocate+copy is slower)
+
+        // Transpose: fall through to generic path.
+        // Zero-copy transpose requires replacing OutputBuffer references in downstream steps,
+        // which is not yet supported by the compiled step infrastructure.
+
+        return null;
     }
 
     /// <summary>
@@ -208,12 +1097,13 @@ internal sealed class CompiledTrainingPlan<T>
         CompiledStep<T> step,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
-        IEngine engine)
+        IEngine engine,
+        List<GCHandle>? handleTracker = null)
     {
         if (typeof(T) != typeof(float)) return null;
 
         // MatMul backward: dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc
-        if (step.OpName == "TensorMatMul" && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2
             && BlasProvider.IsAvailable)
         {
@@ -229,29 +1119,29 @@ internal sealed class CompiledTrainingPlan<T>
             var gradB = gradMap[inputB];
 
             int M = inputA._shape[0], K = inputA._shape[1], N = inputB._shape[1];
-            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
-            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+
+            // Cache array references on first call to avoid GetDataArray() overhead per step
+            float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
 
             return eng =>
             {
-                var dCArr = (float[])(object)gradOut.GetDataArray();
-                var aArr = (float[])(object)inputA.GetDataArray();
-                var bArr = (float[])(object)inputB.GetDataArray();
-                var destA = (float[])(object)gradA.GetDataArray();
-                var destB = (float[])(object)gradB.GetDataArray();
+                cachedDC ??= (float[])(object)gradOut.GetDataArray();
+                cachedA ??= (float[])(object)inputA.GetDataArray();
+                cachedB ??= (float[])(object)inputB.GetDataArray();
+                cachedDestA ??= (float[])(object)gradA.GetDataArray();
+                cachedDestB ??= (float[])(object)gradB.GetDataArray();
 
-                // dA = dC @ B^T — direct BLAS into pre-allocated buffer
-                if (!BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, N, true, destA, 0, K))
+                // dA = dC @ B^T — direct BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, 0, N, false, cachedB, 0, N, true, cachedDestA, 0, K))
                 {
-                    // BLAS unavailable — fallback to engine matmul
-                    var fallbackA = eng.TensorMatMul(gradOut, eng.TensorTranspose(inputB));
-                    fallbackA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                    var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
+                    dA.AsSpan().CopyTo(gradA.AsWritableSpan());
                 }
-                // dB = A^T @ dC — direct BLAS into pre-allocated buffer
-                if (!BlasProvider.TryGemmEx(K, N, M, aArr, 0, K, true, dCArr, 0, N, false, destB, 0, N))
+                // dB = A^T @ dC — direct BLAS with engine fallback
+                if (!BlasProvider.TryGemmEx(K, N, M, cachedA, 0, K, true, cachedDC, 0, N, false, cachedDestB, 0, N))
                 {
-                    var fallbackB = eng.TensorMatMul(eng.TensorTranspose(inputA), gradOut);
-                    fallbackB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                    var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
+                    dB.AsSpan().CopyTo(gradB.AsWritableSpan());
                 }
 
                 inputA.Grad = gradA;
@@ -260,7 +1150,7 @@ internal sealed class CompiledTrainingPlan<T>
         }
 
         // ReLU backward: mask = input > 0, grad = gradOut * mask — SIMD, zero alloc
-        if (step.OpName == "ReLU" && step.Inputs.Length == 1
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
             && step.Inputs[0].IsContiguous)
         {
             var input = step.Inputs[0];
@@ -286,8 +1176,9 @@ internal sealed class CompiledTrainingPlan<T>
             };
         }
 
-        // Add backward: gradA += gradOut, gradB += gradOut — accumulate for multi-consumer safety
-        if (step.OpName == "TensorAdd" && step.Inputs.Length == 2)
+        // Add backward: gradA += gradOut, gradB += gradOut
+        // Use consumerCount to decide: overwrite (fast) for single-consumer, accumulate for multi-consumer
+        if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2)
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
@@ -299,19 +1190,28 @@ internal sealed class CompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
             return eng =>
             {
-                // Accumulate (add) instead of overwrite to handle multi-consumer tensors (e.g. x+x)
-                eng.TensorAddInPlace(gradA, gradOut);
-                eng.TensorAddInPlace(gradB, gradOut);
+                if (accumA)
+                    eng.TensorAddInto(gradA, gradA, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
+
+                if (accumB)
+                    eng.TensorAddInto(gradB, gradB, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradB.AsWritableSpan());
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
         }
 
         // Subtract backward: gradA += gradOut, gradB -= gradOut
-        if (step.OpName == "TensorSubtract" && step.Inputs.Length == 2)
+        if (step.OpType == OpType.TensorSubtract && step.Inputs.Length == 2)
         {
             var inputA = step.Inputs[0];
             var inputB = step.Inputs[1];
@@ -323,19 +1223,32 @@ internal sealed class CompiledTrainingPlan<T>
             var gradOut = gradMap[output];
             var gradA = gradMap[inputA];
             var gradB = gradMap[inputB];
+            bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
+            bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+            var numOps = MathHelper.GetNumericOperations<T>();
 
             return eng =>
             {
-                // Accumulate for multi-consumer safety
-                eng.TensorAddInPlace(gradA, gradOut);
-                eng.TensorSubtractInPlace(gradB, gradOut);
+                if (accumA)
+                    eng.TensorAddInto(gradA, gradA, gradOut);
+                else
+                    gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
+
+                if (accumB)
+                {
+                    // gradB -= gradOut (accumulate negative)
+                    eng.TensorSubtractInto(gradB, gradB, gradOut);
+                }
+                else
+                    numOps.Negate(gradOut.AsSpan(), gradB.AsWritableSpan());
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
         }
 
-        // Multiply backward: gradA += gradOut * B, gradB += gradOut * A
-        if (step.OpName == "TensorMultiply" && step.Inputs.Length == 2
+        // Multiply backward: gradA = gradOut * B, gradB = gradOut * A
+        if (step.OpType == OpType.TensorMultiply && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
         {
             var inputA = step.Inputs[0];
@@ -355,29 +1268,343 @@ internal sealed class CompiledTrainingPlan<T>
             {
                 if (accumA)
                 {
-                    // Accumulate: compute temp = gradOut * B, then gradA += temp
+                    // gradA += gradOut * inputB
                     var temp = eng.TensorMultiply(gradOut, inputB);
-                    eng.TensorAddInPlace(gradA, temp);
+                    eng.TensorAddInto(gradA, gradA, temp);
                 }
                 else
-                {
                     eng.TensorMultiplyInto(gradA, gradOut, inputB);
-                }
+
                 if (accumB)
                 {
+                    // gradB += gradOut * inputA
                     var temp = eng.TensorMultiply(gradOut, inputA);
-                    eng.TensorAddInPlace(gradB, temp);
+                    eng.TensorAddInto(gradB, gradB, temp);
                 }
                 else
-                {
                     eng.TensorMultiplyInto(gradB, gradOut, inputA);
-                }
+
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
         }
 
+        // ReduceSum backward: broadcast scalar gradient to all elements
+        // Only specialize for full scalar reduction (output length == 1)
+        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            return eng =>
+            {
+                // ReduceSum backward: each input element gets the same scalar gradient
+                gradIn.AsWritableSpan().Fill(gradOut.AsSpan()[0]);
+                input.Grad = gradIn;
+            };
+        }
+
+        // Sigmoid backward: grad * sigmoid(out) * (1 - sigmoid(out))
+        if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.SigmoidBackward(gradOut, output);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Tanh backward: grad * (1 - tanh(out)^2)
+        if (step.OpType == OpType.Tanh && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.TanhBackward(gradOut, output);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Negate backward: grad = -gradOut
+        if (step.OpType == OpType.TensorNegate && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                MathHelper.GetNumericOperations<T>().Negate(gradOut.AsSpan(), gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Transpose backward: grad = transpose(gradOut)
+        if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.TensorTranspose(gradOut);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Divide backward: gradA = gradOut / B, gradB = -gradOut * A / (B * B)
+        if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous)
+        {
+            var inputA = step.Inputs[0];
+            var inputB = step.Inputs[1];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputB))
+                return null;
+            var gradOut = gradMap[output];
+            var gradA = gradMap[inputA];
+            var gradB = gradMap[inputB];
+            return eng =>
+            {
+                var gA = eng.TensorDivide(gradOut, inputB);
+                gA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                var negGradTimesA = eng.TensorNegate(eng.TensorMultiply(gradOut, inputA));
+                var bSquared = eng.TensorMultiply(inputB, inputB);
+                var gB = eng.TensorDivide(negGradTimesA, bSquared);
+                gB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                inputA.Grad = gradA;
+                inputB.Grad = gradB;
+            };
+        }
+
+        // Softmax backward
+        if (step.OpType == OpType.Softmax && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+            int axis = step.SavedState != null && step.SavedState.Length > 0 ? (int)step.SavedState[0] : -1;
+            return eng =>
+            {
+                var grad = eng.SoftmaxBackward(gradOut, output, axis);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // GELU backward
+        if (step.OpType == OpType.GELU && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.GeluBackward(gradOut, input);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // LeakyReLU backward
+        if (step.OpType == OpType.LeakyReLU && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            double negSlope = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 0.01;
+            return eng =>
+            {
+                var grad = eng.LeakyReluBackward(gradOut, input, negSlope);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // Swish backward
+        if (step.OpType == OpType.Swish && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            return eng =>
+            {
+                var grad = eng.SwishBackward(gradOut, input);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
+        // ELU backward
+        if (step.OpType == OpType.ELU && step.Inputs.Length == 1)
+        {
+            var input = step.Inputs[0]; var output = step.OutputBuffer;
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input)) return null;
+            var gradOut = gradMap[output]; var gradIn = gradMap[input];
+            double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
+            return eng =>
+            {
+                var grad = eng.EluBackward(gradOut, input, output, alpha);
+                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                input.Grad = gradIn;
+            };
+        }
+
         return null; // Not specialized — use generic fallback
+    }
+
+    /// <summary>
+    /// Detects MatMul→ReLU→MatMul patterns in forward steps and replaces them with
+    /// FusedMultiLayerGemm (Phase B dataflow fusion). The fused kernel keeps inter-layer
+    /// data in L1 cache and uses transposed BLAS for zero-alloc backward.
+    /// </summary>
+    private static void TryFuseForwardBackward(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        IEngine engine,
+        List<Action<IEngine>> fusedForward,
+        List<Action<IEngine>> fusedBackward,
+        HashSet<int> consumedIndices)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        for (int i = 0; i + 2 < steps.Count; i++)
+        {
+            if (consumedIndices.Contains(i)) continue;
+
+            var step0 = steps[i];
+            var step1 = steps[i + 1];
+            var step2 = steps[i + 2];
+
+            // Pattern: MatMul[i] → ReLU[i+1] → MatMul[i+2]
+            // where ReLU's input is MatMul[i]'s output, and MatMul[i+2]'s input is ReLU's output
+            if (step0.OpName != "TensorMatMul" || step1.OpName != "ReLU" || step2.OpName != "TensorMatMul")
+                continue;
+
+            if (step0.Inputs.Length != 2 || step2.Inputs.Length != 2)
+                continue;
+
+            // Verify chain: matmul0.output → relu.input, relu.output → matmul2.input
+            if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0]))
+                continue;
+            if (!ReferenceEquals(step1.OutputBuffer, step2.Inputs[0]))
+                continue;
+
+            // Verify all 2D
+            if (step0.Inputs[0].Rank != 2 || step0.Inputs[1].Rank != 2 ||
+                step2.Inputs[1].Rank != 2)
+                continue;
+
+            // Check hidden dim: must fit in L1 (max) AND be large enough for L1 benefit (min 128)
+            // Below 128, per-op BLAS is faster. Above 128, L1 residency wins.
+            int h = step0.Inputs[1]._shape[1]; // output cols of W1
+            if (h > Optimization.TensorCodecOptions.Current.DataflowFusionMaxHidden || h < 128)
+                continue;
+
+            // Extract dimensions
+            var inputTensor = step0.Inputs[0];   // [M, K]
+            var w1Tensor = step0.Inputs[1];      // [K, H]
+            var w2Tensor = step2.Inputs[1];      // [H, N]
+            var outputTensor = step2.OutputBuffer; // [M, N]
+
+            int m = inputTensor._shape[0];
+            int k = inputTensor._shape[1];
+            int n = w2Tensor._shape[1];
+
+            // Pre-allocate activated intermediate buffer
+            var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
+
+            // Capture for closures
+            var capturedInput = inputTensor;
+            var capturedW1 = w1Tensor;
+            var capturedW2 = w2Tensor;
+            var capturedOutput = outputTensor;
+            var capturedActivated = activatedBuffer;
+            int cm = m, ck = k, ch = h, cn = n;
+            var capturedGradMap = gradMap;
+
+            Func<float, float> relu = x => x > 0f ? x : 0f;
+
+            // Pre-allocate backward workspace at compile time (zero alloc during replay)
+            var backwardWorkspace = new float[cm * ch]; // grad_h buffer
+            var emptyBias = new float[0];
+
+            // Fused forward: single kernel call replaces 3 steps
+            fusedForward.Add(eng =>
+            {
+                var inA = (float[])(object)capturedInput.GetDataArray();
+                var w1A = (float[])(object)capturedW1.GetDataArray();
+                var w2A = (float[])(object)capturedW2.GetDataArray();
+                var outA = (float[])(object)capturedOutput.GetDataArray();
+                var actA = (float[])(object)capturedActivated.GetDataArray();
+                FusedMultiLayerGemm.FusedGemmActivationGemm(inA, w1A, w2A, outA, actA, cm, ck, ch, cn, relu);
+            });
+
+            // Fused backward: pre-allocated workspace, zero alloc during replay
+            fusedBackward.Add(eng =>
+            {
+                var gradOut = capturedGradMap.ContainsKey(capturedOutput)
+                    ? capturedGradMap[capturedOutput] : null;
+                if (gradOut == null) return;
+
+                var gOutArr = (float[])(object)gradOut.GetDataArray();
+                var inA = (float[])(object)capturedInput.GetDataArray();
+                var w1A = (float[])(object)capturedW1.GetDataArray();
+                var w2A = (float[])(object)capturedW2.GetDataArray();
+                var actA = (float[])(object)capturedActivated.GetDataArray();
+
+                var gW1 = capturedGradMap.ContainsKey(capturedW1)
+                    ? (float[])(object)capturedGradMap[capturedW1].GetDataArray() : new float[ck * ch];
+                var gW2 = capturedGradMap.ContainsKey(capturedW2)
+                    ? (float[])(object)capturedGradMap[capturedW2].GetDataArray() : new float[ch * cn];
+                var gIn = capturedGradMap.ContainsKey(capturedInput)
+                    ? (float[])(object)capturedGradMap[capturedInput].GetDataArray() : new float[cm * ck];
+
+                Array.Clear(backwardWorkspace, 0, backwardWorkspace.Length);
+
+                FusedMultiLayerBackward.ComputeGradients(
+                    gOutArr, inA, w1A, w2A, actA,
+                    gW1, gW2, emptyBias, emptyBias, gIn,
+                    cm, ck, ch, cn, FusedMultiLayerBackward.ReLUDerivative,
+                    backwardWorkspace);
+
+                capturedW1.Grad = capturedGradMap.ContainsKey(capturedW1) ? capturedGradMap[capturedW1] : null;
+                capturedW2.Grad = capturedGradMap.ContainsKey(capturedW2) ? capturedGradMap[capturedW2] : null;
+                capturedInput.Grad = capturedGradMap.ContainsKey(capturedInput) ? capturedGradMap[capturedInput] : null;
+            });
+
+            consumedIndices.Add(i);
+            consumedIndices.Add(i + 1);
+            consumedIndices.Add(i + 2);
+
+            // Skip past the fused group
+            i += 2;
+        }
     }
 }
 

@@ -57,6 +57,8 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     public int EntryCount => _entries.Count;
 
+    /// <summary>Internal access to tape entries for compiled backward hash validation.</summary>
+    internal TapeEntryArena<T> Entries => _entries;
 
     /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
@@ -116,6 +118,7 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         SetCurrentTape(this);
+        System.Threading.Interlocked.Increment(ref DifferentiableOps._anyTapeActive);
     }
 
     /// <summary>
@@ -204,6 +207,16 @@ public sealed class GradientTape<T> : IDisposable
             var result = ComputeGradientsViaGraph(loss, sources);
             if (!_options.Persistent) _entries.Reset();
             return result;
+        }
+
+        // Auto-training compiler: reuse compiled backward graph if pattern matches
+        if (_options.Persistent && !createGraph)
+        {
+            var compiledBwd = Compilation.AutoTrainingCompiler.TryGetCompiledBackward(this, loss, sources?.ToArray());
+            if (compiledBwd is not null)
+            {
+                return compiledBwd.Execute();
+            }
         }
 
         var engine = _engine;
@@ -634,6 +647,15 @@ public sealed class GradientTape<T> : IDisposable
                     param[i] = numOps.Subtract(param[i], numOps.Multiply(learningRate, grad[i]));
             }
         }
+
+        // Auto-training compiler: record step pattern for future compilation
+        Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count);
+
+        // If pattern repeats, compile backward graph for next time
+        if (_options.Persistent)
+        {
+            Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, parameters);
+        }
     }
 
     /// <summary>
@@ -643,6 +665,7 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         SetCurrentTape(_parent);
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();

@@ -8,7 +8,8 @@ class Program
 {
     // TensorFlow.Binding NuGet is not built in Release mode, so we must disable the validator
     private static readonly IConfig BenchConfig = DefaultConfig.Instance
-        .WithOptions(ConfigOptions.DisableOptimizationsValidator);
+        .WithOptions(ConfigOptions.DisableOptimizationsValidator)
+        .WithBuildTimeout(TimeSpan.FromMinutes(5));
 
     static void Main(string[] args)
     {
@@ -238,6 +239,31 @@ class Program
             return;
         }
 
+        // Run TensorCodec comprehensive vs PyTorch benchmarks (full suite ~40min)
+        if (args[0] == "--vs-tensorcodec")
+        {
+            BenchmarkRunner.Run<TensorCodecVsPyTorchBenchmarks>(BenchConfig);
+            return;
+        }
+
+        // Run TensorCodec gaps only — focused on operations still losing to PyTorch (~15min)
+        if (args[0] == "--vs-tensorcodec-gaps")
+        {
+            var gapsConfig = ManualConfig.Create(BenchConfig)
+                .AddFilter(new BenchmarkDotNet.Filters.SimpleFilter(
+                    b => b.Descriptor.WorkloadMethodDisplayInfo.Contains("GELU")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("Log")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("Abs")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("Pow")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("GroupNorm")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("LayerNorm")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("Mean")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("LogSoftmax")
+                      || b.Descriptor.WorkloadMethodDisplayInfo.Contains("MLP_MSE")));
+            BenchmarkRunner.Run<TensorCodecVsPyTorchBenchmarks>(gapsConfig);
+            return;
+        }
+
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
         if (args[0] == "--vs-all")
         {
@@ -321,6 +347,8 @@ class Program
         Console.WriteLine("Competitive Benchmarks vs Other Libraries:");
         Console.WriteLine("  --vs-torchsharp-gpu : AiDotNet GPU vs TorchSharp CUDA");
         Console.WriteLine("  --vs-autograd       : AiDotNet autograd + compiled plan vs PyTorch");
+        Console.WriteLine("  --vs-tensorcodec    : TensorCodec comprehensive vs PyTorch (full suite ~40min)");
+        Console.WriteLine("  --vs-tensorcodec-gaps: TensorCodec gaps only (ops losing to PyTorch ~15min)");
         Console.WriteLine("  --vs-torchsharp-cpu : AiDotNet CPU vs TorchSharp CPU");
         Console.WriteLine("  --vs-tensorflow-gpu : AiDotNet GPU vs TensorFlow.NET GPU");
         Console.WriteLine("  --vs-tensorflow-cpu : AiDotNet CPU vs TensorFlow.NET CPU");
