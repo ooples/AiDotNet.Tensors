@@ -18,7 +18,8 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///   Layer 2: AutoTracer — auto-compile hot paths (this, always active)
 ///   Layer 3: TensorCodec optimizations — spectral/dataflow/algebraic
 ///
-/// Enabled by default. Disable via TensorCacheSettings or AutoTracer.Enabled = false.
+/// Enabled by default. Disable via AutoTracer.Enabled = false or
+/// TensorCodecOptions.Current.EnableCompilation = false.
 /// </summary>
 internal static class AutoTracer
 {
@@ -114,6 +115,12 @@ internal sealed class AutoTracerState
         long hash = ComputeLookupHash(opName, outputShape, paramHash, typeof(T).GetHashCode());
         if (_compiledPlans.TryGetValue(hash, out var plan))
         {
+            // Don't clear sequence or return for FailedCompilationSentinel —
+            // that would cause the tracer to repeatedly re-record and re-attempt
+            // compilation for patterns that already failed.
+            if (ReferenceEquals(plan, FailedCompilationSentinel))
+                return null;
+
             // Reset sequence since we're using the compiled plan
             _currentSequence.Clear();
 
@@ -141,7 +148,12 @@ internal sealed class AutoTracerState
         if (hash == _lastPatternHash && _lastPatternHash != 0)
         {
             _patternRepeatCount++;
-            if (_patternRepeatCount >= CompileThreshold && !_compiledPlans.ContainsKey(hash))
+            // Use the same key computation as TryCompile (includes type hash)
+            // to correctly detect both compiled plans and FailedCompilationSentinel entries.
+            long storageKey = hash;
+            storageKey ^= typeof(T).GetHashCode();
+            storageKey *= unchecked((long)0x100000001b3L);
+            if (_patternRepeatCount >= CompileThreshold && !_compiledPlans.ContainsKey(storageKey))
             {
                 TryCompile<T>(hash);
             }

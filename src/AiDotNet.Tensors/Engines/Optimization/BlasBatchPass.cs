@@ -26,6 +26,12 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
     {
         if (!IsEnabled || typeof(T) != typeof(float) || steps.Length < 2) return null;
 
+        // Build set of tensors available at each position (outputs of steps 0..i-1).
+        // Tensors not produced by any step are graph-level inputs and always available.
+        var producedByStep = new Dictionary<object, int>(); // tensor → step index that produces it
+        for (int s = 0; s < steps.Length; s++)
+            producedByStep[steps[s].OutputBuffer] = s;
+
         // Find groups of independent MatMul steps with matching inner dimensions
         var result = new List<CompiledStep<T>>(steps.Length);
         bool anyBatched = false;
@@ -58,18 +64,27 @@ internal sealed class BlasBatchPass : ICpuOptimizationPass
                     int jn = steps[j].Inputs[1]._shape[1];
                     if (jk != k || jn != n) continue;
 
-                    // Check independence: j's inputs must not be any group member's output
-                    bool independent = true;
+                    // Check independence: j's inputs must not depend on group outputs
+                    // AND must be available at position i (produced by steps before i,
+                    // or not produced by any step at all — i.e., graph-level inputs).
+                    bool canBatch = true;
                     foreach (var inp in steps[j].Inputs)
                     {
                         if (groupOutputs.Contains(inp))
                         {
-                            independent = false;
+                            canBatch = false;
+                            break;
+                        }
+                        // If this input is produced by a step that comes after position i,
+                        // it won't be available when the batched step executes at position i.
+                        if (producedByStep.TryGetValue(inp, out int producerIdx) && producerIdx >= i)
+                        {
+                            canBatch = false;
                             break;
                         }
                     }
 
-                    if (independent)
+                    if (canBatch)
                     {
                         group.Add(j);
                         groupOutputs.Add(steps[j].OutputBuffer);
