@@ -206,32 +206,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var pinnedHandles = new List<GCHandle>();
 
         // Build forward actions in original graph order. Fused groups replace their
-        // constituent steps at the position of the first step in the group, ensuring
-        // any non-fused producer that originally appeared before a fused block still
-        // runs before it (preserving data dependencies).
+        // constituent steps at the position of the first fused step in each group,
+        // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
-        var fusedGroupInserted = new HashSet<int>(); // track which fused groups we've already inserted
+        int nextFusedGroupIdx = 0; // index into fusedForwardActions
+        var fusedStepsSeen = new HashSet<int>(); // track individual fused step indices already processed
         for (int i = 0; i < forwardSteps.Count; i++)
         {
             if (fusedStepIndices.Contains(i))
             {
-                // This step is part of a fused group. Insert the fused action at the
-                // position of the first step in the group (only once).
-                if (fusedGroupInserted.Add(i))
+                // First time we hit a step in this fused group: emit the fused action.
+                // Subsequent steps in the same group are skipped.
+                if (fusedStepsSeen.Add(i) && !fusedStepsSeen.Contains(i - 1) || !fusedStepIndices.Contains(i - 1))
                 {
-                    // Find which fused forward action corresponds to this group.
-                    // Fused groups are added sequentially, so the Nth fused group
-                    // corresponds to fusedForwardActions[N].
-                    int groupIdx = 0;
-                    for (int fi = 0; fi < i; fi++)
-                    {
-                        if (fusedStepIndices.Contains(fi) && fusedGroupInserted.Contains(fi))
-                            continue;
-                        if (fusedStepIndices.Contains(fi))
-                            groupIdx++;
-                    }
-                    if (groupIdx < fusedForwardActions.Count)
-                        allForwardActions.Add(fusedForwardActions[groupIdx]);
+                    // This is the first step of a new fused group
+                    if (nextFusedGroupIdx < fusedForwardActions.Count)
+                        allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
+                    nextFusedGroupIdx++;
+                }
+                else
+                {
+                    fusedStepsSeen.Add(i);
                 }
                 continue;
             }
@@ -248,9 +243,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 allForwardActions.Add(eng => exec(eng, output));
             }
         }
-        // Add any remaining fused actions not yet inserted (safety net)
-        if (allForwardActions.Count == 0 && fusedForwardActions.Count > 0)
-            allForwardActions.AddRange(fusedForwardActions);
         var forwardActions = allForwardActions.ToArray();
 
         // Build backward actions: specialized per-step + fused backward for fused groups

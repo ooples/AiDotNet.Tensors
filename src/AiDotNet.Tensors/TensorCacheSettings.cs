@@ -17,8 +17,8 @@ namespace AiDotNet.Tensors;
 /// // Embedded/constrained environment — minimal memory
 /// TensorCacheSettings.Configure(CachingPolicy.Conservative);
 ///
-/// // Custom: 256MB budget, max 2M element tensors
-/// TensorCacheSettings.Configure(maxBudgetMB: 256, maxTensorElements: 2_000_000);
+/// // Custom: max 2M element tensors, 8 buffers per shape
+/// TensorCacheSettings.Configure(maxTensorElements: 2_000_000, maxBuffersPerShape: 8);
 /// </code>
 /// </example>
 /// </summary>
@@ -54,16 +54,14 @@ public static class TensorCacheSettings
     public static void Configure(long maxTensorElements = 0, int maxBuffersPerShape = 0)
     {
         AutoTensorCache.Enabled = true;
-        AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Auto;
 
-        if (maxTensorElements > 0)
-            AutoTensorCache.MaxElementsOverride = maxTensorElements;
+        // Reset overrides when 0 is passed (true auto-detect reset)
+        AutoTensorCache.MaxElementsOverride = maxTensorElements > 0 ? maxTensorElements : 0;
+        AutoTensorCache.MaxBuffersPerShapeOverride = maxBuffersPerShape > 0 ? maxBuffersPerShape : 0;
 
-        if (maxBuffersPerShape > 0)
-            AutoTensorCache.MaxBuffersPerShapeOverride = maxBuffersPerShape;
-
-        if (maxTensorElements > 0 || maxBuffersPerShape > 0)
-            AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Balanced;
+        AutoTensorCache.Policy = (maxTensorElements > 0 || maxBuffersPerShape > 0)
+            ? AutoTensorCache.CachePolicy.Balanced
+            : AutoTensorCache.CachePolicy.Auto;
     }
 
     /// <summary>

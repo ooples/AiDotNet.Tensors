@@ -233,6 +233,11 @@ internal static class SvdDecomposition
         float[] output,
         float[]? workspace = null)
     {
+        if (xCols != factors.OriginalM)
+            throw new ArgumentException(
+                $"Inner dimension mismatch: x has {xCols} columns but spectral factors expect {factors.OriginalM}.",
+                nameof(xCols));
+
         int r = factors.Rank;
         int n = factors.OriginalN;
 
