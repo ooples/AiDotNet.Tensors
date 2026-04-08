@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
@@ -18,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T>
+internal sealed class CompiledTrainingPlan<T> : IDisposable
 {
     private readonly Action<IEngine>[] _forwardActions;
     private readonly Action<IEngine>[] _backwardActions;
@@ -28,6 +29,8 @@ internal sealed class CompiledTrainingPlan<T>
     private readonly Tensor<T>[] _gradients;
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
+    private readonly List<GCHandle> _pinnedHandles = new();
+    private bool _disposed;
 
     // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
     private readonly int[]? _genericGradIndices;
@@ -48,7 +51,8 @@ internal sealed class CompiledTrainingPlan<T>
         Tensor<T>[] gradients,
         Tensor<T> lossGradSeed,
         int[]? genericGradIndices = null,
-        Tensor<T>? lossGradDest = null)
+        Tensor<T>? lossGradDest = null,
+        List<GCHandle>? pinnedHandles = null)
     {
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
@@ -60,6 +64,20 @@ internal sealed class CompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _lossGradDest = lossGradDest;
+        if (pinnedHandles is not null)
+            _pinnedHandles.AddRange(pinnedHandles);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var handle in _pinnedHandles)
+        {
+            if (handle.IsAllocated)
+                handle.Free();
+        }
+        _pinnedHandles.Clear();
     }
 
     internal Tensor<T>[] Gradients => _gradients;
@@ -184,6 +202,9 @@ internal sealed class CompiledTrainingPlan<T>
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
         }
 
+        // Track GCHandles for cleanup on Dispose
+        var pinnedHandles = new List<GCHandle>();
+
         // Build forward actions: fused actions first, then remaining unfused steps
         // Build forward actions with specialized direct-BLAS where possible
         var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
@@ -191,7 +212,7 @@ internal sealed class CompiledTrainingPlan<T>
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
-            var specialized = TryBuildSpecializedForward(step);
+            var specialized = TryBuildSpecializedForward(step, pinnedHandles);
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
@@ -214,7 +235,7 @@ internal sealed class CompiledTrainingPlan<T>
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
 
-            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine);
+            var action = BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles);
             if (action != null)
                 backwardActions.Add(action);
             else
@@ -264,7 +285,8 @@ internal sealed class CompiledTrainingPlan<T>
             gradients,
             lossGradSeed,
             genericGradIndices,
-            gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null);
+            gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
+            pinnedHandles);
     }
 
     /// <summary>
@@ -272,7 +294,15 @@ internal sealed class CompiledTrainingPlan<T>
     /// Calls BLAS/SIMD directly into the pre-allocated output buffer.
     /// Eliminates: GraphMode check, tape recording, shape validation, DifferentiableOps.
     /// </summary>
-    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step)
+    /// <summary>Pin an array and track the handle for later cleanup.</summary>
+    private static GCHandle PinAndTrack(object array, List<GCHandle>? tracker)
+    {
+        var handle = GCHandle.Alloc(array, GCHandleType.Pinned);
+        tracker?.Add(handle);
+        return handle;
+    }
+
+    internal static unsafe Action<IEngine>? TryBuildSpecializedForward(CompiledStep<T> step, List<GCHandle>? handleTracker = null)
     {
         if (typeof(T) != typeof(float)) return null;
 
@@ -324,8 +354,8 @@ internal sealed class CompiledTrainingPlan<T>
             if (typeof(T) == typeof(float) && input.IsContiguous)
             {
                 // Pinned path: GCHandle once at compile time
-                var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                    ((Tensor<float>)(object)input).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+                var inH = PinAndTrack(
+                    ((Tensor<float>)(object)input).GetDataArray(), handleTracker);
                 int len = input.Length;
 
                 // For large arrays, use parallel chunked reduction (matches TensorSum)
@@ -375,9 +405,9 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorAddUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
@@ -394,9 +424,9 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorSubtractUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
@@ -413,9 +443,9 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
             return eng => { unsafe { SimdKernels.VectorMultiplyUnsafe((float*)aH.AddrOfPinnedObject(), (float*)bH.AddrOfPinnedObject(), (float*)oH.AddrOfPinnedObject(), len); } };
         }
@@ -434,10 +464,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -471,8 +501,8 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.NegateUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -491,10 +521,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -513,10 +543,10 @@ internal sealed class CompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             // Pin arrays once at compile time — GCHandles survive across replays
-            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outHandle = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inHandle = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outHandle = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -615,10 +645,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -644,10 +674,10 @@ internal sealed class CompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             float alphaF = step.SavedState != null && step.SavedState.Length > 0 ? (float)(double)step.SavedState[0] : 1.0f;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -667,10 +697,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -689,10 +719,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -717,10 +747,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -744,9 +774,9 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var bH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var oH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var aH = PinAndTrack(((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
             return eng =>
             {
@@ -773,10 +803,10 @@ internal sealed class CompiledTrainingPlan<T>
             && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int rows = inp._shape[0], cols = inp._shape[1];
             return eng =>
             {
@@ -813,8 +843,8 @@ internal sealed class CompiledTrainingPlan<T>
         if (step.OpType == OpType.Mean && step.Inputs.Length == 1 && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inHandle = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inHandle = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
             float[]? cOut = null;
             int len = inp.Length;
             return eng =>
@@ -854,10 +884,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -870,10 +900,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -886,10 +916,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -902,10 +932,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -918,10 +948,10 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -934,8 +964,8 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.ReciprocalUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -945,8 +975,8 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.FloorUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -956,8 +986,8 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.CeilingUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -967,8 +997,8 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng => { unsafe { SimdKernels.RoundUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); } };
         }
@@ -979,12 +1009,12 @@ internal sealed class CompiledTrainingPlan<T>
             && typeof(T) == typeof(float))
         {
             var a = step.Inputs[0]; var b = step.Inputs[1]; var o = step.OutputBuffer;
-            var aH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)a).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var bH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)b).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var oH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var aH = PinAndTrack(
+                ((Tensor<float>)(object)a).GetDataArray(), handleTracker);
+            var bH = PinAndTrack(
+                ((Tensor<float>)(object)b).GetDataArray(), handleTracker);
+            var oH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = a.Length;
             return eng =>
             {
@@ -999,10 +1029,10 @@ internal sealed class CompiledTrainingPlan<T>
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             float fMin = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[0]) : float.MinValue;
             float fMax = step.SavedState != null && step.SavedState.Length >= 2 ? Convert.ToSingle(step.SavedState[1]) : float.MaxValue;
-            var inH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)inp).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
-            var outH = System.Runtime.InteropServices.GCHandle.Alloc(
-                ((Tensor<float>)(object)o).GetDataArray(), System.Runtime.InteropServices.GCHandleType.Pinned);
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
             int len = inp.Length;
             return eng =>
             {
@@ -1067,7 +1097,8 @@ internal sealed class CompiledTrainingPlan<T>
         CompiledStep<T> step,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
-        IEngine engine)
+        IEngine engine,
+        List<GCHandle>? handleTracker = null)
     {
         if (typeof(T) != typeof(float)) return null;
 
