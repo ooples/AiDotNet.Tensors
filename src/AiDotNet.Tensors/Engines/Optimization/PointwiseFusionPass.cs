@@ -88,15 +88,17 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
             fusedName,
             (eng, output) =>
             {
-                // Execute the chain: first step reads from firstInput,
-                // intermediate results go through the pre-allocated buffers,
-                // last step writes to output
+                // Execute the chain sequentially: each step uses its pre-allocated
+                // output buffer, eliminating intermediate tensor allocation.
+                // This is a scheduling optimization (fewer steps to dispatch),
+                // not a single-pass kernel — true element-wise fusion would require
+                // code generation (future work).
                 foreach (var step in capturedSteps)
                     step.Execute(eng, step.OutputBuffer);
             },
             lastOutput,
             new[] { firstInput },
-            steps[end].BackwardFn,
+            null, // BackwardFn from last step is incompatible with fused inputs — inference-only
             steps[end].SavedState);
     }
 

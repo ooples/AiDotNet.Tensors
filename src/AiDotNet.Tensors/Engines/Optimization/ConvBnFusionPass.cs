@@ -154,6 +154,21 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
         var capturedFusedBias = (Tensor<T>)(object)fusedBias;
         var capturedActivation = activationType;
 
+        // Extract original conv parameters from SavedState: [int[] strides, int[] paddings, int[] dilations]
+        int[] strides = new[] { 1, 1 };
+        int[] paddings = new[] { 0, 0 };
+        int[] dilations = new[] { 1, 1 };
+        if (conv.SavedState is { Length: >= 3 })
+        {
+            if (conv.SavedState[0] is int[] s) strides = s;
+            if (conv.SavedState[1] is int[] p) paddings = p;
+            if (conv.SavedState[2] is int[] d) dilations = d;
+        }
+
+        var capturedStrides = strides;
+        var capturedPaddings = paddings;
+        var capturedDilations = dilations;
+
         fused = new CompiledStep<T>(
             "FusedConvBnReLU",
             (eng, output) =>
@@ -161,16 +176,18 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 Tensor<T> result;
                 if (capturedActivation != FusedActivationType.None)
                     result = eng.FusedConv2D(capturedInput, capturedFusedWeights, capturedFusedBias,
-                        1, 1, 0, 0, 1, 1, capturedActivation);
+                        capturedStrides[0], capturedStrides[1],
+                        capturedPaddings[0], capturedPaddings[1],
+                        capturedDilations[0], capturedDilations[1], capturedActivation);
                 else
                     result = eng.Conv2D(capturedInput, capturedFusedWeights,
-                        new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+                        capturedStrides, capturedPaddings, capturedDilations);
 
                 result.AsSpan().CopyTo(output.AsWritableSpan());
             },
             finalOutput,
             new[] { convInput, capturedFusedWeights, capturedFusedBias },
-            conv.BackwardFn,
+            null, // BackwardFn is incompatible with fused inputs — this is inference-only
             conv.SavedState);
 
         return true;
