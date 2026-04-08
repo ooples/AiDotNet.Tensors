@@ -24,10 +24,27 @@ public sealed class SymbolicShape
     public int[] SymbolicDimensions { get; }
 
     /// <summary>Creates a symbolic shape with the given concrete values and variable dimensions.</summary>
+    /// <param name="concreteShape">The initial concrete shape values.</param>
+    /// <param name="symbolicDims">Indices of dimensions to treat as symbolic (variable).
+    /// Must be valid indices into concreteShape (0 to rank-1).</param>
+    /// <exception cref="ArgumentOutOfRangeException">If any symbolic dimension index is out of range.</exception>
     public SymbolicShape(int[] concreteShape, int[]? symbolicDims = null)
     {
         ConcreteShape = (int[])concreteShape.Clone();
-        SymbolicDimensions = symbolicDims ?? Array.Empty<int>();
+        if (symbolicDims is not null)
+        {
+            for (int i = 0; i < symbolicDims.Length; i++)
+            {
+                if (symbolicDims[i] < 0 || symbolicDims[i] >= concreteShape.Length)
+                    throw new ArgumentOutOfRangeException(nameof(symbolicDims),
+                        $"Symbolic dimension index {symbolicDims[i]} is out of range for shape with rank {concreteShape.Length}.");
+            }
+            SymbolicDimensions = (int[])symbolicDims.Clone();
+        }
+        else
+        {
+            SymbolicDimensions = Array.Empty<int>();
+        }
     }
 
     /// <summary>

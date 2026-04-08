@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.Engines.Simd;
@@ -302,11 +303,233 @@ public class CompilationComponentTests
         }
 
         var engine = new CpuEngine();
-        var checkpoint = new GradientCheckpointing<float>(steps, engine);
+        var checkpoint = new AiDotNet.Tensors.Engines.Compilation.GradientCheckpointing<float>(steps, engine);
 
         Assert.Equal(10, checkpoint.SegmentSize);
         Assert.Equal(10, checkpoint.SegmentCount);
         Assert.True(checkpoint.MemorySavingsFactor > 4.0);
+    }
+
+    #endregion
+
+    #region ForwardCSEPass Tests
+
+    [Fact]
+    public void ForwardCSEPass_CSECopy_HasNullBackwardFn()
+    {
+        // Verify that CSE_Copy steps have null BackwardFn (not stale BackwardFn
+        // from the original step). Stale BackwardFn would produce incorrect gradients
+        // because its SavedState is from a computation that never ran.
+        var pass = new ForwardCSEPass();
+
+        // Create two identical steps that the pass should deduplicate
+        var sharedInput = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var output1 = new Tensor<float>(new[] { 4 });
+        var output2 = new Tensor<float>(new[] { 4 });
+
+        // A backward function that should NOT be retained on the copy
+        BackwardFunction<float> backwardFn = (gradOut, inputs, output, state, eng, gradMap) => { };
+
+        var steps = new[]
+        {
+            new CompiledStep<float>("TensorExp", (eng, o) =>
+            {
+                for (int i = 0; i < 4; i++)
+                    o.AsWritableSpan()[i] = MathF.Exp(sharedInput.AsSpan()[i]);
+            }, output1, new[] { sharedInput }, backwardFn, new object[] { "some state" }),
+            new CompiledStep<float>("TensorExp", (eng, o) =>
+            {
+                for (int i = 0; i < 4; i++)
+                    o.AsWritableSpan()[i] = MathF.Exp(sharedInput.AsSpan()[i]);
+            }, output2, new[] { sharedInput }, backwardFn, new object[] { "some state" }),
+        };
+
+        var engine = new CpuEngine();
+        var result = pass.TryOptimize(steps, engine);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Length);
+        // First step should be kept as-is with its backward
+        Assert.NotNull(result[0].BackwardFn);
+        // Second step should be a CSE_Copy with null BackwardFn
+        Assert.Equal("CSE_Copy", result[1].OpName);
+        Assert.Null(result[1].BackwardFn);
+        Assert.Null(result[1].SavedState);
+    }
+
+    #endregion
+
+    #region ConstantFoldingPass Tests
+
+    [Fact]
+    public void ConstantFoldingPass_TreatsAllGraphInputsAsDynamic()
+    {
+        // Verify the pass identifies ALL graph-level inputs as dynamic,
+        // not just steps[0].Inputs[0]. A graph input is any tensor that
+        // appears as a step input but is not produced by any step's output.
+        var pass = new ConstantFoldingPass();
+
+        var input1 = new Tensor<float>(new float[] { 1f, 2f }, new[] { 2 });
+        var input2 = new Tensor<float>(new float[] { 3f, 4f }, new[] { 2 });
+        var output = new Tensor<float>(new[] { 2 });
+
+        // Step uses two external inputs — both should be treated as dynamic
+        var steps = new[]
+        {
+            new CompiledStep<float>("TensorAdd", (eng, o) =>
+            {
+                var span = o.AsWritableSpan();
+                var s1 = input1.AsSpan();
+                var s2 = input2.AsSpan();
+                for (int i = 0; i < 2; i++) span[i] = s1[i] + s2[i];
+            }, output, new[] { input1, input2 }, null, null),
+        };
+
+        var engine = new CpuEngine();
+        // With both inputs being graph-level (not produced by any step), the step
+        // is dynamic and should NOT be folded.
+        var result = pass.TryOptimize(steps, engine);
+
+        // null means no folding occurred (all steps are dynamic) — correct
+        Assert.Null(result);
+    }
+
+    #endregion
+
+    #region TensorCodecOptions Tests
+
+    [Fact]
+    public void TensorCodecOptions_DefaultReturnsFreshInstance()
+    {
+        // Verify that Default returns a new instance each time,
+        // preventing global state corruption via mutation.
+        var d1 = TensorCodecOptions.Default;
+        var d2 = TensorCodecOptions.Default;
+
+        Assert.NotSame(d1, d2);
+
+        // Mutating one instance should not affect another
+        d1.EnableCompilation = false;
+        Assert.True(d2.EnableCompilation);
+    }
+
+    #endregion
+
+    #region SymbolicShape Validation Tests
+
+    [Fact]
+    public void SymbolicShape_ClonesSymbolicDimensions()
+    {
+        // Verify that SymbolicDimensions are defensively copied
+        var dims = new[] { 0 };
+        var shape = new SymbolicShape(new[] { 32, 128 }, dims);
+
+        // Mutating the original array should not affect the SymbolicShape
+        dims[0] = 999;
+        Assert.Equal(0, shape.SymbolicDimensions[0]);
+    }
+
+    [Fact]
+    public void SymbolicShape_ThrowsOnInvalidDimensionIndex()
+    {
+        // Out-of-range symbolic dimension indices should throw
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SymbolicShape(new[] { 32, 128 }, new[] { 5 }));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SymbolicShape(new[] { 32, 128 }, new[] { -1 }));
+    }
+
+    [Fact]
+    public void SymbolicShape_AcceptsValidDimensionIndices()
+    {
+        // Valid indices should not throw
+        var shape = new SymbolicShape(new[] { 32, 128, 64 }, new[] { 0, 2 });
+        Assert.True(shape.Matches(new[] { 64, 128, 64 })); // dim 0,2 are symbolic
+        Assert.True(shape.Matches(new[] { 1, 128, 99 }));
+        Assert.False(shape.Matches(new[] { 32, 256, 64 })); // dim 1 changed (non-symbolic)
+    }
+
+    #endregion
+
+    #region CompiledModelCache Input Rebinding Tests
+
+    [Fact]
+    public void CompiledModelCache_RebindsInputOnCacheHit()
+    {
+        // Verify that the cache overload with Tensor<T> input
+        // correctly rebinds data on cache hits.
+        using var cache = new CompiledModelCache<float>();
+        var engine = new CpuEngine();
+        var weights = CreateRandom(new[] { 8, 4 }, 43);
+
+        // First call: compile with input1
+        var input1 = CreateRandom(new[] { 4, 8 }, 42);
+        var plan = cache.GetOrCompileInference(input1, () =>
+        {
+            engine.TensorMatMul(input1, weights);
+        });
+        var result1 = plan.Execute();
+        var output1 = new float[result1.Length];
+        result1.AsSpan().CopyTo(output1);
+
+        // Second call: cache hit with different data (same shape)
+        var input2 = CreateRandom(new[] { 4, 8 }, 99);
+        var plan2 = cache.GetOrCompileInference(input2, () =>
+        {
+            engine.TensorMatMul(input2, weights);
+        });
+        Assert.Same(plan, plan2); // Same cached plan
+        var result2 = plan2.Execute();
+        var output2 = new float[result2.Length];
+        result2.AsSpan().CopyTo(output2);
+
+        // Results should differ because input data changed
+        bool anyDifferent = false;
+        for (int i = 0; i < output1.Length; i++)
+        {
+            if (MathF.Abs(output1[i] - output2[i]) > 1e-6f)
+            {
+                anyDifferent = true;
+                break;
+            }
+        }
+        Assert.True(anyDifferent, "Cache hit should produce different results with different input data");
+    }
+
+    [Fact]
+    public void CompiledModelCache_SymbolicOverloadStoresUnderSymbolicKey()
+    {
+        // Verify that the symbolic overload stores the plan under the symbolic key
+        // (not the concrete-shape key), so different batch sizes hit the same cache.
+        using var cache = new CompiledModelCache<float>();
+        var engine = new CpuEngine();
+        var weights = CreateRandom(new[] { 8, 4 }, 43);
+
+        var input = CreateRandom(new[] { 4, 8 }, 42);
+        var symbolic = SymbolicShape.BatchDynamic(input._shape);
+
+        int compileCount = 0;
+        cache.GetOrCompileInference(input._shape, () =>
+        {
+            compileCount++;
+            engine.TensorMatMul(input, weights);
+        }, symbolic);
+
+        Assert.Equal(1, compileCount);
+
+        // Different batch size — should hit the symbolic cache
+        var input2 = CreateRandom(new[] { 8, 8 }, 99);
+        var symbolic2 = SymbolicShape.BatchDynamic(input2._shape);
+        cache.GetOrCompileInference(input2._shape, () =>
+        {
+            compileCount++;
+            engine.TensorMatMul(input2, weights);
+        }, symbolic2);
+
+        // Both symbolic keys (ignoring dim 0) should be identical
+        // So compileCount should still be 1 (cache hit)
+        Assert.Equal(1, compileCount);
     }
 
     #endregion

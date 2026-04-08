@@ -13,8 +13,12 @@ public sealed class TensorCodecOptions
     /// <summary>Gets the active TensorCodec options for this thread, or the default.</summary>
     public static TensorCodecOptions Current => _current ?? Default;
 
-    /// <summary>Default options: dataflow fusion and algebraic backward enabled, spectral opt-in.</summary>
-    public static readonly TensorCodecOptions Default = new();
+    /// <summary>
+    /// Default options: dataflow fusion and algebraic backward enabled, spectral opt-in.
+    /// Returns a fresh copy each time to prevent global state corruption — callers can
+    /// freely mutate the returned instance and pass it to SetCurrent().
+    /// </summary>
+    public static TensorCodecOptions Default => new();
 
     /// <summary>Sets thread-local options. Pass null to revert to defaults.</summary>
     public static void SetCurrent(TensorCodecOptions? options) => _current = options;
@@ -35,11 +39,9 @@ public sealed class TensorCodecOptions
     /// Opt-in because it introduces bounded approximation error.</summary>
     public bool EnableSpectralDecomposition { get; set; }
 
-    /// <summary>Maximum approximation error per element for spectral decomposition.</summary>
+    /// <summary>Maximum approximation error per element for spectral decomposition.
+    /// Used as energyThreshold = 1.0 - tolerance for SVD rank selection.</summary>
     public float SpectralErrorTolerance { get; set; } = 1e-5f;
-
-    /// <summary>Minimum rank reduction factor to justify spectral decomposition (2 = 50% rank reduction).</summary>
-    public int SpectralMinRankReduction { get; set; } = 2;
 
     /// <summary>Maximum hidden dimension for dataflow fusion L1 residency.
     /// H * Mr * sizeof(float) must fit in L1 cache (32KB).</summary>

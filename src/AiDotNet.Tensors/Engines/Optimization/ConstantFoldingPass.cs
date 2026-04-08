@@ -25,14 +25,26 @@ internal sealed class ConstantFoldingPass : ICpuOptimizationPass
     {
         if (!IsEnabled || steps.Length == 0) return null;
 
-        // Identify all tensors that are model inputs (first step's inputs that aren't weights)
-        var dynamicTensors = new List<object>();
+        // Build set of all tensors produced by some step's output.
+        // Any tensor that appears as a step input but is NOT produced by any step
+        // is a graph input (model input, weight, etc.) and must be treated as dynamic.
+        var producedByStep = new HashSet<object>();
+        foreach (var step in steps)
+            producedByStep.Add(step.OutputBuffer);
 
-        // The first step's primary input (index 0) is the model input — it's dynamic
-        if (steps[0].Inputs.Length > 0)
-            dynamicTensors.Add(steps[0].Inputs[0]);
+        var dynamicTensors = new HashSet<object>();
+        foreach (var step in steps)
+        {
+            foreach (var inp in step.Inputs)
+            {
+                // If this input is not produced by any step, it's a graph-level input
+                // (model input or a mutable weight) — treat it as dynamic.
+                if (!producedByStep.Contains(inp))
+                    dynamicTensors.Add(inp);
+            }
+        }
 
-        // Propagate: any op whose input is dynamic produces a dynamic output
+        // Propagate: any op with at least one dynamic input produces a dynamic output
         bool anyFolded = false;
         var foldedSteps = new List<CompiledStep<T>>(steps.Length);
 
@@ -41,15 +53,11 @@ internal sealed class ConstantFoldingPass : ICpuOptimizationPass
             bool hasDynamicInput = false;
             foreach (var inp in step.Inputs)
             {
-                foreach (var dyn in dynamicTensors)
+                if (dynamicTensors.Contains(inp))
                 {
-                    if (ReferenceEquals(inp, dyn))
-                    {
-                        hasDynamicInput = true;
-                        break;
-                    }
+                    hasDynamicInput = true;
+                    break;
                 }
-                if (hasDynamicInput) break;
             }
 
             if (hasDynamicInput)

@@ -38,6 +38,9 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
             {
                 // This step computes the same thing as an existing step.
                 // Replace with a copy from the existing output.
+                // BackwardFn is set to null because the CSE copy does not execute
+                // the original op — its SavedState would be stale. Gradients flow
+                // through the original (first) computation instead.
                 var src = existing.OutputBuffer;
                 var dst = step.OutputBuffer;
                 result.Add(new CompiledStep<T>(
@@ -45,8 +48,8 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
                     (eng, output) => src.AsSpan().CopyTo(output.AsWritableSpan()),
                     dst,
                     step.Inputs,
-                    step.BackwardFn,
-                    step.SavedState));
+                    null,
+                    null));
                 anyEliminated = true;
             }
             else

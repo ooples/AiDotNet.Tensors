@@ -43,6 +43,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return true;
     }
 
+
     /// <summary>
     /// Executes the compiled plan. Runs each step's delegate in order.
     /// All buffers are pre-allocated - zero allocation during execution.

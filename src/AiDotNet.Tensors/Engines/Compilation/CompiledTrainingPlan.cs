@@ -210,23 +210,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
-        var fusedStepsSeen = new HashSet<int>(); // track individual fused step indices already processed
         for (int i = 0; i < forwardSteps.Count; i++)
         {
             if (fusedStepIndices.Contains(i))
             {
-                // First time we hit a step in this fused group: emit the fused action.
-                // Subsequent steps in the same group are skipped.
-                if (fusedStepsSeen.Add(i) && !fusedStepsSeen.Contains(i - 1) || !fusedStepIndices.Contains(i - 1))
+                // A fused step starts a new group when its predecessor is NOT fused.
+                // This correctly handles consecutive groups (e.g., {0,1,2, 3,4,5}).
+                bool isFirstInGroup = i == 0 || !fusedStepIndices.Contains(i - 1);
+                if (isFirstInGroup && nextFusedGroupIdx < fusedForwardActions.Count)
                 {
-                    // This is the first step of a new fused group
-                    if (nextFusedGroupIdx < fusedForwardActions.Count)
-                        allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
+                    allForwardActions.Add(fusedForwardActions[nextFusedGroupIdx]);
                     nextFusedGroupIdx++;
-                }
-                else
-                {
-                    fusedStepsSeen.Add(i);
                 }
                 continue;
             }

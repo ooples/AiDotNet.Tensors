@@ -19,6 +19,9 @@ public sealed class CompiledModelCache<T> : IDisposable
 {
     private readonly ConcurrentDictionary<long, ICompiledPlan<T>> _inferencePlans = new();
     private readonly ConcurrentDictionary<long, ICompiledTrainingPlan<T>> _trainingPlans = new();
+    // Maps shape key → the input tensor captured during tracing, so cache hits
+    // can copy new data into the plan's captured tensor.
+    private readonly ConcurrentDictionary<long, Tensor<T>> _capturedInputs = new();
     private readonly object _compileLock = new();
     private bool _disposed;
 
@@ -53,6 +56,52 @@ public sealed class CompiledModelCache<T> : IDisposable
                 old.Dispose();
 
             _inferencePlans[key] = plan;
+            return plan;
+        }
+    }
+
+    /// <summary>
+    /// Gets a cached inference plan, rebinding the input tensor on cache hit.
+    /// On cache miss, the forward action is traced and the input tensor is captured.
+    /// On cache hit, the new input's data is copied into the plan's captured input
+    /// tensor so the compiled plan sees the current batch.
+    /// </summary>
+    /// <param name="input">The input tensor. Its data is copied into the plan on cache hit.</param>
+    /// <param name="forward">The forward pass to trace (called once on cache miss).</param>
+    /// <returns>The compiled inference plan.</returns>
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Action forward)
+    {
+        long key = ComputeShapeKey(input._shape);
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(input._shape))
+        {
+            // Rebind: copy current batch data into the tensor the plan captured during tracing
+            if (_capturedInputs.TryGetValue(key, out var capturedInput)
+                && capturedInput.Length == input.Length)
+            {
+                input.AsSpan().CopyTo(capturedInput.AsWritableSpan());
+            }
+            return cached;
+        }
+
+        lock (_compileLock)
+        {
+            // Double-check after acquiring lock
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(input._shape))
+            {
+                if (_capturedInputs.TryGetValue(key, out var ci) && ci.Length == input.Length)
+                    input.AsSpan().CopyTo(ci.AsWritableSpan());
+                return cached;
+            }
+
+            using var scope = GraphMode.Enable();
+            forward();
+            var plan = scope.CompileInference<T>();
+
+            if (_inferencePlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            _inferencePlans[key] = plan;
+            _capturedInputs[key] = input; // Track the tensor captured during tracing
             return plan;
         }
     }
@@ -104,6 +153,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             foreach (var plan in _trainingPlans.Values) plan.Dispose();
             _inferencePlans.Clear();
             _trainingPlans.Clear();
+            _capturedInputs.Clear();
         }
     }
 
@@ -129,8 +179,25 @@ public sealed class CompiledModelCache<T> : IDisposable
         if (_inferencePlans.TryGetValue(key, out var cached))
             return cached;
 
-        // Cache miss — compile with the current concrete shape
-        return GetOrCompileInference(inputShape, forward);
+        lock (_compileLock)
+        {
+            // Double-check after acquiring lock
+            if (_inferencePlans.TryGetValue(key, out cached))
+                return cached;
+
+            // Compile with the current concrete shape
+            using var scope = GraphMode.Enable();
+            forward();
+            var plan = scope.CompileInference<T>();
+
+            if (_inferencePlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            // Store under the symbolic key so future lookups with
+            // different batch sizes still hit the cache.
+            _inferencePlans[key] = plan;
+            return plan;
+        }
     }
 
     public void Dispose()
