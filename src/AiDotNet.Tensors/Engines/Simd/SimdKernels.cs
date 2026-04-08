@@ -198,6 +198,9 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// Element-wise max of two arrays using AVX Max intrinsic.
+        /// NaN semantics: follows hardware behavior (AVX maxps returns non-NaN operand).
+        /// This matches PyTorch torch.max behavior and is the industry standard for
+        /// performance-critical SIMD paths. Use MathF.Max for IEEE 754 NaN propagation.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void VectorMaxUnsafe(float* a, float* b, float* result, int length)
