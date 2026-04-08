@@ -49,6 +49,7 @@ public sealed class GradientTape<T> : IDisposable
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
     private readonly IEngine _engine;
+    private readonly bool _savedReplayMode; // Saved ReplayMode from outer scope for nested tapes
     private bool _disposed;
 
 
@@ -109,6 +110,7 @@ public sealed class GradientTape<T> : IDisposable
         _entries.Reset();
         _engine = AiDotNetEngine.Current;
         _parent = _current;
+        _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
 
         if (_options.EnableHooks)
         {
@@ -205,6 +207,14 @@ public sealed class GradientTape<T> : IDisposable
         if (loss.GradFn is not null && !createGraph && !DetectAnomaly && !hasHooksRegistered)
         {
             var result = ComputeGradientsViaGraph(loss, sources);
+
+            // Record step pattern for auto-compilation (same as tape-based path below)
+            if (_options.Persistent)
+            {
+                Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
+                Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
+            }
+
             if (!_options.Persistent) _entries.Reset();
             return result;
         }
@@ -679,8 +689,10 @@ public sealed class GradientTape<T> : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        // Clear replay mode so the next tape on this thread records normally
-        Compilation.AutoTrainingCompiler.ReplayMode = false;
+        // Restore the previous ReplayMode instead of hard-resetting.
+        // This is critical for nested tapes: an inner tape disposing must not
+        // clear replay suppression that an outer tape still needs.
+        Compilation.AutoTrainingCompiler.ReplayMode = _savedReplayMode;
         System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
         SetCurrentTape(_parent);
         // Return arena to thread-local cache for reuse by next GradientTape

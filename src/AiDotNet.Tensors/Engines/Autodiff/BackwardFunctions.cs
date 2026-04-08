@@ -1972,12 +1972,21 @@ internal static class BackwardFunctions<T>
         // No Array.Clear — TryGemmEx uses beta=0 which overwrites C entirely
         var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
         var gradInputArr = (float[])(object)gradInput.GetDataArray();
-        BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+        bool okInput = BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
 
         // gradWeight = input^T @ maskedGrad — transposed BLAS, pooled buffer
         var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
         var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
-        BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
+        bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
+
+        if (!okInput || !okWeight)
+        {
+            // BLAS unavailable — fall back to engine-based backward.
+            // Wrap maskedArr into a tensor for the fallback path.
+            var maskedTensor = new Tensor<T>((T[])(object)maskedArr, new[] { M, N });
+            FusedLinearActivationBackwardFallback(maskedTensor, inputs, grads, engine);
+            return;
+        }
 
         // gradBias = sum(maskedGrad, axis=0) — single pass, pooled buffer
         var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
