@@ -49,4 +49,23 @@ public interface ICompiledTrainingPlan<T> : IDisposable
 
     /// <summary>Number of backward execution steps.</summary>
     int BackwardStepCount { get; }
+
+    /// <summary>
+    /// Configures fused optimizer updates that run after each Step().
+    /// Once configured, Step() will automatically update parameters using
+    /// the specified optimizer — no manual gradient application needed.
+    /// </summary>
+    /// <param name="optimizerType">The optimizer algorithm (SGD, Adam, etc.).</param>
+    /// <param name="learningRate">Learning rate.</param>
+    /// <param name="beta1">First moment decay (Adam/AdamW). Default: 0.9.</param>
+    /// <param name="beta2">Second moment decay (Adam/AdamW). Default: 0.999.</param>
+    /// <param name="eps">Epsilon for numerical stability. Default: 1e-8.</param>
+    /// <param name="weightDecay">Weight decay (AdamW/LAMB). Default: 0.</param>
+    void ConfigureOptimizer(
+        OptimizerType optimizerType,
+        float learningRate,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f);
 }
