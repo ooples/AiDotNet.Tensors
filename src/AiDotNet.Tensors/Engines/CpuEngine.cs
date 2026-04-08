@@ -20471,6 +20471,8 @@ public class CpuEngine : ITensorLevelEngine
                 $"TensorBatchMatMul requires a to be 3D and b to be 2D or 3D. Got ranks {a.Rank} and {b.Rank}.");
         }
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.BatchMatMulBackward); } }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // a: [batch, M, K], b: [K, N]
@@ -27252,6 +27254,8 @@ public class CpuEngine : ITensorLevelEngine
         if (logProbs.Rank != 3)
             throw new ArgumentException("logProbs must be 3D [T, N, C].");
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CTCLossBackward); } }
+
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];
         int batchSize = logProbs._shape[1];
@@ -27336,7 +27340,7 @@ public class CpuEngine : ITensorLevelEngine
         Autodiff.DifferentiableOps.RecordIfActive("CTCLoss", losses,
             new[] { logProbs }, Autodiff.BackwardFunctions<T>.CTCLossBackward,
             new object[] { logProbs, targets, inputLengths, targetLengths, blank });
-
+        { var clp2 = logProbs; var ct2 = targets; var cil2 = inputLengths; var ctl2 = targetLengths; var cb2 = blank; AutoTracer.RecordOp("CTCLoss", losses, eng => eng.TensorCTCLoss(clp2, ct2, cil2, ctl2, cb2)); }
         return losses;
     }
 
