@@ -19122,33 +19122,37 @@ public class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
+        int normalizedAxis = axis < 0 ? source._shape.Length + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= source._shape.Length)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {source._shape.Length} dimensions");
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
-            if (scope != null && axis == 0 && source._shape.Length == 2)
+            if (scope is not null)
             {
                 var captured = source;
                 var capIndices = indices;
-                var outShape = new int[] { indices.Length, source._shape[1] };
+                var capAxis = normalizedAxis;
+                // Compute output shape: replace source._shape[axis] with indices shape
+                var outShape = ComputeGatherOutputShape(source._shape, indices._shape, capAxis);
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorGather", source, outShape,
-                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, 0); r.AsSpan().CopyTo(output.AsWritableSpan()); },
-                    BackwardFunctions<T>.GatherBackward, new object[] { capIndices, 0 });
+                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, capAxis); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
             }
         }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
+        var sourceData = source.GetFlattenedData();
+        var indicesData = indices.GetFlattenedData();
 
-        // Simple 1D gather for embedding lookups
-        if (axis == 0 && source._shape.Length == 2)
+        // Fast path: axis=0, 2D source — embedding lookup
+        if (normalizedAxis == 0 && source._shape.Length == 2)
         {
             int embeddingDim = source._shape[1];
             int numIndices = indices.Length;
             var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
-
-            var indicesData = indices.GetFlattenedData();
-            var sourceData = source.GetFlattenedData();
             var resultData = result.GetDataArray();
             Parallel.For(0, numIndices, i =>
             {
@@ -19159,14 +19163,56 @@ public class CpuEngine : ITensorLevelEngine
                 }
             });
 
-            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
-            AutoTracer.RecordOp("TensorGather", result, eng => result);
+            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, normalizedAxis });
+            { var cs = source; var ci = indices; var ca = normalizedAxis; AutoTracer.RecordOp("TensorGather", result, eng => eng.TensorGather(cs, ci, ca)); }
             return result;
         }
-        else
+
+        // General path: gather along any axis for any-rank tensor
         {
-            throw new NotImplementedException("Gather only implemented for axis=0 with 2D source");
+            // Output shape: for each dimension d, if d == axis then use indices shape, else source shape
+            var outShape = ComputeGatherOutputShape(source._shape, indices._shape, normalizedAxis);
+            int totalOutput = 1;
+            for (int d = 0; d < outShape.Length; d++) totalOutput *= outShape[d];
+            var resultData = new T[totalOutput];
+
+            // Compute strides for source
+            int outerSize = 1;
+            for (int d = 0; d < normalizedAxis; d++) outerSize *= source._shape[d];
+            int axisSize = source._shape[normalizedAxis];
+            int innerSize = 1;
+            for (int d = normalizedAxis + 1; d < source._shape.Length; d++) innerSize *= source._shape[d];
+
+            // For indices that are 1D or match the source shape at the gather dimension
+            Parallel.For(0, outerSize, outer =>
+            {
+                for (int idxPos = 0; idxPos < indices.Length; idxPos++)
+                {
+                    int idx = indicesData[idxPos];
+                    if (idx < 0 || idx >= axisSize) continue;
+
+                    int srcBase = (outer * axisSize + idx) * innerSize;
+                    int dstBase = (outer * indices.Length + idxPos) * innerSize;
+                    Array.Copy(sourceData, srcBase, resultData, dstBase, innerSize);
+                }
+            });
+
+            var result = TensorAllocator.Rent<T>(outShape, new Vector<T>(resultData));
+            DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, normalizedAxis });
+            { var cs = source; var ci = indices; var ca = normalizedAxis; AutoTracer.RecordOp("TensorGather", result, eng => eng.TensorGather(cs, ci, ca)); }
+            return result;
         }
+    }
+
+    private static int[] ComputeGatherOutputShape(int[] sourceShape, int[] indicesShape, int axis)
+    {
+        // For 1D indices gathering from ND source:
+        // output shape = sourceShape with sourceShape[axis] replaced by indices total length
+        var outShape = (int[])sourceShape.Clone();
+        int indicesTotal = 1;
+        for (int d = 0; d < indicesShape.Length; d++) indicesTotal *= indicesShape[d];
+        outShape[axis] = indicesTotal;
+        return outShape;
     }
 
     /// <inheritdoc/>
