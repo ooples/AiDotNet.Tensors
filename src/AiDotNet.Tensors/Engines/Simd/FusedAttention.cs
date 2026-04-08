@@ -1,50 +1,37 @@
 using System;
 using System.Runtime.CompilerServices;
-using AiDotNet.Tensors.Helpers;
+#if NET5_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
 /// <summary>
-/// Flash Attention: tiled fused attention kernel that computes
+/// Flash Attention: tiled fused attention kernel using AVX2/FMA SIMD.
 /// O = softmax(Q @ K^T / sqrt(d)) @ V without materializing the full N×N attention matrix.
 ///
-/// Standard attention: O(N^2) memory for the attention matrix, 4 separate kernels.
+/// Standard attention: O(N^2) memory, 4 separate kernels.
 /// Flash Attention: O(N) memory, single tiled pass with online softmax.
 ///
-/// Algorithm (Dao et al., 2022):
-///   For each query tile Qi (size Br × d):
-///     For each key/value tile Kj, Vj (size Bc × d):
-///       Sij = Qi @ Kj^T (local scores, Br × Bc)
-///       mij = rowmax(Sij)
-///       Pij = exp(Sij - mij) (local attention weights)
-///       lij = rowsum(Pij)
-///       Update running max: mi_new = max(mi_old, mij)
-///       Rescale: Oi = exp(mi_old - mi_new) * Oi + Pij @ Vj
-///       Update normalizer: li = exp(mi_old - mi_new) * li_old + lij
-///     Final: Oi = Oi / li
+/// SIMD optimization:
+/// - Score tile: AVX2 FMA dot products (8 floats at a time)
+/// - Online softmax: AVX2 FastExp256 + vectorized max/sum reduction
+/// - V accumulation: AVX2 FMA multiply-add
 ///
-/// Key insight: online softmax maintains numerical stability without needing
-/// the full attention matrix. Each tile computes local exp values and rescales
-/// previous results as the global max evolves.
+/// Tile sizes tuned for L1 cache (32KB): Br=32 queries, Bc=32 keys.
+/// Each tile is Br*Bc*4 = 4KB, fits comfortably in L1 with room for K/V tiles.
 /// </summary>
 internal static class FusedAttention
 {
-    /// <summary>Default tile sizes for the tiled attention kernel.</summary>
-    private const int DefaultBr = 64;  // Query tile size (rows of Q processed together)
-    private const int DefaultBc = 64;  // Key tile size (columns of K^T processed together)
+    private const int DefaultBr = 32;  // Query tile — tuned for L1
+    private const int DefaultBc = 32;  // Key tile — tuned for L1
 
     /// <summary>
-    /// Computes Flash Attention: O = softmax(Q @ K^T / sqrt(d)) @ V
-    /// using tiled online softmax algorithm.
+    /// Flash Attention forward: O = softmax(Q @ K^T / sqrt(d)) @ V
     /// </summary>
-    /// <param name="q">Query matrix [seqQ, headDim]</param>
-    /// <param name="k">Key matrix [seqK, headDim]</param>
-    /// <param name="v">Value matrix [seqK, headDim]</param>
-    /// <param name="output">Output matrix [seqQ, headDim] (pre-allocated)</param>
-    /// <param name="scale">Scale factor, typically 1/sqrt(headDim)</param>
-    /// <param name="isCausal">Whether to apply causal masking (upper triangle = -inf)</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void FlashAttentionForward(
+    internal static unsafe void FlashAttentionForward(
         float[] q, float[] k, float[] v, float[] output,
         int seqQ, int seqK, int headDim,
         float scale, bool isCausal = false)
@@ -52,105 +39,222 @@ internal static class FusedAttention
         int br = Math.Min(DefaultBr, seqQ);
         int bc = Math.Min(DefaultBc, seqK);
 
-        // Per-row running state for online softmax
-        var rowMax = new float[br];    // Running max per query row
-        var rowSum = new float[br];    // Running sum of exp per query row
-        var localScores = new float[br * bc]; // Tile of Q @ K^T scores
+        var rowMax = new float[br];
+        var rowSum = new float[br];
+        var localScores = new float[br * bc];
 
-        // Initialize output to zero
         Array.Clear(output, 0, seqQ * headDim);
 
-        // Outer loop: iterate over query tiles
-        for (int qi = 0; qi < seqQ; qi += br)
+        fixed (float* pQ = q, pK = k, pV = v, pO = output, pScores = localScores,
+               pRowMax = rowMax, pRowSum = rowSum)
         {
-            int actualBr = Math.Min(br, seqQ - qi);
-
-            // Initialize running max to -inf and sum to 0 for this query tile
-            for (int r = 0; r < actualBr; r++)
+            for (int qi = 0; qi < seqQ; qi += br)
             {
-                rowMax[r] = float.NegativeInfinity;
-                rowSum[r] = 0f;
-            }
+                int actualBr = Math.Min(br, seqQ - qi);
 
-            // Inner loop: iterate over key/value tiles
-            for (int kj = 0; kj < seqK; kj += bc)
-            {
-                int actualBc = Math.Min(bc, seqK - kj);
-
-                // Step 1: Compute local scores Sij = Qi @ Kj^T (Br × Bc)
-                ComputeScoreTile(q, k, localScores, qi, kj, actualBr, actualBc, headDim, scale);
-
-                // Step 1b: Apply causal mask if needed
-                if (isCausal)
-                    ApplyCausalMask(localScores, qi, kj, actualBr, actualBc);
-
-                // Step 2: Online softmax update
-                // For each query row, update running max, rescale previous output,
-                // compute local exp weights, and accumulate into output
                 for (int r = 0; r < actualBr; r++)
                 {
-                    int globalRow = qi + r;
-
-                    // Find local row max
-                    float localMax = float.NegativeInfinity;
-                    for (int c = 0; c < actualBc; c++)
-                    {
-                        float s = localScores[r * actualBc + c];
-                        if (s > localMax) localMax = s;
-                    }
-
-                    // Update global max
-                    float prevMax = rowMax[r];
-                    float newMax = Math.Max(prevMax, localMax);
-                    rowMax[r] = newMax;
-
-                    // Rescale factor for previous accumulations
-                    float rescale = prevMax == float.NegativeInfinity
-                        ? 0f
-                        : MathF.Exp(prevMax - newMax);
-
-                    // Rescale previous output and sum
-                    if (rescale > 0f && rescale < 1f)
-                    {
-                        int outOffset = globalRow * headDim;
-                        for (int d = 0; d < headDim; d++)
-                            output[outOffset + d] *= rescale;
-                        rowSum[r] *= rescale;
-                    }
-
-                    // Compute exp weights and accumulate: O += exp(S - max) @ V
-                    float localSum = 0f;
-                    for (int c = 0; c < actualBc; c++)
-                    {
-                        float expVal = MathF.Exp(localScores[r * actualBc + c] - newMax);
-                        localSum += expVal;
-
-                        // Accumulate: output[row, :] += expVal * V[kj + c, :]
-                        int vOffset = (kj + c) * headDim;
-                        int oOffset = globalRow * headDim;
-                        for (int d = 0; d < headDim; d++)
-                            output[oOffset + d] += expVal * v[vOffset + d];
-                    }
-
-                    rowSum[r] += localSum;
+                    pRowMax[r] = float.NegativeInfinity;
+                    pRowSum[r] = 0f;
                 }
-            }
 
-            // Step 3: Normalize output by row sum
-            for (int r = 0; r < actualBr; r++)
-            {
-                int globalRow = qi + r;
-                float invSum = rowSum[r] > 0f ? 1f / rowSum[r] : 0f;
-                int oOffset = globalRow * headDim;
-                for (int d = 0; d < headDim; d++)
-                    output[oOffset + d] *= invSum;
+                for (int kj = 0; kj < seqK; kj += bc)
+                {
+                    int actualBc = Math.Min(bc, seqK - kj);
+
+                    // Step 1: Score tile — Q_tile @ K_tile^T with AVX2 FMA
+                    ComputeScoreTileSimd(pQ, pK, pScores, qi, kj, actualBr, actualBc, headDim, scale);
+
+                    if (isCausal)
+                        ApplyCausalMask(pScores, qi, kj, actualBr, actualBc);
+
+                    // Step 2: Online softmax + V accumulation with AVX2
+                    OnlineSoftmaxAndAccumulate(
+                        pScores, pV, pO, pRowMax, pRowSum,
+                        qi, kj, actualBr, actualBc, headDim);
+                }
+
+                // Step 3: Normalize output by row sum
+                NormalizeOutput(pO, pRowSum, qi, actualBr, headDim);
             }
         }
     }
 
+    /// <summary>AVX2 FMA dot product for score tile computation.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void ComputeScoreTileSimd(
+        float* q, float* k, float* scores,
+        int qi, int kj, int br, int bc, int headDim, float scale)
+    {
+        for (int r = 0; r < br; r++)
+        {
+            float* qRow = q + (qi + r) * headDim;
+            for (int c = 0; c < bc; c++)
+            {
+                float* kRow = k + (kj + c) * headDim;
+                float dot = DotProductSimd(qRow, kRow, headDim);
+                scores[r * bc + c] = dot * scale;
+            }
+        }
+    }
+
+    /// <summary>AVX2 FMA vectorized dot product — 8 floats per cycle.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotProductSimd(float* a, float* b, int length)
+    {
+        float sum = 0f;
+        int i = 0;
+
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 32)
+        {
+            // 4x unrolled AVX2 FMA accumulation for maximum throughput
+            var acc0 = Vector256<float>.Zero;
+            var acc1 = Vector256<float>.Zero;
+            var acc2 = Vector256<float>.Zero;
+            var acc3 = Vector256<float>.Zero;
+
+            int simdLength = length & ~31;
+            for (; i < simdLength; i += 32)
+            {
+                acc0 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), acc0);
+                acc1 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8), acc1);
+                acc2 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16), acc2);
+                acc3 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24), acc3);
+            }
+
+            // Reduce 4 accumulators and horizontal sum via SimdKernels helper
+            acc0 = Avx.Add(Avx.Add(acc0, acc1), Avx.Add(acc2, acc3));
+            sum = SimdKernels.HorizontalSum(acc0);
+        }
+        else if (Fma.IsSupported && length >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            int simdLength = length & ~7;
+            for (; i < simdLength; i += 8)
+                acc = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), acc);
+
+            sum = SimdKernels.HorizontalSum(acc);
+        }
+#endif
+
+        // Scalar tail
+        for (; i < length; i++)
+            sum += a[i] * b[i];
+
+        return sum;
+    }
+
+    /// <summary>Online softmax with AVX2 exp + V accumulation via FMA.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void OnlineSoftmaxAndAccumulate(
+        float* scores, float* v, float* output,
+        float* rowMax, float* rowSum,
+        int qi, int kj, int br, int bc, int headDim)
+    {
+        for (int r = 0; r < br; r++)
+        {
+            int globalRow = qi + r;
+            float* scoreRow = scores + r * bc;
+
+            // Find local row max
+            float localMax = float.NegativeInfinity;
+            for (int c = 0; c < bc; c++)
+                if (scoreRow[c] > localMax) localMax = scoreRow[c];
+
+            // Update global max and compute rescale factor
+            float prevMax = rowMax[r];
+            float newMax = Math.Max(prevMax, localMax);
+            rowMax[r] = newMax;
+
+            float rescale = prevMax == float.NegativeInfinity ? 0f : MathF.Exp(prevMax - newMax);
+
+            // Rescale previous output with AVX2
+            if (rescale > 0f && rescale < 1f)
+            {
+                float* oRow = output + globalRow * headDim;
+                RescaleRowSimd(oRow, rescale, headDim);
+                rowSum[r] *= rescale;
+            }
+
+            // Compute exp weights and accumulate O += exp(s - max) @ V with AVX2 FMA
+            float localSum = 0f;
+            for (int c = 0; c < bc; c++)
+            {
+                float expVal = MathF.Exp(scoreRow[c] - newMax);
+                localSum += expVal;
+
+                // Accumulate: output[row, :] += expVal * V[kj + c, :]
+                float* vRow = v + (kj + c) * headDim;
+                float* oRow = output + globalRow * headDim;
+                AccumulateRowSimd(oRow, vRow, expVal, headDim);
+            }
+
+            rowSum[r] += localSum;
+        }
+    }
+
+    /// <summary>AVX2 row rescale: row[i] *= scale</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void RescaleRowSimd(float* row, float scale, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 8)
+        {
+            var vScale = Vector256.Create(scale);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+                Avx.Store(row + i, Avx.Multiply(Avx.LoadVector256(row + i), vScale));
+        }
+#endif
+        for (; i < length; i++)
+            row[i] *= scale;
+    }
+
+    /// <summary>AVX2 FMA row accumulate: dst[i] += weight * src[i]</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void AccumulateRowSimd(float* dst, float* src, float weight, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vWeight = Vector256.Create(weight);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+                Avx.Store(dst + i, Fma.MultiplyAdd(vWeight, Avx.LoadVector256(src + i), Avx.LoadVector256(dst + i)));
+        }
+#endif
+        for (; i < length; i++)
+            dst[i] += weight * src[i];
+    }
+
+    /// <summary>Normalize output rows by their softmax sum.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void NormalizeOutput(float* output, float* rowSum, int qi, int br, int headDim)
+    {
+        for (int r = 0; r < br; r++)
+        {
+            float invSum = rowSum[r] > 0f ? 1f / rowSum[r] : 0f;
+            float* oRow = output + (qi + r) * headDim;
+            RescaleRowSimd(oRow, invSum, headDim);
+        }
+    }
+
+    /// <summary>Apply causal mask: scores[r,c] = -inf where qi+r < kj+c</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void ApplyCausalMask(float* scores, int qi, int kj, int br, int bc)
+    {
+        for (int r = 0; r < br; r++)
+            for (int c = 0; c < bc; c++)
+                if (qi + r < kj + c)
+                    scores[r * bc + c] = float.NegativeInfinity;
+    }
+
     /// <summary>
-    /// Batched Flash Attention: processes multiple batch×head combinations.
-    /// Q, K, V are [batch * heads, seq, headDim].
+    /// Batched Flash Attention: processes multiple batch*head combinations in parallel.
+    /// Q, K, V are [batchHeads, seq, headDim].
     /// </summary>
     internal static void BatchedFlashAttention(
         float[] q, float[] k, float[] v, float[] output,
@@ -160,14 +264,11 @@ internal static class FusedAttention
         int qStride = seqQ * headDim;
         int kStride = seqK * headDim;
 
-        // Process each batch×head independently (embarrassingly parallel)
         System.Threading.Tasks.Parallel.For(0, batchHeads, bh =>
         {
             int qOffset = bh * qStride;
             int kOffset = bh * kStride;
-            int vOffset = bh * kStride; // V has same layout as K
 
-            // Create per-thread views (avoid allocation by using ArraySegment-like offsets)
             var qSlice = new float[qStride];
             var kSlice = new float[kStride];
             var vSlice = new float[kStride];
@@ -175,46 +276,12 @@ internal static class FusedAttention
 
             Array.Copy(q, qOffset, qSlice, 0, qStride);
             Array.Copy(k, kOffset, kSlice, 0, kStride);
-            Array.Copy(v, vOffset, vSlice, 0, kStride);
+            Array.Copy(v, kOffset, vSlice, 0, kStride);
 
             FlashAttentionForward(qSlice, kSlice, vSlice, oSlice,
                 seqQ, seqK, headDim, scale, isCausal);
 
             Array.Copy(oSlice, 0, output, qOffset, qStride);
         });
-    }
-
-    /// <summary>Compute score tile: Sij = Q[qi:qi+br, :] @ K[kj:kj+bc, :]^T * scale</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ComputeScoreTile(
-        float[] q, float[] k, float[] scores,
-        int qi, int kj, int br, int bc, int headDim, float scale)
-    {
-        for (int r = 0; r < br; r++)
-        {
-            int qRowOffset = (qi + r) * headDim;
-            for (int c = 0; c < bc; c++)
-            {
-                int kRowOffset = (kj + c) * headDim;
-                float dot = 0f;
-                for (int d = 0; d < headDim; d++)
-                    dot += q[qRowOffset + d] * k[kRowOffset + d];
-                scores[r * bc + c] = dot * scale;
-            }
-        }
-    }
-
-    /// <summary>Apply causal mask: set scores[r, c] = -inf where qi+r < kj+c</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ApplyCausalMask(float[] scores, int qi, int kj, int br, int bc)
-    {
-        for (int r = 0; r < br; r++)
-        {
-            for (int c = 0; c < bc; c++)
-            {
-                if (qi + r < kj + c)
-                    scores[r * bc + c] = float.NegativeInfinity;
-            }
-        }
     }
 }
