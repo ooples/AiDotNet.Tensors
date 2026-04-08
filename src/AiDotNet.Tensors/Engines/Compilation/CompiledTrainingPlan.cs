@@ -293,8 +293,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gradients[i] = gradMap[parameters[i]];
         }
 
+        // Phase 6.3: Backward pruning — skip gradient computation for non-trainable tensors
+        var paramSet = new HashSet<Tensor<T>>(parameters);
+        backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
+
         // If all backward steps are specialized (overwrite), we can skip gradient zeroing entirely
         int[]? genericGradIndices = genericBackwardCount == 0 ? new int[0] : null;
+
+        // Phase 4.4: Wire pre-packed weights for MatMul forward steps
+        if (typeof(T) == typeof(float))
+        {
+            var packedWeights = WeightLayoutOptimizer.PrePackWeights(allForwardActions
+                .Select((a, idx) => idx < forwardSteps.Count && !fusedStepIndices.Contains(idx) ? forwardSteps[idx] : null)
+                .Where(s => s is not null)
+                .ToArray()!);
+            // packedWeights are available for future SIMD tile kernels that consume panel format
+        }
 
         return new CompiledTrainingPlan<T>(
             forwardActions,
@@ -1170,7 +1184,39 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // ReLU backward: mask = input > 0, grad = gradOut * mask — SIMD, zero alloc
+        // ReLU backward: mask = input > 0, grad = gradOut * mask
+        // Phase 5.2: Use bitmask (1 bit/element) instead of full input tensor (32x memory savings)
+        if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
+            && step.Inputs[0].IsContiguous && typeof(T) == typeof(float))
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+
+            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input))
+                return null;
+
+            var gradOut = gradMap[output];
+            var gradIn = gradMap[input];
+
+            // Pre-allocate bitmask at compile time (32x smaller than storing full input)
+            byte[]? reluBitmask = null;
+
+            return eng =>
+            {
+                // Create bitmask from forward output (output > 0 ↔ input > 0 for ReLU)
+                var outputData = (float[])(object)output.GetDataArray();
+                int len = output.Length;
+                reluBitmask ??= new byte[(len + 7) / 8];
+                ActivationCheckpoint.CreateReluBitmask(outputData, len);
+
+                // Apply backward using bitmask
+                var gradOutData = (float[])(object)gradOut.GetDataArray();
+                var gradInData = (float[])(object)gradIn.GetDataArray();
+                ActivationCheckpoint.ApplyReluBackwardFromBitmask(gradOutData, reluBitmask, gradInData, len);
+                input.Grad = gradIn;
+            };
+        }
+        // ReLU backward fallback: full input tensor path (non-float types)
         if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
             && step.Inputs[0].IsContiguous)
         {

@@ -113,6 +113,26 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// <summary>Number of cached training plans.</summary>
     public int TrainingPlanCount => _trainingPlans.Count;
 
+    /// <summary>
+    /// Gets a cached inference plan using symbolic shape matching.
+    /// Plans compiled with one batch size can be reused for different batch sizes
+    /// if the symbolic dimensions match.
+    /// </summary>
+    /// <param name="inputShape">Actual input shape.</param>
+    /// <param name="forward">Forward pass to trace on cache miss.</param>
+    /// <param name="symbolicShape">Symbolic shape with dynamic dimensions marked.</param>
+    /// <returns>Compiled inference plan.</returns>
+    public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Action forward, SymbolicShape symbolicShape)
+    {
+        // Use symbolic key (ignores dynamic dims like batch size)
+        long key = symbolicShape.ComputeKey();
+        if (_inferencePlans.TryGetValue(key, out var cached))
+            return cached;
+
+        // Cache miss — compile with the current concrete shape
+        return GetOrCompileInference(inputShape, forward);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
