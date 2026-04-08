@@ -4420,6 +4420,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PowerTensorBackward); } }
+
         if (!bases.IsContiguous) bases = bases.Contiguous();
         if (!exponents.IsContiguous) exponents = exponents.Contiguous();
         if (!bases._shape.SequenceEqual(exponents._shape))
@@ -4548,6 +4550,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorFrac<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.FracBackward); } }
+
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -4672,6 +4676,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Grid must be 4D tensor of shape [D, H, W, C]", nameof(grid));
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, grid._shape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int depth = grid._shape[0];
@@ -12642,6 +12648,8 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SoftmaxBackward); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -12810,6 +12818,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> Sparsemax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.SparsemaxBackward); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -15882,6 +15892,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_source = source; var c_indices = indices; var c_dim = dim; var c_outputSize = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterAdd", source, source._shape, (eng, output) => { var r = eng.ScatterAdd(c_source, c_indices, c_dim, c_outputSize); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterAddBackward); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -17054,6 +17066,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
+
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -17402,6 +17416,8 @@ public class CpuEngine : ITensorLevelEngine
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_upscaleFactor = upscaleFactor; return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, input._shape, (eng, output) => { var r = eng.PixelShuffle(c_input, c_upscaleFactor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.PixelShuffleBackward); } }
+
 
         int batch = shape[0];
         int channels = shape[1];
@@ -17862,6 +17878,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (real == null || imag == null)
             throw new ArgumentNullException("ComplexMagnitudeSquared inputs cannot be null");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
+
         if (!real._shape.SequenceEqual(imag._shape))
             throw new ArgumentException("Real and imaginary parts must have the same shape");
 
@@ -17898,6 +17916,8 @@ public class CpuEngine : ITensorLevelEngine
         var shape = input._shape;
         if (shape.Length != 4)
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_top = top; var c_left = left; var c_height = height; var c_width = width; return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, input._shape, (eng, output) => { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CropBackward); } }
+
 
         int batch = shape[0];
         int channels = shape[1];
@@ -18323,6 +18343,8 @@ public class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (centers == null) throw new ArgumentNullException(nameof(centers));
         if (epsilons == null) throw new ArgumentNullException(nameof(epsilons));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, input._shape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.RBFKernelBackward); } }
+
 
         if (input.Rank != 2)
             throw new ArgumentException($"input must be 2D [batch, features], got rank {input.Rank}", nameof(input));
@@ -18482,6 +18504,8 @@ public class CpuEngine : ITensorLevelEngine
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be at least 1");
         if (axis < 0 || axis >= tensor._shape.Length)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {tensor._shape.Length} dimensions");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, tensor._shape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.RepeatElementsBackward); } }
+
 
         // Calculate output shape
         var outputShape = new int[tensor._shape.Length];
@@ -18788,6 +18812,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+
 
         // Flatten both tensors to 1D
         int n = a.Length;
@@ -18822,6 +18848,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Both tensors must be 2D [batch, features]");
         if (a._shape[0] != b._shape[0])
             throw new ArgumentException("Batch sizes must match");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+
 
         int batch = a._shape[0];
         int n = a._shape[1];
@@ -18979,6 +19007,8 @@ public class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterAddBackward); } }
+
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -19362,6 +19392,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.NegateBackward); } }
+
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -19421,6 +19453,8 @@ public class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor._shape.Length != 2)
             throw new ArgumentException("Tensor must be 2D");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, tensor._shape, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.DiagonalBackward); } }
+
 
         int n = Math.Min(tensor._shape[0], tensor._shape[1]);
         var result = AutoTensorCache.RentOrAllocate<T>([n]);
@@ -21702,6 +21736,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a._shape.Length != 1 || b._shape.Length != 1)
             throw new ArgumentException("Both inputs must be 1D tensors");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, a._shape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.OuterProductBackward); } }
+
 
         int n = a._shape[0];
         int m = b._shape[0];
@@ -22274,6 +22310,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, input._shape, (eng, output) => { var r = eng.RFFT(c_input); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[^1]; // Last dimension is the signal length
@@ -22330,6 +22368,8 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> IRFFT<T>(Tensor<T> input, int outputLength)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); r.AsSpan().CopyTo(output.AsWritableSpan()); }, null); } }
+
         if (!input.IsContiguous) input = input.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -25248,6 +25288,8 @@ public class CpuEngine : ITensorLevelEngine
             normB += vb * vb;
         }
         double sim = dotProd / (Math.Sqrt(normA) * Math.Sqrt(normB) + 1e-8);
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, a._shape, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
+
         var result = new Tensor<T>(new[] { numOps.FromDouble(sim) }, [1]);
         DifferentiableOps.RecordBinary("CosineSimilarity", result, a, b,
             BackwardFunctions<T>.CosineSimilarityBackward);
@@ -26817,6 +26859,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Weight must be rank-3 with last dim 8, got shape [{string.Join(", ", weight._shape)}].", nameof(weight));
         if (input._shape[1] != weight._shape[1])
             throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, input._shape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MatMulBackward); } }
+
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -26990,6 +27034,8 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
         if (a.Length % 2 != 0 || (a.Rank > 0 && a._shape[a.Rank - 1] % 2 != 0))
             throw new ArgumentException("Complex tensors must have even length with the last axis divisible by 2 (interleaved re/im).");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.TensorComplexMultiply(c_a, c_b); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMultiplyBackward); } }
+
 
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a._shape);
@@ -27016,6 +27062,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexConjugate", a, a._shape, (eng, output) => { var r = eng.TensorComplexConjugate(c_a); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexConjugateBackward); } }
+
 
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(a._shape);
@@ -27036,6 +27084,8 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.TensorComplexMagnitude(c); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
+
 
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
