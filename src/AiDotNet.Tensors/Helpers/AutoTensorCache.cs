@@ -174,9 +174,10 @@ internal static class AutoTensorCache
             var tensor = (Tensor<T>)obj;
             if (ShapesMatch(tensor._shape, shape))
             {
-                // Clear mutable state from previous use (Grad, LazySource, etc.)
+                // Clear mutable state from previous use to prevent stale metadata
                 tensor.Grad = null;
                 tensor.LazySource = null;
+                tensor.GradFn = null;
                 return tensor;
             }
             pool.Enqueue(obj);

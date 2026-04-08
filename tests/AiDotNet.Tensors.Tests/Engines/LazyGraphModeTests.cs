@@ -373,7 +373,7 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
 
         [Fact]
-        public void AutoMaterialize_OnDataAccess()
+        public void AutoMaterialize_OnScopeDispose()
         {
             var engine = new CpuEngine();
             var a = MakeRandom(new[] { 16, 16 }, seed: 28);
@@ -445,6 +445,9 @@ namespace AiDotNet.Tensors.Tests.Engines
                 var lazyMm = engine.TensorMatMul(input, weights);
                 var lazyBiased = engine.TensorBroadcastAdd(lazyMm, bias1D);
                 lazyResult = engine.ReLU(lazyBiased);
+
+                // Verify fusion actually reduced the node count (3 ops → fewer after fusion)
+                Assert.True(scope.NodeCount <= 3, $"Expected fusion to reduce node count, got {scope.NodeCount}");
                 scope.Realize();
             }
 

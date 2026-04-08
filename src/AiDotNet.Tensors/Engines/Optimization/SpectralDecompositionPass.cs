@@ -34,6 +34,7 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         {
             if (steps[i].OpName == "TensorMatMul"
                 && steps[i].Inputs.Length == 2
+                && steps[i].Inputs[0].Rank == 2
                 && steps[i].Inputs[1].Rank == 2)
             {
                 var optimized = TryDecomposeWeight(steps[i]);

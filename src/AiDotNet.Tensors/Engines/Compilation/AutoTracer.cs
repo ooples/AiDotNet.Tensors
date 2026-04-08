@@ -112,6 +112,11 @@ internal sealed class AutoTracerState
         {
             // Reset sequence since we're using the compiled plan
             _currentSequence.Clear();
+
+            // Update LRU order — move this plan to end (most recently used)
+            _evictionOrder.Remove(hash);
+            _evictionOrder.AddLast(hash);
+
             return plan as CompiledInferencePlan<T>;
         }
         return null;

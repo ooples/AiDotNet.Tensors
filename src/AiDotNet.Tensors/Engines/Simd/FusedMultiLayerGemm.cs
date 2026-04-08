@@ -281,7 +281,8 @@ internal static class FusedMultiLayerGemm
             activated[i] = val;
         }
 
-        // GEMM2: output = hidden @ W2
+        // GEMM2: output = hidden @ W2 (clear first since SimdGemm accumulates)
+        Array.Clear(output, 0, m * n);
         SimdGemm.Sgemm(hidden.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
     }
 }

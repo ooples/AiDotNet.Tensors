@@ -1290,7 +1290,9 @@ internal sealed class CompiledTrainingPlan<T> : IDisposable
         }
 
         // ReduceSum backward: broadcast scalar gradient to all elements
-        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1)
+        // Only specialize for full scalar reduction (output length == 1)
+        if (step.OpType == OpType.ReduceSum && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
