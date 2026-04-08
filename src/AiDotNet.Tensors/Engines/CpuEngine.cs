@@ -3213,6 +3213,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMany", captured, referenceShape, (eng, output) => { var r = eng.TensorAddMany(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.AddManyBackward); } }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int length = tensors[0].Length;
 
@@ -3228,6 +3230,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordIfActive("TensorAddMany", result, tensors, BackwardFunctions<T>.AddManyBackward);
+        { var ct = tensors; AutoTracer.RecordOp("TensorAddMany", result, eng => eng.TensorAddMany(ct)); }
         return result;
     }
 
@@ -3808,6 +3811,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorMultiplyMany", captured, referenceShape, (eng, output) => { var r = eng.TensorMultiplyMany(captured); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MultiplyManyBackward); } }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
@@ -3820,6 +3825,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordIfActive("TensorMultiplyMany", result, tensors, BackwardFunctions<T>.MultiplyManyBackward);
+        { var ct = tensors; AutoTracer.RecordOp("TensorMultiplyMany", result, eng => eng.TensorMultiplyMany(ct)); }
         return result;
     }
 
@@ -9009,6 +9015,7 @@ public class CpuEngine : ITensorLevelEngine
         // Assign local variable to out parameter after parallel section
         maxIndices = indices;
         DifferentiableOps.RecordUnary("MaxPool2DWithIndices", result, input, BackwardFunctions<T>.MaxPool2DWithIndicesBackward, new object[] { maxIndices, poolSize, stride });
+        { var ci = input; var cp = poolSize; var cs = stride; AutoTracer.RecordOp("MaxPool2DWithIndices", result, eng => { eng.MaxPool2DWithIndices(ci, cp, cs, out _); return result; }); }
         return result;
     }
 
@@ -11225,6 +11232,7 @@ public class CpuEngine : ITensorLevelEngine
 
         maxIndices = localMaxIndices;
         DifferentiableOps.RecordUnary("MaxPool3DWithIndices", result, input, BackwardFunctions<T>.MaxPool3DBackward, new object[] { maxIndices, poolSize, stride });
+        { var ci = input; var cp = poolSize; var cs = stride; AutoTracer.RecordOp("MaxPool3DWithIndices", result, eng => { eng.MaxPool3DWithIndices(ci, cp, cs, out _); return result; }); }
         return result;
     }
 
@@ -11654,6 +11662,25 @@ public class CpuEngine : ITensorLevelEngine
         if (inChannels != kernelInChannels)
             throw new ArgumentException($"Kernel's input channels ({kernelInChannels}) must match input tensor's channels ({inChannels}).");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                int oD = (inDepth - 1) * stride[0] - 2 * padding[0] + kD + outputPadding[0];
+                int oH = (inHeight - 1) * stride[1] - 2 * padding[1] + kH + outputPadding[1];
+                int oW = (inWidth - 1) * stride[2] - 2 * padding[2] + kW + outputPadding[2];
+                var outShape = new[] { batch, outChannels, oD, oH, oW };
+                var ci = input; var ck = kernel;
+                var cs = (int[])stride.Clone(); var cp = (int[])padding.Clone(); var cop = (int[])outputPadding.Clone();
+                return scope.RecordBinary(LazyNodeType.Custom, "ConvTranspose3D", input, kernel, outShape,
+                    (eng, output) => { var r = eng.ConvTranspose3D(ci, ck, cs, cp, cop); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+            }
+        }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ConvTranspose3D", input._shape); if (ac is not null) return ac.Execute(); }
+
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
         int outPadD = outputPadding[0], outPadH = outputPadding[1], outPadW = outputPadding[2];
@@ -11731,6 +11758,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], new Vector<T>(outputData));
         DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, input, kernel, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
+        { var ca = input; var cb = kernel; var cs2 = stride; var cp2 = padding; var cop2 = outputPadding; AutoTracer.RecordOp("ConvTranspose3D", ct3dResult, eng => eng.ConvTranspose3D(ca, cb, cs2, cp2, cop2)); }
         return ct3dResult;
     }
 
@@ -11885,6 +11913,22 @@ public class CpuEngine : ITensorLevelEngine
         if (outputHeight != expectedOutputH || outputWidth != expectedOutputW)
             throw new ArgumentException($"Calculated output dimensions ({expectedOutputH}x{expectedOutputW}) do not match weights dimensions ({outputHeight}x{outputWidth}). Check input, kernel, and stride parameters.");
 
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
+                var ci = input; var cw = weights; var cb = bias; var cs = (int[])stride.Clone();
+                var inputs = bias is not null ? new[] { input, weights, bias } : new[] { input, weights };
+                return scope.RecordVariadic(LazyNodeType.Custom, "LocallyConnectedConv2D", inputs, outShape,
+                    (eng, output) => { var r = eng.LocallyConnectedConv2D(ci, cw, cb, cs); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { (int[])stride.Clone() });
+            }
+        }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("LocallyConnectedConv2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
         var inputData = input.GetDataArray();
         var weightsData = weights.GetDataArray();
@@ -11934,6 +11978,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordBinary("LocallyConnectedConv2D", result, input, weights, BackwardFunctions<T>.LocallyConnectedConv2DBackward, new object[] { stride });
+        { var ca = input; var cb = weights; var cc = bias; var cs = stride; AutoTracer.RecordOp("LocallyConnectedConv2D", result, eng => eng.LocallyConnectedConv2D(ca, cb, cc, cs)); }
         return result;
     }
 
@@ -16236,6 +16281,7 @@ public class CpuEngine : ITensorLevelEngine
         argmax = new Tensor<int>(outputShape, new Vector<int>(argmaxData));
         var scatterMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("ScatterMax", scatterMaxResult, source, BackwardFunctions<T>.ScatterMaxBackward, new object[] { indices, argmax });
+        { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterMax", scatterMaxResult, eng => { eng.ScatterMax(cs, ci, out _, cd, co); return scatterMaxResult; }); }
         return scatterMaxResult;
     }
 
@@ -16302,6 +16348,10 @@ public class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
+
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterSoftmaxBackward); } }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterSoftmax", source._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -16379,6 +16429,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var scatterSmResult = TensorAllocator.Rent<T>(source._shape, new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("ScatterSoftmax", scatterSmResult, source, BackwardFunctions<T>.ScatterSoftmaxBackward, new object[] { indices });
+        { var cs2 = source; var ci2 = indices; AutoTracer.RecordOp("ScatterSoftmax", scatterSmResult, eng => eng.ScatterSoftmax(cs2, ci2, dim, outputSize)); }
         return scatterSmResult;
     }
 
@@ -16605,6 +16656,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("ReduceMax", reduceMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
+        { var ci = input; var ca = axes; var ck = keepDims; AutoTracer.RecordOp("ReduceMax", reduceMaxResult, eng => { eng.ReduceMax(ci, ca, ck, out _); return reduceMaxResult; }); }
         return reduceMaxResult;
     }
 
@@ -20937,6 +20989,10 @@ public class CpuEngine : ITensorLevelEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
 
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.MaskedFillBackward); } }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         var result = tensor.Clone();
         var maskSpan = mask.AsSpan();
         var dest = result.AsWritableSpan();
@@ -20947,6 +21003,7 @@ public class CpuEngine : ITensorLevelEngine
                 dest[i] = value;
         }
 
+        { var ct = tensor; var cm = mask; var cv = value; AutoTracer.RecordOp("MaskedFill", result, eng => eng.TensorMaskedFill(ct, cm, cv)); }
         return result;
     }
 
@@ -21554,6 +21611,10 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); r.AsSpan().CopyTo(output.AsWritableSpan()); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Scatter", input._shape); if (ac is not null) return ac.Execute(); }
+
         if (!indices.IsContiguous) indices = indices.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
@@ -21589,6 +21650,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("Scatter", result, input, values, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis });
+        { var ca2 = input; var ci2 = indices; var cv2 = values; var cx2 = axis; AutoTracer.RecordOp("Scatter", result, eng => eng.Scatter(ca2, ci2, cv2, cx2)); }
         return result;
     }
 
