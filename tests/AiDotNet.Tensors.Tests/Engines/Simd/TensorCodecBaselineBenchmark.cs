@@ -108,7 +108,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 engine.TensorMatMul(h1, w2);
                 compiledPlanFused = scope.CompileTraining(new[] { w1, w2 });
             }
-            double compiledFusedMs = Measure(() => compiledPlanFused.Step(), warmup, iters);
+            double compiledFusedMs;
+            try { compiledFusedMs = Measure(() => compiledPlanFused.Step(), warmup, iters); }
+            finally { compiledPlanFused.Dispose(); }
 
             // === 3. Phase B: Fused Multi-Layer (forward + backward) ===
             Func<float, float> relu = x => x > 0f ? x : 0f;

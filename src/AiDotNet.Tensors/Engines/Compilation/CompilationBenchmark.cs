@@ -5,8 +5,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// <summary>
 /// Phase 3: A/B testing infrastructure for compilation performance.
 ///
-/// Measures steps/sec, throughput, latency, and peak memory for
-/// eager vs compiled vs PyTorch execution paths.
+/// Measures steps/sec, throughput, latency, and live-heap delta for
+/// eager vs compiled execution paths. Memory tracking uses GC.GetTotalMemory
+/// for managed heap deltas and Gen0 collection counts as an allocation proxy.
 ///
 /// Each optimization pass can be toggled independently via TensorCodecOptions
 /// to measure its individual contribution to overall performance.

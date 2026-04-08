@@ -9,9 +9,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// Usage:
 ///   var profiler = new ProfilingCompiler&lt;float&gt;();
-///   profiler.Profile(plan, warmupSteps: 10, measureSteps: 100);
+///   profiler.ProfileInference(plan, warmupSteps: 10, measureSteps: 100);
 ///   var report = profiler.GetReport();
-///   // report.HottestSteps shows which ops to optimize next
+///   // report.Profiles shows per-plan timing data
 /// </summary>
 public sealed class ProfilingCompiler<T>
 {
