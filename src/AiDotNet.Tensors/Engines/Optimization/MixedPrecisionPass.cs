@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -24,18 +25,69 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
         if (!IsEnabled) return null;
+        // Mixed precision only makes sense for float (downcast to Half for forward)
+        if (typeof(T) != typeof(float)) return null;
 
-        // Classify each op as fp16-safe or fp32-required
-        var classifications = new List<PrecisionClass>(steps.Length);
-        foreach (var step in steps)
+#if NET7_0_OR_GREATER
+        // Classify each op and find fp16-safe chains
+        int fp16Count = 0;
+        var classifications = new PrecisionClass[steps.Length];
+        for (int i = 0; i < steps.Length; i++)
         {
-            classifications.Add(ClassifyOp(step.OpName));
+            classifications[i] = ClassifyOp(steps[i].OpName);
+            if (classifications[i] == PrecisionClass.FP16Safe) fp16Count++;
         }
 
-        // For now, return null (no transformation) — the classification data
-        // will be used when Half-precision kernels are available.
-        // The infrastructure is in place for future implementation.
+        // Only apply if at least 30% of ops can run in fp16
+        if (fp16Count < steps.Length * 0.3) return null;
+
+        // For fp16-safe ops, wrap the execute delegate with fp32→fp16→execute→fp16→fp32 casts.
+        // This simulates mixed precision by casting inputs to Half before computation
+        // and casting outputs back to float. True fp16 kernel dispatch would be faster
+        // but requires Half-typed tensors throughout.
+        var result = new CompiledStep<T>[steps.Length];
+        bool anyOptimized = false;
+
+        for (int i = 0; i < steps.Length; i++)
+        {
+            if (classifications[i] == PrecisionClass.FP16Safe && steps[i].Inputs.Length >= 1)
+            {
+                // Wrap with precision cast: forward executes in reduced precision
+                // by rounding inputs to Half precision first (simulates fp16 bandwidth)
+                var capturedStep = steps[i];
+                result[i] = new CompiledStep<T>(
+                    "MP_" + steps[i].OpName,
+                    (eng, output) =>
+                    {
+                        // Simulate fp16: round inputs to Half precision before computation
+                        foreach (var inp in capturedStep.Inputs)
+                        {
+                            if (inp.IsContiguous)
+                            {
+                                var span = ((Tensor<float>)(object)inp).Data.Span;
+                                for (int j = 0; j < span.Length; j++)
+                                    span[j] = (float)(Half)span[j]; // fp32 → fp16 → fp32 round-trip
+                            }
+                        }
+                        capturedStep.Execute(eng, output);
+                    },
+                    steps[i].OutputBuffer,
+                    steps[i].Inputs,
+                    steps[i].BackwardFn, // Backward stays in fp32
+                    steps[i].SavedState);
+                anyOptimized = true;
+            }
+            else
+            {
+                result[i] = steps[i];
+            }
+        }
+
+        return anyOptimized ? result : null;
+#else
+        // System.Half not available before .NET 7 — no mixed precision support
         return null;
+#endif
     }
 
     /// <summary>
