@@ -188,6 +188,189 @@ internal static class FusedKernels
             output[i] = (1f / (1f + MathF.Exp(-a[i]))) * b[i];
     }
 
+    /// <summary>Fused LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta — 2-pass AVX2</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void LayerNormUnsafe(float* input, float* gamma, float* beta, float* output,
+        int length, float eps)
+    {
+        // Pass 1: mean
+        float mean = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+                acc = Avx.Add(acc, Avx.LoadVector256(input + i));
+            mean = SimdKernels.HorizontalSum(acc);
+        }
+#endif
+        for (; i < length; i++) mean += input[i];
+        mean /= length;
+
+        // Pass 1b: variance
+        float variance = 0f;
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vMean = Vector256.Create(mean);
+            var acc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var diff = Avx.Subtract(Avx.LoadVector256(input + i), vMean);
+                acc = Fma.MultiplyAdd(diff, diff, acc);
+            }
+            variance = SimdKernels.HorizontalSum(acc);
+        }
+#endif
+        for (; i < length; i++) { float d = input[i] - mean; variance += d * d; }
+        variance /= length;
+
+        // Pass 2: normalize + scale + shift
+        float invStd = 1f / MathF.Sqrt(variance + eps);
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vMean2 = Vector256.Create(mean);
+            var vInvStd = Vector256.Create(invStd);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var normalized = Avx.Multiply(Avx.Subtract(Avx.LoadVector256(input + i), vMean2), vInvStd);
+                Avx.Store(output + i, Fma.MultiplyAdd(normalized, Avx.LoadVector256(gamma + i), Avx.LoadVector256(beta + i)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+            output[i] = (input[i] - mean) * invStd * gamma[i] + beta[i];
+    }
+
+    /// <summary>Fused Softmax: exp(x - max) / sum(exp(x - max)) — 2-pass AVX2</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void SoftmaxUnsafe(float* input, float* output, int length)
+    {
+        // Pass 1: find max
+        float maxVal = float.NegativeInfinity;
+        for (int i = 0; i < length; i++)
+            if (input[i] > maxVal) maxVal = input[i];
+
+        // Pass 2: exp(x - max) and sum
+        float sum = 0f;
+        int j = 0;
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+        {
+            var vMax = Vector256.Create(maxVal);
+            var vSum = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; j < simdLen; j += 8)
+            {
+                var x = Avx.Subtract(Avx.LoadVector256(input + j), vMax);
+                var expX = SimdKernels.FastExp256(x);
+                Avx.Store(output + j, expX);
+                vSum = Avx.Add(vSum, expX);
+            }
+            sum = SimdKernels.HorizontalSum(vSum);
+        }
+#endif
+        for (; j < length; j++)
+        {
+            output[j] = MathF.Exp(input[j] - maxVal);
+            sum += output[j];
+        }
+
+        // Pass 3: normalize
+        float invSum = 1f / sum;
+        j = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 8)
+        {
+            var vInvSum = Vector256.Create(invSum);
+            int simdLen = length & ~7;
+            for (; j < simdLen; j += 8)
+                Avx.Store(output + j, Avx.Multiply(Avx.LoadVector256(output + j), vInvSum));
+        }
+#endif
+        for (; j < length; j++) output[j] *= invSum;
+    }
+
+    /// <summary>Fused LogSoftmax: x - max - log(sum(exp(x - max))) — 2-pass AVX2</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void LogSoftmaxUnsafe(float* input, float* output, int length)
+    {
+        float maxVal = float.NegativeInfinity;
+        for (int i = 0; i < length; i++)
+            if (input[i] > maxVal) maxVal = input[i];
+
+        float sum = 0f;
+        int j = 0;
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
+        {
+            var vMax = Vector256.Create(maxVal);
+            var vSum = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; j < simdLen; j += 8)
+            {
+                var expX = SimdKernels.FastExp256(Avx.Subtract(Avx.LoadVector256(input + j), vMax));
+                vSum = Avx.Add(vSum, expX);
+            }
+            sum = SimdKernels.HorizontalSum(vSum);
+        }
+#endif
+        for (; j < length; j++)
+            sum += MathF.Exp(input[j] - maxVal);
+
+        float logSumExp = maxVal + MathF.Log(sum);
+        j = 0;
+#if NET5_0_OR_GREATER
+        if (Avx.IsSupported && length >= 8)
+        {
+            var vLse = Vector256.Create(logSumExp);
+            int simdLen = length & ~7;
+            for (; j < simdLen; j += 8)
+                Avx.Store(output + j, Avx.Subtract(Avx.LoadVector256(input + j), vLse));
+        }
+#endif
+        for (; j < length; j++)
+            output[j] = input[j] - logSumExp;
+    }
+
+    /// <summary>Fused BatchNorm inference: (x - mean) / sqrt(var + eps) * gamma + beta — single pass AVX2</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe void BatchNormInferenceUnsafe(
+        float* input, float* output, int length, int channels,
+        float* gamma, float* beta, float* runningMean, float* runningVar, float eps)
+    {
+        // Pre-compute scale and shift per channel
+        int spatialSize = length / channels;
+        for (int c = 0; c < channels; c++)
+        {
+            float scale = gamma[c] / MathF.Sqrt(runningVar[c] + eps);
+            float shift = beta[c] - scale * runningMean[c];
+            int offset = c * spatialSize;
+
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && spatialSize >= 8)
+            {
+                var vScale = Vector256.Create(scale);
+                var vShift = Vector256.Create(shift);
+                int simdLen = spatialSize & ~7;
+                for (; i < simdLen; i += 8)
+                    Avx.Store(output + offset + i,
+                        Fma.MultiplyAdd(vScale, Avx.LoadVector256(input + offset + i), vShift));
+            }
+#endif
+            for (; i < spatialSize; i++)
+                output[offset + i] = scale * input[offset + i] + shift;
+        }
+    }
+
     /// <summary>
     /// Tries to match an op chain to a hardcoded fused kernel.
     /// Returns true if a match was found.

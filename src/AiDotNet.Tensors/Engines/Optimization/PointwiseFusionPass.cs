@@ -80,7 +80,42 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
         var lastOutput = steps[end].OutputBuffer;
         string fusedName = "Fused_" + string.Join("_", chainOps);
 
-        // Try true single-pass fusion via FusedPointwise delegate composition
+        // Try hardcoded SIMD kernel first (zero delegate overhead)
+        if (typeof(T) == typeof(float) && firstInput.IsContiguous
+            && Simd.FusedKernels.TryGetFusedKernel(chainOps.ToArray(), out var kernelName))
+        {
+            var capturedInput = firstInput;
+            var capturedKernel = kernelName;
+
+            return new CompiledStep<T>(
+                "HardcodedFused_" + capturedKernel,
+                (eng, output) =>
+                {
+                    var iMem = ((Tensor<float>)(object)capturedInput).Data;
+                    var oMem = ((Tensor<float>)(object)output).Data;
+                    using var pinI = iMem.Pin();
+                    using var pinO = oMem.Pin();
+                    unsafe
+                    {
+                        float* pIn = (float*)pinI.Pointer;
+                        float* pOut = (float*)pinO.Pointer;
+                        int len = capturedInput.Length;
+                        switch (capturedKernel)
+                        {
+                            case "Swish": Simd.FusedKernels.SwishUnsafe(pIn, pOut, len); break;
+                            case "GELU": Simd.FusedKernels.GeluUnsafe(pIn, pOut, len); break;
+                            case "Mish": Simd.FusedKernels.MishUnsafe(pIn, pOut, len); break;
+                            default: Simd.FusedPointwise.ApplyFused(pIn, pOut, len, x => x); break;
+                        }
+                    }
+                },
+                lastOutput,
+                new[] { firstInput },
+                null,
+                steps[end].SavedState);
+        }
+
+        // Fallback: delegate composition (still single-pass but with delegate overhead)
         if (typeof(T) == typeof(float) && firstInput.IsContiguous)
         {
             var fusedDelegate = Simd.FusedPointwise.BuildFusedDelegate(chainOps.ToArray());

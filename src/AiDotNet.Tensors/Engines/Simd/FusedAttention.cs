@@ -156,11 +156,12 @@ internal static class FusedAttention
         {
             int globalRow = qi + r;
             float* scoreRow = scores + r * bc;
+            float* oRow = output + globalRow * headDim;
 
             // Find local row max
             float localMax = float.NegativeInfinity;
-            for (int c = 0; c < bc; c++)
-                if (scoreRow[c] > localMax) localMax = scoreRow[c];
+            for (int cm = 0; cm < bc; cm++)
+                if (scoreRow[cm] > localMax) localMax = scoreRow[cm];
 
             // Update global max and compute rescale factor
             float prevMax = rowMax[r];
@@ -172,21 +173,44 @@ internal static class FusedAttention
             // Rescale previous output with AVX2
             if (rescale > 0f && rescale < 1f)
             {
-                float* oRow = output + globalRow * headDim;
                 RescaleRowSimd(oRow, rescale, headDim);
                 rowSum[r] *= rescale;
             }
 
-            // Compute exp weights and accumulate O += exp(s - max) @ V with AVX2 FMA
+            // Vectorized exp computation for all columns at once
             float localSum = 0f;
-            for (int c = 0; c < bc; c++)
+
+            // Batch exp: compute exp(score[c] - max) for all c using AVX2 FastExp256
+            int c = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && bc >= 8)
+            {
+                var vNewMax = Vector256.Create(newMax);
+                var vLocalSum = Vector256<float>.Zero;
+                int simdBc = bc & ~7;
+                // Pre-compute all exp values into scores (in-place)
+                for (; c < simdBc; c += 8)
+                {
+                    var s = Avx.Subtract(Avx.LoadVector256(scoreRow + c), vNewMax);
+                    var expS = SimdKernels.FastExp256(s);
+                    Avx.Store(scoreRow + c, expS);
+                    vLocalSum = Avx.Add(vLocalSum, expS);
+                }
+                localSum = SimdKernels.HorizontalSum(vLocalSum);
+            }
+#endif
+            for (; c < bc; c++)
             {
                 float expVal = MathF.Exp(scoreRow[c] - newMax);
+                scoreRow[c] = expVal;
                 localSum += expVal;
+            }
 
-                // Accumulate: output[row, :] += expVal * V[kj + c, :]
+            // Accumulate O += exp_weights @ V (each column has different weight)
+            for (c = 0; c < bc; c++)
+            {
+                float expVal = scoreRow[c];
                 float* vRow = v + (kj + c) * headDim;
-                float* oRow = output + globalRow * headDim;
                 AccumulateRowSimd(oRow, vRow, expVal, headDim);
             }
 
