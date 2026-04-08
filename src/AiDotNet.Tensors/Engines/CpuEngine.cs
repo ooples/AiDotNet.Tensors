@@ -20077,6 +20077,19 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (predictions == null) throw new ArgumentNullException(nameof(predictions));
         if (targets == null) throw new ArgumentNullException(nameof(targets));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                var cp = predictions; var ct = targets; var ce = epsilon;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorBinaryCrossEntropy", predictions, targets, predictions._shape,
+                    (eng, output) => { var r = ((CpuEngine)eng).TensorBinaryCrossEntropy(cp, ct, ce); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                    BackwardFunctions<T>.BinaryCrossEntropyBackward, new object[] { (object)epsilon! });
+            }
+        }
+
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         if (!targets.IsContiguous) targets = targets.Contiguous();
 
