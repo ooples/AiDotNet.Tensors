@@ -448,6 +448,15 @@ public sealed class GradientTape<T> : IDisposable
             return filtered;
         }
 
+        // Auto-training compiler: record step pattern and try to compile for next call.
+        // This makes ComputeGradients auto-compile just like GradientAndUpdate does,
+        // so users get zero-overhead autograd regardless of which API they use.
+        if (_options.Persistent)
+        {
+            Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count);
+            Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
+        }
+
         if (!_options.Persistent)
         {
             _entries.Reset();

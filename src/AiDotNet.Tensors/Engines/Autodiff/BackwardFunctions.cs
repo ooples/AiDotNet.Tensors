@@ -1904,26 +1904,30 @@ internal static class BackwardFunctions<T>
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
-            // Step 1: Fused ReLU mask — apply mask in-place on a copy of gradOutput
-            // This avoids allocating a separate masked gradient tensor
-            var maskedArr = new float[M * N];
+            // Step 1: Fused ReLU mask — pool the masked gradient buffer
+            var maskedTensor = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { M, N });
+            var maskedArr = maskedTensor.GetDataArray();
             fixed (float* pG = gArr, pPA = paArr, pM = maskedArr)
             {
                 SimdKernels.ReluBackwardUnsafe(pG, pPA, pM, M * N);
             }
 
-            // Step 2: gradInput = maskedGrad @ W^T  (transposed BLAS, no transpose allocation)
-            var gradInputArr = new float[M * K];
+            // Step 2: gradInput = maskedGrad @ W^T  (transposed BLAS, pooled buffer)
+            var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            var gradInputArr = (float[])(object)gradInput.GetDataArray();
+            Array.Clear(gradInputArr, 0, M * K);
             BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
-            var gradInput = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
 
-            // Step 3: gradWeight = input^T @ maskedGrad  (transposed BLAS, no transpose allocation)
-            var gradWeightArr = new float[K * N];
+            // Step 3: gradWeight = input^T @ maskedGrad  (transposed BLAS, pooled buffer)
+            var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+            var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
+            Array.Clear(gradWeightArr, 0, K * N);
             BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
-            var gradWeight = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
 
-            // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass
-            var biasArr = new float[N];
+            // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass, pooled buffer
+            var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+            var biasArr = (float[])(object)gradBias.GetDataArray();
+            Array.Clear(biasArr, 0, N);
             fixed (float* pM = maskedArr, pB = biasArr)
             {
                 for (int row = 0; row < M; row++)
@@ -1933,7 +1937,6 @@ internal static class BackwardFunctions<T>
                         pB[j] += rowPtr[j];
                 }
             }
-            var gradBias = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
@@ -1966,18 +1969,22 @@ internal static class BackwardFunctions<T>
         var inArr = (float[])(object)inputs[0].GetDataArray();
         var wArr = (float[])(object)inputs[1].GetDataArray();
 
-        // gradInput = maskedGrad @ W^T — transposed BLAS, zero transpose allocation
-        var gradInputArr = new float[M * K];
+        // gradInput = maskedGrad @ W^T — transposed BLAS, pooled buffer
+        var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+        var gradInputArr = (float[])(object)gradInput.GetDataArray();
+        Array.Clear(gradInputArr, 0, M * K);
         BlasProvider.TryGemmEx(M, K, N, maskedArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
-        var gradInput = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
 
-        // gradWeight = input^T @ maskedGrad — transposed BLAS, zero transpose allocation
-        var gradWeightArr = new float[K * N];
+        // gradWeight = input^T @ maskedGrad — transposed BLAS, pooled buffer
+        var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+        var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
+        Array.Clear(gradWeightArr, 0, K * N);
         BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N);
-        var gradWeight = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
 
-        // gradBias = sum(maskedGrad, axis=0) — single pass, no engine call
-        var biasArr = new float[N];
+        // gradBias = sum(maskedGrad, axis=0) — single pass, pooled buffer
+        var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+        var biasArr = (float[])(object)gradBias.GetDataArray();
+        Array.Clear(biasArr, 0, N);
         fixed (float* pM = maskedArr, pB = biasArr)
         {
             for (int row = 0; row < M; row++)
@@ -1987,7 +1994,6 @@ internal static class BackwardFunctions<T>
                     pB[j] += rowPtr[j];
             }
         }
-        var gradBias = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWeight, engine);
@@ -3231,10 +3237,13 @@ internal static class BackwardFunctions<T>
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
-            // Compute both GEMMs into fresh buffers before accumulating either,
-            // so a failure in the second doesn't leave partial accumulation.
-            var gradInputArr = new float[M * K];
-            var gradWeightArr = new float[K * N];
+            // Pool gradient buffers via AutoTensorCache — zero alloc on steps 2+
+            var inputGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+            var gradInputArr = (float[])(object)inputGrad.GetDataArray();
+            var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
+            Array.Clear(gradInputArr, 0, M * K);
+            Array.Clear(gradWeightArr, 0, K * N);
 
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
             bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
@@ -3242,15 +3251,15 @@ internal static class BackwardFunctions<T>
             if (!okInput || !okWeight)
                 goto fusedFallback; // BLAS refused — use engine fallback for all
 
-            var inputGrad = new Tensor<T>((T[])(object)gradInputArr, inputs[0]._shape);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
-            var weightGrad = new Tensor<T>((T[])(object)gradWeightArr, inputs[1]._shape);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
 
-            // dL/dbias = sum(gradOutput, axis=0) — inline loop, no engine call
+            // dL/dbias = sum(gradOutput, axis=0) — inline loop, pooled buffer
             if (inputs.Length > 2)
             {
-                var biasArr = new float[N];
+                var biasGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+                var biasArr = (float[])(object)biasGrad.GetDataArray();
+                Array.Clear(biasArr, 0, N);
                 fixed (float* pG = gArr, pB = biasArr)
                 {
                     for (int row = 0; row < M; row++)
@@ -3260,7 +3269,6 @@ internal static class BackwardFunctions<T>
                             pB[j] += rowPtr[j];
                     }
                 }
-                var biasGrad = new Tensor<T>((T[])(object)biasArr, inputs[2]._shape);
                 DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
             }
             return;
