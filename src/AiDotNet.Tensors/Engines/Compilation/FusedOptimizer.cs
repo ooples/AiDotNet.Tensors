@@ -559,13 +559,79 @@ internal static class FusedOptimizer
         }
     }
 
-    /// <summary>AVX2 FTRL: Follow The Regularized Leader</summary>
+    /// <summary>AVX2 FTRL: Follow The Regularized Leader.
+    /// Partial vectorization: n accumulation and z update use FMA,
+    /// soft-thresholding uses SIMD compare+blend for branchless L1 proximal.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void FTRLUpdateSimd(
         float* param, float* grad, float* z, float* n, int length,
         float lr, float l1Reg, float l2Reg, float lrPower)
     {
         int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vL1 = Vector256.Create(l1Reg);
+            var vL2 = Vector256.Create(l2Reg);
+            var vLrInv = Vector256.Create(1f / lr);
+            var vNegOne = Vector256.Create(-1f);
+            var vOne = Vector256.Create(1f);
+            var vZero = Vector256<float>.Zero;
+            var absMask = Vector256.Create(0x7FFFFFFFu).AsSingle();
+            int simdLen = length & ~7;
+
+            // Scratch buffers outside the loop to avoid stackalloc-in-loop warning
+            var sigmaArr = stackalloc float[8];
+            var nNewArr = stackalloc float[8];
+            var nOldArr = stackalloc float[8];
+            var denomArr = stackalloc float[8];
+
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var nOld = Avx.LoadVector256(n + i);
+                var nNew = Fma.MultiplyAdd(g, g, nOld);
+                Avx.Store(n + i, nNew);
+
+                // sigma = (pow(nNew, -lrPower) - pow(nOld, -lrPower)) / lr
+                // General case: compute per-element (pow has no SIMD intrinsic)
+                Avx.Store(nNewArr, nNew);
+                Avx.Store(nOldArr, nOld);
+                for (int j = 0; j < 8; j++)
+                    sigmaArr[j] = (MathF.Pow(nNewArr[j], -lrPower) - MathF.Pow(nOldArr[j], -lrPower)) / lr;
+                var sigma = Avx.LoadVector256(sigmaArr);
+
+                // z += g - sigma * param
+                var p = Avx.LoadVector256(param + i);
+                var zOld = Avx.LoadVector256(z + i);
+                var zNew = Avx.Add(zOld, Avx.Subtract(g, Avx.Multiply(sigma, p)));
+                Avx.Store(z + i, zNew);
+
+                // Soft-thresholding: branchless via SIMD compare+blend
+                var absZ = Avx.And(zNew, absMask);
+                var belowThreshold = Avx.Compare(absZ, vL1, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+
+                // sign(z): +1 where z>0, -1 where z<0
+                var posM = Avx.Compare(zNew, vZero, FloatComparisonMode.OrderedGreaterThanSignaling);
+                var negM = Avx.Compare(zNew, vZero, FloatComparisonMode.OrderedLessThanSignaling);
+                var signZ = Avx.BlendVariable(vZero, vOne, posM);
+                signZ = Avx.BlendVariable(signZ, vNegOne, negM);
+
+                // denom = pow(nNew, -lrPower)/lr + l2Reg
+                for (int j = 0; j < 8; j++)
+                    denomArr[j] = MathF.Pow(nNewArr[j], -lrPower) / lr + l2Reg;
+                var denom = Avx.LoadVector256(denomArr);
+
+                // result = -(z - sign*l1Reg) / denom
+                var numerator = Avx.Subtract(zNew, Avx.Multiply(signZ, vL1));
+                var result = Avx.Subtract(vZero, Avx.Divide(numerator, denom));
+
+                // Blend: zero where |z| <= l1Reg, result otherwise
+                result = Avx.BlendVariable(result, vZero, belowThreshold);
+                Avx.Store(param + i, result);
+            }
+        }
+#endif
         for (; i < length; i++)
         {
             float g = grad[i];
