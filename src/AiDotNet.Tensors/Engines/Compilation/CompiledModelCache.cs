@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -7,8 +8,8 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// Caches compiled inference and training plans keyed by input shape.
 /// Automatically recompiles when input dimensions change.
 ///
-/// Thread-safe: each thread gets its own compiled plans via the underlying
-/// GraphMode/AutoTracer thread-local infrastructure.
+/// Thread-safe: uses ConcurrentDictionary and locking for safe concurrent access.
+/// GraphMode/AutoTracer are thread-local, but this cache may be shared across threads.
 ///
 /// Usage:
 ///   var cache = new CompiledModelCache&lt;float&gt;();
@@ -16,8 +17,9 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 public sealed class CompiledModelCache<T> : IDisposable
 {
-    private readonly Dictionary<long, ICompiledPlan<T>> _inferencePlans = new();
-    private readonly Dictionary<long, ICompiledTrainingPlan<T>> _trainingPlans = new();
+    private readonly ConcurrentDictionary<long, ICompiledPlan<T>> _inferencePlans = new();
+    private readonly ConcurrentDictionary<long, ICompiledTrainingPlan<T>> _trainingPlans = new();
+    private readonly object _compileLock = new();
     private bool _disposed;
 
     /// <summary>
@@ -33,17 +35,26 @@ public sealed class CompiledModelCache<T> : IDisposable
         if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(inputShape))
             return cached;
 
-        // Trace the forward pass under GraphMode and compile
-        using var scope = GraphMode.Enable();
-        forward();
-        var plan = scope.CompileInference<T>();
+        lock (_compileLock)
+        {
+            // Double-check after acquiring lock
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(inputShape))
+                return cached;
 
-        // Dispose old plan if shape changed
-        if (_inferencePlans.TryGetValue(key, out var old))
-            old.Dispose();
+            // Trace the forward pass under GraphMode and compile.
+            // The forward action is called once to trace the graph — on subsequent calls
+            // the caller must invoke plan.Execute() with current data in the input tensors.
+            using var scope = GraphMode.Enable();
+            forward();
+            var plan = scope.CompileInference<T>();
 
-        _inferencePlans[key] = plan;
-        return plan;
+            // Dispose old plan if shape changed
+            if (_inferencePlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            _inferencePlans[key] = plan;
+            return plan;
+        }
     }
 
     /// <summary>
@@ -61,17 +72,24 @@ public sealed class CompiledModelCache<T> : IDisposable
         if (_trainingPlans.TryGetValue(key, out var cached))
             return cached;
 
-        // Trace forward + loss under GraphMode and compile with backward
-        using var scope = GraphMode.Enable();
-        forwardAndLoss();
-        var plan = scope.CompileTraining(parameters);
+        lock (_compileLock)
+        {
+            // Double-check after acquiring lock
+            if (_trainingPlans.TryGetValue(key, out cached))
+                return cached;
 
-        // Dispose old plan if exists
-        if (_trainingPlans.TryGetValue(key, out var old))
-            old.Dispose();
+            // Trace forward + loss under GraphMode and compile with backward
+            using var scope = GraphMode.Enable();
+            forwardAndLoss();
+            var plan = scope.CompileTraining(parameters);
 
-        _trainingPlans[key] = plan;
-        return plan;
+            // Dispose old plan if exists
+            if (_trainingPlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            _trainingPlans[key] = plan;
+            return plan;
+        }
     }
 
     /// <summary>
@@ -80,10 +98,13 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// </summary>
     public void Invalidate()
     {
-        foreach (var plan in _inferencePlans.Values) plan.Dispose();
-        foreach (var plan in _trainingPlans.Values) plan.Dispose();
-        _inferencePlans.Clear();
-        _trainingPlans.Clear();
+        lock (_compileLock)
+        {
+            foreach (var plan in _inferencePlans.Values) plan.Dispose();
+            foreach (var plan in _trainingPlans.Values) plan.Dispose();
+            _inferencePlans.Clear();
+            _trainingPlans.Clear();
+        }
     }
 
     /// <summary>Number of cached inference plans.</summary>

@@ -109,45 +109,25 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var step = steps[i];
 
-            // Zero-copy transpose: replace output buffer with strided view, no-op execute
+            // Transpose optimization: execute a contiguous copy into the output buffer
+            // instead of the full engine dispatch. The output remains contiguous (safe for
+            // downstream GetDataArray() fast paths), unlike a strided view which would break
+            // array-based specializations that assume dense row-major storage.
             if (step.OpType == OpType.TensorTranspose && step.Inputs.Length == 1 && step.Inputs[0].Rank == 2)
             {
-                var originalOutput = step.OutputBuffer;
-                var view = step.Inputs[0].Transpose();
+                var capturedStep = step;
+                var capturedOutput = step.OutputBuffer;
                 specializedSteps[i] = new CompiledStep<T>(
                     step.OpName,
-                    (eng, o) => { }, // no-op — data accessed via stride permutation
-                    view,            // output IS the strided view
+                    (eng, o) =>
+                    {
+                        var transposed = eng.TensorTranspose(capturedStep.Inputs[0]);
+                        transposed.AsSpan().CopyTo(capturedOutput.Data.Span);
+                    },
+                    step.OutputBuffer,
                     step.Inputs,
                     step.BackwardFn,
                     step.SavedState);
-
-                // Rewrite downstream steps: replace any input reference to the original
-                // OutputBuffer with the new view so they read from the strided view
-                for (int j = i + 1; j < steps.Count; j++)
-                {
-                    var downstream = steps[j];
-                    bool rewritten = false;
-                    var newInputs = new Tensor<T>[downstream.Inputs.Length];
-                    for (int k = 0; k < downstream.Inputs.Length; k++)
-                    {
-                        if (ReferenceEquals(downstream.Inputs[k], originalOutput))
-                        {
-                            newInputs[k] = view;
-                            rewritten = true;
-                        }
-                        else
-                        {
-                            newInputs[k] = downstream.Inputs[k];
-                        }
-                    }
-                    if (rewritten)
-                    {
-                        steps[j] = new CompiledStep<T>(
-                            downstream.OpName, downstream.Execute, downstream.OutputBuffer,
-                            newInputs, downstream.BackwardFn, downstream.SavedState);
-                    }
-                }
                 continue;
             }
 

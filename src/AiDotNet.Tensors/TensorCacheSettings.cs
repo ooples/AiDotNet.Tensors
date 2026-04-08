@@ -49,10 +49,9 @@ public static class TensorCacheSettings
     /// <summary>
     /// Configures the tensor buffer cache with custom limits.
     /// </summary>
-    /// <param name="maxBudgetMB">Maximum total cache memory in megabytes (0 = auto-detect).</param>
     /// <param name="maxTensorElements">Maximum elements per cached tensor (0 = auto-detect).</param>
     /// <param name="maxBuffersPerShape">Maximum cached buffers per unique shape (0 = auto-detect).</param>
-    public static void Configure(int maxBudgetMB = 0, long maxTensorElements = 0, int maxBuffersPerShape = 0)
+    public static void Configure(long maxTensorElements = 0, int maxBuffersPerShape = 0)
     {
         AutoTensorCache.Enabled = true;
         AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Auto;
@@ -63,7 +62,7 @@ public static class TensorCacheSettings
         if (maxBuffersPerShape > 0)
             AutoTensorCache.MaxBuffersPerShapeOverride = maxBuffersPerShape;
 
-        if (maxBudgetMB > 0 || maxTensorElements > 0 || maxBuffersPerShape > 0)
+        if (maxTensorElements > 0 || maxBuffersPerShape > 0)
             AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Balanced;
     }
 

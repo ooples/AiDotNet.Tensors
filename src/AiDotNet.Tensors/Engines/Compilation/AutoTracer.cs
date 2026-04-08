@@ -41,7 +41,11 @@ internal static class AutoTracer
     /// are treated as different operations — prevents silent wrong-result bugs.</param>
     internal static CompiledInferencePlan<T>? TryGetCompiledPlan<T>(string opName, int[] outputShape, long paramHash = 0)
     {
-        if (!Enabled || GraphMode.IsActive) return null;
+        if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation) return null;
+        // Don't return compiled plans when a GradientTape is recording —
+        // executing a CompiledInferencePlan would bypass DifferentiableOps
+        // recording and break gradient computation.
+        if (Autodiff.DifferentiableOps.IsRecording<T>()) return null;
         return State.TryGetPlan<T>(opName, outputShape, paramHash);
     }
 
@@ -56,7 +60,7 @@ internal static class AutoTracer
     /// <param name="paramHash">Extra hash for op-specific parameters (must match TryGetCompiledPlan).</param>
     internal static void RecordOp<T>(string opName, Tensor<T> result, Func<IEngine, Tensor<T>> replayDelegate, long paramHash = 0)
     {
-        if (!Enabled || GraphMode.IsActive) return;
+        if (!Enabled || GraphMode.IsActive || !TensorCodecOptions.Current.EnableCompilation || Autodiff.DifferentiableOps.IsRecording<T>()) return;
         State.RecordOp(opName, result._shape, replayDelegate, paramHash);
     }
 }
@@ -155,6 +159,13 @@ internal sealed class AutoTracerState
     /// </summary>
     private void TryCompile<T>(long patternHash)
     {
+        // Include type hash in storage key so it matches the lookup hash used in TryGetPlan.
+        // ComputeCurrentHash() doesn't include type, but TryGetPlan uses ComputeLookupHash
+        // which does — so we must store under the same key that lookup will use.
+        long storageKey = patternHash;
+        storageKey ^= typeof(T).GetHashCode();
+        storageKey *= unchecked((long)0x100000001b3L);
+
         try
         {
             using var scope = GraphMode.Enable();
@@ -182,8 +193,8 @@ internal sealed class AutoTracerState
                     _compiledPlans.Remove(oldest);
                 }
 
-                _compiledPlans[patternHash] = plan;
-                _evictionOrder.AddLast(patternHash);
+                _compiledPlans[storageKey] = plan;
+                _evictionOrder.AddLast(storageKey);
             }
 
             _currentSequence.Clear();
@@ -191,8 +202,8 @@ internal sealed class AutoTracerState
         catch
         {
             // Compilation failed — mark pattern as attempted so we don't retry indefinitely.
-            _compiledPlans[patternHash] = FailedCompilationSentinel;
-            _evictionOrder.AddLast(patternHash); // Track for eviction so cache doesn't grow unbounded
+            _compiledPlans[storageKey] = FailedCompilationSentinel;
+            _evictionOrder.AddLast(storageKey);
         }
     }
 

@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.Optimization;
 /// operations and replaces them with low-rank approximations via truncated SVD.
 ///
 /// For W[M,N] with fast singular value decay (effective rank r ≪ min(M,N)):
-///   y = x @ W  →  y = (x @ leftFactor[N,r]) @ rightFactor[r,M]
+///   y = x @ W  →  y = (x @ leftFactor[M,r]) @ rightFactor[r,N]
 ///
 /// This reduces FLOP count from O(M*N) to O(M*r + r*N) per sample.
 /// The approximation error is bounded by SpectralErrorTolerance.

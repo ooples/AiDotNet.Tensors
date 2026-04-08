@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -49,8 +50,11 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
-        // Validate current tape pattern matches the compiled plan's pattern
+        // Validate current tape pattern matches the compiled plan's pattern.
+        // Include loss and sources identity in the hash so different loss tensors
+        // or source sets don't reuse the wrong backward plan.
         long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
+        currentHash = IncludeTargetIdentity(currentHash, loss, sources);
         if (!State.MatchesCompiledHash(currentHash)) return null;
 
         return State.TryGetCompiledBackward<T>();
@@ -72,13 +76,35 @@ internal static class AutoTrainingCompiler
         try
         {
             var compiled = tape.CompileBackward(loss, sources);
-            State.StoreCompiledBackward(compiled);
+            // Store with target identity so the hash includes loss/sources
+            long hash = ComputePatternHash(tape.Entries, tape.EntryCount);
+            hash = IncludeTargetIdentity(hash, loss, sources);
+            State.StoreCompiledBackwardWithHash(compiled, hash);
         }
         catch
         {
             // Compilation failed — mark as attempted to prevent infinite retry
             State.MarkCompilationFailed();
         }
+    }
+
+    /// <summary>
+    /// Incorporates loss tensor and source tensor identities into the pattern hash
+    /// so that different tapes/losses/sources don't collide.
+    /// </summary>
+    private static long IncludeTargetIdentity<T>(long hash, Tensor<T> loss, Tensor<T>[]? sources)
+    {
+        hash ^= RuntimeHelpers.GetHashCode(loss);
+        hash *= unchecked((long)0x100000001b3L);
+        if (sources is not null)
+        {
+            foreach (var src in sources)
+            {
+                hash ^= RuntimeHelpers.GetHashCode(src);
+                hash *= unchecked((long)0x100000001b3L);
+            }
+        }
+        return hash;
     }
 
     /// <summary>
@@ -149,6 +175,13 @@ internal sealed class AutoTrainingState
     {
         _compiledBackward = compiled;
         _compiledStored = true;
+    }
+
+    internal void StoreCompiledBackwardWithHash<T>(CompiledBackwardGraph<T> compiled, long hash)
+    {
+        _compiledBackward = compiled;
+        _compiledStored = true;
+        _lastStepHash = hash;
     }
 
     internal CompiledBackwardGraph<T>? TryGetCompiledBackward<T>()

@@ -205,12 +205,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
-        // Build forward actions: fused actions first, then remaining unfused steps
-        // Build forward actions with specialized direct-BLAS where possible
-        var allForwardActions = new List<Action<IEngine>>(fusedForwardActions);
+        // Build forward actions in original graph order. Fused groups replace their
+        // constituent steps at the position of the first step in the group, ensuring
+        // any non-fused producer that originally appeared before a fused block still
+        // runs before it (preserving data dependencies).
+        var allForwardActions = new List<Action<IEngine>>();
+        var fusedGroupInserted = new HashSet<int>(); // track which fused groups we've already inserted
         for (int i = 0; i < forwardSteps.Count; i++)
         {
-            if (fusedStepIndices.Contains(i)) continue;
+            if (fusedStepIndices.Contains(i))
+            {
+                // This step is part of a fused group. Insert the fused action at the
+                // position of the first step in the group (only once).
+                if (fusedGroupInserted.Add(i))
+                {
+                    // Find which fused forward action corresponds to this group.
+                    // Fused groups are added sequentially, so the Nth fused group
+                    // corresponds to fusedForwardActions[N].
+                    int groupIdx = 0;
+                    for (int fi = 0; fi < i; fi++)
+                    {
+                        if (fusedStepIndices.Contains(fi) && fusedGroupInserted.Contains(fi))
+                            continue;
+                        if (fusedStepIndices.Contains(fi))
+                            groupIdx++;
+                    }
+                    if (groupIdx < fusedForwardActions.Count)
+                        allForwardActions.Add(fusedForwardActions[groupIdx]);
+                }
+                continue;
+            }
             var step = forwardSteps[i];
             var specialized = TryBuildSpecializedForward(step, pinnedHandles);
             if (specialized != null)
@@ -224,6 +248,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 allForwardActions.Add(eng => exec(eng, output));
             }
         }
+        // Add any remaining fused actions not yet inserted (safety net)
+        if (allForwardActions.Count == 0 && fusedForwardActions.Count > 0)
+            allForwardActions.AddRange(fusedForwardActions);
         var forwardActions = allForwardActions.ToArray();
 
         // Build backward actions: specialized per-step + fused backward for fused groups
@@ -253,8 +280,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 });
             }
         }
-        // Append fused backward actions (they handle their own gradient routing)
-        backwardActions.AddRange(fusedBackwardActions);
+        // Append fused backward actions in reverse order — TryFuseForwardBackward records
+        // them in forward order, but autodiff requires backward (reverse) order.
+        for (int i = fusedBackwardActions.Count - 1; i >= 0; i--)
+            backwardActions.Add(fusedBackwardActions[i]);
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -1513,6 +1542,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!ReferenceEquals(step0.OutputBuffer, step1.Inputs[0]))
                 continue;
             if (!ReferenceEquals(step1.OutputBuffer, step2.Inputs[0]))
+                continue;
+
+            // Require single-consumer chain: if step0 or step1 output feeds
+            // other steps beyond the fused chain, skipping them would leave
+            // those consumers without materialized data.
+            if (consumerCount.TryGetValue(step0.OutputBuffer, out int c0) && c0 > 1)
+                continue;
+            if (consumerCount.TryGetValue(step1.OutputBuffer, out int c1) && c1 > 1)
                 continue;
 
             // Verify all 2D

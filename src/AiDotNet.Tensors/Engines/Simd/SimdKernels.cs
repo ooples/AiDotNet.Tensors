@@ -609,7 +609,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i + 24, Avx.Subtract(zero, Avx.LoadVector256(input + i + 24)));
                 }
             }
-            if (Avx.IsSupported && length - i >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
             {
                 var zero = Vector256<float>.Zero;
                 int simdLength = i + ((length - i) & ~7);
@@ -629,7 +629,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var zero = Vector256<float>.Zero;
                 var half = Vector256.Create(0.5f);
@@ -651,7 +651,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             // Scalar tail above already used MathF.Cosh, so only fix [0..simdEnd).
             int simdEnd = i; // i is now past the SIMD range
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported)
             {
                 simdEnd = length & ~7; // same simdLength as the SIMD loop above
                 for (int j = 0; j < simdEnd; j++)
@@ -671,7 +671,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var zero = Vector256<float>.Zero;
                 var half = Vector256.Create(0.5f);
@@ -893,7 +893,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var zero = Vector256<float>.Zero;
                 var one = Vector256.Create(1.0f);
@@ -955,7 +955,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var threshold = Vector256.Create(20.0f);
                 var one = Vector256.Create(1.0f);
@@ -1020,7 +1020,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && Avx2.IsSupported && Fma.IsSupported && length >= 8)
             {
                 var zero = Vector256<float>.Zero;
                 var one = Vector256.Create(1.0f);
