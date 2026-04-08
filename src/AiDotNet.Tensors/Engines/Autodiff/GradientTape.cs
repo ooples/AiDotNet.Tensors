@@ -682,14 +682,8 @@ public sealed class GradientTape<T> : IDisposable
             }
         }
 
-        // Auto-training compiler: record step pattern for future compilation
-        Compilation.AutoTrainingCompiler.RecordStep(_entries, _entries.Count, loss);
-
-        // If pattern repeats, compile backward graph for next time
-        if (_options.Persistent)
-        {
-            Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, parameters);
-        }
+        // Note: ComputeGradients() already handles auto-compilation recording
+        // (RecordStep + TryCompileBackward) — no need to duplicate here.
     }
 
     /// <summary>

@@ -3249,8 +3249,7 @@ internal static class BackwardFunctions<T>
             var weightGrad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
             var gradInputArr = (float[])(object)inputGrad.GetDataArray();
             var gradWeightArr = (float[])(object)weightGrad.GetDataArray();
-            Array.Clear(gradInputArr, 0, M * K);
-            Array.Clear(gradWeightArr, 0, K * N);
+            // No Array.Clear — TryGemmEx with beta=0 overwrites C entirely
 
             bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
             bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
