@@ -2451,7 +2451,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Relative error ~0.01% across [-87.3, 88.7].
         /// </summary>
         [MethodImpl(HotInline)]
-        private static Vector256<float> FastExp256(Vector256<float> x)
+        internal static Vector256<float> FastExp256(Vector256<float> x)
         {
             // Clamp to avoid inf/nan (exp(-87.3) ~ 1e-38, exp(88.7) ~ 3.4e38)
             var clampMin = Vector256.Create(-87.3365f);
@@ -2749,12 +2749,21 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses Cephes-style exp polynomial (~0.01% relative error) for high accuracy.
         /// </summary>
         [MethodImpl(HotInline)]
-        private static Vector256<float> FastSigmoid256(Vector256<float> x)
+        internal static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
             // sigmoid(x) = 1 / (1 + exp(-x))
             var negX = Avx.Subtract(Vector256<float>.Zero, x);
             var expNegX = FastExp256(negX);
             return Avx.Divide(Vector256.Create(1.0f), Avx.Add(Vector256.Create(1.0f), expNegX));
+        }
+
+        /// <summary>Fast vectorized tanh via 2*sigmoid(2x) - 1.</summary>
+        [MethodImpl(HotInline)]
+        internal static Vector256<float> FastTanh256(Vector256<float> x)
+        {
+            var two = Vector256.Create(2f);
+            var one = Vector256.Create(1f);
+            return Avx.Subtract(Avx.Multiply(two, FastSigmoid256(Avx.Multiply(two, x))), one);
         }
 
         /// <summary>
@@ -2763,7 +2772,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Uses a minimax polynomial to approximate log(m) on [1, 2].
         /// </summary>
         [MethodImpl(HotInline)]
-        private static Vector256<float> FastLog256(Vector256<float> x)
+        internal static Vector256<float> FastLog256(Vector256<float> x)
         {
             // Extract exponent: n = floor(log2(x))
             // IEEE 754 float: [sign:1][exponent:8][mantissa:23], bias = 127
