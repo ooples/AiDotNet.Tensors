@@ -86,6 +86,9 @@ internal sealed class TracedOp
 /// </summary>
 internal sealed class AutoTracerState
 {
+    // Sentinel object to mark patterns that failed compilation (prevents infinite retries)
+    private static readonly object FailedCompilationSentinel = new();
+
     private readonly List<TracedOp> _currentSequence = new();
     private readonly Dictionary<long, object> _compiledPlans = new();
     private readonly LinkedList<long> _evictionOrder = new();
@@ -182,8 +185,8 @@ internal sealed class AutoTracerState
         }
         catch
         {
-            // Compilation failed — continue with eager execution
-            // Don't retry: mark this pattern as attempted
+            // Compilation failed — mark pattern as attempted so we don't retry indefinitely.
+            _compiledPlans[patternHash] = FailedCompilationSentinel;
         }
     }
 

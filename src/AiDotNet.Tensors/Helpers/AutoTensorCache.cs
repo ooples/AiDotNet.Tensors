@@ -63,6 +63,10 @@ internal static class AutoTensorCache
     private static readonly long _maxElementsL4;  // elements that fit in L4/HBM
     private static readonly long _maxElementsRam; // absolute max elements to cache
 
+    // User-configurable overrides (0 = use auto-detected defaults)
+    internal static long MaxElementsOverride { get; set; }
+    internal static int MaxBuffersPerShapeOverride { get; set; }
+
     static AutoTensorCache()
     {
         // Detect hardware cache hierarchy
@@ -105,15 +109,17 @@ internal static class AutoTensorCache
     /// </summary>
     internal static int GetMaxPerShape(long tensorElements)
     {
+        if (MaxBuffersPerShapeOverride > 0) return MaxBuffersPerShapeOverride;
+
         int baseMax;
         if (tensorElements <= _maxElementsL2)
-            baseMax = _maxPerShapeL2;       // Fits in L2 → aggressive
+            baseMax = _maxPerShapeL2;       // Fits in L2 -> aggressive
         else if (tensorElements <= _maxElementsL3)
-            baseMax = _maxPerShapeL3;       // Fits in L3 → moderate
+            baseMax = _maxPerShapeL3;       // Fits in L3 -> moderate
         else if (tensorElements <= _maxElementsL4)
-            baseMax = _maxPerShapeL4;       // Fits in L4/HBM → still worth caching
+            baseMax = _maxPerShapeL4;       // Fits in L4/HBM -> still worth caching
         else
-            baseMax = _maxPerShapeRam;      // RAM only → minimal
+            baseMax = _maxPerShapeRam;      // RAM only -> minimal
 
         return Policy switch
         {
@@ -127,13 +133,20 @@ internal static class AutoTensorCache
     /// <summary>
     /// Gets the max element count for cached tensors, based on cache hierarchy.
     /// </summary>
-    internal static long MaxElementsPerTensor => Policy switch
+    internal static long MaxElementsPerTensor
     {
-        CachePolicy.Aggressive => _maxElementsRam,
-        CachePolicy.Conservative => _maxElementsL3,
-        CachePolicy.Balanced => _maxElementsL3,
-        _ => _maxElementsRam // Auto: cache up to RAM budget
-    };
+        get
+        {
+            if (MaxElementsOverride > 0) return MaxElementsOverride;
+            return Policy switch
+            {
+                CachePolicy.Aggressive => _maxElementsRam,
+                CachePolicy.Conservative => _maxElementsL3,
+                CachePolicy.Balanced => _maxElementsL3,
+                _ => _maxElementsRam // Auto: cache up to RAM budget
+            };
+        }
+    }
 
     /// <summary>
     /// Gets a cached tensor with the given shape, or allocates a new one.
@@ -151,7 +164,12 @@ internal static class AutoTensorCache
         {
             var tensor = (Tensor<T>)obj;
             if (ShapesMatch(tensor._shape, shape))
+            {
+                // Clear mutable state from previous use (Grad, LazySource, etc.)
+                tensor.Grad = null;
+                tensor.LazySource = null;
                 return tensor;
+            }
             pool.Enqueue(obj);
         }
 

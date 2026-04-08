@@ -57,8 +57,12 @@ public static class TensorCacheSettings
         AutoTensorCache.Enabled = true;
         AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Auto;
 
-        // Custom overrides are applied through the policy system
-        // For now, set policy to Balanced and let users tune via policy
+        if (maxTensorElements > 0)
+            AutoTensorCache.MaxElementsOverride = maxTensorElements;
+
+        if (maxBuffersPerShape > 0)
+            AutoTensorCache.MaxBuffersPerShapeOverride = maxBuffersPerShape;
+
         if (maxBudgetMB > 0 || maxTensorElements > 0 || maxBuffersPerShape > 0)
             AutoTensorCache.Policy = AutoTensorCache.CachePolicy.Balanced;
     }
