@@ -5,6 +5,16 @@ Hardware: AMD Ryzen 9 3950X, DDR4, Windows 11 Pro
 Runtime: .NET 10.0, BenchmarkDotNet 0.15.8
 Branch: perf/cpu-gpu-optimizations (commit 6b362e6)
 
+## Methodology
+
+All comparisons are **AiDotNet eager vs TorchSharp eager** (both uncompiled, no graph optimization).
+TorchSharp is a C# binding to libtorch via P/Invoke. For small tensors, TorchSharp interop
+overhead can dominate, making the comparison less meaningful for raw compute throughput.
+
+TorchSharp does NOT support `torch.compile()` or `torch.jit`, so compiled-mode comparisons
+are not possible. AiDotNet's compiled plans (CompiledTrainingPlan, CompiledInferencePlan) have
+no TorchSharp equivalent and should be compared against AiDotNet eager, not TorchSharp.
+
 ## Baseline Results (Median values, 1M floats unless noted)
 
 | Operation | AiDotNet (us) | TorchSharp (us) | Ratio | Alloc | Status |
