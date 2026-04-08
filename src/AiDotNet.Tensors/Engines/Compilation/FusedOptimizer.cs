@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Engines.Simd;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -261,7 +262,32 @@ internal static class FusedOptimizer
         float lr, float beta1, float beta2, int step)
     {
         float bc1 = 1f - MathF.Pow(beta1, step);
+        float lrAdj = lr / bc1;
         int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(1e-8f);
+            var signMask = Vector256.Create(0x7FFFFFFFu).AsSingle(); // abs mask
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var absG = Avx.And(g, signMask);
+                var uScaled = Avx.Multiply(vB2, Avx.LoadVector256(u + i));
+                var uNew = Avx.Max(uScaled, absG);
+                Avx.Store(u + i, uNew);
+                var update = Avx.Divide(mNew, Avx.Add(uNew, vEps));
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, update, Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
         for (; i < length; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
@@ -279,7 +305,34 @@ internal static class FusedOptimizer
     {
         float bc1 = 1f - MathF.Pow(beta1, step);
         float bc2 = 1f - MathF.Pow(beta2, step);
+        float lrAdj = lr / bc1;
         int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1f - beta2);
+            var vLr = Vector256.Create(-lrAdj);
+            var vEps = Vector256.Create(eps);
+            var vBc2Inv = Vector256.Create(1f / bc2);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var vmNew = Avx.Max(Avx.LoadVector256(vMax + i), vNew);
+                Avx.Store(vMax + i, vmNew);
+                var vMaxHat = Avx.Multiply(vmNew, vBc2Inv);
+                var denom = Avx.Add(Avx.Sqrt(vMaxHat), vEps);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.Divide(mNew, denom), Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
         for (; i < length; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
@@ -301,13 +354,40 @@ internal static class FusedOptimizer
         float bc2 = 1f - MathF.Pow(beta2, step);
         float bc1Next = 1f - MathF.Pow(beta1, step + 1);
         int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1f - beta2);
+            var vLr = Vector256.Create(-lr);
+            var vEps = Vector256.Create(eps);
+            var vBc1Inv = Vector256.Create(1f / bc1);
+            var vBc2Inv = Vector256.Create(1f / bc2);
+            var vBc1NextInv = Vector256.Create(1f / bc1Next);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var mNew = Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g));
+                Avx.Store(m + i, mNew);
+                var vNew = Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g)));
+                Avx.Store(v + i, vNew);
+                var mHat = Avx.Multiply(mNew, vBc1Inv);
+                var vHat = Avx.Multiply(vNew, vBc2Inv);
+                var mNesterov = Avx.Add(Avx.Multiply(vB1, mHat), Avx.Multiply(Avx.Multiply(v1mB1, g), vBc1NextInv));
+                var denom = Avx.Add(Avx.Sqrt(vHat), vEps);
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, Avx.Divide(mNesterov, denom), Avx.LoadVector256(param + i)));
+            }
+        }
+#endif
         for (; i < length; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
             float mHat = m[i] / bc1;
             float vHat = v[i] / bc2;
-            // Nesterov: use lookahead momentum
             float mNesterov = beta1 * mHat + (1f - beta1) * grad[i] / bc1Next;
             param[i] -= lr * mNesterov / (MathF.Sqrt(vHat) + eps);
         }
@@ -320,6 +400,27 @@ internal static class FusedOptimizer
         float rho, float eps)
     {
         int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vRho = Vector256.Create(rho);
+            var v1mRho = Vector256.Create(1f - rho);
+            var vEps = Vector256.Create(eps);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var ag = Fma.MultiplyAdd(vRho, Avx.LoadVector256(accumGrad + i), Avx.Multiply(v1mRho, Avx.Multiply(g, g)));
+                Avx.Store(accumGrad + i, ag);
+                var rmsGrad = Avx.Sqrt(Avx.Add(ag, vEps));
+                var rmsUpd = Avx.Sqrt(Avx.Add(Avx.LoadVector256(accumUpdate + i), vEps));
+                var update = Avx.Subtract(Vector256<float>.Zero, Avx.Multiply(Avx.Divide(rmsUpd, rmsGrad), g));
+                var au = Fma.MultiplyAdd(vRho, Avx.LoadVector256(accumUpdate + i), Avx.Multiply(v1mRho, Avx.Multiply(update, update)));
+                Avx.Store(accumUpdate + i, au);
+                Avx.Store(param + i, Avx.Add(Avx.LoadVector256(param + i), update));
+            }
+        }
+#endif
         for (; i < length; i++)
         {
             accumGrad[i] = rho * accumGrad[i] + (1f - rho) * grad[i] * grad[i];
@@ -337,9 +438,27 @@ internal static class FusedOptimizer
         float* param, float* grad, float* velocity, int length,
         float lr, float momentum, float weightDecay, float trustCoeff)
     {
-        // Compute layer-wise norms
+        // Compute layer-wise norms with AVX2
         float paramNorm = 0f, gradNorm = 0f;
-        for (int i = 0; i < length; i++)
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var pAcc = Vector256<float>.Zero;
+            var gAcc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var p = Avx.LoadVector256(param + i);
+                var g = Avx.LoadVector256(grad + i);
+                pAcc = Fma.MultiplyAdd(p, p, pAcc);
+                gAcc = Fma.MultiplyAdd(g, g, gAcc);
+            }
+            paramNorm = SimdKernels.HorizontalSum(pAcc);
+            gradNorm = SimdKernels.HorizontalSum(gAcc);
+        }
+#endif
+        for (; i < length; i++)
         {
             paramNorm += param[i] * param[i];
             gradNorm += grad[i] * grad[i];
@@ -365,32 +484,73 @@ internal static class FusedOptimizer
         float bc1 = 1f - MathF.Pow(beta1, step);
         float bc2 = 1f - MathF.Pow(beta2, step);
 
-        // Compute Adam update direction
-        float paramNorm = 0f, updateNorm = 0f;
-        for (int i = 0; i < length; i++)
+        // Pass 1: update moments + compute param norm (AVX2)
+        float paramNormSq = 0f;
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vB1 = Vector256.Create(beta1);
+            var v1mB1 = Vector256.Create(1f - beta1);
+            var vB2 = Vector256.Create(beta2);
+            var v1mB2 = Vector256.Create(1f - beta2);
+            var pNormAcc = Vector256<float>.Zero;
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var g = Avx.LoadVector256(grad + i);
+                var p = Avx.LoadVector256(param + i);
+                Avx.Store(m + i, Fma.MultiplyAdd(vB1, Avx.LoadVector256(m + i), Avx.Multiply(v1mB1, g)));
+                Avx.Store(v + i, Fma.MultiplyAdd(vB2, Avx.LoadVector256(v + i), Avx.Multiply(v1mB2, Avx.Multiply(g, g))));
+                pNormAcc = Fma.MultiplyAdd(p, p, pNormAcc);
+            }
+            paramNormSq = SimdKernels.HorizontalSum(pNormAcc);
+        }
+#endif
+        for (; i < length; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
-            paramNorm += param[i] * param[i];
+            paramNormSq += param[i] * param[i];
         }
-        paramNorm = MathF.Sqrt(paramNorm);
+        float paramNorm = MathF.Sqrt(paramNormSq);
 
-        // Compute update norm
-        for (int i = 0; i < length; i++)
+        // Pass 2: compute update norm
+        float updateNormSq = 0f;
+        for (i = 0; i < length; i++)
         {
             float mHat = m[i] / bc1;
             float vHat = v[i] / bc2;
             float update = mHat / (MathF.Sqrt(vHat) + eps) + weightDecay * param[i];
-            updateNorm += update * update;
+            updateNormSq += update * update;
         }
-        updateNorm = MathF.Sqrt(updateNorm);
+        float updateNorm = MathF.Sqrt(updateNormSq);
 
-        // Trust ratio
+        // Trust ratio + apply update
         float trustRatio = (paramNorm > 0f && updateNorm > 0f) ? paramNorm / updateNorm : 1f;
-
-        // Apply update
         float effectiveLr = lr * trustRatio;
-        for (int i = 0; i < length; i++)
+        i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vLr = Vector256.Create(-effectiveLr);
+            var vEps = Vector256.Create(eps);
+            var vWd = Vector256.Create(weightDecay);
+            var vBc1Inv = Vector256.Create(1f / bc1);
+            var vBc2Inv = Vector256.Create(1f / bc2);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var mHat = Avx.Multiply(Avx.LoadVector256(m + i), vBc1Inv);
+                var vHat = Avx.Multiply(Avx.LoadVector256(v + i), vBc2Inv);
+                var adamUpdate = Avx.Divide(mHat, Avx.Add(Avx.Sqrt(vHat), vEps));
+                var p = Avx.LoadVector256(param + i);
+                var fullUpdate = Avx.Add(adamUpdate, Avx.Multiply(vWd, p));
+                Avx.Store(param + i, Fma.MultiplyAdd(vLr, fullUpdate, p));
+            }
+        }
+#endif
+        for (; i < length; i++)
         {
             float mHat = m[i] / bc1;
             float vHat = v[i] / bc2;
