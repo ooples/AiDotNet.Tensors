@@ -16,13 +16,19 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
 
         public TensorCodecMultiSizeBenchmark(ITestOutputHelper output) => _output = output;
 
-        private static double Measure(Action action, int warmup, int iters)
+        private static double Measure(Action action, int warmup, int iters, bool disableAutoTracer = false)
         {
+            bool wasEnabled = AutoTracer.Enabled;
+            if (disableAutoTracer) AutoTracer.Enabled = false;
+            try
+            {
             for (int i = 0; i < warmup; i++) action();
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < iters; i++) action();
             sw.Stop();
             return sw.Elapsed.TotalMilliseconds / iters;
+            }
+            finally { AutoTracer.Enabled = wasEnabled; }
         }
 
         [Theory(Skip = "Performance benchmark — run manually")]

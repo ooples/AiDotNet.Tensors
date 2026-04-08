@@ -175,7 +175,7 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra
                 factors.Value.Rank, directMs, spectralMs, directMs / spectralMs);
         }
 
-        [Theory]
+        [Theory(Skip = "Performance benchmark — run manually")]
         [InlineData(256, 128, 16)]
         [InlineData(512, 256, 32)]
         public void SpectralMatMul_LargerSizes_VsDirect(int k, int n, int trueRank)

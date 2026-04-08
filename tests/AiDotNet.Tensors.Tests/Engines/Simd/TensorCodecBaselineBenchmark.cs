@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Simd;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -187,14 +188,16 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             double directMs = Measure(() =>
             {
                 Array.Clear(directOut, 0, directOut.Length);
-                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsFullRank, 0, n, directOut, 0, n);
+                if (!BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsFullRank, 0, n, directOut, 0, n))
+                    SimdGemm.Sgemm(inputArr, weightsFullRank, directOut, m, k, n);
             }, warmup, iters);
 
             // === 2. Direct MatMul (BLAS) — low rank (same speed, just different data) ===
             double directLowRankMs = Measure(() =>
             {
                 Array.Clear(directOut, 0, directOut.Length);
-                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsLowRank, 0, n, directOut, 0, n);
+                if (!BlasProvider.TryGemm(m, n, k, inputArr, 0, k, weightsLowRank, 0, n, directOut, 0, n))
+                    SimdGemm.Sgemm(inputArr, weightsLowRank, directOut, m, k, n);
             }, warmup, iters);
 
             // === 3. Phase A: Spectral MatMul — low rank ===

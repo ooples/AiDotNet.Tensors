@@ -645,6 +645,14 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
             for (; i < length; i++)
                 output[i] = MathF.Cosh(input[i]);
+
+            // FastExp256 saturates at ~88.7, producing finite values instead of infinity.
+            // Correct any elements where |input| > 88 using scalar MathF.Cosh.
+            for (int j = 0; j < length; j++)
+            {
+                if (input[j] > 88f || input[j] < -88f)
+                    output[j] = MathF.Cosh(input[j]);
+            }
         }
 
         /// <summary>
@@ -671,6 +679,13 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
             for (; i < length; i++)
                 output[i] = MathF.Sinh(input[i]);
+
+            // FastExp256 saturates at ~88.7 — correct extreme values with scalar fallback
+            for (int j = 0; j < length; j++)
+            {
+                if (input[j] > 88f || input[j] < -88f)
+                    output[j] = MathF.Sinh(input[j]);
+            }
         }
 
         /// <summary>

@@ -61,6 +61,9 @@ internal sealed class BackwardCSEPass<T>
 
             if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, k, false, bArr, 0, k, true, rArr, 0, n))
                 return result;
+
+            // BLAS failed — return the unused rented buffer before falling through
+            AutoTensorCache.Return(result);
         }
 
         // Fallback: use cached transpose
@@ -84,6 +87,9 @@ internal sealed class BackwardCSEPass<T>
 
             if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, m, true, bArr, 0, n, false, rArr, 0, n))
                 return result;
+
+            // BLAS failed — return the unused rented buffer before falling through
+            AutoTensorCache.Return(result);
         }
 
         var aT = GetTranspose(a);

@@ -49,6 +49,10 @@ internal static class AutoTrainingCompiler
         // Only use compiled backward if tape is persistent (entries survive between calls)
         if (!tape.Options.Persistent) return null;
 
+        // Validate current tape pattern matches the compiled plan's pattern
+        long currentHash = ComputePatternHash(tape.Entries, tape.EntryCount);
+        if (!State.MatchesCompiledHash(currentHash)) return null;
+
         return State.TryGetCompiledBackward<T>();
     }
 
@@ -116,6 +120,7 @@ internal sealed class AutoTrainingState
 
     internal bool HasCompiledPlan => _compiledStored;
     internal bool ShouldCompile => _repeatCount >= CompileThreshold && !_compiledStored;
+    internal bool MatchesCompiledHash(long hash) => _compiledStored && hash == _lastStepHash;
 
     internal void RecordStepHash(long hash)
     {

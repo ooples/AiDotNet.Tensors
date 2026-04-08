@@ -57,6 +57,8 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     public int EntryCount => _entries.Count;
 
+    /// <summary>Internal access to tape entries for compiled backward hash validation.</summary>
+    internal TapeEntryArena<T> Entries => _entries;
 
     /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace

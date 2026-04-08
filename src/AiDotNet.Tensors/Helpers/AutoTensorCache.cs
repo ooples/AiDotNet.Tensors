@@ -35,6 +35,9 @@ internal static class AutoTensorCache
     [ThreadStatic]
     private static ConcurrentDictionary<long, ConcurrentQueue<object>>? _pools;
 
+    // Track all thread-local pools so Clear() can flush all threads, not just the caller's
+    private static readonly List<WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>> _allPools = new();
+
     // ═══ Hardware-detected cache hierarchy ═══
     // These are computed once at startup from actual CPU cache sizes.
 
@@ -157,7 +160,13 @@ internal static class AutoTensorCache
         if (!Enabled)
             return TensorAllocator.RentUninitialized<T>(shape);
 
-        var pools = _pools ??= new ConcurrentDictionary<long, ConcurrentQueue<object>>();
+        var pools = _pools;
+        if (pools is null)
+        {
+            pools = new ConcurrentDictionary<long, ConcurrentQueue<object>>();
+            _pools = pools;
+            lock (_allPools) { _allPools.Add(new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools)); }
+        }
         long key = ComputeKey<T>(shape);
 
         if (pools.TryGetValue(key, out var pool) && pool.TryDequeue(out var obj))
@@ -189,7 +198,13 @@ internal static class AutoTensorCache
         if (elements > MaxElementsPerTensor)
             return;
 
-        var pools = _pools ??= new ConcurrentDictionary<long, ConcurrentQueue<object>>();
+        var pools = _pools;
+        if (pools is null)
+        {
+            pools = new ConcurrentDictionary<long, ConcurrentQueue<object>>();
+            _pools = pools;
+            lock (_allPools) { _allPools.Add(new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools)); }
+        }
         long key = ComputeKey<T>(tensor._shape);
         var pool = pools.GetOrAdd(key, _ => new ConcurrentQueue<object>());
 
@@ -198,10 +213,20 @@ internal static class AutoTensorCache
             pool.Enqueue(tensor);
     }
 
-    /// <summary>Clears all cached tensors, releasing memory immediately.</summary>
+    /// <summary>Clears all cached tensors across all threads, releasing memory immediately.</summary>
     internal static void Clear()
     {
         _pools?.Clear();
+        lock (_allPools)
+        {
+            for (int i = _allPools.Count - 1; i >= 0; i--)
+            {
+                if (_allPools[i].TryGetTarget(out var pool))
+                    pool.Clear();
+                else
+                    _allPools.RemoveAt(i); // Remove GC'd references
+            }
+        }
     }
 
     /// <summary>Compute a fast hash key from shape + type.</summary>
