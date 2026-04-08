@@ -35,9 +35,10 @@ internal static class AutoTensorCache
     [ThreadStatic]
     private static ConcurrentDictionary<long, ConcurrentQueue<object>>? _pools;
 
-    // Approximate pool size counters — avoids O(n) ConcurrentQueue.Count
+    // O(1) counters per shape key — avoids O(n) ConcurrentQueue.Count on hot path
+    // Thread-local so no locking needed
     [ThreadStatic]
-    private static ConcurrentDictionary<long, int>? _poolCounters;
+    private static Dictionary<long, int>? _poolCounts;
 
     // Track all thread-local pools so Clear() can flush all threads, not just the caller's
     private static readonly List<WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>> _allPools = new();
@@ -176,12 +177,13 @@ internal static class AutoTensorCache
         if (pools.TryGetValue(key, out var pool) && pool.TryDequeue(out var obj))
         {
             var tensor = (Tensor<T>)obj;
+            // Decrement O(1) counter
+            var counts = _poolCounts;
+            if (counts is not null && counts.TryGetValue(key, out var cnt) && cnt > 0)
+                counts[key] = cnt - 1;
+
             if (ShapesMatch(tensor._shape, shape))
             {
-                // Decrement approximate pool counter
-                var counterKey = key + 0x7f7f7f7f7f7f7f7fL;
-                _poolCounters?.AddOrUpdate(counterKey, 0, (_, c) => Math.Max(0, c - 1));
-
                 // Clear mutable state from previous use to prevent stale metadata
                 tensor.Grad = null;
                 tensor.LazySource = null;
@@ -189,6 +191,8 @@ internal static class AutoTensorCache
                 return tensor;
             }
             pool.Enqueue(obj);
+            if (counts is not null)
+                counts[key] = (counts.TryGetValue(key, out var _cv) ? _cv : 0) + 1;
         }
 
         return TensorAllocator.RentUninitialized<T>(shape);
@@ -217,28 +221,22 @@ internal static class AutoTensorCache
         long key = ComputeKey<T>(tensor._shape);
         var pool = pools.GetOrAdd(key, _ => new ConcurrentQueue<object>());
 
+        // Use O(1) counter instead of O(n) pool.Count
+        var counts = _poolCounts ??= new Dictionary<long, int>();
+        int currentCount = (counts.TryGetValue(key, out var _cv) ? _cv : 0);
         int maxCopies = GetMaxPerShape(elements);
-        if (maxCopies <= 0) return;
-        // Track approximate pool size with Interlocked counter to avoid
-        // O(n) ConcurrentQueue.Count. The counter is approximate under
-        // contention but bounded — worst case is one extra buffer.
-        var counterKey = key + 0x7f7f7f7f7f7f7f7fL; // offset to avoid collision with pool key
-        var counters = _poolCounters;
-        if (counters == null)
+        if (currentCount < maxCopies)
         {
-            counters = new ConcurrentDictionary<long, int>();
-            _poolCounters = counters;
+            pool.Enqueue(tensor);
+            counts[key] = currentCount + 1;
         }
-        int current = counters.GetOrAdd(counterKey, 0);
-        if (current >= maxCopies) return;
-        pool.Enqueue(tensor);
-        counters.AddOrUpdate(counterKey, 1, (_, c) => c + 1);
     }
 
     /// <summary>Clears all cached tensors across all threads, releasing memory immediately.</summary>
     internal static void Clear()
     {
         _pools?.Clear();
+        _poolCounts?.Clear(); // Reset O(1) counters so Return() accepts buffers again
         lock (_allPools)
         {
             for (int i = _allPools.Count - 1; i >= 0; i--)

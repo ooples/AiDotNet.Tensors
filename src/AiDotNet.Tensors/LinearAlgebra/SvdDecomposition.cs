@@ -140,9 +140,16 @@ internal static class SvdDecomposition
                     if (Math.Abs(apq) < 1e-12 * Math.Sqrt(app * aqq))
                         continue;
 
-                    // Compute Jacobi rotation angle
+                    // Compute Jacobi rotation angle.
+                    // When app == aqq, tau = 0 and the standard formula gives t = 0
+                    // (no rotation). For correlated equal-norm columns we must rotate
+                    // by pi/4 to diagonalize the 2x2 block (t = sign(apq) * 1).
                     double tau = (aqq - app) / (2.0 * apq);
-                    double t = Math.Sign(tau) / (Math.Abs(tau) + Math.Sqrt(1.0 + tau * tau));
+                    double t;
+                    if (Math.Abs(tau) < 1e-15)
+                        t = Math.Sign(apq);  // pi/4 rotation
+                    else
+                        t = Math.Sign(tau) / (Math.Abs(tau) + Math.Sqrt(1.0 + tau * tau));
                     double cos = 1.0 / Math.Sqrt(1.0 + t * t);
                     double sin = t * cos;
 
@@ -226,6 +233,11 @@ internal static class SvdDecomposition
         float[] output,
         float[]? workspace = null)
     {
+        if (xCols != factors.OriginalM)
+            throw new ArgumentException(
+                $"Inner dimension mismatch: x has {xCols} columns but spectral factors expect {factors.OriginalM}.",
+                nameof(xCols));
+
         int r = factors.Rank;
         int n = factors.OriginalN;
 

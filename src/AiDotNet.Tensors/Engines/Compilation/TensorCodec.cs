@@ -45,12 +45,9 @@ internal static class TensorCodec
         Action computation,
         TensorCodecOptions? options = null)
     {
-        var opts = options ?? new TensorCodecOptions
-        {
-            EnableDataflowFusion = true,
-            EnableAlgebraicBackward = true,
-            EnableSpectralDecomposition = true
-        };
+        // Use caller-provided options, or default (spectral is opt-in because
+        // it introduces approximation error — docs describe it as opt-in).
+        var opts = options ?? TensorCodecOptions.Default;
 
         var prevOpts = TensorCodecOptions.Current;
         TensorCodecOptions.SetCurrent(opts);
@@ -62,7 +59,7 @@ internal static class TensorCodec
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prevOpts == TensorCodecOptions.Default ? null : prevOpts);
+            TensorCodecOptions.SetCurrent(prevOpts);
         }
     }
 

@@ -64,7 +64,12 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 engine.TensorMatMul(h1, w2);
                 plan = scope.CompileTraining(new[] { w1, w2 });
             }
-            double compiledMs = Measure(() => plan.Step(), warmup, iters);
+            double compiledMs;
+            try
+            {
+                compiledMs = Measure(() => plan.Step(), warmup, iters);
+            }
+            finally { plan.Dispose(); }
 
             // Phase B standalone
             var inputArr = input.GetDataArray();
@@ -119,7 +124,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 engine.TensorAdd(a, b);
                 addPlan = scope.CompileInference<float>();
             }
-            double compiledAddMs = Measure(() => addPlan.Execute(), warmup, iters);
+            double compiledAddMs;
+            try { compiledAddMs = Measure(() => addPlan.Execute(), warmup, iters); }
+            finally { addPlan.Dispose(); }
 
             // Compiled ReLU
             CompiledInferencePlan<float> reluPlan;
@@ -128,7 +135,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
                 engine.ReLU(a);
                 reluPlan = scope.CompileInference<float>();
             }
-            double compiledReluMs = Measure(() => reluPlan.Execute(), warmup, iters);
+            double compiledReluMs;
+            try { compiledReluMs = Measure(() => reluPlan.Execute(), warmup, iters); }
+            finally { reluPlan.Dispose(); }
 
             _output.WriteLine("Elementwise [{0}]:", size);
             _output.WriteLine("  Add:     Eager {0:F4}ms  Compiled {1:F4}ms  ({2:F2}x)",

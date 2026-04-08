@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.Optimization;
 /// operations and replaces them with low-rank approximations via truncated SVD.
 ///
 /// For W[M,N] with fast singular value decay (effective rank r ≪ min(M,N)):
-///   y = x @ W  →  y = (x @ leftFactor[N,r]) @ rightFactor[r,M]
+///   y = x @ W  →  y = (x @ leftFactor[M,r]) @ rightFactor[r,N]
 ///
 /// This reduces FLOP count from O(M*N) to O(M*r + r*N) per sample.
 /// The approximation error is bounded by SpectralErrorTolerance.
@@ -32,7 +32,7 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
 
         for (int i = 0; i < steps.Length; i++)
         {
-            if (steps[i].OpName == "TensorMatMul"
+            if (steps[i].OpType == OpType.TensorMatMul
                 && steps[i].Inputs.Length == 2
                 && steps[i].Inputs[0].Rank == 2
                 && steps[i].Inputs[1].Rank == 2)
@@ -71,10 +71,6 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         var capturedInput = input;
         var capturedFactors = factors.Value;
 
-        // Pre-allocate workspace for spectral matmul (avoids per-call allocation)
-        int xRows = input._shape.Length >= 2 ? input._shape[0] : 1;
-        var workspace = new float[xRows * capturedFactors.Rank];
-
         return new CompiledStep<T>(
             "SpectralMatMul",
             (eng, output) =>
@@ -84,9 +80,11 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
                 int rows = capturedInput._shape.Length >= 2 ? capturedInput._shape[0] : 1;
                 int cols = capturedInput._shape.Length >= 2 ? capturedInput._shape[^1] : capturedInput._shape[0];
 
-                // Reuse workspace across calls
-                if (workspace.Length < rows * capturedFactors.Rank)
-                    workspace = new float[rows * capturedFactors.Rank];
+                // Workspace allocated per call — avoids mutable captured state that
+                // would race if the same plan is executed on multiple threads.
+                // SpectralMatMul reuses the workspace internally across the two GEMMs.
+                int needed = rows * capturedFactors.Rank;
+                var workspace = new float[needed];
 
                 SvdDecomposition.SpectralMatMul(inArr, rows, cols, capturedFactors, outArr, workspace);
             },
