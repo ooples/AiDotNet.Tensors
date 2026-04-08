@@ -1908,9 +1908,12 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         var originalShape = tensor.Shape.ToArray();
         var result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("Reshape", result, tensor, BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
+        AutoTracer.RecordOp("Reshape", result, eng => result);
         return result;
     }
 
@@ -5213,6 +5216,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceSum", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         // Stride-aware: for single-axis reduction on non-contiguous views, use direct stride math
         if (!tensor.IsContiguous && axes != null && axes.Length == 1)
         {
@@ -5815,6 +5820,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("MaxPool2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
         // When tape is active, use WithIndices variant so backward can access max indices
@@ -5824,6 +5831,7 @@ public class CpuEngine : ITensorLevelEngine
             var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
             DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, input, BackwardFunctions<T>.MaxPool2DBackward,
                 new object[] { maxIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
+            AutoTracer.RecordOp("MaxPool2D", resultWithIdx, eng => resultWithIdx);
             return resultWithIdx;
         }
 
@@ -5916,6 +5924,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("AvgPool2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         if (!input.IsContiguous) input = input.Contiguous();
         if (input.Rank != 4)
         {
@@ -5993,6 +6003,7 @@ public class CpuEngine : ITensorLevelEngine
                 for (int idx = 0; idx < bc; idx++) poolKernel(idx);
             DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
                 new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
+            AutoTracer.RecordOp("AvgPool2D", result, eng => result);
             return result;
         }
 
@@ -6034,6 +6045,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("AvgPool2D", result, input, BackwardFunctions<T>.AvgPool2DBackward,
             new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
+        AutoTracer.RecordOp("AvgPool2D", result, eng => result);
         return result;
     }
 
@@ -6066,6 +6078,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Conv1D", input._shape); if (ac is not null) return ac.Execute(); }
+
         // Reshape to 4D: [B, C, 1, L] and [Cout, Cin, 1, K]
         var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
         var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
@@ -6077,6 +6091,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv1DBackward,
             new object[] { stride, padding, dilation });
+        AutoTracer.RecordOp("Conv1D", result, eng => result);
         return result;
     }
 
@@ -7832,6 +7847,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("GLU", input._shape); if (ac is not null) return ac.Execute(); }
+
         int dimSize = input._shape[actualDim];
         if (dimSize % 2 != 0)
             throw new ArgumentException($"Dimension {actualDim} must have even size for GLU, got {dimSize}");
@@ -7875,6 +7892,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(outputShape, new Vector<T>(outputData));
         DifferentiableOps.RecordUnary("GLU", result, input, BackwardFunctions<T>.GLUBackward, new object[] { actualDim });
+        AutoTracer.RecordOp("GLU", result, eng => result);
         return result;
     }
 
@@ -9179,6 +9197,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("DepthwiseConv2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -9238,6 +9258,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var dwConvResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], new Vector<T>(outputData));
         DifferentiableOps.RecordBinary("DepthwiseConv2D", dwConvResult, input, kernel, BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
+        AutoTracer.RecordOp("DepthwiseConv2D", dwConvResult, eng => dwConvResult);
         return dwConvResult;
     }
 
@@ -9418,6 +9439,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ConvTranspose2D", input._shape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -9499,6 +9522,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordBinary("ConvTranspose2D", convTransResult, input, kernel,
             BackwardFunctions<T>.ConvTranspose2DBackward,
             savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+        AutoTracer.RecordOp("ConvTranspose2D", convTransResult, eng => convTransResult);
         return convTransResult;
     }
 
@@ -10710,6 +10734,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Conv3D", input._shape); if (ac is not null) return ac.Execute(); }
+
         int strideD = stride[0], strideH = stride[1], strideW = stride[2];
         int padD = padding[0], padH = padding[1], padW = padding[2];
         int dilationD = dilation[0], dilationH = dilation[1], dilationW = dilation[2];
@@ -10795,6 +10821,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordBinary("Conv3D", result, input, kernel, BackwardFunctions<T>.Conv3DBackward,
             new object[] { stride, padding, dilation });
+        AutoTracer.RecordOp("Conv3D", result, eng => result);
         return result;
     }
 
@@ -11288,6 +11315,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("AvgPool3D", input._shape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -11360,6 +11389,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("AvgPool3D", result, input, BackwardFunctions<T>.AvgPool3DBackward, new object[] { poolSize, stride, padding });
+        AutoTracer.RecordOp("AvgPool3D", result, eng => result);
         return result;
     }
 
@@ -13081,6 +13111,7 @@ public class CpuEngine : ITensorLevelEngine
             var result4D = BatchNorm4D(workingInput, gamma, beta, eps, numOps, out mean, out variance);
             var r4 = was1D ? result4D.Reshape([result4D._shape[1]]) : result4D;
             DifferentiableOps.RecordIfActive("BatchNorm", r4, new[] { input, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            AutoTracer.RecordOp("BatchNorm", r4, eng => r4);
             return r4;
         }
 
@@ -13937,6 +13968,7 @@ public class CpuEngine : ITensorLevelEngine
         var lnResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
         DifferentiableOps.RecordIfActive("LayerNorm", lnResult, new[] { input, gamma, beta },
             BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+        AutoTracer.RecordOp("LayerNorm", lnResult, eng => lnResult);
         return lnResult;
     }
 
@@ -14097,6 +14129,7 @@ public class CpuEngine : ITensorLevelEngine
             }
             DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { input, gamma, beta },
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
+            AutoTracer.RecordOp("GroupNorm", result, eng => result);
             return result;
         }
 
@@ -14364,6 +14397,7 @@ public class CpuEngine : ITensorLevelEngine
         var rmsResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(outputData));
         DifferentiableOps.RecordIfActive("RMSNorm", rmsResult, new[] { input, gamma },
             BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
+        AutoTracer.RecordOp("RMSNorm", rmsResult, eng => rmsResult);
         return rmsResult;
     }
 
@@ -16612,6 +16646,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceMean", input._shape); if (ac is not null) return ac.Execute(); }
+
         // Stride-aware single-axis mean
         if (!input.IsContiguous && axes.Length == 1)
         {
@@ -16634,6 +16670,7 @@ public class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordUnary("ReduceMean", earlyResult, input,
                 BackwardFunctions<T>.ReduceMeanBackward,
                 savedState: new object[] { new[] { axis } });
+            AutoTracer.RecordOp("ReduceMean", earlyResult, eng => earlyResult);
             return earlyResult;
         }
         // Fast path: reduce all axes (axes == null) — just sum/count
@@ -16652,6 +16689,7 @@ public class CpuEngine : ITensorLevelEngine
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
                         savedState: new object[] { Enumerable.Range(0, input.Rank).ToArray() });
+                    AutoTracer.RecordOp("ReduceMean", scalarResult, eng => scalarResult);
                     return scalarResult;
                 }
             }
@@ -16727,6 +16765,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("ReduceMean", result, input,
             BackwardFunctions<T>.ReduceMeanBackward,
             savedState: new object[] { normalizedAxes.ToArray() });
+        AutoTracer.RecordOp("ReduceMean", result, eng => result);
         return result;
     }
 
@@ -17250,6 +17289,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Upsample", input._shape); if (ac is not null) return ac.Execute(); }
+
         // Industry-standard: last two dimensions are height and width
         int heightIdx = shape.Length - 2;
         int widthIdx = shape.Length - 1;
@@ -17297,6 +17338,7 @@ public class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordUnary("Upsample", upsampleResult, input,
             BackwardFunctions<T>.UpsampleBackward,
             savedState: new object[] { scaleH, scaleW });
+        AutoTracer.RecordOp("Upsample", upsampleResult, eng => upsampleResult);
         return upsampleResult;
     }
 
@@ -17507,6 +17549,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("GridSample", input._shape); if (ac is not null) return ac.Execute(); }
+
         if (input._shape.Length != 4)
             throw new ArgumentException("GridSample expects input shape [batch, height, width, channels]");
         if (grid._shape.Length != 4 || grid._shape[3] != 2)
@@ -17573,6 +17617,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordBinary("GridSample", output, input, grid, BackwardFunctions<T>.GridSampleBackward);
+        AutoTracer.RecordOp("GridSample", output, eng => output);
         return output;
     }
 
@@ -17600,6 +17645,8 @@ public class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.Unfold(ci, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
             }
         }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Unfold", input._shape); if (ac is not null) return ac.Execute(); }
+
         if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
         if (padding == null || padding.Length < 2) throw new ArgumentException("padding must have at least 2 elements.", nameof(padding));
@@ -17665,6 +17712,7 @@ public class CpuEngine : ITensorLevelEngine
         if (GradientTape<T>.Current is not null)
             DifferentiableOps.RecordUnary("Unfold", result, originalUnfoldInput, BackwardFunctions<T>.UnfoldBackward,
                 new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
+        AutoTracer.RecordOp("Unfold", result, eng => result);
         return result;
     }
 
@@ -17690,6 +17738,8 @@ public class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.Fold(ci, co, ck, cs, cp); r.AsSpan().CopyTo(output.AsWritableSpan()); });
             }
         }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Fold", input._shape); if (ac is not null) return ac.Execute(); }
+
         if (outputSize == null || outputSize.Length < 2) throw new ArgumentException("outputSize must have at least 2 elements.", nameof(outputSize));
         if (kernelSize == null || kernelSize.Length < 2) throw new ArgumentException("kernelSize must have at least 2 elements.", nameof(kernelSize));
         if (stride == null || stride.Length < 2) throw new ArgumentException("stride must have at least 2 elements.", nameof(stride));
@@ -17762,6 +17812,7 @@ public class CpuEngine : ITensorLevelEngine
         if (GradientTape<T>.Current is not null)
             DifferentiableOps.RecordUnary("Fold", result, originalFoldInput, BackwardFunctions<T>.FoldBackward,
                 new object[] { (int[])kernelSize.Clone(), (int[])stride.Clone(), (int[])padding.Clone() });
+        AutoTracer.RecordOp("Fold", result, eng => result);
         return result;
     }
 
@@ -18497,6 +18548,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Tile", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         // Calculate output shape
         var outputShape = new int[tensor._shape.Length];
         for (int i = 0; i < tensor._shape.Length; i++)
@@ -18544,6 +18597,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("Tile", result, tensor,
             BackwardFunctions<T>.TileBackward);
+        AutoTracer.RecordOp("Tile", result, eng => result);
         return result;
     }
 
@@ -18571,6 +18625,8 @@ public class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.SliceBackward, new object[] { capStart });
             }
         }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSlice", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         // Validate bounds
         for (int i = 0; i < tensor._shape.Length; i++)
@@ -18605,6 +18661,7 @@ public class CpuEngine : ITensorLevelEngine
         });
 
         DifferentiableOps.RecordUnary("TensorSlice", result, tensor, BackwardFunctions<T>.SliceBackward, new object[] { start });
+        AutoTracer.RecordOp("TensorSlice", result, eng => result);
         return result;
     }
 
@@ -18812,9 +18869,12 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPermute", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         // Use tensor's built-in Transpose method
         var result = tensor.Transpose(axes);
         DifferentiableOps.RecordUnary("TensorPermute", result, tensor, BackwardFunctions<T>.PermuteBackward, new object[] { axes });
+        AutoTracer.RecordOp("TensorPermute", result, eng => result);
         return result;
     }
 
@@ -18847,6 +18907,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorExpandDims", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         // Build new shape with 1 inserted at axis
         var newShape = new int[rank + 1];
         for (int i = 0; i < axis; i++)
@@ -18857,6 +18919,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var result = tensor.Reshape(newShape);
         DifferentiableOps.RecordUnary("TensorExpandDims", result, tensor, BackwardFunctions<T>.ExpandDimsBackward, new object[] { axis });
+        AutoTracer.RecordOp("TensorExpandDims", result, eng => result);
         return result;
     }
 
@@ -18882,6 +18945,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSqueeze", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         var shape = tensor._shape.ToList();
 
         if (axis == -1)
@@ -18904,6 +18969,7 @@ public class CpuEngine : ITensorLevelEngine
 
         var squeezeResult = tensor.Reshape(shape.ToArray());
         DifferentiableOps.RecordUnary("TensorSqueeze", squeezeResult, tensor, BackwardFunctions<T>.SqueezeBackward, new object[] { axis });
+        AutoTracer.RecordOp("TensorSqueeze", squeezeResult, eng => squeezeResult);
         return squeezeResult;
     }
 
@@ -18971,6 +19037,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Simple 1D gather for embedding lookups
@@ -18993,6 +19061,7 @@ public class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorGather", result, source, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
+            AutoTracer.RecordOp("TensorGather", result, eng => result);
             return result;
         }
         else
@@ -20139,6 +20208,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSliceAxis", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         int dim0 = tensor._shape[0];
         int dim1 = tensor._shape[1];
         int dim2 = tensor._shape[2];
@@ -20184,6 +20255,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("TensorSliceAxis", result, tensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
+        AutoTracer.RecordOp("TensorSliceAxis", result, eng => result);
         return result;
     }
 
@@ -20587,6 +20659,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorIndexSelect", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         // For 2D tensor with axis=0: select rows
         if (tensor.Rank == 2 && axis == 0)
         {
@@ -20605,6 +20679,7 @@ public class CpuEngine : ITensorLevelEngine
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
                 BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => result);
             return result;
         }
         else if (tensor.Rank == 2 && axis == 1)
@@ -20628,6 +20703,7 @@ public class CpuEngine : ITensorLevelEngine
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
                 BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => result);
             return result;
         }
         else
@@ -20784,6 +20860,8 @@ public class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
             }
         }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         if (mask == null) throw new ArgumentNullException(nameof(mask));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -20799,6 +20877,7 @@ public class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("TensorMaskedFill", result, tensor,
             BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
+        AutoTracer.RecordOp("TensorMaskedFill", result, eng => result);
         return result;
     }
 
@@ -21386,6 +21465,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Gather", input._shape); if (ac is not null) return ac.Execute(); }
+
         // Output shape: input.Shape with axis dimension replaced by indices.Length
         var outputShape = new int[input._shape.Length];
         for (int i = 0; i < input._shape.Length; i++)
@@ -21419,6 +21500,7 @@ public class CpuEngine : ITensorLevelEngine
         }
 
         DifferentiableOps.RecordUnary("Gather", result, input, BackwardFunctions<T>.GatherBackward, new object[] { indices, axis });
+        AutoTracer.RecordOp("Gather", result, eng => result);
         return result;
     }
 
@@ -23927,6 +24009,7 @@ public class CpuEngine : ITensorLevelEngine
         var inResult = TensorAllocator.Rent<T>(input._shape, new Vector<T>(resultData));
         DifferentiableOps.RecordIfActive("InstanceNorm", inResult, new[] { input, gamma, beta },
             BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
+        AutoTracer.RecordOp("InstanceNorm", inResult, eng => inResult);
         return inResult;
     }
 
@@ -24120,6 +24203,8 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Embedding", indices._shape); if (ac is not null) return ac.Execute(); }
+
         if (!embeddingTable.IsContiguous) embeddingTable = embeddingTable.Contiguous();
         if (!indices.IsContiguous) indices = indices.Contiguous();
         int vocabSize = embeddingTable._shape[0];
@@ -24149,6 +24234,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         DifferentiableOps.RecordUnary("Embedding", embResult, embeddingTable, BackwardFunctions<T>.EmbeddingBackward,
             new object[] { indices, vocabSize, embeddingDim });
+        AutoTracer.RecordOp("Embedding", embResult, eng => embResult);
         return embResult;
     }
 
@@ -25536,8 +25622,11 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Flatten", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         var result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
+        AutoTracer.RecordOp("Flatten", result, eng => result);
         return result;
     }
 
@@ -25559,9 +25648,12 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Narrow", tensor._shape); if (ac is not null) return ac.Execute(); }
+
         var result = tensor.Slice(dim, start, start + length);
         DifferentiableOps.RecordUnary("Narrow", result, tensor, BackwardFunctions<T>.NarrowBackward,
             savedState: new object[] { dim, start, length });
+        AutoTracer.RecordOp("Narrow", result, eng => result);
         return result;
     }
 
@@ -25595,6 +25687,8 @@ public class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.ConstantPadBackward, new object[] { capPadding });
             }
         }
+
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ConstantPad", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = tensor.Rank;
@@ -25636,6 +25730,7 @@ public class CpuEngine : ITensorLevelEngine
         }
         DifferentiableOps.RecordUnary("ConstantPad", result, tensor, BackwardFunctions<T>.ConstantPadBackward,
             savedState: new object[] { padding });
+        AutoTracer.RecordOp("ConstantPad", result, eng => result);
         return result;
     }
 
@@ -26040,12 +26135,15 @@ public class CpuEngine : ITensorLevelEngine
             }
         }
 
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("Where", x._shape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(x.Shape.ToArray());
         for (int i = 0; i < x.Length; i++)
             result[i] = condition[i] ? x[i] : y[i];
         DifferentiableOps.RecordBinary("Where", result, x, y,
             BackwardFunctions<T>.WhereBackward, savedState: new object[] { condition });
+        AutoTracer.RecordOp("Where", result, eng => result);
         return result;
     }
 
