@@ -88,15 +88,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Action? _optimizerUpdate;
     private int _optimizerStep;
 
+    // Gradient checkpointing (Phase 5.3)
+    private GradientCheckpointing<T>? _checkpointing;
+
+    /// <summary>
+    /// Enables gradient checkpointing for this plan, reducing memory from O(N) to O(sqrt(N))
+    /// at the cost of ~33% more compute (each segment's forward runs twice).
+    /// Call once after compilation, before training loop.
+    /// </summary>
+    /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
+    public void EnableCheckpointing(int segmentSize = 0)
+    {
+        // Convert forward actions back to steps for checkpointing
+        // (checkpointing wraps the forward step array)
+        _checkpointing = new GradientCheckpointing<T>(
+            _forwardActions.Select((a, i) =>
+            {
+                // Wrap each Action<IEngine> as a CompiledStep with a placeholder output
+                var output = i < _parameters.Length ? _parameters[i] : _lossOutput;
+                return new CompiledStep<T>("Checkpoint", (eng, o) => a(eng), output,
+                    Array.Empty<Tensor<T>>(), null, null);
+            }).ToArray(),
+            _engine, segmentSize);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
         var engine = _engine;
 
-        // Forward: straight-line delegate calls (specialized: direct BLAS, no engine dispatch)
-        var fwd = _forwardActions;
-        for (int i = 0; i < fwd.Length; i++)
-            fwd[i](engine);
+        // Forward: use checkpointing if enabled, otherwise straight-line delegates
+        if (_checkpointing is not null)
+        {
+            _checkpointing.ForwardWithCheckpoints();
+        }
+        else
+        {
+            var fwd = _forwardActions;
+            for (int i = 0; i < fwd.Length; i++)
+                fwd[i](engine);
+        }
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
