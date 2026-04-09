@@ -94,6 +94,16 @@ public sealed partial class VulkanBackend
     public void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int ais, int bis) => GlslBinaryOp(VulkanGlslKernels.ConcatAxisGlsl, a, b, o, os * (ais + bis), new uint[] { (uint)os, (uint)ais, (uint)bis }, 3 * sizeof(uint));
     public void SliceLastAxis(IGpuBuffer i, IGpuBuffer o, int os, int iis, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SliceLastAxisGlsl, i, o, os * ss, new uint[] { (uint)os, (uint)iis, (uint)st, (uint)ss }, 4 * sizeof(uint));
     public void SetSliceLastAxis(IGpuBuffer o, IGpuBuffer v, int os, int ois, int st, int ss) => GlslUnaryOp(VulkanGlslKernels.SetSliceLastAxisGlsl, v, o, os * ss, new uint[] { (uint)os, (uint)ois, (uint)st, (uint)ss }, 4 * sizeof(uint));
+    public void SliceAxis(IGpuBuffer i, IGpuBuffer o, int os, int axSz, int stride, int idx)
+    {
+        if (stride == 1) { SliceLastAxis(i, o, os, axSz, idx, 1); return; }
+        GlslUnaryOp(VulkanGlslKernels.SliceAxisGlsl, i, o, os * stride, new uint[] { (uint)os, (uint)axSz, (uint)stride, (uint)idx }, 4 * sizeof(uint));
+    }
+    public void SetSliceAxis(IGpuBuffer o, IGpuBuffer v, int os, int axSz, int stride, int idx)
+    {
+        if (stride == 1) { SetSliceLastAxis(o, v, os, axSz, idx, 1); return; }
+        GlslUnaryOp(VulkanGlslKernels.SetSliceAxisGlsl, v, o, os * stride, new uint[] { (uint)os, (uint)axSz, (uint)stride, (uint)idx }, 4 * sizeof(uint));
+    }
     public void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.Stack2Glsl, a, b, o, sz * 2, sizeof(uint));
     public void Pad2D(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl, float pv) => GlslUnaryOp(VulkanGlslKernels.Pad2DGlsl, i, o, ba * ch * oh * ow, 8 * sizeof(uint));
     public void Pad2DBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int oh, int ow, int pt, int pl) => GlslUnaryOp(VulkanGlslKernels.Pad2DBackwardGlsl, go, gi, ba * ch * ih * iw, 8 * sizeof(uint));

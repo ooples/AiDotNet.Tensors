@@ -14214,9 +14214,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis==tensor.Rank-1)
-        { try { int outerSize=1; for(int i=0;i<axis;i++)outerSize*=tensor.Shape._dims[i]; int inputInner=tensor.Shape._dims[axis]; var gi=UploadTensorRaw(bb, tensor); var go=bb.AllocateBuffer(outerSize); bb.SliceLastAxis(gi,go,outerSize,inputInner,index,1); int[] outShape=new int[tensor.Rank-1]; for(int i=0,j=0;i<tensor.Rank;i++) if(i!=axis) outShape[j++]=tensor.Shape._dims[i]; return DeferTensorResult<T>(bb,go,outerSize,outShape); } catch{} }
-        return base.TensorSliceAxis(tensor,axis,index);
+        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb) && axis >= 0 && axis < tensor.Rank)
+        {
+            try
+            {
+                int outerSize = 1;
+                for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
+                int axisSize = tensor.Shape._dims[axis];
+                int stride = 1;
+                for (int i = axis + 1; i < tensor.Rank; i++) stride *= tensor.Shape._dims[i];
+                int outputElements = outerSize * stride;
+                var gi = UploadTensorRaw(bb, tensor);
+                var go = bb.AllocateBuffer(outputElements);
+                bb.SliceAxis(gi, go, outerSize, axisSize, stride, index);
+                int[] outShape = new int[tensor.Rank - 1];
+                for (int i = 0, j = 0; i < tensor.Rank; i++)
+                    if (i != axis) outShape[j++] = tensor.Shape._dims[i];
+                return DeferTensorResult<T>(bb, go, outputElements, outShape);
+            }
+            catch { }
+        }
+        return base.TensorSliceAxis(tensor, axis, index);
     }
 
     Tensor<T> IEngine.TensorStack<T>(Tensor<T>[] tensors, int axis)

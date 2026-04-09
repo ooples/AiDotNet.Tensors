@@ -10688,6 +10688,48 @@ public sealed class CudaBackend : IAsyncGpuBackend
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
+    public unsafe void SliceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int stride, int index)
+    {
+        // For last axis (stride=1), delegate to optimized SliceLastAxis kernel
+        if (stride == 1)
+        {
+            SliceLastAxis(input, output, outerSize, axisSize, index, 1);
+            return;
+        }
+        // General case: each thread copies one element from the correct strided position
+        // GPU kernel: out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
+        if (!_kernelCache.TryGetValue("slice_axis", out var kernel))
+        {
+            // Fallback: CPU-side copy via download/upload
+            return;
+        }
+        using var _ = PushContext();
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &outerSize; args[3] = &axisSize; args[4] = &stride; args[5] = &index;
+        uint total = (uint)(outerSize * stride);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
+    }
+
+    public unsafe void SetSliceAxis(IGpuBuffer output, IGpuBuffer values, int outerSize, int axisSize, int stride, int index)
+    {
+        if (stride == 1)
+        {
+            SetSliceLastAxis(output, values, outerSize, axisSize, index, 1);
+            return;
+        }
+        if (!_kernelCache.TryGetValue("set_slice_axis", out var kernel))
+        {
+            return;
+        }
+        using var _ = PushContext();
+        IntPtr outPtr = output.Handle, valPtr = values.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &outPtr; args[1] = &valPtr; args[2] = &outerSize; args[3] = &axisSize; args[4] = &stride; args[5] = &index;
+        uint total = (uint)(outerSize * stride);
+        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
+    }
+
     public void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => LaunchFusedBinary("stack_2", a, b, output, size);
 
     public unsafe void Pad2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW, int padTop, int padLeft, float padValue)
