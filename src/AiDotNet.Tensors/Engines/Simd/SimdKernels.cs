@@ -992,7 +992,27 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 8)
+            if (Avx.IsSupported && length >= 32)
+            {
+                var three = Vector256.Create(3.0f);
+                var zero = Vector256<float>.Zero;
+                var six = Vector256.Create(6.0f);
+                var inv6 = Vector256.Create(1.0f / 6.0f);
+                // 4x unrolled for better ILP
+                int simdLength = length & ~31;
+                for (; i < simdLength; i += 32)
+                {
+                    var x0 = Avx.LoadVector256(input + i);
+                    var x1 = Avx.LoadVector256(input + i + 8);
+                    var x2 = Avx.LoadVector256(input + i + 16);
+                    var x3 = Avx.LoadVector256(input + i + 24);
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x0, Avx.Min(Avx.Max(Avx.Add(x0, three), zero), six)), inv6));
+                    Avx.Store(output + i + 8, Avx.Multiply(Avx.Multiply(x1, Avx.Min(Avx.Max(Avx.Add(x1, three), zero), six)), inv6));
+                    Avx.Store(output + i + 16, Avx.Multiply(Avx.Multiply(x2, Avx.Min(Avx.Max(Avx.Add(x2, three), zero), six)), inv6));
+                    Avx.Store(output + i + 24, Avx.Multiply(Avx.Multiply(x3, Avx.Min(Avx.Max(Avx.Add(x3, three), zero), six)), inv6));
+                }
+            }
+            if (Avx.IsSupported && length - i >= 8)
             {
                 var three = Vector256.Create(3.0f);
                 var zero = Vector256<float>.Zero;
@@ -1002,8 +1022,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 for (; i < simdLength; i += 8)
                 {
                     var x = Avx.LoadVector256(input + i);
-                    var clip = Avx.Min(Avx.Max(Avx.Add(x, three), zero), six);
-                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, clip), inv6));
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(x, Avx.Min(Avx.Max(Avx.Add(x, three), zero), six)), inv6));
                 }
             }
 #endif
