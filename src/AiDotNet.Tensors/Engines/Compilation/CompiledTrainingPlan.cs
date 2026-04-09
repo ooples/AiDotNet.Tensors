@@ -783,7 +783,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     float* pIn = (float*)inHandle.AddrOfPinnedObject();
                     float* pOut = (float*)outHandle.AddrOfPinnedObject();
-                    SimdKernels.GELUUnsafe(pIn, pOut, len);
+                    SimdKernels.FusedGELUUnsafe(pIn, pOut, len);
                 }
             };
         }
