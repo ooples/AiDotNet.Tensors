@@ -626,6 +626,10 @@ internal static class OneDnnProvider
         IntPtr attr);
 
     // Pooling forward primitive descriptor
+    // oneDNN 3.x: dnnl_pooling_forward_primitive_desc_create(
+    //   primitive_desc, engine, prop_kind, algorithm,
+    //   src_desc, dst_desc,
+    //   strides, kernel, dilation, padding_l, padding_r, attr)
     [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
     private static extern unsafe int dnnl_pooling_forward_primitive_desc_create(
         out IntPtr primitiveDesc,
@@ -634,11 +638,11 @@ internal static class OneDnnProvider
         int algorithm,
         IntPtr srcDesc,
         IntPtr dstDesc,
-        IntPtr kernelDesc,   // int64[] kernel sizes
-        IntPtr stridesDesc,  // int64[] strides
-        IntPtr dilationDesc, // int64[] dilations (0 = no dilation)
-        IntPtr padLDesc,     // int64[] padding left
-        IntPtr padRDesc,     // int64[] padding right
+        IntPtr strides,     // int64[] strides
+        IntPtr kernel,      // int64[] kernel sizes
+        IntPtr dilation,    // int64[] dilations (0 = no dilation)
+        IntPtr padL,        // int64[] padding left
+        IntPtr padR,        // int64[] padding right
         IntPtr attr);
 
     // Batch normalization forward primitive descriptor
@@ -1763,21 +1767,31 @@ internal static class OneDnnProvider
                 (IntPtr)padding, (IntPtr)padding,
                 IntPtr.Zero);
 
-            dnnl_memory_desc_destroy(srcDesc);
-            dnnl_memory_desc_destroy(dstDesc);
+            if (rc != 0)
+            {
+                dnnl_memory_desc_destroy(srcDesc);
+                dnnl_memory_desc_destroy(dstDesc);
+                return false;
+            }
 
-            if (rc != 0) return false;
-
-            // Create primitive and execute
+            // Create primitive
             rc = dnnl_primitive_create(out var prim, primDesc);
             dnnl_primitive_desc_destroy(primDesc);
-            if (rc != 0) return false;
+            if (rc != 0)
+            {
+                dnnl_memory_desc_destroy(srcDesc);
+                dnnl_memory_desc_destroy(dstDesc);
+                return false;
+            }
 
-            // Create memory objects
-            var queryMd = dnnl_primitive_desc_query_md(primDesc, 14 /*query_src_md*/, 0);
+            // Create memory objects (must happen BEFORE destroying descriptors)
             IntPtr srcMem, dstMem;
             dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
             dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+
+            // Now safe to destroy descriptors
+            dnnl_memory_desc_destroy(srcDesc);
+            dnnl_memory_desc_destroy(dstDesc);
 
             // Execute
             DnnlExecArg* args = stackalloc DnnlExecArg[2];
@@ -1828,16 +1842,23 @@ internal static class OneDnnProvider
                 out var primDesc, _engine, 1 /*forward_inference*/,
                 srcDesc, dstDesc, epsilon, flags, IntPtr.Zero);
 
-            dnnl_memory_desc_destroy(srcDesc);
-            dnnl_memory_desc_destroy(dstDesc);
-
-            if (rc != 0) return false;
+            if (rc != 0)
+            {
+                dnnl_memory_desc_destroy(srcDesc);
+                dnnl_memory_desc_destroy(dstDesc);
+                return false;
+            }
 
             rc = dnnl_primitive_create(out var prim, primDesc);
             dnnl_primitive_desc_destroy(primDesc);
-            if (rc != 0) return false;
+            if (rc != 0)
+            {
+                dnnl_memory_desc_destroy(srcDesc);
+                dnnl_memory_desc_destroy(dstDesc);
+                return false;
+            }
 
-            // Create memory objects for src, dst, mean, variance, scale, shift
+            // Create memory objects BEFORE destroying descriptors
             long* cDims = stackalloc long[] { channels };
             IntPtr scaleDesc;
             dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, 1, null);
@@ -1845,6 +1866,10 @@ internal static class OneDnnProvider
             IntPtr srcMem, dstMem, meanMem, varMem, scaleMem, shiftMem;
             dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
             dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+
+            // Now safe to destroy 4D descriptors
+            dnnl_memory_desc_destroy(srcDesc);
+            dnnl_memory_desc_destroy(dstDesc);
             dnnl_memory_create(out meanMem, scaleDesc, _engine, (IntPtr)runningMean);
             dnnl_memory_create(out varMem, scaleDesc, _engine, (IntPtr)runningVar);
             dnnl_memory_create(out scaleMem, scaleDesc, _engine, (IntPtr)gamma);

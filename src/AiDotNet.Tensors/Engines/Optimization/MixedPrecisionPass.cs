@@ -51,37 +51,62 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
                 && steps[i].Inputs[0].IsContiguous)
             {
                 var capturedStep = steps[i];
-                // Pre-allocate Half shadow buffers at compile time
+                // Pre-allocate backup + Half buffers per input at compile time.
+                // Strategy: save original fp32 values → write quantized values → execute → restore.
+                // This is safe because restore happens before any other step reads the tensor.
+                var backupBuffers = new float[capturedStep.Inputs.Length][];
                 var halfBuffers = new Half[capturedStep.Inputs.Length][];
                 for (int j = 0; j < capturedStep.Inputs.Length; j++)
-                    halfBuffers[j] = new Half[capturedStep.Inputs[j].Length];
+                {
+                    int len = capturedStep.Inputs[j].Length;
+                    backupBuffers[j] = new float[len];
+                    halfBuffers[j] = new Half[len];
+                }
 
                 result[i] = new CompiledStep<T>(
-                    steps[i].OpName, // Keep original OpName for OpType parsing
+                    steps[i].OpName,
                     (eng, output) =>
                     {
-                        // Quantize: fp32 → fp16 → fp32 round-trip on inputs
-                        // This simulates the bandwidth reduction of Half-precision reads
+                        // Save originals, quantize inputs to Half precision
                         for (int j = 0; j < capturedStep.Inputs.Length; j++)
                         {
                             var inp = capturedStep.Inputs[j];
                             if (inp.IsContiguous && inp is Tensor<float> floatInp)
                             {
                                 var src = floatInp.Data.Span;
+                                var backup = backupBuffers[j];
                                 var halfBuf = halfBuffers[j];
-                                for (int k = 0; k < src.Length && k < halfBuf.Length; k++)
+                                int len = Math.Min(src.Length, backup.Length);
+                                // Save original values
+                                for (int k = 0; k < len; k++)
+                                    backup[k] = src[k];
+                                // Quantize in-place
+                                for (int k = 0; k < len; k++)
+                                {
                                     halfBuf[k] = (Half)src[k];
-                                // Write quantized values back (simulates reading from fp16 memory)
-                                for (int k = 0; k < src.Length && k < halfBuf.Length; k++)
                                     src[k] = (float)halfBuf[k];
+                                }
                             }
                         }
-                        // Execute with rounded inputs
+                        // Execute with quantized inputs
                         capturedStep.Execute(eng, output);
+                        // Restore original fp32 values (critical for backward pass)
+                        for (int j = 0; j < capturedStep.Inputs.Length; j++)
+                        {
+                            var inp = capturedStep.Inputs[j];
+                            if (inp.IsContiguous && inp is Tensor<float> floatInp)
+                            {
+                                var src = floatInp.Data.Span;
+                                var backup = backupBuffers[j];
+                                int len = Math.Min(src.Length, backup.Length);
+                                for (int k = 0; k < len; k++)
+                                    src[k] = backup[k];
+                            }
+                        }
                     },
                     steps[i].OutputBuffer,
                     steps[i].Inputs,
-                    null, // Backward stays in fp32 (no backward through quantization)
+                    steps[i].BackwardFn, // Backward uses restored fp32 inputs
                     steps[i].SavedState);
                 anyOptimized = true;
             }
