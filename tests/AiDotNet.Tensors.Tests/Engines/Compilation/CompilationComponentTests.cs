@@ -454,7 +454,63 @@ public class CompilationComponentTests
 
     #region End-to-End Integration Tests
 
-    [Fact(Skip = "NRE in TryBuildSpecializedForward — pinned GCHandle bug when compiling TensorMultiply(x,x)")]
+    [Fact]
+    public void CompiledTraining_SimpleMatMulReduceSum_Works()
+    {
+        // Minimal: MatMul → ReduceSum — no TensorMultiply
+        var engine = new CpuEngine();
+        var input = CreateRandom(new[] { 4, 4 }, 42);
+        var w = CreateRandom(new[] { 4, 4 }, 43);
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w);
+            engine.ReduceSum(h, null);
+            plan = scope.CompileTraining(new[] { w });
+        }
+
+        try
+        {
+            var loss = plan.Step();
+            Assert.True(loss.Length == 1, $"Loss should be scalar, got length {loss.Length}");
+            Assert.NotNull(plan.Gradients);
+            Assert.True(plan.Gradients.Length == 1, "Should have 1 gradient tensor");
+
+            // Second step should produce same loss (no weight updates)
+            var loss2 = plan.Step();
+            Assert.True(MathF.Abs(loss.GetFlat(0) - loss2.GetFlat(0)) < 1e-4f,
+                "Consistent loss without weight updates");
+        }
+        finally { plan.Dispose(); }
+    }
+
+    [Fact]
+    public void CompiledTraining_MatMulMultiplyReduceSum_Works()
+    {
+        // MatMul → TensorMultiply(x,x) → ReduceSum — tests the TensorMultiply specialization
+        var engine = new CpuEngine();
+        var input = CreateRandom(new[] { 4, 4 }, 42);
+        var w = CreateRandom(new[] { 4, 4 }, 43);
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w);
+            var sq = engine.TensorMultiply(h, h);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { w });
+        }
+
+        try
+        {
+            var loss = plan.Step();
+            Assert.True(loss.Length == 1, $"Loss should be scalar, got length {loss.Length}");
+        }
+        finally { plan.Dispose(); }
+    }
+
+    [Fact]
     public void CompiledTraining_ProducesGradientsAndLossDecreases()
     {
         // End-to-end: compile a 2-layer MLP, train for 20 steps,
@@ -502,16 +558,6 @@ public class CompilationComponentTests
         }
 
         // Compiled training: GraphMode → compile → Step()
-        // Disable optimization passes to test base compilation without SIMD specialization
-        var opts = TensorCodecOptions.Default;
-        opts.EnableDataflowFusion = false;
-        opts.EnableSpectralDecomposition = false;
-        opts.EnablePointwiseFusion = false;
-        opts.EnableConstantFolding = false;
-        opts.EnableForwardCSE = false;
-        opts.EnableBlasBatch = false;
-        TensorCodecOptions.SetCurrent(opts);
-
         CompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.Enable())
         {
