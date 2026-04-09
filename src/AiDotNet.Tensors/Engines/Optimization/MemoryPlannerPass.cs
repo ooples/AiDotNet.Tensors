@@ -4,28 +4,21 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Optimization;
 
 /// <summary>
-/// Phase 5.1: Tensor lifetime analysis and buffer reuse for compiled plans.
+/// Phase 5.1: Tensor lifetime analysis and buffer reuse for compiled inference plans.
 ///
 /// Analyzes the dataflow graph to determine when each intermediate tensor's buffer
 /// is last consumed. Buffers whose lifetime has ended can be reused by later ops,
 /// reducing peak memory allocation.
 ///
-/// Example: In a 10-layer MLP, layer 3's activation is consumed by layer 4's backward.
-/// After layer 4's backward runs, layer 3's buffer can be reused for layer 7's activation.
-///
-/// This pass runs AFTER other optimization passes and modifies buffer assignments
-/// without changing the computation graph structure.
+/// IMPORTANT: Only safe for inference plans (no backward pass). Training plans
+/// need all intermediate tensors alive for backward, so this pass must not be
+/// applied to CompiledTrainingPlan.
 /// </summary>
 internal sealed class MemoryPlannerPass : ICpuOptimizationPass
 {
     public string Name => "MemoryPlanner";
 
-    /// <summary>
-    /// Disabled until downstream input reference rewriting is implemented.
-    /// The current implementation replaces output buffers but doesn't update
-    /// later steps that reference those outputs as inputs, causing stale reads.
-    /// </summary>
-    public bool IsEnabled => false;
+    public bool IsEnabled => true;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
@@ -34,39 +27,97 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
         // Phase 1: Compute last-use index for each tensor
         var lastUse = ComputeLastUseIndices(steps);
 
-        // Phase 2: Analyze potential savings (for diagnostics only until rewriting is done)
-        int reusableBuffers = 0;
-        long savedBytes = 0;
+        // Phase 2: Build pool of reusable buffers and rewrite references.
+        // Key insight: when we reuse buffer A for step j's output, ALL subsequent
+        // steps that reference step j's output as an input must be updated to
+        // point at buffer A instead.
+        var availablePool = new Dictionary<int, Queue<Tensor<T>>>();
+        var reuseMap = new Dictionary<Tensor<T>, Tensor<T>>();
+        int reusedCount = 0;
+
+        var result = new CompiledStep<T>[steps.Length];
+
         for (int i = 0; i < steps.Length; i++)
         {
-            foreach (var inp in steps[i].Inputs)
+            var step = steps[i];
+
+            // Rewrite this step's inputs to use remapped buffers
+            var newInputs = step.Inputs;
+            bool anyRemapped = false;
+            for (int inp = 0; inp < newInputs.Length; inp++)
             {
-                if (lastUse.TryGetValue(inp, out int lastIdx) && lastIdx == i
-                    && inp is Tensor<T> tensor)
+                if (reuseMap.TryGetValue(newInputs[inp], out var remapped))
                 {
-                    reusableBuffers++;
-                    savedBytes += tensor.Length * System.Runtime.InteropServices.Marshal.SizeOf<T>();
+                    if (!anyRemapped)
+                    {
+                        newInputs = (Tensor<T>[])newInputs.Clone();
+                        anyRemapped = true;
+                    }
+                    newInputs[inp] = remapped;
                 }
+            }
+
+            // Return consumed buffers to pool (after this step reads them for the last time)
+            foreach (var inp in step.Inputs)
+            {
+                var actualInp = reuseMap.TryGetValue(inp, out var r) ? r : inp;
+                if (lastUse.TryGetValue(inp, out int lastIdx) && lastIdx == i
+                    && actualInp.Length > 0)
+                {
+                    int count = actualInp.Length;
+                    if (!availablePool.ContainsKey(count))
+                        availablePool[count] = new Queue<Tensor<T>>();
+                    availablePool[count].Enqueue(actualInp);
+                }
+            }
+
+            // Try to reuse a buffer for this step's output
+            var output = step.OutputBuffer;
+            // Don't reuse for the last step's output (returned to caller)
+            if (i < steps.Length - 1
+                && availablePool.TryGetValue(output.Length, out var pool)
+                && pool.Count > 0)
+            {
+                var reusedBuffer = pool.Dequeue();
+                if (!ReferenceEquals(reusedBuffer, output))
+                {
+                    reuseMap[output] = reusedBuffer;
+                    output = reusedBuffer;
+                    reusedCount++;
+                }
+            }
+
+            // Build the (possibly rewritten) step
+            if (anyRemapped || !ReferenceEquals(output, step.OutputBuffer))
+            {
+                var capturedExec = step.Execute;
+                var capturedOutput = output;
+                result[i] = new CompiledStep<T>(
+                    step.OpName,
+                    (eng, o) => capturedExec(eng, capturedOutput),
+                    output,
+                    newInputs,
+                    null, // No backward for inference plans
+                    step.SavedState);
+            }
+            else
+            {
+                result[i] = step;
             }
         }
 
-        // Return null — no transformation applied until input rewriting is implemented.
-        // The analysis above can be used by ProfilingCompiler to report potential savings.
-        return null;
+        return reusedCount > 0 ? result : null;
     }
 
     /// <summary>
     /// Computes the last step index at which each tensor is consumed as an input.
-    /// Tensors consumed after this index are safe to reclaim.
     /// </summary>
     internal static Dictionary<object, int> ComputeLastUseIndices<T>(CompiledStep<T>[] steps)
     {
         var lastUse = new Dictionary<object, int>();
         for (int i = 0; i < steps.Length; i++)
-        {
             foreach (var inp in steps[i].Inputs)
                 lastUse[inp] = i;
-        }
         return lastUse;
     }
 }
