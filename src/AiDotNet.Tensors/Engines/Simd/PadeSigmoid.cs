@@ -50,36 +50,35 @@ internal static class PadeSigmoid
         var n = Avx.RoundToNearestInteger(Avx.Multiply(negX, log2e));
         var r = Fma.MultiplyAddNegated(n, ln2, negX);
 
+        // Clamp n to [-20, 20] to prevent 2^n overflow in IEEE bit manipulation.
+        // This is off the critical path (r computation doesn't depend on clamped n).
+        // For |n| > 20, sigmoid is < 1e-6 or > 1-1e-6, so clamping n is safe.
+        n = Avx.Max(Vector256.Create(-20.0f), Avx.Min(Vector256.Create(20.0f), n));
+
         // Padé [3,3]: P(r) = 1 + r/2 + r²/10 + r³/120
         //              Q(r) = 1 - r/2 + r²/10 - r³/120
-        // P and Q share the EVEN terms and differ in ODD terms.
-        // Compute shared: r²/10, and separate: r/2, r³/120
         var r2 = Avx.Multiply(r, r);
         var r3 = Avx.Multiply(r2, r);
 
-        var one = Vector256.Create(1.0f);
         var r2_10 = Avx.Multiply(Vector256.Create(0.1f), r2);           // r²/10
         var r_half = Avx.Multiply(Vector256.Create(0.5f), r);            // r/2
         var r3_120 = Avx.Multiply(Vector256.Create(1.0f / 120.0f), r3); // r³/120
 
-        // P = 1 + r/2 + r²/10 + r³/120  (even + odd terms)
-        // Q = 1 - r/2 + r²/10 - r³/120  (even - odd terms)
-        var even = Avx.Add(one, r2_10);         // 1 + r²/10
-        var odd = Avx.Add(r_half, r3_120);       // r/2 + r³/120
+        var one = Vector256.Create(1.0f);
+        var even = Avx.Add(one, r2_10);
+        var odd = Avx.Add(r_half, r3_120);
 
-        var P = Avx.Add(even, odd);  // even + odd
-        var Q = Avx.Subtract(even, odd); // even - odd
+        var P = Avx.Add(even, odd);
+        var Q = Avx.Subtract(even, odd);
 
-        // 2^n via IEEE bit manipulation
+        // 2^n via IEEE bit manipulation (n is clamped, so nInt+127 is in [107, 147])
         var nInt = Avx.ConvertToVector256Int32(n);
         var pow2n = Avx2.ShiftLeftLogical(
             Avx2.Add(nInt, Vector256.Create(127)), 23).AsSingle();
 
         // sigmoid = Q / (Q + 2^n * P)
         var denom = Fma.MultiplyAdd(pow2n, P, Q);
-        var result = Avx.Divide(Q, denom);
-
-        return Avx.Max(Vector256<float>.Zero, Avx.Min(one, result));
+        return Avx.Divide(Q, denom);
     }
 #endif
 
@@ -87,6 +86,7 @@ internal static class PadeSigmoid
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Sigmoid(float x)
     {
+        x = MathF.Max(-20f, MathF.Min(20f, x));
         float negX = -x;
         float n = MathF.Round(negX * 1.44269504088896341f);
         float r = negX - n * 0.6931471805599453f;
@@ -100,7 +100,7 @@ internal static class PadeSigmoid
         int bits = (nInt + 127) << 23;
         float pow2n = Unsafe.As<int, float>(ref bits);
         float denom = Q + pow2n * P;
-        return MathF.Max(0f, MathF.Min(1f, Q / denom));
+        return Q / denom;
     }
 
     /// <summary>
@@ -132,4 +132,5 @@ internal static class PadeSigmoid
         for (; i < length; i++)
             output[i] = Sigmoid(input[i]);
     }
+
 }

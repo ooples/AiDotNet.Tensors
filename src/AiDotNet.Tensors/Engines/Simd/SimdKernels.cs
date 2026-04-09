@@ -1359,7 +1359,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Unsafe pointer-based sum with 4-way accumulation. Eliminates Span bounds-checking.
+        /// Unsafe pointer-based sum with 8-way accumulation for maximum memory pipeline utilization.
+        /// 8 independent accumulators keep the CPU's out-of-order execution engine fully fed
+        /// while waiting for memory, hiding latency better than 4-way for large arrays.
+        /// No software prefetch — Zen 2/3+ hardware prefetcher handles sequential patterns optimally.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe float SumUnsafe(float* data, int length)
@@ -1367,37 +1370,31 @@ namespace AiDotNet.Tensors.Engines.Simd
             int i = 0;
             float sum = 0f;
 #if NET5_0_OR_GREATER
-            if (Avx.IsSupported && length >= 32)
+            if (Avx.IsSupported && length >= 64)
             {
                 var vsum0 = Vector256<float>.Zero;
                 var vsum1 = Vector256<float>.Zero;
                 var vsum2 = Vector256<float>.Zero;
                 var vsum3 = Vector256<float>.Zero;
-                int simdLength = length & ~31;
-                if (Sse.IsSupported && length >= 131072)
+                var vsum4 = Vector256<float>.Zero;
+                var vsum5 = Vector256<float>.Zero;
+                var vsum6 = Vector256<float>.Zero;
+                var vsum7 = Vector256<float>.Zero;
+                int simdLength = length & ~63;
+                for (; i < simdLength; i += 64)
                 {
-                    const int prefetchDistance = 256;
-                    for (; i < simdLength; i += 32)
-                    {
-                        if (i + prefetchDistance < length)
-                            Sse.Prefetch0(data + i + prefetchDistance);
-                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
-                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
-                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
-                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
-                    }
-                }
-                else
-                {
-                    for (; i < simdLength; i += 32)
-                    {
-                        vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
-                        vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
-                        vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
-                        vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
-                    }
+                    vsum0 = Avx.Add(vsum0, Avx.LoadVector256(data + i));
+                    vsum1 = Avx.Add(vsum1, Avx.LoadVector256(data + i + 8));
+                    vsum2 = Avx.Add(vsum2, Avx.LoadVector256(data + i + 16));
+                    vsum3 = Avx.Add(vsum3, Avx.LoadVector256(data + i + 24));
+                    vsum4 = Avx.Add(vsum4, Avx.LoadVector256(data + i + 32));
+                    vsum5 = Avx.Add(vsum5, Avx.LoadVector256(data + i + 40));
+                    vsum6 = Avx.Add(vsum6, Avx.LoadVector256(data + i + 48));
+                    vsum7 = Avx.Add(vsum7, Avx.LoadVector256(data + i + 56));
                 }
                 vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                vsum4 = Avx.Add(Avx.Add(vsum4, vsum5), Avx.Add(vsum6, vsum7));
+                vsum0 = Avx.Add(vsum0, vsum4);
                 sum += HorizontalSum(vsum0);
             }
             if (Avx.IsSupported && length - i >= 8)

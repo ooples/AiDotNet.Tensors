@@ -745,7 +745,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Sigmoid forward: pinned SigmoidUnsafe — bypass EnsureMaterialized
+        // Sigmoid forward: direct Padé [3,3] — bypass SigmoidUnsafe dispatch overhead
         if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -757,7 +757,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int len = inp.Length;
             return eng =>
             {
-                unsafe { SimdKernels.SigmoidUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+                unsafe { PadeSigmoid.SigmoidArray((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
             };
         }
         // Sigmoid non-float fallback

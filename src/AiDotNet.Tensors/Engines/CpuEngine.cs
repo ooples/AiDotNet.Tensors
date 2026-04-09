@@ -20432,7 +20432,16 @@ public class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (tensor.Rank != 3) throw new ArgumentException("TensorSliceAxis currently only supports 3D tensors.");
+        if (tensor.Rank < 1) throw new ArgumentException("Cannot slice a scalar tensor.", nameof(tensor));
+        if (axis < 0 || axis >= tensor.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {tensor.Rank}.");
+        if (index < 0 || index >= tensor._shape[axis])
+            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {tensor._shape[axis]}.");
+
+        // Output shape: original shape with shape[axis] removed
+        var outShape = new int[tensor.Rank - 1];
+        for (int d = 0, j = 0; d < tensor.Rank; d++)
+            if (d != axis) outShape[j++] = tensor._shape[d];
 
         if (GraphMode.IsActive)
         {
@@ -20441,11 +20450,6 @@ public class CpuEngine : ITensorLevelEngine
             {
                 var captured = tensor;
                 int capAxis = axis, capIndex = index;
-                // Output shape: remove the sliced axis dimension
-                var outShape = new int[2];
-                int idx = 0;
-                for (int d = 0; d < 3; d++)
-                    if (d != axis) outShape[idx++] = tensor._shape[d];
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSliceAxis", tensor, outShape,
                     (eng, output) => { var r = eng.TensorSliceAxis(captured, capAxis, capIndex); r.AsSpan().CopyTo(output.AsWritableSpan()); },
                     BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
@@ -20454,48 +20458,42 @@ public class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSliceAxis", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        int dim0 = tensor._shape[0];
-        int dim1 = tensor._shape[1];
-        int dim2 = tensor._shape[2];
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var tensorData = tensor.GetDataArray();
 
-        Tensor<T> result;
-        var tensorData = tensor.GetFlattenedData();
+        // Generic N-D slice: select index along axis, producing rank-1 output.
+        // stride = product(shape[axis+1:]) — contiguous elements per index along axis
+        // outerCount = product(shape[:axis]) — number of outer blocks
+        int stride = 1;
+        for (int d = axis + 1; d < tensor.Rank; d++)
+            stride *= tensor._shape[d];
 
-        switch (axis)
+        int outerCount = 1;
+        for (int d = 0; d < axis; d++)
+            outerCount *= tensor._shape[d];
+
+        int axisSize = tensor._shape[axis];
+
+        var result = TensorAllocator.Rent<T>(outShape);
+        var resultData = result.GetDataArray();
+
+        if (outerCount > 64)
         {
-            case 0:
-                // Slice along first axis: result[j,k] = tensor[index, j, k]
-                result = TensorAllocator.Rent<T>([dim1, dim2]);
-                // tensor flat: index * dim1 * dim2 + j * dim2 + k => contiguous block
-                Array.Copy(tensorData, index * dim1 * dim2, result.GetDataArray(), 0, dim1 * dim2);
-                break;
-
-            case 1:
-                // Slice along second axis: result[i,k] = tensor[i, index, k]
-                result = TensorAllocator.Rent<T>([dim0, dim2]);
-                var resultData1 = result.GetDataArray();
-                Parallel.For(0, dim0, i =>
-                {
-                    int srcOffset = i * dim1 * dim2 + index * dim2;
-                    Array.Copy(tensorData, srcOffset, resultData1, i * dim2, dim2);
-                });
-                break;
-
-            case 2:
-                // Slice along third axis: result[i,j] = tensor[i, j, index]
-                result = TensorAllocator.Rent<T>([dim0, dim1]);
-                var resultData2 = result.GetDataArray();
-                Parallel.For(0, dim0, i =>
-                {
-                    for (int j = 0; j < dim1; j++)
-                    {
-                        resultData2[i * dim1 + j] = tensorData[i * dim1 * dim2 + j * dim2 + index];
-                    }
-                });
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException(nameof(axis), "Axis must be 0, 1, or 2 for 3D tensors.");
+            Parallel.For(0, outerCount, outer =>
+            {
+                int srcOffset = outer * axisSize * stride + index * stride;
+                int dstOffset = outer * stride;
+                Array.Copy(tensorData, srcOffset, resultData, dstOffset, stride);
+            });
+        }
+        else
+        {
+            for (int outer = 0; outer < outerCount; outer++)
+            {
+                int srcOffset = outer * axisSize * stride + index * stride;
+                int dstOffset = outer * stride;
+                Array.Copy(tensorData, srcOffset, resultData, dstOffset, stride);
+            }
         }
 
         DifferentiableOps.RecordUnary("TensorSliceAxis", result, tensor, BackwardFunctions<T>.SliceAxisBackward, new object[] { axis, index });
@@ -20601,54 +20599,46 @@ public class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        if (axis < 0 || axis >= destination.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
+        if (index < 0 || index >= destination._shape[axis])
+            throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
 
-        // For 3D tensors
-        if (destination.Rank == 3)
+        if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
+        if (!source.IsContiguous) source = source.Contiguous();
+
+        var dstData = destination.GetDataArray();
+        var srcData = source.GetDataArray();
+
+        // Generic N-D set-slice: write source into destination at [... , index, ...] along axis.
+        // Same stride/outerCount algorithm as TensorSliceAxis but reversed (src→dst).
+        int stride = 1;
+        for (int d = axis + 1; d < destination.Rank; d++)
+            stride *= destination._shape[d];
+
+        int outerCount = 1;
+        for (int d = 0; d < axis; d++)
+            outerCount *= destination._shape[d];
+
+        int axisSize = destination._shape[axis];
+
+        if (outerCount > 64)
         {
-            int dim0 = destination._shape[0];
-            int dim1 = destination._shape[1];
-            int dim2 = destination._shape[2];
-
-            switch (axis)
+            Parallel.For(0, outerCount, outer =>
             {
-                case 0:
-                    // Set destination[index, :, :] = source
-                    Parallel.For(0, dim1, j =>
-                    {
-                        for (int k = 0; k < dim2; k++)
-                        {
-                            destination[index, j, k] = source[j, k];
-                        }
-                    });
-                    break;
-
-                case 1:
-                    Parallel.For(0, dim0, i =>
-                    {
-                        for (int k = 0; k < dim2; k++)
-                        {
-                            destination[i, index, k] = source[i, k];
-                        }
-                    });
-                    break;
-
-                case 2:
-                    Parallel.For(0, dim0, i =>
-                    {
-                        for (int j = 0; j < dim1; j++)
-                        {
-                            destination[i, j, index] = source[i, j];
-                        }
-                    });
-                    break;
-
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(axis));
-            }
+                int dstOffset = outer * axisSize * stride + index * stride;
+                int srcOffset = outer * stride;
+                Array.Copy(srcData, srcOffset, dstData, dstOffset, stride);
+            });
         }
         else
         {
-            throw new NotSupportedException("TensorSetSliceAxis currently only supports 3D tensors.");
+            for (int outer = 0; outer < outerCount; outer++)
+            {
+                int dstOffset = outer * axisSize * stride + index * stride;
+                int srcOffset = outer * stride;
+                Array.Copy(srcData, srcOffset, dstData, dstOffset, stride);
+            }
         }
     }
 
