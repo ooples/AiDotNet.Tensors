@@ -16601,6 +16601,38 @@ public class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
+        // GraphMode: record lazy node for compiled plan
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Compute output shape
+                var effectiveAxes = axes ?? Enumerable.Range(0, input.Rank).ToArray();
+                var normAxes = new HashSet<int>(effectiveAxes.Select(a => a < 0 ? input.Rank + a : a));
+                var outShapeList = new List<int>();
+                for (int d = 0; d < input.Rank; d++)
+                {
+                    if (normAxes.Contains(d)) { if (keepDims) outShapeList.Add(1); }
+                    else outShapeList.Add(input._shape[d]);
+                }
+                var outShape = outShapeList.Count > 0 ? outShapeList.ToArray() : new[] { 1 };
+
+                var capturedInput = input;
+                var capturedAxes = axes;
+                bool capturedKeepDims = keepDims;
+                maxIndices = Array.Empty<int>(); // Indices not available in lazy mode
+                return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
+                    (eng, output) =>
+                    {
+                        var eager = eng.ReduceMax(capturedInput, capturedAxes ?? Array.Empty<int>(), capturedKeepDims, out _);
+                        eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    },
+                    BackwardFunctions<T>.ReduceMaxBackward,
+                    new object[] { axes ?? Array.Empty<int>(), keepDims });
+            }
+        }
+
         // Stride-aware single-axis max
         if (!input.IsContiguous && axes.Length == 1)
         {

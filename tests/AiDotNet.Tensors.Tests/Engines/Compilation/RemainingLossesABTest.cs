@@ -61,12 +61,12 @@ public class RemainingLossesABTest
     {
         switch (opName)
         {
-            case "Max": engine.ReduceMax(input, null, false, out _); break;
+            case "Max": engine.ReduceMax(input, new[] { 0 }, false, out _); break;
             case "LogSoftmax": engine.TensorLogSoftmax(input, -1); break;
             case "Round": engine.TensorRound(input); break;
             case "HardSwish": engine.HardSwish(input); break;
             case "Tanh": engine.Tanh(input); break;
-            case "Mean": engine.ReduceMean(input, null, false); break;
+            case "Mean": engine.ReduceMean(input, new[] { 0 }, false); break;
             case "SELU": engine.TensorSELU(input); break;
             case "Exp": engine.TensorExp(input); break;
             case "Sigmoid": engine.Sigmoid(input); break;
