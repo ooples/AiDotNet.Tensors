@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// 1. ReLU MLP: compiled 0.02x (50x slower than eager)
 /// 2. Large [128x512->256->64]: compiled 0.03x (33x slower)
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class PassRegressionABTest
 {
     private readonly ITestOutputHelper _output;

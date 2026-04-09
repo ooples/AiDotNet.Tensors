@@ -10,6 +10,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// A/B test: Table-driven exp vs current Estrin polynomial exp vs MathF.Exp.
 /// Measures both performance AND accuracy.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class TableDrivenExpABTest
 {
     private readonly ITestOutputHelper _output;

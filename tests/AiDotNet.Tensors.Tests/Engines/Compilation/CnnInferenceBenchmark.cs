@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// End-to-end CNN inference benchmark: compiled vs eager.
 /// Conv2D → ReLU → MaxPool2D pipeline at realistic sizes.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class CnnInferenceBenchmark
 {
     private readonly ITestOutputHelper _output;

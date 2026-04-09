@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// A/B test: GroupNorm [32x64x8x8]. PyTorch = 357us, our compiled = 1,282us (3.6x slower).
 /// Same pattern as BatchNorm — check if specialization is missing or mismatched.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class GroupNormABTest
 {
     private readonly ITestOutputHelper _output;

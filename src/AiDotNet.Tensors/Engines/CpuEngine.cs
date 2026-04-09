@@ -16625,11 +16625,12 @@ public class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "ReduceMax", input, outShape,
                     (eng, output) =>
                     {
-                        var eager = eng.ReduceMax(capturedInput, capturedAxes ?? Array.Empty<int>(), capturedKeepDims, out _);
+                        var effectiveA = capturedAxes ?? Enumerable.Range(0, capturedInput.Rank).ToArray();
+                        var eager = eng.ReduceMax(capturedInput, effectiveA, capturedKeepDims, out _);
                         eager.AsSpan().CopyTo(output.AsWritableSpan());
                     },
                     BackwardFunctions<T>.ReduceMaxBackward,
-                    new object[] { axes ?? Array.Empty<int>(), keepDims });
+                    new object[] { effectiveAxes.ToArray(), keepDims });
             }
         }
 

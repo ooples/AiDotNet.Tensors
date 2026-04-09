@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// A/B tests for remaining operations where PyTorch beat us in BDN.
 /// Each test measures eager vs compiled vs PyTorch reference.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class RemainingLossesABTest
 {
     private readonly ITestOutputHelper _output;

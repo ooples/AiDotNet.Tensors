@@ -10,6 +10,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// Flash Attention benchmarks at realistic sequence lengths.
 /// Compares Flash Attention (O(N) memory) vs naive BLAS-based attention.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class FlashAttentionBenchmarks
 {
     private readonly ITestOutputHelper _output;

@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// tanh path due to 3-pass overhead + ArrayPool allocation.
 /// Test: run BOTH paths on 1M elements and measure.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class GELUPathABTest
 {
     private readonly ITestOutputHelper _output;

@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// End-to-end Transformer attention benchmark at realistic sequence lengths.
 /// Multi-head attention: Q@K^T → scale → softmax → @V with head splitting.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class TransformerAttentionBenchmark
 {
     private readonly ITestOutputHelper _output;

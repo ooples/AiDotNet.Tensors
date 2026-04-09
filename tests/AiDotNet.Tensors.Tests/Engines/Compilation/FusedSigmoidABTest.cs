@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// Current: 1/(1+exp(-x)) = Estrin exp + Avx.Divide = ~0.54ms/1M
 /// Target: < 0.488ms (PyTorch)
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class FusedSigmoidABTest
 {
     private readonly ITestOutputHelper _output;

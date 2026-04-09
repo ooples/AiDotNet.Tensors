@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// Each test measures real steps/sec and reports speedup ratios.
 /// Mark as Skip for CI — run manually with --filter.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class CompilationABBenchmarks
 {
     private readonly ITestOutputHelper _output;

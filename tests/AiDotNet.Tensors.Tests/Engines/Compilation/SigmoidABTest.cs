@@ -9,6 +9,7 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
+[Trait("Category", "Benchmark")]
 public class SigmoidABTest
 {
     private readonly ITestOutputHelper _output;

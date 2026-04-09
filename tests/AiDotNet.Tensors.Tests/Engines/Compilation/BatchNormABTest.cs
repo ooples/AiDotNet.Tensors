@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// A/B test: BatchNorm [32x64x8x8]. PyTorch = 122us, our compiled = 3,010us (24.5x slower).
 /// We added FusedKernels.BatchNormInferenceUnsafe specialization. Verify it improved.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class BatchNormABTest
 {
     private readonly ITestOutputHelper _output;

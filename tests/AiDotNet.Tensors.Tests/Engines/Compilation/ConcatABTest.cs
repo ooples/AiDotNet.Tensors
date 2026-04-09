@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// Hypothesis: compiled Concat runs the eager allocating path.
 /// Measure: eager vs compiled vs raw Buffer.BlockCopy baseline.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class ConcatABTest
 {
     private readonly ITestOutputHelper _output;

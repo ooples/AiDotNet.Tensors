@@ -1757,9 +1757,9 @@ internal static class OneDnnProvider
 
             int rc;
             IntPtr srcDesc, dstDesc;
-            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, srcDims, 1 /*f32*/, DnnlFormatTagNCHW);
+            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, srcDims, DnnlF32, DnnlFormatTagNCHW);
             if (rc != 0) return false;
-            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dstDims, 1 /*f32*/, DnnlFormatTagNCHW);
+            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dstDims, DnnlF32, DnnlFormatTagNCHW);
             if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); return false; }
 
             // Create pooling primitive descriptor
@@ -1834,9 +1834,9 @@ internal static class OneDnnProvider
             long* dims = stackalloc long[] { batch, channels, height, width };
             int rc;
             IntPtr srcDesc, dstDesc;
-            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, dims, 1 /*f32*/, DnnlFormatTagNCHW);
+            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, dims, DnnlF32, DnnlFormatTagNCHW);
             if (rc != 0) return false;
-            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dims, 1 /*f32*/, DnnlFormatTagNCHW);
+            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dims, DnnlF32, DnnlFormatTagNCHW);
             if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); return false; }
 
             // Create batch norm primitive descriptor
@@ -1864,8 +1864,9 @@ internal static class OneDnnProvider
 
             // Create memory objects BEFORE destroying descriptors
             long* cDims = stackalloc long[] { channels };
+            long* cStrides = stackalloc long[] { 1 };
             IntPtr scaleDesc;
-            dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, 1, null);
+            dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, DnnlF32, cStrides);
 
             IntPtr srcMem, dstMem, meanMem, varMem, scaleMem, shiftMem;
             dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
