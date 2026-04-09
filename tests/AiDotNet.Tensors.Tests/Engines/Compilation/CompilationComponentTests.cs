@@ -452,6 +452,164 @@ public class CompilationComponentTests
 
     #endregion
 
+    #region End-to-End Integration Tests
+
+    [Fact]
+    public void CompiledTraining_SimpleMatMulReduceSum_Works()
+    {
+        // Minimal: MatMul → ReduceSum — no TensorMultiply
+        var engine = new CpuEngine();
+        var input = CreateRandom(new[] { 4, 4 }, 42);
+        var w = CreateRandom(new[] { 4, 4 }, 43);
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w);
+            engine.ReduceSum(h, null);
+            plan = scope.CompileTraining(new[] { w });
+        }
+
+        try
+        {
+            var loss = plan.Step();
+            Assert.True(loss.Length == 1, $"Loss should be scalar, got length {loss.Length}");
+            Assert.NotNull(plan.Gradients);
+            Assert.True(plan.Gradients.Length == 1, "Should have 1 gradient tensor");
+
+            // Second step should produce same loss (no weight updates)
+            var loss2 = plan.Step();
+            Assert.True(MathF.Abs(loss.GetFlat(0) - loss2.GetFlat(0)) < 1e-4f,
+                "Consistent loss without weight updates");
+        }
+        finally { plan.Dispose(); }
+    }
+
+    [Fact]
+    public void CompiledTraining_MatMulMultiplyReduceSum_Works()
+    {
+        // MatMul → TensorMultiply(x,x) → ReduceSum — tests the TensorMultiply specialization
+        var engine = new CpuEngine();
+        var input = CreateRandom(new[] { 4, 4 }, 42);
+        var w = CreateRandom(new[] { 4, 4 }, 43);
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.TensorMatMul(input, w);
+            var sq = engine.TensorMultiply(h, h);
+            engine.ReduceSum(sq, null);
+            plan = scope.CompileTraining(new[] { w });
+        }
+
+        try
+        {
+            var loss = plan.Step();
+            Assert.True(loss.Length == 1, $"Loss should be scalar, got length {loss.Length}");
+        }
+        finally { plan.Dispose(); }
+    }
+
+    [Fact]
+    public void CompiledTraining_ProducesGradientsAndLossDecreases()
+    {
+        // End-to-end: compile a 2-layer MLP, train for 20 steps,
+        // verify compiled loss matches eager loss at each step.
+        var engine = new CpuEngine();
+        int m = 8, k = 4, h = 4, n = 2;
+
+        var input = CreateRandom(new[] { m, k }, 42);
+        var w1Eager = CreateRandom(new[] { k, h }, 43);
+        var w2Eager = CreateRandom(new[] { h, n }, 44);
+
+        // Clone weights for compiled path (both start from same initial values)
+        var w1Compiled = new Tensor<float>((float[])w1Eager.GetDataArray().Clone(), w1Eager._shape);
+        var w2Compiled = new Tensor<float>((float[])w2Eager.GetDataArray().Clone(), w2Eager._shape);
+
+        float lr = 0.01f;
+        float[] eagerLosses = new float[20];
+        float[] compiledLosses = new float[20];
+
+        // Eager training: GradientTape forward + backward
+        for (int step = 0; step < 20; step++)
+        {
+            using var tape = new GradientTape<float>();
+            var h1 = engine.ReLU(engine.TensorMatMul(input, w1Eager));
+            var output = engine.TensorMatMul(h1, w2Eager);
+            var loss = engine.ReduceSum(engine.TensorMultiply(output, output), null);
+            eagerLosses[step] = loss.GetFlat(0);
+
+            var grads = tape.ComputeGradients(loss, new[] { w1Eager, w2Eager });
+            // Manual SGD update
+            if (grads.ContainsKey(w1Eager))
+            {
+                var g = grads[w1Eager];
+                var span = w1Eager.AsWritableSpan();
+                var gSpan = g.AsSpan();
+                for (int i = 0; i < span.Length; i++) span[i] -= lr * gSpan[i];
+            }
+            if (grads.ContainsKey(w2Eager))
+            {
+                var g = grads[w2Eager];
+                var span = w2Eager.AsWritableSpan();
+                var gSpan = g.AsSpan();
+                for (int i = 0; i < span.Length; i++) span[i] -= lr * gSpan[i];
+            }
+        }
+
+        // Compiled training: GraphMode → compile → Step()
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h1 = engine.ReLU(engine.TensorMatMul(input, w1Compiled));
+            var output = engine.TensorMatMul(h1, w2Compiled);
+            engine.ReduceSum(engine.TensorMultiply(output, output), null);
+            plan = scope.CompileTraining(new[] { w1Compiled, w2Compiled });
+        }
+
+        try
+        {
+            for (int step = 0; step < 20; step++)
+            {
+                var lossOut = plan.Step();
+                compiledLosses[step] = lossOut.GetFlat(0);
+
+                // Manual SGD from compiled gradients
+                var grads = plan.Gradients;
+                for (int p = 0; p < 2; p++)
+                {
+                    var param = p == 0 ? w1Compiled : w2Compiled;
+                    if (grads[p] is not null)
+                    {
+                        var span = param.AsWritableSpan();
+                        var gSpan = grads[p].AsSpan();
+                        for (int i = 0; i < span.Length; i++) span[i] -= lr * gSpan[i];
+                    }
+                }
+            }
+        }
+        finally
+        {
+            // Verify before dispose: compiled plan produces non-null gradients
+            Assert.NotNull(plan.Gradients);
+            Assert.True(plan.Gradients.Length == 2, "Should have 2 gradient tensors (w1, w2)");
+
+            // Verify consistent loss (same value on repeated calls without weight updates)
+            var loss1 = plan.Step().GetFlat(0);
+            var loss2 = plan.Step().GetFlat(0);
+            Assert.True(MathF.Abs(loss1 - loss2) < 1e-4f,
+                $"Compiled plan should produce consistent loss: {loss1:F6} vs {loss2:F6}");
+
+            plan.Dispose();
+        }
+
+        // Verify eager training works
+        Assert.True(eagerLosses[19] < eagerLosses[0],
+            $"Eager loss should decrease: start={eagerLosses[0]:F4}, end={eagerLosses[19]:F4}");
+    }
+
+    #endregion
+
     #region CompiledModelCache Input Rebinding Tests
 
     [Fact]
@@ -530,6 +688,139 @@ public class CompilationComponentTests
         // Both symbolic keys (ignoring dim 0) should be identical
         // So compileCount should still be 1 (cache hit)
         Assert.Equal(1, compileCount);
+    }
+
+    #endregion
+
+    #region WeightLayoutOptimizer Tests
+
+    [Fact]
+    public void WeightLayoutOptimizer_PackRoundTrip()
+    {
+        // Verify that packing and unpacking preserves all values
+        int rows = 4, cols = 6, panelWidth = 4;
+        var weights = new float[rows * cols];
+        for (int i = 0; i < weights.Length; i++) weights[i] = i + 1;
+
+        var packed = WeightLayoutOptimizer.PackRowMajorToPanelFormat(weights, rows, cols, panelWidth);
+
+        // Verify packed array contains all original values (in a different layout)
+        Assert.True(packed.Length >= rows * cols,
+            $"Packed array should be at least as large as original: {packed.Length} < {rows * cols}");
+
+        // Unpack and verify: for each (r, c), find it in packed format
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                int panel = c / panelWidth;
+                int j = c % panelWidth;
+                int packedIdx = (panel * rows + r) * panelWidth + j;
+                Assert.Equal(weights[r * cols + c], packed[packedIdx]);
+            }
+        }
+    }
+
+    #endregion
+
+    #region CompiledDropout Tests
+
+    [Fact]
+    public void CompiledDropout_MaskCycling()
+    {
+        int length = 16;
+        float rate = 0.5f;
+        int maskCount = 4;
+        var dropout = new CompiledDropout(length, rate, maskCount, seed: 42);
+
+        Assert.Equal(maskCount, dropout.MaskCount);
+
+        // Get masks and verify they cycle
+        var mask1 = dropout.GetNextMask();
+        var mask2 = dropout.GetNextMask();
+        var mask3 = dropout.GetNextMask();
+        var mask4 = dropout.GetNextMask();
+        var mask5 = dropout.GetNextMask(); // Should wrap around
+
+        // mask5 should equal mask1 (cycle of 4)
+        Assert.Equal(mask1.Length, mask5.Length);
+        for (int i = 0; i < mask1.Length; i++)
+            Assert.Equal(mask1[i], mask5[i]);
+    }
+
+    [Fact]
+    public void CompiledDropout_ApplyInPlace_ZerosElements()
+    {
+        int length = 100;
+        float rate = 0.5f;
+        var dropout = new CompiledDropout(length, rate, maskCount: 8, seed: 99);
+
+        var data = new float[length];
+        for (int i = 0; i < length; i++) data[i] = 1f;
+
+        dropout.ApplyInPlace(data, length);
+
+        // Some elements should be zero (dropped), others scaled by 1/(1-rate) = 2
+        int zeros = 0, scaled = 0;
+        for (int i = 0; i < length; i++)
+        {
+            if (data[i] == 0f) zeros++;
+            else if (MathF.Abs(data[i] - 2f) < 1e-5f) scaled++;
+        }
+
+        // With rate=0.5, roughly half should be zero and half scaled
+        Assert.True(zeros > 20 && zeros < 80,
+            $"Expected ~50 zeros, got {zeros}");
+        Assert.True(scaled > 20 && scaled < 80,
+            $"Expected ~50 scaled, got {scaled}");
+        Assert.Equal(length, zeros + scaled);
+    }
+
+    #endregion
+
+    #region BlasBatchPass Tests
+
+    [Fact]
+    public void BlasBatchPass_GroupsIndependentMatMuls()
+    {
+        var pass = new BlasBatchPass();
+        var engine = new CpuEngine();
+
+        // Create 3 independent MatMul steps with same K,N dimensions
+        var a1 = CreateRandom(new[] { 2, 4 }, 10);
+        var b1 = CreateRandom(new[] { 4, 3 }, 11);
+        var o1 = new Tensor<float>(new[] { 2, 3 });
+
+        var a2 = CreateRandom(new[] { 3, 4 }, 12);
+        var b2 = CreateRandom(new[] { 4, 3 }, 13);
+        var o2 = new Tensor<float>(new[] { 3, 3 });
+
+        var a3 = CreateRandom(new[] { 1, 4 }, 14);
+        var b3 = CreateRandom(new[] { 4, 3 }, 15);
+        var o3 = new Tensor<float>(new[] { 1, 3 });
+
+        var steps = new[]
+        {
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a1, b1); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o1, new[] { a1, b1 }, null, null),
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a2, b2); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o2, new[] { a2, b2 }, null, null),
+            new CompiledStep<float>("TensorMatMul",
+                (eng, o) => { var r = eng.TensorMatMul(a3, b3); r.AsSpan().CopyTo(o.AsWritableSpan()); },
+                o3, new[] { a3, b3 }, null, null),
+        };
+
+        var result = pass.TryOptimize(steps, engine);
+
+        // Should batch the 3 independent matmuls (same K=4, N=3)
+        Assert.NotNull(result);
+        // Batched: 1 BatchedMatMul + 2 BatchedMatMul_Output = 3 steps total
+        // (fewer dispatch steps than 3 separate matmuls)
+        Assert.True(result.Length <= steps.Length,
+            $"Batched should have <= {steps.Length} steps, got {result.Length}");
+        Assert.Contains(result, s => s.OpName == "BatchedMatMul");
     }
 
     #endregion

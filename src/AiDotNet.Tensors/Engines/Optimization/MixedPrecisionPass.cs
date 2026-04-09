@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -23,18 +24,10 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
     {
-        if (!IsEnabled) return null;
-
-        // Classify each op as fp16-safe or fp32-required
-        var classifications = new List<PrecisionClass>(steps.Length);
-        foreach (var step in steps)
-        {
-            classifications.Add(ClassifyOp(step.OpName));
-        }
-
-        // For now, return null (no transformation) — the classification data
-        // will be used when Half-precision kernels are available.
-        // The infrastructure is in place for future implementation.
+        // Disabled: real mixed precision requires Tensor<Half> throughout the engine
+        // (see GitHub issue #118). The shadow buffer simulation was fundamentally flawed:
+        // the Execute delegate closed over original inputs, not shadow inputs.
+        // Classification logic is retained for future use when Half support is added.
         return null;
     }
 

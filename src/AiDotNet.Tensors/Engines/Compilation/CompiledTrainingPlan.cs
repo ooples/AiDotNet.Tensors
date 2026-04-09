@@ -84,15 +84,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
+    // Fused optimizer state
+    private Action? _optimizerUpdate;
+    private int _optimizerStep;
+
+    // Gradient checkpointing (Phase 5.3)
+    private GradientCheckpointing<T>? _checkpointing;
+
+    /// <summary>
+    /// Enables gradient checkpointing for this plan, reducing memory from O(N) to O(sqrt(N))
+    /// at the cost of ~33% more compute (each segment's forward runs twice).
+    /// Call once after compilation, before training loop.
+    /// </summary>
+    /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
+    public void EnableCheckpointing(int segmentSize = 0)
+    {
+        // Wrap forward actions as CompiledSteps for the checkpointing system.
+        // Each action writes to _lossOutput as a pass-through output reference —
+        // the actual outputs are in the action's captured closures.
+        var wrappedSteps = new CompiledStep<T>[_forwardActions.Length];
+        for (int i = 0; i < _forwardActions.Length; i++)
+        {
+            var action = _forwardActions[i];
+            wrappedSteps[i] = new CompiledStep<T>(
+                "Forward_" + i,
+                (eng, o) => action(eng),
+                _lossOutput, // Shared output reference — checkpointing only needs execute
+                Array.Empty<Tensor<T>>(),
+                null, null);
+        }
+        _checkpointing = new GradientCheckpointing<T>(wrappedSteps, _engine, segmentSize);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
         var engine = _engine;
 
-        // Forward: straight-line delegate calls (specialized: direct BLAS, no engine dispatch)
-        var fwd = _forwardActions;
-        for (int i = 0; i < fwd.Length; i++)
-            fwd[i](engine);
+        // Forward: use checkpointing if enabled, otherwise straight-line delegates
+        if (_checkpointing is not null)
+        {
+            _checkpointing.ForwardWithCheckpoints();
+        }
+        else
+        {
+            var fwd = _forwardActions;
+            for (int i = 0; i < fwd.Length; i++)
+                fwd[i](engine);
+        }
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
@@ -135,7 +174,93 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int i = 0; i < bwd.Length; i++)
             bwd[i](engine);
 
+        // Fused optimizer update (if configured via ConfigureOptimizer)
+        _optimizerUpdate?.Invoke();
+
         return _lossOutput;
+    }
+
+    public unsafe void ConfigureOptimizer(
+        OptimizerType optimizerType,
+        float learningRate,
+        float beta1 = 0.9f,
+        float beta2 = 0.999f,
+        float eps = 1e-8f,
+        float weightDecay = 0f)
+    {
+        if (typeof(T) != typeof(float))
+            throw new NotSupportedException("Fused optimizer updates only support float parameters.");
+
+        // Pre-allocate optimizer state buffers for each parameter
+        int paramCount = _parameters.Length;
+        var paramArrays = new float[paramCount][];
+        var gradArrays = new float[paramCount][];
+        var lengths = new int[paramCount];
+
+        // Momentum / first moment buffers (Adam, SGD+momentum, etc.)
+        var m = new float[paramCount][];
+        // Second moment buffers (Adam, RMSprop, etc.)
+        var v = new float[paramCount][];
+
+        for (int p = 0; p < paramCount; p++)
+        {
+            paramArrays[p] = (float[])(object)_parameters[p].GetDataArray();
+            gradArrays[p] = _gradients[p] is not null
+                ? (float[])(object)_gradients[p].GetDataArray()
+                : Array.Empty<float>();
+            lengths[p] = _parameters[p].Length;
+
+            bool needsMomentum = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.SGDMomentum or OptimizerType.Lion or OptimizerType.Nadam
+                or OptimizerType.AdaMax or OptimizerType.AMSGrad;
+            bool needsSecondMoment = optimizerType is OptimizerType.Adam or OptimizerType.AdamW
+                or OptimizerType.RMSprop or OptimizerType.Nadam or OptimizerType.AMSGrad
+                or OptimizerType.Adagrad;
+
+            m[p] = needsMomentum ? new float[lengths[p]] : Array.Empty<float>();
+            v[p] = needsSecondMoment ? new float[lengths[p]] : Array.Empty<float>();
+        }
+
+        _optimizerStep = 0;
+        var lr = learningRate;
+        var b1 = beta1;
+        var b2 = beta2;
+        var epsVal = eps;
+        var wd = weightDecay;
+        var optType = optimizerType;
+
+        _optimizerUpdate = () =>
+        {
+            _optimizerStep++;
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (gradArrays[p].Length == 0) continue;
+                int len = lengths[p];
+
+                fixed (float* pParam = paramArrays[p], pGrad = gradArrays[p],
+                       pM = m[p], pV = v[p])
+                {
+                    switch (optType)
+                    {
+                        case OptimizerType.SGD:
+                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
+                            break;
+                        case OptimizerType.Adam:
+                            FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, _optimizerStep);
+                            break;
+                        case OptimizerType.AdamW:
+                            FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
+                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                            break;
+                        default:
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
+                                $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
+                    }
+                }
+            }
+        };
     }
 
     internal static CompiledTrainingPlan<T> Compile(
