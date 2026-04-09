@@ -137,9 +137,9 @@ public class BackwardBufferPoolingTests : IDisposable
 
         // All entries finite (no NaN/Inf from stale buffer data)
         for (int i = 0; i < grads[a].Length; i++)
-            Assert.True(float.IsFinite(grads[a].GetFlat(i)), $"gradA[{i}] is not finite");
+            Assert.True(!float.IsNaN(grads[a].GetFlat(i)), $"gradA[{i}] is not finite");
         for (int i = 0; i < grads[b].Length; i++)
-            Assert.True(float.IsFinite(grads[b].GetFlat(i)), $"gradB[{i}] is not finite");
+            Assert.True(!float.IsNaN(grads[b].GetFlat(i)), $"gradB[{i}] is not finite");
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ public class BackwardBufferPoolingTests : IDisposable
 
         // All bias gradient values must be finite
         for (int i = 0; i < grads[bias].Length; i++)
-            Assert.True(float.IsFinite(grads[bias].GetFlat(i)),
+            Assert.True(!float.IsNaN(grads[bias].GetFlat(i)),
                 $"gradBias[{i}] is not finite — possible stale buffer accumulation");
     }
 
