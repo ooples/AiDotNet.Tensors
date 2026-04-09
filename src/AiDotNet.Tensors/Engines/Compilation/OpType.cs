@@ -56,6 +56,7 @@ internal enum OpType : byte
 
     // Reductions
     ReduceSum,
+    ReduceMax,
     Mean,
 
     // Linear algebra
@@ -135,7 +136,8 @@ internal static class OpTypeParser
         "Round" => OpType.Round,
         "Clamp" => OpType.Clamp,
         "ReduceSum" => OpType.ReduceSum,
-        "Mean" => OpType.Mean,
+        "ReduceMax" => OpType.ReduceMax,
+        "Mean" or "ReduceMean" => OpType.Mean,
         "TensorMatMul" => OpType.TensorMatMul,
         "TensorTranspose" => OpType.TensorTranspose,
         "Conv2D" => OpType.Conv2D,
