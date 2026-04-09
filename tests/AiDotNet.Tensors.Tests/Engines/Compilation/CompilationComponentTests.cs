@@ -825,6 +825,90 @@ public class CompilationComponentTests
 
     #endregion
 
+    #region MemoryPlannerPass Integration Tests
+
+    [Fact]
+    public void MemoryPlannerPass_CompiledInference_ProducesCorrectResult()
+    {
+        // Verify that MemoryPlannerPass buffer reuse doesn't corrupt results.
+        // Compile a 3-step plan (Add → ReLU → Add), run with and without the pass,
+        // compare outputs.
+        var engine = new CpuEngine();
+        var a = CreateRandom(new[] { 4, 4 }, 42);
+        var b = CreateRandom(new[] { 4, 4 }, 43);
+        var c = CreateRandom(new[] { 4, 4 }, 44);
+
+        // Eager reference
+        var step1 = engine.TensorAdd(a, b);
+        var step2 = engine.ReLU(step1);
+        var eagerResult = engine.TensorAdd(step2, c);
+
+        // Compiled (with MemoryPlannerPass enabled by default)
+        CompiledInferencePlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var s1 = engine.TensorAdd(a, b);
+            var s2 = engine.ReLU(s1);
+            engine.TensorAdd(s2, c);
+            plan = scope.CompileInference<float>();
+        }
+
+        var compiledResult = plan.Execute();
+        plan.Dispose();
+
+        // Compare
+        for (int i = 0; i < eagerResult.Length; i++)
+        {
+            float diff = MathF.Abs(eagerResult.GetFlat(i) - compiledResult.GetFlat(i));
+            Assert.True(diff < 1e-5f,
+                $"MemoryPlannerPass: compiled[{i}]={compiledResult.GetFlat(i)}, eager[{i}]={eagerResult.GetFlat(i)}, diff={diff}");
+        }
+    }
+
+    #endregion
+
+    #region GradientCheckpointing Integration Tests
+
+    [Fact]
+    public void GradientCheckpointing_ProducesConsistentResults()
+    {
+        // Verify that EnableCheckpointing() doesn't change the forward output
+        var engine = new CpuEngine();
+        var input = CreateRandom(new[] { 4, 4 }, 42);
+        var w1 = CreateRandom(new[] { 4, 4 }, 43);
+        var w2 = CreateRandom(new[] { 4, 4 }, 44);
+
+        // Compiled WITHOUT checkpointing
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.ReLU(engine.TensorMatMul(input, w1));
+            engine.ReduceSum(engine.TensorMatMul(h, w2), null);
+            plan = scope.CompileTraining(new[] { w1, w2 });
+        }
+        var lossNoCheckpoint = plan.Step().GetFlat(0);
+        plan.Dispose();
+
+        // Compiled WITH checkpointing
+        CompiledTrainingPlan<float> planCk;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.ReLU(engine.TensorMatMul(input, w1));
+            engine.ReduceSum(engine.TensorMatMul(h, w2), null);
+            planCk = scope.CompileTraining(new[] { w1, w2 });
+        }
+        planCk.EnableCheckpointing(segmentSize: 2);
+        var lossCheckpoint = planCk.Step().GetFlat(0);
+        planCk.Dispose();
+
+        // Both should produce the same loss
+        float diff = MathF.Abs(lossNoCheckpoint - lossCheckpoint);
+        Assert.True(diff < 1e-4f,
+            $"Checkpointing should not change loss: no_ck={lossNoCheckpoint:F6}, ck={lossCheckpoint:F6}, diff={diff}");
+    }
+
+    #endregion
+
     #region Helpers
 
     private static Tensor<float> CreateRandom(int[] shape, int seed)

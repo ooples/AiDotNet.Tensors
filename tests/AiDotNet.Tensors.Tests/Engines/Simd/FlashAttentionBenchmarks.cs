@@ -16,7 +16,7 @@ public class FlashAttentionBenchmarks
 
     public FlashAttentionBenchmarks(ITestOutputHelper output) => _output = output;
 
-    [Theory(Skip = "Performance benchmark — run manually via run-compilation-benchmarks.sh")]
+    [Theory]
     [InlineData(64, 32, 50)]
     [InlineData(256, 64, 30)]
     [InlineData(512, 64, 20)]
@@ -63,7 +63,7 @@ public class FlashAttentionBenchmarks
             $"FlashMem: {flashMemory / 1024}KB  NaiveMem: {naiveMemory / 1024}KB");
     }
 
-    [Fact(Skip = "Performance benchmark — run manually")]
+    [Fact]
     public void FlashAttention_CausalMask_Benchmark()
     {
         int seqLen = 512, headDim = 64, iters = 20;

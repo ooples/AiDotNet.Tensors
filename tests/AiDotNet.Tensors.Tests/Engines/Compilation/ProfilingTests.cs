@@ -15,7 +15,7 @@ public class ProfilingTests
 
     public ProfilingTests(ITestOutputHelper output) => _output = output;
 
-    [Fact(Skip = "Profile benchmark — run manually")]
+    [Fact]
     public void Profile_MLP_Inference()
     {
         var engine = new CpuEngine();
@@ -47,7 +47,7 @@ public class ProfilingTests
         plan.Dispose();
     }
 
-    [Fact(Skip = "Profile benchmark — run manually")]
+    [Fact]
     public void Profile_MLP_Training()
     {
         var engine = new CpuEngine();

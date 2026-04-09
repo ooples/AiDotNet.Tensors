@@ -60,7 +60,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             return sw.Elapsed.TotalMilliseconds / iters;
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void FullMatrix_AllApproaches_MLP_Training()
         {
             var engine = new CpuEngine();
@@ -170,7 +170,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd
             _output.WriteLine("================================================================");
         }
 
-        [Fact(Skip = "Performance benchmark — run manually")]
+        [Fact]
         public void FullMatrix_AllApproaches_Inference_SingleMatMul()
         {
             int m = 32, k = 128, n = 64;

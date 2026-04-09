@@ -24,7 +24,7 @@ public class CompilationABBenchmarks
 
     #region End-to-End MLP Training
 
-    [Fact(Skip = "A/B benchmark — run manually")]
+    [Fact]
     public void MLP_Training_CompiledVsEager()
     {
         var engine = new CpuEngine();
@@ -59,7 +59,7 @@ public class CompilationABBenchmarks
 
     #region Flash Attention Scaling
 
-    [Theory(Skip = "A/B benchmark — run manually")]
+    [Theory]
     [InlineData(64, 32)]
     [InlineData(128, 64)]
     [InlineData(256, 64)]
@@ -97,7 +97,7 @@ public class CompilationABBenchmarks
 
     #region Optimizer SIMD Benchmarks
 
-    [Fact(Skip = "A/B benchmark — run manually")]
+    [Fact]
     public unsafe void Optimizer_SIMD_VsScalar()
     {
         int length = 100_000;
@@ -153,7 +153,7 @@ public class CompilationABBenchmarks
 
     #region Fused Kernel Benchmarks
 
-    [Fact(Skip = "A/B benchmark — run manually")]
+    [Fact]
     public unsafe void FusedKernels_VsUnfused()
     {
         int length = 100_000;
@@ -215,7 +215,7 @@ public class CompilationABBenchmarks
 
     #region Per-Pass A/B
 
-    [Fact(Skip = "A/B benchmark — run manually")]
+    [Fact]
     public void OptimizationPasses_IndividualImpact()
     {
         var engine = new CpuEngine();

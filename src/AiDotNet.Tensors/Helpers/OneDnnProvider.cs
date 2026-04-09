@@ -625,6 +625,45 @@ internal static class OneDnnProvider
         int softmaxAxis,
         IntPtr attr);
 
+    // Pooling forward primitive descriptor
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe int dnnl_pooling_forward_primitive_desc_create(
+        out IntPtr primitiveDesc,
+        IntPtr engine,
+        int propKind,
+        int algorithm,
+        IntPtr srcDesc,
+        IntPtr dstDesc,
+        IntPtr kernelDesc,   // int64[] kernel sizes
+        IntPtr stridesDesc,  // int64[] strides
+        IntPtr dilationDesc, // int64[] dilations (0 = no dilation)
+        IntPtr padLDesc,     // int64[] padding left
+        IntPtr padRDesc,     // int64[] padding right
+        IntPtr attr);
+
+    // Batch normalization forward primitive descriptor
+    [DllImport("dnnl", CallingConvention = CallingConvention.Cdecl)]
+    private static extern unsafe int dnnl_batch_normalization_forward_primitive_desc_create(
+        out IntPtr primitiveDesc,
+        IntPtr engine,
+        int propKind,
+        IntPtr srcDesc,
+        IntPtr dstDesc,
+        float epsilon,
+        uint flags,
+        IntPtr attr);
+
+    // Pooling algorithm constants
+    private const int DnnlPoolingMax = 0x1FF;
+    private const int DnnlPoolingAvgIncludePadding = 0x200;
+    private const int DnnlPoolingAvgExcludePadding = 0x201;
+
+    // BatchNorm flags
+    private const uint DnnlUseGlobalStats = 0x1;
+    private const uint DnnlUseScaleShift = 0x2; // oneDNN 2.x
+    private const uint DnnlUseScale = 0x10;     // oneDNN 3.x
+    private const uint DnnlUseShift = 0x20;     // oneDNN 3.x
+
     #endregion
 
     /// <summary>
@@ -1684,5 +1723,157 @@ internal static class OneDnnProvider
 
         return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Attempts MaxPool2D using oneDNN. Returns false if oneDNN is unavailable
+    /// or the primitive creation fails (letting the caller fall back to C#).
+    /// </summary>
+    internal static unsafe bool TryMaxPool2D(
+        float* input, float* output,
+        int batch, int channels, int height, int width,
+        int poolH, int poolW, int strideH, int strideW, int padH, int padW,
+        int outH, int outW)
+    {
+        if (!EnsureInitialized()) return false;
+
+        try
+        {
+            // Create memory descriptors for NCHW layout
+            long* srcDims = stackalloc long[] { batch, channels, height, width };
+            long* dstDims = stackalloc long[] { batch, channels, outH, outW };
+            long* kernel = stackalloc long[] { poolH, poolW };
+            long* strides = stackalloc long[] { strideH, strideW };
+            long* padding = stackalloc long[] { padH, padW };
+            long* dilations = stackalloc long[] { 0, 0 };
+
+            int rc;
+            IntPtr srcDesc, dstDesc;
+            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, srcDims, 1 /*f32*/, DnnlFormatTagNCHW);
+            if (rc != 0) return false;
+            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dstDims, 1 /*f32*/, DnnlFormatTagNCHW);
+            if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); return false; }
+
+            // Create pooling primitive descriptor
+            rc = dnnl_pooling_forward_primitive_desc_create(
+                out var primDesc, _engine, 1 /*forward_inference*/,
+                DnnlPoolingMax,
+                srcDesc, dstDesc,
+                (IntPtr)strides, (IntPtr)kernel, (IntPtr)dilations,
+                (IntPtr)padding, (IntPtr)padding,
+                IntPtr.Zero);
+
+            dnnl_memory_desc_destroy(srcDesc);
+            dnnl_memory_desc_destroy(dstDesc);
+
+            if (rc != 0) return false;
+
+            // Create primitive and execute
+            rc = dnnl_primitive_create(out var prim, primDesc);
+            dnnl_primitive_desc_destroy(primDesc);
+            if (rc != 0) return false;
+
+            // Create memory objects
+            var queryMd = dnnl_primitive_desc_query_md(primDesc, 14 /*query_src_md*/, 0);
+            IntPtr srcMem, dstMem;
+            dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
+            dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+
+            // Execute
+            DnnlExecArg* args = stackalloc DnnlExecArg[2];
+            args[0] = new DnnlExecArg { Arg = DnnlArgSrc, Memory = srcMem };
+            args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
+            rc = dnnl_primitive_execute(prim, _stream, 2, args);
+
+            dnnl_stream_wait(_stream);
+            dnnl_primitive_destroy(prim);
+            dnnl_memory_destroy(srcMem);
+            dnnl_memory_destroy(dstMem);
+
+            return rc == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Attempts BatchNorm inference using oneDNN. Returns false if unavailable.
+    /// Uses global stats (running mean/variance) — inference mode only.
+    /// </summary>
+    internal static unsafe bool TryBatchNorm(
+        float* input, float* output,
+        float* gamma, float* beta,
+        float* runningMean, float* runningVar,
+        int batch, int channels, int height, int width,
+        float epsilon)
+    {
+        if (!EnsureInitialized()) return false;
+
+        try
+        {
+            long* dims = stackalloc long[] { batch, channels, height, width };
+            int rc;
+            IntPtr srcDesc, dstDesc;
+            rc = dnnl_memory_desc_create_with_tag(out srcDesc, 4, dims, 1 /*f32*/, DnnlFormatTagNCHW);
+            if (rc != 0) return false;
+            rc = dnnl_memory_desc_create_with_tag(out dstDesc, 4, dims, 1 /*f32*/, DnnlFormatTagNCHW);
+            if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); return false; }
+
+            // Create batch norm primitive descriptor
+            // Flags: use global stats (inference) + scale + shift
+            uint flags = DnnlUseGlobalStats | DnnlUseScale | DnnlUseShift;
+            rc = dnnl_batch_normalization_forward_primitive_desc_create(
+                out var primDesc, _engine, 1 /*forward_inference*/,
+                srcDesc, dstDesc, epsilon, flags, IntPtr.Zero);
+
+            dnnl_memory_desc_destroy(srcDesc);
+            dnnl_memory_desc_destroy(dstDesc);
+
+            if (rc != 0) return false;
+
+            rc = dnnl_primitive_create(out var prim, primDesc);
+            dnnl_primitive_desc_destroy(primDesc);
+            if (rc != 0) return false;
+
+            // Create memory objects for src, dst, mean, variance, scale, shift
+            long* cDims = stackalloc long[] { channels };
+            IntPtr scaleDesc;
+            dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, 1, null);
+
+            IntPtr srcMem, dstMem, meanMem, varMem, scaleMem, shiftMem;
+            dnnl_memory_create(out srcMem, srcDesc, _engine, (IntPtr)input);
+            dnnl_memory_create(out dstMem, dstDesc, _engine, (IntPtr)output);
+            dnnl_memory_create(out meanMem, scaleDesc, _engine, (IntPtr)runningMean);
+            dnnl_memory_create(out varMem, scaleDesc, _engine, (IntPtr)runningVar);
+            dnnl_memory_create(out scaleMem, scaleDesc, _engine, (IntPtr)gamma);
+            dnnl_memory_create(out shiftMem, scaleDesc, _engine, (IntPtr)beta);
+            dnnl_memory_desc_destroy(scaleDesc);
+
+            DnnlExecArg* args = stackalloc DnnlExecArg[6];
+            args[0] = new DnnlExecArg { Arg = DnnlArgSrc, Memory = srcMem };
+            args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
+            args[2] = new DnnlExecArg { Arg = 3 /*DNNL_ARG_MEAN*/, Memory = meanMem };
+            args[3] = new DnnlExecArg { Arg = 4 /*DNNL_ARG_VARIANCE*/, Memory = varMem };
+            args[4] = new DnnlExecArg { Arg = 33 /*DNNL_ARG_SCALE*/, Memory = scaleMem };
+            args[5] = new DnnlExecArg { Arg = 34 /*DNNL_ARG_SHIFT*/, Memory = shiftMem };
+            rc = dnnl_primitive_execute(prim, _stream, 6, args);
+            dnnl_stream_wait(_stream);
+
+            dnnl_primitive_destroy(prim);
+            dnnl_memory_destroy(srcMem);
+            dnnl_memory_destroy(dstMem);
+            dnnl_memory_destroy(meanMem);
+            dnnl_memory_destroy(varMem);
+            dnnl_memory_destroy(scaleMem);
+            dnnl_memory_destroy(shiftMem);
+
+            return rc == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
