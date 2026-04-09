@@ -951,18 +951,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
+        // Lazy node records: Inputs = [input, gamma, beta], SavedState = [mean, variance, epsilon]
         if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
-            && step.Inputs.Length >= 5 && step.Inputs[0].IsContiguous)
+            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous
+            && step.SavedState is { Length: >= 2 }
+            && step.SavedState[0] is Tensor<T> meanTensor
+            && step.SavedState[1] is Tensor<T> varTensor)
         {
             var input = step.Inputs[0];
             var gamma = step.Inputs[1];
             var beta = step.Inputs[2];
-            var mean = step.Inputs[3];
-            var variance = step.Inputs[4];
+            var mean = meanTensor;
+            var variance = varTensor;
             var output = step.OutputBuffer;
             int channels = gamma.Length;
             float eps = 1e-5f;
-            if (step.SavedState is { Length: > 0 } && step.SavedState[0] is double epsD)
+            if (step.SavedState.Length >= 3 && step.SavedState[2] is double epsD)
                 eps = (float)epsD;
 
             var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
