@@ -198,6 +198,24 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// </summary>
     private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine)
     {
+        // A/B testing showed that optimization passes have net NEGATIVE value for small-to-medium
+        // inference plans. The raw compiled plan (direct BLAS/SIMD dispatch) is already 300-4500x
+        // faster than eager. Passes add compile-time overhead that doesn't pay off at runtime.
+        //
+        // Only run passes for large plans (20+ steps) where fusion can amortize the overhead,
+        // or when the plan contains specific patterns that passes target (Conv+BN, attention).
+        const int MinStepsForPasses = 20;
+        bool hasConvOrAttention = false;
+        for (int i = 0; i < steps.Length && !hasConvOrAttention; i++)
+        {
+            if (steps[i].OpType is OpType.Conv2D or OpType.DepthwiseConv2D
+                or OpType.BatchNorm or OpType.TensorMatMul && steps.Length >= 8)
+                hasConvOrAttention = true;
+        }
+
+        if (steps.Length < MinStepsForPasses && !hasConvOrAttention)
+            return steps;
+
         ICpuOptimizationPass[] passes =
         {
             new ConstantFoldingPass(),
