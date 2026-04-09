@@ -1124,26 +1124,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     float* pIn = (float*)inH.AddrOfPinnedObject();
                     float* pOut = (float*)outH.AddrOfPinnedObject();
                     for (int r = 0; r < rows; r++)
-                    {
-                        float* rowIn = pIn + r * cols;
-                        float* rowOut = pOut + r * cols;
-                        // Find max
-                        float maxVal = rowIn[0];
-                        for (int c = 1; c < cols; c++)
-                            if (rowIn[c] > maxVal) maxVal = rowIn[c];
-                        // Compute shifted values into output, then exp in-place
-                        for (int c = 0; c < cols; c++)
-                            rowOut[c] = rowIn[c] - maxVal;
-                        // Vectorized exp: try VML first, then SIMD fallback
-                        if (!Helpers.VmlProvider.TryExp(rowOut, rowOut, cols))
-                            SimdKernels.ExpUnsafe(rowOut, rowOut, cols);
-                        // Sum + log
-                        float sumExp = SimdKernels.SumUnsafe(rowOut, cols);
-                        float logSumExp = MathF.Log(sumExp);
-                        // Final: log_softmax = shifted - log(sumExp)
-                        for (int c = 0; c < cols; c++)
-                            rowOut[c] = (rowIn[c] - maxVal) - logSumExp;
-                    }
+                        SimdKernels.FusedLogSoftmaxRow(pIn + r * cols, pOut + r * cols, cols);
                 }
             };
         }

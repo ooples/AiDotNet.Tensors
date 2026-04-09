@@ -7723,5 +7723,82 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
     #endregion
+
+    #region Fused LogSoftmax
+
+        /// <summary>
+        /// Fused LogSoftmax for a single row: max + shift + exp + sum + log + subtract
+        /// all inlined with AVX2. Eliminates per-row function call overhead from
+        /// calling ExpUnsafe/SumUnsafe separately.
+        ///
+        /// log_softmax(x_i) = x_i - max(x) - log(sum(exp(x - max(x))))
+        /// </summary>
+        [MethodImpl(HotInline)]
+        public static unsafe void FusedLogSoftmaxRow(float* input, float* output, int cols)
+        {
+            // Pass 1: find max
+            float maxVal = input[0];
+            int c = 1;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && cols >= 8)
+            {
+                var vmax = Avx.LoadVector256(input);
+                int simdCols = cols & ~7;
+                for (c = 8; c < simdCols; c += 8)
+                    vmax = Avx.Max(vmax, Avx.LoadVector256(input + c));
+                // Horizontal max
+                // Horizontal max: reduce 256 → 128 → scalar
+                maxVal = HorizontalMax(vmax);
+                // Scalar remainder
+                for (; c < cols; c++)
+                    if (input[c] > maxVal) maxVal = input[c];
+            }
+            else
+#endif
+            {
+                for (; c < cols; c++)
+                    if (input[c] > maxVal) maxVal = input[c];
+            }
+
+            // Pass 2: fused shift + exp + sum (single scan over data)
+            float sumExp = 0f;
+            c = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported && cols >= 8)
+            {
+                var vMax = Vector256.Create(maxVal);
+                var vSum = Vector256<float>.Zero;
+                int simdCols = cols & ~7;
+                for (; c < simdCols; c += 8)
+                {
+                    var shifted = Avx.Subtract(Avx.LoadVector256(input + c), vMax);
+                    vSum = Avx.Add(vSum, FastExp256(shifted));
+                }
+                sumExp = HorizontalSum(vSum);
+            }
+#endif
+            for (; c < cols; c++)
+                sumExp += MathF.Exp(input[c] - maxVal);
+
+            float logSumExp = MathF.Log(sumExp);
+
+            // Pass 3: final output = x - max - logSumExp
+            c = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && cols >= 8)
+            {
+                var vMax = Vector256.Create(maxVal);
+                var vLSE = Vector256.Create(logSumExp);
+                var vOffset = Avx.Add(vMax, vLSE); // max + logSumExp
+                int simdCols = cols & ~7;
+                for (; c < simdCols; c += 8)
+                    Avx.Store(output + c, Avx.Subtract(Avx.LoadVector256(input + c), vOffset));
+            }
+#endif
+            for (; c < cols; c++)
+                output[c] = input[c] - maxVal - logSumExp;
+        }
+
+    #endregion
     }
 }
