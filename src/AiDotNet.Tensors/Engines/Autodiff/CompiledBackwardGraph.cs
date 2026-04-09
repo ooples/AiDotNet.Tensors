@@ -86,14 +86,25 @@ public sealed class CompiledBackwardGraph<T>
     /// When TensorCodec algebraic optimization is enabled and beneficial,
     /// delegates to OptimizedBackwardPlan for CSE + transposed BLAS.
     /// </summary>
-    public Dictionary<Tensor<T>, Tensor<T>> Execute()
+    public Dictionary<Tensor<T>, Tensor<T>> Execute() => Execute(null);
+
+    /// <summary>
+    /// Executes the compiled backward graph with an optional current loss tensor.
+    /// When currentLoss is provided, it replaces the compilation-time loss for gradient
+    /// seeding. This is necessary because persistent tapes create new loss tensors each
+    /// forward pass (via Reset + re-record), but the compiled graph's reachability indices
+    /// were computed at compilation time.
+    /// </summary>
+    internal Dictionary<Tensor<T>, Tensor<T>> Execute(Tensor<T>? currentLoss)
     {
+        var loss = currentLoss ?? _loss;
+
         // Phase C: try optimized backward with CSE + algebraic simplification
         if (Optimization.TensorCodecOptions.Current.EnableAlgebraicBackward)
         {
             var optimized = OptimizedBackwardPlan<T>.TryCreate(
-                _entries, _reachableEntryIndices, _loss, _sources, _engine);
-            if (optimized != null)
+                _entries, _reachableEntryIndices, loss, _sources, _engine);
+            if (optimized is not null)
                 return optimized.Execute();
         }
 
@@ -120,21 +131,22 @@ public sealed class CompiledBackwardGraph<T>
             Math.Min(gradIndexCount + 1, 1024),
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
-        // Seed gradient
+        // Seed gradient — use current loss (may differ from compilation-time _loss
+        // when persistent tapes Reset + re-record between steps)
         Tensor<T> seedGrad;
-        if (_loss.Length == 1)
+        if (loss.Length == 1)
         {
-            seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])_loss._shape.Clone());
+            seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }
         else
         {
-            var onesData = new T[_loss.Length];
+            var onesData = new T[loss.Length];
             var one = numOps.One;
             for (int j = 0; j < onesData.Length; j++) onesData[j] = one;
-            seedGrad = new Tensor<T>(onesData, _loss._shape);
+            seedGrad = new Tensor<T>(onesData, loss._shape);
         }
-        grads[_loss] = seedGrad;
-        if (_loss._gradIndex >= 0) indexedGrads[_loss._gradIndex] = seedGrad;
+        grads[loss] = seedGrad;
+        if (loss._gradIndex >= 0) indexedGrads[loss._gradIndex] = seedGrad;
 
         try
         {
