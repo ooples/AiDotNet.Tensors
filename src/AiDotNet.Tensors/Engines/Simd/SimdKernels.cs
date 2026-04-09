@@ -2492,22 +2492,30 @@ namespace AiDotNet.Tensors.Engines.Simd
             var r = Fma.MultiplyAddNegated(n, ln2hi, x);
             r = Fma.MultiplyAddNegated(n, ln2lo, r);
 
-            // Polynomial: exp(r) = 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 + r^6/720
-            // Horner's form: ((((c6*r + c5)*r + c4)*r + c3)*r + c2)*r + c1)*r + c0
-            var c0 = Vector256.Create(1.0f);
-            var c1 = Vector256.Create(1.0f);
+            // Polynomial: exp(r) ≈ c0 + c1*r + c2*r² + c3*r³ + c4*r⁴ + c5*r⁵ + c6*r⁶
+            // Estrin's scheme: group into pairs evaluated in parallel,
+            // reducing serial chain from 6 FMAs to 4.
+            // P(r) = (c0 + c1*r) + (c2 + c3*r)*r² + (c4 + c5*r)*r⁴ + c6*r⁶
+            var r2 = Avx.Multiply(r, r);  // r²
+
             var c2 = Vector256.Create(0.5f);
             var c3 = Vector256.Create(0.166666666666f);  // 1/6
             var c4 = Vector256.Create(0.041666666666f);  // 1/24
             var c5 = Vector256.Create(0.008333333333f);  // 1/120
             var c6 = Vector256.Create(0.001388888888f);  // 1/720
 
-            var poly = Fma.MultiplyAdd(c6, r, c5);
-            poly = Fma.MultiplyAdd(poly, r, c4);
-            poly = Fma.MultiplyAdd(poly, r, c3);
-            poly = Fma.MultiplyAdd(poly, r, c2);
-            poly = Fma.MultiplyAdd(poly, r, c1);
-            poly = Fma.MultiplyAdd(poly, r, c0);
+            // Level 1: independent pairs
+            var p01 = Fma.MultiplyAdd(Vector256.Create(1.0f), r, Vector256.Create(1.0f)); // c1*r + c0
+            var p23 = Fma.MultiplyAdd(c3, r, c2);    // c3*r + c2
+            var p45 = Fma.MultiplyAdd(c5, r, c4);    // c5*r + c4
+
+            // Level 2: combine with r²
+            var r4 = Avx.Multiply(r2, r2); // r⁴
+            var lo = Fma.MultiplyAdd(p23, r2, p01);    // (c3*r+c2)*r² + (c1*r+c0)
+            var hi = Fma.MultiplyAdd(c6, r2, p45);     // c6*r² + (c5*r+c4)
+
+            // Level 3: final
+            var poly = Fma.MultiplyAdd(hi, r4, lo);    // hi*r⁴ + lo
 
             // Reconstruct: exp(x) = 2^n * exp(r)
             // 2^n via IEEE 754: add n to the exponent bits of 1.0f (bias = 127)
