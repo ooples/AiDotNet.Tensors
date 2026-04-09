@@ -357,12 +357,18 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // Note: VML TrySigmoid (negate+exp+reciprocal) is SLOWER than polynomial
-            // FastSigmoid256 for float due to the 3-pass overhead. Keep polynomial path.
+            // CPU-adaptive dispatch:
+            // Intel (fast gather): use table-driven sigmoid (no exp, no divide)
+            // AMD (slow gather): use polynomial FastSigmoid256 (exp + divide)
+            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
+            {
+                TableDrivenSigmoid.SigmoidArray(input, output, length);
+                return;
+            }
 
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                // 4x unrolled FastSigmoid256: consistent approximation across all SIMD paths
+                // 4x unrolled FastSigmoid256: optimal for AMD Zen (polynomial path)
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
