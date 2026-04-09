@@ -152,9 +152,14 @@ internal static class OneDnnProvider
     private const int DnnlArgSrc = 1;
     private const int DnnlArgSrc0 = 1;   // For binary ops
     private const int DnnlArgSrc1 = 2;   // For binary ops
+    private const int DnnlArgBias = 3;
+    private const int DnnlArgMean = 4;    // BatchNorm running mean
     private const int DnnlArgDst = 17;
     private const int DnnlArgWeights = 33;
+    private const int DnnlArgVariance = 34; // BatchNorm running variance
     private const int DnnlArgScratchpad = 80;
+    private const int DnnlPropForwardInference = 1; // forward_inference propagation kind
+    private const int DnnlPoolingMax = 1; // max pooling algorithm
 
     // Query types
     private const int DnnlQuerySrcMd = 129;
@@ -658,7 +663,6 @@ internal static class OneDnnProvider
         IntPtr attr);
 
     // Pooling algorithm constants
-    private const int DnnlPoolingMax = 0x1FF;
     private const int DnnlPoolingAvgIncludePadding = 0x200;
     private const int DnnlPoolingAvgExcludePadding = 0x201;
 
@@ -1760,7 +1764,7 @@ internal static class OneDnnProvider
 
             // Create pooling primitive descriptor
             rc = dnnl_pooling_forward_primitive_desc_create(
-                out var primDesc, _engine, 1 /*forward_inference*/,
+                out var primDesc, _engine, DnnlPropForwardInference,
                 DnnlPoolingMax,
                 srcDesc, dstDesc,
                 (IntPtr)strides, (IntPtr)kernel, (IntPtr)dilations,
@@ -1839,7 +1843,7 @@ internal static class OneDnnProvider
             // Flags: use global stats (inference) + scale + shift
             uint flags = DnnlUseGlobalStats | DnnlUseScale | DnnlUseShift;
             rc = dnnl_batch_normalization_forward_primitive_desc_create(
-                out var primDesc, _engine, 1 /*forward_inference*/,
+                out var primDesc, _engine, DnnlPropForwardInference,
                 srcDesc, dstDesc, epsilon, flags, IntPtr.Zero);
 
             if (rc != 0)
@@ -1879,10 +1883,10 @@ internal static class OneDnnProvider
             DnnlExecArg* args = stackalloc DnnlExecArg[6];
             args[0] = new DnnlExecArg { Arg = DnnlArgSrc, Memory = srcMem };
             args[1] = new DnnlExecArg { Arg = DnnlArgDst, Memory = dstMem };
-            args[2] = new DnnlExecArg { Arg = 3 /*DNNL_ARG_MEAN*/, Memory = meanMem };
-            args[3] = new DnnlExecArg { Arg = 4 /*DNNL_ARG_VARIANCE*/, Memory = varMem };
-            args[4] = new DnnlExecArg { Arg = 33 /*DNNL_ARG_SCALE*/, Memory = scaleMem };
-            args[5] = new DnnlExecArg { Arg = 34 /*DNNL_ARG_SHIFT*/, Memory = shiftMem };
+            args[2] = new DnnlExecArg { Arg = DnnlArgMean, Memory = meanMem };
+            args[3] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = varMem };
+            args[4] = new DnnlExecArg { Arg = DnnlArgWeights, Memory = scaleMem }; // BN scale uses WEIGHTS arg
+            args[5] = new DnnlExecArg { Arg = DnnlArgVariance, Memory = shiftMem }; // BN shift uses VARIANCE+1
             rc = dnnl_primitive_execute(prim, _stream, 6, args);
             dnnl_stream_wait(_stream);
 
