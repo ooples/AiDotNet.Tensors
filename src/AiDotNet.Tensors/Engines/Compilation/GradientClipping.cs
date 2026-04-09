@@ -36,7 +36,9 @@ public static class GradientClipping
         for (int g = 0; g < gradients.Length; g++)
         {
             if (gradients[g] is null) continue;
-            var data = gradients[g].GetDataArray();
+            // Ensure contiguous — GetDataArray may return a copy for views
+            var grad = gradients[g].IsContiguous ? gradients[g] : gradients[g].Contiguous();
+            var data = grad.GetDataArray();
             int len = data.Length;
             int i = 0;
 

@@ -6,13 +6,8 @@ namespace AiDotNet.Tensors.Engines.Optimization;
 /// <summary>
 /// Phase 5.1: Tensor lifetime analysis and buffer reuse for compiled inference plans.
 ///
-/// Analyzes the dataflow graph to determine when each intermediate tensor's buffer
-/// is last consumed. Buffers whose lifetime has ended can be reused by later ops,
-/// reducing peak memory allocation.
-///
-/// IMPORTANT: Only safe for inference plans (no backward pass). Training plans
-/// need all intermediate tensors alive for backward, so this pass must not be
-/// applied to CompiledTrainingPlan.
+/// Only safe for inference plans (no backward pass). Training plans need all
+/// intermediate tensors alive for backward.
 /// </summary>
 internal sealed class MemoryPlannerPass : ICpuOptimizationPass
 {
@@ -24,15 +19,11 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
     {
         if (!IsEnabled || steps.Length < 3) return null;
 
-        // Phase 1: Compute last-use index for each tensor
         var lastUse = ComputeLastUseIndices(steps);
 
-        // Phase 2: Build pool of reusable buffers and rewrite references.
-        // Key insight: when we reuse buffer A for step j's output, ALL subsequent
-        // steps that reference step j's output as an input must be updated to
-        // point at buffer A instead.
-        var availablePool = new Dictionary<int, Queue<Tensor<T>>>();
+        var availablePool = new Dictionary<string, Queue<Tensor<T>>>();
         var reuseMap = new Dictionary<Tensor<T>, Tensor<T>>();
+        var enqueuedThisStep = new HashSet<Tensor<T>>();
         int reusedCount = 0;
 
         var result = new CompiledStep<T>[steps.Length];
@@ -40,8 +31,9 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
         for (int i = 0; i < steps.Length; i++)
         {
             var step = steps[i];
+            enqueuedThisStep.Clear();
 
-            // Rewrite this step's inputs to use remapped buffers
+            // Rewrite inputs to use remapped buffers
             var newInputs = step.Inputs;
             bool anyRemapped = false;
             for (int inp = 0; inp < newInputs.Length; inp++)
@@ -57,37 +49,38 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
                 }
             }
 
-            // Return consumed buffers to pool (after this step reads them for the last time)
+            // Return consumed buffers to pool (keyed by shape string, not just length)
             foreach (var inp in step.Inputs)
             {
                 var actualInp = reuseMap.TryGetValue(inp, out var r) ? r : inp;
                 if (lastUse.TryGetValue(inp, out int lastIdx) && lastIdx == i
-                    && actualInp.Length > 0)
+                    && !enqueuedThisStep.Contains(actualInp))
                 {
-                    int count = actualInp.Length;
-                    if (!availablePool.ContainsKey(count))
-                        availablePool[count] = new Queue<Tensor<T>>();
-                    availablePool[count].Enqueue(actualInp);
+                    string shapeKey = ShapeKey(actualInp._shape);
+                    if (!availablePool.ContainsKey(shapeKey))
+                        availablePool[shapeKey] = new Queue<Tensor<T>>();
+                    availablePool[shapeKey].Enqueue(actualInp);
+                    enqueuedThisStep.Add(actualInp);
                 }
             }
 
-            // Try to reuse a buffer for this step's output
+            // Try to reuse a buffer with matching SHAPE for this step's output
             var output = step.OutputBuffer;
-            // Don't reuse for the last step's output (returned to caller)
-            if (i < steps.Length - 1
-                && availablePool.TryGetValue(output.Length, out var pool)
-                && pool.Count > 0)
+            if (i < steps.Length - 1)
             {
-                var reusedBuffer = pool.Dequeue();
-                if (!ReferenceEquals(reusedBuffer, output))
+                string outKey = ShapeKey(output._shape);
+                if (availablePool.TryGetValue(outKey, out var pool) && pool.Count > 0)
                 {
-                    reuseMap[output] = reusedBuffer;
-                    output = reusedBuffer;
-                    reusedCount++;
+                    var reusedBuffer = pool.Dequeue();
+                    if (!ReferenceEquals(reusedBuffer, output))
+                    {
+                        reuseMap[output] = reusedBuffer;
+                        output = reusedBuffer;
+                        reusedCount++;
+                    }
                 }
             }
 
-            // Build the (possibly rewritten) step
             if (anyRemapped || !ReferenceEquals(output, step.OutputBuffer))
             {
                 var capturedExec = step.Execute;
@@ -97,7 +90,7 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
                     (eng, o) => capturedExec(eng, capturedOutput),
                     output,
                     newInputs,
-                    null, // No backward for inference plans
+                    null,
                     step.SavedState);
             }
             else
@@ -109,9 +102,12 @@ internal sealed class MemoryPlannerPass : ICpuOptimizationPass
         return reusedCount > 0 ? result : null;
     }
 
-    /// <summary>
-    /// Computes the last step index at which each tensor is consumed as an input.
-    /// </summary>
+    private static string ShapeKey(int[] shape)
+    {
+        if (shape.Length == 1) return shape[0].ToString();
+        return string.Join(",", shape);
+    }
+
     internal static Dictionary<object, int> ComputeLastUseIndices<T>(CompiledStep<T>[] steps)
     {
         var lastUse = new Dictionary<object, int>();

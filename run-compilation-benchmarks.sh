@@ -4,8 +4,8 @@
 #
 # Usage:
 #   ./run-compilation-benchmarks.sh              # Run all compilation benchmarks
-#   ./run-compilation-benchmarks.sh --quick      # Quick mode (fewer iterations)
-#   ./run-compilation-benchmarks.sh --vs-pytorch # Full BDN vs PyTorch suite
+#   ./run-compilation-benchmarks.sh --vs-pytorch # Full BDN vs PyTorch suite (~40min)
+#   ./run-compilation-benchmarks.sh --vs-autograd # Autograd comparison benchmarks
 #
 # Output: results printed to stdout. Pipe to file for baseline:
 #   ./run-compilation-benchmarks.sh > benchmark_results_$(date +%Y%m%d).txt

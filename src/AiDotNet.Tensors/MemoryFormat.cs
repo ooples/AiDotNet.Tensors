@@ -7,9 +7,7 @@ namespace AiDotNet.Tensors;
 /// NHWC (channels-last) is faster on modern CPUs with AVX2/AVX-512 because it enables
 /// better vectorization of per-channel operations.
 ///
-/// Usage:
-///   var input = tensor.ToFormat(MemoryFormat.ChannelsLast);
-///   var output = engine.Conv2D(input, kernel); // uses NHWC path
+/// Convert between formats using NhwcConv.NchwToNhwc / NhwcToNchw.
 ///
 /// PyTorch equivalent: torch.channels_last
 /// </summary>

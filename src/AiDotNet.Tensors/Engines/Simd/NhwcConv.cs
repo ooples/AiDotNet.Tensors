@@ -67,17 +67,22 @@ internal static class NhwcConv
     /// General Conv2D in NHWC layout using im2col + GEMM.
     /// Kernel stored as [outChannels, inChannels * kernelH * kernelW] (row-major).
     /// </summary>
+    /// <param name="workspace">Pre-allocated workspace of size [outH*outW, inChannels*kernelH*kernelW].
+    /// Pass null to allocate internally (adds GC pressure on hot paths).</param>
     internal static void Conv2DNhwc(
         float[] inputNhwc, float[] kernelFlat, float[] outputNhwc,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW,
-        int outH, int outW)
+        int outH, int outW,
+        float[]? workspace = null)
     {
         int patchLen = inChannels * kernelH * kernelW;
         int spatialOut = outH * outW;
-        var workspace = new float[spatialOut * patchLen];
+        int needed = spatialOut * patchLen;
+        if (workspace is null || workspace.Length < needed)
+            workspace = new float[needed];
 
         for (int b = 0; b < batch; b++)
         {

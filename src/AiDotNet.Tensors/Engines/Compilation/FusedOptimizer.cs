@@ -572,8 +572,6 @@ internal static class FusedOptimizer
         if (Fma.IsSupported && length >= 8)
         {
             var vL1 = Vector256.Create(l1Reg);
-            var vL2 = Vector256.Create(l2Reg);
-            var vLrInv = Vector256.Create(1f / lr);
             var vNegOne = Vector256.Create(-1f);
             var vOne = Vector256.Create(1f);
             var vZero = Vector256<float>.Zero;

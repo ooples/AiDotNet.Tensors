@@ -99,17 +99,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
     public void EnableCheckpointing(int segmentSize = 0)
     {
-        // Convert forward actions back to steps for checkpointing
-        // (checkpointing wraps the forward step array)
-        _checkpointing = new GradientCheckpointing<T>(
-            _forwardActions.Select((a, i) =>
-            {
-                // Wrap each Action<IEngine> as a CompiledStep with a placeholder output
-                var output = i < _parameters.Length ? _parameters[i] : _lossOutput;
-                return new CompiledStep<T>("Checkpoint", (eng, o) => a(eng), output,
-                    Array.Empty<Tensor<T>>(), null, null);
-            }).ToArray(),
-            _engine, segmentSize);
+        // Wrap forward actions as CompiledSteps for the checkpointing system.
+        // Each action writes to _lossOutput as a pass-through output reference —
+        // the actual outputs are in the action's captured closures.
+        var wrappedSteps = new CompiledStep<T>[_forwardActions.Length];
+        for (int i = 0; i < _forwardActions.Length; i++)
+        {
+            var action = _forwardActions[i];
+            wrappedSteps[i] = new CompiledStep<T>(
+                "Forward_" + i,
+                (eng, o) => action(eng),
+                _lossOutput, // Shared output reference — checkpointing only needs execute
+                Array.Empty<Tensor<T>>(),
+                null, null);
+        }
+        _checkpointing = new GradientCheckpointing<T>(wrappedSteps, _engine, segmentSize);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -250,9 +254,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 lr, b1, b2, epsVal, wd, _optimizerStep);
                             break;
                         default:
-                            // Fallback: scalar SGD
-                            FusedOptimizer.SgdUpdateSimd(pParam, pGrad, len, lr);
-                            break;
+                            throw new NotSupportedException(
+                                $"Optimizer type {optType} is not yet supported by ConfigureOptimizer. " +
+                                $"Supported: SGD, Adam, AdamW. Apply gradients manually for other types.");
                     }
                 }
             }
