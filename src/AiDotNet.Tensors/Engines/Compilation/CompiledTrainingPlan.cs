@@ -560,6 +560,49 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Concat forward: direct Buffer.BlockCopy for axis=0 contiguous tensors
+        if ((step.OpName == "Concatenate" || step.OpName == "Concat")
+            && step.Inputs.Length >= 2 && typeof(T) == typeof(float))
+        {
+            // Check all inputs are contiguous
+            bool allContiguous = true;
+            for (int j = 0; j < step.Inputs.Length; j++)
+                if (!step.Inputs[j].IsContiguous) { allContiguous = false; break; }
+
+            if (allContiguous)
+            {
+                // Check if axis=0 (SavedState[0] should be the axis)
+                int axis = 0;
+                if (step.SavedState is { Length: > 0 } && step.SavedState[0] is int a)
+                    axis = a;
+
+                if (axis == 0)
+                {
+                    // Pre-pin all input arrays + output array
+                    var inputArrays = new float[step.Inputs.Length][];
+                    var inputLengths = new int[step.Inputs.Length];
+                    for (int j = 0; j < step.Inputs.Length; j++)
+                    {
+                        inputArrays[j] = (float[])(object)step.Inputs[j].GetDataArray();
+                        inputLengths[j] = step.Inputs[j].Length;
+                    }
+                    var outArr = (float[])(object)step.OutputBuffer.GetDataArray();
+                    var capturedInputArrays = inputArrays;
+                    var capturedLengths = inputLengths;
+
+                    return eng =>
+                    {
+                        int offset = 0;
+                        for (int j = 0; j < capturedInputArrays.Length; j++)
+                        {
+                            Buffer.BlockCopy(capturedInputArrays[j], 0, outArr, offset * 4, capturedLengths[j] * 4);
+                            offset += capturedLengths[j];
+                        }
+                    };
+                }
+            }
+        }
+
         // ReduceMax forward: pinned SIMD for single-output max
         if (step.OpName == "ReduceMax" && step.Inputs.Length == 1
             && step.OutputBuffer.Length == 1 && typeof(T) == typeof(float)
