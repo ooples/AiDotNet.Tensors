@@ -2902,15 +2902,8 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void SetSliceLastAxis(IGpuBuffer output, IGpuBuffer values, int outerSize, int outputInnerSize, int start, int sliceSize);
 
     /// <summary>
-    /// Slices a tensor along any axis. Generalizes SliceLastAxis by accounting for the
-    /// stride between elements along the sliced axis.
+    /// Slices a tensor along any axis by selecting a single index.
     /// </summary>
-    /// <param name="input">Source GPU buffer.</param>
-    /// <param name="output">Destination GPU buffer (outerSize * stride elements).</param>
-    /// <param name="outerSize">Product of dimensions before the axis.</param>
-    /// <param name="axisSize">Size of the dimension being sliced.</param>
-    /// <param name="stride">Product of dimensions after the axis (elements per index along axis).</param>
-    /// <param name="index">Which index along the axis to select.</param>
     void SliceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int stride, int index);
 
     /// <summary>

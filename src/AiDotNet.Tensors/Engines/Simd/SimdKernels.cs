@@ -1367,6 +1367,35 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static unsafe float SumUnsafe(float* data, int length)
         {
+            // For large arrays, use PersistentParallelExecutor to saturate memory bandwidth
+            // across all CPU cores — matching PyTorch's OpenMP approach with zero-allocation,
+            // near-zero dispatch overhead (pre-spawned threads, spin-wait barrier).
+            if (length >= 262144) // 1MB threshold
+            {
+                var executor = Helpers.PersistentParallelExecutor.Instance;
+                int nChunks = Math.Min(Environment.ProcessorCount, 16);
+                int chunkSize = length / nChunks;
+                var partials = new float[nChunks];
+                var capturedData = data;
+                executor.Execute(nChunks, chunk =>
+                {
+                    int start = chunk * chunkSize;
+                    int count = (chunk == nChunks - 1) ? length - start : chunkSize;
+                    if (count > 0) partials[chunk] = SumUnsafeCore(capturedData + start, count);
+                });
+                float total = 0f;
+                for (int c = 0; c < nChunks; c++) total += partials[c];
+                return total;
+            }
+            return SumUnsafeCore(data, length);
+        }
+
+        /// <summary>
+        /// Core single-threaded SIMD sum with 8-way accumulation.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static unsafe float SumUnsafeCore(float* data, int length)
+        {
             int i = 0;
             float sum = 0f;
 #if NET5_0_OR_GREATER
