@@ -2245,7 +2245,7 @@ public class CpuEngine : ITensorLevelEngine
             if (subChunks >= 2)
             {
                 int chunkSize = (length + subChunks - 1) / subChunks;
-                chunkSize = (chunkSize + 15) & ~15; // Align to AVX double boundary (4 doubles)
+                chunkSize = (chunkSize + 15) & ~15;
                 IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
                 int totalLength = length;
                 Parallel.For(0, subChunks, chunk =>
