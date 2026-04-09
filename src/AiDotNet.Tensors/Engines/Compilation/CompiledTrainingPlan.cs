@@ -1150,6 +1150,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Exp forward: pinned ExpUnsafe SIMD
+        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
+            && typeof(T) == typeof(float))
+        {
+            var inp = step.Inputs[0]; var o = step.OutputBuffer;
+            var inH = PinAndTrack(
+                ((Tensor<float>)(object)inp).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(
+                ((Tensor<float>)(object)o).GetDataArray(), handleTracker);
+            int len = inp.Length;
+            return eng =>
+            {
+                unsafe { SimdKernels.ExpUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+            };
+        }
+
         // Sqrt forward: direct SIMD SqrtUnsafe into output buffer
         if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {

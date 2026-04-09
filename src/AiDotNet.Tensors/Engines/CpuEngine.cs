@@ -16821,8 +16821,16 @@ public class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("ReduceMean", earlyResult, eng => earlyResult);
             return earlyResult;
         }
-        // Fast path: reduce all axes (axes == null) — just sum/count
-        if ((axes == null || axes.Length == 0) && input.IsContiguous)
+        // Fast path: reduce all axes — just sum/count
+        // Also catches 1D tensors with axes=[0] since that's equivalent to full reduction
+        bool isFullReduction = axes == null || axes.Length == 0;
+        if (!isFullReduction && input.IsContiguous && axes is not null)
+        {
+            var axisSet = new HashSet<int>();
+            foreach (int a in axes) axisSet.Add(a < 0 ? input.Rank + a : a);
+            isFullReduction = axisSet.Count == input.Rank;
+        }
+        if (isFullReduction && input.IsContiguous)
         {
             if (typeof(T) == typeof(float))
             {
