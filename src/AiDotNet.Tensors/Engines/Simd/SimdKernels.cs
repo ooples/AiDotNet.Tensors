@@ -2787,19 +2787,17 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         internal static Vector256<float> FastSigmoid256(Vector256<float> x)
         {
-            // sigmoid(x) = 1 / (1 + exp(-x))
-            var negX = Avx.Subtract(Vector256<float>.Zero, x);
-            var expNegX = FastExp256(negX);
-            return Avx.Divide(Vector256.Create(1.0f), Avx.Add(Vector256.Create(1.0f), expNegX));
+            // Padé [3,3] fused sigmoid: single divide, parallel P/Q computation
+            return PadeSigmoid.Sigmoid8(x);
         }
 
-        /// <summary>Fast vectorized tanh via 2*sigmoid(2x) - 1.</summary>
+        /// <summary>Fast vectorized tanh via 2*PadeSigmoid(2x) - 1.</summary>
         [MethodImpl(HotInline)]
         internal static Vector256<float> FastTanh256(Vector256<float> x)
         {
             var two = Vector256.Create(2f);
             var one = Vector256.Create(1f);
-            return Avx.Subtract(Avx.Multiply(two, FastSigmoid256(Avx.Multiply(two, x))), one);
+            return Avx.Subtract(Avx.Multiply(two, PadeSigmoid.Sigmoid8(Avx.Multiply(two, x))), one);
         }
 
         /// <summary>
@@ -7731,77 +7729,63 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// in a single inline AVX2 pass, eliminating the FastTanh→FastSigmoid→FastExp call chain.
         /// </summary>
         [MethodImpl(HotInline)]
+        /// <summary>
+        /// Fused GELU using Padé sigmoid: GELU(x) = x * sigmoid(arg)
+        /// where arg = 2 * sqrt(2/pi) * (x + 0.044715*x^3).
+        ///
+        /// Mathematical simplification: GELU = 0.5*x*(1+tanh(s)) = 0.5*x*(1+2*sig(2s)-1) = x*sig(2s)
+        /// This eliminates the tanh→sigmoid→exp chain entirely.
+        /// Uses Padé [3,3] sigmoid with parallel even/odd computation.
+        /// </summary>
         public static unsafe void FusedGELUUnsafe(float* input, float* output, int length)
         {
             int i = 0;
 #if NET5_0_OR_GREATER
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                // 2 * sqrt(2/pi) = 1.5957691216...
+                var vScale = Vector256.Create(1.5957691216057308f);
                 var vCoeff = Vector256.Create(0.044715f);
 
                 int simdLen = length & ~31;
                 for (; i < simdLen; i += 32)
                 {
-                    // Unroll 4x for ILP
                     var x0 = Avx.LoadVector256(input + i);
                     var x1 = Avx.LoadVector256(input + i + 8);
                     var x2 = Avx.LoadVector256(input + i + 16);
                     var x3 = Avx.LoadVector256(input + i + 24);
 
-                    // inner = sqrt(2/pi) * (x + 0.044715 * x^3)
-                    var inner0 = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x0, x0), x0), x0));
-                    var inner1 = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x1, x1), x1), x1));
-                    var inner2 = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x2, x2), x2), x2));
-                    var inner3 = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x3, x3), x3), x3));
+                    // arg = 2*sqrt(2/pi) * (x + 0.044715*x^3)
+                    var arg0 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x0, x0), x0), x0));
+                    var arg1 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x1, x1), x1), x1));
+                    var arg2 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x2, x2), x2), x2));
+                    var arg3 = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x3, x3), x3), x3));
 
-                    // tanh(inner) = 2*sigmoid(2*inner) - 1 = (1 - exp(-2*inner)) / (1 + exp(-2*inner))
-                    // Direct: exp(-2*inner), then (1-e)/(1+e) — single exp + single divide
-                    var e0 = FastExp256(Avx.Multiply(Avx.Subtract(Vector256<float>.Zero, vTwo), inner0));
-                    var e1 = FastExp256(Avx.Multiply(Avx.Subtract(Vector256<float>.Zero, vTwo), inner1));
-                    var e2 = FastExp256(Avx.Multiply(Avx.Subtract(Vector256<float>.Zero, vTwo), inner2));
-                    var e3 = FastExp256(Avx.Multiply(Avx.Subtract(Vector256<float>.Zero, vTwo), inner3));
-
-                    var t0 = Avx.Divide(Avx.Subtract(vOne, e0), Avx.Add(vOne, e0));
-                    var t1 = Avx.Divide(Avx.Subtract(vOne, e1), Avx.Add(vOne, e1));
-                    var t2 = Avx.Divide(Avx.Subtract(vOne, e2), Avx.Add(vOne, e2));
-                    var t3 = Avx.Divide(Avx.Subtract(vOne, e3), Avx.Add(vOne, e3));
-
-                    // result = 0.5 * x * (1 + tanh)
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x0, Avx.Add(vOne, t0))));
-                    Avx.Store(output + i + 8, Avx.Multiply(vHalf, Avx.Multiply(x1, Avx.Add(vOne, t1))));
-                    Avx.Store(output + i + 16, Avx.Multiply(vHalf, Avx.Multiply(x2, Avx.Add(vOne, t2))));
-                    Avx.Store(output + i + 24, Avx.Multiply(vHalf, Avx.Multiply(x3, Avx.Add(vOne, t3))));
+                    // GELU = x * sigmoid(arg) — single Padé sigmoid call, no tanh
+                    Avx.Store(output + i, Avx.Multiply(x0, PadeSigmoid.Sigmoid8(arg0)));
+                    Avx.Store(output + i + 8, Avx.Multiply(x1, PadeSigmoid.Sigmoid8(arg1)));
+                    Avx.Store(output + i + 16, Avx.Multiply(x2, PadeSigmoid.Sigmoid8(arg2)));
+                    Avx.Store(output + i + 24, Avx.Multiply(x3, PadeSigmoid.Sigmoid8(arg3)));
                 }
             }
             if (Avx2.IsSupported && Fma.IsSupported && length - i >= 8)
             {
-                var vHalf = Vector256.Create(0.5f);
-                var vOne = Vector256.Create(1.0f);
-                var vTwo = Vector256.Create(2.0f);
-                var vSqrt2OverPi = Vector256.Create(0.7978845608028654f);
+                var vScale = Vector256.Create(1.5957691216057308f);
                 var vCoeff = Vector256.Create(0.044715f);
                 int simdLen = i + ((length - i) & ~7);
                 for (; i < simdLen; i += 8)
                 {
                     var x = Avx.LoadVector256(input + i);
-                    var inner = Avx.Multiply(vSqrt2OverPi, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x, x), x), x));
-                    var e = FastExp256(Avx.Multiply(Avx.Subtract(Vector256<float>.Zero, vTwo), inner));
-                    var t = Avx.Divide(Avx.Subtract(vOne, e), Avx.Add(vOne, e));
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, t))));
+                    var arg = Avx.Multiply(vScale, Fma.MultiplyAdd(vCoeff, Avx.Multiply(Avx.Multiply(x, x), x), x));
+                    Avx.Store(output + i, Avx.Multiply(x, PadeSigmoid.Sigmoid8(arg)));
                 }
             }
 #endif
             for (; i < length; i++)
             {
                 float x = input[i];
-                float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-                float e = MathF.Exp(-2f * inner);
-                float t = (1f - e) / (1f + e);
-                output[i] = 0.5f * x * (1f + t);
+                float arg = 1.5957691216057308f * (x + 0.044715f * x * x * x);
+                output[i] = x * PadeSigmoid.Sigmoid(arg);
             }
         }
 

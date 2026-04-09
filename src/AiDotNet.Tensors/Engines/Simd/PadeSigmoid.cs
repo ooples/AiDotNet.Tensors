@@ -83,6 +83,26 @@ internal static class PadeSigmoid
     }
 #endif
 
+    /// <summary>Scalar Padé [3,3] sigmoid.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float Sigmoid(float x)
+    {
+        float negX = -x;
+        float n = MathF.Round(negX * 1.44269504088896341f);
+        float r = negX - n * 0.6931471805599453f;
+        float r2 = r * r;
+        float r3 = r2 * r;
+        float even = 1f + r2 * 0.1f;
+        float odd = r * 0.5f + r3 / 120f;
+        float P = even + odd;
+        float Q = even - odd;
+        int nInt = (int)n;
+        int bits = (nInt + 127) << 23;
+        float pow2n = Unsafe.As<int, float>(ref bits);
+        float denom = Q + pow2n * P;
+        return MathF.Max(0f, MathF.Min(1f, Q / denom));
+    }
+
     /// <summary>
     /// Process array using Padé sigmoid.
     /// </summary>
@@ -110,18 +130,6 @@ internal static class PadeSigmoid
         }
 #endif
         for (; i < length; i++)
-        {
-            float negX = -input[i];
-            float n = MathF.Round(negX * 1.44269504088896341f);
-            float r = negX - n * 0.6931471805599453f;
-            float r2_12 = r * r / 12f;
-            float P = 1f + r / 2f + r2_12;
-            float Q = 1f - r / 2f + r2_12;
-            int nInt = (int)n;
-            int bits = (nInt + 127) << 23;
-            float pow2n = Unsafe.As<int, float>(ref bits);
-            float denom = Q + pow2n * P;
-            output[i] = MathF.Max(0f, MathF.Min(1f, Q / denom));
-        }
+            output[i] = Sigmoid(input[i]);
     }
 }
