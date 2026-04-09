@@ -37,10 +37,10 @@ public class TableDrivenExpABTest
         float* pOutTable = (float*)hOutTable.AddrOfPinnedObject();
         float* pOutEstrin = (float*)hOutEstrin.AddrOfPinnedObject();
 
-        // Path A: Table-driven exp (NEW)
+        // Path A: Schraudolph exp with correction (NEW)
         double tableMs = Measure(() =>
         {
-            TableDrivenExp.ExpArray(pIn, pOutTable, length);
+            SchraudolphExp.ExpArray(pIn, pOutTable, length);
         }, warmup, iters);
 
         // Path B: Current Estrin polynomial exp
@@ -79,12 +79,12 @@ public class TableDrivenExpABTest
         double avgErrEstrin = sumErrEstrin / length;
 
         _output.WriteLine($"exp({length:N0} elements):");
-        _output.WriteLine($"  Table-driven: {tableMs:F3}ms   (max err: {maxErrTable:E2}, avg err: {avgErrTable:E2})");
+        _output.WriteLine($"  Schraudolph:  {tableMs:F3}ms   (max err: {maxErrTable:E2}, avg err: {avgErrTable:E2})");
         _output.WriteLine($"  Estrin poly:  {estrinMs:F3}ms   (max err: {maxErrEstrin:E2}, avg err: {avgErrEstrin:E2})");
         _output.WriteLine($"  Scalar:       {scalarMs:F3}ms   (reference)");
         _output.WriteLine($"");
-        _output.WriteLine($"  Table vs Estrin speedup: {estrinMs / tableMs:F2}x");
-        _output.WriteLine($"  Table vs Scalar speedup: {scalarMs / tableMs:F2}x");
+        _output.WriteLine($"  Schraudolph vs Estrin speedup: {estrinMs / tableMs:F2}x");
+        _output.WriteLine($"  Schraudolph vs Scalar speedup: {scalarMs / tableMs:F2}x");
         _output.WriteLine($"  PyTorch exp BDN: ~{(length == 1_000_000 ? "0.654" : "0.069")}ms");
 
         // Accuracy threshold: must be within float32 precision (~1.2e-7)
