@@ -104,4 +104,82 @@ public class CompiledTrainingPlanRebindingTests
 
         Assert.NotEqual(val1, val2);
     }
+
+    [Fact]
+    public void MLP_WithMSELoss_CompiledPlan_ProducesNonZeroGradients()
+    {
+        var engine = new CpuEngine();
+
+        // Simulate DenseLayer: input @ w1 + b1, relu, then @ w2 + b2, then MSE loss
+        var input = Tensor<float>.CreateRandom([16, 4]);
+        var w1 = Tensor<float>.CreateRandom([4, 8]);
+        var b1 = Tensor<float>.CreateRandom([8]);
+        var w2 = Tensor<float>.CreateRandom([8, 2]);
+        var b2 = Tensor<float>.CreateRandom([2]);
+        var target = Tensor<float>.CreateRandom([16, 2]);
+
+        var cache = new CompiledModelCache<float>();
+        var plan = cache.GetOrCompileTraining(
+            input._shape,
+            () =>
+            {
+                var h = engine.FusedLinear(input, w1, b1, FusedActivationType.None);
+                h = engine.ReLU(h);
+                var pred = engine.FusedLinear(h, w2, b2, FusedActivationType.None);
+                var diff = engine.TensorSubtract(pred, target);
+                var sq = engine.TensorMultiply(diff, diff);
+                engine.ReduceSum(sq, null);
+            },
+            new[] { w1, b1, w2, b2 });
+
+        var loss = plan.Step();
+        float gradNorm = 0;
+        int nullCount = 0;
+        for (int i = 0; i < plan.Gradients.Length; i++)
+        {
+            var g = plan.Gradients[i];
+            if (g is null) { nullCount++; continue; }
+            var arr = g.GetDataArray();
+            for (int j = 0; j < arr.Length; j++)
+                gradNorm += arr[j] * arr[j];
+        }
+
+        Assert.True(gradNorm > 0,
+            $"Gradient L2 norm is {gradNorm:F6}. {nullCount} null gradients out of {plan.Gradients.Length}. " +
+            $"Loss: {loss[0]:F4}. MLP backward produced no gradients.");
+    }
+
+    [Fact]
+    public void FusedLinear_CompiledPlan_ProducesNonZeroGradients()
+    {
+        var engine = new CpuEngine();
+
+        var input = Tensor<float>.CreateRandom([4, 3]);
+        var weight = Tensor<float>.CreateRandom([3, 2]);
+        var bias = Tensor<float>.CreateRandom([2]);
+
+        var cache = new CompiledModelCache<float>();
+        var plan = cache.GetOrCompileTraining(
+            input._shape,
+            () =>
+            {
+                var h = engine.FusedLinear(input, weight, bias, FusedActivationType.ReLU);
+                engine.ReduceSum(h, null);
+            },
+            new[] { weight, bias });
+
+        var loss = plan.Step();
+        float gradNorm = 0;
+        foreach (var g in plan.Gradients)
+        {
+            if (g is not null)
+            {
+                var arr = g.GetDataArray();
+                for (int i = 0; i < arr.Length; i++)
+                    gradNorm += arr[i] * arr[i];
+            }
+        }
+
+        Assert.True(gradNorm > 0, $"Gradient L2 norm is {gradNorm} — backward produced no gradients for FusedLinear parameters");
+    }
 }
