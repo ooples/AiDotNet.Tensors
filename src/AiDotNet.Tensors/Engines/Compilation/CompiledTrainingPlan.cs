@@ -560,6 +560,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // ReduceMax forward: pinned SIMD for single-output max
+        if (step.OpName == "ReduceMax" && step.Inputs.Length == 1
+            && step.OutputBuffer.Length == 1 && typeof(T) == typeof(float)
+            && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            int len = input.Length;
+            float[]? cOut = null;
+
+            return eng =>
+            {
+                cOut ??= (float[])(object)output.GetDataArray();
+                unsafe
+                {
+                    float* p = (float*)inH.AddrOfPinnedObject();
+                    float maxVal = p[0];
+                    for (int j = 1; j < len; j++)
+                        if (p[j] > maxVal) maxVal = p[j];
+                    cOut[0] = maxVal;
+                }
+            };
+        }
+
         // TensorAdd forward: pinned SIMD VectorAddUnsafe
         if (step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
@@ -925,9 +950,85 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // BatchNorm/LayerNorm: don't specialize — the generic execute delegate
-        // (from the lazy node) already handles these correctly. Specializing adds
-        // an extra allocate+copy on top of what the generic path already does.
+        // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
+        if (step.OpType == OpType.BatchNorm && typeof(T) == typeof(float)
+            && step.Inputs.Length >= 5 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var mean = step.Inputs[3];
+            var variance = step.Inputs[4];
+            var output = step.OutputBuffer;
+            int channels = gamma.Length;
+            float eps = 1e-5f;
+            if (step.SavedState is { Length: > 0 } && step.SavedState[0] is double epsD)
+                eps = (float)epsD;
+
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
+            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
+            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
+            var meanH = PinAndTrack(((Tensor<float>)(object)mean).GetDataArray(), handleTracker);
+            var varH = PinAndTrack(((Tensor<float>)(object)variance).GetDataArray(), handleTracker);
+            int length = input.Length;
+            float capturedEps = eps;
+
+            return eng =>
+            {
+                unsafe
+                {
+                    Simd.FusedKernels.BatchNormInferenceUnsafe(
+                        (float*)inH.AddrOfPinnedObject(),
+                        (float*)outH.AddrOfPinnedObject(),
+                        length, channels,
+                        (float*)gammaH.AddrOfPinnedObject(),
+                        (float*)betaH.AddrOfPinnedObject(),
+                        (float*)meanH.AddrOfPinnedObject(),
+                        (float*)varH.AddrOfPinnedObject(),
+                        capturedEps);
+                }
+            };
+        }
+
+        // LayerNorm: use FusedKernels.LayerNormUnsafe for direct SIMD
+        if (step.OpType == OpType.LayerNorm && typeof(T) == typeof(float)
+            && step.Inputs.Length >= 3 && step.Inputs[0].IsContiguous)
+        {
+            var input = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var output = step.OutputBuffer;
+            int normSize = gamma.Length;
+            float eps = 1e-5f;
+            if (step.SavedState is { Length: > 0 } && step.SavedState[0] is double epsD)
+                eps = (float)epsD;
+
+            var inH = PinAndTrack(((Tensor<float>)(object)input).GetDataArray(), handleTracker);
+            var outH = PinAndTrack(((Tensor<float>)(object)output).GetDataArray(), handleTracker);
+            var gammaH = PinAndTrack(((Tensor<float>)(object)gamma).GetDataArray(), handleTracker);
+            var betaH = PinAndTrack(((Tensor<float>)(object)beta).GetDataArray(), handleTracker);
+            int batchSize = input.Length / normSize;
+            float capturedEps = eps;
+
+            return eng =>
+            {
+                unsafe
+                {
+                    // LayerNorm per batch element
+                    float* pIn = (float*)inH.AddrOfPinnedObject();
+                    float* pOut = (float*)outH.AddrOfPinnedObject();
+                    float* pG = (float*)gammaH.AddrOfPinnedObject();
+                    float* pB = (float*)betaH.AddrOfPinnedObject();
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        Simd.FusedKernels.LayerNormUnsafe(
+                            pIn + b * normSize, pG, pB,
+                            pOut + b * normSize, normSize, capturedEps);
+                    }
+                }
+            };
+        }
 
         // TensorDivide forward: pinned SIMD VectorDivideUnsafe
         if (step.OpType == OpType.TensorDivide && step.Inputs.Length == 2
