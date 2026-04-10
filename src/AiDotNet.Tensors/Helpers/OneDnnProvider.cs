@@ -1868,7 +1868,8 @@ internal static class OneDnnProvider
             long* cDims = stackalloc long[] { channels };
             long* cStrides = stackalloc long[] { 1 };
             IntPtr scaleDesc;
-            dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, DnnlF32, cStrides);
+            rc = dnnl_memory_desc_create_with_strides(out scaleDesc, 1, cDims, DnnlF32, cStrides);
+            if (rc != 0) { dnnl_memory_desc_destroy(srcDesc); dnnl_memory_desc_destroy(dstDesc); dnnl_primitive_destroy(prim); return false; }
 
             IntPtr srcMem = IntPtr.Zero, dstMem = IntPtr.Zero;
             IntPtr meanMem = IntPtr.Zero, varMem = IntPtr.Zero;

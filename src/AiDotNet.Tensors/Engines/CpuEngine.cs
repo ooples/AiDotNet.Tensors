@@ -6267,44 +6267,10 @@ public class CpuEngine : ITensorLevelEngine
     /// </summary>
     public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation, MemoryFormat format)
     {
-        if (format != MemoryFormat.ChannelsLast || typeof(T) != typeof(float))
-            return Conv2D(input, kernel, stride, padding, dilation);
-
-        if (!input.IsContiguous) input = input.Contiguous();
-        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
-        if (input.Rank != 4 || kernel.Rank != 4)
-            return Conv2D(input, kernel, stride, padding, dilation);
-
-        int batch = input._shape[0], inC = input._shape[1], h = input._shape[2], w = input._shape[3];
-        int outC = kernel._shape[0], kH = kernel._shape[2], kW = kernel._shape[3];
-        if (kernel._shape[1] != inC)
-            throw new ArgumentException($"Kernel channel dim {kernel._shape[1]} != input channels {inC}");
-        int effKH = dilation * (kH - 1) + 1, effKW = dilation * (kW - 1) + 1;
-        int outH = (h + 2 * padding - effKH) / stride + 1;
-        int outW = (w + 2 * padding - effKW) / stride + 1;
-        if (outH <= 0 || outW <= 0)
-            return Conv2D(input, kernel, stride, padding, dilation);
-
-        // Convert NCHW → NHWC
-        var inputArr = (float[])(object)input.GetDataArray();
-        var nhwcInput = new float[inputArr.Length];
-        Simd.NhwcConv.NchwToNhwc(inputArr, nhwcInput, batch, inC, h, w);
-
-        // Flatten kernel to [outC, inC*kH*kW] (already row-major NCHW = [outC, inC, kH, kW])
-        var kernelArr = (float[])(object)kernel.GetDataArray();
-
-        // Run NHWC Conv2D
-        var nhwcOutput = new float[batch * outH * outW * outC];
-        Simd.NhwcConv.Conv2DNhwc(nhwcInput, kernelArr, nhwcOutput,
-            batch, inC, h, w, outC, kH, kW,
-            stride, stride, padding, padding, dilation, dilation, outH, outW);
-
-        // Convert NHWC → NCHW
-        var nchwOutput = new float[nhwcOutput.Length];
-        Simd.NhwcConv.NhwcToNchw(nhwcOutput, nchwOutput, batch, outC, outH, outW);
-
-        return new Tensor<float>(nchwOutput, new[] { batch, outC, outH, outW }) as Tensor<T>
-            ?? throw new InvalidCastException();
+        // Delegate to standard Conv2D which handles GraphMode, autodiff, and tracing.
+        // The NHWC optimization is only a hint — the standard path already selects
+        // the best kernel (OneDNN, NHWC im2col, or generic) based on hardware.
+        return Conv2D(input, kernel, stride, padding, dilation);
     }
 
     /// <summary>

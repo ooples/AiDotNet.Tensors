@@ -72,7 +72,7 @@ internal static class TableDrivenSigmoid
     {
         int i = 0;
 #if NET5_0_OR_GREATER
-        // AVX2 path: compute index, gather from table, interpolate
+        // AVX2 path: compute index, vpgatherdd from pinned table, quadratic interpolate
         if (Avx2.IsSupported && Fma.IsSupported && length >= 8)
         {
             var vXMin = Vector256.Create(XMin);

@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// Our Estrin polynomial uses the SAME algorithm as SLEEF (PyTorch's exp).
 /// The difference is native C compilation vs .NET JIT.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class JITvsNativeExpTest
 {
     private readonly ITestOutputHelper _output;

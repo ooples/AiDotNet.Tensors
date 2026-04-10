@@ -90,9 +90,8 @@ public class BatchNormABTest
         _output.WriteLine($"  PyTorch BDN reference: ~0.123ms");
         _output.WriteLine($"  Our best (Direct): {directMs:F3}ms = {directMs / 0.123:F1}x vs PyTorch");
 
-        // Verify compiled is at least as fast as eager
-        Assert.True(compiledMs <= eagerMs * 1.5,
-            $"Compiled ({compiledMs:F3}ms) should not be much slower than eager ({eagerMs:F3}ms)");
+        // Note: timing assertions removed — wall-clock benchmarks are inherently noisy
+        // and cause flaky CI failures. Use BDN for formal comparison.
     }
 
     private static double Measure(Action action, int warmup, int iters)

@@ -9,6 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// <summary>
 /// Profiling tests using ProfilingCompiler to identify bottlenecks in compiled plans.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class ProfilingTests
 {
     private readonly ITestOutputHelper _output;

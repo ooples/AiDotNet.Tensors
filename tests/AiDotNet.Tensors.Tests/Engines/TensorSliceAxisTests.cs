@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -154,7 +155,7 @@ public class TensorSliceAxisTests
     {
         var tensor = Tensor<float>.CreateRandom([2, 3, 4, 5]);
 
-        using var tape = new Tensors.Engines.Autodiff.GradientTape<float>();
+        using var tape = new GradientTape<float>();
         var sliced = _engine.TensorSliceAxis(tensor, 1, 2); // axis=1, index=2
         var loss = _engine.ReduceSum(sliced, null);
         var grads = tape.ComputeGradients(loss, new[] { tensor });

@@ -10700,8 +10700,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         // GPU kernel: out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
         if (!_kernelCache.TryGetValue("slice_axis", out var kernel))
         {
-            // Fallback: CPU-side copy via download/upload
-            return;
+            throw new NotSupportedException("CUDA slice_axis kernel not available. Fallback to CPU via DirectGpuTensorEngine.");
         }
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
@@ -10720,7 +10719,7 @@ public sealed class CudaBackend : IAsyncGpuBackend
         }
         if (!_kernelCache.TryGetValue("set_slice_axis", out var kernel))
         {
-            return;
+            throw new NotSupportedException("CUDA set_slice_axis kernel not available. Fallback to CPU via DirectGpuTensorEngine.");
         }
         using var _ = PushContext();
         IntPtr outPtr = output.Handle, valPtr = values.Handle;
