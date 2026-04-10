@@ -1086,21 +1086,28 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     }
 
     // --- Split-buffer native Complex<T> operations (WebGPU) ---
-    // Composes from existing GPU primitives. Temp buffers allocated per call —
-    // for high-frequency spectral workloads, consider buffer pooling or
-    // dedicated WGSL compute pipelines.
+    // Composes from existing GPU primitives with cached scratch buffers.
+
+    private IGpuBuffer[]? _complexScratch;
+    private int _complexScratchSize;
+
+    private void EnsureComplexScratch(int n)
+    {
+        if (_complexScratch is not null && _complexScratchSize >= n) return;
+        if (_complexScratch is not null)
+            foreach (var b in _complexScratch) b?.Dispose();
+        _complexScratchSize = n;
+        _complexScratch = new[] { AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n), AllocateBuffer(n) };
+    }
 
     public void SplitComplexMultiply(IGpuBuffer aR, IGpuBuffer aI, IGpuBuffer bR, IGpuBuffer bI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;
-        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
-        var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
-        try
-        {
-            Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
-            Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
-        }
-        finally { t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose(); }
+        EnsureComplexScratch(n);
+        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+        Multiply(aR, bR, t1, n); Multiply(aI, bI, t2, n); Subtract(t1, t2, oR, n);
+        Multiply(aR, bI, t3, n); Multiply(aI, bR, t4, n); Add(t3, t4, oI, n);
     }
 
     public void SplitComplexConjugate(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer oR, IGpuBuffer oI, int n)
@@ -1114,9 +1121,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public void SplitComplexMagnitudeSquared(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n)
     {
         if (n <= 0) return;
-        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
-        try { Multiply(iR, iR, t1, n); Multiply(iI, iI, t2, n); Add(t1, t2, o, n); }
-        finally { t1.Dispose(); t2.Dispose(); }
+        EnsureComplexScratch(n);
+        Multiply(iR, iR, _complexScratch![0], n); Multiply(iI, iI, _complexScratch[1], n);
+        Add(_complexScratch[0], _complexScratch[1], o, n);
     }
     public void SplitComplexPhase(IGpuBuffer iR, IGpuBuffer iI, IGpuBuffer o, int n) => ComplexPhase(iR, iI, o, n);
     public void SplitComplexFromPolar(IGpuBuffer m, IGpuBuffer p, IGpuBuffer oR, IGpuBuffer oI, int n) => PolarToComplex(m, p, oR, oI, n);
@@ -1136,14 +1143,11 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable
     public void SplitComplexCrossSpectral(IGpuBuffer xR, IGpuBuffer xI, IGpuBuffer yR, IGpuBuffer yI, IGpuBuffer oR, IGpuBuffer oI, int n)
     {
         if (n <= 0) return;
-        var t1 = AllocateBuffer(n); var t2 = AllocateBuffer(n);
-        var t3 = AllocateBuffer(n); var t4 = AllocateBuffer(n);
-        try
-        {
-            Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
-            Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
-        }
-        finally { t1.Dispose(); t2.Dispose(); t3.Dispose(); t4.Dispose(); }
+        EnsureComplexScratch(n);
+        var t1 = _complexScratch![0]; var t2 = _complexScratch[1];
+        var t3 = _complexScratch[2]; var t4 = _complexScratch[3];
+        Multiply(xR, yR, t1, n); Multiply(xI, yI, t2, n); Add(t1, t2, oR, n);
+        Multiply(xI, yR, t3, n); Multiply(xR, yI, t4, n); Subtract(t3, t4, oI, n);
     }
 
 }
